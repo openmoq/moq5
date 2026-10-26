@@ -1,3 +1,5 @@
+include("${PROJECT_SOURCE_DIR}/cmake/MoqComponentExports.cmake")
+
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 find_package(Picoquic REQUIRED)
 
@@ -47,7 +49,6 @@ if(_moq_pq_verify_backend STREQUAL "auto")
 endif()
 
 set(_adapter_tls_link "")
-set(_adapter_tls_install_link "")
 set(MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL OFF CACHE INTERNAL
     "adapter-picoquic install-tree dependency on OpenSSL")
 set(MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND "${_moq_pq_verify_backend}" CACHE INTERNAL
@@ -102,7 +103,6 @@ if(_moq_pq_verify_backend STREQUAL "openssl")
     target_compile_definitions(moq-adapter-picoquic
         PRIVATE MOQ_PICOQUIC_VERIFY_OPENSSL)
     set(_adapter_tls_link OpenSSL::SSL OpenSSL::Crypto)
-    set(_adapter_tls_install_link ";OpenSSL::SSL;OpenSSL::Crypto")
     set(MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL ON CACHE INTERNAL
         "adapter-picoquic install-tree dependency on OpenSSL")
 elseif(_moq_pq_verify_backend STREQUAL "mbedtls")
@@ -141,10 +141,7 @@ endif()
 
 target_link_libraries(moq-adapter-picoquic
     PUBLIC moq::core ${_adapter_tls_link}
-    PUBLIC $<BUILD_INTERFACE:${_PQ}>)
-
-set_property(TARGET moq-adapter-picoquic APPEND PROPERTY
-    INTERFACE_LINK_LIBRARIES "$<INSTALL_INTERFACE:${_PQ}>")
+    PUBLIC ${_PQ})
 
 set_target_properties(moq-adapter-picoquic PROPERTIES
     C_STANDARD 11
@@ -162,10 +159,6 @@ endif()
 
 # -- Install ------------------------------------------------------------
 
-install(TARGETS moq-adapter-picoquic
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-
 install(DIRECTORY include/moq
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.h"
@@ -174,45 +167,8 @@ install(DIRECTORY include/moq
 install(FILES moq_picoquic.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
-# -- Adapter targets files -----------------------------------------------
-# Source-tree picoquic targets can't pass CMake's export-set validation,
-# so we generate the adapter import module manually: one for build-tree
-# consumption (absolute paths) and one for install-tree (relocatable).
-
-# Build-tree targets (absolute paths — valid on this machine)
-set(_adapter_pq_link "moq::core;${_adapter_tls_link};${_PQ}")
-file(GENERATE
-    OUTPUT "${PROJECT_BINARY_DIR}/libmoqAdapterTargets.cmake"
-    CONTENT "\
-if(NOT TARGET moq::adapter-picoquic)\n\
-  add_library(moq::adapter-picoquic $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-picoquic,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-picoquic PROPERTIES\n\
-    IMPORTED_LOCATION \"$<TARGET_FILE:moq-adapter-picoquic>\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include;${CMAKE_CURRENT_SOURCE_DIR}\"\n\
-    INTERFACE_LINK_LIBRARIES \"${_adapter_pq_link}\")\n\
-endif()\n")
-
-# Install-tree targets (relocatable via prefix detection).
-# Always use namespaced names since install-tree consumers will have
-# installed picoquic with picoquic::picoquic-core. The adapter needs only
-# picoquic-core: it uses nothing from picoquic-log, and picoquic-core does
-# not depend on it.
-set(_adapter_lib_name "$<TARGET_FILE_NAME:moq-adapter-picoquic>")
-set(_adapter_lib_type "$<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-picoquic,TYPE>,STATIC_LIBRARY>,STATIC,SHARED>")
-set(_adapter_libdir "${CMAKE_INSTALL_LIBDIR}")
-set(_adapter_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
-set(_adapter_pq_target "picoquic::picoquic-core")
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoqAdapterTargets.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterTargets-install.cmake.in
-    @ONLY)
-file(GENERATE
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterTargets-install.cmake
-    INPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterTargets-install.cmake.in)
-
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterTargets-install.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-    RENAME libmoqAdapterTargets.cmake)
+# Native cross-export references keep provider ownership in picoquic::.
+moq_export_component(moq-adapter-picoquic adapter-picoquic libmoqAdapterTargets)
 
 # -- Threaded helper (optional) ------------------------------------------
 
@@ -282,48 +238,12 @@ if(MOQ_BUILD_PQ_THREADED)
         target_compile_options(moq-adapter-picoquic-threaded PRIVATE $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:/WX>)
     endif()
 
-    install(TARGETS moq-adapter-picoquic-threaded
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-
     install(FILES include/moq/picoquic_threaded.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moq)
 
-    # Build-tree imported target
-    file(GENERATE
-        OUTPUT "${PROJECT_BINARY_DIR}/libmoqAdapterThreadedTargets.cmake"
-        CONTENT "\
-if(NOT TARGET moq::adapter-picoquic-threaded)\n\
-  add_library(moq::adapter-picoquic-threaded $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-picoquic-threaded,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-picoquic-threaded PROPERTIES\n\
-    IMPORTED_LOCATION \"$<TARGET_FILE:moq-adapter-picoquic-threaded>\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include\"\n\
-    INTERFACE_LINK_LIBRARIES \"moq::adapter-picoquic$<SEMICOLON>Threads::Threads\")\n\
-endif()\n")
+    moq_export_component(moq-adapter-picoquic-threaded
+        adapter-picoquic-threaded libmoqAdapterThreadedTargets)
 
-    # Install-tree imported target
-    set(_threaded_lib_name "$<TARGET_FILE_NAME:moq-adapter-picoquic-threaded>")
-    file(GENERATE
-        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterThreadedTargets-install.cmake
-        CONTENT "\
-get_filename_component(_THREADED_PREFIX \"\${CMAKE_CURRENT_LIST_FILE}\" PATH)\n\
-get_filename_component(_THREADED_PREFIX \"\${_THREADED_PREFIX}\" PATH)\n\
-get_filename_component(_THREADED_PREFIX \"\${_THREADED_PREFIX}\" PATH)\n\
-get_filename_component(_THREADED_PREFIX \"\${_THREADED_PREFIX}\" PATH)\n\
-\n\
-if(NOT TARGET moq::adapter-picoquic-threaded)\n\
-  add_library(moq::adapter-picoquic-threaded $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-picoquic-threaded,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-picoquic-threaded PROPERTIES\n\
-    IMPORTED_LOCATION \"\${_THREADED_PREFIX}/${_adapter_libdir}/${_threaded_lib_name}\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"\${_THREADED_PREFIX}/${_adapter_incdir}\"\n\
-    INTERFACE_LINK_LIBRARIES \"moq::adapter-picoquic$<SEMICOLON>Threads::Threads\")\n\
-endif()\n\
-\n\
-unset(_THREADED_PREFIX)\n")
-
-    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterThreadedTargets-install.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-        RENAME libmoqAdapterThreadedTargets.cmake)
 endif()
 
 # -- Tests ---------------------------------------------------------------
@@ -813,7 +733,6 @@ if(MOQ_BUILD_TESTS)
     endif()
 endif()
 
-
 if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     # Compile the real facade/Windows shim against typed native-call fakes on
     # a host with pthreads. No sockets/threads and no native Windows claim.
@@ -1121,7 +1040,6 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
         set_tests_properties(pq_inbox PROPERTIES TIMEOUT 120)
     endif()
 
-
     # The streaming_objects, socket_buffer_bytes and bind_address options, and
     # the server's pump and wake behaviour.
     add_executable(test_threaded_server_options
@@ -1408,6 +1326,7 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
         set_tests_properties(pq_zero_rtt_refused PROPERTIES TIMEOUT 60)
     endif()
 
+    if(MOQ_BUILD_PACKAGE_EXPORTS)
     set(_threaded_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-threaded")
     set(_threaded_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-threaded-test-build")
     include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
@@ -1473,6 +1392,8 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
             PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
     endif()
 
+    endif()
+
     # Group-order negotiation and complete delivery over real picoquic in
     # drafts 16, 18 and 22. Deterministic tests own the scheduling oracle.
     if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
@@ -1497,7 +1418,7 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     endif()
 endif()
 
-if(MOQ_BUILD_TESTS)
+if(MOQ_BUILD_TESTS AND MOQ_BUILD_PACKAGE_EXPORTS)
     set(_adapter_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_adapter_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
     set(_adapter_consumer_deps "")

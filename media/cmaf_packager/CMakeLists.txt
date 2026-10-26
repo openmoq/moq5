@@ -84,11 +84,14 @@ if(MOQ_BUILD_TESTS)
     include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
     set(packager_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
     moq_write_consumer_context("${packager_context}")
+    if(MOQ_BUILD_PACKAGE_EXPORTS)
     add_test(NAME cmaf_packager_consumer COMMAND ${CMAKE_COMMAND}
         -DBUILD_DIR=${PROJECT_BINARY_DIR} -DCONTEXT=${packager_context}
         -DCHECK_DIR=${CMAKE_CURRENT_BINARY_DIR}/cold-consumer
         -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_consumer.cmake)
+    set_tests_properties(cmaf_packager_consumer PROPERTIES TIMEOUT 90 LABELS "media;packager")
+    endif()
     set_tests_properties(cmaf_packager cmaf_packager_regression cmaf_packager_symbols
-        cmaf_packager_consumer PROPERTIES TIMEOUT 90 LABELS "media;packager")
+        PROPERTIES TIMEOUT 90 LABELS "media;packager")
 endif()

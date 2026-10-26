@@ -639,6 +639,9 @@ function(_moq_pq_add_picoquic_source)
     endif()
     add_subdirectory("${MOQ_PICOQUIC_SOURCE_DIR}"
         "${CMAKE_BINARY_DIR}/_deps/picoquic" EXCLUDE_FROM_ALL)
+    # The owning LibMoQ project may register the provider's own build export.
+    # Already-available/imported providers never pass through this branch.
+    set(_MOQ_PICOQUIC_SOURCE_ADDED TRUE PARENT_SCOPE)
 endfunction()
 
 # One OpenSSL link identity for source-tree picoquic and the adapter.

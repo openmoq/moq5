@@ -607,11 +607,11 @@ _pt_configure(cfg_installed b-cfg-installed OK "-DMOQ_PICOTLS_PREFIX=${pt}/nest/
 _pt_expect_dirs(cfg_installed "${pt}/nest/inst/include" "${pt}/nest/inst/lib")
 
 # Adapter: the verifier's picotls headers follow the selection.
-# The adapter's build-tree targets file is generated once for every
-# configuration, so libmoq with the picoquic adapter configures only under a
-# single-config generator.
+# These existing stand-in provider cases remain single-config selection
+# probes. Real multi-config adapter import/link consumers are covered by
+# ManualComponentExportsTest.cmake; the stand-ins are not backend qualification.
 if(multi_config)
-    message(STATUS "picotls prefix selection: adapter cases need a single-config generator; not run")
+    message(STATUS "picotls prefix selection: single-config adapter selection probes excluded; use the real multi-config export fixture")
 elseif(DEFINED MOQ_OPENSSL_ROOT AND NOT MOQ_OPENSSL_ROOT STREQUAL "")
     # _pt_adapter(<case> <build-dir> OK|<expected error text> <args>...)
     # Leaves the adapter's include directories under the picotls trees in
@@ -632,6 +632,7 @@ elseif(DEFINED MOQ_OPENSSL_ROOT AND NOT MOQ_OPENSSL_ROOT STREQUAL "")
                 -S "${MOQ_SOURCE}" -B "${dir}"
                 -DMOQ_BUILD_TESTS=OFF -DMOQ_BUILD_SIM=OFF
                 -DMOQ_BUILD_EXAMPLES=OFF
+                -DMOQ_BUILD_PACKAGE_EXPORTS=OFF
                 -DMOQ_BUILD_ADAPTER_PICOQUIC=ON
                 -DMOQ_PICOQUIC_VERIFY_BACKEND=openssl
                 "-DOPENSSL_ROOT_DIR=${MOQ_OPENSSL_ROOT}"

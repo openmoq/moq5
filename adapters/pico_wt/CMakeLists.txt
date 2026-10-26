@@ -1,3 +1,5 @@
+include("${PROJECT_SOURCE_DIR}/cmake/MoqComponentExports.cmake")
+
 # moq-adapter-pico-wt: picoquic WebTransport adapter for libmoq.
 #
 # Optional. Requires MOQ_BUILD_ADAPTER_PICO_WT=ON and
@@ -36,15 +38,8 @@ target_include_directories(moq-adapter-pico-wt
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# picohttp-core is PUBLIC: <moq/pico_wt.h> publicly includes
-# pico_webtransport.h / h3zero_common.h, so consumers of the adapter
-# target must inherit picohttp-core's include dirs. Wrap in
-# BUILD_INTERFACE: the install-tree link interface is hand-written in
-# the generated targets file (referencing picoquic::picohttp-core), so
-# the build-tree target name must never leak into an export.
-target_link_libraries(moq-adapter-pico-wt
-    PUBLIC moq::core $<BUILD_INTERFACE:${_PICOHTTP}>
-)
+# Public headers include the provider's HTTP/3 headers in both package forms.
+target_link_libraries(moq-adapter-pico-wt PUBLIC moq::core ${_PICOHTTP})
 
 # Export public symbols past C_VISIBILITY_PRESET hidden (MOQ_API).
 target_compile_definitions(moq-adapter-pico-wt PRIVATE MOQ_BUILDING)
@@ -61,32 +56,9 @@ elseif(MSVC)
     target_compile_options(moq-adapter-pico-wt PRIVATE $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:/WX>)
 endif()
 
-# -- Build-tree package target ------------------------------------------
-# Build-tree imported target so `find_package(libmoq COMPONENTS
-# adapter-pico-wt)` works against ${PROJECT_BINARY_DIR}, mirroring the
-# picoquic adapter. The install-tree counterpart is generated in the
-# install section below.
-set(_picowt_link "moq::core;${_PICOHTTP}")
-file(GENERATE
-    OUTPUT "${PROJECT_BINARY_DIR}/libmoqPicoWtAdapterTargets.cmake"
-    CONTENT "\
-if(NOT TARGET moq::adapter-pico-wt)\n\
-  add_library(moq::adapter-pico-wt $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-pico-wt,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-pico-wt PROPERTIES\n\
-    IMPORTED_LOCATION \"$<TARGET_FILE:moq-adapter-pico-wt>\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include\"\n\
-    INTERFACE_LINK_LIBRARIES \"${_picowt_link}\")\n\
-endif()\n")
-
-# -- Install ------------------------------------------------------------
-# True install-tree consumption. The pico WT adapter is NOT part of the
-# libmoqTargets export set (it links source-tree picoquic, which can't
-# pass CMake export-set validation), so we install the target plainly
-# and hand-generate a relocatable imported-target file, mirroring the
-# picoquic adapter.
-install(TARGETS moq-adapter-pico-wt
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+# Each facade retains its existing component/module; foreign HTTP targets are
+# referenced through their provider's own native export set.
+moq_export_component(moq-adapter-pico-wt adapter-pico-wt libmoqPicoWtAdapterTargets)
 
 # Public attach-mode header only. Internal headers (pico_wt_adapter.h,
 # pico_wt_endpoint.h) live outside include/. pico_wt_managed.h is
@@ -96,22 +68,6 @@ install(DIRECTORY include/moq
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.h"
     PATTERN "pico_wt_managed.h" EXCLUDE)
-
-# Relocatable install-tree imported target file.
-set(_picowt_lib_name "$<TARGET_FILE_NAME:moq-adapter-pico-wt>")
-set(_picowt_lib_type "$<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-pico-wt,TYPE>,STATIC_LIBRARY>,STATIC,SHARED>")
-set(_picowt_libdir "${CMAKE_INSTALL_LIBDIR}")
-set(_picowt_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoqPicoWtAdapterTargets.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtAdapterTargets-install.cmake.in
-    @ONLY)
-file(GENERATE
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtAdapterTargets-install.cmake
-    INPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtAdapterTargets-install.cmake.in)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtAdapterTargets-install.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-    RENAME libmoqPicoWtAdapterTargets.cmake)
 
 # -- pkg-config (for Meson/autotools consumers) -----------------------
 # Optional component .pc files (the core libmoq.pc is generated in the
@@ -207,7 +163,7 @@ include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
 moq_nested_cxx_args(_picowt_nested_cxx FLAGS)
 moq_nested_cxx_env(_picowt_nested_cxx_env)
 
-if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
+if(MOQ_BUILD_TESTS AND MOQ_BUILD_PACKAGE_EXPORTS AND MOQ_PICOQUIC_SOURCE_DIR)
     set(_picowt_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_picowt_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
     set(_picowt_consumer_deps "")
@@ -256,6 +212,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
         get_filename_component(_o "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
         get_filename_component(_picowt_openssl_root "${_o}" DIRECTORY)
     endif()
+    if(MOQ_BUILD_PACKAGE_EXPORTS)
     add_test(NAME pico_wt_install_consumer
         COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_install_consumer.sh"
@@ -273,6 +230,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
             "${CMAKE_INSTALL_INCLUDEDIR}"
             "${_picowt_abi_context}")
     set_tests_properties(pico_wt_install_consumer PROPERTIES TIMEOUT 600)
+    endif()
 
     # pkg-config consumer (attach): a plain C program built with only
     # `pkg-config --cflags --libs libmoq-pico-wt` from the install prefix.
@@ -734,9 +692,8 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
     # reach standalone managed consumers (the lib is static here, so the
     # dependency cannot be hidden behind the .so boundary).
     target_link_libraries(moq-adapter-pico-wt-managed
-        PUBLIC  moq::adapter-pico-wt moq::adapter-picoquic
-        PRIVATE $<BUILD_INTERFACE:${_PICOHTTP}> ${_PICO_CORE}
-                Threads::Threads)
+        PUBLIC  moq::adapter-pico-wt moq::adapter-picoquic Threads::Threads
+        PRIVATE ${_PICOHTTP} ${_PICO_CORE})
     # Export public symbols past C_VISIBILITY_PRESET hidden (MOQ_API).
     target_compile_definitions(moq-adapter-pico-wt-managed PRIVATE
         MOQ_BUILDING)
@@ -840,47 +797,16 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
     # + Threads; moq::core and PicoQUIC's selected TLS provider arrive
     # transitively through those. libmoqConfig loads moq::adapter-picoquic
     # alongside the attach adapter before this file so both references resolve.
-    file(GENERATE
-        OUTPUT "${PROJECT_BINARY_DIR}/libmoqPicoWtManagedTargets.cmake"
-        CONTENT "\
-if(NOT TARGET moq::adapter-pico-wt-managed)\n\
-  add_library(moq::adapter-pico-wt-managed $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-pico-wt-managed,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-pico-wt-managed PROPERTIES\n\
-    IMPORTED_LOCATION \"$<TARGET_FILE:moq-adapter-pico-wt-managed>\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include\"\n\
-    INTERFACE_LINK_LIBRARIES \"moq::adapter-pico-wt$<SEMICOLON>moq::adapter-picoquic$<SEMICOLON>Threads::Threads\")\n\
-endif()\n")
+    moq_export_component(moq-adapter-pico-wt-managed
+        adapter-pico-wt-managed libmoqPicoWtManagedTargets)
 
     # -- Install ----------------------------------------------------------
-    # True install-tree consumption (CMake-only, like the attach adapter
-    # and mvfst). Not part of the libmoqTargets export set (it links
-    # source-tree picoquic), so install plainly + hand-generate a
-    # relocatable imported-target file.
-    install(TARGETS moq-adapter-pico-wt-managed
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-
     # The managed header is excluded from the unconditional adapter
     # directory install (above) and installed explicitly here, so it ships
     # only when the managed lib is built — mirroring picoquic_threaded.h.
     install(FILES include/moq/pico_wt_managed.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moq)
 
-    # Relocatable install-tree imported target file.
-    set(_picowtm_lib_name "$<TARGET_FILE_NAME:moq-adapter-pico-wt-managed>")
-    set(_picowtm_lib_type "$<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-pico-wt-managed,TYPE>,STATIC_LIBRARY>,STATIC,SHARED>")
-    set(_picowtm_libdir "${CMAKE_INSTALL_LIBDIR}")
-    set(_picowtm_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
-    configure_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoqPicoWtManagedTargets.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtManagedTargets-install.cmake.in
-        @ONLY)
-    file(GENERATE
-        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtManagedTargets-install.cmake
-        INPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtManagedTargets-install.cmake.in)
-    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtManagedTargets-install.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-        RENAME libmoqPicoWtManagedTargets.cmake)
 
     # pkg-config: Requires libmoq-pico-wt (installed above), which pulls
     # in the full PicoQUIC/picotls/provider chain, so a consumer needs only
@@ -910,6 +836,7 @@ endif()\n")
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-managed")
         set(_picowtm_consumer_bld
             "${CMAKE_CURRENT_BINARY_DIR}/consumer-managed-test-build")
+        if(MOQ_BUILD_PACKAGE_EXPORTS)
         add_test(NAME pico_wt_managed_consumer
             COMMAND ${CMAKE_COMMAND} -E env bash -c
                 "set -e; \
@@ -930,6 +857,7 @@ endif()\n")
         set_tests_properties(pico_wt_managed_consumer PROPERTIES TIMEOUT 180)
         include("${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake")
         moq_test_reject_consumer_warnings(pico_wt_managed_consumer)
+        endif()
 
         # Install-tree managed consumer: installs a BUILD_HTTP picoquic +
         # libmoq to a temp prefix and builds the managed consumer against
@@ -943,6 +871,7 @@ endif()\n")
         endif()
         include("${PROJECT_SOURCE_DIR}/tests/cmake/PicoquicInstallStaging.cmake")
         moq_picoquic_install_staging(_picowtm_install_staging)
+        if(MOQ_BUILD_PACKAGE_EXPORTS)
         add_test(NAME pico_wt_managed_install_consumer
             COMMAND ${CMAKE_COMMAND} -E env ${_picowt_nested_cxx_env} bash
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_install_consumer_managed.sh"
@@ -962,6 +891,7 @@ endif()\n")
                 "${_picowt_abi_context}")
         set_tests_properties(pico_wt_managed_install_consumer
             PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+        endif()
 
         # pkg-config consumer (managed): a plain C program built with only
         # `pkg-config --cflags --libs libmoq-pico-wt-managed` — exercises
@@ -999,6 +929,7 @@ endif()\n")
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-managed-verify")
         set(_picowtmv_consumer_bld
             "${CMAKE_CURRENT_BINARY_DIR}/consumer-managed-verify-test-build")
+        if(MOQ_BUILD_PACKAGE_EXPORTS)
         add_test(NAME pico_wt_managed_verify_consumer
             COMMAND ${CMAKE_COMMAND} -E env bash -c
                 "set -e; \
@@ -1020,6 +951,7 @@ endif()\n")
             PROPERTIES TIMEOUT 180)
         include("${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake")
         moq_test_reject_consumer_warnings(pico_wt_managed_verify_consumer)
+        endif()
 
         # Verifier cross-link consumer (pkg-config): the Meson/autotools
         # path — `pkg-config --cflags --libs libmoq-pico-wt-managed libmoq`

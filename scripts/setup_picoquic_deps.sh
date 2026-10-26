@@ -58,7 +58,9 @@
 # Requires: git, cmake, a C compiler, and OpenSSL dev headers
 # (Ubuntu: apt-get install -y libssl-dev cmake).
 # --self-test additionally requires Ninja and CMake 3.20 or newer.
-# Multi-config LibMoQ build-tree exports remain separate portability work.
+# Multi-config CMake component imports and the unresolved multi-config
+# picotls pkg-config directory boundary are distinct; see
+# docs/cmake-component-exports.md. Native Windows qualification remains separate.
 #
 # Windows (Git Bash + Visual Studio 2022): picotls also needs pkg-config, and
 # neither it nor OpenSSL ships with the toolchain. E.g. with vcpkg:

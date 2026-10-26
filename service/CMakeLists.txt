@@ -1,3 +1,5 @@
+include("${PROJECT_SOURCE_DIR}/cmake/MoqComponentExports.cmake")
+
 # moq-service — the service tier (moq_endpoint_t + media receiver/sender).
 # Severable: lower tiers build and work without it; the core stays sans-I/O
 # and all threading lives here.
@@ -25,7 +27,7 @@ target_compile_features(moq-service PUBLIC c_std_11)
 # returns MOQ_ERR_UNSUPPORTED (severability -- never an accidental link
 # failure). The endpoint adds the service-tier contracts on top of them.
 find_package(Threads REQUIRED)
-target_link_libraries(moq-service PRIVATE Threads::Threads)
+target_link_libraries(moq-service PUBLIC Threads::Threads)
 set(_MOQ_SERVICE_FACADE_DEFS "")
 set(_MOQ_SERVICE_FACADE_LIBS "")
 if(MOQ_BUILD_PQ_THREADED)
@@ -108,15 +110,13 @@ if(TARGET moq::mpeg2ts)
 endif()
 # The media player (<moq/media_player.h>) composes the receiver with the
 # playback engine, so it is built when the engine is.
-set(_MOQ_SERVICE_PLAYER_LIBS "")
 if(TARGET moq::playback)
     target_sources(moq-service PRIVATE src/media_player.c)
     target_link_libraries(moq-service PUBLIC moq::playback)
-    set(_MOQ_SERVICE_PLAYER_LIBS moq::playback)
 endif()
 target_compile_definitions(moq-service PRIVATE ${_MOQ_SERVICE_FACADE_DEFS}
                                                ${_MOQ_SERVICE_TS_DEFS})
-target_link_libraries(moq-service PRIVATE ${_MOQ_SERVICE_FACADE_LIBS}
+target_link_libraries(moq-service PUBLIC ${_MOQ_SERVICE_FACADE_LIBS}
                                           ${_MOQ_SERVICE_TS_LIBS})
 
 set_target_properties(moq-service PROPERTIES
@@ -124,10 +124,6 @@ set_target_properties(moq-service PROPERTIES
     OUTPUT_NAME moq-service
     EXPORT_NAME service
 )
-
-install(TARGETS moq-service
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
 if(TARGET moq::playback)
     install(DIRECTORY include/moq
@@ -200,51 +196,9 @@ if(NOT MOQ_BUILD_ADAPTER_MVFST AND NOT MOQ_BUILD_ADAPTER_PROXYGEN
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 endif()
 
-# find_package export (hand-written imported target, like the adapters --
-# the service links the managed facades, whose imported targets are not in
-# the install(EXPORT) set, so install(EXPORT) cannot record them). A static
-# moq-service carries its PRIVATE facade deps as link-only interface deps,
-# so the consumer must link the facades too: reflect the linked facade set
-# (plus the PUBLIC core/msf deps) into INTERFACE_LINK_LIBRARIES. The
-# `service` component branch in libmoqConfig loads those targets first.
-set(_service_libdir "${CMAKE_INSTALL_LIBDIR}")
-set(_service_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
-set(_service_iface "moq::core;moq::msf;Threads::Threads;${_MOQ_SERVICE_FACADE_LIBS};${_MOQ_SERVICE_TS_LIBS};${_MOQ_SERVICE_PLAYER_LIBS}")
-string(REPLACE ";" "$<SEMICOLON>" _service_iface_gen "${_service_iface}")
-
-file(GENERATE
-    OUTPUT "${PROJECT_BINARY_DIR}/libmoqServiceTargets.cmake"
-    CONTENT "\
-if(NOT TARGET moq::service)\n\
-  add_library(moq::service $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-service,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::service PROPERTIES\n\
-    IMPORTED_LOCATION \"$<TARGET_FILE:moq-service>\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include\"\n\
-    INTERFACE_LINK_LIBRARIES \"${_service_iface_gen}\")\n\
-endif()\n")
-
-set(_service_lib_name "$<TARGET_FILE_NAME:moq-service>")
-file(GENERATE
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqServiceTargets-install.cmake
-    CONTENT "\
-get_filename_component(_SERVICE_PREFIX \"\${CMAKE_CURRENT_LIST_FILE}\" PATH)\n\
-get_filename_component(_SERVICE_PREFIX \"\${_SERVICE_PREFIX}\" PATH)\n\
-get_filename_component(_SERVICE_PREFIX \"\${_SERVICE_PREFIX}\" PATH)\n\
-get_filename_component(_SERVICE_PREFIX \"\${_SERVICE_PREFIX}\" PATH)\n\
-\n\
-if(NOT TARGET moq::service)\n\
-  add_library(moq::service $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-service,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::service PROPERTIES\n\
-    IMPORTED_LOCATION \"\${_SERVICE_PREFIX}/${_service_libdir}/${_service_lib_name}\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"\${_SERVICE_PREFIX}/${_service_incdir}\"\n\
-    INTERFACE_LINK_LIBRARIES \"${_service_iface_gen}\")\n\
-endif()\n\
-\n\
-unset(_SERVICE_PREFIX)\n")
-
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqServiceTargets-install.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-    RENAME libmoqServiceTargets.cmake)
+# Keep the existing consumer closure on the actual target for both static and
+# shared consumers. Each optional facade retains its own component export set.
+moq_export_component(moq-service service libmoqServiceTargets)
 
 target_compile_definitions(moq-service PRIVATE MOQ_BUILDING)
 
@@ -1941,7 +1895,7 @@ if(MOQ_BUILD_TESTS)
         # of that is true — an abort is not a result. A tree wanting this
         # coverage builds pico_wt/pq-threaded and passes
         # -DMOQ_PICOQUIC_SOURCE_DIR=... -DMOQ_PICOTLS_PREFIX=...
-        if(wtquic_DIR AND MOQ_PICOQUIC_SOURCE_DIR AND MOQ_PICOTLS_PREFIX
+        if(MOQ_BUILD_PACKAGE_EXPORTS AND wtquic_DIR AND MOQ_PICOQUIC_SOURCE_DIR AND MOQ_PICOTLS_PREFIX
            AND (MOQ_BUILD_PICO_WT_MANAGED OR MOQ_BUILD_PQ_THREADED))
             get_filename_component(_svc_wtqm_prefix "${wtquic_DIR}" DIRECTORY)
             get_filename_component(_svc_wtqm_prefix "${_svc_wtqm_prefix}" DIRECTORY)
@@ -1979,7 +1933,7 @@ if(MOQ_BUILD_TESTS)
                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/wtquic_msquic_install_consumer.cmake)
             set_tests_properties(service_wtquic_msquic_install_consumer PROPERTIES
                 TIMEOUT 900)
-        elseif(wtquic_DIR)
+        elseif(MOQ_BUILD_PACKAGE_EXPORTS AND wtquic_DIR)
             message(STATUS
                 "service: skipping service_wtquic_msquic_install_consumer "
                 "(needs a picoquic-based facade — pico_wt or picoquic-threaded — "
@@ -2046,7 +2000,7 @@ if(MOQ_BUILD_TESTS)
         # against a relocated prefix, plus (when the .pc is generated)
         # the pkg-config chain libmoq-service ->
         # libmoq-wtquic-network-managed -> wtquic-network.
-        if(wtquic_DIR)
+        if(MOQ_BUILD_PACKAGE_EXPORTS AND wtquic_DIR)
             get_filename_component(_svc_wtq_prefix "${wtquic_DIR}" DIRECTORY)
             get_filename_component(_svc_wtq_prefix "${_svc_wtq_prefix}" DIRECTORY)
             get_filename_component(_svc_wtq_prefix "${_svc_wtq_prefix}" DIRECTORY)

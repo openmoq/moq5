@@ -25,6 +25,7 @@ project(libmoq
 )
 
 # -- Build options --------------------------------------------------
+option(MOQ_BUILD_PACKAGE_EXPORTS "Generate and install the LibMoQ CMake package" ON)
 option(MOQ_BUILD_TESTS             "Build test suite"               ON)
 option(MOQ_BUILD_SIM               "Build moq-sim"                  ${MOQ_BUILD_TESTS})
 option(MOQ_BUILD_ADAPTER_PICOQUIC  "Build picoquic adapter"         OFF)
@@ -210,8 +211,15 @@ endif()
 # the picohttp-core / WebTransport contract based on MOQ_BUILD_ADAPTER_PICO_WT.
 if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
     list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+    set(_MOQ_PICOQUIC_SOURCE_ADDED FALSE)
     find_package(Picoquic REQUIRED)
     include(MoqPicoquicPkgConfig)
+    if(MOQ_BUILD_PACKAGE_EXPORTS AND _MOQ_PICOQUIC_SOURCE_ADDED)
+        # Cross-export closure retains the provider's own set and namespace.
+        # Cold consumers import these exact configured producer artifacts.
+        export(EXPORT picoquic-targets NAMESPACE picoquic::
+            FILE "${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoquicBuildTargets.cmake")
+    endif()
 endif()
 
 if(MOQ_BUILD_ADAPTER_PICOQUIC)
@@ -413,9 +421,26 @@ if(MOQ_BUILD_RELAY_CORE)
     endif()
 endif()
 
+# A static native export carries these actual private implementation edges.
+# Record producer kind/compiled closure, independent of consumer build options.
+set(_MOQ_MSQUIC_ATTACH_NEEDS_THREADS OFF)
+if(MOQ_BUILD_MSQUIC_MANAGED AND TARGET moq-adapter-msquic)
+    get_target_property(_moq_msquic_kind moq-adapter-msquic TYPE)
+    if(_moq_msquic_kind STREQUAL "STATIC_LIBRARY")
+        set(_MOQ_MSQUIC_ATTACH_NEEDS_THREADS ON)
+    endif()
+endif()
+set(_MOQ_WTQUIC_NETWORK_NEEDS_THREADS OFF)
+if(TARGET moq-adapter-wtquic-network-managed)
+    get_target_property(_moq_network_kind moq-adapter-wtquic-network-managed TYPE)
+    if(_moq_network_kind STREQUAL "STATIC_LIBRARY")
+        set(_MOQ_WTQUIC_NETWORK_NEEDS_THREADS ON)
+    endif()
+endif()
+
 # -- Install/export --------------------------------------------------
+function(moq_install_cmake_package)
 include(CMakePackageConfigHelpers)
-include(GNUInstallDirs)
 
 install(EXPORT libmoqTargets
     NAMESPACE moq::
@@ -446,6 +471,11 @@ if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
         cmake/MoqPicotlsProjectPolicy.cmake
         cmake/MoqPicotlsBuildPolicy.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
+endif()
+
+endfunction()
+if(MOQ_BUILD_PACKAGE_EXPORTS)
+    moq_install_cmake_package()
 endif()
 
 # Stage the reachable upstream picoquic libraries into the prefix. The
@@ -686,6 +716,7 @@ if(MOQ_BUILD_FUZZ)
 endif()
 
 # -- Build-tree export (for downstream consumption without install) -----
+function(moq_write_build_tree_package)
 export(EXPORT libmoqTargets
     NAMESPACE moq::
     FILE ${CMAKE_CURRENT_BINARY_DIR}/libmoqTargets.cmake)
@@ -698,9 +729,16 @@ string(APPEND _build_tree_config
     "  list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/cmake\")\n"
     "  if(_LIBMOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL)\n"
     "    find_dependency(OpenSSL)\n"
-    "  endif()\n"
-    "  find_dependency(Picoquic)\n"
-    "endmacro()\n")
+    "  endif()\n")
+if(_MOQ_PICOQUIC_SOURCE_ADDED)
+    string(APPEND _build_tree_config
+        "  find_dependency(Threads)\n"
+        "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqPicoquicBuildTargets.cmake\")\n")
+else()
+    # Installed/imported SDK discovery keeps its existing package contract.
+    string(APPEND _build_tree_config "  find_dependency(Picoquic)\n")
+endif()
+string(APPEND _build_tree_config "endmacro()\n")
 string(APPEND _build_tree_config
     "include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqTargets.cmake\")\n")
 if(MOQ_BUILD_ADAPTER_PICOQUIC)
@@ -813,6 +851,9 @@ if(MOQ_BUILD_ADAPTER_WTQUIC)
             "  moq_wtquic_component_preflight(adapter-wtquic-${_backend}-managed)\n"
             "  if(_libmoq_wt_api_ok)\n"
             "    find_dependency(wtquic CONFIG COMPONENTS ${_backend})\n"
+            "    if(\"${_backend}\" STREQUAL \"network\" AND ${_MOQ_WTQUIC_NETWORK_NEEDS_THREADS})\n"
+            "      find_dependency(Threads)\n"
+            "    endif()\n"
             "    if(NOT TARGET moq::adapter-wtquic)\n"
             "      include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqWtquicAdapterTargets.cmake\")\n"
             "    endif()\n"
@@ -836,6 +877,9 @@ if(MOQ_BUILD_ADAPTER_MSQUIC)
         "  endif()\n"
         "  list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/cmake\")\n"
         "  find_dependency(MsQuic)\n"
+        "  if(${_MOQ_MSQUIC_ATTACH_NEEDS_THREADS})\n"
+        "    find_dependency(Threads)\n"
+        "  endif()\n"
         "endmacro()\n"
         "if(\"adapter-msquic\" IN_LIST \${CMAKE_FIND_PACKAGE_NAME}_FIND_COMPONENTS)\n"
         "  _moq_find_msquic_buildtree()\n"
@@ -979,6 +1023,14 @@ if(MOQ_BUILD_SERVICE)
             "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqWtquic${_wt_export}ManagedTargets.cmake\")\n"
             "  endif()\n")
     endforeach()
+    if(MOQ_BUILD_MSQUIC_MANAGED)
+        string(APPEND _build_tree_config
+            "  if(NOT TARGET moq::adapter-msquic)\n"
+            "    _moq_find_msquic_buildtree()\n"
+            "    include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicAdapterTargets.cmake\")\n"
+            "  endif()\n"
+            "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqMsquicManagedTargets.cmake\")\n")
+    endif()
     string(APPEND _build_tree_config
         "  include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqServiceTargets.cmake\")\n"
         "  set(\${CMAKE_FIND_PACKAGE_NAME}_service_FOUND TRUE)\n"
@@ -1010,3 +1062,33 @@ string(APPEND _build_tree_config
     "endforeach()\n")
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/libmoqConfig.cmake
     "${_build_tree_config}")
+endfunction()
+if(MOQ_BUILD_PACKAGE_EXPORTS)
+    moq_write_build_tree_package()
+else()
+    # Stop advertising a prior ON generation when this build tree is reused.
+    # These are exact LibMoQ-owned outputs, not foreign package files.
+    file(REMOVE
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqConfigVersion.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/cmake-install/libmoqConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqServiceTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterThreadedTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtAdapterTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtManagedTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicAdapterTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicNetworkManagedTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicMsquicManagedTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqMsquicAdapterTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqMsquicManagedTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterMvfstTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterProxygenWtTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterProxygenWtManagedTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqRelayCoreTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqRelayTargets.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqRelayComponents.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/MoqWtquicApi.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoquicBuildTargets.cmake")
+endif()

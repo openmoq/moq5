@@ -40,6 +40,7 @@ set_tests_properties(cmake_windows_owned_policy cmake_picoquic_component_selecti
 # Installed package modules reach siblings through ${CMAKE_CURRENT_LIST_DIR}
 # only at a downstream configure, so check the installed set itself.
 include(GNUInstallDirs)
+if(MOQ_BUILD_PACKAGE_EXPORTS)
 add_test(NAME cmake_install_module_siblings
     COMMAND ${CMAKE_COMMAND}
         "-DMOQ_BUILD=${PROJECT_BINARY_DIR}"
@@ -48,8 +49,69 @@ add_test(NAME cmake_install_module_siblings
         "-DMOQ_CONFIG=$<CONFIG>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckInstalledModuleSiblings.cmake")
 set_tests_properties(cmake_install_module_siblings PROPERTIES TIMEOUT 300)
+endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ConsumerBuildContext.cmake")
+
+# Permanent POSIX import regression: real service/PicoQUIC/PicoWT graphs plus
+# explicitly limited native registration mechanics for other optional modules.
+if(NOT WIN32)
+    set(_manual_export_context "${CMAKE_CURRENT_BINARY_DIR}/manual-export-context.cmake")
+    moq_write_consumer_context("${_manual_export_context}")
+    set(_manual_export_modes service helper embedding)
+    if(MOQ_BUILD_PQ_THREADED AND MOQ_PICOQUIC_SOURCE_DIR)
+        list(APPEND _manual_export_modes picoquic)
+        if(MOQ_BUILD_PICO_WT_MANAGED)
+            list(APPEND _manual_export_modes pico-wt)
+        endif()
+    endif()
+    # Cold component-only rows need an actual installed SDK. Pin MsQuic's
+    # artifact/header identity so ambient package discovery cannot supply Threads.
+    set(_cold_msquic_include "")
+    if(TARGET moq::adapter-msquic)
+        get_target_property(_cold_msquic_dirs msquic::msquic INTERFACE_INCLUDE_DIRECTORIES)
+        foreach(_dir IN LISTS _cold_msquic_dirs)
+            if(EXISTS "${_dir}/msquic.h")
+                set(_cold_msquic_include "${_dir}")
+                break()
+            endif()
+        endforeach()
+        if(_cold_msquic_include)
+            list(APPEND _manual_export_modes msquic-attach)
+        endif()
+    endif()
+    if(APPLE AND TARGET moq::adapter-wtquic-network-managed AND wtquic_DIR)
+        list(APPEND _manual_export_modes wtquic-network)
+    endif()
+    foreach(_mode IN LISTS _manual_export_modes)
+        foreach(_shared OFF ON)
+            set(_name "cmake_manual_exports_${_mode}_${_shared}")
+            set(_manual_provider_args "")
+            if(_mode MATCHES "^pico")
+                foreach(_var MOQ_PICOQUIC_SOURCE_DIR MOQ_PICOTLS_PREFIX MOQ_PTLS_LIB_DIR OPENSSL_ROOT_DIR)
+                    if(DEFINED ${_var} AND NOT "${${_var}}" STREQUAL "")
+                        list(APPEND _manual_provider_args "-D${_var}=${${_var}}")
+                    endif()
+                endforeach()
+            endif()
+            if(_mode STREQUAL "msquic-attach")
+                list(APPEND _manual_provider_args
+                    "-DMOQ_MSQUIC_PIN_INCLUDE_DIR=${_cold_msquic_include}"
+                    "-DMOQ_MSQUIC_PIN_LIBRARY=$<TARGET_FILE:msquic::msquic>")
+            elseif(_mode STREQUAL "wtquic-network")
+                list(APPEND _manual_provider_args "-Dwtquic_DIR=${wtquic_DIR}")
+            endif()
+            add_test(NAME "${_name}" COMMAND "${CMAKE_COMMAND}"
+                "-DMOQ_SOURCE=${PROJECT_SOURCE_DIR}"
+                "-DMOQ_WORK=${CMAKE_CURRENT_BINARY_DIR}/${_name}"
+                "-DMOQ_CONTEXT=${_manual_export_context}"
+                "-DMOQ_MODE=${_mode}" "-DMOQ_SHARED=${_shared}"
+                ${_manual_provider_args}
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ManualComponentExportsTest.cmake")
+            set_tests_properties("${_name}" PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+        endforeach()
+    endforeach()
+endif()
 
 # The OpenSSL selection test-owned children receive. Placeholder library files
 # are named for static archives on Unix-like hosts.
@@ -133,7 +195,8 @@ set_tests_properties(cmake_sim_off_configure PROPERTIES TIMEOUT 300)
 
 # Source-mode downstream of an installed prefix: the installed FindPicoquic
 # adds picoquic from MOQ_PICOQUIC_SOURCE_DIR and hooks its project().
-if(MOQ_PICOQUIC_SOURCE_DIR AND (MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT))
+if(MOQ_BUILD_PACKAGE_EXPORTS AND MOQ_PICOQUIC_SOURCE_DIR AND
+   (MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT))
     if(MOQ_BUILD_ADAPTER_PICOQUIC)
         set(_pq_source_component adapter-picoquic)
     else()

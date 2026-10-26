@@ -514,6 +514,7 @@ if(Python3_Interpreter_FOUND AND UNIX AND MOQR_SDK_CXX)
     include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
     set(_sdk_consumer_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
     moq_write_consumer_context("${_sdk_consumer_context}")
+    if(MOQ_BUILD_PACKAGE_EXPORTS)
     add_test(NAME relay_sdk_package COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/check_sdk_package.py
         --build ${PROJECT_BINARY_DIR} --source ${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -526,6 +527,7 @@ if(Python3_Interpreter_FOUND AND UNIX AND MOQR_SDK_CXX)
         --sim $<TARGET_EXISTS:moq-sim>
         --msquic-dir "${msquic_DIR}")
     set_tests_properties(relay_sdk_package PROPERTIES TIMEOUT 180 LABELS "relay;boundary")
+    endif()
 endif()
 
 # Inspect private counter exhaustion without exporting a production test seam.

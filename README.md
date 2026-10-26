@@ -207,6 +207,26 @@ facade the service still builds, but that transport returns
 > package does not ship the private header and will fail configuration with a
 > clear message.
 
+### CMake component imports
+
+`MOQ_BUILD_PACKAGE_EXPORTS` defaults to ON. An embedding project may explicitly
+set `-DMOQ_BUILD_PACKAGE_EXPORTS=OFF` to use source dependencies without native
+exports. In-tree targets and ordinary artifact/header installation remain usable;
+LibMoQ CMake package config/version/target modules are omitted. Existing pkg-config
+availability follows its existing dependency rules. With exports ON, injected
+source providers own their unique native exports and ordinary consumer setup.
+
+Native CMake exports of the actual service and adapter targets retain the
+configured producer artifacts for each configuration. For a Ninja Multi-Config producer, downstream
+Debug and Release builds use the matching records; the producer must build each
+artifact before it can be linked. Repeated `find_package` calls are supported.
+Normal CMake consumer mappings and single-config defaults still apply.
+
+Installed prefixes describe the one selected producer configuration. Install
+Debug and Release into separate prefixes; a combined multi-config SDK is not the
+contract. See [CMake component exports](docs/cmake-component-exports.md) for the
+ownership, provider and qualification boundaries.
+
 ### Windows (MSVC)
 
 The core, service tier and picoquic raw-QUIC adapter (including the threaded
@@ -221,10 +241,11 @@ export PKG_CONFIG=$OPENSSL_ROOT_DIR/tools/pkgconf/pkgconf.exe
 
 Then run `scripts/setup_picoquic_deps.sh` from Git Bash and configure as on
 the other platforms, from a "x64 Native Tools" / Developer shell with
-`-G Ninja` (the hand-written build-tree target exports do not support
-multi-config generators such as Visual Studio's yet). Consumers of the
-installed package can use any generator; they only need `OPENSSL_ROOT_DIR`
-in addition to the usual `MOQ_PICOQUIC_SOURCE_DIR` / `MOQ_PICOTLS_PREFIX`.
+`-G Ninja`. The configuration ownership repair for CMake component imports
+does not certify native Visual Studio, MSVC DLL loading or import libraries;
+those still need native Windows qualification. Consumers of the
+selected-config installed package can use any generator; they only need
+`OPENSSL_ROOT_DIR` in addition to the usual `MOQ_PICOQUIC_SOURCE_DIR` / `MOQ_PICOTLS_PREFIX`.
 
 The raw picoquic managed facade supports clients and single-lane servers on
 Windows (`lane_count` 0 or 1). Windows server lane groups are unsupported:

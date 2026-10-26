@@ -1,3 +1,5 @@
+include("${PROJECT_SOURCE_DIR}/cmake/MoqComponentExports.cmake")
+
 # MoQ over wtquic (WebTransport over HTTP/3). The attach adapter is
 # BACKEND-NEUTRAL: its production dependency is the wtquic core
 # (wtq::wtquic), not any one transport backend. MsQuic is just one wtquic
@@ -10,6 +12,7 @@ add_library(moq::adapter-wtquic ALIAS moq-adapter-wtquic)
 
 target_include_directories(moq-adapter-wtquic PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 # BACKEND-NEUTRAL: the adapter header names only core wtquic types
 # (wtq_session_t, wtq_session_events_t), never a transport backend —
@@ -29,47 +32,16 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
 endif()
 
-# Build-tree imported target so `find_package(libmoq COMPONENTS
-# adapter-wtquic)` works against ${PROJECT_BINARY_DIR}, mirroring the
-# pico WT adapter. The install-tree counterpart is generated below.
-file(GENERATE
-    OUTPUT "${PROJECT_BINARY_DIR}/libmoqWtquicAdapterTargets.cmake"
-    CONTENT "\
-if(NOT TARGET moq::adapter-wtquic)\n\
-  add_library(moq::adapter-wtquic $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-wtquic,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-wtquic PROPERTIES\n\
-    IMPORTED_LOCATION \"$<TARGET_FILE:moq-adapter-wtquic>\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include\"\n\
-    INTERFACE_LINK_LIBRARIES \"moq::core;wtq::wtquic\")\n\
-endif()\n")
+# Native build/install exports retain the optional component boundary.
+moq_export_component(moq-adapter-wtquic adapter-wtquic libmoqWtquicAdapterTargets)
 
 # -- Install / export --------------------------------------------------
 include(GNUInstallDirs)
 
-install(TARGETS moq-adapter-wtquic
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
 install(DIRECTORY include/moq
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.h")
-
-# Relocatable install-tree imported target file (the wtquic dependency
-# is re-found by the adapter-wtquic component block in libmoqConfig).
-set(_wtquic_lib_name "$<TARGET_FILE_NAME:moq-adapter-wtquic>")
-set(_wtquic_lib_type "$<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-wtquic,TYPE>,STATIC_LIBRARY>,STATIC,SHARED>")
-set(_wtquic_libdir "${CMAKE_INSTALL_LIBDIR}")
-set(_wtquic_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoqWtquicAdapterTargets.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicAdapterTargets-install.cmake.in
-    @ONLY)
-file(GENERATE
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicAdapterTargets-install.cmake
-    INPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicAdapterTargets-install.cmake.in)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicAdapterTargets-install.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-    RENAME libmoqWtquicAdapterTargets.cmake)
 
 # -- pkg-config ---------------------------------------------------------
 # Unlike the picoquic-family adapters, the transport dependency is
@@ -115,6 +87,7 @@ if(MOQ_BUILD_WTQUIC_NETWORK_MANAGED)
         moq-adapter-wtquic-network-managed)
     target_include_directories(moq-adapter-wtquic-network-managed PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     )
     target_include_directories(moq-adapter-wtquic-network-managed PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -135,36 +108,9 @@ if(MOQ_BUILD_WTQUIC_NETWORK_MANAGED)
             $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
 
-    file(GENERATE
-        OUTPUT "${PROJECT_BINARY_DIR}/libmoqWtquicNetworkManagedTargets.cmake"
-        CONTENT "\
-if(NOT TARGET moq::adapter-wtquic-network-managed)\n\
-  add_library(moq::adapter-wtquic-network-managed $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-wtquic-network-managed,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-wtquic-network-managed PROPERTIES\n\
-    IMPORTED_LOCATION \"$<TARGET_FILE:moq-adapter-wtquic-network-managed>\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include\"\n\
-    INTERFACE_LINK_LIBRARIES \"moq::adapter-wtquic;wtq::network\")\n\
-endif()\n")
+    moq_export_component(moq-adapter-wtquic-network-managed
+        adapter-wtquic-network-managed libmoqWtquicNetworkManagedTargets)
 
-    install(TARGETS moq-adapter-wtquic-network-managed
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-    set(_network_managed_lib_name
-        "$<TARGET_FILE_NAME:moq-adapter-wtquic-network-managed>")
-    set(_network_managed_lib_type "$<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-wtquic-network-managed,TYPE>,STATIC_LIBRARY>,STATIC,SHARED>")
-    set(_network_managed_libdir "${CMAKE_INSTALL_LIBDIR}")
-    set(_network_managed_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
-    configure_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoqWtquicNetworkManagedTargets.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicNetworkManagedTargets-install.cmake.in
-        @ONLY)
-    file(GENERATE
-        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicNetworkManagedTargets-install.cmake
-        INPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicNetworkManagedTargets-install.cmake.in)
-    install(FILES
-        ${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicNetworkManagedTargets-install.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-        RENAME libmoqWtquicNetworkManagedTargets.cmake)
     configure_file(
         ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoq-wtquic-network-managed.pc.in
         ${CMAKE_CURRENT_BINARY_DIR}/libmoq-wtquic-network-managed.pc @ONLY)
@@ -191,6 +137,7 @@ if(MOQ_BUILD_WTQUIC_MSQUIC_MANAGED)
         moq-adapter-wtquic-msquic-managed)
     target_include_directories(moq-adapter-wtquic-msquic-managed PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     )
     target_include_directories(moq-adapter-wtquic-msquic-managed PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/..
@@ -211,36 +158,9 @@ if(MOQ_BUILD_WTQUIC_MSQUIC_MANAGED)
             $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
 
-    file(GENERATE
-        OUTPUT "${PROJECT_BINARY_DIR}/libmoqWtquicMsquicManagedTargets.cmake"
-        CONTENT "\
-if(NOT TARGET moq::adapter-wtquic-msquic-managed)\n\
-  add_library(moq::adapter-wtquic-msquic-managed $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-wtquic-msquic-managed,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-wtquic-msquic-managed PROPERTIES\n\
-    IMPORTED_LOCATION \"$<TARGET_FILE:moq-adapter-wtquic-msquic-managed>\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include\"\n\
-    INTERFACE_LINK_LIBRARIES \"moq::adapter-wtquic;wtq::msquic\")\n\
-endif()\n")
+    moq_export_component(moq-adapter-wtquic-msquic-managed
+        adapter-wtquic-msquic-managed libmoqWtquicMsquicManagedTargets)
 
-    install(TARGETS moq-adapter-wtquic-msquic-managed
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-    set(_msquic_managed_lib_name
-        "$<TARGET_FILE_NAME:moq-adapter-wtquic-msquic-managed>")
-    set(_msquic_managed_lib_type "$<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-wtquic-msquic-managed,TYPE>,STATIC_LIBRARY>,STATIC,SHARED>")
-    set(_msquic_managed_libdir "${CMAKE_INSTALL_LIBDIR}")
-    set(_msquic_managed_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
-    configure_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoqWtquicMsquicManagedTargets.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicMsquicManagedTargets-install.cmake.in
-        @ONLY)
-    file(GENERATE
-        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicMsquicManagedTargets-install.cmake
-        INPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicMsquicManagedTargets-install.cmake.in)
-    install(FILES
-        ${CMAKE_CURRENT_BINARY_DIR}/libmoqWtquicMsquicManagedTargets-install.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-        RENAME libmoqWtquicMsquicManagedTargets.cmake)
     # MsQuic's library dir is carried by wtquic-msquic.pc (Requires:), so this
     # package's .pc needs no MsQuic path of its own.
     configure_file(
@@ -390,7 +310,6 @@ if(MOQ_BUILD_TESTS)
                 $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
         add_test(NAME wtquic_msquic_managed COMMAND test_wtquic_msquic_managed)
-
 
         # The native fixture is EXPLICITLY REQUESTED and never built by an
         # ordinary configure. It needs a wtquic providing the trusted client
@@ -570,6 +489,7 @@ int main(void) { return p == 0; }
     include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
     set(_moq_consumer_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
     moq_write_consumer_context("${_moq_consumer_context}")
+    if(MOQ_BUILD_PACKAGE_EXPORTS)
     add_test(NAME wtquic_install_consumer
         COMMAND ${CMAKE_COMMAND}
             -DBUILD=${PROJECT_BINARY_DIR}
@@ -587,6 +507,7 @@ int main(void) { return p == 0; }
             "-DLINK_FLAGS=${CMAKE_EXE_LINKER_FLAGS}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer_install.cmake)
     set_tests_properties(wtquic_install_consumer PROPERTIES TIMEOUT 300)
+    endif()
     # The loader-image helper decides what the consumer lane proved, so its
     # own decisions are pinned against captured fixture text for both
     # supported platforms. No process is started.
@@ -597,6 +518,7 @@ int main(void) { return p == 0; }
 
     # Build-tree consumer: the same consumer project resolved against
     # ${PROJECT_BINARY_DIR} (no install step).
+    if(MOQ_BUILD_PACKAGE_EXPORTS)
     add_test(NAME wtquic_adapter_consumer
         COMMAND ${CMAKE_COMMAND}
             -DBUILD=${PROJECT_BINARY_DIR}
@@ -607,6 +529,7 @@ int main(void) { return p == 0; }
             "-DLINK_FLAGS=${CMAKE_EXE_LINKER_FLAGS}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer_buildtree.cmake)
     set_tests_properties(wtquic_adapter_consumer PROPERTIES TIMEOUT 180)
+    endif()
 
     # Opaque-key allocator unit test: includes the adapter TU directly to
     # reach the static allocator. No network/certs — pure logic.

@@ -1,3 +1,5 @@
+include("${PROJECT_SOURCE_DIR}/cmake/MoqComponentExports.cmake")
+
 # MoQ over raw QUIC on MsQuic.
 #
 # When the managed facade is enabled it shares this library rather than
@@ -19,6 +21,7 @@ endif()
 
 target_include_directories(moq-adapter-msquic PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 # msquic::msquic is PUBLIC: the adapter header includes <msquic.h>.
 target_link_libraries(moq-adapter-msquic
@@ -61,38 +64,13 @@ if(MOQ_BUILD_MSQUIC_MANAGED)
         moq::adapter-msquic Threads::Threads)
 endif()
 
-# -- Build-tree imported targets so `find_package(libmoq COMPONENTS
-# adapter-msquic[-managed])` works against ${PROJECT_BINARY_DIR},
-# mirroring the wtquic adapter. Install-tree counterparts below.
-file(GENERATE
-    OUTPUT "${PROJECT_BINARY_DIR}/libmoqMsquicAdapterTargets.cmake"
-    CONTENT "\
-if(NOT TARGET moq::adapter-msquic)\n\
-  add_library(moq::adapter-msquic $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-msquic,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-msquic PROPERTIES\n\
-    IMPORTED_LOCATION \"$<TARGET_FILE:moq-adapter-msquic>\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include\"\n\
-    INTERFACE_LINK_LIBRARIES \"moq::core;msquic::msquic\")\n\
-endif()\n")
+# -- Component install/export ------------------------------------------
+moq_export_component(moq-adapter-msquic adapter-msquic libmoqMsquicAdapterTargets)
 if(MOQ_BUILD_MSQUIC_MANAGED)
-    # INTERFACE imported target: the managed implementation ships inside the
-    # attach library, so there is no managed artifact to point at.
-    file(GENERATE
-        OUTPUT "${PROJECT_BINARY_DIR}/libmoqMsquicManagedTargets.cmake"
-        CONTENT "\
-if(NOT TARGET moq::adapter-msquic-managed)\n\
-  add_library(moq::adapter-msquic-managed INTERFACE IMPORTED)\n\
-  set_target_properties(moq::adapter-msquic-managed PROPERTIES\n\
-    INTERFACE_LINK_LIBRARIES \"moq::adapter-msquic;Threads::Threads\")\n\
-endif()\n")
+    moq_export_component(moq-adapter-msquic-managed
+        adapter-msquic-managed libmoqMsquicManagedTargets)
 endif()
 
-# -- Install / export --------------------------------------------------
-include(GNUInstallDirs)
-
-install(TARGETS moq-adapter-msquic
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES include/moq/msquic.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moq)
 if(MOQ_BUILD_MSQUIC_MANAGED)
@@ -105,43 +83,12 @@ endif()
 
 # The installed component re-finds MsQuic through the same vendored
 # module the build used.
-install(FILES ${PROJECT_SOURCE_DIR}/cmake/FindMsQuic.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
-
-# Relocatable install-tree imported target files (MsQuic is re-found by
-# the component blocks in libmoqConfig).
-set(_msquic_lib_name "$<TARGET_FILE_NAME:moq-adapter-msquic>")
-set(_msquic_lib_type "$<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-msquic,TYPE>,STATIC_LIBRARY>,STATIC,SHARED>")
-set(_msquic_libdir "${CMAKE_INSTALL_LIBDIR}")
-set(_msquic_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoqMsquicAdapterTargets.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/libmoqMsquicAdapterTargets-install.cmake.in
-    @ONLY)
-file(GENERATE
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqMsquicAdapterTargets-install.cmake
-    INPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqMsquicAdapterTargets-install.cmake.in)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqMsquicAdapterTargets-install.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-    RENAME libmoqMsquicAdapterTargets.cmake)
-if(MOQ_BUILD_MSQUIC_MANAGED)
-    # Relocatable managed component file: an INTERFACE imported target over
-    # the installed attach library (no artifact of its own, so nothing to
-    # locate). The template is placeholder-free; configure_file just stages
-    # it into the install cmake dir.
-    configure_file(
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoqMsquicManagedTargets.cmake.in
-        ${CMAKE_CURRENT_BINARY_DIR}/libmoqMsquicManagedTargets-install.cmake
-        COPYONLY)
-    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqMsquicManagedTargets-install.cmake
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-        RENAME libmoqMsquicManagedTargets.cmake)
+if(MOQ_BUILD_PACKAGE_EXPORTS)
+    install(FILES ${PROJECT_SOURCE_DIR}/cmake/FindMsQuic.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 endif()
 
-# No pkg-config file: MsQuic ships no .pc to chain a Requires: onto, so
-# a .pc here would have to bake link paths. CMake package consumption
-# is the supported path (see README).
-
+# No pkg-config file: MsQuic has no .pc to chain a Requires: onto.
 if(MOQ_BUILD_TESTS)
     # Public-header compile/link smokes: <moq/msquic.h> stands alone,
     # in C and C++, against the build-tree target.
@@ -316,6 +263,7 @@ if(MOQ_BUILD_TESTS)
         include(${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake)
         set(_msquic_consumer_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
         moq_write_consumer_context("${_msquic_consumer_context}")
+        if(MOQ_BUILD_PACKAGE_EXPORTS)
         add_test(NAME msquic_adapter_consumer
             COMMAND ${CMAKE_COMMAND}
                 -DBUILD=${PROJECT_BINARY_DIR}
@@ -327,7 +275,9 @@ if(MOQ_BUILD_TESTS)
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer_buildtree.cmake)
         set_tests_properties(msquic_adapter_consumer PROPERTIES
             TIMEOUT 180)
+        endif()
 
+        if(MOQ_BUILD_PACKAGE_EXPORTS)
         add_test(NAME msquic_install_consumer
             COMMAND ${CMAKE_COMMAND}
                 "-DCONSUMER_CONTEXT=${_msquic_consumer_context}"
@@ -343,6 +293,7 @@ if(MOQ_BUILD_TESTS)
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer_install.cmake)
         set_tests_properties(msquic_install_consumer PROPERTIES
             TIMEOUT 300)
+        endif()
 
         # Shared-library link regression: a BUILD_SHARED_LIBS=ON tree must
         # build and link the managed component (the facade and its hidden
@@ -363,7 +314,9 @@ if(MOQ_BUILD_TESTS)
             TIMEOUT 600)
         include(${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake)
         foreach(_consumer msquic_adapter_consumer msquic_install_consumer msquic_managed_shared_link)
-            moq_test_reject_consumer_warnings(${_consumer})
+            if(TEST ${_consumer})
+                moq_test_reject_consumer_warnings(${_consumer})
+            endif()
         endforeach()
     endif()
 

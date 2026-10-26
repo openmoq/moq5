@@ -1,3 +1,5 @@
+include("${PROJECT_SOURCE_DIR}/cmake/MoqComponentExports.cmake")
+
 # moq-adapter-mvfst: mvfst QUIC transport adapter for libmoq.
 #
 # Optional. Requires MOQ_BUILD_ADAPTER_MVFST=ON and an installed
@@ -63,20 +65,10 @@ target_include_directories(moq-adapter-mvfst
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
+# Preserve the package's existing mvfst usage and link-only fmt closure on the
+# real target. No packaging-only stand-in becomes a public exported target.
 target_link_libraries(moq-adapter-mvfst
-    PUBLIC  moq::core
-    PRIVATE mvfst::mvfst
-)
-
-# Packaging-only interface for the hand-written imported target files. fmt is
-# a static-link requirement of the mvfst/Folly objects, not a LibMoQ public
-# header requirement, so keep our direct edge link-only. Upstream mvfst/Folly
-# targets may still propagate their own compile usage.
-add_library(moq-adapter-mvfst-export-interface INTERFACE)
-target_link_libraries(moq-adapter-mvfst-export-interface INTERFACE
-    moq::core
-    mvfst::mvfst
-    "$<LINK_ONLY:fmt::fmt>")
+    PUBLIC moq::core mvfst::mvfst "$<LINK_ONLY:fmt::fmt>")
 
 target_compile_features(moq-adapter-mvfst PUBLIC cxx_std_17)
 
@@ -95,67 +87,20 @@ endif()
 
 # -- Install (separate from core libmoqTargets) ---------------------
 
-install(TARGETS moq-adapter-mvfst
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-
 install(DIRECTORY include/moq
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
 
 # Install vendored FindSodium.cmake beside the package config files
 # so install-tree consumers can find it.
-install(FILES cmake/FindSodium.cmake
-              cmake/MoqMvfstBoostIcu.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
+if(MOQ_BUILD_PACKAGE_EXPORTS)
+    install(FILES cmake/FindSodium.cmake
+                  cmake/MoqMvfstBoostIcu.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
+endif()
 
-# -- Adapter target files -------------------------------------------
-# Separate from core libmoqTargets to keep the optional boundary.
-# Build-tree targets (absolute paths — valid on this machine).
-set(_mvfst_adapter_link
-    "$<TARGET_PROPERTY:moq-adapter-mvfst-export-interface,INTERFACE_LINK_LIBRARIES>")
-set(_mvfst_adapter_link_dirs
-    "$<TARGET_PROPERTY:moq-adapter-mvfst-export-interface,INTERFACE_LINK_DIRECTORIES>")
-file(GENERATE
-    OUTPUT "${PROJECT_BINARY_DIR}/libmoqAdapterMvfstTargets.cmake"
-    CONTENT "\
-if(NOT TARGET moq::adapter-mvfst)\n\
-  add_library(moq::adapter-mvfst $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-mvfst,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-mvfst PROPERTIES\n\
-    IMPORTED_LOCATION \"$<TARGET_FILE:moq-adapter-mvfst>\"\n\
-    IMPORTED_LINK_INTERFACE_LANGUAGES \"CXX\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include\"\n\
-    INTERFACE_LINK_DIRECTORIES \"${_mvfst_adapter_link_dirs}\"\n\
-    INTERFACE_LINK_LIBRARIES \"${_mvfst_adapter_link}\")\n\
-endif()\n")
-
-# Install-tree targets (relocatable via prefix detection).
-set(_mvfst_adapter_lib_name "$<TARGET_FILE_NAME:moq-adapter-mvfst>")
-set(_mvfst_adapter_libdir "${CMAKE_INSTALL_LIBDIR}")
-set(_mvfst_adapter_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
-file(GENERATE
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterMvfstTargets-install.cmake
-    CONTENT "\
-get_filename_component(_MVFST_PREFIX \"\${CMAKE_CURRENT_LIST_FILE}\" PATH)\n\
-get_filename_component(_MVFST_PREFIX \"\${_MVFST_PREFIX}\" PATH)\n\
-get_filename_component(_MVFST_PREFIX \"\${_MVFST_PREFIX}\" PATH)\n\
-get_filename_component(_MVFST_PREFIX \"\${_MVFST_PREFIX}\" PATH)\n\
-\n\
-if(NOT TARGET moq::adapter-mvfst)\n\
-  add_library(moq::adapter-mvfst $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-mvfst,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-mvfst PROPERTIES\n\
-    IMPORTED_LOCATION \"\${_MVFST_PREFIX}/${_mvfst_adapter_libdir}/${_mvfst_adapter_lib_name}\"\n\
-    IMPORTED_LINK_INTERFACE_LANGUAGES \"CXX\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"\${_MVFST_PREFIX}/${_mvfst_adapter_incdir}\"\n\
-    INTERFACE_LINK_DIRECTORIES \"${_mvfst_adapter_link_dirs}\"\n\
-    INTERFACE_LINK_LIBRARIES \"${_mvfst_adapter_link}\")\n\
-endif()\n\
-\n\
-unset(_MVFST_PREFIX)\n")
-
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterMvfstTargets-install.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-    RENAME libmoqAdapterMvfstTargets.cmake)
+# Optional component, separate from the core export set.
+moq_export_component(moq-adapter-mvfst adapter-mvfst libmoqAdapterMvfstTargets)
 
 # -- Smoke tests ----------------------------------------------------
 
@@ -408,6 +353,7 @@ if(MOQ_BUILD_TESTS)
         COMMAND test_mvfst_managed_app_deadline_timer)
     set_tests_properties(mvfst_managed_app_deadline_timer PROPERTIES TIMEOUT 40)
 
+    if(MOQ_BUILD_PACKAGE_EXPORTS)
     # -- Build-tree consumer tests ------------------------------------
     include(tests/consumer_context.cmake)
     set(MOQ_ADAPTER_CONSUMER_TEST_ROOT "" CACHE PATH "Private adapter consumer test artifacts")
@@ -492,4 +438,5 @@ if(MOQ_BUILD_TESTS)
         COMMAND ${CMAKE_COMMAND} -P
             "${CMAKE_CURRENT_BINARY_DIR}/run_install_consumer_test.cmake")
     set_tests_properties(mvfst_install_consumer_build PROPERTIES TIMEOUT 120)
+    endif()
 endif()

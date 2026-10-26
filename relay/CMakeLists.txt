@@ -30,8 +30,10 @@ function(moqr_component target export_name export_set)
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-    install(EXPORT ${export_set} NAMESPACE moq::
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
+    if(MOQ_BUILD_PACKAGE_EXPORTS)
+        install(EXPORT ${export_set} NAMESPACE moq::
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
+    endif()
 endfunction()
 moqr_component(moq-relay-core relay-core libmoqRelayCoreTargets)
 if(NOT BUILD_SHARED_LIBS)

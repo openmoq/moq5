@@ -238,6 +238,7 @@ if(MOQ_BUILD_TESTS)
     include(${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake)
     set(_consumer_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
     moq_write_consumer_context("${_consumer_context}")
+    if(MOQ_BUILD_PACKAGE_EXPORTS)
     add_test(NAME cpp_consumer
         COMMAND ${CMAKE_COMMAND}
             "-DSRC=${_consumer_src}" "-DWORK=${_consumer_bld}"
@@ -247,6 +248,7 @@ if(MOQ_BUILD_TESTS)
             "-DPICOTLS_PREFIX=${MOQ_PICOTLS_PREFIX}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer_test.cmake")
     moq_test_reject_consumer_warnings(cpp_consumer)
+    endif()
 
     # The C++ player against an INSTALLED SDK (this tree's library type and
     # the CTest configuration): picoquic and libmoq are installed to a
@@ -254,6 +256,7 @@ if(MOQ_BUILD_TESTS)
     # there only. Both children take this tree's full build context (the
     # same preload cpp_consumer uses) and its OpenSSL selection.
     if(TARGET moq::service AND TARGET moq::playback AND MOQ_PICOQUIC_SOURCE_DIR)
+        if(MOQ_BUILD_PACKAGE_EXPORTS)
         include(${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerProviderContext.cmake)
         set(_cpp_player_openssl_context
             "${CMAKE_CURRENT_BINARY_DIR}/player-consumer-openssl-context.cmake")
@@ -315,6 +318,7 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(cpp_player_install_consumer
             PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
         moq_test_reject_consumer_warnings(cpp_player_install_consumer)
+        endif()
 
         # The runner's path and configuration rules, without a build.
         add_test(NAME cpp_player_install_consumer_rules

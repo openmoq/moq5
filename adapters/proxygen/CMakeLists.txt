@@ -1,3 +1,5 @@
+include("${PROJECT_SOURCE_DIR}/cmake/MoqComponentExports.cmake")
+
 # moq-adapter-proxygen-wt: proxygen WebTransport adapter for libmoq.
 #
 # Optional. Requires MOQ_BUILD_ADAPTER_PROXYGEN=ON and installed proxygen.
@@ -53,7 +55,7 @@ if(c-ares_FOUND)
     get_target_property(_cares_loc c-ares::cares LOCATION)
     if(_cares_loc)
         get_filename_component(_cares_dir "${_cares_loc}" DIRECTORY)
-        target_link_directories(moq-adapter-proxygen-wt PRIVATE "${_cares_dir}")
+        target_link_directories(moq-adapter-proxygen-wt PUBLIC "${_cares_dir}")
     endif()
 endif()
 
@@ -63,13 +65,6 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
 endif()
 
 # -- Install (separate from core libmoqTargets) ---------------------
-# Mirrors the mvfst adapter: plain install(TARGETS) + a hand-generated
-# imported-target file (build-tree + relocatable install-tree), because
-# the proxygen link interface can't pass core export-set validation.
-
-install(TARGETS moq-adapter-proxygen-wt
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
 # Install ONLY the single public header explicitly — preserves the
 # "only this surface is public" rule. Internal headers (e.g.
@@ -82,62 +77,13 @@ install(FILES include/moq/proxygen_wt.hpp
 # so install-tree find_dependency(proxygen CONFIG) can resolve it. Shared
 # dest with the mvfst adapter; identical file, so the install is idempotent
 # when both adapters are enabled.
-install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../mvfst/cmake/FindSodium.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
-
-# proxygen/wangle export a bare "-lcares" with no library path. The
-# adapter library works around it with target_link_directories; consumers
-# of the imported target need the same path, so propagate it via
-# INTERFACE_LINK_DIRECTORIES (absolute — a system dependency, same
-# non-relocatable caveat as picotls/OpenSSL elsewhere). Empty if c-ares
-# was found as a proper imported target with its own location.
-set(_pxg_linkdir_line "")
-if(_cares_dir)
-    set(_pxg_linkdir_line "    INTERFACE_LINK_DIRECTORIES \"${_cares_dir}\"\n")
+if(MOQ_BUILD_PACKAGE_EXPORTS)
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../mvfst/cmake/FindSodium.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 endif()
 
-# Build-tree imported target (absolute paths — valid on this machine).
-set(_pxg_adapter_link "moq::core;proxygen::proxygen")
-file(GENERATE
-    OUTPUT "${PROJECT_BINARY_DIR}/libmoqAdapterProxygenWtTargets.cmake"
-    CONTENT "\
-if(NOT TARGET moq::adapter-proxygen-wt)\n\
-  add_library(moq::adapter-proxygen-wt $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-proxygen-wt,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-proxygen-wt PROPERTIES\n\
-    IMPORTED_LOCATION \"$<TARGET_FILE:moq-adapter-proxygen-wt>\"\n\
-    IMPORTED_LINK_INTERFACE_LANGUAGES \"CXX\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include\"\n\
-${_pxg_linkdir_line}\
-    INTERFACE_LINK_LIBRARIES \"${_pxg_adapter_link}\")\n\
-endif()\n")
-
-# Install-tree imported target (relocatable via prefix detection).
-set(_pxg_adapter_lib_name "$<TARGET_FILE_NAME:moq-adapter-proxygen-wt>")
-set(_pxg_adapter_libdir "${CMAKE_INSTALL_LIBDIR}")
-set(_pxg_adapter_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
-file(GENERATE
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterProxygenWtTargets-install.cmake
-    CONTENT "\
-get_filename_component(_PXG_PREFIX \"\${CMAKE_CURRENT_LIST_FILE}\" PATH)\n\
-get_filename_component(_PXG_PREFIX \"\${_PXG_PREFIX}\" PATH)\n\
-get_filename_component(_PXG_PREFIX \"\${_PXG_PREFIX}\" PATH)\n\
-get_filename_component(_PXG_PREFIX \"\${_PXG_PREFIX}\" PATH)\n\
-\n\
-if(NOT TARGET moq::adapter-proxygen-wt)\n\
-  add_library(moq::adapter-proxygen-wt $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-proxygen-wt,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-proxygen-wt PROPERTIES\n\
-    IMPORTED_LOCATION \"\${_PXG_PREFIX}/${_pxg_adapter_libdir}/${_pxg_adapter_lib_name}\"\n\
-    IMPORTED_LINK_INTERFACE_LANGUAGES \"CXX\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"\${_PXG_PREFIX}/${_pxg_adapter_incdir}\"\n\
-${_pxg_linkdir_line}\
-    INTERFACE_LINK_LIBRARIES \"moq::core$<SEMICOLON>proxygen::proxygen\")\n\
-endif()\n\
-\n\
-unset(_PXG_PREFIX)\n")
-
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterProxygenWtTargets-install.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-    RENAME libmoqAdapterProxygenWtTargets.cmake)
+# The actual target carries the package's c-ares search directory as usage.
+moq_export_component(moq-adapter-proxygen-wt adapter-proxygen-wt libmoqAdapterProxygenWtTargets)
 
 # -- Managed client facade (owns connect + thread + session) ---------
 # Separate target: the managed facade uses C++20 coroutines (proxygen
@@ -170,7 +116,7 @@ if(_cares_dir)
     # PUBLIC so in-tree consumers (the service tier and its test executables)
     # inherit the c-ares search path: proxygen/wangle emit a bare -lcares with
     # no -L. External consumers get it via INTERFACE_LINK_DIRECTORIES in the
-    # generated imported-target file (_pxg_linkdir_line).
+    # generated imported-target file.
     target_link_directories(moq-adapter-proxygen-wt-managed PUBLIC "${_cares_dir}")
 endif()
 
@@ -179,51 +125,13 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
 endif()
 
-install(TARGETS moq-adapter-proxygen-wt-managed
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
 install(FILES include/moq/proxygen_wt_managed.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moq)
 
 # Build-tree imported target (absolute paths).
-file(GENERATE
-    OUTPUT "${PROJECT_BINARY_DIR}/libmoqAdapterProxygenWtManagedTargets.cmake"
-    CONTENT "\
-if(NOT TARGET moq::adapter-proxygen-wt-managed)\n\
-  add_library(moq::adapter-proxygen-wt-managed $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-proxygen-wt-managed,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-proxygen-wt-managed PROPERTIES\n\
-    IMPORTED_LOCATION \"$<TARGET_FILE:moq-adapter-proxygen-wt-managed>\"\n\
-    IMPORTED_LINK_INTERFACE_LANGUAGES \"CXX\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"${CMAKE_CURRENT_SOURCE_DIR}/include\"\n\
-${_pxg_linkdir_line}\
-    INTERFACE_LINK_LIBRARIES \"moq::adapter-proxygen-wt$<SEMICOLON>proxygen::proxygen\")\n\
-endif()\n")
-
-# Install-tree imported target (relocatable).
-file(GENERATE
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterProxygenWtManagedTargets-install.cmake
-    CONTENT "\
-get_filename_component(_PXGM_PREFIX \"\${CMAKE_CURRENT_LIST_FILE}\" PATH)\n\
-get_filename_component(_PXGM_PREFIX \"\${_PXGM_PREFIX}\" PATH)\n\
-get_filename_component(_PXGM_PREFIX \"\${_PXGM_PREFIX}\" PATH)\n\
-get_filename_component(_PXGM_PREFIX \"\${_PXGM_PREFIX}\" PATH)\n\
-\n\
-if(NOT TARGET moq::adapter-proxygen-wt-managed)\n\
-  add_library(moq::adapter-proxygen-wt-managed $<IF:$<STREQUAL:$<TARGET_PROPERTY:moq-adapter-proxygen-wt-managed,TYPE>,STATIC_LIBRARY>,STATIC,SHARED> IMPORTED)\n\
-  set_target_properties(moq::adapter-proxygen-wt-managed PROPERTIES\n\
-    IMPORTED_LOCATION \"\${_PXGM_PREFIX}/${_pxg_adapter_libdir}/$<TARGET_FILE_NAME:moq-adapter-proxygen-wt-managed>\"\n\
-    IMPORTED_LINK_INTERFACE_LANGUAGES \"CXX\"\n\
-    INTERFACE_INCLUDE_DIRECTORIES \"\${_PXGM_PREFIX}/${_pxg_adapter_incdir}\"\n\
-${_pxg_linkdir_line}\
-    INTERFACE_LINK_LIBRARIES \"moq::adapter-proxygen-wt$<SEMICOLON>proxygen::proxygen\")\n\
-endif()\n\
-\n\
-unset(_PXGM_PREFIX)\n")
-
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterProxygenWtManagedTargets-install.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq
-    RENAME libmoqAdapterProxygenWtManagedTargets.cmake)
+moq_export_component(moq-adapter-proxygen-wt-managed
+    adapter-proxygen-wt-managed libmoqAdapterProxygenWtManagedTargets)
 
 # -- Tests -----------------------------------------------------------
 if(MOQ_BUILD_TESTS)
@@ -376,6 +284,7 @@ if(MOQ_BUILD_TESTS)
     set_tests_properties(proxygen_wt_managed_scheduler PROPERTIES TIMEOUT 40)
 
     # -- Cold-consumer tests ------------------------------------------
+    if(MOQ_BUILD_PACKAGE_EXPORTS)
     include(${CMAKE_CURRENT_SOURCE_DIR}/../mvfst/tests/consumer_context.cmake)
     set(MOQ_ADAPTER_CONSUMER_TEST_ROOT "" CACHE PATH "Private adapter consumer test artifacts")
     set(_consumer_root "${CMAKE_CURRENT_BINARY_DIR}")
@@ -469,4 +378,5 @@ if(MOQ_BUILD_TESTS)
         COMMAND ${CMAKE_COMMAND} -P
             "${CMAKE_CURRENT_BINARY_DIR}/run_install_consumer_test.cmake")
     set_tests_properties(proxygen_wt_install_consumer PROPERTIES TIMEOUT 180)
+    endif()
 endif()
