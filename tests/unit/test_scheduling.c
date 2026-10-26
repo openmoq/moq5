@@ -737,10 +737,36 @@ static uint32_t dreset_recount(const moq_transport_bridge_t *b)
     return n;
 }
 
-/* Both table counts against their recounts, and the session's summary. */
+/* Active dstreams with nothing queued, no FIN handed and no deferred
+ * reset -- the only streams mapped DATA can join -- counted from the table:
+ * what the bridge's dopen_heads must hold. */
+static uint32_t dopen_recount(const moq_transport_bridge_t *b)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < b->dstream_cap; i++) {
+        const bridge_dstream_t *d = &b->dstreams[i];
+        if (d->active && d->q_len == 0 && !d->fin_handed && !d->has_reset)
+            n++;
+    }
+    return n;
+}
+
+/* Held-stream records in use, counted from the table: what the bridge's
+ * holds_live must hold. */
+static uint32_t holds_recount(const moq_transport_bridge_t *b)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; b->holds && i < b->max_holds; i++)
+        if (b->holds[i].state != BRIDGE_HOLD_FREE) n++;
+    return n;
+}
+
+/* The table counts against their recounts, and the session's summary. */
 #define CHECK_TABLE_COUNTS(br) do { \
     MOQ_TEST_CHECK_EQ_INT((int)(br)->dq_timed, (int)dq_timed_recount(br)); \
     MOQ_TEST_CHECK_EQ_INT((int)(br)->dreset_count, (int)dreset_recount(br)); \
+    MOQ_TEST_CHECK_EQ_INT((int)(br)->dopen_heads, (int)dopen_recount(br)); \
+    MOQ_TEST_CHECK_EQ_INT((int)(br)->holds_live, (int)holds_recount(br)); \
     CHECK_SESSION_COUNTS((br)->session); \
 } while (0)
 
@@ -5727,6 +5753,149 @@ static bool pass_cost_reuse_row(pair_t *p)
     return true;
 }
 
+/* The payload writes accepted on `sid`, in order, must carry objects
+ * 0..n-1 of `track` -- every one of them once and none out of order. */
+static bool mapped_objects_in_order(const pair_t *p, uint64_t sid,
+                                    uint8_t track, unsigned n)
+{
+    unsigned next = 0;
+    for (size_t i = 0; i < p->mt->nchunks; ++i) {
+        const mt_chunk_t *c = &p->mt->chunks[i];
+        if (c->sid != sid || c->len != PAYLOAD_LEN || c->head[0] != PAYLOAD_TAG)
+            continue;
+        if (c->head[1] != track || c->head[4] != (uint8_t)next) return false;
+        ++next;
+    }
+    return next == n;
+}
+
+/* The accepted chunk index of `sid`'s FIN, or SIZE_MAX. */
+static size_t mapped_fin_at(const pair_t *p, uint64_t sid)
+{
+    for (size_t i = 0; i < p->mt->nchunks; ++i)
+        if (p->mt->chunks[i].sid == sid && p->mt->chunks[i].fin) return i;
+    return SIZE_MAX;
+}
+
+/* Stream A's objects, written one service at a time while A refuses every
+ * write, until the bridge holds the retained-byte budget. Returns how many
+ * were written. */
+static unsigned mapped_fill_budget(pair_t *p, moq_subgroup_handle_t sg,
+                                   uint8_t track, uint64_t group)
+{
+    unsigned n = 0;
+    while (p->pub_br->dq_bytes < p->pub_br->max_retained_bytes && n < 64) {
+        if (write_object(p, sg, track, group, 0, n) != MOQ_OK) return 0;
+        ++n;
+        if (moq_transport_bridge_service(p->pub_br, p->now) != MOQ_OK) return 0;
+    }
+    return p->pub_br->dq_bytes >= p->pub_br->max_retained_bytes ? n : 0;
+}
+
+/* At the retained-byte budget only mapped DATA leaves the core, and only to
+ * an open head: a mapped stream with nothing queued, no FIN handed and no
+ * reset. B is one; its FIN-only write crosses A's later object, which stays
+ * core-owned behind the budget like B's byte-bearing writes would. Once A
+ * accepts again every object goes, in order, before nothing is left. */
+static bool mapped_open_head_row(pair_t *p)
+{
+    regression_owner_t o;
+    if (!regression_owner(p, false, "open-head", 128, 0, &o)) return false;
+    moq_subgroup_handle_t asg, bsg;
+    uint64_t asid, bsid;
+    size_t ah, bh;
+    if (!regression_open_header(p, &o, 1, &asg, &asid, &ah) ||
+        !regression_open_header(p, &o, 2, &bsg, &bsid, &bh)) return false;
+    mt_stream_t *ast = mt_stream(p->mt, asid);
+    PC_REQUIRE(ast != NULL);
+    ast->refuse = true;
+    const unsigned held = mapped_fill_budget(p, asg, 1, 1);
+    PC_REQUIRE(held > 0);
+    CHECK_TABLE_COUNTS(p->pub_br);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dopen_heads, 1); /* B */
+    PC_REQUIRE(write_object(p, asg, 1, 1, 0, held) == MOQ_OK);
+    PC_REQUIRE(moq_session_close_subgroup(p->pub, bsg, p->now) == MOQ_OK);
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK(mapped_fin_at(p, bsid) != SIZE_MAX);
+    MOQ_TEST_CHECK(moq_session_has_pending_output(p->pub)); /* A's object */
+    MOQ_TEST_CHECK(p->pub_br->dq_bytes >= p->pub_br->max_retained_bytes);
+    CHECK_TABLE_COUNTS(p->pub_br);
+    ast->refuse = false;
+    serve_all(p);
+    MOQ_TEST_CHECK(!moq_session_has_pending_output(p->pub));
+    MOQ_TEST_CHECK(mapped_objects_in_order(p, asid, 1, held + 1));
+    CHECK_TABLE_COUNTS(p->pub_br);
+    return true;
+}
+
+/* At the budget with no open head, nothing leaves the core: B's FIN waits
+ * behind B's own held objects and A's later object behind the budget, for
+ * as many passes as the budget stays spent. Once both accept again each
+ * stream's objects go in order and B's FIN after B's last object. */
+static bool mapped_no_open_head_row(pair_t *p)
+{
+    regression_owner_t o;
+    if (!regression_owner(p, false, "no-head", 128, 0, &o)) return false;
+    moq_subgroup_handle_t asg, bsg;
+    uint64_t asid, bsid;
+    size_t ah, bh;
+    if (!regression_open_header(p, &o, 1, &asg, &asid, &ah) ||
+        !regression_open_header(p, &o, 2, &bsg, &bsid, &bh)) return false;
+    mt_stream_t *ast = mt_stream(p->mt, asid), *bst = mt_stream(p->mt, bsid);
+    PC_REQUIRE(ast != NULL && bst != NULL);
+    ast->refuse = bst->refuse = true;
+    PC_REQUIRE(write_object(p, bsg, 2, 2, 0, 0) == MOQ_OK);
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    const unsigned held = mapped_fill_budget(p, asg, 1, 1);
+    PC_REQUIRE(held > 0);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dopen_heads, 0);
+    PC_REQUIRE(moq_session_close_subgroup(p->pub, bsg, p->now) == MOQ_OK);
+    PC_REQUIRE(write_object(p, asg, 1, 1, 0, held) == MOQ_OK);
+    const size_t chunks = p->mt->nchunks;
+    for (unsigned i = 0; i < 4; ++i) {
+        PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(p->mt->nchunks, chunks);
+        MOQ_TEST_CHECK(moq_session_has_pending_output(p->pub));
+        CHECK_TABLE_COUNTS(p->pub_br);
+    }
+    ast->refuse = bst->refuse = false;
+    serve_all(p);
+    MOQ_TEST_CHECK(!moq_session_has_pending_output(p->pub));
+    MOQ_TEST_CHECK(mapped_objects_in_order(p, asid, 1, held + 1));
+    MOQ_TEST_CHECK(mapped_objects_in_order(p, bsid, 2, 1));
+    size_t last_b = SIZE_MAX;
+    for (size_t i = 0; i < p->mt->nchunks; ++i)
+        if (p->mt->chunks[i].sid == bsid && p->mt->chunks[i].len > 0) last_b = i;
+    const size_t fin = mapped_fin_at(p, bsid);
+    MOQ_TEST_CHECK(fin != SIZE_MAX && last_b != SIZE_MAX && fin >= last_b);
+    CHECK_TABLE_COUNTS(p->pub_br);
+    return true;
+}
+
+/* A session close supersedes the held backlog even with the budget spent
+ * and no open head: the close is the head the scan selects. */
+static bool mapped_close_row(pair_t *p)
+{
+    regression_owner_t o;
+    if (!regression_owner(p, false, "close-head", 128, 0, &o)) return false;
+    moq_subgroup_handle_t asg;
+    uint64_t asid;
+    size_t ah;
+    if (!regression_open_header(p, &o, 1, &asg, &asid, &ah)) return false;
+    mt_stream_t *ast = mt_stream(p->mt, asid);
+    PC_REQUIRE(ast != NULL);
+    ast->refuse = true;
+    const unsigned held = mapped_fill_budget(p, asg, 1, 1);
+    PC_REQUIRE(held > 0);
+    PC_REQUIRE(write_object(p, asg, 1, 1, 0, held) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)p->pub_br->dopen_heads, 0);
+    PC_REQUIRE(moq_session_close(p->pub, 0x0, "done", p->now) == MOQ_OK);
+    PC_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_transport_bridge_is_terminal(p->pub_br));
+    CHECK_TABLE_COUNTS(p->pub_br);
+    return true;
+}
+
 /* An untimed backlog held at the budget, with no reset owed: however large
  * the table or the backlog, service reads no table slot for expiry and none
  * for deferred resets, and objects still go out once the budget frees.
@@ -6250,13 +6419,25 @@ static void test_pass_costs(void)
             MOQ_TEST_CHECK(pass_cost_reuse_row(&p));
         else MOQ_TEST_CHECK(false);
         pair_destroy(&p);
+        static bool (*const mapped_rows[])(pair_t *) = {
+            mapped_open_head_row, mapped_no_open_head_row, mapped_close_row,
+        };
+        for (size_t r = 0; r < sizeof(mapped_rows) / sizeof(mapped_rows[0]); ++r) {
+            if (pair_init_retained(&p, k_versions[v], 1u << 20, true,
+                                   PC_STREAMS, 1024, 64, 0, true))
+                MOQ_TEST_CHECK(mapped_rows[r](&p));
+            else MOQ_TEST_CHECK(false);
+            pair_destroy(&p);
+        }
         printf("pass costs d%d: checked\n", draft_of(k_versions[v]));
     }
     MOQ_TEST_PASS("deadline walks read the stream table only for timed items "
                   "and keep the exact earliest deadline through refusal, "
                   "expiry, cancellation and the pending FIFO; a refused reset "
                   "is tried once a pass, a reused slot's reset included; the "
-                  "inbound walk reads the table only once an entry is marked");
+                  "inbound walk reads the table only once an entry is marked; "
+                  "at the budget mapped DATA reaches only an open head and a "
+                  "leading close still goes");
 }
 
 /* -- session queue inspection ----------------------------------------------- */

@@ -401,6 +401,7 @@ struct moq_transport_bridge {
     bridge_hold_t         *holds;
     uint32_t               max_holds;
     uint64_t               hold_seq;
+    uint32_t               holds_live; /* records not BRIDGE_HOLD_FREE */
     /* One receive-entry cancellation per waiting DATA demand. A successful
      * STOP keeps its ref here until the session's RX allocation ends; STOP
      * acceptance alone never means capacity was recovered. */
@@ -443,6 +444,9 @@ struct moq_transport_bridge {
     uint64_t               dq_bytes;       /* bytes queued across dstreams */
     uint32_t               dq_items;       /* actions queued across dstreams */
     uint32_t               dq_timed;       /* of those, with a delivery deadline */
+    uint32_t               dopen_heads;    /* active dstreams with nothing
+                                            * queued, no FIN handed and no
+                                            * deferred reset */
     uint32_t               dreset_count;   /* active dstreams holding a deferred
                                             * reset (has_reset) */
     /* Service passes begun, from 1: a dstream whose reset_pass equals it
@@ -542,7 +546,9 @@ bool bridge_session_poll_ready_action(moq_session_t *s, moq_action_t *out,
  * map-blocked request, never a connection/control barrier. The gate's first
  * call only inspects. Its reserve call must secure ownership before take,
  * without advancing the session or calling the endpoint. False admission
- * leaves the action session-owned. No borrowed action escapes this call. */
+ * leaves the action session-owned. No borrowed action escapes this call.
+ * `data_open` false promises the gate admits no SEND_DATA; only a leading
+ * session close can then be selected, so the scan stops at the head. */
 typedef enum {
     BRIDGE_ACTION_BARRIER,
     BRIDGE_ACTION_SKIP,
@@ -552,7 +558,8 @@ typedef bridge_action_gate_t (*bridge_action_gate_fn)(
     void *ctx, const moq_action_t *action, const moq_action_meta_t *meta,
     bool reserve);
 bool bridge_session_poll_mapped_action(moq_session_t *s, moq_action_t *out,
-    moq_action_meta_t *meta, bridge_action_gate_fn gate, void *ctx);
+    moq_action_meta_t *meta, bool data_open, bridge_action_gate_fn gate,
+    void *ctx);
 /* Transfer an expired subgroup's reset debt into its existing bridge owner.
  * No action slot is needed. False retains a terminal waiting for event credit
  * in the session; do not dispatch its reset yet. The terminal flag is returned

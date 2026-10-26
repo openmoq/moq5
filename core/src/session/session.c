@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stdlib.h>
 #include "session_internal.h"
 #include "../bridge/transport_bridge_internal.h"
 #include "../internal/validate.h"
@@ -4250,12 +4251,13 @@ bool bridge_session_poll_ready_action(moq_session_t *s, moq_action_t *out,
     return false;
 }
 
-bool bridge_session_poll_mapped_action(moq_session_t *s, moq_action_t *out,
-    moq_action_meta_t *meta, bridge_action_gate_fn gate, void *ctx)
+/* The queue index of the action a mapped poll takes from the actions in
+ * [head, end), or the tail when none qualifies. The gate only inspects. */
+static size_t mapped_select(const moq_session_t *s, size_t end,
+                            bridge_action_gate_fn gate, void *ctx)
 {
-    session_action_poll_prepare(s);
     size_t best = s->action_tail;
-    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+    for (size_t i = s->action_head; i < end; ++i) {
         const size_t at = i % s->action_cap;
         const moq_action_t *a = &s->actions[at];
         const moq_action_meta_t *m = &s->action_meta[at];
@@ -4307,6 +4309,25 @@ bool bridge_session_poll_mapped_action(moq_session_t *s, moq_action_t *out,
             sched_compare(m, &s->action_meta[best % s->action_cap]) < 0)
             best = i;
     }
+    return best;
+}
+
+bool bridge_session_poll_mapped_action(moq_session_t *s, moq_action_t *out,
+    moq_action_meta_t *meta, bool data_open, bridge_action_gate_fn gate,
+    void *ctx)
+{
+    session_action_poll_prepare(s);
+    /* Without admissible DATA nothing past the head can be selected, and
+     * the gate's inspecting calls change nothing, so the head decides. */
+    const size_t end = data_open || s->action_head == s->action_tail
+        ? s->action_tail : s->action_head + 1;
+    const size_t best = mapped_select(s, end, gate, ctx);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    /* Test builds hold the head-only selection to the full scan. */
+    if (end != s->action_tail &&
+        mapped_select(s, s->action_tail, gate, ctx) != best)
+        abort();
+#endif
     if (best == s->action_tail) return false;
     const size_t at = best % s->action_cap;
     if (gate(ctx, &s->actions[at], &s->action_meta[at], true) !=

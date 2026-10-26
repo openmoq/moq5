@@ -10,6 +10,7 @@
 #include "transport_bridge_internal.h"
 #include <moq/session.h>
 #include <moq/rcbuf.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef MOQ_SESSION_SWEEP_TESTING
@@ -750,10 +751,41 @@ static void bridge_owner_unlink(moq_transport_bridge_t *b, bridge_dstream_t *d)
     d->owner_prev = d->owner_next = BRIDGE_INDEX_EMPTY;
 }
 
+/* An open head can take mapped DATA without queueing behind its own
+ * stream: active, nothing queued, no FIN handed and no deferred reset.
+ * b->dopen_heads counts them; every change to those fields goes through
+ * bridge_dstream_note with the state before it. */
+static bool bridge_dstream_open_head(const bridge_dstream_t *d)
+{
+    return d->active && d->q_len == 0 && !d->fin_handed && !d->has_reset;
+}
+
+static void bridge_dstream_note(moq_transport_bridge_t *b,
+                                const bridge_dstream_t *d, bool was_open)
+{
+    const bool open = bridge_dstream_open_head(d);
+    if (open && !was_open) b->dopen_heads++;
+    else if (was_open && !open) b->dopen_heads--;
+}
+
+/* Whether some stream is an open head. */
+static bool bridge_dstream_any_open(const moq_transport_bridge_t *b)
+{
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    /* Test builds hold the tally to the table at every use. */
+    uint32_t open = 0;
+    for (uint32_t i = 0; i < b->dstream_cap; i++)
+        open += bridge_dstream_open_head(&b->dstreams[i]);
+    if (open != b->dopen_heads) abort();
+#endif
+    return b->dopen_heads != 0;
+}
+
 /* Drop `d`'s queued actions and release its queue. */
 static void bridge_dstream_release(moq_transport_bridge_t *b,
                                    bridge_dstream_t *d)
 {
+    const bool was_open = bridge_dstream_open_head(d);
     if (d->heap_at != BRIDGE_INDEX_EMPTY) bridge_dheap_remove(b, d);
     if (d->owner_next != BRIDGE_INDEX_EMPTY)
         b->dstreams[d->owner_next].order_dirty = true;
@@ -775,6 +807,7 @@ static void bridge_dstream_release(moq_transport_bridge_t *b,
         bridge_index_remove(b->dsid_index, b->dindex_mask, d->sid);
     uint32_t slot = (uint32_t)(d - b->dstreams);
     if (d->has_reset) b->dreset_count--;
+    if (was_open) b->dopen_heads--;
     memset(d, 0, sizeof(*d));
     d->next_free = b->dstream_free;
     b->dstream_free = slot;
@@ -800,6 +833,7 @@ static void bridge_clear_all_state(moq_transport_bridge_t *b)
     b->tombstone_count = 0;
     if (b->holds) {
         memset(b->holds, 0, b->max_holds * sizeof(bridge_hold_t));
+        b->holds_live = 0;
         b->pressure_count = 0;
         b->pressure_choice = moq_stream_ref_from_u64(0);
         b->may_wait = false;
@@ -1110,7 +1144,9 @@ static void bridge_prune_terminal_output(moq_transport_bridge_t *b)
             kept++;
         }
         if (kept != d->q_len) {
+            const bool was_open = bridge_dstream_open_head(d);
             d->q_len = kept;
+            bridge_dstream_note(b, d, was_open);
             bridge_dstream_requeue(b, d);
         }
     }
@@ -1158,11 +1194,25 @@ bool bridge_stream_has_inbound_pending(const bridge_stream_entry_t *e)
 
 /* -- Held peer streams ------------------------------------------------ */
 
+/* The record slots a scan for held streams must visit: none while every
+ * record is free, so per-pass hold upkeep costs nothing without holds. */
+static uint32_t bridge_hold_span(const moq_transport_bridge_t *b)
+{
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    /* Test builds hold the tally to the table at every use. */
+    uint32_t live = 0;
+    for (uint32_t i = 0; b->holds && i < b->max_holds; i++)
+        live += b->holds[i].state != BRIDGE_HOLD_FREE;
+    if (live != b->holds_live) abort();
+#endif
+    return b->holds && b->holds_live ? b->max_holds : 0;
+}
+
 static bridge_hold_t *bridge_hold_find(const moq_transport_bridge_t *b,
                                        uint64_t transport_id)
 {
-    if (!b->holds) return NULL;
-    for (uint32_t i = 0; i < b->max_holds; i++)
+    const uint32_t n = bridge_hold_span(b);
+    for (uint32_t i = 0; i < n; i++)
         if (b->holds[i].state != BRIDGE_HOLD_FREE &&
             b->holds[i].transport_id == transport_id)
             return &b->holds[i];
@@ -1175,8 +1225,8 @@ static bridge_hold_t *bridge_hold_find(const moq_transport_bridge_t *b,
 static bool bridge_hold_class_waiting(const moq_transport_bridge_t *b,
                                       bool mapped)
 {
-    if (!b->holds) return false;
-    for (uint32_t i = 0; i < b->max_holds; i++)
+    const uint32_t n = bridge_hold_span(b);
+    for (uint32_t i = 0; i < n; i++)
         if (b->holds[i].state == BRIDGE_HOLD_RECORDED &&
             b->holds[i].mapped == mapped)
             return true;
@@ -1189,7 +1239,8 @@ static void bridge_publish_deadline(moq_transport_bridge_t *b)
 {
     bool has = b->ready_due;
     uint64_t d = has ? b->ready_at : UINT64_MAX;
-    for (uint32_t i = 0; i < b->max_holds; i++) {
+    const uint32_t n = bridge_hold_span(b);
+    for (uint32_t i = 0; i < n; i++) {
         const bridge_hold_t *h = &b->holds[i];
         if (h->state != BRIDGE_HOLD_RECORDED) continue;
         uint64_t due = h->first_refusal_us > UINT64_MAX - BRIDGE_HOLD_AGE_US
@@ -1235,6 +1286,7 @@ static bridge_hold_t *bridge_hold_record(moq_transport_bridge_t *b,
         h->transport_id = transport_id;
         h->first_refusal_us = now_us;
         h->seq = ++b->hold_seq;
+        ++b->holds_live;
         b->may_wait = true;
         bridge_publish_deadline(b);
         return h;
@@ -1245,6 +1297,7 @@ static bridge_hold_t *bridge_hold_record(moq_transport_bridge_t *b,
 static void bridge_hold_release(moq_transport_bridge_t *b, bridge_hold_t *h)
 {
     if (!h) return;
+    if (h->state != BRIDGE_HOLD_FREE) --b->holds_live;
     memset(h, 0, sizeof(*h));
     bridge_publish_deadline(b);
 }
@@ -1397,11 +1450,12 @@ static moq_result_t bridge_hold_drive_cancel(moq_transport_bridge_t *b,
  * and the paired adapter sweep must be able to use it without another tick. */
 static void bridge_hold_offer(moq_transport_bridge_t *b, bool *progress)
 {
-    if (!b->holds) return;
+    const uint32_t n = bridge_hold_span(b);
+    if (n == 0) return;
     for (int mapped = 0; mapped < 2; mapped++) {
         bridge_hold_t *oldest = NULL;
         bool outstanding = false;
-        for (uint32_t i = 0; i < b->max_holds; i++) {
+        for (uint32_t i = 0; i < n; i++) {
             bridge_hold_t *h = &b->holds[i];
             if (h->state != BRIDGE_HOLD_RECORDED || h->mapped != (mapped != 0))
                 continue;
@@ -1432,7 +1486,8 @@ static moq_result_t bridge_hold_maintain(moq_transport_bridge_t *b,
                                          uint64_t now_us, bool *progress)
 {
     if (!b->holds) return MOQ_OK;
-    for (uint32_t i = 0; i < b->max_holds; i++) {
+    const uint32_t n = bridge_hold_span(b);
+    for (uint32_t i = 0; i < n; i++) {
         bridge_hold_t *h = &b->holds[i];
         if (h->state != BRIDGE_HOLD_RECORDED) continue;
         if (h->first_refusal_us <= UINT64_MAX - BRIDGE_HOLD_AGE_US &&
@@ -1441,7 +1496,7 @@ static moq_result_t bridge_hold_maintain(moq_transport_bridge_t *b,
             *progress = true;
         }
     }
-    for (uint32_t i = 0; i < b->max_holds && !b->fatal; i++) {
+    for (uint32_t i = 0; i < n && !b->fatal; i++) {
         bridge_hold_t *h = &b->holds[i];
         if (h->state != BRIDGE_HOLD_CANCELLING) continue;
         moq_result_t rc = bridge_hold_drive_cancel(b, h, progress);
@@ -1695,7 +1750,7 @@ bool moq_transport_bridge_has_pending(const moq_transport_bridge_t *b)
              bridge_stream_has_inbound_pending(&b->streams[i])))
             return true;
     }
-    for (uint32_t i = 0; b->holds && i < b->max_holds; i++) {
+    for (uint32_t i = 0, n = bridge_hold_span(b); i < n; i++) {
         if (b->holds[i].state == BRIDGE_HOLD_CANCELLING ||
             (b->holds[i].state == BRIDGE_HOLD_RECORDED && !b->holds[i].offered))
             return true;
@@ -1724,7 +1779,7 @@ bool moq_transport_bridge_has_outbound_pending(const moq_transport_bridge_t *b)
         if (b->streams[i].active && b->streams[i].reset_source_held)
             return true;
     /* An owed cancellation of a held stream is send-side work. */
-    for (uint32_t i = 0; b->holds && i < b->max_holds; i++)
+    for (uint32_t i = 0, n = bridge_hold_span(b); i < n; i++)
         if (b->holds[i].state == BRIDGE_HOLD_CANCELLING)
             return true;
     return false;
@@ -2323,7 +2378,9 @@ static moq_result_t bridge_dstream_fin(moq_transport_bridge_t *b,
     if (!d) return MOQ_OK;
     if (!bridge_drained_cap(b) && !d->has_reset)
         return bridge_dstream_free(b, d);
+    const bool was_open = bridge_dstream_open_head(d);
     d->fin_handed = true;
+    bridge_dstream_note(b, d, was_open);
     return MOQ_OK;
 }
 
@@ -2409,6 +2466,7 @@ static bridge_dstream_t *bridge_dstream_new(moq_transport_bridge_t *b,
     b->dstream_free = d->next_free;
     memset(d, 0, sizeof(*d));
     d->active = true;
+    b->dopen_heads++;
     d->ref = ref;
     d->heap_at = d->owner_prev = d->owner_next = BRIDGE_INDEX_EMPTY;
     bridge_index_insert(b->dref_index, b->dindex_mask, ref._v, slot);
@@ -2494,7 +2552,9 @@ static moq_result_t bridge_dstream_push(moq_transport_bridge_t *b,
     bridge_data_item_t *item = &d->q[(d->q_head + d->q_len) % d->q_cap];
     item->action = *act;
     item->meta = *meta;
+    const bool was_open = bridge_dstream_open_head(d);
     d->q_len++;
+    bridge_dstream_note(b, d, was_open);
     b->dq_bytes += bridge_send_data_bytes(&act->u.send_data);
     b->dq_items++;
     if (meta->deadline_us != UINT64_MAX) b->dq_timed++;
@@ -2508,7 +2568,9 @@ static void bridge_dstream_pop(moq_transport_bridge_t *b, bridge_dstream_t *d,
 {
     *out = d->q[d->q_head];
     d->q_head = (d->q_head + 1) % d->q_cap;
+    const bool was_open = bridge_dstream_open_head(d);
     d->q_len--;
+    bridge_dstream_note(b, d, was_open);
     b->dq_bytes -= bridge_send_data_bytes(&out->action.u.send_data);
     b->dq_items--;
     if (out->meta.deadline_us != UINT64_MAX) b->dq_timed--;
@@ -2520,7 +2582,9 @@ static void bridge_dstream_unpop(moq_transport_bridge_t *b, bridge_dstream_t *d,
 {
     d->q_head = (d->q_head + d->q_cap - 1) % d->q_cap;
     d->q[d->q_head] = *item;
+    const bool was_open = bridge_dstream_open_head(d);
     d->q_len++;
+    bridge_dstream_note(b, d, was_open);
     b->dq_bytes += bridge_send_data_bytes(&item->action.u.send_data);
     b->dq_items++;
     if (item->meta.deadline_us != UINT64_MAX) b->dq_timed++;
@@ -2538,7 +2602,9 @@ static void bridge_dstream_truncate(moq_transport_bridge_t *b,
         if (item->meta.deadline_us != UINT64_MAX) b->dq_timed--;
         moq_action_cleanup(a);
     }
+    const bool was_open = bridge_dstream_open_head(d);
     d->q_len = keep;
+    bridge_dstream_note(b, d, was_open);
 }
 
 /* -- SEND_DATA: two-phase header+payload ---------------------------- */
@@ -3110,7 +3176,9 @@ static moq_result_t bridge_dstream_reset(moq_transport_bridge_t *b,
             &d->q[(d->q_head + keep) % d->q_cap].action.u.send_data);
     if (keep == 0) return bridge_dstream_free(b, d);
     bridge_dstream_truncate(b, d, keep);
+    const bool was_open = bridge_dstream_open_head(d);
     d->has_reset = true;
+    bridge_dstream_note(b, d, was_open);
     b->dreset_count++;
     d->reset_terminal = terminal;
     d->reset_code = error_code;
@@ -4016,7 +4084,9 @@ static moq_result_t bridge_expire_data(moq_transport_bridge_t *b,
     b->pending_count = dst;
     if (d) {
         if (reset_ready && !pending_reset && !d->has_reset) {
+            const bool was_open = bridge_dstream_open_head(d);
             d->has_reset = true;
+            bridge_dstream_note(b, d, was_open);
             b->dreset_count++;
             d->reset_terminal = terminal;
             d->reset_code = reset.error_code;
@@ -4432,8 +4502,9 @@ static moq_result_t bridge_drain_actions(moq_transport_bridge_t *b)
         }
         if (b->pending_count >= b->max_pending ||
             b->dq_bytes >= b->max_retained_bytes) {
+            /* The gate admits DATA only to an open head. */
             if (!bridge_session_poll_mapped_action(b->session, &act, &meta,
-                                                    bridge_mapped_action_gate, b))
+                    bridge_dstream_any_open(b), bridge_mapped_action_gate, b))
                 return b->fatal ? MOQ_ERR_INTERNAL : MOQ_OK;
         }
         /* Try a refused reset once per pass. Data preceding its barrier may
@@ -5395,7 +5466,8 @@ static bridge_inbound_outcome_t bridge_retry_inbound_pending(
 static uint32_t bridge_pressure_demand(const moq_transport_bridge_t *b)
 {
     uint32_t demand = 0;
-    for (uint32_t i = 0; i < b->max_holds; ++i) {
+    const uint32_t n = bridge_hold_span(b);
+    for (uint32_t i = 0; i < n; ++i) {
         const bridge_hold_t *h = &b->holds[i];
         if (h->state != BRIDGE_HOLD_RECORDED || h->offered ||
             h->kind != BRIDGE_STREAM_UNI)
