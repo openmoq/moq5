@@ -474,15 +474,23 @@ struct D22SurfaceTests {
         #expect(request.track.name.bytes == Data("v".utf8))
     }
 
-    @Test("Legacy drafts refuse selected initial timeouts and expose no admission record", arguments: [WireVersion.draft16, .draft18])
+    @Test("Legacy drafts apply their own rules to selected initial timeouts and expose no admission record", arguments: [WireVersion.draft16, .draft18])
     func legacyAdmission(_ version: MoQTransportModel.WireVersion) throws {
         let (c, s) = try pair(version)
+        // Drafts 16 and 18 carry the timeouts in SUBSCRIBE (draft-16 9.2.2.2,
+        // draft-18 10.2.3, 10.2.4). Draft-16's single DELIVERY_TIMEOUT is a
+        // QUIC varint and never 0; draft-18 takes 0 and UInt64.max alike.
         for selected in 1...3 {
-            var config = SubscribeConfiguration(track: track("legacy"))
+            var config = SubscribeConfiguration(track: track(version == .draft16 ? "legacy" : "legacy-\(selected)"))
             config.objectDeliveryTimeoutMs = selected & 1 != 0 ? 0 : nil
             config.subgroupDeliveryTimeoutMs = selected & 2 != 0 ? .max : nil
-            #expect(throws: MoQError.unsupported) { try c.subscribe(config, now: 9) }
-            #expect(c.pollActionsExtended().isEmpty)
+            if version == .draft16 {
+                #expect(throws: MoQError.invalidArgument) { try c.subscribe(config, now: 9) }
+                #expect(c.pollActionsExtended().isEmpty)
+            } else {
+                _ = try c.subscribe(config, now: 9)
+                #expect(!c.pollActionsExtended().isEmpty)
+            }
         }
         try c.subscribe(SubscribeConfiguration(track: track("legacy")))
         try settle(c, s)
@@ -1774,7 +1782,7 @@ struct D22SurfaceTests {
         #expect(s.pollActionsExtended().isEmpty)
     }
 
-    @Test("Legacy publication UPDATE keeps generic input and rejects typed options",
+    @Test("Legacy publication UPDATE keeps generic input and applies the draft's rules to typed options",
           arguments: [MoQTransportModel.WireVersion.draft16, .draft18])
     func legacyPublicationUpdate(_ version: MoQTransportModel.WireVersion) throws {
         let (c, s) = try pair(version)
@@ -1786,13 +1794,26 @@ struct D22SurfaceTests {
         try s.acceptPublish(request.publication)
         try settle(c, s)
         _ = c.pollEventsExtended()
+        // The Location Filter is draft-22 only. Drafts 16 and 18 carry the
+        // timeouts (draft-16 9.2.2.2, draft-18 10.2.3, 10.2.4): draft-16's
+        // single DELIVERY_TIMEOUT is a QUIC varint and never 0; draft-18 takes
+        // 0 and UInt64.max alike.
         for row in 0..<3 {
             var config = SubscriptionUpdateConfiguration()
             if row == 0 { config.location = LocationFilter.none }
             if row == 1 { config.objectDeliveryTimeoutMs = 0 }
             if row == 2 { config.subgroupDeliveryTimeoutMs = .max }
-            #expect(throws: MoQError.unsupported) { try s.updatePublication(request.publication, config) }
-            #expect(s.pollActionsExtended().isEmpty)
+            if row == 0 {
+                #expect(throws: MoQError.unsupported) { try s.updatePublication(request.publication, config) }
+                #expect(s.pollActionsExtended().isEmpty)
+            } else if version == .draft16 {
+                #expect(throws: MoQError.invalidArgument) { try s.updatePublication(request.publication, config) }
+                #expect(s.pollActionsExtended().isEmpty)
+            } else {
+                try s.updatePublication(request.publication, config)
+                try settle(c, s)
+                _ = c.pollEventsExtended()
+            }
         }
         var config = SubscriptionUpdateConfiguration()
         config.deliveryTimeoutUs = 1000

@@ -1838,12 +1838,18 @@ static void test_typed_publication_update(int &failures)
         moq::publication_update_options options{};
         options.location = moq::location_filter_config{};
         MOQ_CHECK(p.server.update_publication({}, {}, options, 1).error().code() == moq::errc::unsupported);
+        // Drafts 16 and 18 carry the timeouts (draft-16 9.2.2.2, draft-18
+        // 10.2.3, 10.2.4). Draft-16's single DELIVERY_TIMEOUT is a QUIC varint
+        // and never 0; draft-18 takes both values, and refuses only the empty
+        // handle.
+        const auto want = version == MOQ_VERSION_DRAFT_16 ? moq::errc::invalid
+                                                          : moq::errc::stale_handle;
         options = {};
         options.object_delivery_timeout_ms = 0;
-        MOQ_CHECK(p.server.update_publication({}, {}, options, 1).error().code() == moq::errc::unsupported);
+        MOQ_CHECK(p.server.update_publication({}, {}, options, 1).error().code() == want);
         options = {};
         options.subgroup_delivery_timeout_ms = UINT64_MAX;
-        MOQ_CHECK(p.server.update_publication({}, {}, options, 1).error().code() == moq::errc::unsupported);
+        MOQ_CHECK(p.server.update_publication({}, {}, options, 1).error().code() == want);
         MOQ_CHECK(!p.server.poll_action());
     }
     MOQ_PASS("typed_publication_update");
@@ -1910,13 +1916,24 @@ static void test_initial_admission_and_timeouts(int &failures)
     }
     for (auto version : {MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18}) {
         auto p = establish_pair(failures, version);
+        // Drafts 16 and 18 carry the timeouts in SUBSCRIBE (draft-16 9.2.2.2,
+        // draft-18 10.2.3, 10.2.4). Draft-16's single DELIVERY_TIMEOUT is a
+        // QUIC varint and never 0; draft-18 takes 0 and UINT64_MAX alike.
         for (unsigned selected = 1; selected <= 3; ++selected) {
             moq::subscribe_options options{};
             if (selected & 1) options.object_delivery_timeout_ms = 0;
             if (selected & 2) options.subgroup_delivery_timeout_ms = UINT64_MAX;
-            auto refused = p.client.subscribe({.ns = {"admission"}, .track = "v"}, options, 9);
-            MOQ_CHECK(!refused.ok() && refused.error().code() == moq::errc::unsupported);
-            MOQ_CHECK(!p.client.poll_action());
+            if (version == MOQ_VERSION_DRAFT_16) {
+                auto refused = p.client.subscribe({.ns = {"admission"}, .track = "v"}, options, 9);
+                MOQ_CHECK(!refused.ok() && refused.error().code() == moq::errc::invalid);
+                MOQ_CHECK(!p.client.poll_action());
+            } else {
+                static const char *const tracks[] = {"w1", "w2", "w3"};
+                MOQ_CHECK(p.client.subscribe({.ns = {"admission"},
+                                              .track = std::string_view(tracks[selected - 1])},
+                                             options, 9).ok());
+                MOQ_CHECK(p.client.poll_action().has_value());
+            }
         }
         MOQ_CHECK(p.client.subscribe({.ns = {"admission"}, .track = "v"}, 0).ok());
         settle(p.client, p.server, 0);
@@ -1924,7 +1941,7 @@ static void test_initial_admission_and_timeouts(int &failures)
         MOQ_CHECK(ev.has_value());
         if (ev) MOQ_CHECK(!std::get<moq::extended_event::subscribe_request>(ev->variant_extended()).options);
     }
-    MOQ_PASS("initial admission, all locations, independent nil-zero-MAX and legacy refusal");
+    MOQ_PASS("initial admission, all locations, independent nil-zero-MAX and legacy draft rules");
 }
 
 static void test_historical_state_snapshots(int &failures)
