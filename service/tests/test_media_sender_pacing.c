@@ -1509,7 +1509,8 @@ static bool fix_init_q2(fix_t *fix, moq_alloc_t *alloc, uint32_t max_actions,
                         bool drop_without_demand, uint64_t now,
                         uint32_t queue_objects, bool keep_drop_policy,
                         bool publish_tracks, const char *accept_pub_name,
-                        int accept_pub_track, uint64_t version)
+                        int accept_pub_track, uint64_t version,
+                        moq_media_send_backpressure_t drop_policy)
 {
     memset(fix, 0, sizeof(*fix));
     fix->publish_mode = publish_tracks;
@@ -1537,6 +1538,8 @@ static bool fix_init_q2(fix_t *fix, moq_alloc_t *alloc, uint32_t max_actions,
          * leaves the live preset in place so a full queue EVICTS instead. */
         if (!keep_drop_policy)
             cfg.backpressure = MOQ_MEDIA_SEND_BP_RETURN_WOULD_BLOCK;
+        else if (drop_policy != MOQ_MEDIA_SEND_BP_UNSET)
+            cfg.backpressure = drop_policy;
     }
     moq_media_sender_callbacks_init_sized(&cfg.callbacks, sizeof(cfg.callbacks));
     cfg.callbacks.ctx = fix;
@@ -1609,7 +1612,7 @@ static bool fix_init_q(fix_t *fix, moq_alloc_t *alloc, uint32_t max_actions,
 {
     return fix_init_q2(fix, alloc, max_actions, drop_without_demand, now,
                        queue_objects, keep_drop_policy, false, NULL, -1,
-                       PACING_VERSION);
+                       PACING_VERSION, MOQ_MEDIA_SEND_BP_UNSET);
 }
 
 /* Publish-mode variant: the sender PUSHES its tracks, and the peer accepts the
@@ -1621,7 +1624,7 @@ static bool fix_init_pub_act(fix_t *fix, moq_alloc_t *alloc, uint64_t now,
 {
     return fix_init_q2(fix, alloc, max_actions, false, now, queue_objects,
                        true, true, accept_pub_name, accept_pub_track,
-                       PACING_VERSION);
+                       PACING_VERSION, MOQ_MEDIA_SEND_BP_UNSET);
 }
 
 static bool fix_init(fix_t *fix, moq_alloc_t *alloc, uint32_t max_actions,
@@ -1645,6 +1648,15 @@ static bool fix_init_drop_act(fix_t *fix, moq_alloc_t *alloc, uint64_t now,
                               uint32_t queue_objects, uint32_t max_actions)
 {
     return fix_init_q(fix, alloc, max_actions, false, now, queue_objects, true);
+}
+
+/* Same, with an explicit drop policy. */
+static bool fix_init_policy_act(fix_t *fix, moq_alloc_t *alloc, uint64_t now,
+                                uint32_t queue_objects, uint32_t max_actions,
+                                moq_media_send_backpressure_t policy)
+{
+    return fix_init_q2(fix, alloc, max_actions, false, now, queue_objects,
+                       true, false, NULL, -1, PACING_VERSION, policy);
 }
 
 /* The peer subscribes to one media track; returns once SUBSCRIBE_OK arrived
@@ -2107,7 +2119,7 @@ static void test_demand_resumes_at_group_start(uint64_t version, bool end_skippe
         ? (end_skipped ? "pacing_d16_end_skipped_group" : "pacing_d16_resume_group")
         : (end_skipped ? "pacing_d18_end_skipped_group" : "pacing_d18_resume_group");
     if (!fix_init_q2(&fix, &alloc, 0, true, now, 0, false,
-                     false, NULL, -1, version)) {
+                     false, NULL, -1, version, MOQ_MEDIA_SEND_BP_UNSET)) {
         failures++; goto out;
     }
     if (!subscribe_track(&fix, 1, "a", now)) { failures++; goto out; }
@@ -2193,7 +2205,7 @@ static void test_demand_loss_after_emission(uint64_t version)
         ? "pacing_d16_demand_loss_after_emission"
         : "pacing_d18_demand_loss_after_emission";
     if (!fix_init_q2(&fix, &alloc, 0, true, now, 0, false,
-                     false, NULL, -1, version)) {
+                     false, NULL, -1, version, MOQ_MEDIA_SEND_BP_UNSET)) {
         failures++; goto out;
     }
     if (!subscribe_track(&fix, 0, "v", now)) { failures++; goto out; }
@@ -5001,6 +5013,201 @@ out:
     else         printf("FAIL: %s (%d diagnostics)\n", label, nf);
 }
 
+/* ===================================================================== *
+ *  A drop evicts the group whose first object the facade still holds.
+ *
+ *  The constrained ring refuses the first object of group 1 with
+ *  MOQ_ERR_WOULD_BLOCK, so the facade retains that write for a retry. Before
+ *  the retry, two newer keyframe groups overflow the queue and the drop policy
+ *  evicts group 1. media_sender.h: a drop policy evicts whole groups and
+ *  abandons the open subgroup on the wire if it was mid-send; it never makes
+ *  the sender fatal. draft-18 11.4.3: a subgroup closed before all of its
+ *  objects were delivered MUST be reset, never closed with a FIN.
+ * ===================================================================== */
+static void test_drop_blocked_group(moq_media_send_backpressure_t policy,
+                                    const char *name)
+{
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    fix_t fix;
+    uint64_t now = 1000;
+    enum { QCAP = 2, ACTS = 4 };
+    if (!fix_init_policy_act(&fix, &alloc, now, QCAP, ACTS, policy)) {
+        failures++; goto out;
+    }
+    if (!subscribe_track(&fix, 0, "v", now)) { failures++; goto out; }
+    set_phase(&fix, PHASE_PACE);
+
+    int from = fix.tr.n;
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xd0, true, true, 1000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xd1, true, true, 2000) == MOQ_OK);
+    drive(&fix, now);
+    /* Group 0 went out; group 1 was refused by the session, not dropped. */
+    expect_conserved(fix.s, 2, 1, 1, 0, PAYLOAD_LEN, "blkdrop-g1-refused");
+    MOQ_TEST_CHECK_EQ_INT(fix.tr.n - from, 1);
+    MOQ_TEST_CHECK(!moq_media_sender_is_fatal(fix.s));
+
+    /* Two newer keyframe groups overflow the bound of two: the oldest group,
+     * group 1, is evicted whole and the newest sync point is kept. */
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xd2, true, true, 3000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xd3, true, true, 4000) == MOQ_OK);
+    {
+        drop_snap_t d; drop_snap(fix.s, &d);
+        MOQ_TEST_CHECK_EQ_U64(d.dropped, 1);
+        MOQ_TEST_CHECK_EQ_U64(d.keyframes, 1);
+        MOQ_TEST_CHECK_EQ_U64(d.groups, 1);
+    }
+    expect_conserved(fix.s, 4, 1, 2, 1, 2 * PAYLOAD_LEN, "blkdrop-g1-evicted");
+
+    /* Capacity returns over later hooks; a few more prove nothing repeats. */
+    for (int i = 0; i < 16; i++) {
+        moq_media_sender_stats_t st; memset(&st, 0, sizeof(st));
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(fix.s, &st, sizeof(st))
+                       == MOQ_OK);
+        if (st.objects_queued == 0 || moq_media_sender_is_fatal(fix.s)) break;
+        drive(&fix, now);
+    }
+    for (int i = 0; i < 4; i++) drive(&fix, now);
+
+    /* The drop killed neither the sender nor the session. */
+    MOQ_TEST_CHECK(!moq_media_sender_is_fatal(fix.s));
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_fatal_code(fix.s), 0);
+    MOQ_TEST_CHECK(moq_session_state(moq_simpair_client(fix.sp)) ==
+                   MOQ_SESS_ESTABLISHED);
+    MOQ_TEST_CHECK(moq_session_state(moq_simpair_server(fix.sp)) ==
+                   MOQ_SESS_ESTABLISHED);
+    MOQ_TEST_CHECK(moq_media_sender_track_has_subscriber(fix.s, fix.t[0]));
+    expect_conserved(fix.s, 4, 3, 0, 1, 0, "blkdrop-drained");
+
+    /* The publication keeps going: a later group is accepted and delivered. */
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xd4, true, true, 5000) == MOQ_OK);
+    for (int i = 0; i < 8; i++) {
+        moq_media_sender_stats_t st; memset(&st, 0, sizeof(st));
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(fix.s, &st, sizeof(st))
+                       == MOQ_OK);
+        if (st.objects_queued == 0 || moq_media_sender_is_fatal(fix.s)) break;
+        drive(&fix, now);
+    }
+    MOQ_TEST_CHECK(!moq_media_sender_is_fatal(fix.s));
+    expect_conserved(fix.s, 5, 4, 0, 1, 0, "blkdrop-later-group");
+
+    /* Every delivered object, exactly, in order: group 1 never appears, and
+     * the groups after it keep their own ids. */
+    {
+        const tr_exp_t exp[4] = { { 0, 0, 0, 0xd0, 0 }, { 0, 2, 0, 0xd2, 2 },
+                                  { 0, 3, 0, 0xd3, 3 }, { 0, 4, 0, 0xd4, 4 } };
+        expect_from(&fix, from, exp, 4, "blkdrop-media");
+    }
+    /* Complete groups 0, 2 and 3 FIN; group 4 is still open. Group 1 never
+     * FINs: its only object was dropped before it was delivered. */
+    {
+        const term_exp_t terms[3] = { { 0, 0, 0, true, true },
+                                      { 0, 2, 0, true, true },
+                                      { 0, 3, 0, true, true } };
+        expect_terminals(&fix, terms, 3, "blkdrop-terminals");
+    }
+    /* No object of group 1 reached the peer, so draft-18 11.4.3 owes it no
+     * RESET; one is allowed only if its subgroup was opened. A RESET of any
+     * other group would truncate a complete one. */
+    MOQ_TEST_CHECK(fix.reset_n <= 1);
+    for (int i = 0; i < fix.reset_n && i < RESET_MAX; i++)
+        MOQ_TEST_CHECK(fix.reset[i].track == 0 && fix.reset[i].group == 1 &&
+                       fix.reset[i].subgroup == 0);
+    fix.reset_consumed = fix.reset_n;
+
+out:
+    fix_free(&fix);
+    MOQ_TEST_CHECK(as.balance == 0);
+    report(&fix, name, before);
+}
+
+/* Same, when the facade holds a write in the MIDDLE of group 1: its first
+ * object was delivered, so the evicted tail leaves a subgroup on the wire that
+ * draft-18 11.4.3 requires to be reset, not FINed truncated. */
+static void test_drop_blocked_tail(moq_media_send_backpressure_t policy,
+                                   const char *name)
+{
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    fix_t fix;
+    uint64_t now = 1000;
+    enum { QCAP = 2, ACTS = 4 };
+    if (!fix_init_policy_act(&fix, &alloc, now, QCAP, ACTS, policy)) {
+        failures++; goto out;
+    }
+    if (!subscribe_track(&fix, 0, "v", now)) { failures++; goto out; }
+    set_phase(&fix, PHASE_PACE);
+
+    int from = fix.tr.n;
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xe8, true, true, 1000) == MOQ_OK);
+    drive(&fix, now);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xe9, true, true, 2000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xea, false, false, 2500) == MOQ_OK);
+    drive(&fix, now);
+    /* Group 1's first object went out; its second was refused, not dropped. */
+    expect_conserved(fix.s, 3, 2, 1, 0, PAYLOAD_LEN, "blktail-g1o1-refused");
+    MOQ_TEST_CHECK_EQ_INT(fix.tr.n - from, 2);
+    MOQ_TEST_CHECK_EQ_INT(fix.reset_n, 0);
+    MOQ_TEST_CHECK(!moq_media_sender_is_fatal(fix.s));
+
+    /* Two newer keyframe groups overflow the bound: group 1's queued tail is
+     * the oldest group and is evicted whole. */
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xeb, true, true, 3000) == MOQ_OK);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xec, true, true, 4000) == MOQ_OK);
+    {
+        drop_snap_t d; drop_snap(fix.s, &d);
+        MOQ_TEST_CHECK_EQ_U64(d.dropped, 1);
+        MOQ_TEST_CHECK_EQ_U64(d.keyframes, 0);
+        MOQ_TEST_CHECK_EQ_U64(d.groups, 1);
+    }
+    expect_conserved(fix.s, 5, 2, 2, 1, 2 * PAYLOAD_LEN, "blktail-evicted");
+
+    for (int i = 0; i < 16; i++) {
+        moq_media_sender_stats_t st; memset(&st, 0, sizeof(st));
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(fix.s, &st, sizeof(st))
+                       == MOQ_OK);
+        if (st.objects_queued == 0 || moq_media_sender_is_fatal(fix.s)) break;
+        drive(&fix, now);
+    }
+    for (int i = 0; i < 4; i++) drive(&fix, now);
+
+    MOQ_TEST_CHECK(!moq_media_sender_is_fatal(fix.s));
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_fatal_code(fix.s), 0);
+    MOQ_TEST_CHECK(moq_session_state(moq_simpair_client(fix.sp)) ==
+                   MOQ_SESS_ESTABLISHED);
+    MOQ_TEST_CHECK(moq_session_state(moq_simpair_server(fix.sp)) ==
+                   MOQ_SESS_ESTABLISHED);
+    MOQ_TEST_CHECK(moq_media_sender_track_has_subscriber(fix.s, fix.t[0]));
+    expect_conserved(fix.s, 5, 4, 0, 1, 0, "blktail-drained");
+    {
+        const tr_exp_t exp[4] = { { 0, 0, 0, 0xe8, 0 }, { 0, 1, 0, 0xe9, 1 },
+                                  { 0, 2, 0, 0xeb, 3 }, { 0, 3, 0, 0xec, 4 } };
+        expect_from(&fix, from, exp, 4, "blktail-media");
+    }
+    /* Group 1 is reset exactly once and never FINs; complete groups 0 and 2
+     * FIN; group 3 is still open. */
+    {
+        const reset_exp_t rexp[1] = {
+            { 0, 1, 0, 0x10, true, .sub_opaque = 0, .pub_opaque = 0 } };
+        expect_resets(&fix, rexp, 1, "blktail-reset");
+        const term_exp_t terms[2] = { { 0, 0, 0, true, true },
+                                      { 0, 2, 0, true, true } };
+        expect_terminals(&fix, terms, 2, "blktail-terminals");
+    }
+    {
+        drop_snap_t d; drop_snap(fix.s, &d);
+        MOQ_TEST_CHECK_EQ_U64(d.abandoned, 1);
+    }
+
+out:
+    fix_free(&fix);
+    MOQ_TEST_CHECK(as.balance == 0);
+    report(&fix, name, before);
+}
+
+
 int main(void)
 {
     test_one_at_a_time();
@@ -5050,6 +5257,14 @@ int main(void)
     for (size_t r = 0; r < sizeof(rings) / sizeof(rings[0]); r++)
         for (int e = 0; e < 2; e++) test_failed_ts_timeline(rings[r], e != 0);
 #endif
+    test_drop_blocked_group(MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME,
+                            "pacing_drop_blocked_group_to_keyframe");
+    test_drop_blocked_group(MOQ_MEDIA_SEND_BP_DROP_GROUP,
+                            "pacing_drop_blocked_group_drop_group");
+    test_drop_blocked_tail(MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME,
+                           "pacing_drop_blocked_tail_to_keyframe");
+    test_drop_blocked_tail(MOQ_MEDIA_SEND_BP_DROP_GROUP,
+                           "pacing_drop_blocked_tail_drop_group");
     if (failures) {
         fprintf(stderr, "FAILURES: %d\n", failures);
         return 1;

@@ -313,6 +313,10 @@ struct moq_media_track {
     uint64_t              emit_obj;          /* next object id in emit_group */
     bool                  pending_reset;     /* a drop abandoned emit_group;
                                                 the drain must reset it */
+    bool                  write_blocked;     /* the facade holds a write of
+                                                blocked_group refused with
+                                                WOULD_BLOCK, pending retry */
+    uint64_t              blocked_group;
     bool                  skip_open;         /* a no-demand drop cut skip_group
                                                 short, so the rest of it is
                                                 dropped even once demand returns */
@@ -905,6 +909,15 @@ static bool preq_fits(const moq_media_sender_t *s, size_t need)
            s->preq_bytes + need <= active_byte_cap(s);
 }
 
+/* The facade holds Group g of this track: its subgroup is open on the wire, or
+ * a write of it was refused with WOULD_BLOCK and waits for a retry. A drop of
+ * g must reset it, or the next write of another Group is refused. */
+static bool sender_holds_group(const moq_media_track_t *t, uint64_t g)
+{
+    return (t->emit_open && t->emit_group == g) ||
+           (t->write_blocked && t->blocked_group == g);
+}
+
 /* Evict one specific group (every queued entry of track t + group g,
  * wherever it sits). With multiple tracks the streams interleave, so a
  * group's entries are not necessarily contiguous -- dropping only the
@@ -949,7 +962,7 @@ static void preq_evict_group(moq_media_sender_t *s,
          * this path's own wire semantics: if the subgroup for this group is
          * open, its tail just went away -- the drain must RESET it, not leave
          * it truncated. */
-        if (t->emit_open && t->emit_group == g)
+        if (sender_holds_group(t, g))
             t->pending_reset = true;
     }
 }
@@ -1945,6 +1958,7 @@ static moq_result_t sender_flush_reset(moq_media_sender_t *s,
     }
     t->pending_reset = false;
     t->emit_open = false;
+    t->write_blocked = false;
     s->stats.groups_abandoned++;
     t->tstats.groups_abandoned++;
     return MOQ_OK;
@@ -2227,7 +2241,8 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
                  * truncated. */
                 if (!t->drain_dropped) {
                     t->drain_dropped = true;
-                    if (t->emit_open) t->pending_reset = true;
+                    if (t->emit_open || sender_holds_group(t, e->group_seq))
+                        t->pending_reset = true;
                 }
                 preq_entry_release(s, e);
                 rd++;
@@ -2293,9 +2308,14 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
         if (props) moq_rcbuf_decref(props);   /* facade took its own ref */
 
         if (wrc != MOQ_OK) {
-            /* WOULD_BLOCK is shared capacity, NOT a fatal: retry later. */
-            if (wrc != MOQ_ERR_WOULD_BLOCK)
+            /* WOULD_BLOCK is shared capacity, NOT a fatal: retry later. A
+             * drop of this Group before the retry must abandon the write. */
+            if (wrc == MOQ_ERR_WOULD_BLOCK) {
+                t->write_blocked = true;
+                t->blocked_group = e->group_seq;
+            } else {
                 sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+            }
             t->drain_hold = true;
             stop = true;
             if (wr != rd) s->preq[wr % s->ring_cap] = *e;
@@ -2303,6 +2323,7 @@ static void sender_drain(moq_media_sender_t *s, uint64_t now_us)
             continue;
         }
 
+        t->write_blocked = false;
         t->emit_group = e->group_seq;
         t->emit_open = true;          /* facade subgroup stays open until the
                                          next group; complete groups have no
@@ -6462,7 +6483,7 @@ static void sender_abandon_open_group_locked(moq_media_sender_t *s,
     if (!t->group_open) return;
     uint64_t g = t->group_seq;
     preq_evict_group(s, t, g);
-    if (t->emit_open && t->emit_group == g) t->pending_reset = true;
+    if (sender_holds_group(t, g)) t->pending_reset = true;
     t->group_open = false;
     t->cur_group_anchored = false;
 }
@@ -7553,6 +7574,7 @@ bool moq_media_sender_test_emit_head(moq_media_sender_t *s,
     moq_media_track_t *t = e->track;
     bool new_group = !t->emit_open || t->emit_group != e->group_seq;
     t->emit_obj = (new_group ? 0 : t->emit_obj) + 1;
+    t->write_blocked = false;
     t->emit_group = e->group_seq;
     t->emit_open = true;
     s->stats.objects_sent++;
