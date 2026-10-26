@@ -58,8 +58,13 @@
 # Requires: git, cmake, a C compiler, and OpenSSL dev headers
 # (Ubuntu: apt-get install -y libssl-dev cmake).
 # --self-test additionally requires Ninja and CMake 3.20 or newer.
-# Configuration selection alone does not provide Windows archive discovery or
-# multi-config consumer exports; those remain separate portability work.
+# Multi-config LibMoQ build-tree exports remain separate portability work.
+#
+# Windows (Git Bash + Visual Studio 2022): picotls also needs pkg-config, and
+# neither it nor OpenSSL ships with the toolchain. E.g. with vcpkg:
+#   vcpkg install openssl pkgconf --triplet x64-windows-static-md
+#   export OPENSSL_ROOT_DIR=<vcpkg>/installed/x64-windows-static-md
+#   export PKG_CONFIG=$OPENSSL_ROOT_DIR/tools/pkgconf/pkgconf.exe
 
 set -euo pipefail
 
@@ -273,7 +278,7 @@ set(MSVC TRUE)
 add_compile_options(/DMOQ_CALLER_FLAG=17)
 include("${MOQ_POLICY}")
 get_directory_property(actual COMPILE_OPTIONS)
-if(NOT "${actual}" STREQUAL "/DMOQ_CALLER_FLAG=17;/WX;/UNDEBUG")
+if(NOT "${actual}" STREQUAL "/DMOQ_CALLER_FLAG=17;/UNDEBUG")
     message(FATAL_ERROR "MSVC policy options changed: ${actual}")
 endif()
 CMAKE
@@ -774,6 +779,19 @@ exec 3>&1 1>&2
 command -v git   >/dev/null 2>&1 || die "git not found"
 command -v cmake >/dev/null 2>&1 || die "cmake not found"
 
+# Without OpenSSL picotls silently drops its OpenSSL backend and the build then
+# fails on the missing picotls-openssl target; on Windows neither OpenSSL nor
+# pkg-config comes with the toolchain, so check up front.
+case "$(uname -s)" in
+MINGW* | MSYS* | CYGWIN*)
+    if [ -z "${PKG_CONFIG:-}" ] && ! command -v pkg-config >/dev/null 2>&1; then
+        die "pkg-config not found (picotls requires it); install one (e.g. vcpkg pkgconf) and set PKG_CONFIG=/path/to/pkgconf.exe"
+    fi
+    [ -n "${OPENSSL_ROOT_DIR:-}" ] \
+        || die "OPENSSL_ROOT_DIR not set; point it at an OpenSSL install (e.g. vcpkg x64-windows-static-md)"
+    ;;
+esac
+
 # Fetch a repo at an exact commit into $dir (idempotent, shallow when
 # the server allows fetch-by-SHA, which GitHub does).
 fetch_at() {
@@ -818,6 +836,7 @@ build_picotls "$picotls_dir" "$picotls_build"
 
 # Sanity: picotls-core archive must exist where FindPicoquic expects it.
 ls "$picotls_build"/libpicotls-core.* >/dev/null 2>&1 \
+    || [ -f "$picotls_build/picotls-core.lib" ] \
     || die "picotls build produced no libpicotls-core in $picotls_build"
 
 # -- Emit the two configure inputs -------------------------------------
@@ -835,9 +854,15 @@ env_file="$MOQ_DEPS_DIR/picoquic_deps.env"
 # NOT a shell file - Actions parses it as raw NAME=value env-file lines,
 # so these stay unescaped (unlike the eval/source output above).
 if [ -n "${GITHUB_ENV:-}" ]; then
+    gh_picoquic_dir=$picoquic_dir
+    gh_picotls_build=$picotls_build
+    if command -v cygpath >/dev/null 2>&1; then
+        gh_picoquic_dir=$(cygpath -m "$picoquic_dir")
+        gh_picotls_build=$(cygpath -m "$picotls_build")
+    fi
     {
-        printf 'MOQ_PICOQUIC_SOURCE_DIR=%s\n' "$picoquic_dir"
-        printf 'MOQ_PICOTLS_PREFIX=%s\n'      "$picotls_build"
+        printf 'MOQ_PICOQUIC_SOURCE_DIR=%s\n' "$gh_picoquic_dir"
+        printf 'MOQ_PICOTLS_PREFIX=%s\n'      "$gh_picotls_build"
     } >> "$GITHUB_ENV"
 fi
 

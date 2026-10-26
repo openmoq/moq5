@@ -29,6 +29,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>   /* Sleep */
+#endif
 
 /* Async-signal-safe: the handler only sets a flag. The send loop checks it
  * each iteration. (Do NOT call libmoq from a signal handler --
@@ -230,8 +233,12 @@ int main(int argc, char **argv)
             break;
         }
 
+#ifdef _WIN32
+        Sleep(33);                              /* ~30 fps pacing */
+#else
         struct timespec ts = { 0, 33333000 };   /* ~30 fps pacing */
         nanosleep(&ts, NULL);
+#endif
     }
 
     printf("wrote %llu objects\n", sent);

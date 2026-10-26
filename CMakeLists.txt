@@ -126,6 +126,12 @@ if(MOQ_BUILD_ADAPTER_MVFST OR MOQ_BUILD_ADAPTER_PROXYGEN)
     enable_language(CXX)
 endif()
 
+# MSVC only exposes C11 <stdatomic.h> (used by the threaded service tier)
+# behind this switch (VS 2022 17.5+).
+if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+endif()
+
 # -- Core (always built) -------------------------------------------
 add_subdirectory(core)
 
@@ -432,6 +438,8 @@ install(FILES
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 
 if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
+    # FindPicoquic.cmake injects MoqPicoquicProjectPolicy.cmake into picoquic's
+    # project() when a consumer rebuilds picoquic from source, so both ship.
     install(FILES
         cmake/FindPicoquic.cmake
         cmake/MoqPicoquicProjectPolicy.cmake

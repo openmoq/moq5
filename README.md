@@ -202,6 +202,25 @@ facade the service still builds, but that transport returns
 > package does not ship the private header and will fail configuration with a
 > clear message.
 
+### Windows (MSVC)
+
+The core, service tier and picoquic raw-QUIC adapter (including the threaded
+facade) build with Visual Studio 2022 (17.5+). Neither OpenSSL nor pkg-config
+(which picotls requires) ships with the toolchain; vcpkg provides both:
+
+```sh
+vcpkg install openssl pkgconf --triplet x64-windows-static-md
+export OPENSSL_ROOT_DIR=<vcpkg>/installed/x64-windows-static-md
+export PKG_CONFIG=$OPENSSL_ROOT_DIR/tools/pkgconf/pkgconf.exe
+```
+
+Then run `scripts/setup_picoquic_deps.sh` from Git Bash and configure as on
+the other platforms, from a "x64 Native Tools" / Developer shell with
+`-G Ninja` (the hand-written build-tree target exports do not support
+multi-config generators such as Visual Studio's yet). Consumers of the
+installed package can use any generator; they only need `OPENSSL_ROOT_DIR`
+in addition to the usual `MOQ_PICOQUIC_SOURCE_DIR` / `MOQ_PICOTLS_PREFIX`.
+
 ## Packaging
 
 Install with `cmake --install`, then consume via

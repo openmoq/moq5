@@ -26,8 +26,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#ifdef _WIN32
+#include <winsock2.h>   /* sockaddr_in, htons */
+#else
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#endif
 
 static volatile int running = 1;
 
