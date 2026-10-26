@@ -36,6 +36,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <moq/media_sender.h>
 #include "test_support.h"
+#include "media_sender_cmaf_init.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <spawn.h>
@@ -183,6 +184,9 @@ static moq_media_sender_t *lossless_sender(uint64_t block_timeout_us, bool cmaf,
     tc.packaging = cmaf ? MOQ_MEDIA_PACKAGING_CMAF : MOQ_MEDIA_PACKAGING_RAW;
     tc.codec = (moq_bytes_t){ CODEC, 11 };
     tc.bitrate = 1000000;
+    uint8_t init[256];
+    if (cmaf)
+        tc.init_data = (moq_bytes_t){ init, sender_test_cmaf_init(init, 1) };
     if (moq_media_sender_add_track(s, &tc, t) != MOQ_OK) { moq_media_sender_test_free(s); return NULL; }
     return s;
 }

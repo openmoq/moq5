@@ -259,9 +259,10 @@ int main(int argc, char **argv)
                  *   - desc.init_data: the full container/init segment (for CMAF
                  *     the ftyp+moov). Muxers/recorders want this, not decoders.
                  * desc.init_data is the *resolved* bytes regardless of how the
-                 * catalog carried them: a CMAF track references a shared entry
-                 * via MSF-01 initRef -> initDataList; RAW/LOC keeps init inline.
-                 * Either way the receiver hands you the resolved segment here. */
+                 * catalog carried them. Service senders on every supported
+                 * transport reference root initDataList via MSF-01 initRef,
+                 * for RAW audio/video and CMAF alike. Supported legacy inline
+                 * input is also resolved; the application sees the bytes here. */
                 /* name and codec are PEER-CONTROLLED: escape before printing so
                  * a remote peer cannot inject terminal control sequences. */
                 fputs("TRACK_ADDED name=", stdout);

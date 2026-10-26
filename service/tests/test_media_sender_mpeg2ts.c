@@ -484,11 +484,12 @@ static void test_catalog_metadata(void)
 static void test_catalog_late_add(bool raw, bool with_init, bool d22)
 {
     int before = failures;
-    const bool full = !raw && with_init;
-    const char *name = d22 ? "ts_late_add_init_full_d22"
-                     : raw ? "ts_late_add_raw_legacy"
-                           : with_init ? "ts_late_add_init_full"
-                                       : "ts_late_add_no_init_delta";
+    const bool full = with_init;
+    const char *name = raw
+        ? (d22 ? (with_init ? "raw_late_add_full_d22" : "raw_late_add_delta_d22")
+               : (with_init ? "raw_late_add_full_legacy" : "raw_late_add_delta_legacy"))
+        : (d22 ? (with_init ? "ts_late_add_full_d22" : "ts_late_add_delta_d22")
+               : (with_init ? "ts_late_add_full_legacy" : "ts_late_add_delta_legacy"));
     moq_media_sender_t *s = d22 ? make_d22_sender()
                                 : make_sender(MOQ_MEDIA_SEND_BP_RETURN_WOULD_BLOCK, 0);
     MOQ_TEST_CHECK(s != NULL);
@@ -547,7 +548,15 @@ static void test_catalog_late_add(bool raw, bool with_init, bool d22)
         goto cleanup;
     }
 
-    /* A full generation is object 0; the legacy controls are base + ADD. */
+    char base_json[4096];
+    size_t base_len = moq_rcbuf_len(objs[0]);
+    MOQ_TEST_CHECK(base_len < sizeof(base_json));
+    if (base_len < sizeof(base_json)) {
+        memcpy(base_json, moq_rcbuf_data(objs[0]), base_len); base_json[base_len] = '\0';
+        MOQ_TEST_CHECK(strstr(base_json, "\"version\":\"draft-01\"") != NULL);
+        MOQ_TEST_CHECK(strstr(base_json, "\"initData\":") == NULL);
+    }
+    /* Init-bearing RAW and TS use a full generation; init-less adds use a delta. */
     moq_rcbuf_t *wire = objs[n - 1];
     MOQ_TEST_CHECK(wire != NULL);
     if (!wire) goto cleanup;
@@ -563,6 +572,13 @@ static void test_catalog_late_add(bool raw, bool with_init, bool d22)
         MOQ_TEST_CHECK(find_track(&cat, "base") != NULL);
         late = find_track(&cat, "late");
     } else {
+        char delta_json[2048];
+        size_t delta_len = moq_rcbuf_len(wire);
+        MOQ_TEST_CHECK(delta_len < sizeof(delta_json));
+        if (delta_len < sizeof(delta_json)) {
+            memcpy(delta_json, moq_rcbuf_data(wire), delta_len); delta_json[delta_len] = '\0';
+            MOQ_TEST_CHECK(strstr(delta_json, "\"version\"") == NULL);
+        }
         MOQ_TEST_CHECK(!cat.has_generated_at);
         MOQ_TEST_CHECK(cat.delta_update != NULL && cat.delta_update_count == 1);
         if (!cat.delta_update || cat.delta_update_count != 1) goto cleanup;
@@ -576,24 +592,23 @@ static void test_catalog_late_add(bool raw, bool with_init, bool d22)
     MOQ_TEST_CHECK(late != NULL);
     if (!late) goto cleanup;
     MOQ_TEST_CHECK(late->has_init_ref == full);
-    MOQ_TEST_CHECK(late->has_init_data == (raw && with_init));
+    MOQ_TEST_CHECK(!late->has_init_data);
     MOQ_TEST_CHECK_EQ_SIZE(cat.init_data_count, full ? 1 : 0);
     if (!full) {
-        if (raw) {
-            rc = moq_msf_decode_init_data(al, late->init_data, &decoded);
-            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
-            MOQ_TEST_CHECK(decoded && moq_rcbuf_len(decoded) == sizeof(raw_init) &&
-                           memcmp(moq_rcbuf_data(decoded), raw_init,
-                                  sizeof(raw_init)) == 0);
-        } else {
-            MOQ_TEST_CHECK(moq_msf_track_mpeg2ts_check(late, NULL) == MOQ_OK);
-        }
+        if (!raw) MOQ_TEST_CHECK(moq_msf_track_mpeg2ts_check(late, NULL) == MOQ_OK);
         goto cleanup;
     }
-    rc = moq_msf_track_mpeg2ts_init_data(al, &cat, late, &decoded, NULL);
+    const moq_msf_init_data_entry_t *entry =
+        moq_msf_catalog_find_init_data(&cat, late->init_ref);
+    MOQ_TEST_CHECK(entry != NULL);
+    if (!raw) rc = moq_msf_track_mpeg2ts_init_data(al, &cat, late, &decoded, NULL);
+    else if (entry) rc = moq_msf_decode_init_data(al, entry->data, &decoded);
+    else rc = MOQ_ERR_PROTO;
     MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
-    MOQ_TEST_CHECK(decoded && moq_rcbuf_len(decoded) == psi_len &&
-                   memcmp(moq_rcbuf_data(decoded), psi, psi_len) == 0);
+    const uint8_t *want_init = raw ? raw_init : psi;
+    const size_t want_len = raw ? sizeof(raw_init) : psi_len;
+    MOQ_TEST_CHECK(decoded && moq_rcbuf_len(decoded) == want_len &&
+                   memcmp(moq_rcbuf_data(decoded), want_init, want_len) == 0);
     if (decoded) { moq_rcbuf_decref(decoded); decoded = NULL; }
 
     /* Model commitment, then build the later independent refresh document.
@@ -616,10 +631,14 @@ static void test_catalog_late_add(bool raw, bool with_init, bool d22)
                    again->init_ref.len > 0 &&
                    memcmp(again->init_ref.data, late->init_ref.data,
                           again->init_ref.len) == 0);
-    rc = moq_msf_track_mpeg2ts_init_data(al, &refresh, again, &decoded, NULL);
+    entry = moq_msf_catalog_find_init_data(&refresh, again->init_ref);
+    MOQ_TEST_CHECK(entry != NULL);
+    if (!raw) rc = moq_msf_track_mpeg2ts_init_data(al, &refresh, again, &decoded, NULL);
+    else if (entry) rc = moq_msf_decode_init_data(al, entry->data, &decoded);
+    else rc = MOQ_ERR_PROTO;
     MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
-    MOQ_TEST_CHECK(decoded && moq_rcbuf_len(decoded) == psi_len &&
-                   memcmp(moq_rcbuf_data(decoded), psi, psi_len) == 0);
+    MOQ_TEST_CHECK(decoded && moq_rcbuf_len(decoded) == want_len &&
+                   memcmp(moq_rcbuf_data(decoded), want_init, want_len) == 0);
 cleanup:
     if (decoded) moq_rcbuf_decref(decoded);
     moq_msf_catalog_cleanup(al, &refresh);
@@ -2078,41 +2097,42 @@ static moq_simpair_t *companion_pair(moq_version_t version)
     return sp;
 }
 
-/* A CMAF track without init_data: accepted while an AUTO companion is
- * unresolved, and blocking it once it resolves to draft 22. */
+/* A rejected CMAF registration must not poison an AUTO sender. */
 static moq_result_t add_no_init_cmaf(moq_media_sender_t *s)
 {
     ts_track_opts_t o;
     memset(&o, 0, sizeof(o));
     o.name = "cmaf";
     o.packaging = MOQ_MEDIA_PACKAGING_CMAF;
-    moq_media_track_t *t = NULL;
-    return add_track(s, &o, &t);
+    moq_media_track_t *t = (moq_media_track_t *)(uintptr_t)1;
+    moq_result_t rc = add_track(s, &o, &t);
+    MOQ_TEST_CHECK(t == NULL);
+    return rc;
 }
 
-/* Rows: 0 explicit legacy on D22, 1 explicit D22 on D18, 2 AUTO on D22
- * blocked by a CMAF track without init_data, 3 explicit D22 before any draft
- * is observed -- each refused before a byte is taken. Controls: 4 legacy on
- * D18, 5 explicit D22 on D22, 6 AUTO on D22, 7 AUTO on D18, 8 unresolved AUTO
- * -- each takes the whole stream. */
+/* Explicit companion/draft mismatches refuse before taking bytes. Controls
+ * accept the whole stream, including AUTO after a missing-init CMAF registration
+ * was refused. Cover that registration both before and after the D22 latch. */
 static void test_companion_refusal(void)
 {
     int before = failures;
     static const struct {
         moq_media_companion_profile_t companion;
         moq_version_t version;       /* 0: no session observed */
-        bool blocker;
+        bool rejected_cmaf;
         bool refused;
     } rows[] = {
         { MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, MOQ_VERSION_DRAFT_22, false, true },
         { MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, MOQ_VERSION_DRAFT_18, false, true },
-        { MOQ_MEDIA_COMPANION_AUTO, MOQ_VERSION_DRAFT_22, true, true },
+        { MOQ_MEDIA_COMPANION_AUTO, MOQ_VERSION_DRAFT_22, true, false },
         { MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, 0, false, true },
         { MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, MOQ_VERSION_DRAFT_18, false, false },
         { MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, MOQ_VERSION_DRAFT_22, false, false },
         { MOQ_MEDIA_COMPANION_AUTO, MOQ_VERSION_DRAFT_22, false, false },
         { MOQ_MEDIA_COMPANION_AUTO, MOQ_VERSION_DRAFT_18, false, false },
         { MOQ_MEDIA_COMPANION_AUTO, 0, false, false },
+        { MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, MOQ_VERSION_DRAFT_16, false, false },
+        { MOQ_MEDIA_COMPANION_AUTO, MOQ_VERSION_DRAFT_16, false, false },
     };
     static uint8_t stream[STREAM_MAX];
     size_t len = make_stream(stream, 188, false);
@@ -2123,15 +2143,32 @@ static void test_companion_refusal(void)
         moq_msf_mpeg2ts_t rec;
         ts_rec(&rec, MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM, 188);
         moq_media_track_t *t = add_bytes_track(s, &rec, 4);
-        if (rows[i].blocker)
-            MOQ_TEST_CHECK_EQ_INT((int)add_no_init_cmaf(s), (int)MOQ_OK);
+        if (rows[i].rejected_cmaf)
+            MOQ_TEST_CHECK_EQ_INT((int)add_no_init_cmaf(s), (int)MOQ_ERR_INVAL);
         moq_simpair_t *sp = NULL;
         if (rows[i].version) {
             sp = companion_pair(rows[i].version);
             MOQ_TEST_CHECK(sp != NULL);
             if (sp) moq_media_sender_test_pump(s, moq_simpair_client(sp), 1000);
         }
+        if (rows[i].rejected_cmaf && sp)
+            MOQ_TEST_CHECK_EQ_INT((int)add_no_init_cmaf(s), (int)MOQ_ERR_INVAL);
         if (t && (sp || !rows[i].version)) {
+            moq_rcbuf_t *json = NULL;
+            MOQ_TEST_CHECK(moq_media_sender_test_build_catalog(s, &json) == MOQ_OK && json);
+            if (json) {
+                char text[2048];
+                size_t n = moq_rcbuf_len(json);
+                MOQ_TEST_CHECK(n < sizeof(text));
+                if (n < sizeof(text)) {
+                    memcpy(text, moq_rcbuf_data(json), n); text[n] = '\0';
+                    MOQ_TEST_CHECK(strstr(text, "\"version\":\"draft-01\"") != NULL);
+                    MOQ_TEST_CHECK(strstr(text, "\"packaging\":\"mpeg2ts\"") != NULL);
+                    MOQ_TEST_CHECK(strstr(text, "\"initData\":") == NULL);
+                    MOQ_TEST_CHECK(strstr(text, "\"initRef\":") == NULL);
+                }
+                moq_rcbuf_decref(json);
+            }
             /* One sync byte: on refusal it is not taken into the carry. */
             size_t consumed = 99;
             moq_result_t rc = write_ts(s, t, stream, 1, false, &consumed);
@@ -2167,10 +2204,10 @@ static void test_companion_refusal(void)
     if (failures == before) printf("PASS: ts_write_companion_refusal\n");
 }
 
-/* The session latches between Objects of one call -- while the writer has
- * released the sender -- and resolves an AUTO companion to a refusal (draft 22
- * with a CMAF track lacking init_data). The call stops there: no further byte
- * is taken, and the bytes already taken stay reported. */
+/* The session latches between Objects of one call while the writer releases
+ * the sender. Explicit LEGACY initially accepts writes before negotiation, then
+ * refuses the D22 mismatch. No further byte is taken; prior consumption stays
+ * reported. This preserves the partial-consumption oracle after early CMAF refusal. */
 typedef struct yield_latch {
     moq_media_sender_t *s;
     moq_simpair_t *sp;
@@ -2189,14 +2226,13 @@ static void test_companion_refusal_at_yield(void)
     int before = failures;
     static uint8_t stream[STREAM_MAX];
     size_t len = make_stream(stream, 188, false);
-    moq_media_sender_t *s = make_companion_sender(MOQ_MEDIA_COMPANION_AUTO);
+    moq_media_sender_t *s = make_companion_sender(MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01);
     moq_simpair_t *sp = companion_pair(MOQ_VERSION_DRAFT_22);
     MOQ_TEST_CHECK(s != NULL && sp != NULL);
     if (s && sp) {
         moq_msf_mpeg2ts_t rec;
         ts_rec(&rec, MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM, 188);
         moq_media_track_t *t = add_bytes_track(s, &rec, 2);
-        MOQ_TEST_CHECK_EQ_INT((int)add_no_init_cmaf(s), (int)MOQ_OK);
         yield_latch_t y = { s, sp, 0 };
         moq_media_sender_test_set_ts_yield_hook(latch_in_yield, &y);
         size_t consumed = 0;
@@ -2233,6 +2269,10 @@ int main(void)
     test_catalog_late_add(false, true, false);
     test_catalog_late_add(false, false, false);
     test_catalog_late_add(true, true, false);
+    test_catalog_late_add(true, false, false);
+    test_catalog_late_add(true, true, true);
+    test_catalog_late_add(true, false, true);
+    test_catalog_late_add(false, false, true);
     test_catalog_late_add(false, true, true);
     test_track_cfg_abi();
     test_chunking();

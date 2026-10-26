@@ -460,10 +460,6 @@ struct moq_media_sender {
      * with the matching companion (sender_resolve_companion_locked). */
     moq_media_companion_profile_t companion_profile;
     bool             companion_auto;
-    /* AUTO resolved to draft-22 while a registered CMAF track has no
-     * init_data (CMSF-01 3.1). The companion is then unusable, reported as
-     * MOQ_ERR_UNSUPPORTED, until such tracks are removed. Under mu. */
-    bool             companion_blocked;
 
     /* Namespace + catalog track name, deep-copied (same idiom as the
      * receiver): [ns part bytes...][catalog name bytes]. */
@@ -788,8 +784,7 @@ static moq_bytes_t default_role(moq_media_type_t t)
 static bool sender_version_usable(const moq_media_sender_t *s)
 {
     if (s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
-        return s->transport_version == MOQ_VERSION_DRAFT_22 &&
-               !s->companion_blocked;
+        return s->transport_version == MOQ_VERSION_DRAFT_22;
     if (s->companion_profile == MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01)
         return s->transport_version == MOQ_VERSION_DRAFT_16 ||
                s->transport_version == MOQ_VERSION_DRAFT_18;
@@ -797,10 +792,9 @@ static bool sender_version_usable(const moq_media_sender_t *s)
 }
 
 /* Whether a media write is refused as a companion/negotiated-version
- * mismatch: the latched draft is one the companion in effect cannot use
- * (including an AUTO companion blocked on draft 22), or an explicit D22
- * companion has not yet observed draft 22. An unresolved AUTO companion
- * before any draft is latched is not refused. CALLER MUST HOLD s->mu. */
+ * mismatch: the latched draft is one the companion in effect cannot use,
+ * or an explicit D22 companion has not yet observed draft 22. An unresolved
+ * AUTO companion before any draft is latched is not refused. CALLER MUST HOLD s->mu. */
 static bool sender_companion_refused_locked(const moq_media_sender_t *s)
 {
     if (sender_version_usable(s)) return false;
@@ -1147,8 +1141,7 @@ static void track_fill_msf(const moq_media_track_t *t, moq_msf_track_t *m)
     m->has_role = true;
     m->role = t->role.len ? t->role : default_role(t->media_type);
     if (t->codec.len) { m->has_codec = true; m->codec = t->codec; }
-    /* init data is wired by the caller: CMAF -> initDataList[] + initRef,
-     * LOC -> inline initData (legacy). */
+    /* Init data is wired by the caller: root initDataList[] + initRef. */
     if (t->width)  { m->has_width = true;  m->width = t->width; }
     if (t->height) { m->has_height = true; m->height = t->height; }
     if (t->samplerate) { m->has_samplerate = true; m->samplerate = t->samplerate; }
@@ -1248,31 +1241,12 @@ static void sender_tracks_release(moq_media_sender_t *s,
  * stay distinguishable: a REAL build (initial/mutation/refresh) chooses one
  * fresh stamp and carries it with the buffer it encoded, while a COMPARISON
  * build is handed the published stamp and never consults the clock. */
-/* Whether this sender publishes the draft-22 companion's MSF-01 catalog:
- * version "draft-01" (5.1.1), every track's initialization data in the root
- * initDataList referenced by initRef (5.1.7, 5.2.13), and Group IDs based on
- * the wallclock at creation, the approach 6.1 suggests. That base is
- * best-effort: it does not by itself guarantee 6.1's restart rule that a new
- * starting Group ID exceeds every earlier one (draft-ietf-moq-msf-01 6.1,
- * lines 2778-2790), which stays the application's responsibility. The legacy
- * companion keeps its catalog and group numbering unchanged. */
-static bool sender_msf01_catalog(const moq_media_sender_t *s)
+/* Every service companion carries nonempty initialization data in the root
+ * initDataList with track initRef (MSF-01 5.1.7, 5.2.13). This one rule governs
+ * independent catalogs, stable ID assignment and the deltaUpdate fallback. */
+static bool sender_init_by_reference(const moq_media_track_t *t)
 {
-    return s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
-}
-
-/* Whether t's initialization data is carried in the root initDataList and
- * referenced by initRef, rather than inline: a CMAF init segment (CMSF 3.1),
- * an mpeg2ts track's PSI (Use of MSF Initialization Data), and every track of
- * the draft-22 companion (MSF-01 5.1.7, 5.2.13). The one rule for the
- * independent catalog, id assignment and the deltaUpdate fallback. */
-static bool sender_init_by_reference(const moq_media_sender_t *s,
-                                     const moq_media_track_t *t)
-{
-    return t->init_data.len > 0 &&
-           (t->packaging == MOQ_MEDIA_PACKAGING_CMAF ||
-            t->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS ||
-            sender_msf01_catalog(s));
+    return t->init_data.len > 0;
 }
 
 /* The first Group ID of every track of this sender instance, media,
@@ -1340,50 +1314,32 @@ static moq_result_t sender_build_catalog_at(moq_media_sender_t *s,
         moq_media_track_t *t = s->tracks[i];
         if (!track_in_catalog(t, only_registered)) continue;
         track_fill_msf(t, &mt[k]);
-        if (t->init_data.len > 0) {
-            if (sender_init_by_reference(s, t)) {
-                /* CMSF §3.1, and MSF-01 5.1.7/5.2.13 for every track of the
-                 * draft-22 companion: the init data lives in initDataList[];
-                 * the track references it via initRef. An mpeg2ts track's PSI
-                 * packets go the same way, as the "inline" entry the draft
-                 * requires (Use of MSF Initialization Data). Tracks with
-                 * identical init bytes share the one id assigned at add_track,
-                 * so the catalog emits one entry per id, whichever of its
-                 * tracks is still included. */
-                size_t e = idl_count;
-                for (size_t j = 0; j < idl_count; j++) {
-                    if (idl[j].id.len == t->init_ref.len &&
-                        memcmp(idl[j].id.data, t->init_ref.data,
-                               t->init_ref.len) == 0) {
-                        e = j;
-                        break;
-                    }
-                }
-                if (e == idl_count) {
-                    rc = moq_msf_encode_init_data(&s->alloc, t->init_data,
-                                                  &b64[nb]);
-                    if (rc < 0) break;
-                    idl[idl_count].id   = t->init_ref;
-                    idl[idl_count].type =
-                        (moq_bytes_t){ (const uint8_t *)"inline", 6 };
-                    idl[idl_count].data = (moq_bytes_t){
-                        moq_rcbuf_data(b64[nb]), moq_rcbuf_len(b64[nb]) };
-                    nb++;
-                    idl_count++;
-                }
-                mt[k].has_init_ref = true;
-                mt[k].init_ref = idl[e].id;
-            } else {
-                /* Legacy LOC: inline initData (base64), not shared. */
-                rc = moq_msf_encode_init_data(&s->alloc, t->init_data, &b64[nb]);
-                if (rc < 0) break;
-                if (moq_rcbuf_len(b64[nb]) > 0) {
-                    mt[k].has_init_data = true;
-                    mt[k].init_data = (moq_bytes_t){
-                        moq_rcbuf_data(b64[nb]), moq_rcbuf_len(b64[nb]) };
-                    nb++;
+        if (sender_init_by_reference(t)) {
+            /* Identical init bytes share the stable ID assigned at add_track,
+             * so emit one root entry per ID, whichever track still uses it. */
+            size_t e = idl_count;
+            for (size_t j = 0; j < idl_count; j++) {
+                if (idl[j].id.len == t->init_ref.len &&
+                    memcmp(idl[j].id.data, t->init_ref.data,
+                           t->init_ref.len) == 0) {
+                    e = j;
+                    break;
                 }
             }
+            if (e == idl_count) {
+                rc = moq_msf_encode_init_data(&s->alloc, t->init_data,
+                                              &b64[nb]);
+                if (rc < 0) break;
+                idl[idl_count].id   = t->init_ref;
+                idl[idl_count].type =
+                    (moq_bytes_t){ (const uint8_t *)"inline", 6 };
+                idl[idl_count].data = (moq_bytes_t){
+                    moq_rcbuf_data(b64[nb]), moq_rcbuf_len(b64[nb]) };
+                nb++;
+                idl_count++;
+            }
+            mt[k].has_init_ref = true;
+            mt[k].init_ref = idl[e].id;
         }
         k++;
     }
@@ -1408,8 +1364,7 @@ static moq_result_t sender_build_catalog_at(moq_media_sender_t *s,
          * marked removed (complete_finalized), so the loop above already
          * yields an empty tracks array. */
         cat.is_complete = s->complete_finalized;
-        if (sender_msf01_catalog(s))
-            cat.version_form = MOQ_MSF_VERSION_FORM_DRAFT_NAME;   /* 5.1.1 */
+        cat.version_form = MOQ_MSF_VERSION_FORM_DRAFT_NAME;   /* MSF-01 5.1.1 */
         rc = moq_msf_catalog_encode(&s->alloc, &cat, out);
     }
 
@@ -2679,8 +2634,8 @@ static bool rcbuf_bytes_eq(const moq_rcbuf_t *a, const moq_rcbuf_t *b)
 
 /* Build one deltaUpdate object (ADD or REMOVE) from `tracks`, encoded to an
  * rcbuf. An ADD op carries full, self-contained tracks (packaging/isLive forced
- * on so the encoder emits them, and any init data inlined base64 so the
- * receiver's apply_delta builds a valid effective without a root initDataList);
+ * on so the encoder emits them). Init-bearing additions use a full independent
+ * generation because deltas cannot carry the root initDataList;
  * a REMOVE op carries only the track name (MSF 5.1.6). Returns MOQ_OK with *out
  * set. */
 static moq_result_t sender_build_delta_op(moq_media_sender_t *s,
@@ -2692,14 +2647,7 @@ static moq_result_t sender_build_delta_op(moq_media_sender_t *s,
     if (n == 0) return MOQ_ERR_INVAL;
     moq_msf_track_t *mt = (moq_msf_track_t *)s->alloc.alloc(
         n * sizeof(moq_msf_track_t), s->alloc.ctx);
-    moq_rcbuf_t **b64 = (moq_rcbuf_t **)s->alloc.alloc(
-        n * sizeof(moq_rcbuf_t *), s->alloc.ctx);
-    if (!mt || !b64) {
-        if (mt) s->alloc.free(mt, n * sizeof(moq_msf_track_t), s->alloc.ctx);
-        if (b64) s->alloc.free(b64, n * sizeof(moq_rcbuf_t *), s->alloc.ctx);
-        return MOQ_ERR_NOMEM;
-    }
-    memset(b64, 0, n * sizeof(moq_rcbuf_t *));
+    if (!mt) return MOQ_ERR_NOMEM;
 
     moq_result_t rc = MOQ_OK;
     for (size_t i = 0; i < n; i++) {
@@ -2707,21 +2655,6 @@ static moq_result_t sender_build_delta_op(moq_media_sender_t *s,
             track_fill_msf(tracks[i], &mt[i]);
             mt[i].has_packaging = true;   /* encoder emits packaging + isLive */
             mt[i].has_is_live = true;
-            /* Inline the init segment (base64) so the add is self-contained --
-             * a delta has no root initDataList for an initRef to resolve. This
-             * matches the LOC track's canonical inline-init shape; CMAF init-
-             * bearing adds never reach here (the caller falls back to a full
-             * independent generation so the track keeps its initRef shape). */
-            if (tracks[i]->init_data.len > 0) {
-                rc = moq_msf_encode_init_data(&s->alloc, tracks[i]->init_data,
-                                              &b64[i]);
-                if (rc < 0) break;
-                mt[i].has_init_data = true;
-                mt[i].init_data = (moq_bytes_t){ moq_rcbuf_data(b64[i]),
-                                                 moq_rcbuf_len(b64[i]) };
-                mt[i].has_init_ref = false;   /* inline, not a list reference */
-                mt[i].init_ref = (moq_bytes_t){ NULL, 0 };
-            }
         } else { /* REMOVE: name only (MSF 5.1.6). */
             memset(&mt[i], 0, sizeof(mt[i]));
             mt[i].struct_size = sizeof(mt[i]);
@@ -2739,8 +2672,6 @@ static moq_result_t sender_build_delta_op(moq_media_sender_t *s,
         rc = moq_msf_catalog_encode(&s->alloc, &cat, out);
     }
 
-    for (size_t i = 0; i < n; i++) if (b64[i]) moq_rcbuf_decref(b64[i]);
-    s->alloc.free(b64, n * sizeof(moq_rcbuf_t *), s->alloc.ctx);
     s->alloc.free(mt, n * sizeof(moq_msf_track_t), s->alloc.ctx);
     return rc;
 }
@@ -2891,12 +2822,10 @@ static bool sender_stage_generation(moq_media_sender_t *s)
              * carry. Emitting it inline here would diverge from the track's
              * canonical (initRef) shape in every later independent catalog,
              * which the receiver's immutable-tuple check rejects. So a
-             * generation that adds such a track -- an init-bearing CMAF or
-             * mpeg2ts track, and every init-bearing track of the draft-22
-             * companion (MSF-01 has no per-track initData) -- falls back to
-             * a full independent generation. Legacy LOC inline init, and
-             * init-less tracks, stay on the delta path. */
-            if (sender_init_by_reference(s, t))
+             * generation that adds any init-bearing track falls back to a
+             * full independent generation. Init-less tracks stay on the delta
+             * path. */
+            if (sender_init_by_reference(t))
                 init_ref_add = true;
         } else if (!in_cat && t->in_published) {
             rems[nr++] = t;
@@ -3527,32 +3456,22 @@ static void sender_pub_on_publish_finished(void *ctx, moq_pub_track_t *pt)
     if (fire && cb) cb(cbctx, s, t);
 }
 
-static bool sender_assign_init_ref(moq_media_sender_t *s, moq_media_track_t *t);
-
 /* Resolve an AUTO companion against the draft just latched: draft 22 selects
  * D22_MSF01_LOC04_PUBLIC, drafts 16/18 LEGACY_MSF01_LOC01, and any other draft
  * leaves it unresolved, which no draft can use. The latch runs before this
  * session's publisher, catalog or first object exists, so nothing reaches the
  * wire under an unresolved companion. Resolution happens once:
- *   draft-22: tracks registered meanwhile take the initDataList ids the
- *     draft-22 companion gives every init-bearing track. Group IDs already
- *     assigned keep the wallclock base read at creation.
+ *   draft-22: Group IDs already assigned keep the wallclock base read at
+ *     creation. InitDataList IDs were assigned at registration on every profile.
  *   legacy: Group IDs assigned meanwhile were counted from that base; they
  *     are moved down by it, so the legacy companion still starts at 0.
- * Until the track list is frozen, each pass also re-derives companion_blocked.
- * Returns false only when an initDataList id cannot be allocated.
  * CALLER MUST HOLD s->mu. */
-static bool sender_resolve_companion_locked(moq_media_sender_t *s)
+static void sender_resolve_companion_locked(moq_media_sender_t *s)
 {
     if (s->companion_profile == MOQ_MEDIA_COMPANION_AUTO) {
         moq_version_t v = s->transport_version;
         if (v == MOQ_VERSION_DRAFT_22) {
             s->companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
-            for (size_t i = 0; i < s->track_count; i++) {
-                if (s->tracks[i]->init_ref.len == 0 &&
-                    !sender_assign_init_ref(s, s->tracks[i]))
-                    return false;
-            }
         } else if (v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18) {
             s->companion_profile = MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
             uint64_t base = s->group_base;
@@ -3568,19 +3487,6 @@ static bool sender_resolve_companion_locked(moq_media_sender_t *s)
             s->group_base = 0;
         }
     }
-    if (s->companion_auto && !s->tracks_frozen) {
-        bool blocked = false;
-        if (s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC) {
-            for (size_t i = 0; i < s->track_count && !blocked; i++) {
-                const moq_media_track_t *t = s->tracks[i];
-                blocked = !t->removed &&
-                          t->packaging == MOQ_MEDIA_PACKAGING_CMAF &&
-                          t->init_data.len == 0;
-            }
-        }
-        s->companion_blocked = blocked;
-    }
-    return true;
 }
 
 static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
@@ -3616,14 +3522,10 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         moq_version_t v = moq_session_version(session);
         pthread_mutex_lock(&s->mu);
         s->transport_version = v;
-        bool resolved = sender_resolve_companion_locked(s);
-        bool usable = resolved && sender_version_usable(s);
-        if (resolved && !usable) s->stats.last_error = MOQ_ERR_UNSUPPORTED;
+        sender_resolve_companion_locked(s);
+        bool usable = sender_version_usable(s);
+        if (!usable) s->stats.last_error = MOQ_ERR_UNSUPPORTED;
         pthread_mutex_unlock(&s->mu);
-        if (!resolved) {
-            sender_set_fatal(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
-            return;
-        }
         if (!usable) return;
     }
 
@@ -4637,7 +4539,7 @@ static bool sender_init_ref_taken(const moq_media_sender_t *s, moq_bytes_t id)
  * CALLER MUST HOLD s->mu; t is not yet registered. */
 static bool sender_assign_init_ref(moq_media_sender_t *s, moq_media_track_t *t)
 {
-    if (!sender_init_by_reference(s, t))
+    if (!sender_init_by_reference(t))
         return true;
     for (size_t i = 0; i < s->track_count; i++) {
         const moq_media_track_t *u = s->tracks[i];
@@ -5763,14 +5665,10 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
         if (cfg->samplerate == 0) return MOQ_ERR_INVAL;          /* 5.2.28 */
         if (cfg->channel_config.len == 0) return MOQ_ERR_INVAL;  /* 5.2.29 */
     }
-    /* CMSF-01 3.1: a CMAF track's initialization (its moov) MUST reach the
-     * catalog; without it no moof is decodable. Enforced for the draft-22
-     * companion, whose catalog carries it in the root initDataList. An
-     * explicit companion is fixed at creation, so this read needs no lock;
-     * an AUTO sender is checked under the lock at registration. */
-    bool cmaf_needs_init =
-        cfg->packaging == MOQ_MEDIA_PACKAGING_CMAF && cfg->init_data.len == 0;
-    if (cmaf_needs_init && !s->companion_auto && sender_msf01_catalog(s))
+    /* CMSF-01 3.1 requires the CMAF header in the catalog on every
+     * transport. Refuse missing init before allocation or registration,
+     * including unresolved AUTO. Object validation opt-out does not waive it. */
+    if (cfg->packaging == MOQ_MEDIA_PACKAGING_CMAF && cfg->init_data.len == 0)
         return MOQ_ERR_INVAL;
     /* contentProtectionRefIDs: each id must be coherent AND resolve to a
      * configured root contentProtections entry (catalog coherence, not DRM
@@ -6007,16 +5905,6 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     if (sender_name_taken(s, t->name) ||
         (tl && sender_name_taken(s, tl->name)) ||
         (mtl && sender_name_taken(s, mtl->name))) {
-        pthread_mutex_unlock(&s->mu);
-        if (mtl) track_free(s, mtl);
-        if (tl) track_free(s, tl);
-        track_free(s, t);
-        return MOQ_ERR_INVAL;
-    }
-    /* An AUTO sender already resolved to draft 22 refuses it like an
-     * explicit one. Before resolution it is accepted; resolving to draft 22
-     * with it still registered blocks the companion (companion_blocked). */
-    if (cmaf_needs_init && sender_msf01_catalog(s)) {
         pthread_mutex_unlock(&s->mu);
         if (mtl) track_free(s, mtl);
         if (tl) track_free(s, tl);
@@ -7942,8 +7830,8 @@ void moq_media_sender_test_mark_published(moq_media_sender_t *s)
 
 /* Select the media companion of an endpoint-free test sender (one built by
  * moq_media_sender_test_new), as moq_media_sender_cfg_t.companion_profile
- * does at creation. Call before adding tracks: track-level state derived from
- * the profile (initDataList ids) is fixed at add_track. Test-only; declared
+ * does at creation. Call before adding tracks: Group-ID state derived from
+ * the profile is fixed at creation. Test-only; declared
  * by the tests that use it. */
 void moq_media_sender_test_set_companion(moq_media_sender_t *s,
                                          moq_media_companion_profile_t profile);

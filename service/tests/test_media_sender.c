@@ -13,6 +13,7 @@
 #include <moq/loc.h>
 #include <moq/wire.h>   /* MOQ_QUIC_VARINT_MAX */
 #include "test_support.h"
+#include "media_sender_cmaf_init.h"
 #include "endpoint_offer_expect.h"
 #include "media_builders.h"  /* shared CENC-protected init builder */
 
@@ -1260,43 +1261,7 @@ static size_t build_cmaf_obj(uint8_t *out, uint32_t track_id, uint32_t sflags)
 /* Minimal AVC init segment whose tkhd carries track_id. */
 static size_t build_cmaf_init(uint8_t *buf, uint32_t track_id)
 {
-    static const uint8_t avcc[] = { 0x01 };
-    size_t p = 0;
-    p += box_hdr_(buf + p, 20, "ftyp");
-    memcpy(buf + p, "isom", 4); p += 4; wr32be(buf + p, 0); p += 4;
-    memcpy(buf + p, "isom", 4); p += 4;
-
-    size_t avcc_box = 8 + sizeof(avcc);
-    size_t avc1 = 8 + 78 + avcc_box;
-    size_t stsd = 8 + 8 + avc1;
-    size_t stbl = 8 + stsd;
-    size_t minf = 8 + stbl;
-    size_t mdhd = 8 + 4 + 12;
-    size_t mdia = 8 + mdhd + minf;
-    size_t tkhd = 24;
-    size_t trak = 8 + tkhd + mdia;
-    size_t moov = 8 + trak;
-
-    p += box_hdr_(buf + p, (uint32_t)moov, "moov");
-    p += box_hdr_(buf + p, (uint32_t)trak, "trak");
-    p += box_hdr_(buf + p, (uint32_t)tkhd, "tkhd");
-    wr32be(buf + p, 0); p += 4;            /* version+flags */
-    wr32be(buf + p, 0); p += 4;            /* creation */
-    wr32be(buf + p, 0); p += 4;            /* modification */
-    wr32be(buf + p, track_id); p += 4;     /* track_ID */
-    p += box_hdr_(buf + p, (uint32_t)mdia, "mdia");
-    p += box_hdr_(buf + p, (uint32_t)mdhd, "mdhd");
-    wr32be(buf + p, 0); p += 4; wr32be(buf + p, 0); p += 4;
-    wr32be(buf + p, 0); p += 4; wr32be(buf + p, 90000); p += 4;
-    p += box_hdr_(buf + p, (uint32_t)minf, "minf");
-    p += box_hdr_(buf + p, (uint32_t)stbl, "stbl");
-    p += box_hdr_(buf + p, (uint32_t)stsd, "stsd");
-    wr32be(buf + p, 0); p += 4; wr32be(buf + p, 1); p += 4;
-    p += box_hdr_(buf + p, (uint32_t)avc1, "avc1");
-    memset(buf + p, 0, 78); p += 78;
-    p += box_hdr_(buf + p, (uint32_t)avcc_box, "avcC");
-    memcpy(buf + p, avcc, sizeof(avcc)); p += sizeof(avcc);
-    return p;
+    return sender_test_cmaf_init(buf, track_id);
 }
 
 static moq_rcbuf_t *mkbuf_bytes(const uint8_t *d, size_t n)
@@ -1306,9 +1271,9 @@ static moq_rcbuf_t *mkbuf_bytes(const uint8_t *d, size_t n)
     return b;
 }
 
-/* Create a pre-ready CMAF sender, add a CMAF track (optionally with an init
- * segment carrying init_tid), write one object, return the write result. */
-static moq_result_t try_cmaf_write(bool validate, bool with_init,
+/* Create a pre-ready CMAF sender with a required header. A targeted init_tid
+ * tests ID matching; otherwise use the object ID. Return the write result. */
+static moq_result_t try_cmaf_write(bool validate, bool targeted_init_id,
                                    uint32_t init_tid, uint32_t obj_tid,
                                    uint32_t obj_sflags, bool starts_group,
                                    bool malformed)
@@ -1332,10 +1297,16 @@ static moq_result_t try_cmaf_write(bool validate, bool with_init,
     tc.codec = MOQ_BYTES_LITERAL("avc1.640028");
     tc.bitrate = 1500000;             /* MSF-01 5.2.22: required for video */
     tc.timescale = 90000;
-    if (with_init)
-        tc.init_data = (moq_bytes_t){ initbuf, build_cmaf_init(initbuf, init_tid) };
+    tc.init_data = (moq_bytes_t){ initbuf,
+        build_cmaf_init(initbuf, targeted_init_id ? init_tid : obj_tid) };
     moq_media_track_t *v = NULL;
-    moq_media_sender_add_track(s, &tc, &v);
+    moq_result_t added = moq_media_sender_add_track(s, &tc, &v);
+    MOQ_TEST_CHECK_EQ_INT((int)added, (int)MOQ_OK);
+    MOQ_TEST_CHECK(v != NULL);
+    if (added != MOQ_OK || !v) {
+        moq_media_sender_destroy(s);
+        return MOQ_ERR_INTERNAL;
+    }
 
     moq_rcbuf_t *b;
     if (malformed) {
@@ -1376,8 +1347,16 @@ static moq_result_t cmaf_write_default_cfg(bool set_passthrough, bool malformed)
     tc.codec = MOQ_BYTES_LITERAL("avc1.640028");
     tc.bitrate = 1500000;
     tc.timescale = 90000;
+    uint8_t initbuf[256];
+    tc.init_data = (moq_bytes_t){ initbuf, build_cmaf_init(initbuf, 1) };
     moq_media_track_t *v = NULL;
-    moq_media_sender_add_track(s, &tc, &v);
+    moq_result_t added = moq_media_sender_add_track(s, &tc, &v);
+    MOQ_TEST_CHECK_EQ_INT((int)added, (int)MOQ_OK);
+    MOQ_TEST_CHECK(v != NULL);
+    if (added != MOQ_OK || !v) {
+        moq_media_sender_destroy(s);
+        return MOQ_ERR_INTERNAL;
+    }
 
     moq_rcbuf_t *b;
     if (malformed) {
@@ -1417,11 +1396,19 @@ static moq_result_t try_cmaf_write_sap(bool validate, bool starts_group,
     tc.codec = MOQ_BYTES_LITERAL("avc1.640028");
     tc.bitrate = 1500000;             /* MSF-01 5.2.22: required for video */
     tc.timescale = 90000;
+    uint8_t initbuf[256];
+    tc.init_data = (moq_bytes_t){ initbuf, build_cmaf_init(initbuf, 1) };
     moq_media_track_t *v = NULL;
-    moq_media_sender_add_track(s, &tc, &v);
+    moq_result_t added = moq_media_sender_add_track(s, &tc, &v);
+    MOQ_TEST_CHECK_EQ_INT((int)added, (int)MOQ_OK);
+    MOQ_TEST_CHECK(v != NULL);
+    if (added != MOQ_OK || !v) {
+        moq_media_sender_destroy(s);
+        return MOQ_ERR_INTERNAL;
+    }
 
     uint8_t objbuf[256];
-    size_t objlen = build_cmaf_obj(objbuf, 0, 0x02000000);  /* valid sync object */
+    size_t objlen = build_cmaf_obj(objbuf, 1, 0x02000000);  /* valid sync object */
     moq_rcbuf_t *b = mkbuf_bytes(objbuf, objlen);
     moq_media_send_object_t o = mkobj(b, true, starts_group, false);
     o.has_sap_type = has_sap;
@@ -3694,7 +3681,7 @@ int main(int argc, char **argv)
     /* == init_data survives add_track -> published catalog ============== *
      * A RAW/LOC track's init_data must be encoded into the catalog the sender
      * publishes (any packaging). The server captures the catalog payload; we
-     * parse it and confirm the "video" track's initData decodes to the bytes
+     * parse it and confirm the "video" track's initRef resolves to the bytes
      * passed to add_track. */
     {
         int port = 0;
@@ -3751,10 +3738,14 @@ int main(int argc, char **argv)
                 moq_msf_catalog_find_role(&catalog, "video");
             MOQ_TEST_CHECK(vt != NULL);
             if (vt) {
-                MOQ_TEST_CHECK(vt->has_init_data && vt->init_data.len > 0);
+                MOQ_TEST_CHECK(catalog.version_form == MOQ_MSF_VERSION_FORM_DRAFT_NAME);
+                MOQ_TEST_CHECK(vt->has_init_ref && !vt->has_init_data);
+                const moq_msf_init_data_entry_t *entry =
+                    moq_msf_catalog_find_init_data(&catalog, vt->init_ref);
+                MOQ_TEST_CHECK(entry != NULL);
                 moq_rcbuf_t *decoded = NULL;
-                MOQ_TEST_CHECK_EQ_INT((int)moq_msf_decode_init_data(
-                    al, vt->init_data, &decoded), (int)MOQ_OK);
+                if (entry) MOQ_TEST_CHECK_EQ_INT((int)moq_msf_decode_init_data(
+                    al, entry->data, &decoded), (int)MOQ_OK);
                 if (decoded) {
                     MOQ_TEST_CHECK_EQ_U64(moq_rcbuf_len(decoded),
                                           sizeof(extradata));
@@ -3763,7 +3754,7 @@ int main(int argc, char **argv)
                     moq_rcbuf_decref(decoded);
                 }
                 /* Default config authors NO CMSF metadata: a track/catalog with
-                 * none configured emits none (byte-compatible with pre-CMSF). */
+                 * none configured emits none. */
                 MOQ_TEST_CHECK_EQ_U64(catalog.content_protection_count, 0);
                 MOQ_TEST_CHECK(!vt->has_max_grp_sap && !vt->has_max_obj_sap);
                 MOQ_TEST_CHECK_EQ_U64(vt->cp_ref_id_count, 0);
@@ -3872,7 +3863,7 @@ int main(int argc, char **argv)
         /* validate on: malformed CMAF object rejected, no ownership taken. */
         MOQ_TEST_CHECK_EQ_INT(
             (int)try_cmaf_write(true, false, 0, 0, 0, true, true), (int)MOQ_ERR_PROTO);
-        /* validate on, no init: a well-formed object is accepted. */
+        /* validate on, matching default header: a well-formed object is accepted. */
         MOQ_TEST_CHECK_EQ_INT(
             (int)try_cmaf_write(true, false, 0, 1, 0x02000000, true, false), (int)MOQ_OK);
         /* validate on: a group-start object that is known not to be a SAP is

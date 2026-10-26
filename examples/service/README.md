@@ -43,10 +43,11 @@ player's contracts.
 
 These C examples leave the media companion at its default, AUTO, which follows
 the draft the endpoint negotiates. On drafts 16/18 that is the legacy profile:
-LOC-01 object metadata and the MSF-01 catalog in its legacy form, Group IDs
-from 0. On draft 22 it is the draft-22 profile: LOC-04 object metadata, the
-MSF-01 draft-01 catalog (`"version":"draft-01"`, init data in the root
-`initDataList`), and Group IDs starting at the sender's wallclock milliseconds.
+LOC-01 object metadata and Group IDs from 0. On draft 22 it is the draft-22
+profile: LOC-04 object metadata and Group IDs starting at the sender's wallclock
+milliseconds. Every profile, including explicit LEGACY and unresolved AUTO,
+publishes MSF-01 catalogs with `"version":"draft-01"` and supplied init data in
+the root `initDataList`, referenced by each track's `initRef`.
 On draft 22 the sender generates the LOC-04 block from the typed fields of
 each RAW `write`: a capture time (`has_capture_time`) is a Unix-microsecond
 Timestamp; a presentation time alone, as in `media_send.c`, is media time and
@@ -172,18 +173,19 @@ Codec init/decoder config travels in the **catalog**, not in the media objects:
   H.264/HEVC SPS/PPS/VPS, an AAC `AudioSpecificConfig`, or a CMAF init segment.
   This applies to **any** packaging (RAW/LOC or CMAF) when the codec needs it.
   The service copies it during `add_track` (your buffer need not outlive the
-  call). How it is published depends on packaging:
-  - **RAW/LOC** — base64'd **inline** on the track's catalog entry on drafts
-    16/18. With the draft-22 companion every init-bearing track goes through
-    `initDataList`/`initRef` instead, as CMAF does.
-  - **CMAF** — published in the catalog's MSF-01 **`initDataList`** and
-    referenced from the track via **`initRef`**. The emitter deduplicates:
-    tracks whose CMAF init segment bytes are identical share a single
-    `initDataList` entry, and the entry `id` is the name of the first track
-    that introduced that init segment. The receiver follows the `initRef`
-    back into `initDataList` and resolves it transparently (see below).
+  call). Every companion on drafts 16/18/22 publishes supplied RAW audio/video,
+  CMAF and MPEG-TS initialization as a base64 `"inline"` entry in the root
+  **`initDataList`**, referenced from the track via **`initRef`**. Tracks with
+  identical init bytes share a single stable ID. Removing the first track does
+  not change that ID for surviving tracks; reusing a removed name for different
+  bytes gets a distinct ID. An init-bearing late addition publishes a full
+  independent catalog; an init-less addition can still use a delta.
 
-  Leave it empty when the codec carries its parameter sets in-band.
+  RAW may leave init empty when its codec carries parameter sets in-band.
+  CMAF requires a nonempty header at `add_track`, even before AUTO resolves and
+  even with `validate_cmaf = false`. Missing init returns `MOQ_ERR_INVAL` with a
+  NULL output handle and leaves the sender unchanged, so a corrected call can
+  retry immediately. The service does not repeat track init in media objects.
 - The receiver gets two forms at `TRACK_ADDED` (both **borrowed** for the event
   — copy if you retain them):
   - `desc.init.codec_config` — the **decoder extradata** (SPS/PPS/VPS, AAC ASC).
@@ -191,7 +193,7 @@ Codec init/decoder config travels in the **catalog**, not in the media objects:
   - `desc.init_data` — the **full container/init segment** (for CMAF the
     `ftyp`+`moov`). Muxers/recorders that reproduce the container want this;
     decoders usually do **not**. This is the **resolved** segment whether the
-    catalog carried it inline (RAW/LOC) or via `initRef`→`initDataList` (CMAF);
+    catalog carried it by reference or in a supported older inline format;
     the application sees the bytes either way and never resolves the reference
     itself.
 - `init_data` is **not** app-written per-object metadata. Per-object LOC headers
@@ -199,6 +201,12 @@ Codec init/decoder config travels in the **catalog**, not in the media objects:
 - In v0 a mid-stream codec/config change is modeled as a **new track / config
   generation** (a new catalog entry), not by mutating a live track's
   `init_data`.
+
+Service catalog emission uses this shape even for explicit LEGACY. Earlier
+D16/D18 service output used `"version":"1"` and per-track RAW `initData`; peers
+that depended on that output must accept the canonical form. The receiver still
+accepts supported legacy catalog forms. The low-level C catalog codec retains
+its explicit version-form selector and default.
 
 ### CMAF bytes and decoder config
 

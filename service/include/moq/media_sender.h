@@ -224,10 +224,6 @@ typedef struct moq_media_sender_cfg {
      *     fails as D22_MSF01_LOC04_PUBLIC does when it cannot. Objects written
      *     before resolution are numbered from it; resolving to legacy renumbers
      *     them from 0, before any is sent.
-     *   - add_track accepts a CMAF track without init_data. If the sender then
-     *     resolves to draft 22 with such a track still registered, it reports
-     *     UNSUPPORTED (write/wait, stats.last_error) and publishes nothing
-     *     until those tracks are removed.
      *   - write() accepts RAW objects (explicit D22 refuses writes before
      *     D22 is observed). A RAW object's metadata tail, when present, is
      *     validated and kept for draft 22 (an invalid one is INVAL); its
@@ -249,13 +245,16 @@ typedef struct moq_media_sender_cfg {
      * D22_MSF01_LOC04_PUBLIC still requires the tail. On drafts 16/18 the
      * tail is ignored, as with LEGACY.
      *
-     * D22_MSF01_LOC04_PUBLIC also selects its MSF-01 catalog: version
+     * Every companion publishes the MSF-01 catalog: version
      * "draft-01"; every track's init_data in the root initDataList,
      * referenced by initRef (no per-track initData); a CMAF track without
      * init_data refused by add_track (CMSF-01 3.1); an added track with
-     * init_data published as a full catalog, not a delta; and each track's
-     * Group IDs (media, generated timeline and catalog) starting at the
-     * wallclock milliseconds read when the sender is created, the
+     * init_data published as a full catalog, not a delta. This also applies
+     * before AUTO resolves.
+     *
+     * D22_MSF01_LOC04_PUBLIC selects each track's Group IDs (media, generated
+     * timeline and catalog) starting at the wallclock milliseconds read when
+     * the sender is created, the
      * best-effort approach MSF-01 6.1 suggests. It keeps a restarted
      * publisher's IDs above its predecessor's only while the clock moves
      * forward and no instance numbers groups faster than the clock; restart
@@ -267,7 +266,7 @@ typedef struct moq_media_sender_cfg {
      * that ID, and an add_track / remove_track / convert_to_vod / complete
      * whose catalog change would need one, return MOQ_ERR_LIMIT without
      * taking ownership or changing state. The legacy companion keeps its
-     * catalog and Group IDs from 0. Unknown values fail creation with
+     * Group IDs from 0. Unknown values fail creation with
      * MOQ_ERR_INVAL. */
     moq_media_companion_profile_t         companion_profile;
     /* Preserve the complete preceding allocation; never read. */
@@ -335,22 +334,26 @@ typedef struct moq_media_track_cfg {
                                           inherent codec, so there it is
                                           optional. */
     uint32_t    timescale;             /* 0 = 1000000 (microseconds) */
-    moq_bytes_t init_data;             /* OPTIONAL codec/decoder init config,
+    moq_bytes_t init_data;             /* Codec/decoder init config,
                                           carried in the catalog for ANY
                                           packaging when the codec needs it:
                                           a CMAF init segment, H.264/HEVC
                                           SPS/PPS/VPS, AAC AudioSpecificConfig,
                                           etc. -- i.e. the encoder's extradata.
-                                          The service base64-encodes it into the
-                                          published catalog; receivers see it at
-                                          TRACK_ADDED as desc.init_data. This is
+                                          Required and nonempty for CMAF on
+                                          every companion, including unresolved
+                                          AUTO, even if validate_cmaf is false.
+                                          Otherwise optional. The service
+                                          base64-encodes it in root initDataList
+                                          with a track initRef; receivers see
+                                          it at TRACK_ADDED as desc.init_data. This is
                                           NOT per-object LOC metadata (that is
                                           generated per object from the typed
                                           fields). Borrowed: the service copies
                                           it during add_track, so the caller's
                                           buffer need not outlive the call.
-                                          Empty when the codec carries its
-                                          parameter sets in-band. */
+                                          RAW may leave it empty when the codec
+                                          carries its parameter sets in-band. */
     moq_bytes_t role;                  /* empty = derived from media_type */
     moq_bytes_t lang;
     bool        is_live;               /* catalog isLive (presets: true) */
@@ -635,7 +638,13 @@ MOQ_API void moq_media_track_cfg_init_sized(moq_media_track_cfg_t *cfg,
  * number (the service runs the program filter for it), emit_sap_timeline or
  * emit_media_timeline (TS keeps presentation times inside the packets), and
  * init_data that is not whole source packets. A build without moq::mpeg2ts
- * returns MOQ_ERR_UNSUPPORTED for an MPEG2TS track. */
+ * returns MOQ_ERR_UNSUPPORTED for an MPEG2TS track.
+ *
+ * CMAF requires nonempty init_data on every companion, before or after
+ * negotiation, including unresolved AUTO and validate_cmaf=false. Missing init
+ * returns MOQ_ERR_INVAL with *out == NULL, without registering a track or
+ * changing the sender.
+ */
 MOQ_API moq_result_t moq_media_sender_add_track(
     moq_media_sender_t *s, const moq_media_track_cfg_t *cfg,
     moq_media_track_t **out);
@@ -772,8 +781,7 @@ typedef struct moq_media_send_object {
  * and refuses with INVAL a capture time it cannot send as Unix time because
  * the track's properties carry a Timescale; see companion_profile);
  * unusable timing or invalid LOC input is INVAL, generated-property
- * allocation failure is NOMEM. A companion/negotiated-version mismatch, or an
- * AUTO sender blocked on draft 22 by a CMAF track without init_data, is
+ * allocation failure is NOMEM. A companion/negotiated-version mismatch is
  * UNSUPPORTED without transfer or endpoint/session termination. An object
  * that would open a group after Group ID 2^62 - 1 (the library's write-path
  * bound) is MOQ_ERR_LIMIT, without transfer; the track's open group still
