@@ -38,6 +38,7 @@
 typedef struct ca {
     moq_alloc_t vt;
     long        live;
+    long        peak;        /* the highest live, ever */
     size_t      fail_size;
     bool        watching;
     size_t      sizes[2];
@@ -55,6 +56,7 @@ static void *ca_a(size_t n, void *c)
     void *p = refuse ? NULL : malloc(n);
     if (p != NULL) {
         a->live += (long)n;
+        if (a->live > a->peak) a->peak = a->live;
     }
     for (size_t i = 0; a->watching && i < 2; i++) {
         if (n == a->sizes[i]) {
@@ -70,6 +72,7 @@ static void *ca_r(void *p, size_t o, size_t n, void *c)
     void *q = realloc(p, n);
     if (q != NULL) {
         a->live += (long)n - (long)o;
+        if (a->live > a->peak) a->peak = a->live;
     }
     return q;
 }
@@ -136,6 +139,10 @@ typedef struct sfrig {
     uint64_t       carried;
     bool           freeze_owner_on_ack;
     uint64_t       ack_base;
+    /* With `freeze_owner_on_evict`, shard 0 freezes right after the step
+     * that pushed its first eviction watermark beyond `evict_base`. */
+    bool           freeze_owner_on_evict;
+    uint64_t       evict_base;
     int            failures;
 } sfrig_t;
 
@@ -154,7 +161,35 @@ typedef struct sfrig {
 /* The relay-side session of the next connection receives objects as chunks
  * (OPEN records), so an Object can be in the log before it is whole. */
 static bool g_sf_server_streaming = false;
+/* The draft every connection the rig makes speaks. */
+static moq_version_t g_sf_version = MOQ_VERSION_DRAFT_22;
 static uint64_t g_sf_log_bytes = 0;
+/* The groups each shard's log retains (4 unless a row needs fewer). */
+static uint32_t g_sf_log_groups = 4;
+/* The chunk nodes each shard's log holds (0: the default). */
+static uint32_t g_sf_log_chunk_nodes = 0;
+/* The shards the next rig runs (2 unless a row needs a third). */
+static uint16_t g_sf_shards = 2;
+
+/* The runtime configuration the rig creates. */
+static void
+sfrig_cfg(moqr_shards_cfg_t *cfg, ca_t *a, bool earned, uint32_t channel_entries,
+          uint32_t max_fetches)
+{
+    moqr_shards_cfg_init_sized(cfg, sizeof(*cfg), &a->vt);
+    cfg->shards = g_sf_shards;
+    cfg->admit_remote_demand = true;
+    cfg->core_cfg.log_budget.max_groups = g_sf_log_groups;
+    cfg->core_cfg.log_budget.max_bytes = g_sf_log_bytes != 0
+                                           ? g_sf_log_bytes : 1u << 20;
+    cfg->core_cfg.log_max_chunk_nodes = g_sf_log_chunk_nodes;
+    cfg->core_cfg.linger_us = 500;
+    cfg->fill_timeout_default_ms = SF_DEFAULT_WAIT_MS;
+    cfg->fill_timeout_max_ms = SF_MAX_WAIT_MS;
+    cfg->live_visibility = earned;
+    cfg->demand_channel_entries = channel_entries;
+    cfg->core_cfg.max_fetches = max_fetches;
+}
 
 static moqr_result_t
 sfrig_create_ex(sfrig_t *r, ca_t *a, bool earned, uint32_t channel_entries,
@@ -165,18 +200,7 @@ sfrig_create_ex(sfrig_t *r, ca_t *a, bool earned, uint32_t channel_entries,
     r->now = 1;
     r->earned = earned;
     moqr_shards_cfg_t cfg;
-    moqr_shards_cfg_init_sized(&cfg, sizeof(cfg), &a->vt);
-    cfg.shards = 2;
-    cfg.admit_remote_demand = true;
-    cfg.core_cfg.log_budget.max_groups = 4;
-    cfg.core_cfg.log_budget.max_bytes = g_sf_log_bytes != 0
-                                          ? g_sf_log_bytes : 1u << 20;
-    cfg.core_cfg.linger_us = 500;
-    cfg.fill_timeout_default_ms = SF_DEFAULT_WAIT_MS;
-    cfg.fill_timeout_max_ms = SF_MAX_WAIT_MS;
-    cfg.live_visibility = earned;
-    cfg.demand_channel_entries = channel_entries;
-    cfg.core_cfg.max_fetches = max_fetches;
+    sfrig_cfg(&cfg, a, earned, channel_entries, max_fetches);
     return moqr_shards_create(&cfg, &r->s);
 }
 
@@ -197,6 +221,19 @@ sfrig_owner_acks(sfrig_t *r)
         return 0;
     }
     return st.enqueued[MOQR_SHARDS_MSG_ACK];
+}
+
+/* Eviction watermarks shard 0 has pushed toward any requester so far. */
+static uint64_t
+sfrig_owner_evicts(sfrig_t *r)
+{
+    moqr_shards_stats_t st;
+    memset(&st, 0, sizeof(st));
+    if (moqr_shards_get_stats(r->s, 0, &st) != MOQR_OK) {
+        r->failures++;
+        return 0;
+    }
+    return st.enqueued[MOQR_SHARDS_MSG_GRP_EVICT];
 }
 
 static void
@@ -229,7 +266,7 @@ sfrig_connect(sfrig_t *r, uint16_t shard)
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
     cfg.alloc = &r->alloc->vt;
     cfg.seed = 0xF111 + (uint64_t)slot;
-    cfg.version = MOQ_VERSION_DRAFT_22;
+    cfg.version = g_sf_version;
     cfg.client_send_request_capacity = true;
     cfg.client_initial_request_capacity = 1024;
     cfg.server_send_request_capacity = true;
@@ -242,7 +279,7 @@ sfrig_connect(sfrig_t *r, uint16_t shard)
     cn->rsess = moq_simpair_server(cn->sp);
     if (moq_simpair_start(cn->sp) != MOQ_OK ||
         moqr_bind_conn_open(moqr_shards_bind(r->s, shard), cn->rsess,
-                            MOQ_VERSION_DRAFT_22) != MOQR_OK) {
+                            g_sf_version) != MOQR_OK) {
         moq_simpair_destroy(cn->sp);
         return NULL;
     }
@@ -293,6 +330,11 @@ sfrig_step_earned(sfrig_t *r, uint16_t sh, uint64_t *pending)
         sfrig_owner_acks(r) > r->ack_base) {
         r->frozen |= 1u;
         r->freeze_owner_on_ack = false;
+    }
+    if (r->freeze_owner_on_evict && sh == 0 &&
+        sfrig_owner_evicts(r) > r->evict_base) {
+        r->frozen |= 1u;
+        r->freeze_owner_on_evict = false;
     }
 }
 
@@ -3408,6 +3450,164 @@ cleanup:
     return metadata_failures == 0 ? 0 : 1;
 }
 
+/* An origin on the owner shard and a requester on the other speak
+ * different drafts: the requester's SUBSCRIBE_OK states the origin's Track
+ * Properties, and its Object the origin's Object Properties, in the
+ * requester's integer encoding (Type 0x10 = 1000 is 10 43 E8 in draft-16,
+ * 10 83 E8 in draft-18 and draft-22). The provenance crosses the shard hop
+ * with the bytes. */
+typedef struct sfx_peer {
+    moq_subscription_t sub;
+    int setups, announcements, requests, acks, objects, unsubs, closed;
+    uint8_t ack_props[16], obj_props[16];
+    size_t ack_props_len, obj_props_len;
+} sfx_peer_t;
+
+static void
+sfx_drain(sfconn_t *cn, sfx_peer_t *ps)
+{
+    moq_event_t ev;
+    while (moq_session_poll_events(cn->peer, &ev, 1) != 0) {
+        switch (ev.kind) {
+        case MOQ_EVENT_SETUP_COMPLETE: ps->setups++; break;
+        case MOQ_EVENT_NAMESPACE_ACCEPTED: ps->announcements++; break;
+        case MOQ_EVENT_SUBSCRIBE_REQUEST:
+            ps->sub = ev.u.subscribe_request.sub;
+            ps->requests++;
+            break;
+        case MOQ_EVENT_SUBSCRIBE_OK:
+            ps->acks++;
+            ps->ack_props_len = ev.u.subscribe_ok.track_properties.len;
+            if (ps->ack_props_len != 0 && ps->ack_props_len <= sizeof(ps->ack_props))
+                memcpy(ps->ack_props, ev.u.subscribe_ok.track_properties.data,
+                       ps->ack_props_len);
+            break;
+        case MOQ_EVENT_OBJECT_RECEIVED: {
+            const moq_rcbuf_t *pr = ev.u.object_received.properties;
+            ps->objects++;
+            ps->obj_props_len = pr ? moq_rcbuf_len(pr) : 0;
+            if (ps->obj_props_len != 0 && ps->obj_props_len <= sizeof(ps->obj_props))
+                memcpy(ps->obj_props, moq_rcbuf_data(pr), ps->obj_props_len);
+            break;
+        }
+        case MOQ_EVENT_UNSUBSCRIBED: ps->unsubs++; break;
+        case MOQ_EVENT_SESSION_CLOSED: ps->closed++; break;
+        default: break;
+        }
+        moq_event_cleanup(&ev);
+    }
+}
+
+static int
+cross_shard_mixed_draft(moq_version_t origin, moq_version_t requester)
+{
+    static const uint8_t q1000[] = { 0x10, 0x43, 0xE8 }, v1000[] = { 0x10, 0x83, 0xE8 };
+    const uint8_t *src = origin == MOQ_VERSION_DRAFT_16 ? q1000 : v1000;
+    const uint8_t *want = requester == MOQ_VERSION_DRAFT_16 ? q1000 : v1000;
+    char row[48];
+    snprintf(row, sizeof(row), "d%u->d%u", (unsigned)origin, (unsigned)requester);
+    ca_t a;
+    ca_init(&a);
+    sfrig_t r;
+    if (sfrig_create(&r, &a, true) != MOQR_OK) {
+        printf("FIXTURE: cross_shard_mixed_draft(%s) rig create\n", row);
+        sfrig_destroy(&r);
+        return 2;
+    }
+    sfconn_t *cn[2] = {0};
+    sfx_peer_t ps[2];
+    memset(ps, 0, sizeof(ps));
+    moq_rcbuf_t *payload = NULL;
+#define SFX_REQUIRE(expr)                                                         \
+    do {                                                                          \
+        if (!(expr)) {                                                            \
+            printf("FIXTURE: cross_shard_mixed_draft(%s): %s\n", row, #expr);     \
+            r.failures++;                                                         \
+            goto cleanup;                                                         \
+        }                                                                         \
+    } while (0)
+    g_sf_version = origin;
+    cn[0] = sfrig_connect(&r, 0);
+    g_sf_version = requester;
+    cn[1] = sfrig_connect(&r, 1);
+    g_sf_version = MOQ_VERSION_DRAFT_22;
+    SFX_REQUIRE(cn[0] != NULL && cn[1] != NULL && cn[0]->shard != cn[1]->shard);
+    sfrig_pump(&r, 4);
+    sfx_drain(cn[0], &ps[0]);
+    sfx_drain(cn[1], &ps[1]);
+    SFX_REQUIRE(ps[0].setups == 1 && ps[1].setups == 1);
+
+    moq_bytes_t ns[] = { B("mixed"), B("live") };
+    moq_publish_namespace_cfg_t pcfg;
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = ns, .count = 2 };
+    moq_announcement_t ann;
+    SFX_REQUIRE(moq_session_publish_namespace(cn[0]->peer, &pcfg, r.now, &ann) == MOQ_OK);
+    sfrig_pump(&r, 8);
+    sfx_drain(cn[0], &ps[0]);
+    SFX_REQUIRE(ps[0].announcements == 1);
+
+    moq_subscribe_cfg_t scfg;
+    moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace = (moq_namespace_t){ .parts = ns, .count = 2 };
+    scfg.track_name = B("video");
+    scfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    moq_subscription_t rsub;
+    SFX_REQUIRE(moq_session_subscribe(cn[1]->peer, &scfg, r.now, &rsub) == MOQ_OK);
+    sfrig_pump(&r, 8);
+    sfx_drain(cn[0], &ps[0]);
+    SFX_REQUIRE(ps[0].requests == 1);
+    moq_accept_subscribe_cfg_t acfg;
+    moq_accept_subscribe_cfg_init(&acfg);
+    acfg.track_properties = (moq_bytes_t){ src, 3 };
+    SFX_REQUIRE(moq_session_accept_subscribe(cn[0]->peer, ps[0].sub, &acfg, r.now) == MOQ_OK);
+    sfrig_pump(&r, 10);
+    sfx_drain(cn[1], &ps[1]);
+    SFX_REQUIRE(ps[1].acks == 1);
+
+    static const uint8_t body[] = { 0x44, 0x00, 0xab, 0x19 };
+    SFX_REQUIRE(moq_rcbuf_create(&a.vt, body, sizeof(body), &payload) == MOQ_OK);
+    SFX_REQUIRE(moq_session_send_object_datagram(cn[0]->peer, ps[0].sub, 1, 0, 90, false,
+                                                 payload, src, 3, r.now) == MOQ_OK);
+    moq_rcbuf_decref(payload);
+    payload = NULL;
+    for (int i = 0; i < 16 && ps[1].objects == 0; i++) {
+        sfrig_pump(&r, 1);
+        sfx_drain(cn[0], &ps[0]);
+        sfx_drain(cn[1], &ps[1]);
+    }
+cleanup:
+    moq_rcbuf_decref(payload);
+    printf("cross_shard_mixed_draft(%s): ack_props=%zu objects=%d obj_props=%zu unsubs=%d "
+           "closed=%d\n", row, ps[1].ack_props_len, ps[1].objects, ps[1].obj_props_len,
+           ps[0].unsubs, ps[0].closed + ps[1].closed);
+    int fixture = r.failures;
+    int bad = 0;
+    if (fixture == 0) {
+        if (!(ps[1].ack_props_len == 3 && memcmp(ps[1].ack_props, want, 3) == 0)) bad++;
+        if (!(ps[1].objects == 1 && ps[1].obj_props_len == 3 &&
+              memcmp(ps[1].obj_props, want, 3) == 0)) bad++;
+        if (ps[0].unsubs != 0 || ps[0].closed + ps[1].closed != 0) bad++;
+    }
+    sfrig_destroy(&r);
+    if (a.live != 0) fixture++;
+#undef SFX_REQUIRE
+    printf("%s: cross_shard_mixed_draft(%s) property_failures=%d fixture_failures=%d\n",
+           fixture ? "FIXTURE" : bad ? "FAIL" : "PASS", row, bad, fixture);
+    return fixture ? 2 : bad ? 1 : 0;
+}
+
+static int
+cross_shard_mixed_draft_all(void)
+{
+    int f = 0;
+    f += cross_shard_mixed_draft(MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_16);
+    f += cross_shard_mixed_draft(MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18);
+    f += cross_shard_mixed_draft(MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_22);
+    f += cross_shard_mixed_draft(MOQ_VERSION_DRAFT_22, MOQ_VERSION_DRAFT_18);
+    return f;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -3428,6 +3628,9 @@ main(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "--retained-push-refused") == 0) {
         return cross_shard_retained_typed(SF_TYPED_PUSH_REFUSED) != 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--mixed-draft") == 0) {
+        return cross_shard_mixed_draft_all() != 0;
     }
     if (argc == 2 && strcmp(argv[1], "--track-properties") == 0) {
         if (cross_shard_track_properties(false) != 0) {

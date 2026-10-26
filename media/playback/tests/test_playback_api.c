@@ -392,9 +392,9 @@ int main(void)
         moq_playback_t *pb = NULL;
         CHECK(moq_playback_create(alloc, &cfg, &pb) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
         moq_playback_event_t ev;
-        CHECK(moq_playback_poll_event(pb, &ev) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &ev, sizeof(ev)) == MOQ_DONE);
         moq_playback_destroy(pb);
     }
 
@@ -405,11 +405,11 @@ int main(void)
         moq_playback_t *pb = NULL;
         CHECK(moq_playback_create(alloc, &cfg, &pb) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(NULL, &cmd) == MOQ_ERR_INVAL);
-        CHECK(moq_playback_poll_command(pb, NULL) == MOQ_ERR_INVAL);
+        CHECK(moq_playback_poll_command(NULL, &cmd, sizeof(cmd)) == MOQ_ERR_INVAL);
+        CHECK(moq_playback_poll_command(pb, NULL, sizeof(moq_playback_cmd_t)) == MOQ_ERR_INVAL);
         moq_playback_event_t ev;
-        CHECK(moq_playback_poll_event(NULL, &ev) == MOQ_ERR_INVAL);
-        CHECK(moq_playback_poll_event(pb, NULL) == MOQ_ERR_INVAL);
+        CHECK(moq_playback_poll_event(NULL, &ev, sizeof(ev)) == MOQ_ERR_INVAL);
+        CHECK(moq_playback_poll_event(pb, NULL, sizeof(moq_playback_event_t)) == MOQ_ERR_INVAL);
         moq_playback_destroy(pb);
     }
 
@@ -472,13 +472,13 @@ int main(void)
         CHECK(moq_playback_test_push_cmd(pb, &cmd) == MOQ_OK);
 
         moq_playback_cmd_t polled;
-        CHECK(moq_playback_poll_command(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &polled, sizeof(polled)) == MOQ_OK);
         CHECK(polled.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(polled.u.decode_video.payload == buf);
         CHECK(moq_rcbuf_refcount(buf) == 2);
 
         moq_playback_cmd_t empty;
-        CHECK(moq_playback_poll_command(pb, &empty) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &empty, sizeof(empty)) == MOQ_DONE);
 
         moq_playback_cmd_cleanup(&polled);
         CHECK(moq_rcbuf_refcount(buf) == 1);
@@ -508,15 +508,15 @@ int main(void)
         CHECK(moq_playback_test_push_event(pb, &e3) == MOQ_OK);
 
         moq_playback_event_t out;
-        CHECK(moq_playback_poll_event(pb, &out) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &out, sizeof(out)) == MOQ_OK);
         CHECK(out.kind == MOQ_PLAYBACK_EVENT_GAP_DETECTED);
         CHECK(out.u.gap_detected.group_id == 10);
-        CHECK(moq_playback_poll_event(pb, &out) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &out, sizeof(out)) == MOQ_OK);
         CHECK(out.kind == MOQ_PLAYBACK_EVENT_SKIP_FORWARD);
         CHECK(out.u.skip_forward.to_group_id == 15);
-        CHECK(moq_playback_poll_event(pb, &out) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &out, sizeof(out)) == MOQ_OK);
         CHECK(out.kind == MOQ_PLAYBACK_EVENT_TRACK_ENDED);
-        CHECK(moq_playback_poll_event(pb, &out) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &out, sizeof(out)) == MOQ_DONE);
 
         moq_playback_destroy(pb);
     }
@@ -538,7 +538,7 @@ int main(void)
         CHECK(moq_playback_test_push_cmd(pb, &cmd) == MOQ_ERR_WOULD_BLOCK);
 
         moq_playback_cmd_t polled;
-        CHECK(moq_playback_poll_command(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &polled, sizeof(polled)) == MOQ_OK);
         CHECK(moq_playback_test_push_cmd(pb, &cmd) == MOQ_OK);
 
         moq_playback_destroy(pb);
@@ -559,15 +559,17 @@ int main(void)
         CHECK(moq_playback_test_push_event(pb, &evt) == MOQ_ERR_WOULD_BLOCK);
 
         moq_playback_event_t polled;
-        CHECK(moq_playback_poll_event(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &polled, sizeof(polled)) == MOQ_OK);
         CHECK(moq_playback_test_push_event(pb, &evt) == MOQ_OK);
 
         moq_playback_destroy(pb);
     }
 
     /* -- OOM: fail at each create allocation point -------------------- */
-    /* create does 6 allocs: struct, cmd_ring, evt_ring, tracks, objects, sample_scratch */
-    for (uint64_t fail_pt = 1; fail_pt <= 6; fail_pt++) {
+    /* create does 9 allocs: struct, cmd_ring, evt_ring, tracks, objects,
+     * sample_scratch, configuration copy table, released history, known
+     * ranges */
+    for (uint64_t fail_pt = 1; fail_pt <= 9; fail_pt++) {
         moq_playback_cfg_t cfg;
         moq_playback_cfg_init(&cfg);
         oom_state_t oom = { 0, 0, fail_pt };
@@ -812,8 +814,8 @@ int main(void)
         cfg.max_tracks = 1;
         cfg.max_buffered_objects = 1;
 
-        /* create uses 6 allocs. codec copy is alloc #7. */
-        oom_state_t oom = { 0, 0, 7 };
+        /* create uses 9 allocs. codec copy is alloc #10. */
+        oom_state_t oom = { 0, 0, 10 };
         moq_alloc_t fa = oom_allocator(&oom);
         moq_playback_t *pb = NULL;
         CHECK(moq_playback_create(&fa, &cfg, &pb) == MOQ_OK);
@@ -836,8 +838,8 @@ int main(void)
         cfg.max_tracks = 1;
         cfg.max_buffered_objects = 1;
 
-        /* create uses 6. codec copy #7 (succeeds). init_data copy #8. */
-        oom_state_t oom = { 0, 0, 8 };
+        /* create uses 9. codec copy #10 (succeeds). init_data copy #11. */
+        oom_state_t oom = { 0, 0, 11 };
         moq_alloc_t fa = oom_allocator(&oom);
         moq_playback_t *pb = NULL;
         CHECK(moq_playback_create(&fa, &cfg, &pb) == MOQ_OK);
@@ -1143,7 +1145,7 @@ int main(void)
         CHECK(moq_rcbuf_create(alloc, data, 1, &p3) == MOQ_OK);
 
         moq_rcbuf_t *props = NULL;
-        MAKE_LOC_PROPS(alloc, 1000, false, &props);
+        MAKE_LOC_PROPS(alloc, 1000, true, &props);
 
         moq_playback_object_t obj;
         moq_playback_object_init(&obj);
@@ -1187,7 +1189,7 @@ int main(void)
         CHECK(moq_rcbuf_create(alloc, data2, 2, &small) == MOQ_OK);
 
         moq_rcbuf_t *props = NULL;
-        MAKE_LOC_PROPS(alloc, 1000, false, &props);
+        MAKE_LOC_PROPS(alloc, 1000, true, &props);
 
         moq_playback_object_t obj;
         moq_playback_object_init(&obj);
@@ -1419,7 +1421,7 @@ int main(void)
         CHECK(moq_rcbuf_create(alloc, data, 1, &payload) == MOQ_OK);
 
         moq_rcbuf_t *props = NULL;
-        MAKE_LOC_PROPS(alloc, 1000, false, &props);
+        MAKE_LOC_PROPS(alloc, 1000, true, &props);
 
         moq_playback_object_t obj;
         moq_playback_object_init(&obj);
@@ -1455,7 +1457,7 @@ int main(void)
         CHECK(moq_rcbuf_create(alloc, data, 1, &p2) == MOQ_OK);
 
         moq_rcbuf_t *props = NULL;
-        MAKE_LOC_PROPS(alloc, 1000, false, &props);
+        MAKE_LOC_PROPS(alloc, 1000, true, &props);
 
         moq_playback_object_t obj;
         moq_playback_object_init(&obj);
@@ -1595,7 +1597,7 @@ int main(void)
         CHECK(moq_rcbuf_create(alloc, data, 1, &p_dup) == MOQ_OK);
 
         moq_rcbuf_t *props = NULL;
-        MAKE_LOC_PROPS(alloc, 1000, false, &props);
+        MAKE_LOC_PROPS(alloc, 1000, true, &props);
 
         moq_playback_object_t obj;
         moq_playback_object_init(&obj);
@@ -1647,7 +1649,7 @@ int main(void)
         CHECK(moq_rcbuf_create(alloc, data1, 1, &dup_payload) == MOQ_OK);
 
         moq_rcbuf_t *props = NULL;
-        MAKE_LOC_PROPS(alloc, 1000, false, &props);
+        MAKE_LOC_PROPS(alloc, 1000, true, &props);
 
         moq_playback_object_t obj;
         moq_playback_object_init(&obj);
@@ -1821,7 +1823,7 @@ int main(void)
 
         /* First command: CONFIGURE_VIDEO */
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.struct_size == sizeof(moq_playback_cmd_t));
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         CHECK(cmd.track._opaque == t._opaque);
@@ -1832,7 +1834,7 @@ int main(void)
         moq_playback_cmd_cleanup(&cmd);
 
         /* Second command: DECODE_VIDEO */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.struct_size == sizeof(moq_playback_cmd_t));
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.track._opaque == t._opaque);
@@ -1854,7 +1856,7 @@ int main(void)
         moq_playback_cmd_cleanup(&cmd);
         CHECK(moq_rcbuf_refcount(payload) == 1);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         moq_rcbuf_decref(payload);
         moq_rcbuf_decref(props);
@@ -1894,9 +1896,9 @@ int main(void)
         CHECK(moq_playback_test_buffered_count(pb) == 0);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK); /* CONFIGURE */
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK); /* CONFIGURE */
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK); /* DECODE */
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK); /* DECODE */
         CHECK(cmd.u.decode_video.payload == p);
         CHECK(moq_rcbuf_refcount(p) == 2);
         moq_playback_cmd_cleanup(&cmd);
@@ -1943,15 +1945,15 @@ int main(void)
 
         /* Should release object 0 only (CONFIGURE + DECODE). */
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.object_id == 0);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
         CHECK(moq_playback_test_buffered_count(pb) == 1); /* obj 2 held */
 
         /* Now push object 1. */
@@ -1961,15 +1963,15 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         /* Should release objects 1 and 2. */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.object_id == 1);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.object_id == 2);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
         CHECK(moq_playback_test_buffered_count(pb) == 0);
 
         moq_rcbuf_decref(p0); moq_rcbuf_decref(p1); moq_rcbuf_decref(p2);
@@ -2005,15 +2007,15 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.group_id == 500);
         CHECK(cmd.u.decode_video.object_id == 3);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         moq_rcbuf_decref(p);
         moq_rcbuf_decref(props);
@@ -2047,7 +2049,7 @@ int main(void)
         CHECK(moq_playback_test_buffered_count(pb) == 0);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.struct_size == sizeof(moq_playback_event_t));
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
         CHECK(evt.u.object_dropped.reason == MOQ_PLAYBACK_DROP_MISSING_TIMESTAMP);
@@ -2090,7 +2092,7 @@ int main(void)
         CHECK(moq_playback_test_buffered_count(pb) == 0);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.struct_size == sizeof(moq_playback_event_t));
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
         CHECK(evt.u.object_dropped.reason == MOQ_PLAYBACK_DROP_MALFORMED_LOC);
@@ -2172,13 +2174,13 @@ int main(void)
 
         /* Drain filler, retry: both CONFIGURE + DECODE fit. */
         moq_playback_cmd_t polled;
-        CHECK(moq_playback_poll_command(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &polled, sizeof(polled)) == MOQ_OK);
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
-        CHECK(moq_playback_poll_command(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &polled, sizeof(polled)) == MOQ_OK);
         CHECK(polled.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&polled);
-        CHECK(moq_playback_poll_command(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &polled, sizeof(polled)) == MOQ_OK);
         CHECK(polled.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         moq_playback_cmd_cleanup(&polled);
         CHECK(moq_playback_test_buffered_count(pb) == 0);
@@ -2224,20 +2226,21 @@ int main(void)
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
-        /* CONFIGURE_VIDEO increfed track config. */
+        /* CONFIGURE_VIDEO increfed track config; the track also keeps it
+         * as its decoder and its release-order configuration. */
         CHECK(moq_rcbuf_refcount(stored_codec) == 2);
-        CHECK(moq_rcbuf_refcount(stored_init) == 2);
+        CHECK(moq_rcbuf_refcount(stored_init) == 4);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
 
         CHECK(moq_rcbuf_refcount(stored_codec) == 1);
-        CHECK(moq_rcbuf_refcount(stored_init) == 1);
+        CHECK(moq_rcbuf_refcount(stored_init) == 3);
 
         /* Drain DECODE too. */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         moq_playback_cmd_cleanup(&cmd);
 
         moq_rcbuf_decref(p);
@@ -2278,35 +2281,35 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.object_id == 0);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.object_id == 1);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
         CHECK(moq_playback_test_buffered_count(pb) == 2);
 
         /* Second tick: releases objects 2 and 3. */
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.u.decode_video.object_id == 2);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.u.decode_video.object_id == 3);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
         CHECK(moq_playback_test_buffered_count(pb) == 0);
 
         for (int i = 0; i < 4; i++) {
@@ -2366,13 +2369,13 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK); /* CONFIGURE */
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK); /* CONFIGURE */
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK); /* DECODE (keyframe) */
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK); /* DECODE (keyframe) */
         CHECK(cmd.u.decode_video.keyframe == true);
         CHECK(cmd.u.decode_video.object_id == 0);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK); /* DECODE (non-kf) */
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK); /* DECODE (non-kf) */
         CHECK(cmd.u.decode_video.keyframe == false);
         CHECK(cmd.u.decode_video.decode_time_us == 7000);
         CHECK(cmd.u.decode_video.object_id == 1);
@@ -2380,7 +2383,7 @@ int main(void)
 
         /* No OBJECT_DROPPED event. */
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
 
         moq_rcbuf_decref(kf_p);
         moq_rcbuf_decref(kf_props);
@@ -2434,24 +2437,24 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.group_id == 1);
         CHECK(cmd.u.decode_video.object_id == 0);
         moq_playback_cmd_cleanup(&cmd);
 
         /* Group advanced: object from group 2 released. */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.group_id == 2);
         CHECK(cmd.u.decode_video.object_id == 0);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
         CHECK(moq_playback_test_buffered_count(pb) == 0);
 
         moq_rcbuf_decref(p0);
@@ -2498,18 +2501,18 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.group_id == 1);
         CHECK(cmd.u.decode_video.object_id == 0);
         moq_playback_cmd_cleanup(&cmd);
 
         /* No DECODE for the END_OF_GROUP marker. */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
         CHECK(moq_playback_test_buffered_count(pb) == 0);
 
         CHECK(moq_playback_test_anchor_group(pb, t) == 2);
@@ -2559,15 +2562,15 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.object_id == 0);
         moq_playback_cmd_cleanup(&cmd);
         /* No decode for o1 — it was a stranded leftover, dropped not decoded. */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         CHECK(moq_playback_test_buffered_count(pb) == 0);
         CHECK(moq_rcbuf_refcount(p1) == 1);   /* dropped → buffer ref gone */
@@ -2623,15 +2626,15 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.object_id == 0);
         moq_playback_cmd_cleanup(&cmd);
         /* No decode for the marker, and none for stranded o2. */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         CHECK(moq_playback_test_buffered_count(pb) == 0);
         CHECK(moq_rcbuf_refcount(p2) == 1);
@@ -2685,7 +2688,7 @@ int main(void)
             CHECK(moq_playback_test_buffered_count(pb) == 0);
 
             moq_playback_cmd_t cmd;
-            while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+            while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
                 moq_playback_cmd_cleanup(&cmd);
 
             moq_rcbuf_decref(pa);
@@ -2746,7 +2749,7 @@ int main(void)
 
         /* Drain and retry: now the closer decodes and the leftover drops. */
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         CHECK(moq_playback_test_buffered_count(pb) == 0);
@@ -2804,18 +2807,18 @@ int main(void)
 
         /* Object 0 released as DECODE. */
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.object_id == 0);
         moq_playback_cmd_cleanup(&cmd);
 
         /* Object 1 missing, group is closed → PARTIAL_GROUP_ABANDONED. */
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.struct_size == sizeof(moq_playback_event_t));
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_PARTIAL_GROUP_ABANDONED);
         CHECK(evt.u.partial_group_abandoned.from_group_id == 1);
@@ -2887,14 +2890,14 @@ int main(void)
 
         /* Drain event + commands, retry. */
         moq_playback_event_t polled_evt;
-        CHECK(moq_playback_poll_event(pb, &polled_evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &polled_evt, sizeof(polled_evt)) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
-        CHECK(moq_playback_poll_event(pb, &polled_evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &polled_evt, sizeof(polled_evt)) == MOQ_OK);
         CHECK(polled_evt.kind == MOQ_PLAYBACK_EVENT_PARTIAL_GROUP_ABANDONED);
         CHECK(moq_playback_test_buffered_count(pb) == 0);
         CHECK(moq_playback_test_anchor_group(pb, t) == 2);
@@ -2925,7 +2928,7 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.struct_size == sizeof(moq_playback_event_t));
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_TRACK_ENDED);
         CHECK(evt.track._opaque == t._opaque);
@@ -3004,12 +3007,12 @@ int main(void)
 
         /* Drain event, retry tick. */
         moq_playback_event_t polled;
-        CHECK(moq_playback_poll_event(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &polled, sizeof(polled)) == MOQ_OK);
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         /* TRACK_ENDED emitted. */
-        CHECK(moq_playback_poll_event(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &polled, sizeof(polled)) == MOQ_OK);
         CHECK(polled.struct_size == sizeof(moq_playback_event_t));
         CHECK(polled.kind == MOQ_PLAYBACK_EVENT_TRACK_ENDED);
 
@@ -3102,13 +3105,13 @@ int main(void)
         /* Tick 1: max_release=1, releases object 0 only. */
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         /* Marker still buffered. */
         CHECK(moq_playback_test_buffered_count(pb) == 1);
@@ -3166,7 +3169,7 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.struct_size == sizeof(moq_playback_cmd_t));
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         CHECK(cmd.u.configure_video.width == 1920);
@@ -3183,7 +3186,7 @@ int main(void)
         /* Raw init_data released after CMAF parse; only codec_config kept. */
         CHECK(moq_playback_test_track_init_data(pb, t) == NULL);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.struct_size == sizeof(moq_playback_cmd_t));
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF);
         CHECK(cmd.u.decode_cmaf.group_id == 1);
@@ -3244,9 +3247,9 @@ int main(void)
         CHECK(moq_playback_test_buffered_count(pb) == 0);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK); /* CONFIGURE */
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK); /* CONFIGURE */
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK); /* DECODE_CMAF */
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK); /* DECODE_CMAF */
         CHECK(cmd.u.decode_cmaf.fragment == p);
         moq_playback_cmd_cleanup(&cmd);
         CHECK(moq_rcbuf_refcount(p) == 1);
@@ -3284,7 +3287,7 @@ int main(void)
         CHECK(moq_playback_test_buffered_count(pb) == 0);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
         CHECK(evt.u.object_dropped.reason == MOQ_PLAYBACK_DROP_MALFORMED_CMAF);
 
@@ -3325,7 +3328,7 @@ int main(void)
         CHECK(moq_playback_test_buffered_count(pb) == 0);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
         CHECK(evt.u.object_dropped.reason ==
               MOQ_PLAYBACK_DROP_UNSUPPORTED_MULTI_SAMPLE);
@@ -3397,12 +3400,12 @@ int main(void)
         CHECK(moq_playback_test_buffered_count(pb) == 0);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
 
         /* Sample 0: keyframe, size=2 */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF);
         CHECK(cmd.u.decode_cmaf.decode_time_us == 0);
         CHECK(cmd.u.decode_cmaf.keyframe == true);
@@ -3411,7 +3414,7 @@ int main(void)
         moq_playback_cmd_cleanup(&cmd);
 
         /* Sample 1: non-key, size=3 */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF);
         CHECK(cmd.u.decode_cmaf.decode_time_us == 33333);
         CHECK(cmd.u.decode_cmaf.keyframe == false);
@@ -3420,7 +3423,7 @@ int main(void)
         moq_playback_cmd_cleanup(&cmd);
 
         /* Sample 2: non-key, size=1 */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF);
         CHECK(cmd.u.decode_cmaf.decode_time_us == 66666);
         CHECK(cmd.u.decode_cmaf.keyframe == false);
@@ -3428,7 +3431,7 @@ int main(void)
         CHECK(cmd.u.decode_cmaf.mdat_offset == s0_off + 5);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
         CHECK(moq_rcbuf_refcount(payload) == 1);
 
         moq_rcbuf_decref(payload);
@@ -3475,13 +3478,13 @@ int main(void)
         CHECK(moq_playback_test_buffered_count(pb) == 1);
 
         moq_playback_cmd_t polled;
-        CHECK(moq_playback_poll_command(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &polled, sizeof(polled)) == MOQ_OK);
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
-        CHECK(moq_playback_poll_command(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &polled, sizeof(polled)) == MOQ_OK);
         CHECK(polled.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&polled);
-        CHECK(moq_playback_poll_command(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &polled, sizeof(polled)) == MOQ_OK);
         CHECK(polled.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF);
         moq_playback_cmd_cleanup(&polled);
         CHECK(moq_playback_test_buffered_count(pb) == 0);
@@ -3530,19 +3533,19 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF);
         CHECK(cmd.u.decode_cmaf.group_id == 1);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_TRACK_ENDED);
 
         CHECK(moq_playback_test_buffered_count(pb) == 0);
@@ -3586,8 +3589,8 @@ int main(void)
         size_t init_len = build_avc_init(init_seg, 90000, 320, 240,
                                           avcc, sizeof(avcc));
 
-        /* create=6 allocs, codec_config copy=#7 (fail) */
-        oom_state_t oom = { 0, 0, 7 };
+        /* create=9 allocs, codec_config copy=#10 (fail) */
+        oom_state_t oom = { 0, 0, 10 };
         moq_alloc_t fa = oom_allocator(&oom);
         moq_playback_t *pb = NULL;
         CHECK(moq_playback_create(&fa, &cfg, &pb) == MOQ_OK);
@@ -3699,7 +3702,7 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         CHECK(cmd.u.configure_video.width == 320);
         CHECK(cmd.u.configure_video.height == 240);
@@ -3713,7 +3716,7 @@ int main(void)
     /*  PB5a: keyframe gating and decode safety                        */
     /* ================================================================ */
 
-    /* -- initial RAW non-keyframe is dropped -------------------------- */
+    /* -- initial RAW non-keyframe waits for an entry ------------------ */
     {
         moq_playback_cfg_t cfg;
         moq_playback_cfg_init(&cfg);
@@ -3741,22 +3744,23 @@ int main(void)
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
-        CHECK(moq_rcbuf_refcount(p) == 1);
-        CHECK(moq_playback_test_buffered_count(pb) == 0);
+        /* Held, not dropped: an earlier independent object may still
+         * arrive and become the entry. */
+        CHECK(moq_rcbuf_refcount(p) == 2);
+        CHECK(moq_playback_test_buffered_count(pb) == 1);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.struct_size == sizeof(moq_playback_event_t));
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_KEYFRAME_WAITING);
 
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
-        CHECK(evt.kind == MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
-        CHECK(evt.u.object_dropped.reason == MOQ_PLAYBACK_DROP_KEYFRAME_WAIT);
+        /* Reported once. */
+        CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
 
         moq_rcbuf_decref(p);
         moq_rcbuf_decref(props);
@@ -3791,22 +3795,22 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
 
         moq_rcbuf_decref(p);
         moq_rcbuf_decref(props);
         moq_playback_destroy(pb);
     }
 
-    /* -- initial CMAF non-keyframe dropped --------------------------- */
+    /* -- initial CMAF non-keyframe waits for an entry ----------------- */
     {
         moq_playback_cfg_t cfg;
         moq_playback_cfg_init(&cfg);
@@ -3838,21 +3842,20 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_KEYFRAME_WAITING);
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
-        CHECK(evt.kind == MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
-        CHECK(evt.u.object_dropped.reason == MOQ_PLAYBACK_DROP_KEYFRAME_WAIT);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
 
-        CHECK(moq_rcbuf_refcount(p) == 1);
+        /* Held until an entry arrives. */
+        CHECK(moq_rcbuf_refcount(p) == 2);
         moq_rcbuf_decref(p);
         moq_playback_destroy(pb);
     }
 
-    /* -- CMAF keyframe exits wait after non-keyframe drop ------------ */
+    /* -- CMAF keyframe after a non-keyframe becomes the entry -------- */
     {
         moq_playback_cfg_t cfg;
         moq_playback_cfg_init(&cfg);
@@ -3893,19 +3896,19 @@ int main(void)
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
-        /* Non-keyframe dropped, keyframe decoded. */
+        /* The keyframe is the entry and is decoded; the non-keyframe below
+         * it is dropped STALE once release starts. */
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
-        CHECK(evt.kind == MOQ_PLAYBACK_EVENT_KEYFRAME_WAITING);
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
-        CHECK(evt.u.object_dropped.reason == MOQ_PLAYBACK_DROP_KEYFRAME_WAIT);
+        CHECK(evt.u.object_dropped.reason == MOQ_PLAYBACK_DROP_STALE);
+        CHECK(evt.u.object_dropped.object_id == 0);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF);
         CHECK(cmd.u.decode_cmaf.object_id == 1);
         moq_playback_cmd_cleanup(&cmd);
@@ -3946,7 +3949,7 @@ int main(void)
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         /* Group 2: object 0 and object 2 (end_of_group), missing 1.
@@ -3980,7 +3983,7 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         /* Object 2/0 decoded. */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.group_id == 2);
         CHECK(cmd.u.decode_video.object_id == 0);
@@ -3988,18 +3991,18 @@ int main(void)
 
         /* Gap at 2/1 → partial abandon. */
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_PARTIAL_GROUP_ABANDONED);
 
         /* RESET emitted when group 3 object found. */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_RESET);
         CHECK(cmd.u.reset.reason == MOQ_PLAYBACK_RESET_GAP);
 
         /* Group 3 non-keyframe dropped (keyframe wait). */
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_KEYFRAME_WAITING);
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
         CHECK(evt.u.object_dropped.reason == MOQ_PLAYBACK_DROP_KEYFRAME_WAIT);
 
@@ -4016,15 +4019,15 @@ int main(void)
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_SKIP_FORWARD);
         CHECK(evt.u.skip_forward.from_group_id == 2);
         CHECK(evt.u.skip_forward.to_group_id == 4);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.group_id == 4);
         moq_playback_cmd_cleanup(&cmd);
@@ -4038,7 +4041,11 @@ int main(void)
         moq_playback_destroy(pb);
     }
 
-    /* -- non-monotonic DTS dropped ----------------------------------- */
+    /* -- RAW: object order is decode order ---------------------------- */
+    /* LOC carries a presentation timestamp only, and frame reordering
+     * (B-frames) makes it decrease in decode order: I P B B presenting at
+     * 1, 4, 2, 3 ms. Every object decodes, in object order, carrying its
+     * timestamp; nothing is dropped. */
     {
         moq_playback_cfg_t cfg;
         moq_playback_cfg_init(&cfg);
@@ -4048,49 +4055,106 @@ int main(void)
         moq_playback_track_t t = MOQ_PLAYBACK_TRACK_INVALID;
         CHECK(moq_playback_add_track(pb, &tc, &t) == MOQ_OK);
 
-        moq_rcbuf_t *props0 = NULL, *props1 = NULL;
-        MAKE_LOC_PROPS(alloc, 2000, true, &props0);
-        MAKE_LOC_PROPS(alloc, 1000, false, &props1);
-
+        static const uint64_t ts[4] = { 1000, 4000, 2000, 3000 };
+        moq_rcbuf_t *props[4] = { NULL }, *payload[4] = { NULL };
         uint8_t data[] = { 0x01 };
+        moq_playback_object_t obj;
+        for (uint64_t o = 0; o < 4; o++) {
+            MAKE_LOC_PROPS(alloc, ts[o], o == 0, &props[o]);
+            CHECK(moq_rcbuf_create(alloc, data, 1, &payload[o]) == MOQ_OK);
+            moq_playback_object_init(&obj);
+            obj.track = t;
+            obj.group_id = 1;
+            obj.object_id = o;
+            obj.payload = payload[o];
+            obj.properties = props[o];
+            CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
+        }
+
+        CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
+
+        moq_playback_cmd_t cmd;
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
+        CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
+        moq_playback_cmd_cleanup(&cmd);
+        for (uint64_t o = 0; o < 4; o++) {
+            CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
+            CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
+            CHECK(cmd.u.decode_video.object_id == o);
+            CHECK(cmd.u.decode_video.decode_time_us == ts[o]);
+            CHECK(cmd.u.decode_video.presentation_time_us == ts[o]);
+            moq_playback_cmd_cleanup(&cmd);
+        }
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
+
+        moq_playback_event_t evt;
+        while (moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK)
+            CHECK(evt.kind != MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
+        CHECK(moq_playback_test_buffered_count(pb) == 0);
+
+        for (unsigned o = 0; o < 4; o++) {
+            moq_rcbuf_decref(payload[o]);
+            moq_rcbuf_decref(props[o]);
+        }
+        moq_playback_destroy(pb);
+    }
+
+    /* -- CMAF: a decode time below the last one is dropped ------------ */
+    /* tfdt is a real decode clock, so going backwards within a timeline
+     * is malformed. */
+    {
+        moq_playback_cfg_t cfg;
+        moq_playback_cfg_init(&cfg);
+        moq_playback_t *pb = make_pb(alloc, &cfg);
+
+        moq_playback_track_cfg_t tc;
+        moq_playback_track_cfg_init(&tc);
+        tc.media_type = MOQ_PLAYBACK_MEDIA_VIDEO;
+        tc.packaging = MOQ_PLAYBACK_PACKAGING_CMAF;
+        tc.timescale = 90000;
+        moq_playback_track_t t = MOQ_PLAYBACK_TRACK_INVALID;
+        CHECK(moq_playback_add_track(pb, &tc, &t) == MOQ_OK);
+
+        uint8_t mdat[] = { 0x01 };
+        uint8_t frag_buf[512];
+        size_t len0 = build_cmaf_fragment(frag_buf, 900000, 3000, 1,
+                                          0x02000000, 0, mdat, 1);
         moq_rcbuf_t *p0 = NULL, *p1 = NULL;
-        CHECK(moq_rcbuf_create(alloc, data, 1, &p0) == MOQ_OK);
-        CHECK(moq_rcbuf_create(alloc, data, 1, &p1) == MOQ_OK);
+        CHECK(moq_rcbuf_create(alloc, frag_buf, len0, &p0) == MOQ_OK);
+        size_t len1 = build_cmaf_fragment(frag_buf, 450000, 3000, 1,
+                                          0x01000000, 0, mdat, 1);
+        CHECK(moq_rcbuf_create(alloc, frag_buf, len1, &p1) == MOQ_OK);
 
         moq_playback_object_t obj;
         moq_playback_object_init(&obj);
         obj.track = t;
         obj.group_id = 1;
-
-        obj.object_id = 0; obj.payload = p0; obj.properties = props0;
+        obj.object_id = 0; obj.payload = p0;
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
-        obj.object_id = 1; obj.payload = p1; obj.properties = props1;
+        obj.object_id = 1; obj.payload = p1;
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
-        CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
-        CHECK(cmd.u.decode_video.decode_time_us == 2000);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
+        CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF);
+        CHECK(cmd.u.decode_cmaf.decode_time_us == 10000000);
         moq_playback_cmd_cleanup(&cmd);
-
-        /* Object 1 has DTS 1000 < 2000 → dropped. */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        /* Object 1 decodes at 5000000 us < 10000000 us: dropped. */
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
         CHECK(evt.u.object_dropped.reason == MOQ_PLAYBACK_DROP_NON_MONOTONIC_DTS);
         CHECK(evt.u.object_dropped.object_id == 1);
-
         CHECK(moq_playback_test_buffered_count(pb) == 0);
 
         moq_rcbuf_decref(p0); moq_rcbuf_decref(p1);
-        moq_rcbuf_decref(props0); moq_rcbuf_decref(props1);
         moq_playback_destroy(pb);
     }
 
@@ -4129,25 +4193,18 @@ int main(void)
         CHECK(moq_playback_test_buffered_count(pb) == 1);
         CHECK(moq_rcbuf_refcount(p) == 2);
 
-        /* Drain, retry: KEYFRAME_WAITING fills the slot. */
+        /* Drain, retry: KEYFRAME_WAITING fills the slot; the object, which
+         * has no entry yet, stays buffered. */
         moq_playback_event_t polled;
-        CHECK(moq_playback_poll_event(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &polled, sizeof(polled)) == MOQ_OK);
 
-        /* Tick: emits KEYFRAME_WAITING, then OBJECT_DROPPED needs
-           another slot → WOULD_BLOCK. Object still buffered. */
-        CHECK(moq_playback_tick(pb, 0) == MOQ_ERR_WOULD_BLOCK);
-        CHECK(moq_playback_test_buffered_count(pb) == 1);
-
-        CHECK(moq_playback_poll_event(pb, &polled) == MOQ_OK);
-        CHECK(polled.kind == MOQ_PLAYBACK_EVENT_KEYFRAME_WAITING);
-
-        /* Drain, retry: OBJECT_DROPPED succeeds, object dropped. */
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
-        CHECK(moq_playback_test_buffered_count(pb) == 0);
-        CHECK(moq_rcbuf_refcount(p) == 1);
+        CHECK(moq_playback_test_buffered_count(pb) == 1);
+        CHECK(moq_rcbuf_refcount(p) == 2);
 
-        CHECK(moq_playback_poll_event(pb, &polled) == MOQ_OK);
-        CHECK(polled.kind == MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
+        CHECK(moq_playback_poll_event(pb, &polled, sizeof(polled)) == MOQ_OK);
+        CHECK(polled.kind == MOQ_PLAYBACK_EVENT_KEYFRAME_WAITING);
+        CHECK(moq_playback_poll_event(pb, &polled, sizeof(polled)) == MOQ_DONE);
 
         moq_rcbuf_decref(p);
         moq_rcbuf_decref(props);
@@ -4185,10 +4242,10 @@ int main(void)
         /* Decode group 1: CONFIGURE+DECODE fits in 2 slots. */
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
 
@@ -4230,16 +4287,16 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_ERR_WOULD_BLOCK);
 
         /* Drain filler + DECODE. */
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_PARTIAL_GROUP_ABANDONED);
 
         /* Retry: RESET succeeds now. */
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_RESET);
         CHECK(cmd.u.reset.reason == MOQ_PLAYBACK_RESET_GAP);
 
@@ -4283,7 +4340,7 @@ int main(void)
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         /* Group 2: objects 0 and 2(end_of_group), missing 1.
@@ -4325,37 +4382,37 @@ int main(void)
            RESET(GAP), SKIP_FORWARD(2→3), CONFIGURE,
            DECODE_CMAF(3/0 at DTS 0).
            NOT: OBJECT_DROPPED(NON_MONOTONIC_DTS). */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF);
         CHECK(cmd.u.decode_cmaf.group_id == 2);
         CHECK(cmd.u.decode_cmaf.decode_time_us == 10033333);
         moq_playback_cmd_cleanup(&cmd);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_PARTIAL_GROUP_ABANDONED);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_RESET);
         CHECK(cmd.u.reset.reason == MOQ_PLAYBACK_RESET_GAP);
 
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_SKIP_FORWARD);
         CHECK(evt.u.skip_forward.from_group_id == 2);
         CHECK(evt.u.skip_forward.to_group_id == 3);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF);
         CHECK(cmd.u.decode_cmaf.group_id == 3);
         CHECK(cmd.u.decode_cmaf.decode_time_us == 0);
         moq_playback_cmd_cleanup(&cmd);
 
         /* No NON_MONOTONIC_DTS drop. */
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
 
         moq_rcbuf_decref(p1); moq_rcbuf_decref(p2_0);
         moq_rcbuf_decref(p2_2); moq_rcbuf_decref(p3);
@@ -4391,21 +4448,21 @@ int main(void)
 
         obj.object_id = 0; obj.payload = p0; obj.properties = props0;
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
-        obj.object_id = 2; obj.payload = p2; obj.properties = props2;
-        CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
-
+        /* The later object arrives at T: the wait is measured from it. */
         uint64_t T = 1000000;
+        obj.object_id = 2; obj.payload = p2; obj.properties = props2;
+        CHECK(moq_playback_push_object(pb, &obj, T) == MOQ_OK);
         CHECK(moq_playback_tick(pb, T) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.object_id == 0);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         CHECK(moq_playback_test_gap_waiting(pb, t));
         CHECK(moq_playback_test_buffered_count(pb) == 1);
@@ -4413,7 +4470,7 @@ int main(void)
         /* Tick just before timeout: no events. */
         CHECK(moq_playback_tick(pb, T + 499999) == MOQ_OK);
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
         CHECK(moq_playback_test_buffered_count(pb) == 1);
 
         moq_rcbuf_decref(p0); moq_rcbuf_decref(p2);
@@ -4448,13 +4505,13 @@ int main(void)
 
         obj.object_id = 0; obj.payload = p0; obj.properties = props0;
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
-        obj.object_id = 2; obj.payload = p2; obj.properties = props2;
-        CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
-
+        /* The later object arrives at T: the wait is measured from it. */
         uint64_t T = 1000000;
+        obj.object_id = 2; obj.payload = p2; obj.properties = props2;
+        CHECK(moq_playback_push_object(pb, &obj, T) == MOQ_OK);
         CHECK(moq_playback_tick(pb, T) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         CHECK(moq_playback_test_gap_waiting(pb, t));
@@ -4467,16 +4524,16 @@ int main(void)
 
         CHECK(moq_playback_tick(pb, T + 100000) == MOQ_OK);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.object_id == 1);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.u.decode_video.object_id == 2);
         moq_playback_cmd_cleanup(&cmd);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
 
         moq_rcbuf_decref(p0); moq_rcbuf_decref(p1); moq_rcbuf_decref(p2);
         moq_rcbuf_decref(props0); moq_rcbuf_decref(props1);
@@ -4509,25 +4566,25 @@ int main(void)
 
         obj.object_id = 0; obj.payload = p0; obj.properties = props0;
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
-        obj.object_id = 2; obj.payload = p2; obj.properties = props2;
-        CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
-
+        /* The later object arrives at T: the wait is measured from it. */
         uint64_t T = 1000000;
+        obj.object_id = 2; obj.payload = p2; obj.properties = props2;
+        CHECK(moq_playback_push_object(pb, &obj, T) == MOQ_OK);
         CHECK(moq_playback_tick(pb, T) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         /* Timeout fires. */
         CHECK(moq_playback_tick(pb, T + 500000) == MOQ_OK);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.struct_size == sizeof(moq_playback_event_t));
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_GAP_DETECTED);
         CHECK(evt.u.gap_detected.group_id == 1);
 
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_PARTIAL_GROUP_ABANDONED);
 
         CHECK(moq_rcbuf_refcount(p2) == 1);
@@ -4546,19 +4603,19 @@ int main(void)
 
         CHECK(moq_playback_tick(pb, T + 600000) == MOQ_OK);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_RESET);
         CHECK(cmd.u.reset.reason == MOQ_PLAYBACK_RESET_GAP);
 
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_SKIP_FORWARD);
         CHECK(evt.u.skip_forward.from_group_id == 1);
         CHECK(evt.u.skip_forward.to_group_id == 2);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.group_id == 2);
         moq_playback_cmd_cleanup(&cmd);
@@ -4601,7 +4658,7 @@ int main(void)
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         /* Fill 1 of 2 event slots. Gap timeout needs 2 atomically. */
@@ -4615,12 +4672,12 @@ int main(void)
 
         /* Drain filler, now 2 free slots → both events succeed. */
         moq_playback_event_t polled;
-        CHECK(moq_playback_poll_event(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &polled, sizeof(polled)) == MOQ_OK);
 
         CHECK(moq_playback_tick(pb, 200000) == MOQ_OK);
-        CHECK(moq_playback_poll_event(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &polled, sizeof(polled)) == MOQ_OK);
         CHECK(polled.kind == MOQ_PLAYBACK_EVENT_GAP_DETECTED);
-        CHECK(moq_playback_poll_event(pb, &polled) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &polled, sizeof(polled)) == MOQ_OK);
         CHECK(polled.kind == MOQ_PLAYBACK_EVENT_PARTIAL_GROUP_ABANDONED);
         CHECK(moq_playback_test_buffered_count(pb) == 0);
         CHECK(moq_rcbuf_refcount(p2) == 1);
@@ -4658,7 +4715,7 @@ int main(void)
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         /* Group 2: object 0 only, gap at 1 blocks release.
@@ -4701,25 +4758,25 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         /* Group 2 object 0 decoded before shed. */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.group_id == 2);
         CHECK(cmd.u.decode_video.object_id == 0);
         moq_playback_cmd_cleanup(&cmd);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.struct_size == sizeof(moq_playback_event_t));
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_BACKLOG_SHED);
         CHECK(evt.u.backlog_shed.dropped_groups > 0);
 
         /* Recovery: RESET + keyframe in remaining groups. */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_RESET);
 
-        while (moq_playback_poll_event(pb, &evt) == MOQ_OK)
+        while (moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK)
             (void)0;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         moq_rcbuf_decref(p1); moq_rcbuf_decref(p2);
@@ -4757,7 +4814,7 @@ int main(void)
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         /* Group 2: only obj 0 (missing obj 1 → blocked).
@@ -4796,21 +4853,21 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_ERR_WOULD_BLOCK);
 
         moq_playback_event_t polled;
-        CHECK(moq_playback_poll_event(pb, &polled) == MOQ_OK);
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        CHECK(moq_playback_poll_event(pb, &polled, sizeof(polled)) == MOQ_OK);
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         /* Drain and iterate until complete. */
         while (moq_playback_tick(pb, 0) == MOQ_ERR_WOULD_BLOCK) {
-            while (moq_playback_poll_event(pb, &polled) == MOQ_OK)
+            while (moq_playback_poll_event(pb, &polled, sizeof(polled)) == MOQ_OK)
                 (void)0;
-            while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+            while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
                 moq_playback_cmd_cleanup(&cmd);
         }
 
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
-        while (moq_playback_poll_event(pb, &polled) == MOQ_OK)
+        while (moq_playback_poll_event(pb, &polled, sizeof(polled)) == MOQ_OK)
             (void)0;
 
         moq_rcbuf_decref(p1); moq_rcbuf_decref(p2);
@@ -4846,13 +4903,13 @@ int main(void)
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
         moq_playback_object_init(&obj);
         obj.track = t; obj.group_id = 1;
-        obj.object_id = 2; obj.payload = p2; obj.properties = props2;
-        CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
-
+        /* The later object arrives at T: the wait is measured from it. */
         uint64_t T = 1000000;
+        obj.object_id = 2; obj.payload = p2; obj.properties = props2;
+        CHECK(moq_playback_push_object(pb, &obj, T) == MOQ_OK);
         CHECK(moq_playback_tick(pb, T) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         CHECK(moq_playback_test_gap_waiting(pb, t));
@@ -4867,11 +4924,11 @@ int main(void)
         CHECK(moq_playback_tick(pb, T + 100) == MOQ_OK);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_PARTIAL_GROUP_ABANDONED);
 
         /* No GAP_DETECTED — closed-group path took precedence. */
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
 
         moq_rcbuf_decref(p0); moq_rcbuf_decref(p2);
         moq_rcbuf_decref(props0); moq_rcbuf_decref(props2);
@@ -4946,7 +5003,7 @@ int main(void)
         /* Tick: no commands emitted (paused). */
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
         CHECK(moq_playback_test_buffered_count(pb) == 1);
 
         /* Pressure low: depth <= max_recommended. */
@@ -4954,10 +5011,10 @@ int main(void)
         CHECK(moq_playback_handle_feedback(pb, &fb, 0) == MOQ_OK);
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
         CHECK(moq_playback_test_buffered_count(pb) == 0);
@@ -4999,11 +5056,21 @@ int main(void)
         obj.track = t; obj.group_id = 2; obj.object_id = 0;
         obj.payload = p2; obj.properties = props2;
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
+        /* Group 2's stream ended after object 0: delivery is past 2/1, so
+         * the wait on it runs. */
+        moq_playback_stream_terminal_t fin;
+        memset(&fin, 0, sizeof(fin));
+        fin.struct_size = sizeof(fin);
+        fin.kind = MOQ_PLAYBACK_STREAM_FIN;
+        fin.group_id = 2;
+        fin.has_last_object = true;
+        fin.last_object_id = 0;
+        CHECK(moq_playback_on_stream_terminal(pb, t, &fin, 0) == MOQ_OK);
 
         /* Decode group 1. Group 2 obj 0 decoded, gap at 2/1 starts. */
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
         CHECK(moq_playback_test_gap_waiting(pb, t));
 
@@ -5019,18 +5086,18 @@ int main(void)
         /* Tick while paused: gap timer must not fire. */
         CHECK(moq_playback_tick(pb, 1000000) == MOQ_OK);
         moq_playback_event_t gap_evt;
-        CHECK(moq_playback_poll_event(pb, &gap_evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &gap_evt, sizeof(gap_evt)) == MOQ_DONE);
 
         /* Resume. Gap timer should fire now. */
         fb.u.queue_pressure.depth = 2;
         CHECK(moq_playback_handle_feedback(pb, &fb, 0) == MOQ_OK);
         CHECK(moq_playback_tick(pb, 1000000) == MOQ_OK);
 
-        CHECK(moq_playback_poll_event(pb, &gap_evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &gap_evt, sizeof(gap_evt)) == MOQ_OK);
         CHECK(gap_evt.kind == MOQ_PLAYBACK_EVENT_GAP_DETECTED);
-        while (moq_playback_poll_event(pb, &gap_evt) == MOQ_OK)
+        while (moq_playback_poll_event(pb, &gap_evt, sizeof(gap_evt)) == MOQ_OK)
             (void)0;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         moq_rcbuf_decref(p); moq_rcbuf_decref(p2);
@@ -5063,7 +5130,7 @@ int main(void)
         /* Decode first object. */
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         /* Report decode error. */
@@ -5073,13 +5140,13 @@ int main(void)
         fb.kind = MOQ_PLAYBACK_FEEDBACK_DECODE_ERROR;
         CHECK(moq_playback_handle_feedback(pb, &fb, 0) == MOQ_OK);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.struct_size == sizeof(moq_playback_cmd_t));
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_RESET);
         CHECK(cmd.u.reset.reason == MOQ_PLAYBACK_RESET_DECODE_ERROR);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.struct_size == sizeof(moq_playback_event_t));
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_KEYFRAME_WAITING);
 
@@ -5136,10 +5203,10 @@ int main(void)
 
         /* Next polled command is RESET, not stale DECODE. */
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_RESET);
         CHECK(cmd.u.reset.reason == MOQ_PLAYBACK_RESET_DECODE_ERROR);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         moq_rcbuf_decref(p0); moq_rcbuf_decref(p1);
         moq_rcbuf_decref(props0); moq_rcbuf_decref(props1);
@@ -5170,11 +5237,11 @@ int main(void)
 
         /* No RESET or KEYFRAME_WAITING queued. */
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_RESET); /* filler */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
 
         moq_playback_destroy(pb);
     }
@@ -5200,12 +5267,12 @@ int main(void)
         CHECK(moq_playback_handle_feedback(pb, &fb, 0) == MOQ_ERR_WOULD_BLOCK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_TRACK_ENDED); /* filler */
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
 
         moq_playback_destroy(pb);
     }
@@ -5236,7 +5303,7 @@ int main(void)
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         /* Report decode error. */
@@ -5245,10 +5312,10 @@ int main(void)
         fb.track = t;
         fb.kind = MOQ_PLAYBACK_FEEDBACK_DECODE_ERROR;
         CHECK(moq_playback_handle_feedback(pb, &fb, 0) == MOQ_OK);
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             (void)0;
         moq_playback_event_t evt;
-        while (moq_playback_poll_event(pb, &evt) == MOQ_OK)
+        while (moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK)
             (void)0;
 
         /* Push non-keyframe for group 2. */
@@ -5263,9 +5330,9 @@ int main(void)
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
         CHECK(evt.u.object_dropped.reason == MOQ_PLAYBACK_DROP_KEYFRAME_WAIT);
         CHECK(moq_rcbuf_refcount(p1) == 1);
@@ -5281,10 +5348,10 @@ int main(void)
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.group_id == 3);
         moq_playback_cmd_cleanup(&cmd);
@@ -5328,12 +5395,12 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.struct_size == sizeof(moq_playback_cmd_t));
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_AUDIO);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_AUDIO);
         CHECK(cmd.u.decode_audio.decode_time_us == 5000);
         CHECK(cmd.u.decode_audio.payload == p);
@@ -5345,7 +5412,7 @@ int main(void)
 
         /* No KEYFRAME_WAITING event for audio. */
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
 
         moq_rcbuf_decref(p); moq_rcbuf_decref(props);
         moq_playback_destroy(pb);
@@ -5387,7 +5454,7 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_AUDIO);
         CHECK(cmd.u.configure_audio.samplerate == 48000);
         CHECK(cmd.u.configure_audio.channel_count == 2);
@@ -5395,7 +5462,7 @@ int main(void)
         CHECK(cmd.u.configure_audio.codec_config != NULL);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_AUDIO);
         CHECK(cmd.u.decode_audio.decode_time_us == 1000000);
         CHECK(cmd.u.decode_audio.mdat_len == 3);
@@ -5434,7 +5501,7 @@ int main(void)
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         moq_playback_feedback_t fb;
@@ -5443,13 +5510,13 @@ int main(void)
         fb.kind = MOQ_PLAYBACK_FEEDBACK_DECODE_ERROR;
         CHECK(moq_playback_handle_feedback(pb, &fb, 0) == MOQ_OK);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_RESET);
         CHECK(cmd.u.reset.reason == MOQ_PLAYBACK_RESET_DECODE_ERROR);
 
         /* No KEYFRAME_WAITING for audio. */
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
 
         /* Next audio object decodes immediately (no keyframe wait). */
         moq_rcbuf_t *props2 = NULL;
@@ -5463,10 +5530,10 @@ int main(void)
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
 
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_AUDIO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_AUDIO);
         moq_playback_cmd_cleanup(&cmd);
 
@@ -5505,7 +5572,7 @@ int main(void)
         obj.payload = ap; obj.properties = aprops;
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
 
-        /* Push video non-keyframe: should be dropped (keyframe wait). */
+        /* Push video non-keyframe: it waits for an entry. */
         moq_rcbuf_t *vprops = NULL;
         MAKE_LOC_PROPS(alloc, 1000, false, &vprops);
         moq_rcbuf_t *vp = NULL;
@@ -5519,21 +5586,21 @@ int main(void)
 
         /* Audio decoded. */
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_AUDIO);
         CHECK(cmd.track._opaque == at._opaque);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_AUDIO);
         CHECK(cmd.track._opaque == at._opaque);
         moq_playback_cmd_cleanup(&cmd);
 
-        /* No video decode (keyframe wait dropped it). */
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        /* No video decode: the video track has no entry yet. */
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         moq_playback_event_t evt;
         bool got_kf_wait = false;
-        while (moq_playback_poll_event(pb, &evt) == MOQ_OK) {
+        while (moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK) {
             if (evt.kind == MOQ_PLAYBACK_EVENT_KEYFRAME_WAITING)
                 got_kf_wait = true;
         }
@@ -5548,6 +5615,7 @@ int main(void)
     {
         moq_playback_cmd_t cmd;
         memset(&cmd, 0, sizeof(cmd));
+        cmd.struct_size = sizeof(cmd);   /* as a poll stamps it */
         cmd.kind = MOQ_PLAYBACK_CMD_CONFIGURE_AUDIO;
         uint8_t data[] = { 0x01 };
         moq_rcbuf_t *c1 = NULL, *c2 = NULL;
@@ -5622,10 +5690,10 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
         CHECK(cmd.u.decode_video.decode_time_us == 1000);
         CHECK(cmd.u.decode_video.payload == p);
@@ -5711,7 +5779,7 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_TRACK_ENDED);
 
         /* Later push returns WRONG_STATE. */
@@ -5765,10 +5833,10 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_AUDIO);
         moq_playback_cmd_cleanup(&cmd);
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_AUDIO);
         moq_playback_cmd_cleanup(&cmd);
 
@@ -5830,36 +5898,36 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_AUDIO);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_AUDIO);
         CHECK(cmd.u.decode_audio.decode_time_us == 1000000);
         CHECK(cmd.u.decode_audio.mdat_len == 2);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_AUDIO);
         CHECK(cmd.u.decode_audio.decode_time_us == 1021333);
         CHECK(cmd.u.decode_audio.mdat_len == 3);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_AUDIO);
         CHECK(cmd.u.decode_audio.decode_time_us == 1042666);
         CHECK(cmd.u.decode_audio.mdat_len == 1);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
         CHECK(moq_rcbuf_refcount(payload) == 1);
 
         moq_rcbuf_decref(payload);
         moq_playback_destroy(pb);
     }
 
-    /* -- Multi-sample command queue full: WOULD_BLOCK commit-last ---- */
+    /* -- Multi-sample object released incrementally through the ring -- */
     {
         moq_playback_cfg_t cfg;
         moq_playback_cfg_init(&cfg);
@@ -5911,13 +5979,32 @@ int main(void)
         obj.payload = payload;
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
 
-        /* tick: CONFIGURE uses 1 slot, 3 DECODE needs 3 more = 4 total > 3 */
+        /* tick: CONFIGURE and the first two samples fill the three slots;
+         * the object stays at the cursor with one sample left. */
         CHECK(moq_playback_tick(pb, 0) == MOQ_ERR_WOULD_BLOCK);
         CHECK(moq_playback_test_buffered_count(pb) == 1);
-        CHECK(moq_rcbuf_refcount(payload) == 2);
+        CHECK(moq_rcbuf_refcount(payload) == 4);
 
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
+        CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
+        moq_playback_cmd_cleanup(&cmd);
+        for (int i = 0; i < 2; i++) {
+            CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
+            CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF);
+            CHECK(cmd.u.decode_cmaf.decode_time_us == (uint64_t)i * 33333);
+            moq_playback_cmd_cleanup(&cmd);
+        }
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
+
+        /* Drained: the last sample follows. */
+        CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK);
+        CHECK(cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF);
+        CHECK(cmd.u.decode_cmaf.decode_time_us == 66666);
+        moq_playback_cmd_cleanup(&cmd);
+        CHECK(moq_playback_test_buffered_count(pb) == 0);
+        CHECK(moq_rcbuf_refcount(payload) == 1);
 
         moq_rcbuf_decref(payload);
         moq_playback_destroy(pb);
@@ -5980,10 +6067,10 @@ int main(void)
 
         /* No CONFIGURE or DECODE queued — object dropped. */
         moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        CHECK(moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_DONE);
 
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_OK);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK);
         CHECK(evt.kind == MOQ_PLAYBACK_EVENT_OBJECT_DROPPED);
         CHECK(evt.u.object_dropped.reason == MOQ_PLAYBACK_DROP_MALFORMED_CMAF);
 
@@ -5994,7 +6081,7 @@ int main(void)
         moq_playback_destroy(pb);
     }
 
-    /* -- Multi-sample valid but cmd queue too small: WOULD_BLOCK ------ */
+    /* -- Multi-sample object larger than the command ring drains ------ */
     {
         moq_playback_cfg_t cfg;
         moq_playback_cfg_init(&cfg);
@@ -6045,14 +6132,27 @@ int main(void)
         obj.payload = payload;
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
 
+        /* Three samples through a two-slot ring: CONFIGURE and sample 0,
+         * then samples 1 and 2. Nothing is dropped. */
+        size_t decodes = 0;
+        moq_playback_cmd_t cmd;
         CHECK(moq_playback_tick(pb, 0) == MOQ_ERR_WOULD_BLOCK);
         CHECK(moq_playback_test_buffered_count(pb) == 1);
-        CHECK(moq_rcbuf_refcount(payload) == 2);
-
-        moq_playback_cmd_t cmd;
-        CHECK(moq_playback_poll_command(pb, &cmd) == MOQ_DONE);
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK) {
+            if (cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF) decodes++;
+            moq_playback_cmd_cleanup(&cmd);
+        }
+        CHECK(decodes == 1);
+        CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK) {
+            if (cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF) decodes++;
+            moq_playback_cmd_cleanup(&cmd);
+        }
+        CHECK(decodes == 3);
+        CHECK(moq_playback_test_buffered_count(pb) == 0);
+        CHECK(moq_rcbuf_refcount(payload) == 1);
         moq_playback_event_t evt;
-        CHECK(moq_playback_poll_event(pb, &evt) == MOQ_DONE);
+        CHECK(moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_DONE);
 
         moq_rcbuf_decref(payload);
         moq_playback_destroy(pb);
@@ -6097,7 +6197,7 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
         int n = 0;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK) {
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK) {
             n++;
             moq_playback_cmd_cleanup(&cmd);
         }
@@ -6140,7 +6240,7 @@ int main(void)
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
         int n = 0;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK) {
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK) {
             n++;
             moq_playback_cmd_cleanup(&cmd);
         }
@@ -6192,7 +6292,7 @@ static void test_sparse_future_group(const moq_alloc_t *alloc)
 
     CHECK(moq_playback_tick(pb, 1000000) == MOQ_OK);
     moq_playback_cmd_t cmd;
-    while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+    while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
         moq_playback_cmd_cleanup(&cmd);
 
     /* Skip group 1 entirely. Push group 2 object 0. */
@@ -6218,7 +6318,7 @@ static void test_sparse_future_group(const moq_alloc_t *alloc)
 
     moq_playback_event_t evt;
     bool had_gap = false, had_abandon = false;
-    while (moq_playback_poll_event(pb, &evt) == MOQ_OK) {
+    while (moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK) {
         if (evt.kind == MOQ_PLAYBACK_EVENT_GAP_DETECTED)
             had_gap = true;
         if (evt.kind == MOQ_PLAYBACK_EVENT_PARTIAL_GROUP_ABANDONED)
@@ -6229,7 +6329,7 @@ static void test_sparse_future_group(const moq_alloc_t *alloc)
 
     /* Group 2 should decode after recovery. */
     bool had_decode = false;
-    while (moq_playback_poll_command(pb, &cmd) == MOQ_OK) {
+    while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK) {
         if (cmd.kind == MOQ_PLAYBACK_CMD_DECODE_AUDIO)
             had_decode = true;
         moq_playback_cmd_cleanup(&cmd);

@@ -1,8 +1,12 @@
 # picoquic patches LibMoQ applies, in order. Read by
 # scripts/setup_picoquic_deps.sh and scripts/provider_patches.sh.
-0002-reset-stream-after-fin.patch
-0006-own-application-close-reason.patch
-0007-stream-terminal-observation.patch
-0008-use-declared-project-version.patch
-0009-return-stream-credit-at-final-size.patch
-0010-classify-terminal-stream-reset-and-stop.patch
+0001-use-declared-project-version.patch
+0002-deduplicate-link-libraries.patch
+0003-align-stream-reset-stop-and-credit.patch
+0004-stateless-reset-lookup.patch
+0005-own-application-close-reason.patch
+0006-stream-terminal-observation.patch
+0007-per-thread-public-random.patch
+0008-classify-terminal-stream-reset-and-stop.patch
+0009-stateless-reset-ingress.patch
+0010-refuse-stop-after-direct-receive.patch

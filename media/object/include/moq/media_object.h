@@ -180,6 +180,13 @@ typedef struct moq_media_parsed_object {
     bool                  has_capture_time;
     uint64_t              capture_time_us;   /* UNIX microseconds only */
 
+    /* RAW (LOC): decode_time_us and presentation_time_us both copy the
+     * object's LOC media time (its capture timestamp on drafts 16/18, the
+     * LOC-04 time on draft 22) and composition_offset_us is 0. LOC carries
+     * no decode timestamp: decode order is object order, so decode_time_us
+     * may decrease in decode order and is not evidence of a known decode
+     * clock, and a zero offset does not mean the codec has no reordered
+     * frames. CMAF: decode_time_us is the tfdt/trun decode time. */
     uint64_t              decode_time_us;
     int64_t               composition_offset_us;
     uint64_t              presentation_time_us;

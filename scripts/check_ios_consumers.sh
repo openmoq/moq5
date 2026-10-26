@@ -55,9 +55,13 @@ build_for() {
     # Explicitly UNSET MOQ_SERVICE* so a stray shell env can never mask an
     # accidental reintroduction of the root MOQ5 dependency: the MoQServiceApple
     # wrapper vends MoQService unconditionally, which is the whole point of the
-    # iOS/Xcode lane, and this check is load-bearing on that.
+    # iOS/Xcode lane, and this check is load-bearing on that. SDKROOT goes
+    # too, and the toolchain's swift runs rather than the xcrun shim: the
+    # shim exports SDKROOT for the macOS SDK, which the final link's clang
+    # then prefers over the iOS --sysroot (-Wincompatible-sysroot).
     (cd "$player" && \
-     env -u MOQ_SERVICE -u MOQ_SERVICE_IOS -u MOQ_TRANSPORT swift build \
+     env -u MOQ_SERVICE -u MOQ_SERVICE_IOS -u MOQ_TRANSPORT -u SDKROOT \
+        "$(xcrun --find swift)" build \
         --scratch-path "$scratch" \
         --triple "$triple" \
         --sdk "$(xcrun --sdk "$sdk" --show-sdk-path)" >&2)

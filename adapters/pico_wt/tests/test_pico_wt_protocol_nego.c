@@ -186,6 +186,14 @@ static int run_scenario(uint8_t cid_byte, const char *offer,
     }
 
 done:
+    /* The client's h3zero context is this test's: h3zero frees only a
+     * server's with its connection. Delete it while that connection still
+     * exists; the delete also detaches the connection's callback, which
+     * deleting the connection would otherwise call. A failed setup may have
+     * created the context without the rest, and this covers that too. */
+    if (client_h3)
+        h3zero_callback_delete_context(test_ctx ? test_ctx->cnx_client : NULL,
+                                       client_h3);
     if (test_ctx)
         tls_api_delete_ctx(test_ctx);
     return ret;

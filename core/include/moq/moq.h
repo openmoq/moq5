@@ -15,6 +15,7 @@
 #include "types.h"
 #include "location.h"
 #include "fill.h"
+#include "cluster.h"
 #include "rcbuf.h"
 #include "session.h"
 #include "transport_binding.h"

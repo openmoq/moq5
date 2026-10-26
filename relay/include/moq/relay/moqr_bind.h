@@ -93,10 +93,12 @@ typedef struct moqr_bind_limits {
  * the difference being exactly those three terms. These private limits do
  * not change the embedded config layout or the Joining FETCH byte budget. */
 typedef struct moqr_bind_capacity {
+    uint32_t struct_size, _reserved;
     uint64_t structure_bytes;
     uint64_t announce_bytes;
     uint64_t total_bytes;
 } moqr_bind_capacity_t;
+#define MOQR_BIND_CAPACITY_V0_SIZE 32u
 
 typedef struct moqr_bind_cfg {
     uint32_t           struct_size;
@@ -164,9 +166,19 @@ MOQR_API moqr_result_t moqr_bind_cfg_resolve(const moqr_bind_cfg_t *cfg,
                                     const moqr_core_limits_t *core_limits,
                                     moqr_bind_limits_t *out);
 
-MOQR_API moqr_result_t moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
+/* Sized outputs: require V0, copy/stamp min(out_size, current) on MOQ_OK;
+ * leave all output bytes unchanged on error. Admission CAPACITY differs from
+ * transient WOULD_BLOCK and allocation NOMEM. */
+MOQR_API moq_result_t moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
                                           const moqr_core_limits_t *core_limits,
-                                          moqr_bind_capacity_t *out);
+                                          moqr_bind_capacity_t *out, size_t out_size);
+
+/* Capacity planning before a core exists: pass the immutable resolved
+ * cluster configuration from moqr_cluster_cfg_resolve. The ordinary describe
+ * function uses cfg->core when supplied, otherwise describes legacy mode. */
+MOQR_API moq_result_t moqr_bind_cluster_capacity_describe(
+    const moqr_bind_cfg_t *cfg, const moqr_core_limits_t *core_limits,
+    const moqr_cluster_info_t *cluster, moqr_bind_capacity_t *out, size_t out_size);
 
 MOQR_API moqr_result_t moqr_bind_create(const moqr_bind_cfg_t *cfg,
                                moqr_bind_t **out);
@@ -200,6 +212,30 @@ MOQR_API void moqr_bind_destroy(moqr_bind_t *b);
 MOQR_API moqr_result_t moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
                                   moq_version_t version);
 
+/* Optional local policy for an attached cluster peer. Correlation identities
+ * are local-only and must name only connections known to be one endpoint.
+ * A configured cost overrides that peer's asserted RELAY_COST, including zero.
+ * Configure at attachment, before any route or subscription uses the peer. */
+typedef struct moqr_bind_cluster_peer_cfg {
+    uint32_t struct_size;
+    bool has_relay_cost;
+    uint8_t _reserved[3];
+    uint64_t relay_cost;
+    uint64_t correlation_id;
+} moqr_bind_cluster_peer_cfg_t;
+#define MOQR_BIND_CLUSTER_PEER_CFG_V0_SIZE 24u
+MOQR_API void moqr_bind_cluster_peer_cfg_init_sized(
+    moqr_bind_cluster_peer_cfg_t *cfg, size_t cfg_size);
+#define moqr_bind_cluster_peer_cfg_init(p) \
+    moqr_bind_cluster_peer_cfg_init_sized((p), sizeof(*(p)))
+/* NULL uses ordinary attachment policy. Reads the named cfg V0 prefix;
+ * ignores unknown tail and relay_cost when has_relay_cost is false.
+ * Copies policy; session stays caller-owned. Refusal takes no ownership. */
+
+MOQR_API moq_result_t moqr_bind_conn_open_cluster(moqr_bind_t *b,
+    moq_session_t *session, moq_version_t version,
+    const moqr_bind_cluster_peer_cfg_t *cfg);
+
 /* This connection's negotiated draft, or MOQ_VERSION_DRAFT_16 if unattached. */
 MOQR_API moq_version_t moqr_bind_conn_version(const moqr_bind_t *b,
                                      const moq_session_t *session);
@@ -222,9 +258,9 @@ MOQR_API moqr_result_t moqr_bind_conn_close(moqr_bind_t *b, moq_session_t *sessi
  */
 MOQR_API moqr_result_t moqr_bind_pump(moqr_bind_t *b, uint64_t now_us);
 
-/* Whether the LAST moqr_bind_pump ended with any connection's delivery pass
- * expired on the per-pass delivery guard with work remaining. The runtime's
- * stepper reads this to request one further coalesced self-wake, so a batch
+/* Whether the LAST moqr_bind_pump exhausted a delivery/discard work budget,
+ * or recovered refusal room with an interrupted event drain still owed.
+ * The runtime's stepper requests one further coalesced self-wake, so a batch
  * larger than a single pass drains across a FINITE continuation chain
  * instead of stranding behind a doorbell nobody rings — a guard-bounded
  * batch may be the only traffic there is, so nothing else is guaranteed to
@@ -245,7 +281,9 @@ MOQR_API bool moqr_bind_pump_budget_pending(const moqr_bind_t *b);
  * wake), so a continuation would only spin. The runtime's stepper uses this to gate
  * the applied-inbound self-continuation on ACTUAL forward-progressable work: a
  * pass that drained everything (or left only ACTION_CAP backpressure) leaves
- * this false, so an applied batch that fully delivered earns no wake. */
+ * this false, so an applied batch that fully delivered earns no wake. An
+ * interrupted event drain gates every delivery retry; its retained ready bit
+ * earns a continuation only after refusal room permits polling again. */
 MOQR_API bool moqr_bind_pump_continuation_pending(const moqr_bind_t *b);
 
 /* The fill wait: how long a fill fetch stream waits for upstream to deliver
@@ -404,7 +442,10 @@ typedef struct moqr_bind_stats {
     uint32_t conns;
     uint64_t events_translated;
     uint64_t deliveries_written;
-    uint64_t ingest_refusals;    /* TOO_OLD / ordering INVALs at the log */
+    uint64_t ingest_refusals;    /* ingest operations the log refused:
+                                  * objects or chunks too old, out of
+                                  * order or over capacity (one object
+                                  * can count more than once)          */
     uint64_t session_errors;     /* unexpected session-call failures     */
     moqr_latency_hist_t forward_latency;   /* ingest→delivery, us          */
     uint32_t pending_high_water; /* max deferred-output ring depth seen   */

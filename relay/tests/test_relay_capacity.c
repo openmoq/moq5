@@ -152,7 +152,7 @@ cap_zero_byte_records(void)
     cfg.log_max_objects_per_group = 2049;
 
     moqr_core_capacity_t cap;
-    moqr_core_capacity_describe(&cfg, &cap);
+    moqr_core_capacity_describe(&cfg, &cap, sizeof(cap));
 
     moqr_core_t *c = NULL;
     MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_OK);
@@ -205,7 +205,7 @@ cap_zero_byte_fetches(void)
     cfg.fetch_pin_bytes = 32768;   /* 1 byte x 16384 concurrent pins */
 
     moqr_core_capacity_t cap;
-    moqr_core_capacity_describe(&cfg, &cap);
+    moqr_core_capacity_describe(&cfg, &cap, sizeof(cap));
 
     moqr_core_t *c = NULL;
     MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_OK);
@@ -295,9 +295,9 @@ cap_overflow_refused(void)
         cfg.log_max_cursors = 1048576;
         moqr_core_capacity_t cap;
         memset(&cap, 0xEE, sizeof(cap));
-        MOQ_TEST_CHECK(moqr_core_capacity_describe(&cfg, &cap) ==
-                       MOQR_ERR_INVAL);
-        MOQ_TEST_CHECK_EQ_U64(cap.total_bytes, 0);   /* zeroed, not stale */
+        MOQ_TEST_CHECK(moqr_core_capacity_describe(&cfg, &cap, sizeof(cap)) ==
+                       MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK_EQ_U64(cap.total_bytes, UINT64_C(0xeeeeeeeeeeeeeeee)); /* refusal leaves output unchanged */
     }
     {
         moqr_log_cfg_t lc;
@@ -324,8 +324,8 @@ cap_overflow_refused(void)
         moqr_core_relay_cfg_init_sized(&cfg, sizeof(cfg), &a.vt);
         cfg.log_max_subgroups = 1u << 29;   /* gpos stride exceeds u32 */
         moqr_core_capacity_t cap;
-        MOQ_TEST_CHECK(moqr_core_capacity_describe(&cfg, &cap) ==
-                       MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK(moqr_core_capacity_describe(&cfg, &cap, sizeof(cap)) ==
+                       MOQ_ERR_INVAL);
         moqr_core_t *c = NULL;
         MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_ERR_INVAL);
         MOQ_TEST_CHECK(c == NULL);
@@ -339,8 +339,8 @@ cap_overflow_refused(void)
         moqr_core_relay_cfg_init_sized(&cfg, sizeof(cfg), &a.vt);
         cfg.log_budget.max_groups = (1u << 30) + 1;
         moqr_core_capacity_t cap;
-        MOQ_TEST_CHECK(moqr_core_capacity_describe(&cfg, &cap) ==
-                       MOQR_ERR_INVAL);
+        MOQ_TEST_CHECK(moqr_core_capacity_describe(&cfg, &cap, sizeof(cap)) ==
+                       MOQ_ERR_INVAL);
         moqr_core_t *c = NULL;
         MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_ERR_INVAL);
         MOQ_TEST_CHECK(c == NULL);
@@ -414,7 +414,7 @@ cap_core_offer_matrix_representable(void)
     }
     moqr_core_t *core = NULL;
     moqr_core_capacity_t cap;
-    MOQ_TEST_CHECK_EQ_INT((int)moqr_core_capacity_describe(&cfg, &cap), (int)MOQR_ERR_INVAL);
+    MOQ_TEST_CHECK_EQ_INT((int)moqr_core_capacity_describe(&cfg, &cap, sizeof(cap)), (int)MOQ_ERR_INVAL);
     MOQ_TEST_CHECK_EQ_INT((int)moqr_core_create(&cfg, &core), (int)MOQR_ERR_INVAL);
     MOQ_TEST_CHECK(core == NULL);
     MOQ_TEST_CHECK_EQ_INT((int)a.allocs, 0);
@@ -442,12 +442,12 @@ cap_core_log_max_chunk_nodes_knob(void)
     zero_cfg.log_max_chunk_nodes = 0;
 
     moqr_core_capacity_t def_cap, small_cap, zero_cap;
-    MOQ_TEST_CHECK(moqr_core_capacity_describe(&def_cfg, &def_cap) ==
-                   MOQR_OK);
-    MOQ_TEST_CHECK(moqr_core_capacity_describe(&small_cfg, &small_cap) ==
-                   MOQR_OK);
-    MOQ_TEST_CHECK(moqr_core_capacity_describe(&zero_cfg, &zero_cap) ==
-                   MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_capacity_describe(&def_cfg, &def_cap, sizeof(def_cap)) ==
+                   MOQ_OK);
+    MOQ_TEST_CHECK(moqr_core_capacity_describe(&small_cfg, &small_cap, sizeof(small_cap)) ==
+                   MOQ_OK);
+    MOQ_TEST_CHECK(moqr_core_capacity_describe(&zero_cfg, &zero_cap, sizeof(zero_cap)) ==
+                   MOQ_OK);
     MOQ_TEST_CHECK_EQ_U64(zero_cap.total_bytes, def_cap.total_bytes);
 
     moqr_log_cfg_t def_lc, small_lc;
@@ -525,10 +525,9 @@ cap_core_log_max_chunk_nodes_knob(void)
         poisoned.c.log_max_objects_per_group;
     clean_prefix.c.log_max_cursors = poisoned.c.log_max_cursors;
     moqr_core_capacity_t prefix_cap, clean_prefix_cap;
-    MOQ_TEST_CHECK(moqr_core_capacity_describe(&poisoned.c, &prefix_cap) ==
-                   MOQR_OK);
-    MOQ_TEST_CHECK(moqr_core_capacity_describe(&clean_prefix.c,
-                                               &clean_prefix_cap) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_capacity_describe(&poisoned.c, &prefix_cap, sizeof(prefix_cap)) ==
+                   MOQ_OK);
+    MOQ_TEST_CHECK(moqr_core_capacity_describe(&clean_prefix.c, &clean_prefix_cap, sizeof(clean_prefix_cap)) == MOQ_OK);
     MOQ_TEST_CHECK_EQ_U64(prefix_cap.total_bytes, clean_prefix_cap.total_bytes);
 
     ca_t op_a;

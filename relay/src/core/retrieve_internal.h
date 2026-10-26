@@ -2,6 +2,7 @@
 #define MOQR_RETRIEVE_INTERNAL_H
 
 #include <moq/relay/relay.h>
+#include "cluster_internal.h"
 
 /*
  * Same-build internal interface between relay-core and the relay runtime.
@@ -61,6 +62,14 @@ MOQR_CORE_API moqr_result_t moqr_core_internal_retrieve_open(
     moqr_core_t *core, moqr_binding_t binding, const moqr_fetch_req_t *req,
     uint64_t now_us, moqr_fetch_t *owner, moqr_core_retrieve_plan_t *plan);
 
+/* Same admission with original source generation and requester identity pinned
+ * across a shard mailbox. Never admits cached data from another publisher. */
+MOQR_CORE_API moqr_result_t moqr_core_internal_retrieve_open_cluster(
+    moqr_core_t *core, moqr_binding_t binding, const moqr_fetch_req_t *req,
+    moqr_cluster_advertisement_id_t source,
+    uint64_t requester_hop_id, uint64_t requester_correlation_id,
+    uint64_t now_us, moqr_fetch_t *owner, moqr_core_retrieve_plan_t *plan);
+
 /*
  * Move the owner's view to [start .. end] (inclusive, end_object UINT64_MAX
  * for the whole end group), which must lie inside the admitted range. Drops
@@ -95,7 +104,38 @@ MOQR_CORE_API moqr_result_t moqr_core_internal_fetch_track(
  */
 MOQR_CORE_API moqr_result_t moqr_core_internal_delivery_flags(
     const moqr_core_t *core, moqr_binding_t binding,
-    bool *subgroup_properties, bool *follows_gap, moqr_reset_desc_t *gap_reset);
+    bool *subgroup_properties, bool *follows_gap, moqr_reset_desc_t *gap_reset,
+    uint32_t *list);
+
+/* Reconcile only this owner's locally ended outgoing subgroup, including a
+ * STALLED or paused head with no outstanding delivery. `list` is the stable
+ * position captured from delivery_flags when that stream opened; it also
+ * identifies its begun ledger after group eviction. Consume at most budget
+ * records (OPEN heads included), with DISCARDED accounting. An unrelated
+ * held delivery and all shared log data remain untouched. `more` requests
+ * another bounded pass; `retired` proves authoritative eviction or that the
+ * exact subscription owner is gone. A seal alone never retires the numeric
+ * key. No notice is acked. STALE_HANDLE for a gone binding/owner/track (only
+ * the gone owner also sets retired), INVAL for a foreign binding or bad
+ * position, WRONG_STATE for an absent key above the eviction horizon,
+ * CAPACITY for unavailable cursor storage. Outputs are borrowed for the call.
+ */
+MOQR_CORE_API moqr_result_t moqr_core_internal_discard_subgroup(
+    moqr_core_t *core, moqr_binding_t binding, moqr_sub_t sub,
+    uint64_t group, uint64_t subgroup, uint32_t list, uint32_t budget,
+    uint64_t now_us, bool *retired, bool *more);
+
+/* Under demonstrated binder-slot pressure only, omit records that cannot
+ * acquire a downstream stream. The synchronous predicate is pure and must
+ * not reenter the core; its pointers are borrowed for the call. Notices and
+ * evict resets remain eligible, and the original ranking applies among all
+ * eligible work, including records already owning a binder slot. Existing
+ * held work is preserved. Ordinary next_delivery is unchanged. */
+typedef bool (*moqr_core_delivery_eligible_fn)(void *ctx, uint64_t sub_cookie,
+                                               const moqr_record_view_t *rec);
+MOQR_CORE_API moqr_result_t moqr_core_internal_next_eligible(
+    moqr_core_t *core, moqr_binding_t binding, uint64_t now_us,
+    moqr_delivery_t *out, moqr_core_delivery_eligible_fn eligible, void *ctx);
 
 /* End every held rendezvous SUBSCRIBE whose deadline has passed at `now_us`
  * with TIMEOUT (one queued now, or owed until the intent ring takes it). The
@@ -103,6 +143,12 @@ MOQR_CORE_API moqr_result_t moqr_core_internal_delivery_flags(
  * at or after a deadline never resumes that subscription. */
 MOQR_CORE_API moqr_result_t moqr_core_internal_rendezvous_expire(moqr_core_t *core,
                                                                  uint64_t now_us);
+
+/* True only for the same retained track immediately after one ordinary
+ * source release. Permits queued old OPEN cleanup after idle linger, while
+ * refusing active/pending replacement generations and replaced track handles. */
+MOQR_CORE_API bool moqr_core_internal_source_idle(const moqr_core_t *core,
+    moqr_track_t track, uint64_t old_source_gen);
 
 /* The immediate end of a failed source for when moqr_core_source_done
  * cannot queue its terminals (MOQR_ERR_WOULD_BLOCK that a drain did not
@@ -114,6 +160,16 @@ MOQR_CORE_API moqr_result_t moqr_core_internal_rendezvous_expire(moqr_core_t *co
 MOQR_CORE_API moqr_result_t moqr_core_internal_source_abort(
     moqr_core_t *core, moqr_track_t track, uint64_t track_gen,
     moqr_pd_desc_t status);
+
+/* End one ACTIVE subscription alone with `status` (moqr_core_internal_
+ * source_abort's per-subscription form): its binding's next delivery scan
+ * retires it with a SUB_DONE before delivering anything else for it, and
+ * keeps it marked while the intent ring is full. MOQR_OK,
+ * MOQR_ERR_INVAL, MOQR_ERR_STALE_HANDLE or MOQR_ERR_WRONG_STATE (not
+ * ACTIVE). */
+MOQR_CORE_API moqr_result_t moqr_core_internal_sub_fail(moqr_core_t *core,
+                                                       moqr_sub_t sub,
+                                                       moqr_pd_desc_t status);
 
 /* Hold one free subscription slot for a later moqr_core_subscribe made with
  * req->reserved, so that no other request takes it meanwhile: the binding

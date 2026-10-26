@@ -30,8 +30,12 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef MOQ_TEST_HAVE_MPEG2TS
+#include "ts_stream.h"
+#endif
 
 static int failures = 0;
 
@@ -77,6 +81,11 @@ void moq_media_sender_test_set_cond_wait_hook(
     int (*fn)(const struct timespec *, void *), void *ctx);
 void moq_media_sender_test_drop_track_locked(moq_media_sender_t *s,
                                              moq_media_track_t *t);
+bool moq_media_sender_test_has_pending_output(moq_media_sender_t *s);
+bool moq_media_sender_test_complete_failed(moq_media_sender_t *s);
+bool moq_media_sender_test_timeline_held(moq_media_sender_t *s);
+void moq_media_sender_test_set_alloc(const moq_alloc_t *alloc);
+void moq_media_sender_test_refuse_catalog_build(moq_media_sender_t *s);
 
 /* -- Trace ------------------------------------------------------------- *
  * One record per object the PEER actually received, in arrival order, tagged
@@ -2821,8 +2830,10 @@ out:
  *  before the drain and owns its terminal semantics.
  *
  *  Two public arms: moq_media_sender_remove_track() and
- *  moq_media_sender_complete(). complete() marks EVERY track removed, so its
- *  expectations differ and are declared separately.
+ *  moq_media_sender_complete(). complete() is a graceful end, not a removal:
+ *  accepted media is sent, every track then ends after its own media, and
+ *  only then are the tracks removed -- so nothing is discarded, and its
+ *  expectations are declared separately.
  * ===================================================================== */
 static void test_removal_accounting(bool via_complete)
 {
@@ -2863,6 +2874,9 @@ static void test_removal_accounting(bool via_complete)
 
     int from = fix.tr.n;
     drive(&fix, now);
+    /* Completion is staged over hooks: the media and each track's end, then
+     * the finalize, then each removed track's teardown. */
+    for (int i = 0; via_complete && i < 4; i++) drive(&fix, now);
 
     if (!via_complete) {
         /* The demanded AUDIO track is unaffected: its object still leaves. */
@@ -2891,30 +2905,37 @@ static void test_removal_accounting(bool via_complete)
         const term_exp_t terms[1] = { { 0, 0, 0, false, false } };
         expect_terminals(&fix, terms, 1, "rm-terminals");
     } else {
-        /* complete() removes EVERY track: all four objects are discarded,
-         * three distinct groups (video g0, video g1, audio g0), nothing sent,
-         * and conservation holds: 4 == 0 + 0 + 4. */
-        expect_from(&fix, from, NULL, 0, "complete-nothing-sent");
-        expect_conserved(fix.s, 4, 0, 0, 4, 0, "complete-stats");
+        /* complete() keeps the accepted media: all four objects leave in
+         * enqueue order, nothing is discarded, and conservation holds:
+         * 4 == 4 + 0 + 0. */
+        const tr_exp_t media[4] = { { 0, 0, 0, 0x20, 0 }, { 0, 0, 1, 0x21, 1 },
+                                    { 0, 1, 0, 0x22, 2 }, { 1, 0, 0, 0x23, 3 } };
+        expect_from(&fix, from, media, 4, "complete-media-sent");
+        expect_conserved(fix.s, 4, 4, 0, 0, 0, "complete-stats");
         moq_media_sender_stats_t st; memset(&st, 0, sizeof(st));
         MOQ_TEST_CHECK(moq_media_sender_get_stats(fix.s, &st, sizeof(st)) == MOQ_OK);
-        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 4);
-        MOQ_TEST_CHECK_EQ_U64(st.keyframes_dropped, 3);
-        MOQ_TEST_CHECK_EQ_U64(st.groups_dropped, 3);
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
+        MOQ_TEST_CHECK_EQ_U64(st.keyframes_dropped, 0);
+        MOQ_TEST_CHECK_EQ_U64(st.groups_dropped, 0);
         MOQ_TEST_CHECK_EQ_U64(st.groups_abandoned, 0);
-        /* complete() ends BOTH subscriptions, exactly once each, with the
-         * declared status. */
+        /* Each track ends after its own media: video by its end_track
+         * marker at {its last group + 1, 0}, audio by the end complete()
+         * owes it. */
+        const stat_exp_t sx[2] = { { 0, 2, 0, MOQ_OBJECT_END_OF_TRACK },
+                                   { 1, 1, 0, MOQ_OBJECT_END_OF_TRACK } };
+        expect_status(&fix, sx, 2, "complete-status");
+        /* Every media subgroup closes cleanly; each end has a terminal-only
+         * subgroup of its own. */
+        const term_exp_t terms[5] = {
+            { 0, 0, 0, true, true }, { 0, 1, 0, true, true }, { 0, 2, 0, false, false },
+            { 1, 0, 0, true, true }, { 1, 1, 0, false, false } };
+        expect_terminals(&fix, terms, 5, "complete-terminals");
+        /* The removal that follows ends both subscriptions, exactly once
+         * each, with the declared status. */
         const done_exp_t dexp[2] = {
             { fix.sub[0]._opaque, MOQ_PUB_DONE_TRACK_ENDED },
             { fix.sub[1]._opaque, MOQ_PUB_DONE_TRACK_ENDED } };
         expect_done(&fix, dexp, 2, "complete-done");
-        /* Neither track emitted media: each terminal opens and closes its own
-         * subgroup at group 0. */
-        const stat_exp_t sx[2] = { { 0, 0, 0, MOQ_OBJECT_END_OF_TRACK },
-                                   { 1, 0, 0, MOQ_OBJECT_END_OF_TRACK } };
-        expect_status(&fix, sx, 2, "complete-status");
-        const term_exp_t terms[2] = { { 0, 0, 0, false, false }, { 1, 0, 0, false, false } };
-        expect_terminals(&fix, terms, 2, "complete-terminals");
     }
 
     /* A further hook adds no media and mutates no counter. */
@@ -4154,6 +4175,832 @@ static void test_wait_recheck(void)
     else        printf("FAIL: wait_recheck_closed_group (%d diagnostics)\n", n);
 }
 
+
+/* ===================================================================== *
+ *  Graceful completion with a generated SAP timeline.
+ *  complete() owes the "v.sap" sibling an end as well as its media track:
+ *  the timeline ends only after every record its media produced has gone
+ *  out, and the terminal (isComplete) catalog is cut only after both ends.
+ *  A timeline without a subscriber keeps its records for a joiner and holds
+ *  the completion with them, as retained media does.
+ *
+ *  Its own small rig, not fix_t: the peer subscribes to the catalog, the
+ *  media track and (optionally) its timeline, and every delivery is logged
+ *  in one arrival order, so ordering across tracks is compared directly.
+ * ===================================================================== */
+enum { TLC_V = 0, TLC_SAP = 1, TLC_CAT = 2, TLC_A = 3, TLC_NSUB = 4, TLC_LOG = 64,
+       TLC_COPY = 192 };
+
+typedef enum { TLC_OBJ, TLC_STATUS, TLC_DONE } tlc_kind_t;
+
+typedef struct {
+    tlc_kind_t kind;
+    int        track;          /* TLC_V / TLC_SAP / TLC_CAT / TLC_A, -1 = foreign */
+    uint64_t   group, object;
+    int        status;
+    int        pass;           /* the drive that delivered it */
+    bool       cat_complete;   /* a catalog object that parsed isComplete */
+    bool       cat_bad;        /* a catalog object that did not parse */
+    size_t     len;
+    uint8_t    copy[TLC_COPY];
+    bool       truncated;
+} tlc_rec_t;
+
+typedef struct {
+    moq_simpair_t      *sp;
+    moq_media_sender_t *s;
+    moq_media_track_t  *v;
+    moq_media_track_t  *a;
+    moq_subscription_t  sub[TLC_NSUB];
+    int                 sub_ok;
+    tlc_rec_t           log[TLC_LOG];
+    int                 n;
+    bool                overflow, unexpected;
+    int                 pass;
+} tlc_t;
+
+static int tlc_track_of(const tlc_t *x, uint64_t sub_opaque)
+{
+    for (int i = 0; i < TLC_NSUB; i++)
+        if (x->sub[i]._opaque && x->sub[i]._opaque == sub_opaque) return i;
+    return -1;
+}
+
+static tlc_rec_t *tlc_push(tlc_t *x, tlc_kind_t k, int track)
+{
+    if (x->n >= TLC_LOG) { x->overflow = true; return NULL; }
+    tlc_rec_t *r = &x->log[x->n++];
+    memset(r, 0, sizeof(*r));
+    r->kind = k;
+    r->track = track;
+    r->pass = x->pass;
+    return r;
+}
+
+static void tlc_collect(tlc_t *x, uint64_t now)
+{
+    moq_session_t *srv = moq_simpair_server(x->sp);
+    moq_event_t ev;
+    while (moq_session_poll_events(srv, &ev, 1) == 1) {
+        if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+            const moq_object_received_event_t *o = &ev.u.object_received;
+            int idx = tlc_track_of(x, o->sub._opaque);
+            tlc_rec_t *r = tlc_push(x, o->status == MOQ_OBJECT_NORMAL
+                                           ? TLC_OBJ : TLC_STATUS, idx);
+            if (r) {
+                r->group = o->group_id;
+                r->object = o->object_id;
+                r->status = (int)o->status;
+                r->len = o->payload ? moq_rcbuf_len(o->payload) : 0;
+                if (r->len > TLC_COPY) r->truncated = true;
+                else if (r->len) memcpy(r->copy, moq_rcbuf_data(o->payload), r->len);
+                if (idx == TLC_CAT && o->status == MOQ_OBJECT_NORMAL) {
+                    moq_msf_catalog_t cat;
+                    memset(&cat, 0, sizeof(cat));
+                    moq_bytes_t j = { moq_rcbuf_data(o->payload),
+                                      moq_rcbuf_len(o->payload) };
+                    if (moq_msf_catalog_parse(moq_alloc_default(), j, &cat) == MOQ_OK) {
+                        r->cat_complete = cat.is_complete;
+                        moq_msf_catalog_cleanup(moq_alloc_default(), &cat);
+                    } else {
+                        r->cat_bad = true;
+                    }
+                }
+            }
+        } else if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) {
+            tlc_rec_t *r = tlc_push(x, TLC_DONE,
+                                    tlc_track_of(x, ev.u.subscribe_done.sub._opaque));
+            if (r) r->status = (int)ev.u.subscribe_done.status_code;
+        } else if (ev.kind == MOQ_EVENT_SUBSCRIBE_OK) {
+            x->sub_ok++;
+        } else if (ev.kind == MOQ_EVENT_NAMESPACE_PUBLISHED) {
+            moq_accept_namespace_cfg_t ac;
+            moq_accept_namespace_cfg_init(&ac);
+            (void)moq_session_accept_namespace(srv, ev.u.namespace_published.ann,
+                                               &ac, now);
+        } else if (ev.kind != MOQ_EVENT_SUBGROUP_FINISHED) {
+            x->unexpected = true;
+        }
+        moq_event_cleanup(&ev);
+    }
+}
+
+/* make_pair with a peer event queue deep enough for a whole pump, so every
+ * delivery surfaces in the pump that issued it and arrival passes order the
+ * sender's issues across streams. */
+static moq_simpair_t *tlc_pair(moq_alloc_t *alloc, uint32_t max_actions)
+{
+    moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.alloc = alloc; cfg.seed = 42; cfg.initial_now_us = 1000;
+    cfg.client_send_request_capacity = true;
+    cfg.client_initial_request_capacity = 32;
+    cfg.server_send_request_capacity = true;
+    cfg.server_initial_request_capacity = 32;
+    cfg.version = PACING_VERSION;
+    cfg.max_actions = max_actions;   /* 0 = library default */
+    cfg.max_events = 256;
+    moq_simpair_t *sp = NULL;
+    if (moq_simpair_create(&cfg, &sp) != MOQ_OK) return NULL;
+    moq_simpair_start(sp);
+    (void)moq_simpair_run_until_quiescent(sp, 64, NULL);
+    moq_event_t ev;
+    while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1)
+        moq_event_cleanup(&ev);
+    while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1)
+        moq_event_cleanup(&ev);
+    return sp;
+}
+
+static void tlc_drive(tlc_t *x, uint64_t now)
+{
+    x->pass++;
+    moq_media_sender_test_pump(x->s, moq_simpair_client(x->sp), now);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(x->sp, 64, NULL) == MOQ_OK);
+    tlc_collect(x, now);
+}
+
+static bool tlc_subscribe(tlc_t *x, int idx, const char *name, uint64_t now)
+{
+    moq_subscribe_cfg_t sc; moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = (moq_namespace_t){ g_ns, 2 };
+    sc.track_name = (moq_bytes_t){ (const uint8_t *)name, strlen(name) };
+    sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    sc.has_forward = true; sc.forward = true;
+    if (moq_session_subscribe(moq_simpair_server(x->sp), &sc, now,
+                              &x->sub[idx]) != MOQ_OK)
+        return false;
+    int want = x->sub_ok + 1;
+    for (int i = 0; i < 16 && x->sub_ok < want; i++) tlc_drive(x, now);
+    return x->sub_ok == want;
+}
+
+static moq_result_t tlc_write_to(tlc_t *x, moq_media_track_t *t,
+                                 uint8_t sentinel, bool starts, bool has_sap,
+                                 moq_sap_type_t sap, uint64_t pts_us)
+{
+    uint8_t d[PAYLOAD_LEN];
+    memset(d, sentinel, sizeof(d));
+    moq_rcbuf_t *b = NULL;
+    if (moq_rcbuf_create(moq_alloc_default(), d, sizeof(d), &b) != MOQ_OK)
+        return MOQ_ERR_NOMEM;
+    moq_media_send_object_t o; memset(&o, 0, sizeof(o));
+    o.struct_size = sizeof(o);
+    o.payload = b;
+    o.is_sync = starts;
+    o.starts_group = starts;
+    o.presentation_time_us = pts_us;
+    o.has_sap_type = has_sap;
+    o.sap_type = sap;
+    moq_result_t rc = moq_media_sender_write(x->s, t, &o);
+    if (rc != MOQ_OK) moq_rcbuf_decref(b);
+    return rc;
+}
+
+static moq_result_t tlc_write(tlc_t *x, uint8_t sentinel, bool starts,
+                              moq_sap_type_t sap, uint64_t pts_us)
+{
+    return tlc_write_to(x, x->v, sentinel, starts, true, sap, pts_us);
+}
+
+/* Index of the first/last record matching (kind, track), or -1. */
+static int tlc_find(const tlc_t *x, tlc_kind_t k, int track, bool last)
+{
+    int at = -1;
+    for (int i = 0; i < x->n; i++)
+        if (x->log[i].kind == k && x->log[i].track == track) {
+            at = i;
+            if (!last) break;
+        }
+    return at;
+}
+
+static int tlc_count(const tlc_t *x, tlc_kind_t k, int track)
+{
+    int c = 0;
+    for (int i = 0; i < x->n; i++)
+        c += x->log[i].kind == k && x->log[i].track == track;
+    return c;
+}
+
+static int tlc_first_complete_catalog(const tlc_t *x)
+{
+    for (int i = 0; i < x->n; i++)
+        if (x->log[i].kind == TLC_OBJ && x->log[i].track == TLC_CAT &&
+            x->log[i].cat_complete)
+            return i;
+    return -1;
+}
+
+/* Every SAP record the media produced, as the last (independent) timeline
+ * Object carries them: CMSF §3.6.1 [{"l":[group,object],"data":[sap,ept]}],
+ * ept the presentation time rounded to ms. */
+static const char TLC_SAP_ALL[] =
+    "[{\"l\":[0,0],\"data\":[1,0]},{\"l\":[1,0],\"data\":[1,33]},"
+    "{\"l\":[1,1],\"data\":[3,50]},{\"l\":[2,0],\"data\":[1,67]}]";
+
+/* Which subscription arrives only after the hold is observed:
+ *   TL_DEMANDED  - none: "v" and "v.sap" are both subscribed before complete();
+ *   TL_JOINER    - "v.sap": its records are kept and the completion held;
+ *   MEDIA_JOINER - "v": the media is retained, so it has produced no records
+ *                  yet, and the subscribed timeline must not end before it;
+ *   OTHER_HELD   - "a", a second track whose one Object is retained: "v"
+ *                  and its timeline complete in full while "a" holds the
+ *                  finalization, and the timeline's outstanding work is
+ *                  reported as work on every pump until its end is sent.
+ * `max_actions` bounds the session's action ring, so the media, the timeline
+ * and both ends contend for room across several pumps. */
+typedef enum { TL_DEMANDED, TL_JOINER, MEDIA_JOINER, OTHER_HELD } tlc_mode_t;
+
+static void test_complete_timeline(tlc_mode_t mode, uint32_t max_actions,
+                                   bool mt)
+{
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    tlc_t x;
+    memset(&x, 0, sizeof(x));
+    uint64_t now = 1000;
+    char label[96];
+    const char *tl_name = mt ? "v.timeline" : "v.sap";
+    snprintf(label, sizeof(label), "pacing_complete_%s_%s_act%u",
+             mt ? "media_timeline" : "timeline",
+             mode == TL_DEMANDED ? "demanded"
+             : mode == TL_JOINER ? "joiner"
+             : mode == MEDIA_JOINER ? "media_joiner" : "other_held",
+             (unsigned)max_actions);
+
+    x.sp = tlc_pair(&alloc, max_actions);
+    if (!x.sp) { failures++; goto out; }
+    g_ns[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns[1] = MOQ_BYTES_LITERAL("tl");
+    moq_media_sender_cfg_t cfg;
+    moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
+    cfg.namespace_ = (moq_namespace_t){ g_ns, 2 };
+    cfg.catalog_refresh_interval_us = UINT64_MAX;
+    x.s = moq_media_sender_test_new_cfg(&cfg);
+    if (!x.s) { failures++; goto out; }
+    moq_media_track_cfg_t tc;
+    moq_media_track_cfg_init(&tc);
+    tc.name = MOQ_BYTES_LITERAL("v");
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+    tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+    tc.codec = MOQ_BYTES_LITERAL("av01");
+    tc.bitrate = 1500000;
+    tc.timescale = 1000000;
+    tc.is_live = true;
+    tc.emit_sap_timeline = !mt;
+    tc.sap_timeline_history_groups = 8;   /* nothing evicted here */
+    tc.emit_media_timeline = mt;
+    tc.media_timeline_history_groups = 1; /* each group's record evicts the last */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(x.s, &tc, &x.v),
+                          (int)MOQ_OK);
+    if (!x.v) { failures++; goto out; }
+    if (mode == OTHER_HELD) {
+        x.a = add_track(x.s, "a", MOQ_MEDIA_TYPE_AUDIO);
+        if (!x.a) { failures++; goto out; }
+    }
+    for (int c = 0; c < 16 && !moq_media_sender_is_ready(x.s); c++)
+        tlc_drive(&x, now);
+    MOQ_TEST_CHECK(moq_media_sender_is_ready(x.s));
+    MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_CAT, MOQ_MSF_CATALOG_TRACK_NAME, now));
+    if (mode != MEDIA_JOINER)
+        MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_V, "v", now));
+    if (mode != TL_JOINER)
+        MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_SAP, tl_name, now));
+    /* Nothing delivered yet: the catalog subscription starts after the
+     * catalog already published, and no media has been written. */
+    MOQ_TEST_CHECK_EQ_INT(x.n, 0);
+    MOQ_TEST_CHECK_EQ_INT(tlc_first_complete_catalog(&x), -1);
+
+    /* Three media groups, the middle one with a mid-group SAP 3: four SAP
+     * records. Written and completed with no pump in between, so the whole
+     * backlog and every end meet the bounded ring together. */
+    MOQ_TEST_CHECK(tlc_write(&x, 0x60, true,  MOQ_SAP_TYPE_1, 0)     == MOQ_OK);
+    MOQ_TEST_CHECK(tlc_write(&x, 0x61, true,  MOQ_SAP_TYPE_1, 33000) == MOQ_OK);
+    MOQ_TEST_CHECK(tlc_write(&x, 0x62, false, MOQ_SAP_TYPE_3, 50000) == MOQ_OK);
+    MOQ_TEST_CHECK(tlc_write(&x, 0x63, true,  MOQ_SAP_TYPE_1, 66600) == MOQ_OK);
+    if (mode == OTHER_HELD)
+        MOQ_TEST_CHECK(tlc_write_to(&x, x.a, 0x70, true, false, MOQ_SAP_NONE,
+                                    10000) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(x.s), (int)MOQ_OK);
+    int from_pass = x.pass;
+
+    /* Drive until the terminal catalog arrives, or a generous bound. With
+     * "a" held, work is reported on every pump while one of v's ends is
+     * still to arrive. (An end is on the wire before the facade's end_track
+     * has also sent its done, so work can outlast the arrival by a pump;
+     * the hold is checked idle below.) */
+    for (int d = 0; d < 64 && tlc_first_complete_catalog(&x) < 0; d++) {
+        tlc_drive(&x, now);
+        if (mode == OTHER_HELD) {
+            bool ends_out = tlc_count(&x, TLC_STATUS, TLC_V) == 1 &&
+                            tlc_count(&x, TLC_STATUS, TLC_SAP) == 1;
+            bool pending = moq_media_sender_test_has_pending_output(x.s);
+            MOQ_TEST_CHECK(pending || ends_out);
+            if (!pending && !ends_out)
+                fprintf(stderr, "  pump %d: pending=%d ends_out=%d\n",
+                        x.pass, (int)pending, (int)ends_out);
+        }
+    }
+
+    if (mode == TL_JOINER) {
+        /* Held: the media and its end went out, the timeline kept all four
+         * records for a joiner, and nothing finalized -- no terminal
+         * catalog, no SUBSCRIBE_DONE, work still reported pending. */
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_V), 4);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_V), 1);
+        MOQ_TEST_CHECK_EQ_INT(tlc_first_complete_catalog(&x), -1);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_V), 0);
+        MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+        {   /* A completion held for a joiner has not failed. */
+            moq_media_sender_stats_t st;
+            MOQ_TEST_CHECK(moq_media_sender_get_stats(x.s, &st, sizeof(st)) == MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT((int)st.completion_error, (int)MOQ_OK);
+        }
+        int held_at = x.n;
+        /* A joiner subscribes: it is owed those records, then the end. */
+        MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_SAP, tl_name, now));
+        MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(x.s));
+        for (int d = 0; d < 64 && tlc_first_complete_catalog(&x) < 0; d++)
+            tlc_drive(&x, now);
+        /* Nothing about the timeline was delivered before the join. */
+        for (int i = 0; i < held_at; i++)
+            MOQ_TEST_CHECK(x.log[i].track != TLC_SAP);
+    } else if (mode == MEDIA_JOINER) {
+        /* Held: the media is retained for a joiner with its end behind it,
+         * so no record exists yet and the subscribed timeline neither emits
+         * nor ends; nothing finalizes and no work is reported. */
+        MOQ_TEST_CHECK_EQ_INT(x.n, 0);
+        MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+        MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_V, "v", now));
+        MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(x.s));
+        for (int d = 0; d < 64 && tlc_first_complete_catalog(&x) < 0; d++)
+            tlc_drive(&x, now);
+    } else if (mode == OTHER_HELD) {
+        /* v and its timeline are complete and ended; "a" holds the
+         * finalization with its retained Object. A joiner releases it. */
+        MOQ_TEST_CHECK_EQ_INT(tlc_first_complete_catalog(&x), -1);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_V), 1);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_SAP), 1);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_A), 0);
+        MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+        MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_A, "a", now));
+        MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(x.s));
+        for (int d = 0; d < 64 && tlc_first_complete_catalog(&x) < 0; d++)
+            tlc_drive(&x, now);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_A), 1);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_A), 1);
+        int a_end = tlc_find(&x, TLC_STATUS, TLC_A, false);
+        int a_obj = tlc_find(&x, TLC_OBJ, TLC_A, false);
+        MOQ_TEST_CHECK(a_end > a_obj && a_obj >= 0);
+        int t = tlc_first_complete_catalog(&x);
+        MOQ_TEST_CHECK(t >= 0 && a_end >= 0 && x.log[t].pass >= x.log[a_end].pass);
+    }
+
+    /* The inventory is taken once the rig is idle, the teardown's done
+     * included. */
+    MOQ_TEST_CHECK(tlc_first_complete_catalog(&x) >= 0);
+    for (int i = 0; i < 4; i++) tlc_drive(&x, now);
+
+    /* Media: exactly the four Objects, then one END_OF_TRACK after them. */
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_V), 4);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_V), 1);
+    int v_last = tlc_find(&x, TLC_OBJ, TLC_V, true);
+    int v_end = tlc_find(&x, TLC_STATUS, TLC_V, false);
+    MOQ_TEST_CHECK(v_end > v_last && v_last >= 0);
+    if (v_end >= 0)
+        MOQ_TEST_CHECK_EQ_INT(x.log[v_end].status, MOQ_OBJECT_END_OF_TRACK);
+
+    /* Timeline: one Object per media group's boundary, strictly increasing
+     * Locations; the last carries every record still retained; then one
+     * END_OF_TRACK. The SAP history keeps all four records. The media
+     * timeline keeps one group's record, so a boundary whose record was
+     * evicted before it could go out is skipped, and every Object carries
+     * exactly its own group's §7.1.1 record. */
+    int sap_n = tlc_count(&x, TLC_OBJ, TLC_SAP);
+    if (mt) MOQ_TEST_CHECK(sap_n >= 1 && sap_n <= 3);
+    else    MOQ_TEST_CHECK(sap_n >= 3 && sap_n <= 4);
+    uint64_t pg = 0, po = 0;
+    bool first = true;
+    for (int i = 0; i < x.n; i++) {
+        const tlc_rec_t *r = &x.log[i];
+        if (r->kind != TLC_OBJ || r->track != TLC_SAP) continue;
+        if (!first)
+            MOQ_TEST_CHECK(r->group > pg || (r->group == pg && r->object > po));
+        first = false; pg = r->group; po = r->object;
+        if (mt) {
+            static const uint64_t media_ms[3] = { 0, 33, 66 };
+            moq_msf_media_timeline_record_t rec[2];
+            size_t nrec = 0;
+            MOQ_TEST_CHECK(!r->truncated);
+            MOQ_TEST_CHECK(moq_msf_media_timeline_decode(
+                (moq_bytes_t){ r->copy, r->len }, rec, 2, &nrec) == MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(nrec, 1);
+            MOQ_TEST_CHECK_EQ_U64(r->object, 0);
+            if (nrec == 1 && r->group < 3) {
+                MOQ_TEST_CHECK_EQ_U64(rec[0].group, r->group);
+                MOQ_TEST_CHECK_EQ_U64(rec[0].object, 0);
+                MOQ_TEST_CHECK_EQ_U64(rec[0].media_time_ms, media_ms[r->group]);
+            }
+        }
+    }
+    int sap_last = tlc_find(&x, TLC_OBJ, TLC_SAP, true);
+    if (sap_last >= 0 && mt) {
+        MOQ_TEST_CHECK_EQ_U64(x.log[sap_last].group, 2);
+    } else if (sap_last >= 0) {
+        const tlc_rec_t *r = &x.log[sap_last];
+        MOQ_TEST_CHECK_EQ_U64(r->group, 2);
+        MOQ_TEST_CHECK_EQ_U64(r->object, 0);
+        MOQ_TEST_CHECK(!r->truncated && r->len == sizeof(TLC_SAP_ALL) - 1 &&
+                       memcmp(r->copy, TLC_SAP_ALL, r->len) == 0);
+        if (r->len != sizeof(TLC_SAP_ALL) - 1 || memcmp(r->copy, TLC_SAP_ALL, r->len))
+            fprintf(stderr, "  last timeline object: %.*s\n", (int)r->len,
+                    (const char *)r->copy);
+    }
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_SAP), 1);
+    int sap_end = tlc_find(&x, TLC_STATUS, TLC_SAP, false);
+    MOQ_TEST_CHECK(sap_end > sap_last && sap_last >= 0);
+    if (sap_end >= 0)
+        MOQ_TEST_CHECK_EQ_INT(x.log[sap_end].status, MOQ_OBJECT_END_OF_TRACK);
+
+    /* The terminal catalog is cut no earlier than the pump that sent the later
+     * of the two ends. Within one pump the streams' arrival order is the
+     * transport's (it schedules by priority), so pumps are compared. Exactly
+     * one terminal catalog, and every catalog Object parsed. */
+    int term = tlc_first_complete_catalog(&x);
+    MOQ_TEST_CHECK(term >= 0 && v_end >= 0 && sap_end >= 0);
+    if (term >= 0 && v_end >= 0 && sap_end >= 0) {
+        MOQ_TEST_CHECK(x.log[term].pass >= x.log[v_end].pass);
+        MOQ_TEST_CHECK(x.log[term].pass >= x.log[sap_end].pass);
+    }
+    int ncomplete = 0;
+    for (int i = 0; i < x.n; i++) {
+        ncomplete += x.log[i].kind == TLC_OBJ && x.log[i].cat_complete;
+        MOQ_TEST_CHECK(!x.log[i].cat_bad);
+    }
+    MOQ_TEST_CHECK_EQ_INT(ncomplete, 1);
+
+    /* Each subscription ends once, TRACK_ENDED, no earlier than its track's
+     * END_OF_TRACK (the facade's end owes it); the catalog subscription
+     * itself stays. */
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_V), 1);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_SAP), 1);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT), 0);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_A), mode == OTHER_HELD);
+    for (int i = 0; i < x.n; i++)
+        if (x.log[i].kind == TLC_DONE) {
+            MOQ_TEST_CHECK_EQ_INT(x.log[i].status, (int)MOQ_PUB_DONE_TRACK_ENDED);
+            int e = tlc_find(&x, TLC_STATUS, x.log[i].track, false);
+            MOQ_TEST_CHECK(e >= 0 && x.log[i].pass >= x.log[e].pass);
+        }
+    MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+
+    /* Non-vacuity of the pressure: under a bounded ring the completion took
+     * several pumps; the media and the timeline did not all fit in the first. */
+    if (max_actions) {
+        int in_first = 0;
+        for (int i = 0; i < x.n; i++)
+            in_first += x.log[i].pass == from_pass + 1 &&
+                        (x.log[i].track == TLC_V || x.log[i].track == TLC_SAP);
+        MOQ_TEST_CHECK(in_first < 4 + sap_n + 2);
+    }
+    MOQ_TEST_CHECK(!x.overflow && !x.unexpected);
+    for (int i = 0; i < x.n; i++) MOQ_TEST_CHECK(x.log[i].track >= 0);
+    {
+        moq_media_sender_stats_t st;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(x.s, &st, sizeof(st)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)st.completion_error, (int)MOQ_OK);
+    }
+    if (failures != before)
+        for (int i = 0; i < x.n; i++)
+            fprintf(stderr, "   [%d] pass=%d kind=%d track=%d %llu:%llu st=%d cc=%d len=%zu\n", i,
+                    x.log[i].pass, (int)x.log[i].kind, x.log[i].track,
+                    (unsigned long long)x.log[i].group, (unsigned long long)x.log[i].object,
+                    x.log[i].status, (int)x.log[i].cat_complete, x.log[i].len);
+
+out:
+    if (x.s) moq_media_sender_test_free(x.s);
+    if (x.sp) {
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_client(x.sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        while (moq_session_poll_events(moq_simpair_server(x.sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        moq_simpair_destroy(x.sp);
+    }
+    MOQ_TEST_CHECK(as.balance == 0);
+    int nf = failures - before;
+    if (nf == 0) printf("PASS: %s\n", label);
+    else         printf("FAIL: %s (%d diagnostics)\n", label, nf);
+}
+
+#ifdef MOQ_TEST_HAVE_MPEG2TS
+/* A sender allocator that refuses every request while armed. */
+static bool g_tsf_refuse;
+static void *tsf_alloc(size_t n, void *ctx) { (void)ctx; return g_tsf_refuse ? NULL : malloc(n); }
+static void *tsf_realloc(void *p, size_t o, size_t n, void *ctx)
+{
+    (void)o; (void)ctx;
+    return g_tsf_refuse ? NULL : realloc(p, n);
+}
+static void tsf_free(void *p, size_t n, void *ctx) { (void)n; (void)ctx; free(p); }
+static const moq_alloc_t g_tsf_alloc = { NULL, tsf_alloc, tsf_realloc, tsf_free };
+
+/* A failed completion on one track does not hide another track's timeline
+ * output. A byte-stream MPEG2TS track's completion fails (its source's last
+ * Object cannot be copied): no end and no terminal catalog follow. The video
+ * track's media went out while its SAP timeline had no subscriber, so its
+ * records are kept for a joiner -- not work. A subscriber then joins the
+ * timeline over a bounded action ring: until every record has gone out, a
+ * write refused for room included, there is work; then none. `video_ended`:
+ * video was ended (end_track) before complete(), so once caught up its
+ * timeline would be owed its completion end -- which a failed completion
+ * no longer sends, and so is no work either. */
+static void test_failed_ts_timeline(uint32_t max_actions, bool video_ended)
+{
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    tlc_t x;
+    memset(&x, 0, sizeof(x));
+    uint64_t now = 1000;
+    char label[96];
+    snprintf(label, sizeof(label), "pacing_failed_ts_timeline%s_act%u",
+             video_ended ? "_video_ended" : "", (unsigned)max_actions);
+    bool held_seen = false;
+
+    x.sp = tlc_pair(&alloc, max_actions);
+    if (!x.sp) { failures++; goto out; }
+    g_ns[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns[1] = MOQ_BYTES_LITERAL("tsf");
+    moq_media_sender_cfg_t cfg;
+    moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
+    cfg.namespace_ = (moq_namespace_t){ g_ns, 2 };
+    cfg.catalog_refresh_interval_us = UINT64_MAX;
+    moq_media_sender_test_set_alloc(&g_tsf_alloc);
+    x.s = moq_media_sender_test_new_cfg(&cfg);
+    moq_media_sender_test_set_alloc(NULL);
+    if (!x.s) { failures++; goto out; }
+    /* The TS track first: its completion step runs before video's end. */
+    moq_msf_mpeg2ts_t rec;
+    moq_msf_mpeg2ts_init(&rec);
+    rec.has_mode = true;
+    rec.mode = MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM;
+    rec.has_packet_size = true;
+    rec.packet_size = 188;
+    moq_msf_track_ext_t ext = { .kind = MOQ_MSF_EXT_MPEG2TS, .u = { .mpeg2ts = &rec } };
+    moq_media_track_cfg_t tc;
+    moq_media_track_cfg_init_sized(&tc, sizeof(tc));
+    tc.name = MOQ_BYTES_LITERAL("ts");
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+    tc.packaging = MOQ_MEDIA_PACKAGING_MPEG2TS;
+    tc.bitrate = 3000000;
+    tc.extensions = &ext;
+    tc.extension_count = 1;
+    tc.mpeg2ts_object_packets = 3;
+    moq_media_track_t *ts = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(x.s, &tc, &ts), (int)MOQ_OK);
+    moq_media_track_cfg_init(&tc);
+    tc.name = MOQ_BYTES_LITERAL("v");
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+    tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+    tc.codec = MOQ_BYTES_LITERAL("av01");
+    tc.bitrate = 1500000;
+    tc.timescale = 1000000;
+    tc.is_live = true;
+    tc.emit_sap_timeline = true;
+    tc.sap_timeline_history_groups = 8;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(x.s, &tc, &x.v), (int)MOQ_OK);
+    if (!ts || !x.v) { failures++; goto out; }
+    for (int c = 0; c < 16 && !moq_media_sender_is_ready(x.s); c++) tlc_drive(&x, now);
+    MOQ_TEST_CHECK(moq_media_sender_is_ready(x.s));
+    MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_CAT, MOQ_MSF_CATALOG_TRACK_NAME, now));
+    MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_V, "v", now));
+
+    /* Video's media goes out; its timeline, with no subscriber, keeps the
+     * four records. */
+    MOQ_TEST_CHECK(tlc_write(&x, 0x60, true,  MOQ_SAP_TYPE_1, 0)     == MOQ_OK);
+    MOQ_TEST_CHECK(tlc_write(&x, 0x61, true,  MOQ_SAP_TYPE_1, 33000) == MOQ_OK);
+    MOQ_TEST_CHECK(tlc_write(&x, 0x62, false, MOQ_SAP_TYPE_3, 50000) == MOQ_OK);
+    MOQ_TEST_CHECK(tlc_write(&x, 0x63, true,  MOQ_SAP_TYPE_1, 66600) == MOQ_OK);
+    if (video_ended)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_end_track(x.s, x.v), (int)MOQ_OK);
+    for (int d = 0; d < 32 && (tlc_count(&x, TLC_OBJ, TLC_V) < 4 ||
+                               tlc_count(&x, TLC_STATUS, TLC_V) < (video_ended ? 1 : 0));
+         d++)
+        tlc_drive(&x, now);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_V), 4);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_V), video_ended ? 1 : 0);
+    /* Four TS packets: one whole three-packet Object, and one packet the
+     * packetizer still holds until its source is finished. */
+    {
+        ts_gen_t g;
+        ts_gen_init(&g, 188, 1, false);
+        static uint8_t gop[16 * 188];
+        size_t n = ts_gen_gop(&g, gop, 5);
+        MOQ_TEST_CHECK(n >= 4 * 188);
+        n = 4 * 188;
+        moq_media_send_mpeg2ts_t in;
+        memset(&in, 0, sizeof(in));
+        in.struct_size = sizeof(in);
+        in.data = (moq_bytes_t){ gop, n };
+        size_t consumed = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_write_mpeg2ts(x.s, ts, &in, &consumed),
+                              (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(consumed, n);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(x.s), (int)MOQ_OK);
+
+    /* The pump that finishes the TS source cannot copy its last Object. */
+    g_tsf_refuse = true;
+    tlc_drive(&x, now);
+    g_tsf_refuse = false;
+    MOQ_TEST_CHECK(moq_media_sender_test_complete_failed(x.s));
+    MOQ_TEST_CHECK(!moq_media_sender_is_fatal(x.s));
+    {
+        moq_media_sender_stats_t st;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(x.s, &st, sizeof(st)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)st.completion_error, (int)MOQ_ERR_NOMEM);
+    }
+    for (int d = 0; d < 8; d++) tlc_drive(&x, now);
+    /* Kept records with no subscriber, a failed completion, retained TS
+     * media: nothing is work. */
+    MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+    int quiet_at = x.n;
+
+    /* A subscriber joins the timeline: its records are output. */
+    moq_subscribe_cfg_t sc; moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = (moq_namespace_t){ g_ns, 2 };
+    sc.track_name = MOQ_BYTES_LITERAL("v.sap");
+    sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    sc.has_forward = true; sc.forward = true;
+    int ok0 = x.sub_ok;
+    MOQ_TEST_CHECK(moq_session_subscribe(moq_simpair_server(x.sp), &sc, now,
+                                         &x.sub[TLC_SAP]) == MOQ_OK);
+    bool all_out = false;
+    for (int d = 0; d < 64 && !all_out; d++) {
+        tlc_drive(&x, now);
+        int last = tlc_find(&x, TLC_OBJ, TLC_SAP, true);
+        all_out = last >= 0 && x.log[last].group == 2 &&
+                  x.log[last].len == sizeof(TLC_SAP_ALL) - 1 &&
+                  memcmp(x.log[last].copy, TLC_SAP_ALL, x.log[last].len) == 0;
+        bool held = moq_media_sender_test_timeline_held(x.s);
+        held_seen |= held;
+        /* Once the subscription is established, until the last record is
+         * out, there is work. */
+        if (!all_out && x.sub_ok > ok0)
+            MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(x.s));
+        if (held) MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(x.s));
+    }
+    MOQ_TEST_CHECK(all_out);
+    /* These rings refuse a timeline write mid-way (non-vacuity). */
+    if (max_actions >= 2 && max_actions <= 8) MOQ_TEST_CHECK(held_seen);
+    for (int d = 0; d < 8; d++) tlc_drive(&x, now);
+    MOQ_TEST_CHECK(!moq_media_sender_test_timeline_held(x.s));
+    MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+    /* No completion end and no terminal catalog: the completion failed. */
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_V), video_ended ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_SAP), 0);
+    MOQ_TEST_CHECK_EQ_INT(tlc_first_complete_catalog(&x), -1);
+    for (int i = 0; i < quiet_at; i++) MOQ_TEST_CHECK(x.log[i].track != TLC_SAP);
+    MOQ_TEST_CHECK(!x.overflow && !x.unexpected);
+
+out:
+    g_tsf_refuse = false;
+    if (x.s) moq_media_sender_test_free(x.s);
+    if (x.sp) {
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_client(x.sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        while (moq_session_poll_events(moq_simpair_server(x.sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        moq_simpair_destroy(x.sp);
+    }
+    MOQ_TEST_CHECK(as.balance == 0);
+    int nf = failures - before;
+    if (nf == 0) printf("PASS: %s (held %s)\n", label, held_seen ? "seen" : "not seen");
+    else         printf("FAIL: %s (%d diagnostics)\n", label, nf);
+}
+#endif
+
+/* The terminal catalog itself cannot be built. Video and audio ended
+ * (end_track) and their media and ends went out, so complete() owes no
+ * further end: the next pump finalizes and stages the terminal generation,
+ * whose build's first allocation is refused (a one-shot seam at the build:
+ * a pump-wide refusal would stop the removed tracks' teardown first, which
+ * retries quietly). `mode`: 0 that failure; 1 the healthy control (the
+ * terminal catalog commits); 2 the healthy commit, then a periodic catalog
+ * refresh whose build is refused the same way -- a failure after the
+ * completion finished, which is not the completion's. */
+static void test_terminal_catalog_failure(int mode)
+{
+    static const char *const names[] = { "fails", "commits", "commits_then_refresh_fails" };
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    tlc_t x;
+    memset(&x, 0, sizeof(x));
+    uint64_t now = 1000;
+    char label[96];
+    snprintf(label, sizeof(label), "pacing_terminal_catalog_%s", names[mode]);
+
+    x.sp = tlc_pair(&alloc, 0);
+    if (!x.sp) { failures++; goto out; }
+    g_ns[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns[1] = MOQ_BYTES_LITERAL("tcf");
+    moq_media_sender_cfg_t cfg;
+    moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
+    cfg.namespace_ = (moq_namespace_t){ g_ns, 2 };
+    cfg.catalog_refresh_interval_us = mode == 2 ? 2000000 : UINT64_MAX;
+    x.s = moq_media_sender_test_new_cfg(&cfg);
+    if (!x.s) { failures++; goto out; }
+    moq_media_track_cfg_t tc;
+    moq_media_track_cfg_init(&tc);
+    tc.name = MOQ_BYTES_LITERAL("v");
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+    tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+    tc.codec = MOQ_BYTES_LITERAL("av01");
+    tc.bitrate = 1500000;
+    tc.is_live = true;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_add_track(x.s, &tc, &x.v), (int)MOQ_OK);
+    x.a = add_track(x.s, "a", MOQ_MEDIA_TYPE_AUDIO);
+    if (!x.v || !x.a) { failures++; goto out; }
+    for (int c = 0; c < 16 && !moq_media_sender_is_ready(x.s); c++) tlc_drive(&x, now);
+    MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_CAT, MOQ_MSF_CATALOG_TRACK_NAME, now));
+    MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_V, "v", now));
+    MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_A, "a", now));
+    MOQ_TEST_CHECK(tlc_write(&x, 0x60, true, MOQ_SAP_TYPE_1, 0) == MOQ_OK);
+    MOQ_TEST_CHECK(tlc_write(&x, 0x61, true, MOQ_SAP_TYPE_1, 33000) == MOQ_OK);
+    MOQ_TEST_CHECK(tlc_write_to(&x, x.a, 0x70, true, false, MOQ_SAP_NONE, 10000) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_end_track(x.s, x.v), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_end_track(x.s, x.a), (int)MOQ_OK);
+    for (int d = 0; d < 32 && (tlc_count(&x, TLC_STATUS, TLC_V) < 1 ||
+                               tlc_count(&x, TLC_STATUS, TLC_A) < 1); d++)
+        tlc_drive(&x, now);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_V), 2);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_A), 1);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_V), 1);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_A), 1);
+    MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(x.s), (int)MOQ_OK);
+    if (mode == 0) moq_media_sender_test_refuse_catalog_build(x.s);
+    for (int d = 0; d < 8; d++) tlc_drive(&x, now);
+
+    moq_media_sender_stats_t st;
+    MOQ_TEST_CHECK(moq_media_sender_get_stats(x.s, &st, sizeof(st)) == MOQ_OK);
+    if (mode == 0) {
+        /* The existing policy: an unbuildable catalog is the encode fatal.
+         * No terminal catalog; the completion's exact failure, kept. */
+        MOQ_TEST_CHECK(moq_media_sender_is_fatal(x.s));
+        MOQ_TEST_CHECK_EQ_U64(moq_media_sender_fatal_code(x.s),
+                              MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE);
+        MOQ_TEST_CHECK_EQ_INT(tlc_first_complete_catalog(&x), -1);
+        MOQ_TEST_CHECK_EQ_INT((int)st.completion_error, (int)MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK_EQ_INT((int)st.last_error, (int)MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(x.s), (int)MOQ_ERR_CLOSED);
+        moq_media_sender_stats_t st2;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(x.s, &st2, sizeof(st2)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)st2.completion_error, (int)MOQ_ERR_NOMEM);
+    } else {
+        MOQ_TEST_CHECK(!moq_media_sender_is_fatal(x.s));
+        MOQ_TEST_CHECK(tlc_first_complete_catalog(&x) >= 0);
+        MOQ_TEST_CHECK_EQ_INT((int)st.completion_error, (int)MOQ_OK);
+    }
+    if (mode == 2) {
+        /* After the commit: a refresh is due, and its build is refused. */
+        int catalogs = tlc_count(&x, TLC_OBJ, TLC_CAT);
+        now += 3000000;
+        moq_media_sender_test_refuse_catalog_build(x.s);
+        tlc_drive(&x, now);
+        for (int d = 0; d < 4; d++) tlc_drive(&x, now);
+        /* The refresh did fail (non-vacuity): the existing encode fatal. */
+        MOQ_TEST_CHECK(moq_media_sender_is_fatal(x.s));
+        MOQ_TEST_CHECK_EQ_U64(moq_media_sender_fatal_code(x.s),
+                              MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_CAT), catalogs);
+        moq_media_sender_stats_t st3;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(x.s, &st3, sizeof(st3)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)st3.completion_error, (int)MOQ_OK);
+    }
+    MOQ_TEST_CHECK(!x.overflow && !x.unexpected);
+
+out:
+    if (x.s) moq_media_sender_test_free(x.s);
+    if (x.sp) {
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_client(x.sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        while (moq_session_poll_events(moq_simpair_server(x.sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        moq_simpair_destroy(x.sp);
+    }
+    MOQ_TEST_CHECK(as.balance == 0);
+    int nf = failures - before;
+    if (nf == 0) printf("PASS: %s\n", label);
+    else         printf("FAIL: %s (%d diagnostics)\n", label, nf);
+}
+
 int main(void)
 {
     test_one_at_a_time();
@@ -4189,6 +5036,20 @@ int main(void)
     test_reset_attempt_once_per_hook(1);
     test_reset_attempt_once_per_hook(2);
     test_reset_partial_fanout();
+    /* Every mode, unbounded and across bounded action rings: each ring size
+     * refuses a different write first. */
+    static const uint32_t rings[] = { 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    for (size_t r = 0; r < sizeof(rings) / sizeof(rings[0]); r++)
+        for (int m = TL_DEMANDED; m <= OTHER_HELD; m++) {
+            test_complete_timeline((tlc_mode_t)m, rings[r], false);
+            if (m == TL_DEMANDED)
+                test_complete_timeline((tlc_mode_t)m, rings[r], true);
+        }
+    for (int m = 0; m < 3; m++) test_terminal_catalog_failure(m);
+#ifdef MOQ_TEST_HAVE_MPEG2TS
+    for (size_t r = 0; r < sizeof(rings) / sizeof(rings[0]); r++)
+        for (int e = 0; e < 2; e++) test_failed_ts_timeline(rings[r], e != 0);
+#endif
     if (failures) {
         fprintf(stderr, "FAILURES: %d\n", failures);
         return 1;

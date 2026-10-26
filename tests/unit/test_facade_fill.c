@@ -1213,6 +1213,114 @@ done:
     if (failures == before) MOQ_TEST_PASS("d22_foreign_fill_handle");
 }
 
+/* moq_sub_track_has_queued_input counts input a poll will return and
+ * nothing else: a fill's queued OBJECTs (its CREATED and TERMINAL items
+ * are not input) and the live subscription's queued objects. It is false
+ * once they are polled, for NULL, for a track the subscriber does not own,
+ * and for a released track. */
+static void test_d22_track_has_queued_input(void)
+{
+    rig_t r; rig_open(&r, MOQ_VERSION_DRAFT_22, true, true);
+    retain(&r, 3, 3);
+    moq_location_filter_cfg_t loc; moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_NEXT_OBJECT;
+    moq_location_filter_cfg_t floc; moq_location_filter_cfg_init(&floc);
+    floc.kind = MOQ_LOCATION_FILTER_RELATIVE_GROUP;
+    floc.relative_group_offset = 1;
+    moq_fill_cfg_t fill; moq_fill_cfg_init(&fill);
+    fill.location = &floc;
+    moq_sub_track_t *track = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)subscribe_join_current(&r, &track, &loc, &fill), (int)MOQ_OK);
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(r.sub, track));
+    settle(&r);
+    MOQ_TEST_CHECK(moq_sub_track_has_queued_input(r.sub, track));
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(NULL, track));
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(r.sub, NULL));
+    /* Not one of the subscriber's tracks: compared, never read. */
+    static const uint64_t elsewhere[16];
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(
+        r.sub, (const moq_sub_track_t *)(const void *)elsewhere));
+
+    /* Fill items in order: CREATED, three OBJECTs, TERMINAL. Input remains
+     * until the last OBJECT is polled; the TERMINAL alone is not input. */
+    moq_sub_fill_item_t it;
+    size_t objects = 0;
+    while (moq_sub_poll_fill(r.sub, &it, sizeof(it)) == MOQ_OK) {
+        bool input = moq_sub_track_has_queued_input(r.sub, track);
+        if (it.kind == MOQ_SUB_FILL_OBJECT) objects++;
+        if (it.kind == MOQ_SUB_FILL_CREATED || objects < 3)
+            MOQ_TEST_CHECK(input);
+        else
+            MOQ_TEST_CHECK(!input);
+        moq_sub_fill_item_cleanup(&it);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(objects, 3);
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(r.sub, track));
+
+    /* A live object is input until polled. */
+    moq_rcbuf_t *payload = mk(&r, "live");
+    moq_pub_object_cfg_t oc; moq_pub_object_cfg_init_sized(&oc, sizeof(oc));
+    oc.group_id = 4; oc.object_id = 0; oc.payload = payload;
+    MOQ_TEST_CHECK(moq_pub_write_object_ex(r.pub, r.ptrack, &oc, now(&r)) == MOQ_OK);
+    moq_rcbuf_decref(payload);
+    settle(&r);
+    MOQ_TEST_CHECK(moq_sub_track_has_queued_input(r.sub, track));
+    moq_sub_object_t obj;
+    MOQ_TEST_CHECK(moq_sub_poll_object(r.sub, &obj) == MOQ_OK);
+    MOQ_TEST_CHECK(obj.track == track);
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(r.sub, track));
+    moq_sub_object_cleanup(&obj);
+
+    /* Released: false, whatever the pointer once named. */
+    MOQ_TEST_CHECK(moq_sub_unsubscribe(r.sub, track, now(&r)) == MOQ_OK);
+    settle(&r);
+    (void)moq_sub_release_track(r.sub, track);
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(r.sub, track));
+    rig_close(&r);
+}
+
+/* The pending fill item counts by kind: with room for one fill item, the
+ * CREATED item fills the queue and the fill's one OBJECT waits pending,
+ * input still to come; once that OBJECT is polled, only the TERMINAL is
+ * left pending, which is not input. */
+static void test_d22_pending_fill_input(void)
+{
+    rig_t r; rig_open(&r, MOQ_VERSION_DRAFT_22, true, false);
+    moq_sub_cfg_t scfg; moq_sub_cfg_init_sized(&scfg, sizeof(scfg));
+    scfg.max_fill_items = 1;
+    MOQ_TEST_CHECK(moq_sub_create(moq_simpair_client(r.sp), &r.alloc, &scfg, &r.sub) == MOQ_OK);
+    retain(&r, 3, 1);
+    moq_location_filter_cfg_t loc; moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_NEXT_OBJECT;
+    moq_location_filter_cfg_t floc; moq_location_filter_cfg_init(&floc);
+    floc.kind = MOQ_LOCATION_FILTER_RELATIVE_GROUP;
+    floc.relative_group_offset = 1;
+    moq_fill_cfg_t fill; moq_fill_cfg_init(&fill);
+    fill.location = &floc;
+    moq_sub_track_t *track = NULL;
+    MOQ_TEST_CHECK_EQ_INT((int)subscribe_join_current(&r, &track, &loc, &fill), (int)MOQ_OK);
+    settle(&r);
+    moq_sub_fill_item_t it;
+    MOQ_TEST_CHECK(moq_sub_track_has_queued_input(r.sub, track));
+    MOQ_TEST_CHECK(moq_sub_poll_fill(r.sub, &it, sizeof(it)) == MOQ_OK);
+    MOQ_TEST_CHECK(it.kind == MOQ_SUB_FILL_CREATED);
+    moq_sub_fill_item_cleanup(&it);
+    /* Only the pending OBJECT is left: still input. */
+    MOQ_TEST_CHECK(moq_sub_track_has_queued_input(r.sub, track));
+    settle(&r);
+    MOQ_TEST_CHECK(moq_sub_poll_fill(r.sub, &it, sizeof(it)) == MOQ_OK);
+    MOQ_TEST_CHECK(it.kind == MOQ_SUB_FILL_OBJECT);
+    moq_sub_fill_item_cleanup(&it);
+    /* Only the TERMINAL is left (pending or queued): not input. */
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(r.sub, track));
+    settle(&r);
+    MOQ_TEST_CHECK(moq_sub_poll_fill(r.sub, &it, sizeof(it)) == MOQ_OK);
+    MOQ_TEST_CHECK(it.kind == MOQ_SUB_FILL_TERMINAL);
+    moq_sub_fill_item_cleanup(&it);
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(r.sub, track));
+    rig_close(&r);
+}
+
 int main(void)
 {
     test_d18_refused();
@@ -1225,6 +1333,8 @@ int main(void)
     test_d22_stale_fill_handle();
     test_d22_foreign_fill_handle();
     test_d22_created_item_credit();
+    test_d22_track_has_queued_input();
+    test_d22_pending_fill_input();
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

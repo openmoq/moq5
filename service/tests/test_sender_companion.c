@@ -33,6 +33,10 @@ typedef struct old_callbacks_v0 {
     void (*joined)(void *, moq_media_sender_t *, moq_media_track_t *, size_t);
     void (*left)(void *, moq_media_sender_t *, moq_media_track_t *, size_t);
 } old_callbacks_v0_t;
+typedef struct old_companion_sender_cfg {
+    old_sender_cfg_t prefix;
+    moq_media_companion_profile_t companion_profile;
+} old_companion_sender_cfg_t;
 
 #ifdef __cplusplus
 #define PIN static_assert
@@ -62,15 +66,19 @@ PIN(ALIGNOF(old_sender_cfg_t) == ALIGNOF(moq_media_sender_cfg_t), "cfg alignment
 PIN(sizeof(moq_media_send_object_t) ==
     ((sizeof(old_send_object_t) + sizeof(void *) + ALIGNOF(old_send_object_t) - 1) /
      ALIGNOF(old_send_object_t)) * ALIGNOF(old_send_object_t), "full object extent");
-PIN(sizeof(moq_media_sender_cfg_t) == sizeof(old_sender_cfg_t) + ALIGNOF(old_sender_cfg_t), "full cfg extent");
+PIN(sizeof(old_companion_sender_cfg_t) == sizeof(old_sender_cfg_t) + ALIGNOF(old_sender_cfg_t), "frozen companion cfg extent");
+PIN(offsetof(moq_media_sender_cfg_t, resource_auth) >= sizeof(old_companion_sender_cfg_t), "auth never uses old companion padding");
+PIN(sizeof(moq_media_sender_cfg_t) ==
+    ((offsetof(moq_media_sender_cfg_t, resource_auth) + sizeof(void *) + ALIGNOF(old_sender_cfg_t) - 1) /
+     ALIGNOF(old_sender_cfg_t)) * ALIGNOF(old_sender_cfg_t), "full cfg extent");
 #if UINTPTR_MAX == UINT64_MAX
-PIN(sizeof(old_sender_cfg_t) == 176 && sizeof(moq_media_sender_cfg_t) == 184, "LP64 cfg pin");
+PIN(sizeof(old_sender_cfg_t) == 176 && sizeof(old_companion_sender_cfg_t) == 184 && sizeof(moq_media_sender_cfg_t) == 192, "LP64 cfg pin");
 PIN(sizeof(old_send_object_t) == 72 && sizeof(moq_media_send_object_t) == 80, "LP64 object pin");
 #elif defined(__arm__)
-PIN(sizeof(old_sender_cfg_t) == 112 && sizeof(moq_media_sender_cfg_t) == 120, "ARM cfg pin");
+PIN(sizeof(old_sender_cfg_t) == 112 && sizeof(old_companion_sender_cfg_t) == 120 && sizeof(moq_media_sender_cfg_t) == 128, "ARM cfg pin");
 PIN(sizeof(old_send_object_t) == 56 && sizeof(moq_media_send_object_t) == 64, "ARM object pin");
 #elif defined(__i386__)
-PIN(sizeof(old_sender_cfg_t) == 104 && sizeof(moq_media_sender_cfg_t) == 108, "i686 cfg pin");
+PIN(sizeof(old_sender_cfg_t) == 104 && sizeof(old_companion_sender_cfg_t) == 108 && sizeof(moq_media_sender_cfg_t) == 116, "i686 cfg pin");
 PIN(sizeof(old_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 48 : 52), "i686 old object pin");
 PIN(sizeof(moq_media_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 52 : 56), "i686 full object pin");
 #endif
@@ -78,6 +86,7 @@ PIN(sizeof(moq_media_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 52 : 56), 
 
 #ifndef SENDER_COMPANION_LAYOUT_ONLY
 #include <moq/sim.h>
+#include "media_sender_cmaf_init.h"
 #include <moq/wire.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1041,10 +1050,10 @@ static void auto_resolution(moq_version_t version, bool before_latch, bool with_
         char text[1024] = {0};
         size_t n = moq_rcbuf_len(json) < sizeof(text) - 1 ? moq_rcbuf_len(json) : sizeof(text) - 1;
         memcpy(text, moq_rcbuf_data(json), n);
-        CHECK((strstr(text, "\"version\":\"draft-01\"") != NULL) == d22);
-        CHECK((strstr(text, "\"initDataList\"") != NULL) == d22);
-        CHECK((strstr(text, "\"initRef\"") != NULL) == d22);
-        CHECK((strstr(text, "\"initData\"") != NULL) == !d22);
+        CHECK(strstr(text, "\"version\":\"draft-01\"") != NULL);
+        CHECK(strstr(text, "\"initDataList\"") != NULL);
+        CHECK(strstr(text, "\"initRef\"") != NULL);
+        CHECK(strstr(text, "\"initData\"") == NULL);
         moq_rcbuf_decref(json);
     }
 
@@ -1104,52 +1113,124 @@ done:
     finish(&f);
 }
 
-/* CMSF-01 3.1 under AUTO: a CMAF track without init_data is accepted while the
- * draft is unknown. Draft 22 then blocks the companion -- UNSUPPORTED, nothing
- * published, no fatal -- until the track is removed; drafts 16/18 publish it.
- * Once resolved to draft 22, add_track refuses such a track outright. */
-static void auto_cmaf_without_init(moq_version_t version)
+/* Literal independent catalog bytes before and after actual negotiation,
+ * including AUTO additions made on either side of resolution. The transport
+ * changes LOC properties and Group IDs; it never changes this catalog shape. */
+static void canonical_catalog(moq_version_t version, bool automatic, bool late)
 {
-    label = version == MOQ_VERSION_DRAFT_22 ? "auto-draft22-cmaf-without-init-blocks"
-                                            : "auto-legacy-cmaf-without-init-publishes"; ++rows;
-    const bool d22 = version == MOQ_VERSION_DRAFT_22;
-    old_sender_cfg_t *cfg = config(4, MOQ_MEDIA_COMPANION_AUTO, 1024);
+    label = "canonical-catalog-draft-matrix"; ++rows;
+    const uint32_t profile = automatic ? MOQ_MEDIA_COMPANION_AUTO :
+        version == MOQ_VERSION_DRAFT_22 ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC :
+                                         MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+    old_sender_cfg_t *cfg = config(4, profile, 1024);
     fixture_t f = {0};
-    bool started = start_auto(&f, cfg, 1700000000123ull, MOQ_MEDIA_PACKAGING_CMAF,
-                              (moq_bytes_t){NULL, 0});
+    f.alloc = (moq_alloc_t){.ctx=&f.memory,.alloc=allocate,.realloc=resize,.free=release};
+    moq_media_sender_test_set_alloc(&f.alloc);
+    g_clock_rc = 0; g_clock_ts = ms_clock(1700000000123ull);
+    moq_media_sender_test_set_clock_hook(scripted_clock, NULL);
+    moq_result_t rc = moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg, &f.sender);
+    moq_media_sender_test_set_clock_hook(NULL, NULL);
     free(cfg);
-    if (!started || !observe_session(&f, version)) { finish(&f); return; }
-    CHECK(moq_media_sender_test_companion(f.sender) ==
-          (d22 ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC
-               : MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01));
-    CHECK(!moq_media_sender_is_fatal(f.sender));
-    CHECK(moq_session_state(f.local) == MOQ_SESS_ESTABLISHED);
-    moq_action_t a;
-    size_t actions = moq_session_poll_actions(f.local, &a, 1);
-    CHECK((actions != 0) == !d22);
-    if (actions) moq_action_cleanup(&a);
-    if (d22) {
-        CHECK(stats(&f).last_error == MOQ_ERR_UNSUPPORTED);
-        old_send_object_t *o = object(0, NULL);
-        CHECK(write_object(&f, o) == MOQ_ERR_UNSUPPORTED);
-        free(o);
-        CHECK(stats(&f).objects_written == 0);
+    CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) goto done;
+    moq_media_sender_test_set_clock_ms(f.sender, true, 1000);
+    if (late && !observe_session(&f, version)) goto done;
+    moq_media_track_cfg_t tc;
+    moq_media_track_cfg_init(&tc);
+    tc.name = MOQ_BYTES_LITERAL("v"); tc.codec = MOQ_BYTES_LITERAL("av01");
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO; tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+    tc.bitrate = 1000;
+    const uint8_t video[] = {1,2,3}, audio[] = {0x12,0x10};
+    const uint8_t cmaf[] = {0,0,0,24};   /* opaque catalog-shape control */
+    tc.init_data = (moq_bytes_t){video, sizeof(video)};
+    CHECK(moq_media_sender_add_track(f.sender, &tc, &f.track) == MOQ_OK);
+    tc.name = MOQ_BYTES_LITERAL("a"); tc.codec = MOQ_BYTES_LITERAL("mp4a.40.2");
+    tc.media_type = MOQ_MEDIA_TYPE_AUDIO; tc.samplerate = 48000;
+    tc.channel_config = MOQ_BYTES_LITERAL("2");
+    tc.init_data = (moq_bytes_t){audio, sizeof(audio)};
+    moq_media_track_t *a = NULL;
+    CHECK(moq_media_sender_add_track(f.sender, &tc, &a) == MOQ_OK && a);
+    tc.name = MOQ_BYTES_LITERAL("c"); tc.packaging = MOQ_MEDIA_PACKAGING_CMAF;
+    tc.init_data = (moq_bytes_t){cmaf, sizeof(cmaf)};
+    moq_media_track_t *c = NULL;
+    CHECK(moq_media_sender_add_track(f.sender, &tc, &c) == MOQ_OK && c);
+    static const char want[] =
+        "{\"version\":\"draft-01\",\"generatedAt\":1000,\"tracks\":["
+        "{\"name\":\"v\",\"packaging\":\"loc\",\"isLive\":true,\"role\":\"video\","
+        "\"codec\":\"av01\",\"bitrate\":1000,\"timescale\":1000000,\"initRef\":\"v\"},"
+        "{\"name\":\"a\",\"packaging\":\"loc\",\"isLive\":true,\"role\":\"audio\","
+        "\"codec\":\"mp4a.40.2\",\"samplerate\":48000,\"bitrate\":1000,"
+        "\"timescale\":1000000,\"channelConfig\":\"2\",\"initRef\":\"a\"},"
+        "{\"name\":\"c\",\"packaging\":\"cmaf\",\"isLive\":true,\"role\":\"audio\","
+        "\"codec\":\"mp4a.40.2\",\"samplerate\":48000,\"bitrate\":1000,"
+        "\"timescale\":1000000,\"channelConfig\":\"2\",\"initRef\":\"c\"}],"
+        "\"initDataList\":[{\"id\":\"v\",\"type\":\"inline\",\"data\":\"AQID\"},"
+        "{\"id\":\"a\",\"type\":\"inline\",\"data\":\"EhA=\"},"
+        "{\"id\":\"c\",\"type\":\"inline\",\"data\":\"AAAAGA==\"}]}";
+    for (unsigned pass = 0; pass < (late ? 1u : 2u); pass++) {
+        if (pass && !observe_session(&f, version)) goto done;
+        moq_rcbuf_t *json = NULL;
+        CHECK(moq_media_sender_test_build_catalog(f.sender, &json) == MOQ_OK && json);
+        CHECK(json && moq_rcbuf_len(json) == sizeof(want) - 1 &&
+              memcmp(moq_rcbuf_data(json), want, sizeof(want) - 1) == 0);
+        if (json) moq_rcbuf_decref(json);
+    }
+done:
+    finish(&f);
+}
+
+/* Missing/empty CMAF init is refused on every companion both before and after
+ * negotiation, even with validate_cmaf=false. No allocation, registration or
+ * catalog mutation occurs. Supplying init immediately retries the same name. */
+static void cmaf_without_init(moq_version_t version, uint32_t profile)
+{
+    label = "cmaf-without-init-refused-without-poisoning"; ++rows;
+    old_sender_cfg_t *cfg = config(4, profile, 1024); /* validate_cmaf=false */
+    fixture_t f = {0};
+    f.alloc = (moq_alloc_t){.ctx=&f.memory,.alloc=allocate,.realloc=resize,.free=release};
+    moq_media_sender_test_set_alloc(&f.alloc);
+    g_clock_rc = 0; g_clock_ts = ms_clock(1700000000123ull);
+    moq_media_sender_test_set_clock_hook(scripted_clock, NULL);
+    moq_result_t rc = moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg, &f.sender);
+    moq_media_sender_test_set_clock_hook(NULL, NULL);
+    free(cfg);
+    CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) goto done;
+    moq_media_sender_test_set_clock_ms(f.sender, true, 1000);
+    for (int negotiated = 0; negotiated < 2; negotiated++) {
+        if (negotiated && !observe_session(&f, version)) goto done;
         moq_media_track_cfg_t tc;
         moq_media_track_cfg_init(&tc);
-        tc.name = MOQ_BYTES_LITERAL("w"); tc.codec = MOQ_BYTES_LITERAL("av01");
+        tc.name = negotiated ? MOQ_BYTES_LITERAL("after") : MOQ_BYTES_LITERAL("before");
+        tc.codec = MOQ_BYTES_LITERAL("avc1.640028"); tc.bitrate = 1000;
         tc.media_type = MOQ_MEDIA_TYPE_VIDEO; tc.packaging = MOQ_MEDIA_PACKAGING_CMAF;
-        tc.bitrate = 1000;
-        moq_media_track_t *late = NULL;
-        CHECK(moq_media_sender_add_track(f.sender, &tc, &late) == MOQ_ERR_INVAL && !late);
-        CHECK(moq_media_sender_remove_track(f.sender, f.track) == MOQ_OK);
-        moq_media_sender_test_pump(f.sender, f.local, 1001);
-        actions = moq_session_poll_actions(f.local, &a, 1);
-        CHECK(actions != 0);
-        if (actions) moq_action_cleanup(&a);
-    } else {
-        CHECK(stats(&f).last_error == MOQ_OK);
+        moq_rcbuf_t *before = NULL, *after = NULL;
+        CHECK(moq_media_sender_test_build_catalog(f.sender, &before) == MOQ_OK && before);
+        uint8_t init[256];
+        size_t init_len = sender_test_cmaf_init(init, 1);
+        moq_media_sender_stats_t st = stats(&f);
+        for (int empty = 0; empty < 2; empty++) {
+            tc.init_data = (moq_bytes_t){empty ? init : NULL, 0};
+            size_t live = f.memory.live, calls = f.memory.calls;
+            moq_media_track_t *t = (moq_media_track_t *)(uintptr_t)1;
+            CHECK(moq_media_sender_add_track(f.sender, &tc, &t) == MOQ_ERR_INVAL);
+            CHECK(t == NULL && f.memory.live == live && f.memory.calls == calls);
+        }
+        CHECK(moq_media_sender_test_build_catalog(f.sender, &after) == MOQ_OK && after);
+        CHECK(before && after && moq_rcbuf_len(before) == moq_rcbuf_len(after) &&
+              memcmp(moq_rcbuf_data(before), moq_rcbuf_data(after), moq_rcbuf_len(before)) == 0);
+        if (before) moq_rcbuf_decref(before);
+        if (after) moq_rcbuf_decref(after);
+        CHECK(stats(&f).last_error == st.last_error && !moq_media_sender_is_fatal(f.sender));
+        tc.init_data = (moq_bytes_t){init, init_len};
+        moq_media_track_t *t = NULL;
+        CHECK(moq_media_sender_add_track(f.sender, &tc, &t) == MOQ_OK && t);
+        CHECK(stats(&f).last_error == MOQ_OK && !moq_media_sender_is_fatal(f.sender));
     }
-    CHECK(!moq_media_sender_is_fatal(f.sender));
+    CHECK(moq_session_state(f.local) == MOQ_SESS_ESTABLISHED);
+    moq_media_sender_test_pump(f.sender, f.local, 1001);
+    CHECK(stats(&f).last_error == MOQ_OK && !moq_media_sender_is_fatal(f.sender));
+done:
     finish(&f);
 }
 
@@ -1514,8 +1595,16 @@ int main(void)
                 auto_resolution(drafts[i], v & 1u, false, true, 33);
             }
         }
-    auto_cmaf_without_init(MOQ_VERSION_DRAFT_18);
-    auto_cmaf_without_init(MOQ_VERSION_DRAFT_22);
+    for (size_t i = 0; i < 3; i++) {
+        const uint32_t explicit_profile = drafts[i] == MOQ_VERSION_DRAFT_22
+            ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC
+            : MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+        cmaf_without_init(drafts[i], MOQ_MEDIA_COMPANION_AUTO);
+        cmaf_without_init(drafts[i], explicit_profile);
+        for (int automatic = 0; automatic < 2; automatic++)
+            for (int late = 0; late < 2; late++)
+                canonical_catalog(drafts[i], automatic != 0, late != 0);
+    }
     scale_offer_matrix();
     scale_detector();
     scale_metadata_boundaries();

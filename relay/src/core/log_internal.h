@@ -18,8 +18,9 @@
 #define MOQR_LOG_DEF_MAX_OBJECTS      4096u
 #define MOQR_LOG_DEF_MAX_RECORDS      4096u
 #define MOQR_LOG_DEF_MAX_CURSORS      64u
-/* Chunk-node pool: bounds the metadata for OPEN/chunked records (each retained
- * zero-copy rcbuf slice takes one node). Closed-form: max_chunk_nodes nodes. */
+/* Chunk-node pool: bounds the metadata for chunked records, OPEN and COMPLETE
+ * alike (each retained zero-copy rcbuf slice takes one node until its record is
+ * abandoned or its group evicted). Closed-form: max_chunk_nodes nodes. */
 #define MOQR_LOG_DEF_MAX_CHUNK_NODES  8192u
 
 /* Subgroups remembered by moqr_log_note_gap before they have a list. */
@@ -76,6 +77,7 @@ typedef struct moqr_rec {
     bool              first_object;  /* first object ever published in its
                                       * subgroup (upstream FIRST_OBJECT)    */
     bool              subgroup_properties; /* upstream header PROPERTIES     */
+    uint8_t           properties_codec;    /* MOQR_PROPS_CODEC_* at ingest   */
     bool              follows_gap;   /* not known to continue the stream the
                                       * list's previous record was on: an
                                       * earlier object of the subgroup was

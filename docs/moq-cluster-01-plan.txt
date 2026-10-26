@@ -1,0 +1,146 @@
+MoQ Cluster draft-01 implementation plan
+Historical original-PR plan and receipts. The results below predate the
+current-main composition and API/adoption repairs; they are not current
+qualification results or accepted baseline exceptions.
+Spec: docs/moq-cluster-01-design.md
+Approved scope: full draft-22 session and reusable relay support.
+Execution: parallel protocol and route-engine tasks; root owns integration.
+
+Global constraints
+Use docs/draft-lcurley-moq-cluster-01.txt first. Preserve legacy profiles,
+unnegotiated bytes, sized ABI prefixes, auth, allocators and rollback on refusal.
+No generated attribution, unrelated refactoring, or new Markdown documents.
+Native QUIC and WebTransport validation are distinct from sans-I/O delivery.
+
+Shared interface
+moq_cluster_metadata_t (core/include/moq/cluster.h) is a borrowed ordered
+const uint64_t *hop_ids plus size_t hop_count, bool has_route_cost and uint64_t
+route_cost. Zero hops denotes absent HOP_PATH only for update configuration;
+initial negotiated advertisements must supply a nonempty path. Wire decoding
+can retain encoded bytes privately; public events must project to uint64 arrays.
+Root creates this header before dispatch. Protocol agent owns all remaining
+core files. Engine agent owns relay core and relay.h. Root owns bind and shard.
+
+Task 1: Cluster wire and session contract
+Files: core/include/moq/{session.h,cluster.h,moq.h}, core/src/wire/*d22*,
+core/src/session/{profile_d22.c,session*.c,session_internal.h,request_stream*},
+core/CMakeLists.txt, tests/test_cluster_session.c and tests/CMakeLists.txt.
+Consumes shared metadata. Produces opt-in session config, negotiated-info
+query, publication/discovery/update metadata and metadata-aware send API.
+Write tests first for both SETUP perspectives, absent/zero relay cost, zeros
+in paths, duplicate nonzero IDs, full uint64 values, malformed/truncated paths,
+parameter scope, updates, and unchanged unnegotiated bytes. Run failing tests,
+implement transactional codecs/session retention, then rerun focused and core
+regressions. No external deps or changes to legacy profile behavior.
+
+Task 2: Bounded relay route engine
+Files: relay/include/moq/relay/relay.h, relay/src/core/, relay/abi/,
+relay/tests/test_relay_cluster.c and relay/tests/CMakeLists.txt.
+Consumes shared metadata and per-binding peer identity/cost. Produces bounded
+multiple routes per namespace, metadata-aware announce/update/withdraw,
+per-request route selection, advertised route metadata and accounting.
+Write failing fixtures for alternatives, longest prefix, requester exclusions,
+known-origin preference, saturating cost, local loops, unknown origins, source
+pinning, withdrawals, warm discounts and deterministic re-parenting. Implement
+using existing allocators/pools/intent conventions; preserve legacy announce
+behavior unless cluster configuration is explicitly enabled. Tests must prove
+rollback under capacity limits, no stale-route delivery, and deterministic order.
+
+Task 3: Bind and shard integration
+Files: relay/src/bind/, relay/src/shard/, relay/include/moq/relay/moqr_bind.h,
+relay/include/moq/relay/moqr_shards.h, relay/tests/test_relay_cluster_mesh.c.
+Consumes exact APIs supplied by Tasks 1 and 2. Record signatures before editing.
+Propagate negotiation identity/cost when attaching sessions. Translate incoming
+namespace metadata to owned engine routes, append local hop when advertising,
+bridge ordinary peers with zero, and translate intents to metadata-aware send
+and update calls. Apply source-specific eligibility to SUBSCRIBE and FETCH.
+Do not consume an intent until its wire output is queued; retain metadata for
+retries. Withdraw before origin changes. Mirror owned route changes across
+shards with their generations and bounded bytes.
+Create a two-hop SimPair mesh fixture with an ordinary publisher, relay peers,
+and subscriber. Assert catalog/init plus increasing media objects, then add a
+cycle, redundant routes, source loss, update and cross-shard cases. Verify
+unnegotiated and mixed-draft regression suites remain green.
+
+Task 4: Verification and review
+Build Debug with warnings as errors and enabled core/relay/service tests:
+cmake -S . -B /tmp/moq5-cluster01-baseline -G Ninja -DCMAKE_BUILD_TYPE=Debug
+  -DMOQ_BUILD_RELAY_CORE=ON -DMOQ_BUILD_RELAY_RUNTIME=ON
+  -DMOQ_BUILD_RELAY_TOOL=OFF -DMOQ_BUILD_SERVICE=ON -DMOQ_BUILD_MSF=ON
+  -DMOQ_WARNINGS_AS_ERRORS=ON -DMOQ_BUILD_EXAMPLES=OFF
+cmake --build /tmp/moq5-cluster01-baseline -j 4
+ctest --test-dir /tmp/moq5-cluster01-baseline --output-on-failure -j 4
+Run ASan/UBSan with the same components. Run ABI/export and installed-consumer
+checks through CTest. Inspect the complete branch diff against the specification
+and correct substantive findings with focused regressions. Find available
+native and WebTransport fixtures and moq-pub reference; report unavailable live
+coverage explicitly. Run git diff --check and record exact test counts and
+remaining limitations before claiming completion.
+
+Review focus
+1. Negotiated high KVP codes must not shift the low-parameter presence mask.
+2. Backpressure must not append hops twice, double-charge costs or lose routes.
+3. Source generations must survive joining FETCH and delayed teardown.
+4. Unknown origins must not share retained media or claim continuity.
+5. Frozen initializers and structs embedded in public records must stay safe.
+Each is exercised by the owning task's focused tests and whole-suite checks.
+
+Implementation and validation notes (2026-10-22)
+All four implementation layers are present: draft-22 wire/session negotiation,
+bounded per-recipient route selection, binding integration, and cross-shard
+route/source propagation. Frozen embedded relay configurations use separate
+cluster configuration APIs. The relay README contains the host setup example.
+
+Media acceptance uses real session bytes through publisher -> relay A -> relay B
+-> subscriber, including two-shard nodes, redundant links, authorization denial,
+explicit zero cost, small queues and allocation refusal during metadata updates.
+Native QUIC and WebTransport use their existing TLS/packet simulations; these
+are separate adapter tests, not a live socket mesh. The ../moq-pub sibling was
+not present and was not tested.
+
+Sanitizer control: the unmodified pre-implementation tree reproduces
+six failures under ASan/UBSan/LeakSanitizer with halt_on_error=1:
+  media_object_mpeg2ts: test fixture index152 beyond unsigned char[152].
+  media_receiver_relay_bootstrap (and draft_16/draft_18/draft_22): fixture leaks.
+  media_receiver_finite_tail_ordering: fixture leaks.
+Control build: /tmp/moq5-cluster01-control-asan
+Control log: /tmp/moq5-cluster01-control-ctest.log
+LeakSanitizer needs execution outside the restricted ptrace sandbox here.
+
+Final Debug verification:
+  cmake --build /tmp/moq5-cluster01-baseline -j4
+  ctest --test-dir /tmp/moq5-cluster01-baseline --output-on-failure -j4
+  Result: 575/575 passed, including ABI/export and installed-consumer checks.
+  Log: /tmp/moq5-cluster01-final-ctest.log
+
+Adapter verification:
+  ctest --test-dir /tmp/moq5-cluster01-transports --output-on-failure
+    -R '^(pq_sim_establish|pico_wt_loopback|pico_wt_loopback_private)$'
+  Result: 3/3 passed. Both transport families verify negotiated cluster
+  metadata, catalog bytes and three progressing media groups.
+  Log: /tmp/moq5-cluster01-transports-final-ctest.log
+
+Header verification:
+  CC_ILP32=/usr/bin/clang-18 bash scripts/check_ilp32_headers.sh
+  Result: public headers and ABI pins accepted for ARM/i686, including
+  normal and short enums (10 checks passed).
+  Log: /tmp/moq5-cluster01-ilp32-final.log
+
+Final sanitizer verification:
+  Configure /tmp/moq5-cluster01-asan-gcc with the same Debug/component flags
+  above and these additional compiler/linker flags:
+    -DCMAKE_C_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer'
+    -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+  cmake --build /tmp/moq5-cluster01-asan-gcc -j4
+  ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1
+    ctest --test-dir /tmp/moq5-cluster01-asan-gcc --output-on-failure -j4
+  Result: 569/575 passed; the six failures match the sanitizer control above,
+  including the exact bounds diagnostic and leak totals. All six new cluster
+  tests passed (wire, session, bounded-work, engine, shards and media mesh).
+  Log: /tmp/moq5-cluster01-asan-final-ctest.log
+
+Final source review covered source-pinned routing, anonymous publisher
+continuity, metadata retry/authorization, capacity accounting, queued stale
+source responses and all retained partial-group cleanup on failover. Focused
+regressions verify the corrected failure modes. No known cluster issue remains.
+git diff --check passes. No live socket mesh or external publisher run is claimed.

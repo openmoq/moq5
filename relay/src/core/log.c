@@ -295,6 +295,23 @@ chunk_alloc(moqr_log_t *log)
     return idx;
 }
 
+/* Whether a group's records hold a chunk node: OPEN and COMPLETE chunked
+ * records alike keep one per retained chunk (datagrams are never chunked).
+ * Stops at the first record that does. */
+static bool
+group_holds_node(const moqr_group_t *g)
+{
+    for (uint32_t s = 0; s < g->sg_count; s++) {
+        const moqr_rec_vec_t *v = &g->sgs[s].v;
+        for (uint32_t i = 0; i < v->count; i++) {
+            if (v->recs[i].chunk_count > 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* Return a record's chunk list to the pool, decref'ing each retained slice
  * exactly once, and reset the record's list to empty. Byte accounting is the
  * caller's job (eviction subtracts g->bytes wholesale; abandon adjusts
@@ -519,34 +536,49 @@ moqr_log_note_evicted_below(moqr_log_t *log, uint64_t oldest_retained)
     if (log == NULL || oldest_retained == 0) {
         return 0;
     }
-    /* Locally retained groups below the watermark stay SERVABLE — the
-     * upstream eviction only proves nothing MORE will arrive for them, so
-     * their unsealed subgroup lists are sealed through the ordinary seal
-     * path (late-FIN notices, downstream closes, retirement coverage all
-     * follow from that), never destroyed. A seal the preflight rejects
-     * (contradictory header-EOG evidence) is left unsealed: the range stays
-     * UNKNOWN and fail-closed rather than force-closed. */
-    size_t sealed = 0;
-    for (uint32_t gi = 0; gi < log->group_count; gi++) {
+    /* Locally retained groups below the watermark stay SERVABLE: the
+     * upstream eviction proves that nothing MORE will arrive for them, not
+     * that what arrived is the whole subgroup. A list that has not ended may
+     * lack objects the source evicted before it forwarded them, so it ends
+     * with a reset, never a clean FIN (a FIN says every object of the
+     * subgroup was delivered; draft-22 §11.3.2). An object still OPEN can
+     * never complete: it is abandoned with the eviction cause first. A list
+     * that already ended keeps its terminal (a seal stays a FIN, a reset
+     * keeps its cause), and a list whose last object was abandoned ends with
+     * that object's reset, the terminal its stream already has. Without an
+     * eviction cause nothing is terminalized: the lists stay UNKNOWN and
+     * fail-closed rather than force-closed. Complete records stay retained,
+     * and each subscription gets the reset after them. */
+    moqr_reset_desc_t evicted;
+    bool have_cause =
+        moqr_reset_desc_internal(MOQR_RESET_CODE_EVICTED, &evicted) == MOQR_OK;
+    size_t ended = 0;
+    for (uint32_t gi = 0; have_cause && gi < log->group_count; gi++) {
         moqr_group_t *g = &log->groups[gi];
         if (g->group_id >= oldest_retained) {
             break;   /* ids ascend */
         }
         for (uint32_t si = 0; si < g->sg_count; si++) {
-            if (g->sgs[si].sealed) {
-                continue;
+            moqr_subgroup_t *sg = &g->sgs[si];
+            if (sg->sealed) {
+                continue;   /* first terminal wins */
             }
-            /* A list whose tail is ABANDONED was already terminalized
-             * downstream by its reset — sealing it would close the same
-             * subgroup twice. Leave it to the reset's own accounting. */
-            const moqr_rec_vec_t *v = &g->sgs[si].v;
-            if (v->count > 0 &&
-                v->recs[v->count - 1].obj_state == MOQR_OBJ_ABANDONED) {
-                continue;
+            moqr_reset_desc_t cause = evicted;
+            moqr_rec_t *tail =
+                sg->v.count > 0 ? &sg->v.recs[sg->v.count - 1] : NULL;
+            if (tail != NULL && tail->obj_state == MOQR_OBJ_OPEN &&
+                moqr_log_abandon_record(log, g->group_id, sg->subgroup_id,
+                                        tail->object_id,
+                                        evicted) != MOQR_OK) {
+                continue;   /* left OPEN: the list stays UNKNOWN */
             }
-            if (moqr_log_seal_subgroup(log, g->group_id,
-                                       g->sgs[si].subgroup_id) == MOQR_OK) {
-                sealed++;
+            if (tail != NULL && tail->obj_state == MOQR_OBJ_ABANDONED &&
+                moqr_reset_desc_valid(tail->reset)) {
+                cause = tail->reset;
+            }
+            if (moqr_log_reset_subgroup(log, g->group_id, sg->subgroup_id,
+                                        cause) == MOQR_OK) {
+                ended++;
             }
         }
     }
@@ -561,7 +593,7 @@ moqr_log_note_evicted_below(moqr_log_t *log, uint64_t oldest_retained)
         }
         log->any_evicted = true;
     }
-    return sealed;
+    return ended;
 }
 
 uint64_t
@@ -739,6 +771,14 @@ group_retains_beyond(const moqr_group_t *g, uint64_t final_q)
 #define LOG_DESC_HAS(desc, field)                             \
     (offsetof(moqr_log_append_desc_t, field) +                \
          sizeof(((moqr_log_append_desc_t *)0)->field) <= (desc)->struct_size)
+
+/* A stated properties codec is one of MOQR_PROPS_CODEC_*. */
+static bool
+log_desc_codec_valid(const moqr_log_append_desc_t *desc)
+{
+    return !LOG_DESC_HAS(desc, properties_codec) ||
+           desc->properties_codec <= MOQR_PROPS_CODEC_VI64;
+}
 
 static bool
 log_hole_has(const moqr_log_t *log, uint64_t group_id, uint64_t subgroup_id)
@@ -935,7 +975,7 @@ moqr_result_t
 moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
 {
     if (log == NULL || desc == NULL ||
-        desc->struct_size < LOG_DESC_MIN_SIZE) {
+        desc->struct_size < LOG_DESC_MIN_SIZE || !log_desc_codec_valid(desc)) {
         return MOQR_ERR_INVAL;
     }
     /* Status objects carry no payload (mirrors the session's
@@ -1183,6 +1223,8 @@ moqr_log_append(moqr_log_t *log, const moqr_log_append_desc_t *desc)
     rec.first_object = LOG_DESC_HAS(desc, first_object) && desc->first_object;
     rec.subgroup_properties = LOG_DESC_HAS(desc, subgroup_properties) &&
                               desc->subgroup_properties;
+    rec.properties_codec = LOG_DESC_HAS(desc, properties_codec)
+                               ? desc->properties_codec : MOQR_PROPS_CODEC_UNKNOWN;
     rec.follows_gap = !desc->datagram_pref && sg->gap_pending;
     rec.gap_reset = moqr_reset_desc_none();
     /* An append to a subgroup whose upstream stream already ended (a RESET,
@@ -1288,7 +1330,7 @@ moqr_result_t
 moqr_log_open_record(moqr_log_t *log, const moqr_log_append_desc_t *desc)
 {
     if (log == NULL || desc == NULL ||
-        desc->struct_size < LOG_DESC_MIN_SIZE) {
+        desc->struct_size < LOG_DESC_MIN_SIZE || !log_desc_codec_valid(desc)) {
         return MOQR_ERR_INVAL;
     }
     if (desc->obj_state != MOQR_OBJ_OPEN) {
@@ -1358,13 +1400,40 @@ moqr_log_append_chunk(moqr_log_t *log, uint64_t group_id, uint64_t subgroup_id,
     if (len == 0) {
         return MOQR_OK;   /* zero-length chunk: no node, no bytes, no state */
     }
-    /* Byte budget: evict oldest groups (never this open record's group) until
-     * the chunk fits. The record fits alone (open checked declared+props <=
-     * max_bytes), so this only sheds older data; if this record's group is
-     * itself the oldest and blocking, fail closed (the caller abandons). */
-    while (log->retained_bytes + len > log->max_bytes) {
+    /* Byte budget and chunk-node pool: evict oldest groups (never this open
+     * record's group) until the chunk fits both. COMPLETE chunked records
+     * keep their nodes until their group is evicted, so the pool, like the
+     * byte budget, is reclaimed from the oldest data. The record fits alone in
+     * bytes (open checked declared+props <= max_bytes), so this only sheds
+     * older data. Eviction stops at this record's group, so only a group older
+     * than it can give a node back: when only nodes are short, those groups
+     * are looked at once, up to the first that holds a node. If none does --
+     * every node in use is this group's or a newer group's -- nothing is
+     * evicted for nothing; otherwise the groups ahead of that holder go first,
+     * a group holding no node included, and the holder frees a node. If this
+     * record's group is itself the oldest and blocking, or no older group
+     * holds a node when only nodes are short, fail closed: the record stays
+     * OPEN and the chunk is not taken (the caller abandons). Eviction compacts
+     * the group array, so the record is resolved again after each. */
+    bool older_holds_node = false;   /* found at the first node-only shortage */
+    for (;;) {
+        bool bytes_short = log->retained_bytes + len > log->max_bytes;
+        if (!bytes_short && log->chunk_free_head != MOQR_CHUNK_NIL) {
+            break;
+        }
         if (log->group_count == 0 || &log->groups[0] == g) {
             return MOQR_ERR_CAPACITY;
+        }
+        if (!bytes_short && !older_holds_node) {
+            for (const moqr_group_t *o = log->groups; o != g; o++) {
+                if (group_holds_node(o)) {
+                    older_holds_node = true;
+                    break;
+                }
+            }
+            if (!older_holds_node) {
+                return MOQR_ERR_CAPACITY;
+            }
         }
         evict_group_at(log, 0, /*reason=*/0);
         rc = resolve_open_rec(log, group_id, subgroup_id, object_id,
@@ -1666,6 +1735,7 @@ view_fill(moqr_record_view_t *out, const moqr_rec_t *rec)
     out->first_object = rec->first_object;
     out->payload = rec->payload;
     out->properties = rec->properties;
+    out->properties_codec = rec->properties_codec;
     out->chunk_count = rec->chunk_count;
     out->declared_len = rec->declared_len;
     out->_chunk_head = rec->chunk_head;

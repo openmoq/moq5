@@ -22,13 +22,13 @@ on:
   workflow_dispatch:
     inputs:
       picoquic_ref:
-        description: 'picoquic branch/tag/full SHA override (default: a602e60babea48da7849169d716aaf68684e66d6)'
+        description: 'picoquic branch/tag/full SHA override (default: 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2)'
         required: false
-        default: 'a602e60babea48da7849169d716aaf68684e66d6'
+        default: '70b5fd5aafdd2d6c349ff783202ece9d778bcaf2'
       picotls_ref:
-        description: 'picotls branch/tag/full SHA override (default: f06553b877ada93c860dd1db9002eabf7365292d)'
+        description: 'picotls branch/tag/full SHA override (default: 7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1)'
         required: false
-        default: 'f06553b877ada93c860dd1db9002eabf7365292d'
+        default: '7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1'
 
 permissions:
   contents: read
@@ -57,8 +57,8 @@ jobs:
       - name: Validate picoquic + picotls refs
         shell: bash
         env:
-          PICOQUIC_REF: ${{ github.event.inputs.picoquic_ref || 'a602e60babea48da7849169d716aaf68684e66d6' }}
-          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || 'f06553b877ada93c860dd1db9002eabf7365292d' }}
+          PICOQUIC_REF: ${{ github.event.inputs.picoquic_ref || '70b5fd5aafdd2d6c349ff783202ece9d778bcaf2' }}
+          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || '7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1' }}
         run: |
           set -euo pipefail
           src/libmoq/scripts/validate_git_ref.sh "$PICOQUIC_REF" picoquic_ref
@@ -70,8 +70,8 @@ jobs:
       - name: Fetch picoquic + picotls (recurse submodules)
         shell: bash
         env:
-          PICOQUIC_REF: ${{ github.event.inputs.picoquic_ref || 'a602e60babea48da7849169d716aaf68684e66d6' }}
-          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || 'f06553b877ada93c860dd1db9002eabf7365292d' }}
+          PICOQUIC_REF: ${{ github.event.inputs.picoquic_ref || '70b5fd5aafdd2d6c349ff783202ece9d778bcaf2' }}
+          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || '7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1' }}
         run: |
           set -euo pipefail
           fetch_ref() {  # <repo> <ref> <dir>: full SHA, branch or tag

@@ -30,11 +30,11 @@ typedef struct moqr_bind_meta_ref {
 /* Source provenance above describes the received block, NOT current route
  * liveness: a WARM track can retain it after its source generation changes.
  * revision is local to this binding; zero means no state has been learned.
- * EMPTY is available across wire profiles. Validated nonempty D18/D22 Track
- * Properties replay byte-for-byte between those profiles, with destination
- * validation and existing unsupported-mandatory handling still in force.
- * Preserve wire_version; this is not a LOC/media conversion or a nonempty
- * D16 cross-profile compatibility claim. No implicit transcoder is provided. */
+ * EMPTY is available across wire profiles. A nonempty set is kept exactly as
+ * received with its wire_version; a reply converts the set's Key-Value-Pair
+ * integers to its own draft when they differ (draft-16 QUIC varints, vi64 in
+ * draft-18/22) and refuses one it cannot state exactly. This is not a
+ * LOC/media conversion. */
 
 /* Retain/release are nonallocating, memory-only. Retain requires an empty out;
  * release clears it. Release ALL manager-held pins before destroying b.
@@ -55,6 +55,12 @@ moqr_result_t moqr_bind_meta_retain_executing(
  * caller must already hold a currently resolved track/demand identity. */
 moqr_result_t moqr_bind_meta_latest(moqr_bind_t *b, moqr_track_t track,
                                   moqr_bind_meta_ref_t *out);
+
+/* The set a reply this relay originates for `track` states (FETCH_OK,
+ * TRACK_STATUS_OK): the recorded set, EMPTY when the binding does not manage
+ * the source's metadata, otherwise UNAVAILABLE. Returns an owned ref. */
+moqr_result_t moqr_bind_meta_reply(moqr_bind_t *b, moqr_track_t track,
+                                   moqr_bind_meta_ref_t *out);
 
 /* Replace the complete latest state after checking the exact LOCAL track and
  * current source generation. The local retained source must have opted into

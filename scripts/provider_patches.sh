@@ -23,6 +23,17 @@
 provider_patches_log() { printf '[provider_patches] %s\n' "$*" >&2; }
 provider_patches_die() { printf '[provider_patches] ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Compare canonical shell paths: Git for Windows can return a drive-letter path
+# while Git Bash reports the same checkout as /d/..., so string comparison of
+# rev-parse and pwd would reject a valid dependency checkout.
+provider_is_checkout_root() {
+    local dir=$1 git_root shell_root
+    git_root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || return 1
+    git_root=$(cd "$git_root" && pwd -P) || return 1
+    shell_root=$(cd "$dir" && pwd -P) || return 1
+    [ "$git_root" = "$shell_root" ]
+}
+
 # read_patch_series <series-file>: prints the manifest's patch names.
 read_patch_series() {
     local series=$1 line
@@ -40,7 +51,7 @@ provider_apply_patch() {
     local patch="$patch_dir/$name"
     [ -f "$patch" ] || provider_patches_die "missing $provider patch: $patch"
     # A non-repository child of libmoq can silently skip every patch path.
-    [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$dir" && pwd -P)" ] \
+    provider_is_checkout_root "$dir" \
         || provider_patches_die "$provider patch input is not its own git root: $dir"
     if git -C "$dir" apply --check "$patch" >/dev/null 2>&1; then
         git -C "$dir" apply "$patch" \
@@ -89,7 +100,7 @@ provider_apply_series() {
     shift 3
     local declared=("$@")
     provider_check_series "$provider" "$patch_dir" "${declared[@]}"
-    [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$dir" && pwd -P)" ] \
+    provider_is_checkout_root "$dir" \
         || provider_patches_die "$provider patch input is not its own git root: $dir"
     # Later patches may rewrite lines an earlier one introduced, so a patch
     # cannot be judged applied or not on its own once its successors are in.
@@ -110,6 +121,9 @@ provider_apply_series() {
         for name in "${declared[@]}"; do
             if ! git -C "$dir" apply --check "$patch_dir/$name" >/dev/null 2>&1 &&
                ! git -C "$dir" apply --reverse --check "$patch_dir/$name" >/dev/null 2>&1; then
+                # Preserve Git's hunk/path diagnostic for provider-specific
+                # checkout failures (notably Windows line-ending differences).
+                git -C "$dir" apply --check --verbose "$patch_dir/$name" >&2 || :
                 provider_patches_die "$provider patch $name conflicts with $dir"
             fi
         done

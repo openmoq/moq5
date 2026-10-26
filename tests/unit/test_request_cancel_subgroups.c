@@ -173,6 +173,7 @@ typedef struct fixture {
 
 typedef struct tally {
     int      resets[SG_COUNT];
+    int      outgoing_terminals[SG_COUNT];
     uint64_t reset_code[SG_COUNT];
     int      writes[SG_COUNT];
     int      other_actions;
@@ -649,6 +650,24 @@ static void record_action(const fixture_t *f, tally_t *t, const moq_action_t *a)
 
 static void record_event(const fixture_t *f, tally_t *t, const moq_event_t *e)
 {
+    if (e->kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED &&
+        e->detail_size >= MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE) {
+        const moq_outgoing_subgroup_terminated_event_t *d =
+            &e->u.outgoing_subgroup_terminated;
+        int i = sg_index(f, d->stream_ref);
+        if (i >= 0) {
+            ++t->outgoing_terminals[i];
+            MOQ_TEST_CHECK_EQ_U64(d->subgroup._opaque, f->sg[i]._opaque);
+            MOQ_TEST_CHECK_EQ_U64(d->sub._opaque, f->sub_a._opaque);
+            MOQ_TEST_CHECK(!moq_publication_is_valid(d->pub));
+            MOQ_TEST_CHECK_EQ_U64(d->group_id, (uint64_t)(10 + i));
+            MOQ_TEST_CHECK_EQ_U64(d->subgroup_id, 0);
+            MOQ_TEST_CHECK_EQ_U64(d->error_code, 0x2);
+            MOQ_TEST_CHECK_EQ_INT((int)d->cause,
+                                 (int)MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT);
+            return;
+        }
+    }
     if (e->kind == MOQ_EVENT_UNSUBSCRIBED &&
         moq_subscription_eq(e->u.unsubscribed.sub, f->sub_a)) {
         t->unsubscribed_a++;
@@ -785,6 +804,11 @@ static void expect_settled(fixture_t *f, const tally_t *t, int updated_b,
     MOQ_TEST_CHECK_EQ_INT(t->writes[SG_A_FIN], 0);
     MOQ_TEST_CHECK_EQ_INT(t->resets[SG_B_OPEN], 0);
     MOQ_TEST_CHECK_EQ_INT(t->writes[SG_B_OPEN], 0);
+    for (int i = 0; i < SG_COUNT; i++) {
+        bool timeout = (i == SG_A_FIN && f->o.sg_timeout_ms != 0) ||
+                       (i == SG_A_OPEN && f->o.obj_timeout_ms != 0);
+        MOQ_TEST_CHECK_EQ_INT(t->outgoing_terminals[i], timeout ? 1 : 0);
+    }
     MOQ_TEST_CHECK_EQ_INT(t->other_actions, 0);
     /* A migrated request completes silently; any other cancellation surfaces
      * exactly one UNSUBSCRIBED. Either way every reset is accounted for when
@@ -1584,9 +1608,13 @@ static void test_object_timeout_race(bool reset)
     MOQ_TEST_CHECK_EQ_INT(live_under(f.s, f.sub_a), live_count(&f));
 
     f.now = T_NOW + 6000;
-    MOQ_TEST_CHECK_EQ_INT((int)moq_session_tick(f.s, f.now), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_tick(f.s, f.now),
+                         (int)(reset ? MOQ_ERR_WOULD_BLOCK : MOQ_OK));
     MOQ_TEST_CHECK_EQ_SIZE(actions_queued(f.s), (size_t)1);
-    MOQ_TEST_CHECK(reset_queued_for(&f, SG_A_OPEN));
+    if (reset)
+        MOQ_TEST_CHECK(sg_state(&f, SG_A_OPEN) == MOQ_SG_TERMINAL_OWED);
+    else
+        MOQ_TEST_CHECK(reset_queued_for(&f, SG_A_OPEN));
     MOQ_TEST_CHECK(owner_kept(&f));
     poll_all(&f, &t);
     MOQ_TEST_CHECK_EQ_INT(t.resets[SG_A_OPEN], 1);
@@ -2153,6 +2181,8 @@ static void test_reuse_while_owed(bool reset)
                 owed_n++;
             }
         MOQ_TEST_CHECK_EQ_SIZE(owed_n, (size_t)live_count(&f));
+        /* The owe path arms the owed-reset walks. */
+        MOQ_TEST_CHECK(owed_n == 0 || f.s->sg_reset_owed);
         int fr = sg_find_free(f.s);
         MOQ_TEST_CHECK(fr < 0 || (fr < 64 && !owed_slot[fr]));
         for (size_t k = 0; k < f.s->sg_cap && k < 64; k++)
@@ -2191,6 +2221,8 @@ static void test_reuse_while_owed(bool reset)
     MOQ_TEST_CHECK_EQ_INT(t.other_actions, 0);
     for (size_t k = 0; k < f.s->sg_cap; k++)
         MOQ_TEST_CHECK(f.s->subgroups[k].state != MOQ_SG_RESET_OWED);
+    /* The retry that issued the last of them ended the walks. */
+    MOQ_TEST_CHECK(!f.s->sg_reset_owed);
 
     /* C is accepted and opens as many subgroups as A held. */
     moq_accept_subscribe_cfg_t acc;

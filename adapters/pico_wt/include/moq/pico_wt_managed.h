@@ -336,10 +336,15 @@ MOQ_API uint64_t moq_pico_wt_managed_close_code(
 MOQ_API uint64_t moq_pico_wt_managed_terminal_error(
     const moq_pico_wt_managed_t *m);
 
-/* Graceful-drain probe (backs moq_endpoint_drain). 1 = local stream flush done
- * (no queued/ready reliable stream data or unsent FIN; NOT a packet-ACK check),
- * 0 = still draining, -2 = called on the network thread. App-thread; safe to
- * poll. */
+/* Graceful-drain probe (backs moq_endpoint_drain). 1 = the stream output is
+ * flushed and acknowledged, as observed by a network pass that began after the
+ * last moq_pico_wt_managed_wake(): no queued/ready reliable stream data or
+ * unsent FIN, and the peer has acknowledged every stream's sent bytes, FIN and
+ * RESET (with a reset's reliable prefix; never a FIN the peer has yet to send).
+ * Transport acknowledgement, not the peer application's reading. 0 = still
+ * draining or not observed since the last wake (a wake makes the next probe 0
+ * until a later pass decides), -2 = called on the network thread. App-thread;
+ * safe to poll. */
 MOQ_API int moq_pico_wt_managed_drain_state(moq_pico_wt_managed_t *m);
 
 /* The configured listen port (server) or target port (client). */

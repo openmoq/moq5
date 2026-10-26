@@ -79,10 +79,12 @@ picoquic_threaded — and the **wtquic Network.framework managed client**
 (`moq_wtquic_network_managed_`, WebTransport, Apple/client-only) share the
 unified **lane** API: the pump callback is
 `on_lane_pump(handle, lane, now, user)`, servers iterate a lane's
-connections with `<prefix>_lane_next_conn(lane, prev)`, and each is a
-single serialized lane (`cfg.lane_count > 1` → `MOQ_ERR_UNSUPPORTED`;
-msquic additionally supports multiple real lanes; the wtquic Network
-client degenerates to one lane owning one client connection). The other
+connections with `<prefix>_lane_next_conn(lane, prev)`. Each lane is a serialized
+domain. Msquic supports multiple lanes; raw picoquic servers support lane groups
+on supported POSIX `SO_REUSEPORT` platforms. Windows raw picoquic servers,
+raw picoquic clients, mvfst, and the wtquic Network client retain one lane
+(`lane_count > 1` is unsupported; server counts above the picoquic maximum
+are invalid). The wtquic Network client owns one client connection. The other
 WebTransport managed adapters (`moq_pico_wt_managed_`, proxygen) still
 use the older `on_pump(handle, now, ctx)` shape.
 
@@ -519,6 +521,21 @@ Implications:
   (no `.pc` — see "Why mvfst is CMake-only" below); a Meson/autotools build
   cannot pull mvfst via `pkg-config`. VLC's MoQ module is gated on
   `libmoq_dep` + `picoquic_dep` for this reason.
+- **Where those `.pc` files expect PicoQUIC:** picoquic ships no `.pc`, so
+  `libmoq.pc` and `libmoq-pico-wt.pc` name its headers and archives
+  themselves.
+  - Built against an **installed picoquic package**, they carry that
+    package's own include and library directories: relative to `${prefix}`
+    when it was installed under LibMoQ's prefix, as fixed absolute paths when
+    it lives elsewhere (those do not move with the prefix).
+  - Built from a **picoquic source tree** (`MOQ_PICOQUIC_SOURCE_DIR`), nothing
+    of picoquic is installed with LibMoQ: install picoquic (with
+    `BUILD_HTTP=ON` for pico WT) into the **same prefix** with its default
+    layout. Its archives are then found in LibMoQ's `${libdir}`, and its
+    headers in `${prefix}/include`, which the `.pc` names whenever LibMoQ's
+    own `CMAKE_INSTALL_INCLUDEDIR` is something else. A picoquic installed
+    elsewhere, or with a different include directory, is not described by
+    these files.
 - **CMake consumers:** use `find_package(libmoq COMPONENTS ...)` with the
   component names above. mvfst additionally needs a C++ compiler (the
   config errors out otherwise) and a discoverable `mvfst` package.

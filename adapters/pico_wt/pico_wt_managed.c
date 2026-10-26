@@ -14,6 +14,7 @@
 #include "../common/moq_alpn.h"
 #include "../common/moq_setup_tokens.h"
 #include "../common/moq_adapter_binding.h"
+#include "../common/moq_posix_compat.h"   /* pthread + clock_gettime (Windows shim) */
 #include "../common/moq_pq_stream_backlog.h"
 #include "pico_wt_adapter.h"
 
@@ -23,17 +24,35 @@
 #include <pico_webtransport.h>
 #include <h3zero_common.h>
 
-#include <arpa/inet.h>
 #include <errno.h>
+#ifdef _WIN32
+#include <ws2tcpip.h>   /* getaddrinfo, inet_pton */
+#else
+#include <arpa/inet.h>
 #include <netdb.h>
-#include <pthread.h>
+#include <unistd.h>
+#endif
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 #include <time.h>
 
 #define PICO_WT_MANAGED_ALPN "h3"
+
+/* Winsock is reference counted per process. Each successful create pairs one
+ * WSAStartup with one WSACleanup (destroy or the create failure path), so the
+ * facade works in hosts that never initialized Winsock themselves. */
+#ifdef _WIN32
+static int wt_net_startup(void)
+{
+    WSADATA wsa;
+    return WSAStartup(MAKEWORD(2, 2), &wsa) == 0 ? 0 : -1;
+}
+static void wt_net_cleanup(void) { WSACleanup(); }
+#else
+static int wt_net_startup(void) { return 0; }
+static void wt_net_cleanup(void) {}
+#endif
 
 /* Advertised inbound flow-control credit, per unidirectional stream and
  * connection-wide. picoquic's defaults (initial_max_stream_data_uni 64 KiB,
@@ -188,15 +207,20 @@ struct moq_pico_wt_managed {
     uint64_t           close_flush_deadline_us;    /* network thread only */
     bool               stopped;
     bool               loop_came_up;   /* loop reached ready (latched) */
+    bool               startup_retiring; /* mutex: rejected until joined */
     bool               pump_exit;
     bool               loop_running;   /* packet loop is active; stop waits
                                          * for the callback to clear it */
     bool               local_close_started;    /* network thread only */
     bool               quic_lost_reported;     /* network thread only */
     uint64_t           local_close_deadline_us; /* network thread only */
-    bool               tx_drained;      /* network thread: local stream flush
-                                         * done (no queued/ready stream data or
-                                         * unsent FIN). Read by drain(). */
+    bool               tx_drained;      /* network thread: the stream output
+                                         * is flushed and acknowledged, as of a
+                                         * pass no wake overtook. Read by
+                                         * drain_state(). */
+    uint64_t           drain_gen;       /* advanced by every wake (mutex): a
+                                         * pass publishes tx_drained only if
+                                         * none arrived since it began */
     bool               activity_pending;
     bool               wake_pending;
     int                wake_in_flight;
@@ -217,6 +241,11 @@ struct moq_pico_wt_managed {
     char              test_connect_authority[256]; /* server: last CONNECT */
     char              test_connect_sni[256];       /* server: its TLS SNI */
     char              test_connect_path[256];      /* server: its :path */
+    /* Drain-state observation: a network-thread hook run after a pass has
+     * published its drain state, and the generation that pass began under. */
+    void            (*test_stage)(moq_pico_wt_managed_t *, int, void *);
+    void             *test_stage_ctx;
+    uint64_t          test_pass_gen;
 #endif
 };
 
@@ -312,6 +341,10 @@ static void allow_peer_missing_reset_stream_at(moq_pico_wt_managed_t *m,
         m->conn->endpoint_ctx.reset_stream_at_synthesized = true;
 }
 
+static int managed_client_wt_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
+    size_t length, picohttp_call_back_event_t event,
+    h3zero_stream_ctx_t *stream_ctx, void *app_ctx);
+
 static int managed_client_h3_callback(picoquic_cnx_t *cnx,
     uint64_t stream_id, uint8_t *bytes, size_t length,
     picoquic_call_back_event_t fin_or_event, void *callback_ctx,
@@ -347,8 +380,10 @@ static int managed_client_h3_callback(picoquic_cnx_t *cnx,
         fin_or_event != picoquic_callback_stateless_reset &&
         m->ctrl_ctx != NULL && !m->h3_ctx->settings.settings_received &&
         m->h3_ctx->pending_wt_connect == m->ctrl_ctx;
+#endif
     int rc = h3zero_callback(cnx, stream_id, bytes, length, fin_or_event,
                              m->h3_ctx, v_stream_ctx);
+#if defined(MOQ_PICO_WT_TESTING)
     if (connect_pending && m->h3_ctx->settings.settings_received) {
         if (m->h3_ctx->pending_wt_connect == NULL) {
             if (rc == 0 && !m->fatal)
@@ -357,11 +392,22 @@ static int managed_client_h3_callback(picoquic_cnx_t *cnx,
             m->test_connect_left_pending++;
         }
     }
-    return rc;
-#else
-    return h3zero_callback(cnx, stream_id, bytes, length, fin_or_event,
-                           m->h3_ctx, v_stream_ctx);
 #endif
+    /* h3zero binds a complete WT header to its session prefix, but emits no
+     * path callback without payload or FIN. Admit that stream now so CONNECT
+     * acceptance can rebind it too. Re-find it: parsing may create or delete
+     * the context supplied by picoquic. Partial headers and refused streams
+     * have no facade binding; repeated DATA does not add another slot. */
+    if (rc == 0 && fin_or_event == picoquic_callback_stream_data &&
+        m->conn == NULL) {
+        h3zero_stream_ctx_t *sc = h3zero_find_stream(m->h3_ctx, stream_id);
+        if (sc != NULL && sc != m->ctrl_ctx &&
+            sc->path_callback == managed_client_wt_cb &&
+            sc->path_callback_ctx == m)
+            rc = managed_client_wt_cb(cnx, NULL, 0,
+                picohttp_callback_post_data, sc, m);
+    }
+    return rc;
 }
 
 static void mark_activity(moq_pico_wt_managed_t *m)
@@ -518,14 +564,15 @@ static void pwm_early_refuse(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx,
 /* Buffer one delivery made before the CONNECT response. A stream beyond the
  * stream limit, or one whose entry would pass the entry or storage limit, is
  * refused with WT_BUFFERED_STREAM_REJECTED; other streams keep theirs. An
- * empty delivery that is neither a FIN nor a STOP carries nothing and is not
- * kept. Returns 0: a refused stream never closes the connection. */
+ * empty delivery that is neither a FIN nor a STOP carries nothing and keeps no
+ * entry, but it still registers its stream. The receive wrapper uses this to
+ * admit a parsed header with no payload or FIN, so replay can rebind it to
+ * the session before later bytes arrive. Returns 0: a refused stream never
+ * closes the connection. */
 static int pwm_early_buffer(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx,
                             h3zero_stream_ctx_t *sc, const uint8_t *bytes,
                             size_t len, pwm_early_kind_t kind)
 {
-    if (kind == PWM_EARLY_DATA && len == 0)
-        return 0;
     size_t slot = pwm_early_slot(m, sc->stream_id);
     if (slot == SIZE_MAX) {
         if (m->early_nstreams == MOQ_PWM_EARLY_MAX_STREAMS) {
@@ -538,6 +585,8 @@ static int pwm_early_buffer(moq_pico_wt_managed_t *m, picoquic_cnx_t *cnx,
         m->early_streams[slot].sc = sc;
         m->early_streams[slot].retired = false;
     }
+    if (kind == PWM_EARLY_DATA && len == 0)
+        return 0;
     pwm_early_chunk_t *ch = NULL;
     if (m->early_entries < MOQ_PWM_EARLY_MAX_ENTRIES &&
         len <= MOQ_PWM_EARLY_MAX_BYTES - sizeof(pwm_early_chunk_t) &&
@@ -1124,8 +1173,15 @@ static int loop_callback(picoquic_quic_t *quic,
 {
     moq_pico_wt_managed_t *m = (moq_pico_wt_managed_t *)callback_ctx;
 
+    pthread_mutex_lock(&m->mutex);
+    if (m->startup_retiring) {
+        pthread_mutex_unlock(&m->mutex);
+        /* The creator rejected this attempt before READY. Keep rejecting
+         * subsequent callbacks too: the provider may call port_update even
+         * after READY requests termination. No packet work may begin. */
+        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+    }
     if (cb_mode == picoquic_packet_loop_ready) {
-        pthread_mutex_lock(&m->mutex);
         m->network_thread_id = pthread_self();
         m->network_thread_id_set = true;
         m->loop_came_up = true;
@@ -1137,6 +1193,7 @@ static int loop_callback(picoquic_quic_t *quic,
                 ->do_time_check = 1;
         return 0;
     }
+    pthread_mutex_unlock(&m->mutex);
 
     if (cb_mode == picoquic_packet_loop_wake_up) {
         pthread_mutex_lock(&m->mutex);
@@ -1194,6 +1251,15 @@ static int loop_callback(picoquic_quic_t *quic,
 
     uint64_t now = picoquic_get_quic_time(quic);
 
+    /* The wake generation this pass began under: work admitted before a
+     * later wake is not covered by what this pass observes. */
+    pthread_mutex_lock(&m->mutex);
+    uint64_t pass_gen = m->drain_gen;
+    pthread_mutex_unlock(&m->mutex);
+#if defined(MOQ_PICO_WT_TESTING)
+    m->test_pass_gen = pass_gen;
+#endif
+
     /* service → on_pump → service (all on the network thread). */
     if (moq_pico_wt_service(conn, now) < 0) {
         pthread_mutex_lock(&m->mutex);
@@ -1215,6 +1281,10 @@ static int loop_callback(picoquic_quic_t *quic,
             return local_close_step(m, quic);
         }
     }
+#if defined(MOQ_PICO_WT_TESTING)
+    /* After the pump, before the post-pump service. */
+    if (m->test_stage) m->test_stage(m, 1, m->test_stage_ctx);
+#endif
 
     if (moq_pico_wt_service(conn, now) < 0) {
         pthread_mutex_lock(&m->mutex);
@@ -1291,22 +1361,34 @@ static int loop_callback(picoquic_quic_t *quic,
                                    dl == UINT64_MAX ? 0 : dl);
     }
 
-    /* Publish the graceful-drain state (network thread): local stream flush is
-     * done once no stream has queued/ready reliable data or an unsent FIN -- i.e.
-     * every reliable stream byte + FIN has been handed to the transport. This is
-     * deliberately NOT the packet-ACK backlog (picoquic_is_cnx_backlog_empty),
-     * which can stay non-empty forever on an idle connection after the bytes are
-     * sent and the peer has surfaced the object. The probe is network-thread-only
-     * and side-effect free. */
+    /* Publish the graceful-drain state (network thread). Drained: the session
+     * holds no pending output (moq_session_has_pending_output: no unpolled
+     * action, no retained FIN/RESET/STOP, response or cancellation -- a pass
+     * that stopped at the bridge's budget leaves some), the bridge
+     * holds no outbound action, no stream has queued/ready reliable data or an
+     * unsent FIN (every byte and FIN handed to picoquic), and the peer has
+     * acknowledged every stream's send half (moq_pq_cnx_streams_acked: sent
+     * bytes, FIN, RESET and reliable prefix -- never a peer FIN, and not the
+     * packet backlog, picoquic_is_cnx_backlog_empty, which ACK-only packets
+     * keep non-empty on an idle connection). Published only when no wake
+     * arrived since the pass began, so it never predates work queued before
+     * that wake. Network-thread-only and side-effect free. */
     {
         bool drained =
             m->active_cnx &&
             picoquic_get_cnx_state(m->active_cnx) == picoquic_state_ready &&
-            moq_pq_cnx_stream_backlog_empty(m->active_cnx);
+            !moq_session_has_pending_output(moq_pico_wt_conn_session(conn)) &&
+            !moq_transport_bridge_has_outbound_pending(conn->bridge) &&
+            moq_pq_cnx_stream_backlog_empty(m->active_cnx) &&
+            moq_pq_cnx_streams_acked(m->active_cnx);
         pthread_mutex_lock(&m->mutex);
-        m->tx_drained = drained;
+        m->tx_drained = drained && m->drain_gen == pass_gen;
         pthread_mutex_unlock(&m->mutex);
     }
+#if defined(MOQ_PICO_WT_TESTING)
+    /* The drain state is published and the facade mutex released. */
+    if (m->test_stage) m->test_stage(m, 2, m->test_stage_ctx);
+#endif
 
     mark_activity(m);
     return 0;
@@ -1558,6 +1640,13 @@ moq_result_t moq_pico_wt_managed_create(
         m->alloc.free(m, sizeof(*m), m->alloc.ctx);
         return MOQ_ERR_INTERNAL;
     }
+    if (wt_net_startup() != 0) {
+        pthread_cond_destroy(&m->cond);
+        pthread_mutex_destroy(&m->mutex);
+        free_strings(m);
+        m->alloc.free(m, sizeof(*m), m->alloc.ctx);
+        return MOQ_ERR_INTERNAL;
+    }
 
     uint64_t now = picoquic_current_time();
 
@@ -1657,22 +1746,32 @@ moq_result_t moq_pico_wt_managed_create(
     for (int attempt = 0; attempt < 3 && !tctx; attempt++) {
         pthread_mutex_lock(&m->mutex);
         m->loop_came_up = false;
+        m->startup_retiring = false;
         pthread_mutex_unlock(&m->mutex);
         int thread_ret = 0;
         picoquic_network_thread_ctx_t *cand =
             picoquic_start_network_thread(m->quic, &m->loop_param,
                 loop_callback, m, &thread_ret);
         if (!cand) continue;
-        /* Wait on OUR ready latch (a loop that came up and exited again
-         * clears thread_is_ready -- see moq_picoquic_threaded.c). */
-        bool came_up = false;
-        for (int waited_ms = 0; waited_ms < 2000; waited_ms++) {
-            pthread_mutex_lock(&m->mutex);
-            came_up = m->loop_came_up;
-            pthread_mutex_unlock(&m->mutex);
-            if (came_up || cand->return_code != 0) break;
-            usleep(1000);
+        /* Only the facade latch is synchronized with the ready callback.
+         * The provider writes return_code without our mutex, and clears
+         * thread_is_ready again on exit. A loop that reached readiness and
+         * exited promptly is still a successful start; a pre-ready failure
+         * instead reaches the deadline before its candidate is joined. */
+        struct timespec deadline;
+        bool has_deadline = clock_gettime(CLOCK_REALTIME, &deadline) == 0;
+        if (has_deadline) deadline.tv_sec += 2;
+        pthread_mutex_lock(&m->mutex);
+        while (!m->loop_came_up && has_deadline) {
+            if (pthread_cond_timedwait(&m->cond, &m->mutex, &deadline) != 0)
+                break;
         }
+        bool came_up = m->loop_came_up;
+        /* Commit retirement before unlocking. A late READY must not start
+         * work or publish session/adapter ownership while we join. The
+         * decision remains set until deletion finishes, before any retry. */
+        m->startup_retiring = !came_up;
+        pthread_mutex_unlock(&m->mutex);
         if (came_up)
             tctx = cand;
         else
@@ -1703,6 +1802,7 @@ fail_configure:
     picoquic_free(m->quic);
     m->quic = NULL;
 fail_quic:
+    wt_net_cleanup();
     pthread_cond_destroy(&m->cond);
     pthread_mutex_destroy(&m->mutex);
     free_strings(m);
@@ -1738,15 +1838,18 @@ moq_result_t moq_pico_wt_managed_stop(moq_pico_wt_managed_t *m)
     if (ctx) {
         (void)picoquic_wake_up_network_thread(ctx);
         struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec += 3;
-        pthread_mutex_lock(&m->mutex);
-        while (m->loop_running) {
-            if (pthread_cond_timedwait(&m->cond, &m->mutex,
-                                       &deadline) == ETIMEDOUT)
-                break;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) == 0) {
+            deadline.tv_sec += 3;
+            pthread_mutex_lock(&m->mutex);
+            while (m->loop_running) {
+                if (pthread_cond_timedwait(&m->cond, &m->mutex,
+                                           &deadline) != 0)
+                    break;
+            }
+            pthread_mutex_unlock(&m->mutex);
         }
-        pthread_mutex_unlock(&m->mutex);
+        /* Clock/wait errors skip only the graceful wait. Wake borrowers
+         * have left through the fence above; the provider still must join. */
         picoquic_delete_network_thread(ctx);
     }
 
@@ -1780,6 +1883,7 @@ void moq_pico_wt_managed_destroy(moq_pico_wt_managed_t *m)
         m->ctrl_ctx = NULL;
     }
     if (m->quic) picoquic_free(m->quic);
+    wt_net_cleanup();
     pthread_cond_destroy(&m->cond);
     pthread_mutex_destroy(&m->mutex);
     free_strings(m);
@@ -1827,11 +1931,13 @@ bool moq_pico_wt_managed_is_closed(const moq_pico_wt_managed_t *m)
     return m ? locked_bool(m, 1) : false;
 }
 /* Graceful-drain probe for moq_endpoint_drain()'s backend vtable. Returns
- * 1 = local stream flush done (no queued/ready reliable stream data or unsent
- * FIN; NOT a packet-ACK check), 0 = still draining, -2 = called on the network
- * thread (caller -> WRONG_STATE). The flushed state is computed on the network
- * thread (loop_callback) and read here under the mutex; this never touches
- * picoquic from the app thread. */
+ * 1 = stream output flushed and acknowledged as of a pass that began after the
+ * last wake (no bridge action, no queued/ready reliable stream data or unsent
+ * FIN, every stream's send half acknowledged by the peer), 0 = still draining
+ * or not yet observed since the last wake, -2 = called on the network thread
+ * (caller -> WRONG_STATE). The state is computed on the network thread
+ * (loop_callback) and read here under the mutex; this never touches picoquic
+ * from the app thread. */
 int moq_pico_wt_managed_drain_state(moq_pico_wt_managed_t *m)
 {
     if (!m) return 0;
@@ -1884,6 +1990,10 @@ moq_result_t moq_pico_wt_managed_wake(moq_pico_wt_managed_t *m)
 {
     if (!m) return MOQ_ERR_INVAL;
     pthread_mutex_lock(&m->mutex);
+    /* Whatever the caller queued before this wake is unobserved until a pass
+     * that begins after it: the cached drain state no longer stands. */
+    m->drain_gen++;
+    m->tx_drained = false;
     if (m->stopped || m->fatal || m->closed || m->pump_exit ||
         !m->thread_ctx) {
         pthread_mutex_unlock(&m->mutex);
@@ -1938,7 +2048,10 @@ moq_result_t moq_pico_wt_managed_wait(moq_pico_wt_managed_t *m,
     struct timespec deadline;
     bool has_deadline = (timeout_us != UINT64_MAX);
     if (has_deadline) {
-        clock_gettime(CLOCK_REALTIME, &deadline);
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            pthread_mutex_unlock(&m->mutex);
+            return MOQ_ERR_INTERNAL;
+        }
         deadline.tv_sec  += (time_t)(timeout_us / 1000000ULL);
         deadline.tv_nsec += (long)((timeout_us % 1000000ULL) * 1000ULL);
         if (deadline.tv_nsec >= 1000000000L) {
@@ -1947,14 +2060,15 @@ moq_result_t moq_pico_wt_managed_wait(moq_pico_wt_managed_t *m,
         }
     }
 
+    bool wait_failed = false;
     while (!m->activity_pending && !m->stopped &&
            !m->fatal && !m->closed && !m->pump_exit) {
-        if (has_deadline) {
-            if (pthread_cond_timedwait(&m->cond, &m->mutex,
-                                       &deadline) == ETIMEDOUT)
-                break;
-        } else {
-            pthread_cond_wait(&m->cond, &m->mutex);
+        int wrc = has_deadline
+            ? pthread_cond_timedwait(&m->cond, &m->mutex, &deadline)
+            : pthread_cond_wait(&m->cond, &m->mutex);
+        if (wrc != 0) {
+            wait_failed = !has_deadline || wrc != ETIMEDOUT;
+            break;
         }
     }
 
@@ -1964,6 +2078,8 @@ moq_result_t moq_pico_wt_managed_wait(moq_pico_wt_managed_t *m,
     } else if (m->activity_pending) {
         m->activity_pending = false;
         result = MOQ_OK;
+    } else if (wait_failed) {
+        result = MOQ_ERR_INTERNAL;
     } else {
         result = MOQ_DONE;
     }
@@ -2048,6 +2164,40 @@ moq_pico_wt_conn_t *moq_pico_wt_managed_test_conn(moq_pico_wt_managed_t *m)
 
 picoquic_cnx_t *moq_pico_wt_managed_test_cnx(moq_pico_wt_managed_t *m)
 { return m ? m->active_cnx : NULL; }
+
+void moq_pico_wt_managed_test_set_stage_hook(
+    moq_pico_wt_managed_t *m,
+    void (*fn)(moq_pico_wt_managed_t *, int, void *), void *ctx)
+{
+    if (!m) return;
+    m->test_stage = fn;
+    m->test_stage_ctx = ctx;
+}
+
+uint64_t moq_pico_wt_managed_test_drain_gen(moq_pico_wt_managed_t *m)
+{
+    pthread_mutex_lock(&m->mutex);
+    uint64_t g = m->drain_gen;
+    pthread_mutex_unlock(&m->mutex);
+    return g;
+}
+
+void moq_pico_wt_managed_test_drain_facts(moq_pico_wt_managed_t *m,
+                                          moq_pwt_test_drain_facts_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (!m || !m->active_cnx || !m->conn) return;
+    moq_pico_wt_conn_t *conn = m->conn;
+    out->ready = picoquic_get_cnx_state(m->active_cnx) == picoquic_state_ready;
+    out->session_pending =
+        moq_session_has_pending_output(moq_pico_wt_conn_session(conn));
+    out->bridge_pending = moq_transport_bridge_has_outbound_pending(conn->bridge);
+    out->backlog_empty = moq_pq_cnx_stream_backlog_empty(m->active_cnx);
+    out->acked = moq_pq_cnx_streams_acked(m->active_cnx) != 0;
+    pthread_mutex_lock(&m->mutex);
+    out->gen_unchanged = m->drain_gen == m->test_pass_gen;
+    pthread_mutex_unlock(&m->mutex);
+}
 
 unsigned moq_pico_wt_managed_test_connect_enqueued(moq_pico_wt_managed_t *m)
 { return m ? m->test_connect_enqueued : 0; }

@@ -37,6 +37,94 @@ Public declarations use only C types and opaque library objects. Test counters,
 seal/inspection hooks, binding authorization glue, and the CLI toy policy are
 private; defining a testing macro does not expose them from installed headers.
 
+## Cluster Configuration And Metadata
+
+Cluster draft-01 is opt-in on draft-22 sessions. Use a sized session
+initializer, then set `cluster_enabled` and `cluster_hop_id` before creation.
+Both endpoints must offer the feature. `cluster_has_relay_cost` distinguishes
+an omitted cost (one) from `cluster_relay_cost == 0` (free). Query local/peer
+identity and negotiation with `moq_session_cluster_info`. Zero withholds an
+identity and is valid; use one configured local identity across relay peers.
+
+Use `moqr_cluster_cfg_init_sized` and `moqr_core_create_cluster` for a standalone
+core. The separate record preserves the layout of embedded core configurations.
+For the shard runtime, use its appended `cluster_enabled`, `cluster_hop_id`,
+`max_cluster_routes` and `max_cluster_hops` fields. A binding refuses a
+cluster-enabled session whose local identity differs from its core, or whose
+core has clustering disabled. Ordinary sessions can attach to a cluster core.
+
+The default route and received-path limits are 256 routes and 32 hops per
+core. Paths exceeding the configured limit are refused without truncation.
+`moqr_core_cluster_info` reports these limits and route usage. Before creating
+the core, pass the same cluster configuration to
+`moqr_core_cluster_capacity_describe`; resolve it with `moqr_cluster_cfg_resolve`
+for `moqr_bind_cluster_capacity_describe`. The shard capacity description
+includes its cluster pools, copied metadata and bounded replication queues.
+
+Attach peer sessions with `moqr_bind_conn_open`, or use
+`moqr_bind_conn_open_cluster` with a sized `moqr_bind_cluster_peer_cfg_t` to
+override the peer's relay cost or correlate connections known to be one
+endpoint. Correlation IDs remain local. The binding opens namespace discovery
+after setup and applies the existing authorization policy before importing
+routes. Hop and correlation IDs do not grant access.
+
+Session publication/update configurations carry `moq_cluster_metadata_t`.
+Inputs are borrowed for the call; retained paths are copied. Event paths and
+`moq_session_namespace_cluster` results are borrowed until the next advancing
+session call. `moq_session_send_namespace_cluster` sends discovery metadata;
+repeat it to update the same advertisement. Partial publication updates retain
+omitted fields; explicit zero changes cost to zero. Updates preserve the first
+hop; changing publisher identity requires withdrawal and a new advertisement.
+
+Direct engine hosts configure peer bindings with
+`moqr_core_binding_set_cluster` and supply routes through
+`moqr_core_announce_cluster`. `moqr_core_cluster_route` selects for one
+recipient; its metadata borrows core storage until the next mutating core call.
+Its cost is already accumulated. A direct forwarding host appends the local
+hop once; the session binding performs that step for attached sessions.
+
+The new cluster functions and the four core/binding capacity-description
+functions return `moq_result_t`. Structured query/planner outputs take explicit sizes: require the
+named `*_V0_SIZE`, write and stamp `min(out_size, library_size)` only on
+`MOQ_OK`, and leave the output untouched on `MOQ_DONE` or error. The unreleased
+`moqr_core_capacity_t` and `moqr_bind_capacity_t` are sized in place; rebuild
+relay callers against these headers. Existing ordinary relay operations keep
+their `MOQR_*` result contract. Do not cast one result vocabulary to the other:
+`MOQ_ERR_WOULD_BLOCK` is -8, `MOQ_ERR_STALE_HANDLE` is -6, and the new
+`MOQ_ERR_CAPACITY` is -17 (configured admission policy, not automatic retry).
+`MOQ_ERR_LIMIT` means non-recyclable identity exhaustion. Validation, intent
+credit, capacity and identity-limit refusals change no route/owner/queued
+intent. NOMEM may follow reclamation of already-reclaimable cache storage;
+it never partially commits metadata or takes live ownership.
+
+Initialize resolved peer input with `moqr_cluster_peer_cfg_init`: cost defaults
+to one, explicit zero means free, and an unnegotiated peer must have Hop ID
+zero. `moqr_core_binding_set_cluster(core, binding, &peer)` copies the sized
+input before routes exist; NULL selects defaults. The binding's host-policy
+input uses `moqr_bind_cluster_peer_cfg_init` and `has_relay_cost` to distinguish
+an override from negotiation. `moqr_bind_conn_open_cluster(bind, session,
+version, &peer)` has one size source (`peer.struct_size`); NULL equals ordinary
+attachment policy. Neither operation takes session ownership on refusal.
+
+A route query's `advertisement` is a comparison snapshot: the **original full
+binding handle** plus a nonzero, never-reused advertisement serial. All mirrors
+inside one live shard runtime retain that ID. Same-ad cost/path-suffix/warm
+updates retain it; withdrawal/reannounce changes it, as does binding reuse.
+It is comparable only inside that runtime (or one standalone-core lifetime),
+not across independent/recreated runtimes. Nonzero publisher Hop ID can
+establish content continuity across different advertisements; anonymous
+continuity requires the complete advertisement ID. Equality is not proof of
+live ownership or authorization. Serial exhaustion refuses admission/update
+with LIMIT and leaves withdrawal/query/cleanup usable; binding generations
+retire rather than wrap. No global ID allocator or public pool index is used.
+
+Replication, original-owner forced dispatch and warm tie-breaking are private
+same-build mechanisms, not application exports. Forced dispatch checks the
+owner shard, full live binding, exact local non-mirrored advertisement and
+recipient exclusions. Stale selections fail instead of choosing a replacement.
+A live direct PUBLISH remains eligible for its exact track without a namespace
+advertisement; it grants no namespace or sibling-track permission.
+
 ## Ownership
 
 | Resource | Contract |

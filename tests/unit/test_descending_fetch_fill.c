@@ -798,7 +798,9 @@ done:
     return failures;
 }
 
-static int d18_local_refusal(void)
+/* Draft-18 requests a descending FETCH: one request on the wire, a live
+ * handle (its response's group deltas count down, 11.4.4.1). */
+static int d18_local_descending_request(void)
 {
     int failures = 0;
     fixture_t p;
@@ -815,9 +817,9 @@ static int d18_local_refusal(void)
         cfg.end_object = 10;
         size_t tail = p.client->action_tail;
         moq_fetch_t handle;
-        MOQ_TEST_CHECK_EQ_INT(moq_session_fetch(p.client, &cfg, 1, &handle), MOQ_ERR_INVAL);
-        MOQ_TEST_CHECK_EQ_SIZE(p.client->action_tail, tail);
-        MOQ_TEST_CHECK(!moq_fetch_is_valid(handle));
+        MOQ_TEST_CHECK_EQ_INT(moq_session_fetch(p.client, &cfg, 1, &handle), MOQ_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(p.client->action_tail, tail + 1);
+        MOQ_TEST_CHECK(moq_fetch_is_valid(handle));
     }
     moq_simpair_destroy(p.pair);
     return failures;
@@ -1379,7 +1381,8 @@ int main(void)
         inbound_fetch_writer(MOQ_VERSION_DRAFT_22), &failed_cases);
     failures += record("d18_admitted_peer_desc_fetch_writer_literal_wire",
         inbound_fetch_writer(MOQ_VERSION_DRAFT_18), &failed_cases);
-    failures += record("d18_local_desc_refusal_unchanged", d18_local_refusal(), &failed_cases);
+    failures += record("d18_local_descending_request", d18_local_descending_request(),
+                       &failed_cases);
     failures += record("d22_desc_fill_writer", fill_writer(), &failed_cases);
     failures += record("desc_fill_writer_object_wrap_refusal",
         fill_writer_object_wrap(), &failed_cases);

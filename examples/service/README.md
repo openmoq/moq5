@@ -10,13 +10,44 @@ should use. They use **only public headers** and link **`moq::service`** — no
   `auto_subscribe = true` (see *Subscription modes* below).
 - `media_send.c` — connect an endpoint, attach a sender, add a track, and write
   media objects (placeholder payloads; see the note below).
+- `media_player.c` — play a namespace through `moq_media_player`: track
+  selection, ordering and timing done for you, with decoder-ready access units
+  out (CONFIGURE / TIMELINE / UNIT / DISCONTINUITY / END). Built when the
+  playback engine is (`MOQ_BUILD_PLAYBACK=ON`). See *Receiver objects or
+  player access units?* below.
+
+### Receiver objects or player access units?
+
+Both read the same catalog and media; they differ in what they hand you.
+
+- **The receiver** (`media_receive.c`) gives you **objects**: every track the
+  catalog describes, any packaging (RAW/LOC, CMAF/CMSF, MPEG-TS), each object
+  with its timing metadata, in arrival order per track. You choose and
+  subscribe tracks, reorder, wait out gaps, map times to a clock and decide
+  when to present. Use it for remuxing, recording, relaying into another
+  framework that does its own buffering, or a packaging the player does not
+  play.
+- **The player** (`media_player.c`) gives you **access units for a decoder**:
+  RAW/LOC video (the units as published, e.g. H.264 Annex-B), and AAC-LC
+  (`mp4a.40.2`) or Opus audio. It selects tracks (AUTO plays one
+  catalog render group; MANUAL takes your selection), puts units in decode
+  order, settles gaps, losses and ends, maps each track onto a timeline and
+  says how every track ended. You feed its CONFIGURE to your decoder, its
+  UNITs to the decoder in order, and present at each unit's time on its
+  TIMELINE. The example has no decoder: it prints and checks the outputs,
+  and `--dump DIR` writes the encoded units and their boundaries to files,
+  which is not rendering.
+
+Both run on one owner thread of yours; see `docs/media-player.md` for the
+player's contracts.
 
 These C examples leave the media companion at its default, AUTO, which follows
 the draft the endpoint negotiates. On drafts 16/18 that is the legacy profile:
-LOC-01 object metadata and the MSF-01 catalog in its legacy form, Group IDs
-from 0. On draft 22 it is the draft-22 profile: LOC-04 object metadata, the
-MSF-01 draft-01 catalog (`"version":"draft-01"`, init data in the root
-`initDataList`), and Group IDs starting at the sender's wallclock milliseconds.
+LOC-01 object metadata and Group IDs from 0. On draft 22 it is the draft-22
+profile: LOC-04 object metadata and Group IDs starting at the sender's wallclock
+milliseconds. Every profile, including explicit LEGACY and unresolved AUTO,
+publishes MSF-01 catalogs with `"version":"draft-01"` and supplied init data in
+the root `initDataList`, referenced by each track's `initRef`.
 On draft 22 the sender generates the LOC-04 block from the typed fields of
 each RAW `write`: a capture time (`has_capture_time`) is a Unix-microsecond
 Timestamp; a presentation time alone, as in `media_send.c`, is media time and
@@ -78,14 +109,22 @@ start point or priority would require the subscription to end first.
    `cfg->endpoint`.
 3. Drive from your own thread: receiver `poll_track` / `poll_object` / `wait`;
    sender `add_track` (before readiness) then `write`.
-4. Teardown, in order: destroy the child (`*_destroy`), then call
-   `moq_endpoint_drain(ep, timeout_us)` if you have reliable stream bytes that
-   should be flushed before shutdown, then `moq_endpoint_stop`, then
-   `moq_endpoint_destroy`. (`stop` refuses with `MOQ_ERR_WRONG_STATE` while a
-   child is still attached and remains an abrupt stop when you skip the drain.)
-   `moq_endpoint_drain` is a **local stream flush**: it waits until the transport
-   has no queued/ready reliable stream bytes or unsent FIN, not until packets
-   are ACKed or the peer application has consumed the media.
+4. Teardown, in order: for a finite publication, end its tracks
+   (`moq_media_sender_end_track`) and call `moq_endpoint_drain(ep, timeout_us)`
+   while the sender is **still attached** -- destroying it first discards what
+   it still has queued, end-of-track markers included -- then destroy the
+   child (`*_destroy`), then `moq_endpoint_stop`, then `moq_endpoint_destroy`.
+   (`stop` refuses with `MOQ_ERR_WRONG_STATE` while a child is still attached
+   and remains an abrupt stop when you skip the drain.) `moq_endpoint_drain`
+   succeeds once the attached services have handed over the output they owe
+   (media retained for a track nobody has subscribed to, and an end-of-track
+   marker queued behind it, are not owed; an accepted publication paused at
+   Forward 0 still owes its end, so its drain times out) and the
+   transport has flushed it: on the picoquic backends that also means the peer
+   has acknowledged every stream's sent bytes, FIN and RESET (MsQuic may wait
+   for acknowledgement too).
+   It is transport acknowledgement, not the peer application having consumed
+   the media.
 
 For WebTransport interop with deployed relays that negotiate WT but omit the
 `reset_stream_at` transport parameter required by draft-ietf-webtrans-http3, the
@@ -113,9 +152,12 @@ latch: every blocking call on the endpoint and its attachments returns
 
 For a finite stream (a file, a clip, a stopped capture) call
 `moq_media_sender_end_track(s, track)` to signal a clean end-of-stream. After the
-track's already-queued objects drain, the service emits a reliable
-`END_OF_TRACK` over a subgroup **stream** (not a QUIC datagram, so it does not
-depend on datagram negotiation). Receivers surface `MOQ_MEDIA_TRACK_ENDED` and
+track's already-queued objects drain, the service ends each subscription
+with a reliable `END_OF_TRACK` over a subgroup **stream** (not a QUIC datagram,
+so it does not depend on datagram negotiation). A track this sender published
+itself (`publish_tracks`) ends instead with its publication's completion,
+reporting that the track ended, after its streams close; how a relay carries
+that end on to its own subscribers is up to the relay. Receivers surface `MOQ_MEDIA_TRACK_ENDED` and
 `moq_media_receiver_track_state` returns `ENDED` — the EOS signal a
 GStreamer/FFmpeg/VLC/OBS integration forwards downstream, rather than treating
 connection teardown as the end. Ending one track does **not** end other tracks or
@@ -131,18 +173,19 @@ Codec init/decoder config travels in the **catalog**, not in the media objects:
   H.264/HEVC SPS/PPS/VPS, an AAC `AudioSpecificConfig`, or a CMAF init segment.
   This applies to **any** packaging (RAW/LOC or CMAF) when the codec needs it.
   The service copies it during `add_track` (your buffer need not outlive the
-  call). How it is published depends on packaging:
-  - **RAW/LOC** — base64'd **inline** on the track's catalog entry on drafts
-    16/18. With the draft-22 companion every init-bearing track goes through
-    `initDataList`/`initRef` instead, as CMAF does.
-  - **CMAF** — published in the catalog's MSF-01 **`initDataList`** and
-    referenced from the track via **`initRef`**. The emitter deduplicates:
-    tracks whose CMAF init segment bytes are identical share a single
-    `initDataList` entry, and the entry `id` is the name of the first track
-    that introduced that init segment. The receiver follows the `initRef`
-    back into `initDataList` and resolves it transparently (see below).
+  call). Every companion on drafts 16/18/22 publishes supplied RAW audio/video,
+  CMAF and MPEG-TS initialization as a base64 `"inline"` entry in the root
+  **`initDataList`**, referenced from the track via **`initRef`**. Tracks with
+  identical init bytes share a single stable ID. Removing the first track does
+  not change that ID for surviving tracks; reusing a removed name for different
+  bytes gets a distinct ID. An init-bearing late addition publishes a full
+  independent catalog; an init-less addition can still use a delta.
 
-  Leave it empty when the codec carries its parameter sets in-band.
+  RAW may leave init empty when its codec carries parameter sets in-band.
+  CMAF requires a nonempty header at `add_track`, even before AUTO resolves and
+  even with `validate_cmaf = false`. Missing init returns `MOQ_ERR_INVAL` with a
+  NULL output handle and leaves the sender unchanged, so a corrected call can
+  retry immediately. The service does not repeat track init in media objects.
 - The receiver gets two forms at `TRACK_ADDED` (both **borrowed** for the event
   — copy if you retain them):
   - `desc.init.codec_config` — the **decoder extradata** (SPS/PPS/VPS, AAC ASC).
@@ -150,7 +193,7 @@ Codec init/decoder config travels in the **catalog**, not in the media objects:
   - `desc.init_data` — the **full container/init segment** (for CMAF the
     `ftyp`+`moov`). Muxers/recorders that reproduce the container want this;
     decoders usually do **not**. This is the **resolved** segment whether the
-    catalog carried it inline (RAW/LOC) or via `initRef`→`initDataList` (CMAF);
+    catalog carried it by reference or in a supported older inline format;
     the application sees the bytes either way and never resolves the reference
     itself.
 - `init_data` is **not** app-written per-object metadata. Per-object LOC headers
@@ -158,6 +201,12 @@ Codec init/decoder config travels in the **catalog**, not in the media objects:
 - In v0 a mid-stream codec/config change is modeled as a **new track / config
   generation** (a new catalog entry), not by mutating a live track's
   `init_data`.
+
+Service catalog emission uses this shape even for explicit LEGACY. Earlier
+D16/D18 service output used `"version":"1"` and per-track RAW `initData`; peers
+that depended on that output must accept the canonical form. The receiver still
+accepts supported legacy catalog forms. The low-level C catalog codec retains
+its explicit version-form selector and default.
 
 ### CMAF bytes and decoder config
 
@@ -231,6 +280,9 @@ cmake --preset rc-static -DMOQ_BUILD_SERVICE=ON -DMOQ_BUILD_MSF=ON
 cmake --build build/rc-static --target moq_example_media_receive moq_example_media_send
 ```
 
+Add `-DMOQ_BUILD_MEDIA_OBJECT=ON -DMOQ_BUILD_PLAYBACK=ON` and the
+`moq_example_media_player` target for the player example.
+
 This builds the binaries, but with no transport facade compiled in `connect()`
 returns `MOQ_ERR_UNSUPPORTED` at runtime.
 
@@ -272,6 +324,26 @@ ffmpeg ... -f h264 pipe:1 \
   | ./build/rc-static/examples/service/moq_example_media_publish_loc \
       moqt://localhost:4433 example video --insecure-skip-verify
 ```
+
+Play what is published with the player example: AUTO selection, or name the
+tracks to play (each track without a catalog render group gets a timeline of
+its own):
+
+```
+./build/rc-static/examples/service/moq_example_media_player moqt://localhost:4433 example \
+    --insecure-skip-verify
+./build/rc-static/examples/service/moq_example_media_player moqt://localhost:4433 example \
+    --track video --track audio --seconds 60 --insecure-skip-verify
+```
+
+For a finite publication, `--finite --dump DIR` turns it into a check: it
+succeeds only if every track ends by the publisher's END_OF_TRACK with every
+location settled, and writes each track's units with their boundaries and
+decoder configurations. `scripts/check_media_player_dump.py` then decodes the
+dump and compares it with the published file, and
+`scripts/live_media_player_cases.sh` runs a table of such cases (drafts,
+transports, media, joins, interruption, publisher loss, decoder pressure)
+against a relay.
 
 ### Consuming an installed libmoq (Meson / pkg-config)
 

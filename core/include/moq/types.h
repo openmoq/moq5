@@ -51,6 +51,10 @@ typedef int moq_result_t;
 /* A non-replenishable implementation limit was reached. Retrying unchanged
  * cannot succeed; unlike WOULD_BLOCK this is not temporary backpressure. */
 #define MOQ_ERR_LIMIT             (-16)
+/* Admission declined under configured capacity policy. The caller rejects or
+ * selects another source; draining transient output alone need not help.
+ * Distinct from allocation failure and from retryable WOULD_BLOCK. */
+#define MOQ_ERR_CAPACITY          (-17)
 #define MOQ_ERR_INTERNAL        (-99)
 
 MOQ_API const char *moq_strerror(moq_result_t rc);
@@ -248,6 +252,7 @@ MOQ_API uint64_t moq_track_sub_handle_id_for_trace(moq_track_sub_handle_t h);
 #define MOQ_HANDLE_POOL_PLAYBACK_TRACK 8u
 #define MOQ_HANDLE_POOL_SUBSCRIBE_TRACKS 9u
 #define MOQ_HANDLE_POOL_FILL          10u
+#define MOQ_HANDLE_POOL_PLAYBACK_COMMAND_HOLD 11u
 
 /*
  * Pack handle fields into a 64-bit opaque value.

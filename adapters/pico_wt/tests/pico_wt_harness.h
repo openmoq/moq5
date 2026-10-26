@@ -81,6 +81,11 @@ typedef struct {
     uint32_t max_events;               /* session event queue; 0 -> default */
     moq_version_t version;             /* both sessions; 0 -> draft-16 */
     uint32_t server_max_fills;         /* server fill pool; 0 -> default */
+    uint32_t server_max_actions;       /* server action queue; 0 -> default */
+    uint32_t server_send_buffer;       /* server outbound bytes; 0 -> default */
+    bool cluster_enabled;
+    uint64_t client_hop_id;
+    uint64_t server_hop_id;
 } pico_wt_harness_cfg_t;
 
 /* picohttp callback for the WT control stream on both ends:
@@ -144,7 +149,9 @@ int pico_wt_harness_handshake(pico_wt_harness_t *h);
 
 /*
  * ASAN-safe teardown: adapters (detach from picoquic/h3zero) →
- * sessions → tls context. Does NOT free *h. Safe on partial setup.
+ * sessions → the client's h3zero context (its connection's callback
+ * detached first) → tls context; then the aliases to what was freed.
+ * Does NOT free *h. Safe on partial setup.
  */
 void pico_wt_harness_cleanup(pico_wt_harness_t *h);
 

@@ -26,6 +26,7 @@
 #include <moq/sim.h>
 #include <moq/session.h>
 #include "test_support.h"
+#include "media_sender_cmaf_init.h"
 #include "ts_stream.h"
 #include "media_builders.h"
 #include "ts_desc_layout_probe.h"
@@ -2037,6 +2038,7 @@ static void par_flow(moq_version_t ver, moq_media_packaging_t pk,
     rec.program_number = 1;
     moq_msf_track_ext_t ext = { .kind = MOQ_MSF_EXT_MPEG2TS,
                                 .u = { .mpeg2ts = &rec } };
+    uint8_t init[256];
     moq_media_track_cfg_t tc;
     moq_media_track_cfg_init(&tc);
     tc.name = (moq_bytes_t){ (const uint8_t *)"m", 1 };
@@ -2050,6 +2052,8 @@ static void par_flow(moq_version_t ver, moq_media_packaging_t pk,
     } else {
         tc.codec = (moq_bytes_t){ (const uint8_t *)"avc1.64001f", 11 };
         tc.timescale = 90000;
+        if (pk == MOQ_MEDIA_PACKAGING_CMAF)
+            tc.init_data = (moq_bytes_t){ init, sender_test_cmaf_init(init, 1) };
     }
     MOQ_TEST_CHECK(moq_media_sender_add_track(e.s, &tc, &e.st) == MOQ_OK);
     if (!e.st) { failures++; e2e_free(&e); return; }
@@ -2163,6 +2167,7 @@ static void par_drops(moq_media_packaging_t pk, par_drop_t *pd)
     rec.packet_size = 188;
     moq_msf_track_ext_t ext = { .kind = MOQ_MSF_EXT_MPEG2TS,
                                 .u = { .mpeg2ts = &rec } };
+    uint8_t init[256];
     moq_media_track_cfg_t tc;
     moq_media_track_cfg_init(&tc);
     tc.name = (moq_bytes_t){ (const uint8_t *)"m", 1 };
@@ -2175,6 +2180,8 @@ static void par_drops(moq_media_packaging_t pk, par_drop_t *pd)
     } else {
         tc.codec = (moq_bytes_t){ (const uint8_t *)"avc1.64001f", 11 };
         tc.timescale = 90000;
+        if (pk == MOQ_MEDIA_PACKAGING_CMAF)
+            tc.init_data = (moq_bytes_t){ init, sender_test_cmaf_init(init, 1) };
     }
     e2e_t e;
     memset(&e, 0, sizeof(e));

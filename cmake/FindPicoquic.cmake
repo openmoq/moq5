@@ -19,8 +19,14 @@
 
 # WebTransport needs picoquic's HTTP/3 library (picohttp-core). Managed WT
 # requires the base WT adapter (enforced in the top-level CMakeLists), so this
-# one flag covers both.
-set(_MOQ_PQ_NEED_HTTP ${MOQ_BUILD_ADAPTER_PICO_WT})
+# one flag covers both. A consumer of an installed libmoq that ships the WT
+# adapter re-runs this module without MOQ_BUILD_ADAPTER_PICO_WT;
+# libmoqConfig.cmake sets _LIBMOQ_PICOQUIC_NEEDS_HTTP for it instead.
+if(MOQ_BUILD_ADAPTER_PICO_WT OR _LIBMOQ_PICOQUIC_NEEDS_HTTP)
+    set(_MOQ_PQ_NEED_HTTP ON)
+else()
+    set(_MOQ_PQ_NEED_HTTP OFF)
+endif()
 
 # A drain-capable adapter (raw threaded helper or managed WebTransport) compiles
 # adapters/common/moq_pq_stream_backlog.h against picoquic's PRIVATE
@@ -646,13 +652,23 @@ endfunction()
 # duplicate libraries. The adapter keeps its target dependency (its verifier
 # uses OpenSSL directly); picoquic-core is given the same targets instead.
 #
-# Applies only when the adapter will link OpenSSL: the adapter is built and
-# its verifier backend resolves to openssl (the rule in
-# adapters/picoquic/CMakeLists.txt: "openssl", or "auto" unless picoquic is
-# configured WITH_OPENSSL=OFF). OpenSSL-off, mbedTLS, installed or
-# pre-existing picoquic targets are left as they are.
+# Applies only when the adapter will link OpenSSL. In libmoq's own build:
+# the adapter is built and its verifier backend resolves to openssl (the
+# rule in adapters/picoquic/CMakeLists.txt: "openssl", or "auto" unless
+# picoquic is configured WITH_OPENSSL=OFF). In a consumer of the installed
+# package, which has none of those options: the installed adapter recorded
+# that it links OpenSSL (libmoqConfig sets _LIBMOQ_ADAPTER_PICOQUIC_NEEDS_
+# OPENSSL and finds OpenSSL before picoquic). OpenSSL-off, mbedTLS,
+# installed or pre-existing picoquic targets are left as they are.
 function(_moq_pq_openssl_identity_wanted out_var)
     set(${out_var} FALSE PARENT_SCOPE)
+    if(DEFINED WITH_OPENSSL AND NOT WITH_OPENSSL)
+        return()
+    endif()
+    if(_LIBMOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL)
+        set(${out_var} TRUE PARENT_SCOPE)
+        return()
+    endif()
     if(NOT MOQ_BUILD_ADAPTER_PICOQUIC)
         return()
     endif()
@@ -859,23 +875,38 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
     endif()
 
     if(TARGET picoquic-core)
-        # picoquic-core was created by the add_subdirectory above. Only it is
-        # respelled: it is the provider edge the adapter's consumers link.
-        # picohttp-core and an in-tree picotls-openssl carry raw OpenSSL
-        # edges of their own and are left as they are.
+        # picoquic-core and picohttp-core were created by the add_subdirectory
+        # above. They are respelled: they are the provider edges the
+        # adapters' consumers link (picohttp-core under WebTransport and the
+        # service tier). An in-tree picotls-openssl carries raw OpenSSL edges
+        # of its own and is left as it is.
         if(_moq_pq_openssl_identity)
             _moq_pq_openssl_respell(picoquic-core)
+            if(TARGET picohttp-core)
+                _moq_pq_openssl_respell(picohttp-core)
+            endif()
         endif()
         # The provider's own edges are used as declared: picoquic-log links
         # picoquic-core, picoquic-test links picoquic-log, and picoquic-core
-        # needs nothing from picoquic-log. That holds for the qualified source
-        # baseline (picoquic a602e60b), whose core no longer calls the log
+        # needs nothing from picoquic-log. That holds for the pinned source
+        # baseline (picoquic 70b5fd5), whose core no longer calls the log
         # library. Automatic accommodation of the older core/log cycle (e.g.
         # 55b473e2, whose core calls picoquic_set_qlog) is retired, and there
         # is no configure-time capability check. Consumers of such a source
         # tree MAY fail to link: its static archives still build with the
         # symbol unresolved, and another dependency may or may not supply
         # picoquic-log.
+
+        # picoquic's CMake build has no Windows configuration of its own (its
+        # Windows build is the Visual Studio solution, which defines _WINDOWS).
+        # Without it picoquic.h takes the POSIX path (<arpa/inet.h>), so define
+        # it for picoquic and for every libmoq source that includes picoquic.
+        # The same CMake build also omits the system libraries picoquic and
+        # picotls call on Windows (Winsock, BCryptGenRandom).
+        if(WIN32)
+            target_compile_definitions(picoquic-core PUBLIC _WINDOWS)
+            target_link_libraries(picoquic-core PUBLIC ws2_32 bcrypt)
+        endif()
         if(NOT TARGET picoquic::picoquic-core)
             add_library(picoquic::picoquic-core ALIAS picoquic-core)
         endif()

@@ -49,6 +49,9 @@ struct moqr_shards {
      * indexed src*shard_count + dst; the diagonal is unused. */
     r_mailbox            *mbox;
     uint32_t              mbox_cap;        /* entries per mailbox */
+    bool                  cluster_enabled;
+    uint32_t              cluster_routes;
+    uint32_t              cluster_hops;
     /* Directed FIFO demand channels (K>1 only), indexed src*shard_count+dst
      * like the mailboxes; the diagonal is unused. */
     r_demand_channel_t   *dch;
@@ -153,6 +156,10 @@ cap_mul(uint64_t a, uint64_t b)
  * protocol meaning of its own (pump-sub table full, subscribe hard error),
  * mirroring MOQ_REQUEST_ERROR_INTERNAL (moq/session.h). */
 #define R_ERR_INTERNAL       0x0u
+/* Wire REQUEST_ERROR code for a Joining FETCH whose joined subscription's
+ * track is no longer the one its name resolves to, mirroring
+ * MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID (moq/session.h). */
+#define R_ERR_INVALID_JOINING 0x32u
 
 #define SHARDS_CFG_HAS(cfg, field)                       \
     (offsetof(moqr_shards_cfg_t, field) +                \
@@ -362,6 +369,18 @@ typedef struct r_jentry {
     bool     cap_blocked;  /* mirror install refused for lack of core room */
 } r_jentry;
 
+/* Owned snapshot of one original route slot. The exporter keeps the current
+ * state until every destination accepted it. No borrowed core view crosses a
+ * step or a mailbox lock. */
+typedef struct r_cluster_snapshot {
+    bool present;
+    uint8_t *canon;
+    uint32_t canon_len;
+    uint64_t *hops;
+    moqr_cluster_export_t record;
+    uint64_t sent;
+} r_cluster_snapshot;
+
 typedef struct r_ctrl_msg {   /* one namespace's latest net state (coalesced) */
     bool     used;
     uint64_t round;        /* barrier stamp: visible at round + 1 */
@@ -369,6 +388,10 @@ typedef struct r_ctrl_msg {   /* one namespace's latest net state (coalesced) */
     uint16_t origin;       /* the announcing shard (constant per directed box) */
     uint8_t *canon;        /* owned */
     uint32_t canon_len;
+    bool cluster;
+    uint32_t source_index;
+    uint64_t *hops;       /* owned; copied before publishing the slot */
+    moqr_cluster_export_t record;
 } r_ctrl_msg;
 
 /* A directed control channel is a COALESCING set of per-namespace net states, not
@@ -379,11 +402,15 @@ typedef struct r_ctrl_msg {   /* one namespace's latest net state (coalesced) */
 struct r_mailbox {
     r_ctrl_msg *slots;
     uint32_t    cap, count;
+    /* Cluster-only extra slot in the create-time allocation. Publication is
+     * allocation-free, independent of refused admissions; never ANNOUNCE. */
+    r_ctrl_msg *withdrawal;
     /* Leaf lock for this ONE directed mailbox: the producer (the source
      * shard's outbound phase) and the consumer (the destination shard's
      * inbound phase) may run on different threads; every slot/count access
-     * happens under it. Strictly a leaf — the critical sections call only
-     * journal/bitset helpers and the shared allocator, never another mailbox,
+     * happens under it. Strictly a leaf — critical sections call journal
+     * helpers, the shared allocator, and (for cluster snapshots) the owning
+     * shard's non-callback route import. They never enter another mailbox,
      * a shard phase, or anything that can call back in, so the lock order
      * "caller's shard domain -> one mailbox -> nothing" has no cycles. The
      * deterministic runner takes it uncontended (same code path). */
@@ -413,6 +440,8 @@ typedef struct r_pdemand {
     uint8_t     *canon;        /* owned ns+name key (canon2 layout)        */
     uint32_t     canon_len;
     uint16_t     origin;       /* owner shard the mirror pointed at        */
+    moqr_cluster_advertisement_id_t     source_advertisement;
+    uint64_t     requester_hop_id, requester_correlation_id;
     uint8_t      state;
     uint32_t     term_code;    /* TERMINATING: the wire code to commit     */
     bool         term_overrun; /* TERMINATING: count as table overrun, not
@@ -542,6 +571,8 @@ typedef struct r_demand_msg {
     uint64_t     demand_id;
     moqr_track_t track;        /* the REQUESTER's track handle             */
     uint64_t     track_gen;
+    moqr_cluster_advertisement_id_t     source_advertisement;
+    uint64_t     requester_hop_id, requester_correlation_id;
     uint8_t     *canon;        /* DEMAND: owned ns+name key (msg-owned)    */
     uint32_t     canon_len;
     bool         has_largest;  /* ACK: the owner track's largest location  */
@@ -577,6 +608,11 @@ typedef struct r_demand_msg {
     bool         adv_subgroup_end;
     moq_rcbuf_t *payload;
     moq_rcbuf_t *props;
+    /* OBJ / OBJ_OPEN / FILL_ITEM: the codec `props` were stated in at the
+     * owner (MOQR_PROPS_CODEC_*), and whether the upstream subgroup header
+     * set PROPERTIES; the requester's ingest states both as received. */
+    uint8_t      props_codec;
+    bool         subgroup_props;
     uint64_t     bytes_accounted;   /* gauge contribution fixed at push (an
                                      * ownership transfer nulls the refs
                                      * before pop, so pop cannot recount) */
@@ -598,13 +634,19 @@ typedef struct r_demand_msg {
      * fill_end_group/fill_end_object. OPEN: the admission (error_code on
      * REJECT); on ACCEPT the inclusive range group_id/object_id ..
      * fill_end_group/fill_end_object, End Of Track, and the FETCH_OK End
-     * Location's raw object field (its group is fill_end_group). */
+     * Location's raw object field (its group is fill_end_group).
+     * fetch_capacity: a REJECT because the owner had no room for it. */
     bool         fetch_standalone;
+    bool         cluster_selected;
     bool         fetch_eot;
+    bool         fetch_capacity;
     uint32_t     fetch_admit;
     uint32_t     fetch_range_form;
     uint64_t     fetch_relative_start;
     uint64_t     fetch_end_raw_object;
+    /* REQ of a Joining FETCH: the demand whose feed the joined subscription
+     * reads (0 for any other FETCH). */
+    uint64_t     fetch_join_demand;
 } r_demand_msg_t;
 
 /* Whether a message kind is DATA (byte-gated, counted against the data
@@ -804,6 +846,7 @@ typedef struct r_fitem {
     uint64_t     declared_len;
     moq_rcbuf_t *payload;       /* owned clone (OBJECT)                   */
     moq_rcbuf_t *props;         /* OBJECT properties / ERROR reason       */
+    uint8_t      props_codec;   /* OBJECT properties' MOQR_PROPS_CODEC_*  */
     uint64_t     charged;       /* bytes still charged to the channel     */
 } r_fitem_t;
 
@@ -837,11 +880,16 @@ typedef struct r_fret {
      * REQ carries it, the request's raw range form, and the owner's
      * admission once OPEN arrives (begun). */
     bool      standalone;
+    bool      cluster_selected;
+    moqr_cluster_advertisement_id_t  source_advertisement;
+    uint64_t  requester_hop_id, requester_correlation_id;
     uint8_t  *canon;
     uint32_t  canon_len;
     uint32_t  range_form;
     uint64_t  relative_start;
+    uint64_t  join_demand_id;   /* a Joining FETCH's feeding demand, or 0 */
     moqr_retrieve_standalone_plan_t plan;
+    moq_rcbuf_t *meta_props;    /* owns plan.meta_bytes while open        */
 } r_fret_t;
 
 typedef struct r_oret {
@@ -863,6 +911,12 @@ typedef struct r_oret {
     bool         standalone;
     moqr_fetch_t owner;
     moqr_core_retrieve_plan_t plan;
+    /* Its Track Properties, from this binding's reply pin at admission, as
+     * an owned clone (never the pin itself) until OPEN carries them. */
+    moqr_bind_meta_state_t meta_state;
+    moq_version_t meta_version;
+    moq_rcbuf_t *meta_props;
+    bool         capacity;         /* refused for room (the owner's pool) */
     moqr_retrieve_cursor_t cursor; /* fixed row: never copied while live */
 } r_oret_t;
 
@@ -883,6 +937,7 @@ struct r_mgr {
     /* pseudo-bindings: pb[j] mirrors origin j; pb[shard] unused. */
     moqr_binding_t *pb;
     moqr_binding_t  mgr_bind;   /* wildcard namespace watcher */
+    r_cluster_snapshot *cluster; /* indexed by originating core route slot */
     /* remote-owner demand recorded by the router, forwarded by the demand
      * phase, and resolved by the inbound drain (refused by default; admitted
      * with data pumped back when admission is enabled). */
@@ -963,6 +1018,10 @@ struct r_mgr {
      * A permanent error mutates nothing and queues nothing; it fail-stops the
      * step and must not set this. Cleared per step. */
     bool            reconcile_owed_local_drain;
+    /* A cluster import refused intent credit before this step's pump.
+     * Retry once after that pump has had its opportunity to return credit;
+     * unchanged route CAPACITY does not arm this retry or a self-wake. */
+    bool            cluster_inbound_retry;
     /* Turn-outcome classification: exactly one of the four turns_*
      * counters increments per data-phase turn, decided at the single
      * dp_turn_classify point with pre-registered precedence (message
@@ -995,9 +1054,10 @@ struct r_mgr {
     uint64_t        next_fill_id;
     bool            fill_starved;
     bool            fill_wake_owed;
-    bool            oom;        /* dropped an unrecoverable borrowed observation
-                                 * (canon OOM / journal-full / pending-demand-full)
-                                 * — fail-stops the step */
+    bool            oom; /* dropped an unrecoverable borrowed observation
+                          * (canon OOM / journal-full / pending-demand-full)
+                          * — fail-stops the step */
+    moqr_result_t cluster_error; /* sticky policy/invariant failure, never NOMEM */
 #ifdef MOQR_BIND_TESTING
     /* Verify-only SG_SEAL ingest evidence: a bounded ring of the seals this
      * REQUESTER shard applied to its core, in ingest order (seq is the
@@ -1147,6 +1207,163 @@ mbox_push(moqr_shards_t *s, uint16_t src, uint16_t dst, uint8_t op,
 out:
     pthread_mutex_unlock(&mb->mu);
     return pushed;
+}
+
+/* Publish a whole original-source snapshot under one leaf lock. A reused
+ * source slot replaces its predecessor, including while the consumer lags. */
+static bool
+mbox_push_cluster(moqr_shards_t *s, uint16_t src, uint16_t dst,
+                  uint32_t index, const r_cluster_snapshot *snapshot,
+                  bool *allocation_failed)
+{
+    r_mailbox *mb = &s->mbox[(uint32_t)src * s->shard_count + dst];
+    uint8_t *canon = NULL;
+    uint64_t *hops = NULL;
+    size_t hop_bytes = snapshot->present
+        ? snapshot->record.route.metadata.hop_count * sizeof(uint64_t) : 0;
+    if (snapshot->present) {
+        canon = canon_dup(snapshot->canon, snapshot->canon_len, &s->alloc);
+        if (canon == NULL) { *allocation_failed = true; return false; }
+        hops = sh_alloc(&s->alloc, hop_bytes);
+        if (hops == NULL) {
+            sh_free(&s->alloc, canon, snapshot->canon_len);
+            *allocation_failed = true;
+            return false;
+        }
+        memcpy(hops, snapshot->hops, hop_bytes);
+    }
+    bool pushed = false;
+    pthread_mutex_lock(&mb->mu);
+    r_ctrl_msg *slot = NULL;
+    bool waiting_withdraw = mb->withdrawal->used && mb->withdrawal->source_index == index;
+    /* Do not let a reannouncement overtake an already published withdrawal.
+     * The source snapshot remains unsent and retries after its durable pop. */
+    if (waiting_withdraw) {
+        if (!snapshot->present) slot = mb->withdrawal;
+    } else {
+        for (uint32_t i = 0; i < mb->cap; ++i) {
+            if (mb->slots[i].used && mb->slots[i].cluster &&
+                mb->slots[i].source_index == index) {
+                slot = &mb->slots[i];
+                break;
+            }
+            if (!mb->slots[i].used && slot == NULL) slot = &mb->slots[i];
+        }
+        if (slot == NULL && !snapshot->present && !mb->withdrawal->used)
+            slot = mb->withdrawal;
+    }
+    if (slot != NULL) {
+        if (slot->used) {
+            sh_free(&s->alloc, slot->canon, slot->canon_len);
+            sh_free(&s->alloc, slot->hops,
+                    slot->record.route.metadata.hop_count * sizeof(uint64_t));
+        } else {
+            mb->count++;
+        }
+        memset(slot, 0, sizeof(*slot));
+        slot->used = true;
+        slot->cluster = true;
+        slot->round = s->round;
+        slot->origin = src;
+        slot->source_index = index;
+        slot->op = snapshot->present ? R_OP_ANNOUNCE : R_OP_UNANNOUNCE;
+        slot->canon = canon;
+        slot->canon_len = snapshot->present ? snapshot->canon_len : 0;
+        slot->hops = hops;
+        if (snapshot->present) slot->record = snapshot->record;
+        slot->record.source_index = index;
+        slot->record.route.metadata.hop_ids = hops;
+        pushed = true;
+    }
+    pthread_mutex_unlock(&mb->mu);
+    if (!pushed) {
+        sh_free(&s->alloc, canon, snapshot->canon_len);
+        sh_free(&s->alloc, hops, hop_bytes);
+    }
+    return pushed;
+}
+
+/* Capture after all local mutations. Comparisons include source identity and
+ * charged/warm cost, so an alternative changing below the best path is still
+ * replicated. Imports are excluded by the core exporter. */
+static void
+shard_cluster_outbound(moqr_shards_t *s, uint16_t shard, uint64_t *wake)
+{
+    r_mgr *m = s->shards[shard].mgr;
+    for (uint32_t i = 0; i < s->cluster_routes; ++i) {
+        moqr_cluster_export_t record;
+        memset(&record, 0, sizeof(record));
+        moqr_result_t rc = moqr_core_internal_cluster_export(m->core, i, &record);
+        if (rc != MOQR_OK && rc != MOQR_DONE) {
+            m->cluster_error = rc;
+            return;
+        }
+        bool present = rc == MOQR_OK;
+        r_cluster_snapshot *snapshot = &m->cluster[i];
+        if (present) {
+            uint32_t canon_len = 0;
+            uint8_t *canon = canon_build(record.ns.parts, record.ns.count,
+                                        &canon_len, &m->alloc);
+            if (canon == NULL) { m->oom = true; return; }
+            const moqr_cluster_route_t *a = &snapshot->record.route;
+            const moqr_cluster_route_t *b = &record.route;
+            size_t hop_bytes = b->metadata.hop_count * sizeof(uint64_t);
+            bool same = snapshot->present && snapshot->canon_len == canon_len &&
+                memcmp(snapshot->canon, canon, canon_len) == 0 &&
+                moqr_cluster_advertisement_id_eq(a->advertisement, b->advertisement) &&
+                snapshot->record.source_session_cookie == record.source_session_cookie &&
+                snapshot->record.revision == record.revision &&
+                a->accumulated_cost == b->accumulated_cost &&
+                a->warm == b->warm &&
+                a->metadata.has_route_cost == b->metadata.has_route_cost &&
+                a->metadata.route_cost == b->metadata.route_cost &&
+                a->metadata.hop_count == b->metadata.hop_count &&
+                snapshot->record.source_peer_hop_id == record.source_peer_hop_id &&
+                snapshot->record.source_correlation_id == record.source_correlation_id &&
+                memcmp(snapshot->hops, b->metadata.hop_ids, hop_bytes) == 0;
+            if (same) {
+                sh_free(&m->alloc, canon, canon_len);
+            } else {
+                uint64_t *hops = sh_alloc(&m->alloc, hop_bytes);
+                if (hops == NULL) {
+                    sh_free(&m->alloc, canon, canon_len);
+                    m->oom = true;
+                    return;
+                }
+                memcpy(hops, b->metadata.hop_ids, hop_bytes);
+                sh_free(&m->alloc, snapshot->canon, snapshot->canon_len);
+                sh_free(&m->alloc, snapshot->hops,
+                        snapshot->record.route.metadata.hop_count * sizeof(uint64_t));
+                snapshot->canon = canon;
+                snapshot->canon_len = canon_len;
+                snapshot->hops = hops;
+                snapshot->record = record;
+                snapshot->record.ns.parts = NULL;
+                snapshot->record.ns.count = 0;
+                memset(snapshot->record.ns_parts, 0,
+                       sizeof(snapshot->record.ns_parts));
+                snapshot->record.route.metadata.hop_ids = hops;
+                snapshot->present = true;
+                snapshot->sent = 0;
+            }
+        } else if (snapshot->present) {
+            snapshot->present = false;
+            snapshot->sent = 0;
+        }
+        for (uint16_t d = 0; d < s->shard_count; ++d) {
+            if (d == shard || ((snapshot->sent >> d) & 1u) != 0) continue;
+            bool allocation_failed = false;
+            if (mbox_push_cluster(s, shard, d, i, snapshot, &allocation_failed)) {
+                snapshot->sent |= 1ull << d;
+                if (wake != NULL) *wake |= 1ull << d;
+            } else if (allocation_failed) {
+                /* No queued message can return credit for an allocation
+                 * refusal. Surface it instead of silently stranding state. */
+                m->oom = true;
+                return;
+            }
+        }
+    }
 }
 
 /* -- the demand channel (FIFO; sibling to — never part of — the mailbox) ----- */
@@ -1478,6 +1695,29 @@ shards_router(void *ctx, const moqr_intent_t *it, uint64_t now_us)
         d->canon = canon;
         d->canon_len = clen;
         d->origin = (uint16_t)(it->binding_cookie - base);
+        if (m->s->cluster_enabled) {
+            moqr_cluster_advertisement_id_t route;
+            moqr_result_t rc = moqr_core_internal_cluster_upstream_route(m->core,
+                it->track, it->track_gen, &route, &d->requester_hop_id,
+                &d->requester_correlation_id);
+            if (rc != MOQR_OK) {
+                /* The source can withdraw after this intent was queued and
+                 * before the binding drains it. Its generation is then moot;
+                 * never turn it into a fresh lookup on a replacement route. */
+                sh_free(&m->alloc, d->canon, d->canon_len);
+                m->pend_len--;
+                if (rc != MOQR_DONE && rc != MOQR_ERR_STALE_HANDLE &&
+                    rc != MOQR_ERR_WRONG_STATE) m->oom = true;
+                return true;
+            }
+            if (moq_handle_session_tag(route.source._opaque) != (uint32_t)d->origin + 1u) {
+                sh_free(&m->alloc, d->canon, d->canon_len);
+                m->pend_len--;
+                m->cluster_error = MOQR_ERR_INTERNAL;
+                return true;
+            }
+            d->source_advertisement = route;
+        }
         d->state = D_ST_RECORDED;
         d->term_overrun = false;
         d->term_quiet = false;
@@ -1566,6 +1806,9 @@ shards_router(void *ctx, const moqr_intent_t *it, uint64_t now_us)
     }
     if (it->kind != MOQR_INTENT_NS_FOUND && it->kind != MOQR_INTENT_NS_GONE) {
         return true;
+    }
+    if (m->s->cluster_enabled) {
+        return true; /* route snapshots observe all alternatives, not fan-out */
     }
     uint8_t op = (it->kind == MOQR_INTENT_NS_FOUND) ? R_OP_ANNOUNCE
                                                     : R_OP_UNANNOUNCE;
@@ -1755,6 +1998,15 @@ mgr_free(r_mgr *m)
         return;
     }
     const moq_alloc_t *a = &m->alloc;
+    if (m->cluster != NULL) {
+        for (uint32_t i = 0; i < m->s->cluster_routes; ++i) {
+            sh_free(a, m->cluster[i].canon, m->cluster[i].canon_len);
+            sh_free(a, m->cluster[i].hops,
+                    m->cluster[i].record.route.metadata.hop_count * sizeof(uint64_t));
+        }
+        sh_free(a, m->cluster,
+                (size_t)m->s->cluster_routes * sizeof(*m->cluster));
+    }
     if (m->jrn != NULL) {
         for (uint32_t i = 0; i < m->jrn_len; i++) {
             sh_free(a, m->jrn[i].canon, m->jrn[i].canon_len);
@@ -1779,6 +2031,7 @@ mgr_free(r_mgr *m)
                 moq_rcbuf_decref(m->fret[i].win[k].payload);
                 moq_rcbuf_decref(m->fret[i].win[k].props);
             }
+            moq_rcbuf_decref(m->fret[i].meta_props);
             sh_free(a, m->fret[i].canon, m->fret[i].canon_len);
         }
         sh_free(a, m->fret, (size_t)m->fill_cap * sizeof(m->fret[0]));
@@ -1787,6 +2040,7 @@ mgr_free(r_mgr *m)
         for (uint32_t i = 0; i < m->fill_cap; i++) {
             /* bind_destroy already released collector/cached copies. */
             moqr_bind_retrieve_forget(&m->oret[i].cursor);
+            moq_rcbuf_decref(m->oret[i].meta_props);
         }
         sh_free(a, m->oret, (size_t)m->fill_cap * sizeof(m->oret[0]));
     }
@@ -1812,6 +2066,16 @@ mgr_create(moqr_shards_t *s, uint16_t shard, moqr_core_t *core)
     m->jrn_cap = s->jrn_cap;
     m->pend_cap = s->pend_cap;
     m->psub_cap = s->pend_cap;
+    if (s->cluster_enabled) {
+        m->cluster = sh_alloc(a, (size_t)s->cluster_routes * sizeof(*m->cluster));
+        if (m->cluster == NULL) {
+            mgr_free(m);
+            return NULL;
+        }
+        memset(m->cluster, 0, (size_t)s->cluster_routes * sizeof(*m->cluster));
+        for (uint32_t i = 0; i < s->cluster_routes; ++i)
+            m->cluster[i].sent = UINT64_MAX;
+    }
     m->jrn = sh_alloc(a, (size_t)m->jrn_cap * sizeof(m->jrn[0]));
     m->pend = sh_alloc(a, (size_t)m->pend_cap * sizeof(m->pend[0]));
     m->psub = sh_alloc(a, (size_t)m->psub_cap * sizeof(m->psub[0]));
@@ -1879,6 +2143,9 @@ mgr_open_bindings(r_mgr *m)
     if (rc != MOQR_OK) {
         return rc;
     }
+    if (m->s->cluster_enabled) {
+        return MOQR_OK; /* snapshots enumerate all sources directly */
+    }
     /* Zero-count wildcard prefix: matches every announce; opened on an empty
      * trie at create, so there is no replay backlog to overflow the intent
      * ring. */
@@ -1896,6 +2163,48 @@ mgr_open_bindings(r_mgr *m)
 static bool
 shard_apply_slot(r_mgr *m, r_mailbox *mb, r_ctrl_msg *slot)
 {
+    if (slot->cluster) {
+        moqr_cluster_export_t record = slot->record;
+        moq_bytes_t parts[R_NS_MAX_PARTS];
+        if (slot->op == R_OP_ANNOUNCE)
+            record.ns = canon_to_ns(slot->canon, parts);
+        record.route.metadata.hop_ids = slot->hops;
+        moqr_result_t rc = moqr_core_internal_cluster_import(m->core,
+            m->pb[slot->origin], &record, slot->op == R_OP_UNANNOUNCE);
+        if (rc == MOQR_ERR_WRONG_STATE && slot->op == R_OP_ANNOUNCE) {
+            /* A source pool slot was reused for a different namespace. The
+             * old lifetime withdraws before its replacement is admitted. */
+            rc = moqr_core_internal_cluster_import(m->core, m->pb[slot->origin],
+                                          &record, true);
+            if (rc == MOQR_OK || rc == MOQR_DONE) {
+                m->reconcile_owed_local_drain = true;
+                rc = moqr_core_internal_cluster_import(m->core, m->pb[slot->origin],
+                                              &record, false);
+            }
+        }
+        if (rc == MOQR_ERR_WOULD_BLOCK) {
+            m->cluster_inbound_retry = true;
+            return false;
+        }
+        if (rc == MOQR_ERR_CAPACITY) return false;
+        if (rc != MOQR_OK && rc != MOQR_DONE) {
+            if (rc == MOQR_ERR_NOMEM) m->oom = true;
+            else m->cluster_error = rc == MOQR_INTERNAL_LIMIT ? MOQR_ERR_CAPACITY : rc;
+            return false;
+        }
+        m->reconcile_owed_local_drain = true;
+        sh_free(&m->alloc, slot->canon, slot->canon_len);
+        sh_free(&m->alloc, slot->hops,
+                slot->record.route.metadata.hop_count * sizeof(uint64_t));
+        slot->used = false;
+        slot->hops = NULL;
+        mb->count--;
+        /* A full control mailbox may have held the producer on an unsent
+         * alternative. Return credit on this same durable pop; concurrent
+         * steppers must not depend on an unrelated future session event. */
+        m->s->shards[m->shard].pop_wake |= 1ull << slot->origin;
+        return true;
+    }
     uint64_t bit = 1ull << slot->origin;
     if (slot->op == R_OP_ANNOUNCE) {
         r_jentry *e = jrn_get(m, slot->canon, slot->canon_len);
@@ -1940,6 +2249,9 @@ shard_inbound_batch(moqr_shards_t *s, uint16_t shard)
         }
         r_mailbox *mb = &s->mbox[(uint32_t)src * s->shard_count + shard];
         pthread_mutex_lock(&mb->mu);
+        if (mb->withdrawal != NULL && mb->withdrawal->used &&
+            (s->live_visibility || mb->withdrawal->round < s->round))
+            (void)shard_apply_slot(m, mb, mb->withdrawal);
         for (uint32_t i = 0; i < mb->cap; i++) {
             r_ctrl_msg *slot = &mb->slots[i];
             if (!slot->used) {
@@ -1963,6 +2275,9 @@ shard_reconcile(moqr_shards_t *s, uint16_t shard, uint64_t now_us)
     r_mgr *m = s->shards[shard].mgr;
     if (m == NULL) {
         return;
+    }
+    if (s->cluster_enabled) {
+        return; /* import applies atomic source-slot snapshots */
     }
     uint64_t room_epoch = moqr_core_room_epoch(m->core);
     if (m->cap_blocked_count != 0 && room_epoch != m->cap_epoch) {
@@ -1997,6 +2312,10 @@ shard_outbound(moqr_shards_t *s, uint16_t shard, uint64_t *pushed_dst_mask)
 {
     r_mgr *m = s->shards[shard].mgr;
     if (m == NULL) {
+        return;
+    }
+    if (s->cluster_enabled) {
+        shard_cluster_outbound(s, shard, pushed_dst_mask);
         return;
     }
     uint32_t i = 0;
@@ -2191,10 +2510,28 @@ shards_fill_open(void *ctx, const moqr_bind_fill_query_t *q,
     return MOQR_OK;
 }
 
+/* Whether the owner's outstanding delivery toward `src` came from an
+ * upstream subgroup whose header set PROPERTIES (false for a notice). */
+static bool
+shard_delivery_subgroup_props(r_mgr *m, uint16_t src)
+{
+    bool sgp = false, follows_gap = false;
+    moqr_reset_desc_t gap_reset;
+    uint32_t list;
+    if (moqr_core_internal_delivery_flags(m->core, m->pb[src], &sgp, &follows_gap,
+                                          &gap_reset, &list) != MOQR_OK) {
+        return false;
+    }
+    return sgp;
+}
+
 /* The standalone FETCH source's open: ask the shard that owns the track
  * (named by its binding cookie here) to admit and answer the request. The
  * key is copied now; the REQ carries it. No free retrieval slot refuses this
- * request alone. */
+ * request alone. A Joining FETCH names the accepted demand that feeds the
+ * joined track here: the owner answers it only while that demand's
+ * subscription there still reads the track the name resolves to. With no
+ * such demand, the subscription it joins is no longer fed (STALE_HANDLE). */
 static moqr_result_t
 shards_sa_open(void *ctx, const moqr_retrieve_standalone_query_t *q,
                uint64_t *handle)
@@ -2202,6 +2539,9 @@ shards_sa_open(void *ctx, const moqr_retrieve_standalone_query_t *q,
     r_mgr *m = ctx;
     if (m == NULL || q == NULL || handle == NULL || m->fret == NULL) {
         return MOQR_ERR_INVAL;
+    }
+    if (m->s->cluster_enabled && !q->cluster_selected) {
+        return MOQR_ERR_WRONG_STATE; /* never dispatch an unfiltered mirror */
     }
     uint64_t base = MOQR_SHARD_COOKIE_BASE;
     if (q->remote_cookie < base || q->remote_cookie - base >= m->s->shard_count ||
@@ -2218,6 +2558,19 @@ shards_sa_open(void *ctx, const moqr_retrieve_standalone_query_t *q,
     if (f == NULL) {
         return MOQR_ERR_CAPACITY;
     }
+    uint64_t join_demand = 0;
+    if (q->join) {
+        for (uint32_t i = 0; i < m->pend_len && join_demand == 0; i++) {
+            const r_pdemand *d = &m->pend[i];
+            if (d->state == D_ST_ACKED && moqr_track_eq(d->track, q->join_track) &&
+                d->origin == (uint16_t)(q->remote_cookie - base)) {
+                join_demand = d->demand_id;
+            }
+        }
+        if (join_demand == 0) {
+            return MOQR_ERR_STALE_HANDLE;
+        }
+    }
     uint32_t clen = 0;
     uint8_t *canon = canon2_build(q->ns.parts, (uint32_t)q->ns.count, q->name,
                                   &clen, &m->alloc);
@@ -2227,6 +2580,10 @@ shards_sa_open(void *ctx, const moqr_retrieve_standalone_query_t *q,
     memset(f, 0, sizeof(*f));
     f->used = true;
     f->standalone = true;
+    f->cluster_selected = q->cluster_selected;
+    f->source_advertisement = q->cluster_source_advertisement;
+    f->requester_hop_id = q->cluster_requester_hop_id;
+    f->requester_correlation_id = q->cluster_requester_correlation_id;
     f->req_owed = true;
     f->origin = (uint16_t)(q->remote_cookie - base);
     f->id = ++m->next_fill_id;
@@ -2240,6 +2597,7 @@ shards_sa_open(void *ctx, const moqr_retrieve_standalone_query_t *q,
     f->end_object = q->end_object;
     f->range_form = q->range_form;
     f->relative_start = q->relative_start;
+    f->join_demand_id = join_demand;
     f->deadline_us = q->deadline_us;
     f->order = (uint8_t)q->group_order;
     f->prio = q->subscriber_priority;
@@ -2332,6 +2690,7 @@ shards_fill_retrieve_peek(void *ctx, uint64_t handle, uint64_t now_us,
             out->object.obj_state = MOQR_OBJ_COMPLETE;
             out->object.payload = it->payload;
             out->object.properties = it->props;
+            out->object.properties_codec = it->props_codec;
         } else if (it->result.kind == MOQR_RETRIEVE_ERROR && it->props != NULL) {
             out->reason = (moq_bytes_t){ moq_rcbuf_data(it->props),
                                          moq_rcbuf_len(it->props) };
@@ -2434,6 +2793,9 @@ shards_fill_close(void *ctx, uint64_t handle)
         return;
     }
     fret_drop_window(f);
+    moq_rcbuf_decref(f->meta_props);
+    f->meta_props = NULL;
+    f->plan.meta_bytes = (moq_bytes_t){ NULL, 0 };
     if (f->req_owed) {
         f->req_owed = false;
     } else if (!f->ended && !f->abandoned) {
@@ -2498,6 +2860,7 @@ oret_free(r_mgr *m, r_oret_t *o)
     if (o->standalone && moqr_fetch_is_valid(o->owner)) {
         (void)moqr_core_fetch_close(m->core, o->owner);
     }
+    moq_rcbuf_decref(o->meta_props);
     memset(o, 0, sizeof(*o));
 }
 
@@ -2662,11 +3025,26 @@ shard_pd_forwarded(moqr_pd_desc_t pd)
            pd.tag == MOQR_CODE_WIRE_D22;
 }
 
+/* A track handle identifies retained storage; a source transition can keep
+ * that handle and change only track_gen. Every queued response must match
+ * the current source generation before touching that storage. */
+static bool
+pend_source_current(const r_mgr *m, const r_pdemand *d)
+{
+    uint64_t generation = 0;
+    return moqr_core_track_current_generation(m->core, d->track, &generation)
+               == MOQR_OK && generation == d->track_gen;
+}
+
 static bool
 pend_terminal_step(moqr_shards_t *s, r_mgr *m, r_pdemand *d,
                    moqr_pd_desc_t done, moqr_reset_desc_t reset,
                    bool graceful, uint64_t now_us)
 {
+    if (!pend_source_current(m, d) &&
+        !moqr_core_internal_source_idle(m->core, d->track, d->track_gen)) {
+        return true; /* never abandon records belonging to a replacement */
+    }
     /* The terminal this shard is resolving into its own core, recorded where
      * it is actually consumed rather than where it arrived. */
     m->last_done_pd = done;
@@ -3037,8 +3415,13 @@ requester_fill_phase(moqr_shards_t *s, uint16_t shard,
             if (f->standalone) {
                 /* The key moves to the channel with the REQ. */
                 msg.fetch_standalone = true;
+                msg.cluster_selected = f->cluster_selected;
+                msg.source_advertisement = f->source_advertisement;
+                msg.requester_hop_id = f->requester_hop_id;
+                msg.requester_correlation_id = f->requester_correlation_id;
                 msg.fetch_range_form = f->range_form;
                 msg.fetch_relative_start = f->relative_start;
+                msg.fetch_join_demand = f->join_demand_id;
                 msg.canon = f->canon;
                 msg.canon_len = f->canon_len;
             }
@@ -3113,6 +3496,35 @@ owner_fill_push(moqr_shards_t *s, uint16_t shard, uint16_t dst,
     return true;
 }
 
+/* owner_fill_push with *props (an owned reference, or NULL) moved into the
+ * message as its properties: on success the channel owns it and *props is
+ * NULL; on a refused push it is handed back to *props, never released. */
+static bool
+owner_fill_push_props(moqr_shards_t *s, uint16_t shard, uint16_t dst,
+                      r_demand_msg_t *msg, moq_rcbuf_t **props, dp_budget_t *bud,
+                      uint64_t *pushed_dst_mask, uint64_t *pending)
+{
+    msg->props = *props;
+    *props = NULL;
+    r_mgr *m = s->shards[shard].mgr;
+    uint64_t lb = dmsg_logical_bytes(msg);
+    if (!dp_admit(bud, lb) ||
+        !dch_push_arb(s, shard, dst, msg, true, ctrl_work_pending(m, dst))) {
+        *props = msg->props;
+        msg->props = NULL;
+        dmsg_release(&s->alloc, msg);
+        *pending |= 1ull << dst;
+        return false;
+    }
+    dp_spend(bud, lb);
+    m->pump_messages++;
+    m->pump_bytes += lb;
+    if (pushed_dst_mask != NULL) {
+        *pushed_dst_mask |= 1ull << dst;
+    }
+    return true;
+}
+
 /* Shared coverage runs only in the owner data phase. Peeking at zero credit
  * still observes hard errors/deadlines; successful FIFO transfer is the sole
  * permission to commit. All cursor allocations remain bind-owned. */
@@ -3144,6 +3556,7 @@ owner_fill_pass(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                 msg.fetch_standalone = true;
                 msg.fetch_admit = MOQR_FETCH_REJECT;
                 msg.error_code = o->plan.wire.error_code;
+                msg.fetch_capacity = o->capacity;
                 if (owner_fill_push(s, shard, dst, &msg, bud,
                                     pushed_dst_mask, pending)) oret_free(m, o);
                 break;
@@ -3170,9 +3583,13 @@ owner_fill_pass(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                     msg.fill_end_group = o->plan.end_group;
                     msg.fill_end_object = o->plan.end_object;
                     msg.fetch_end_raw_object = o->plan.wire.end_object;
+                    msg.metadata.state = o->meta_state;
+                    msg.metadata.wire_version = o->meta_version;
                 }
-                if (!owner_fill_push(s, shard, dst, &msg, bud,
-                                     pushed_dst_mask, pending)) break;
+                /* The clone moves into the message whole: once pushed, this
+                 * lane never touches it again; refused, it comes back. */
+                if (!owner_fill_push_props(s, shard, dst, &msg, &o->meta_props, bud,
+                                           pushed_dst_mask, pending)) break;
                 o->open_sent = true;
                 continue;
             }
@@ -3215,6 +3632,7 @@ owner_fill_pass(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                 msg.datagram_pref = it.object.datagram_pref;
                 msg.end_of_group = it.object.end_of_group;
                 msg.declared_len = it.object.declared_len;
+                msg.props_codec = it.object.properties_codec;
                 if ((it.object.payload != NULL &&
                      moq_rcbuf_clone(&s->alloc, it.object.payload,
                                      &msg.payload) != MOQ_OK) ||
@@ -3286,6 +3704,24 @@ shard_demand_phase(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
     for (uint32_t i = 0; i < m->pend_len; i++) {
         r_pdemand *d = &m->pend[i];
         bool drop = false;
+        if (!pend_source_current(m, d)) {
+            if (d->state == D_ST_RECORDED) {
+                drop = true;
+            } else if ((d->state == D_ST_ACKED || d->state == D_ST_TERMINATING) &&
+                       moqr_core_internal_source_idle(m->core, d->track,
+                                                       d->track_gen)) {
+                /* An idle release keeps this old log, so its unfinished
+                 * records still need ordinary quiet cancellation cleanup. */
+                if (d->state == D_ST_ACKED) {
+                    d->state = D_ST_TERMINATING;
+                    d->term_code = 0;
+                    d->term_overrun = false;
+                    d->term_quiet = true;
+                }
+            } else {
+                d->state = D_ST_UNDEMANDING;
+            }
+        }
         if (d->state == D_ST_TERMINATING) {
             /* Commit the local terminal, one retryable stage at a time; the
              * triggering channel head stays durable (and keeps every later
@@ -3376,6 +3812,9 @@ shard_demand_phase(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
             msg.demand_id = d->demand_id;
             msg.track = d->track;
             msg.track_gen = d->track_gen;
+            msg.source_advertisement = d->source_advertisement;
+            msg.requester_hop_id = d->requester_hop_id;
+            msg.requester_correlation_id = d->requester_correlation_id;
             msg.canon = canon_dup(d->canon, d->canon_len, &m->alloc);
             msg.canon_len = d->canon_len;
             if (msg.canon != NULL &&
@@ -3847,6 +4286,8 @@ shard_data_phase(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                     om.prio = d.rec.publisher_priority;
                     om.end_of_group = d.rec.end_of_group;
                     om.first_object = d.rec.first_object;
+                    om.props_codec = d.rec.properties_codec;
+                    om.subgroup_props = shard_delivery_subgroup_props(m, src);
                     if (d.rec.properties != NULL &&
                         moq_rcbuf_clone(&s->alloc, d.rec.properties,
                                         &om.props) != MOQ_OK) {
@@ -4043,6 +4484,8 @@ shard_data_phase(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
             msg.end_of_group = d.rec.end_of_group;
             msg.first_object = d.rec.first_object;
             msg.adv_subgroup_end = d.subgroup_end;
+            msg.props_codec = d.rec.properties_codec;
+            msg.subgroup_props = shard_delivery_subgroup_props(m, src);
             bool oom = false;
             if (d.rec.payload != NULL &&
                 moq_rcbuf_clone(&s->alloc, d.rec.payload, &msg.payload) !=
@@ -4145,7 +4588,13 @@ owner_admit_demand(moqr_shards_t *s, uint16_t shard, uint16_t src,
     req.cookie = msg->demand_id;
     moqr_sub_t sub;
     memset(&sub, 0, sizeof(sub));
-    moqr_result_t rc = moqr_core_subscribe(m->core, m->pb[src], &req, &sub);
+    if (s->cluster_enabled && moq_handle_session_tag(msg->source_advertisement.source._opaque) != (uint32_t)shard + 1u)
+        return demand_reply_done(s, shard, src, msg, true, R_ERR_INTERNAL, pushed_dst_mask);
+    moqr_result_t rc = s->cluster_enabled
+        ? moqr_core_internal_subscribe_cluster(m->core, m->pb[src], &req,
+            msg->source_advertisement,
+            msg->requester_hop_id, msg->requester_correlation_id, &sub)
+        : moqr_core_subscribe(m->core, m->pb[src], &req, &sub);
     if (rc == MOQR_ERR_WOULD_BLOCK) {
         return false;   /* intent ring full: DEMAND stays durable */
     }
@@ -4190,7 +4639,10 @@ owner_admit_demand(moqr_shards_t *s, uint16_t shard, uint16_t src,
 /* Owner role: admit a standalone FETCH another shard routed here, exactly as
  * a FETCH this shard received would be admitted (the requester's pseudo-
  * binding stands for its connection). The answer, OPEN with the admission,
- * is pushed by the data phase. */
+ * is pushed by the data phase. A Joining FETCH is answered only from the
+ * track its feeding demand's pump-sub reads: once that demand no longer
+ * serves, or the name resolves to a replacement, the join is refused, never
+ * served the replacement's Objects. */
 static bool
 owner_sa_accept(moqr_shards_t *s, uint16_t shard, uint16_t src,
                 const r_demand_msg_t *msg, r_oret_t *o, uint64_t now_us)
@@ -4222,14 +4674,60 @@ owner_sa_accept(moqr_shards_t *s, uint16_t shard, uint16_t src,
     o->order = msg->fill_order;
     o->prio = msg->prio;
     o->credit = msg->fill_credit;
-    moqr_result_t rc = moqr_core_internal_retrieve_open(m->core, m->pb[src], &req,
-                                                        now_us, &o->owner, &o->plan);
-    if (rc != MOQR_OK) {
+    const r_psub *joined = msg->fetch_join_demand != 0
+                               ? owner_fill_psub(m, src, msg->fetch_join_demand)
+                               : NULL;
+    if (msg->fetch_join_demand != 0 && joined == NULL) {
+        o->owner = MOQR_FETCH_INVALID;
+        o->plan.wire.admit = MOQR_FETCH_REJECT;
+        o->plan.wire.error_code = R_ERR_INVALID_JOINING;
+        return true;
+    }
+    if (s->cluster_enabled && msg->cluster_selected &&
+        moq_handle_session_tag(msg->source_advertisement.source._opaque) != (uint32_t)shard + 1u) {
+        o->owner = MOQR_FETCH_INVALID;
+        o->plan.wire.admit = MOQR_FETCH_REJECT;
+        o->plan.wire.error_code = R_ERR_INTERNAL;
+        return true;
+    }
+    moqr_result_t rc = s->cluster_enabled && msg->cluster_selected
+        ? moqr_core_internal_retrieve_open_cluster(m->core, m->pb[src], &req,
+            msg->source_advertisement,
+            msg->requester_hop_id, msg->requester_correlation_id,
+            now_us, &o->owner, &o->plan)
+        : moqr_core_internal_retrieve_open(m->core, m->pb[src], &req,
+                                           now_us, &o->owner, &o->plan);
+    if (rc == MOQR_OK && joined != NULL && o->plan.wire.admit == MOQR_FETCH_ACCEPT &&
+        !moqr_track_eq(o->plan.track, joined->otrack)) {
+        (void)moqr_core_fetch_close(m->core, o->owner);
+        memset(&o->plan, 0, sizeof(o->plan));
+        o->owner = MOQR_FETCH_INVALID;
+        o->plan.wire.admit = MOQR_FETCH_REJECT;
+        o->plan.wire.error_code = R_ERR_INVALID_JOINING;
+    } else if (rc != MOQR_OK) {
         memset(&o->plan, 0, sizeof(o->plan));
         o->owner = MOQR_FETCH_INVALID;
         o->plan.wire.admit = MOQR_FETCH_REJECT;
         o->plan.wire.error_code = R_ERR_INTERNAL;
+        o->capacity = rc == MOQR_ERR_CAPACITY;   /* the owner's FETCH pool */
     } else if (o->plan.wire.admit == MOQR_FETCH_ACCEPT) {
+        /* The answer's Track Properties are fixed here, at admission. A copy
+         * that cannot be made is UNAVAILABLE: the requester refuses rather
+         * than answer without them. */
+        moqr_bind_meta_ref_t pin;
+        moqr_bind_t *bind = s->shards[shard].bind;
+        (void)moqr_bind_meta_reply(bind, o->plan.track, &pin);
+        o->meta_state = pin.state;
+        o->meta_version = pin.wire_version;
+        if (pin.state == MOQR_BIND_META_PRESENT &&
+            (pin.bytes.len == 0 || pin.bytes.data == NULL ||
+             pin.bytes.len > MOQR_BIND_META_SET_MAX ||
+             moq_rcbuf_create(&m->alloc, pin.bytes.data, pin.bytes.len,
+                              &o->meta_props) != MOQ_OK)) {
+            o->meta_state = MOQR_BIND_META_UNAVAILABLE;
+            o->meta_props = NULL;
+        }
+        moqr_bind_meta_release(bind, &pin);
         o->start_group = o->plan.start_group;
         o->start_object = o->plan.start_object;
         o->end_group = o->plan.end_group;
@@ -4342,6 +4840,36 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
         }
         r_demand_msg_t *msg;
         while ((msg = dch_head(s, src, shard)) != NULL) {
+            if ((msg->kind >= D_MSG_DONE && msg->kind <= D_MSG_SG_SEAL) ||
+                msg->kind == D_MSG_METADATA) {
+                r_pdemand *d = pend_find(m, msg->demand_id);
+                if (!demand_reply_matches(d, src, msg)) {
+                    dch_pop(s, src, shard);
+                    continue; /* a reply for another retained/source identity */
+                }
+                if (!pend_source_current(m, d)) {
+                    if ((d->state == D_ST_ACKED || d->state == D_ST_TERMINATING) &&
+                        moqr_core_internal_source_idle(m->core, d->track,
+                                                        d->track_gen)) {
+                        if (d->state == D_ST_ACKED) {
+                            d->state = D_ST_TERMINATING;
+                            d->term_code = 0;
+                            d->term_overrun = false;
+                            d->term_quiet = true;
+                        }
+                        break; /* quiet old-log cleanup precedes later replies */
+                    }
+                    /* Source changes run before this FIFO drain. Old queued
+                     * objects, chunks, resets, metadata and terminals must
+                     * neither write nor scrub the replacement's log. Keep
+                     * the old owner's cancel obligation, without a local
+                     * source terminal that could end the replacement. */
+                    d->state = D_ST_UNDEMANDING;
+                    if (msg->kind == D_MSG_DONE) pend_retire(m, d);
+                    dch_pop(s, src, shard);
+                    continue;
+                }
+            }
             if (msg->kind == D_MSG_DEMAND) {
                 bool durable =
                     s->admit_remote
@@ -4547,6 +5075,8 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                 desc.first_object = msg->first_object;
                 desc.payload = msg->payload;
                 desc.properties = msg->props;
+                desc.properties_codec = msg->props_codec;
+                desc.subgroup_properties = msg->subgroup_props;
                 desc.now_us = now_us;
                 moqr_result_t rc = moqr_core_ingest(m->core, d->track, &desc);
                 if (rc == MOQR_OK) {
@@ -4631,6 +5161,8 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                     desc.obj_state = MOQR_OBJ_OPEN;
                     desc.declared_len = msg->declared_len;
                     desc.properties = msg->props;
+                    desc.properties_codec = msg->props_codec;
+                    desc.subgroup_properties = msg->subgroup_props;
                     desc.now_us = now_us;
                     moqr_result_t rc =
                         moqr_core_ingest(m->core, d->track, &desc);
@@ -4866,7 +5398,7 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                      * the local bind's evict-reset, this stage touches ONLY
                      * begun/open subgroups — completed-but-unsealed slots
                      * survive so the GRP_EVICT behind it can still find and
-                     * seal those streams. Each cleared slot is the retry
+                     * reset those streams. Each cleared slot is the retry
                      * cursor — a fail-stop retry never redoes one. */
                     bool fault = false;
                     if (row != NULL) {
@@ -4914,8 +5446,15 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                     dch_pop(s, src, shard);
                 } else {   /* D_MSG_GRP_EVICT: group_id = the watermark */
                     /* Everything below the owner's oldest retained group is
-                     * gone: abandon still-open objects, seal so completed-
-                     * but-unsealed streams close, then free the slots. */
+                     * gone there: what this destination holds of it stays
+                     * servable, but nothing more of it will cross. A slot
+                     * still here never got its SG_SEAL, and the owner may
+                     * have evicted the subgroup's remaining objects too:
+                     * its completeness is unknown, so its still-open object
+                     * is abandoned and the subgroup is reset, never sealed
+                     * (a FIN says every object was delivered; same rule as
+                     * the bind's own watermark close). Each slot is settled
+                     * once, then freed. */
                     bool fault = false;
                     if (row != NULL) {
                         for (uint32_t sl = 0; sl < s->sg_slots; sl++) {
@@ -4945,32 +5484,37 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                                     m->inbound_data_applied = true;
                                 }
                             }
-                            moqr_result_t sr = moqr_core_seal_subgroup(
+                            moqr_result_t sr = moqr_core_reset_subgroup(
                                 m->core, d->track, row[sl].group,
-                                row[sl].subgroup);
+                                row[sl].subgroup, evict_desc);
                             if (sr != MOQR_OK && sr != MOQR_DONE &&
                                 sr != MOQR_ERR_STALE_HANDLE) {
                                 fault = true;
                                 break;
                             }
+                            if (sr == MOQR_OK) {
+                                m->inbound_data_applied = true;
+                            }
                             memset(&row[sl], 0, sizeof(row[sl]));
                         }
                     }
                     /* The slot sweep above can only reach subgroups this
-                     * destination already OPENED; the watermark also closes
-                     * everything it never received. Recording it on the local
-                     * journal turns "not yet" into "never will" for the whole
-                     * below-watermark range, and the EXISTING per-subscription
-                     * eviction machinery (position reclaim, EVICT_WATERMARK
-                     * notices, downstream subgroup closes) then retires the
-                     * dangling downstream state on the following scans —
-                     * without this, a subgroup whose seal died with the
-                     * owner's eviction stays open downstream forever. */
+                     * destination streamed through a slot; whole-object
+                     * subgroups and ones a GRP_RESET already settled have
+                     * none. Recording the watermark on the local journal
+                     * resets every retained subgroup below it that had not
+                     * ended, the same way, and turns "not yet" into "never
+                     * will" for the absent range — without this, a subgroup
+                     * whose seal died with the owner's eviction stays open
+                     * downstream until this shard evicts the group too. */
                     {
                         moqr_result_t wr = moqr_core_note_track_evicted_below(
                             m->core, d->track, msg->group_id);
                         if (wr != MOQR_OK && wr != MOQR_ERR_STALE_HANDLE) {
                             fault = true;
+                        }
+                        if (wr == MOQR_OK) {
+                            m->inbound_data_applied = true;
                         }
                     }
                     if (fault) {
@@ -5025,12 +5569,23 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                                 msg->group_id, msg->object_id };
                             f->plan.end = (moqr_retrieve_location_t){
                                 msg->fill_end_group, msg->fill_end_object };
+                            f->plan.meta_state = msg->metadata.state;
+                            f->plan.meta_wire_version = msg->metadata.wire_version;
+                            if (msg->props != NULL) {
+                                /* Moved out of the message before its pop. */
+                                f->meta_props = msg->props;
+                                msg->props = NULL;
+                                f->plan.meta_bytes = (moq_bytes_t){
+                                    moq_rcbuf_data(f->meta_props),
+                                    moq_rcbuf_len(f->meta_props) };
+                            }
                             f->start_group = msg->group_id;
                             f->start_object = msg->object_id;
                             f->end_group = msg->fill_end_group;
                             f->end_object = msg->fill_end_object;
                         } else {
                             f->plan.wire.error_code = msg->error_code;
+                            f->plan.capacity = msg->fetch_capacity;
                             f->ended = true;
                             f->more_owed = false;
                         }
@@ -5065,6 +5620,7 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
                 it->declared_len = msg->declared_len;
                 it->payload = msg->payload;
                 it->props = msg->props;
+                it->props_codec = msg->props_codec;
                 msg->payload = NULL;   /* moved into the window */
                 msg->props = NULL;
                 it->charged = dch_hold_head(s, src, shard);
@@ -5121,6 +5677,13 @@ shards_step_one(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
     shard_inbound_batch(s, shard);                              /* phase 1 */
     shard_demand_inbound(s, shard, now_us, pushed_dst_mask);    /*   ..    */
     moqr_result_t rc = moqr_bind_pump(s->shards[shard].bind, now_us); /* 2 */
+    r_mgr *m = s->shards[shard].mgr;
+    if (rc == MOQR_OK && m != NULL && m->cluster_inbound_retry) {
+        m->cluster_inbound_retry = false;
+        shard_inbound_batch(s, shard);
+        /* A successful import marks its newly queued fan-out for a local
+         * drain. A still-refused import owns its slot without self-spinning. */
+    }
     shard_reconcile(s, shard, now_us);                          /* phase 3 */
     shard_outbound(s, shard, pushed_dst_mask);                  /* phase 4 */
     shard_demand_phase(s, shard, now_us, pushed_dst_mask);      /* phase 5 */
@@ -5165,6 +5728,7 @@ shards_step_accounted(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
     if (wm != NULL) {
         wm->inbound_data_applied = false;
         wm->reconcile_owed_local_drain = false;
+        wm->cluster_inbound_retry = false;
         wm->fill_wake_owed = false;
     }
     uint64_t push_mask = 0;
@@ -5233,9 +5797,8 @@ moqr_shards_step(moqr_shards_t *s, uint64_t now_us)
      * convergence over a candidate set that silently lost an observation. */
     for (uint16_t i = 0; i < s->shard_count && result == MOQR_OK; i++) {
         r_mgr *m = s->shards[i].mgr;
-        if (m != NULL && m->oom) {
-            result = MOQR_ERR_NOMEM;
-        }
+        if (m != NULL && m->oom) result = MOQR_ERR_NOMEM;
+        else if (m != NULL && m->cluster_error != MOQR_OK) result = m->cluster_error;
     }
     shards_round_advance(s);
     return result;
@@ -5300,6 +5863,18 @@ shards_templates(const moqr_shards_cfg_t *cfg, const moq_alloc_t *a,
     }
 }
 
+static moqr_cluster_cfg_t
+shards_cluster_cfg(const moqr_shards_cfg_t *cfg)
+{
+    moqr_cluster_cfg_t out;
+    moqr_cluster_cfg_init_sized(&out, sizeof(out));
+    out.enabled = SHARDS_CFG_HAS(cfg, cluster_enabled) && cfg->cluster_enabled;
+    out.local_hop_id = SHARDS_CFG_HAS(cfg, cluster_hop_id) ? cfg->cluster_hop_id : 0;
+    out.max_routes = SHARDS_CFG_HAS(cfg, max_cluster_routes) ? cfg->max_cluster_routes : 0;
+    out.max_hops = SHARDS_CFG_HAS(cfg, max_cluster_hops) ? cfg->max_cluster_hops : 0;
+    return out;
+}
+
 moqr_result_t
 moqr_shards_cfg_resolve(const moqr_shards_cfg_t *cfg,
                         moqr_shards_limits_t *out)
@@ -5339,6 +5914,18 @@ moqr_shards_cfg_resolve(const moqr_shards_cfg_t *cfg,
     moqr_core_relay_cfg_t core_tmpl;
     moqr_bind_cfg_t bind_tmpl;
     shards_templates(cfg, a, &core_tmpl, &bind_tmpl);
+
+    moqr_cluster_cfg_t cluster_cfg = shards_cluster_cfg(cfg);
+    if (cluster_cfg.enabled) {
+        /* The reserved withdrawal contributes both allocation bytes and one
+         * pending count. Refuse before either arithmetic can wrap. */
+        uint64_t slots = (uint64_t)out->mbox_cap + 1u;
+        if (k > 1u && (slots > UINT32_MAX || slots > SIZE_MAX / sizeof(r_ctrl_msg)))
+            return MOQR_ERR_INVAL;
+        moqr_core_capacity_t capacity;
+        if (moqr_core_cluster_capacity_describe(&core_tmpl, &cluster_cfg, &capacity, sizeof(capacity)) != MOQ_OK)
+            return MOQR_ERR_INVAL;
+    }
 
     out->jrn_cap =
         (SHARDS_CFG_HAS(cfg, journal_entries) && cfg->journal_entries != 0)
@@ -5441,11 +6028,15 @@ moqr_shards_capacity_describe(const moqr_shards_cfg_t *cfg,
     uint64_t K2 = cap_mul(K, K);
 
     moqr_core_capacity_t cc;
-    if (moqr_core_capacity_describe(&core_tmpl, &cc) != MOQR_OK) {
+    moqr_cluster_cfg_t cluster_cfg = shards_cluster_cfg(cfg);
+    if (moqr_core_cluster_capacity_describe(&core_tmpl, &cluster_cfg, &cc, sizeof(cc)) != MOQ_OK) {
         return MOQR_ERR_INVAL;
     }
     moqr_bind_capacity_t bc;
-    if (moqr_bind_capacity_describe(&bind_tmpl, &clim, &bc) != MOQR_OK) {
+    moqr_cluster_info_t cluster_info;
+    if (moqr_cluster_cfg_resolve(&cluster_cfg, &cluster_info, sizeof(cluster_info)) != MOQ_OK)
+        return MOQR_ERR_INVAL;
+    if (moqr_bind_cluster_capacity_describe(&bind_tmpl, &clim, &cluster_info, &bc, sizeof(bc)) != MOQ_OK) {
         return MOQR_ERR_INVAL;
     }
     out->core_structure_bytes = cc.structure_bytes;
@@ -5460,7 +6051,7 @@ moqr_shards_capacity_describe(const moqr_shards_cfg_t *cfg,
                           cap_mul(K, sizeof(r_shard_t)));
     if (K > 1u) {
         st = cap_add(st, cap_mul(K2, cap_add(sizeof(r_mailbox),
-                                             cap_mul(lim.mbox_cap,
+                                             cap_mul((uint64_t)lim.mbox_cap + (cluster_cfg.enabled ? 1u : 0u),
                                                      sizeof(r_ctrl_msg)))));
         st = cap_add(st,
                      cap_mul(K2, cap_add(sizeof(r_demand_channel_t),
@@ -5473,6 +6064,10 @@ moqr_shards_capacity_describe(const moqr_shards_cfg_t *cfg,
                     cap_mul(lim.pend_cap,
                             sizeof(r_pdemand) + sizeof(r_psub))));
         st = cap_add(st, cap_mul(K, mgr));
+        if (cluster_cfg.enabled) {
+            uint64_t routes = cluster_cfg.max_routes != 0 ? cluster_cfg.max_routes : 256u;
+            st = cap_add(st, cap_mul(K, cap_mul(routes, sizeof(r_cluster_snapshot))));
+        }
         st = cap_add(st, cap_mul(K2, sizeof(moqr_binding_t)));
         if (lim.admit) {
             uint64_t rows = cap_mul(2u * (uint64_t)lim.pend_cap,
@@ -5514,6 +6109,17 @@ moqr_shards_capacity_describe(const moqr_shards_cfg_t *cfg,
             out->canon_byte_ceiling,
             cap_mul(K, cap_mul(shards_fill_slots(&lim, &clim),
                                R_CANON_FT_MAX)));
+        /* Each standalone retrieval slot, owner and requester side, holds
+         * at most one Track Properties copy of at most a full set: the
+         * owner's from admission until OPEN carries it, the requester's from
+         * OPEN until the request closes. In between it is the channel's,
+         * inside channel_byte_ceiling, and never in two places at once. */
+        if (lim.admit) {
+            out->canon_byte_ceiling = cap_add(
+                out->canon_byte_ceiling,
+                cap_mul(K, cap_mul(cap_mul(2u, shards_fill_slots(&lim, &clim)),
+                                   cap_add(MOQR_BIND_META_SET_MAX, hdr))));
+        }
         /* Allocate-before-push staging: one message's owned material per
          * concurrently stepping source shard (a channel-bounded record/reason +
          * two clone headers, a full-track DEMAND key, or P-sized metadata
@@ -5533,6 +6139,19 @@ moqr_shards_capacity_describe(const moqr_shards_cfg_t *cfg,
                            cap_add(cap_add(cap_mul(2u, hdr), R_CANON_FT_MAX),
                                    cap_add(MOQR_BIND_META_SET_MAX, hdr))));
         }
+    }
+
+    if (K > 1u && cluster_cfg.enabled) {
+        uint64_t routes = cluster_cfg.max_routes != 0 ? cluster_cfg.max_routes : 256u;
+        uint64_t hops = cluster_cfg.max_hops != 0 ? cluster_cfg.max_hops : 32u;
+        uint64_t hop_bytes = cap_mul(hops, sizeof(uint64_t));
+        out->canon_byte_ceiling = cap_add(out->canon_byte_ceiling,
+            cap_add(cap_mul(K, cap_mul(routes, cap_add(R_CANON_NS_MAX, hop_bytes))),
+                    cap_mul(K2, cap_mul(lim.mbox_cap, hop_bytes))));
+        /* Snapshot replacement and mailbox push allocate before releasing
+         * their old bytes; at most one such operation per source shard. */
+        out->staging_byte_ceiling = cap_add(out->staging_byte_ceiling,
+            cap_mul(K, cap_add(R_CANON_NS_MAX, hop_bytes)));
     }
 
     uint64_t total = cap_mul(K, out->per_shard_bytes);
@@ -5611,6 +6230,10 @@ moqr_shards_create(const moqr_shards_cfg_t *cfg, moqr_shards_t **out)
      * given, else sized off the core's namespace-node budget. Self-echo suppression
      * is per-entry, so it needs no separate pool. */
     s->jrn_cap = lim.jrn_cap;
+    moqr_cluster_cfg_t cluster_cfg = shards_cluster_cfg(cfg);
+    s->cluster_enabled = cluster_cfg.enabled;
+    s->cluster_routes = cluster_cfg.max_routes != 0 ? cluster_cfg.max_routes : 256u;
+    s->cluster_hops = cluster_cfg.max_hops != 0 ? cluster_cfg.max_hops : 32u;
 
     /* Pending remote-owner demand bound (per shard): at most one upstream attempt
      * per track, so the core's max_tracks is the natural default; explicit knob
@@ -5698,12 +6321,14 @@ moqr_shards_create(const moqr_shards_cfg_t *cfg, moqr_shards_t **out)
         for (size_t r = 0; r < nring; r++) {
             r_mailbox *mb = &s->mbox[r];
             mb->cap = s->mbox_cap;
-            mb->slots = a->alloc((size_t)s->mbox_cap * sizeof(r_ctrl_msg), a->ctx);
+            size_t slots = (size_t)s->mbox_cap + (s->cluster_enabled ? 1u : 0u);
+            mb->slots = a->alloc(slots * sizeof(r_ctrl_msg), a->ctx);
             if (mb->slots == NULL) {
                 moqr_shards_destroy(s);
                 return MOQR_ERR_NOMEM;
             }
-            memset(mb->slots, 0, (size_t)s->mbox_cap * sizeof(r_ctrl_msg));
+            memset(mb->slots, 0, slots * sizeof(r_ctrl_msg));
+            if (s->cluster_enabled) mb->withdrawal = &mb->slots[mb->cap];
         }
         /* Demand channels: same layout and the same mutex-first discipline. */
         s->dch = a->alloc(nring * sizeof(*s->dch), a->ctx);
@@ -5755,9 +6380,10 @@ moqr_shards_create(const moqr_shards_cfg_t *cfg, moqr_shards_t **out)
         ccfg.trace = sh->trace;
         ccfg.shard_index = i;
         ccfg.shard_count = (uint16_t)k;
-        if (moqr_core_create(&ccfg, &sh->core) != MOQR_OK) {
+        moq_result_t create_rc = moqr_core_create_cluster(&ccfg, &cluster_cfg, &sh->core);
+        if (create_rc != MOQ_OK) {
             moqr_shards_destroy(s);
-            return MOQR_ERR_NOMEM;
+            return moqr_result_legacy(create_rc);
         }
         /* Manager (K>1 only): allocated before the bind so the intent router can
          * point at it. K==1 is inert — no manager, no router. */
@@ -5892,9 +6518,12 @@ moqr_shards_destroy(moqr_shards_t *s)
             for (uint32_t i = 0; mb->slots != NULL && i < mb->cap; i++) {
                 if (mb->slots[i].used) {
                     sh_free(&s->alloc, mb->slots[i].canon, mb->slots[i].canon_len);
+                    sh_free(&s->alloc, mb->slots[i].hops,
+                            mb->slots[i].record.route.metadata.hop_count * sizeof(uint64_t));
                 }
             }
-            sh_free(&s->alloc, mb->slots, (size_t)mb->cap * sizeof(r_ctrl_msg));
+            sh_free(&s->alloc, mb->slots,
+                    ((size_t)mb->cap + (s->cluster_enabled ? 1u : 0u)) * sizeof(r_ctrl_msg));
             (void)pthread_mutex_destroy(&mb->mu);
         }
         s->alloc.free(s->mbox, nring * sizeof(*s->mbox), s->alloc.ctx);
@@ -6057,6 +6686,27 @@ moqr_shards_debug_remote_demand_refused(moqr_shards_t *s, uint16_t shard)
         return 0;
     }
     return s->shards[shard].mgr->remote_demand_refused;
+}
+
+void
+moqr_shards_debug_retrieval_meta(moqr_shards_t *s, uint16_t shard, uint32_t *owner_held,
+                                 uint32_t *requester_held, uint32_t *max_refs)
+{
+    *owner_held = *requester_held = *max_refs = 0;
+    if (s == NULL || shard >= s->shard_count || s->shards[shard].mgr == NULL) return;
+    r_mgr *m = s->shards[shard].mgr;
+    for (uint32_t i = 0; m->oret != NULL && i < m->fill_cap; i++) {
+        if (m->oret[i].meta_props == NULL) continue;
+        (*owner_held)++;
+        uint32_t n = moq_rcbuf_refcount(m->oret[i].meta_props);
+        if (n > *max_refs) *max_refs = n;
+    }
+    for (uint32_t i = 0; m->fret != NULL && i < m->fill_cap; i++) {
+        if (m->fret[i].meta_props == NULL) continue;
+        (*requester_held)++;
+        uint32_t n = moq_rcbuf_refcount(m->fret[i].meta_props);
+        if (n > *max_refs) *max_refs = n;
+    }
 }
 
 uint32_t
@@ -6277,9 +6927,8 @@ moqr_shards_step_shard(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
      * aggregate runner's per-shard oom scan (moqr_shards_step), scoped to the
      * one shard a threaded caller drives. */
     r_mgr *m = s->shards[shard].mgr;
-    if (m != NULL && m->oom) {
-        return MOQR_ERR_NOMEM;
-    }
+    if (m != NULL && m->oom) return MOQR_ERR_NOMEM;
+    if (m != NULL && m->cluster_error != MOQR_OK) return m->cluster_error;
     return MOQR_OK;
 }
 

@@ -8,9 +8,11 @@
  * write_payload() copy/retain the bytes into the adapter-owned send queue and
  * mark the stream active; picoquic later asks for them via
  * picoquic_callback_prepare_to_send, serviced by pq_endpoint_on_prepare_to_send.
- * write returns WOULD_BLOCK when the queue's byte cap is reached, so the bridge
- * retains and retries. reset_stream and stop_sending return codes are checked —
- * non-zero maps to ERROR (the bridge treats this as fatal).
+ * write returns WOULD_BLOCK only when the queue's byte cap, one for the whole
+ * connection, is reached (MOQ_TRANSPORT_CAP_SHARED_ADMISSION), so the bridge
+ * retains and retries, and offers no other stream's bytes meanwhile.
+ * reset_stream and stop_sending return codes are checked — non-zero maps to
+ * ERROR (the bridge treats this as fatal).
  *
  * Reliable reset: reset_stream_at keeps a prefix of the stream with
  * RESET_STREAM_AT when both sides advertised the reset_stream_at transport
@@ -23,10 +25,10 @@
 #include <stddef.h>
 
 #if !defined(PICOQUIC_CLOSE_REASON_COPIED) || PICOQUIC_CLOSE_REASON_COPIED != 1
-#error picoquic_must_copy_close_reasons_apply_libmoq_picoquic_patch_0006
+#error picoquic_must_copy_close_reasons_apply_libmoq_picoquic_patch_0005
 #endif
 #if !defined(PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED) || PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED != 1
-#error picoquic_must_classify_terminal_stream_ops_apply_libmoq_picoquic_patch_0010
+#error picoquic_must_classify_terminal_stream_ops_apply_libmoq_picoquic_patch_0008
 #endif
 
 /* PICOQUIC_ERROR_DATAGRAM_TOO_LONG is defined in picoquic.h */
@@ -97,7 +99,7 @@ static moq_transport_result_t pq_push_result(pq_endpoint_ctx_t *ep,
 {
     if (!ep->cnx) return MOQ_TRANSPORT_ERROR;    /* cnx released */
     if (r < 0) return MOQ_TRANSPORT_ERROR;       /* allocation failure: fatal */
-    if (r == 0) return MOQ_TRANSPORT_WOULD_BLOCK; /* queue cap: retain + retry */
+    if (r == 0) return MOQ_TRANSPORT_WOULD_BLOCK; /* connection queue cap */
     /* Bytes are queued; picoquic must poll the stream to pull them. A failure
      * to mark it active means they would never be sent -- treat as fatal. */
     if (picoquic_mark_active_stream(ep->cnx, stream_id, 1, NULL) != 0 ||
@@ -113,6 +115,14 @@ static moq_transport_result_t pq_write(void *ctx, uint64_t stream_id,
     pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
     return pq_push_result(ep, stream_id,
         moq_pq_send_queue_push_copy(ep->queue, stream_id, data, len, fin));
+}
+
+/* The queue's cap is the shared budget. A released connection answers false:
+ * the write itself reports that. */
+static bool pq_budget_spent(void *ctx)
+{
+    pq_endpoint_ctx_t *ep = (pq_endpoint_ctx_t *)ctx;
+    return ep->cnx && moq_pq_send_queue_budget_full(ep->queue);
 }
 
 static moq_transport_result_t pq_write_payload(void *ctx, uint64_t stream_id,
@@ -270,10 +280,14 @@ static moq_transport_result_t pq_stop_sending(void *ctx, uint64_t stream_id,
         return MOQ_TRANSPORT_OK;
     /* Idempotent as a reset is: picoquic answers a receiving part already
      * terminal -- reset by the peer, read to its final size, or retired with
-     * the stream -- before changing anything, and nothing is sent, watched or
-     * reported for it. Any other refusal stays an ERROR. */
+     * the stream -- before changing anything. No frame/watch is due; notify
+     * only that receive fact so held adapter input can be discarded.
+     * Any other refusal stays an ERROR. */
     int rc = picoquic_stop_sending(ep->cnx, stream_id, error_code);
-    if (rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) return MOQ_TRANSPORT_OK;
+    if (rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) {
+        if (ep->rx_stop_terminal) ep->rx_stop_terminal(ep->rx_owner, stream_id);
+        return MOQ_TRANSPORT_OK;
+    }
     if (rc != 0) return MOQ_TRANSPORT_ERROR;
     if (ep->rx_stopped && ep->rx_stopped(ep->rx_owner, stream_id) != 0)
         return MOQ_TRANSPORT_ERROR;
@@ -327,7 +341,7 @@ static moq_transport_result_t pq_send_datagram(void *ctx,
 /*
  * picoquic_close_ex accepts a reason string. We forward the reason
  * if provided, bounded here to 255 bytes. The qualified picoquic provider
- * copies the string before returning (patch 0006).
+ * copies the string before returning (patch 0005).
  */
 static moq_transport_result_t pq_close(void *ctx, uint64_t code,
                                         const uint8_t *reason,
@@ -363,6 +377,7 @@ int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
     ep_ctx->deferred_count = ep_ctx->deferred_cap = 0;
     ep_ctx->reliable_resets = 0;
     ep_ctx->rx_terminal_discard = NULL;
+    ep_ctx->rx_stop_terminal = NULL;
     ep_ctx->rx_stopped = NULL;
     ep_ctx->rx_rebind = NULL;
     ep_ctx->rx_owner = NULL;
@@ -375,7 +390,8 @@ int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
                            MOQ_TRANSPORT_CAP_WRITE_PAYLOAD |
                            MOQ_TRANSPORT_CAP_HOLD_INPUT |
                            MOQ_TRANSPORT_CAP_RELIABLE_RESET |
-                           MOQ_TRANSPORT_CAP_STREAM_DRAINED,
+                           MOQ_TRANSPORT_CAP_STREAM_DRAINED |
+                           MOQ_TRANSPORT_CAP_SHARED_ADMISSION,
         .open_uni        = pq_open_uni,
         .open_bidi       = pq_open_bidi,
         .write           = pq_write,
@@ -387,6 +403,7 @@ int pq_endpoint_init(moq_transport_endpoint_ops_t *ops,
         .close_transport = pq_close,
         .set_stream_priority = pq_priority,
         .reset_stream_at = pq_reset_at,
+        .budget_spent    = pq_budget_spent,
     };
 #if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
     ops->capabilities |= MOQ_TRANSPORT_CAP_COMMIT_REPORT;

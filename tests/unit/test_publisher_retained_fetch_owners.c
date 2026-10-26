@@ -741,18 +741,17 @@ static void constructor(moq_version_t version, uint32_t capacity)
     moq_pub_cfg_init_sized(&cfg, sizeof(cfg));
     size_t start = m.calls;
     NEED(moq_pub_create(s, &a, &cfg, &pub) == MOQ_OK);
-    unsigned count = version == MOQ_VERSION_DRAFT_22 ? 4 : 1;
+    /* Publisher, optional fills, admissions, FETCH owners, generic answers. */
+    unsigned count = version == MOQ_VERSION_DRAFT_22 ? 5 : 4;
     CHECK(m.calls - start == count);
     size_t base = m.sizes[start % 8];
     if (!measured_publisher_size) measured_publisher_size = base;
     CHECK(base == measured_publisher_size);
-    size_t pool = version == MOQ_VERSION_DRAFT_22 ? m.sizes[(m.calls - 1) % 8] : 0;
-    if (version == MOQ_VERSION_DRAFT_22) {
-        CHECK(pool % capacity == 0);
-        if (!measured_owner_size) measured_owner_size = pool / capacity;
-        CHECK(pool / capacity == measured_owner_size);
-        CHECK(measured_owner_size >= sizeof(moq_fetch_t));
-    }
+    size_t pool = m.sizes[(m.calls - 2) % 8];
+    CHECK(pool % capacity == 0);
+    if (!measured_owner_size) measured_owner_size = pool / capacity;
+    CHECK(pool / capacity == measured_owner_size);
+    CHECK(measured_owner_size >= sizeof(moq_fetch_t));
     printf("storage draft=%u capacity=%u publisher=%zu owner_pool=%zu cell=%zu\n",
            (unsigned)version, capacity, base, pool, pool / capacity);
     moq_pub_destroy(pub);

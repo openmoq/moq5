@@ -56,6 +56,7 @@ static moq_result_t make_session(const moq_alloc_t *alloc,
                                   uint64_t auth_token_cache_size,
                                   bool defer_subscription_updates,
                                   uint32_t max_data_streams,
+                                  const moq_simpair_cfg_t *pair_cfg,
                                   moq_session_t **out)
 {
     moq_session_cfg_t scfg = MOQ_SESSION_CFG_INIT;
@@ -83,6 +84,21 @@ static moq_result_t make_session(const moq_alloc_t *alloc,
     }
     scfg.defer_subscription_updates = defer_subscription_updates;
     if (max_data_streams) scfg.max_data_streams = max_data_streams;
+    /* Explicit per-side gates keep a legacy SimPair config from reading
+     * appended fields or offering the extension by accident. */
+#define PAIR_HAS(field) cfg_has_field(pair_cfg, offsetof(moq_simpair_cfg_t, field), sizeof(pair_cfg->field))
+    if (perspective == MOQ_PERSPECTIVE_CLIENT) {
+        if (PAIR_HAS(client_cluster_enabled)) scfg.cluster_enabled = pair_cfg->client_cluster_enabled;
+        if (PAIR_HAS(client_cluster_hop_id)) scfg.cluster_hop_id = pair_cfg->client_cluster_hop_id;
+        if (PAIR_HAS(client_cluster_has_relay_cost)) scfg.cluster_has_relay_cost = pair_cfg->client_cluster_has_relay_cost;
+        if (PAIR_HAS(client_cluster_relay_cost)) scfg.cluster_relay_cost = pair_cfg->client_cluster_relay_cost;
+    } else {
+        if (PAIR_HAS(server_cluster_enabled)) scfg.cluster_enabled = pair_cfg->server_cluster_enabled;
+        if (PAIR_HAS(server_cluster_hop_id)) scfg.cluster_hop_id = pair_cfg->server_cluster_hop_id;
+        if (PAIR_HAS(server_cluster_has_relay_cost)) scfg.cluster_has_relay_cost = pair_cfg->server_cluster_has_relay_cost;
+        if (PAIR_HAS(server_cluster_relay_cost)) scfg.cluster_relay_cost = pair_cfg->server_cluster_relay_cost;
+    }
+#undef PAIR_HAS
     moq_result_t rc = moq_session_create(&scfg, initial_now_us, out);
     if (rc < 0) return rc;
     rc = bind_simulated_transport(*out);
@@ -280,7 +296,7 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
                                    auth_token_cache_size,
                                    client_defer_subscription_updates,
                                    client_max_data_streams,
-                                   &sp->client);
+                                   cfg, &sp->client);
     if (rc < 0)
         goto fail;
 
@@ -300,7 +316,7 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
                       auth_token_cache_size,
                       server_defer_subscription_updates,
                       0 /* server keeps the default pool */,
-                      &sp->server);
+                      cfg, &sp->server);
     if (rc < 0)
         goto fail;
 

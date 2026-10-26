@@ -114,8 +114,17 @@ target_link_libraries(fuzz_session_d18 PRIVATE moq::core)
 target_compile_options(fuzz_session_d18 PRIVATE ${FUZZ_FLAGS})
 target_link_options(fuzz_session_d18 PRIVATE ${FUZZ_FLAGS})
 
-set(_fuzz_target_count 8)
-set(_fuzz_test_count 13)
+# The PicoQUIC lane group's datagram router: a pure function of the bytes
+# with no transport dependency, compiled here from its source so the fuzz
+# tree needs no adapter.
+add_executable(fuzz_pq_cid_route fuzz_pq_cid_route.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../adapters/picoquic/pq_cid_route.c)
+target_include_directories(fuzz_pq_cid_route PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../adapters/picoquic)
+target_compile_options(fuzz_pq_cid_route PRIVATE ${FUZZ_FLAGS})
+target_link_options(fuzz_pq_cid_route PRIVATE ${FUZZ_FLAGS})
+set(_fuzz_target_count 9)
+set(_fuzz_test_count 15)
 
 # The relay admin parser, built only when the relay tier is in this tree.
 if(TARGET moqr-admin)
@@ -220,6 +229,8 @@ add_test(NAME fuzz_session_data_smoke
          COMMAND fuzz_session_data -runs=1 -max_len=0)
 add_test(NAME fuzz_session_d18_smoke
          COMMAND fuzz_session_d18 -runs=1 -max_len=0)
+add_test(NAME fuzz_pq_cid_route_smoke
+         COMMAND fuzz_pq_cid_route -runs=1 -max_len=0)
 
 # Non-empty corpus smoke: prove the targets reach the parser.
 add_test(NAME fuzz_control_d18_corpus
@@ -237,6 +248,9 @@ add_test(NAME fuzz_session_data_corpus
 add_test(NAME fuzz_session_d18_corpus
          COMMAND fuzz_session_d18
          ${CMAKE_CURRENT_SOURCE_DIR}/corpus/session_d18 -runs=0)
+add_test(NAME fuzz_pq_cid_route_corpus
+         COMMAND fuzz_pq_cid_route
+         ${CMAKE_CURRENT_SOURCE_DIR}/corpus/pq_cid_route -runs=0)
 
 message(STATUS
     "Fuzz targets: ${_fuzz_target_count} targets, "

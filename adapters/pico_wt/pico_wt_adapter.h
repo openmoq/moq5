@@ -13,6 +13,7 @@
  */
 
 #include <moq/pico_wt.h>
+#include <moq/transport_bridge.h>
 #include "pico_wt_endpoint.h"
 
 /*
@@ -58,6 +59,8 @@ typedef struct pw_rx_stream {
     uint64_t budget;       /* window headroom kept ahead of session intake */
     uint64_t granted;      /* absolute window last advertised */
     uint8_t  kind;         /* pw_rx_kind_t */
+    /* Bridge-managed parser bytes, accepted separately from held input. */
+    moq_transport_uni_prefix_t uni_prefix;
     bool     app_fc;       /* this adapter owns the stream's window */
     bool     rx_complete;  /* the transport already delivered every byte and
                             * the FIN (and may have retired the stream): no
@@ -74,6 +77,7 @@ typedef struct pw_rx_stream {
     bool     held_input;
     bool     held_fin;
     size_t   held_len;
+    bool     admission_stopped; /* discard until a real receive terminal/release */
     /* h3zero released the stream while retained work was still owed to the
      * bridge: its terminal follows that work (pw_rx_after_service). */
     bool     released;
@@ -124,6 +128,9 @@ struct moq_pico_wt_conn {
     pw_rx_stream_t             *rx;
     size_t                      rx_count;
     size_t                      rx_cap;
+    /* A nested FIN service owes a fresh full sweep, never recursive replay. */
+    bool                        rx_sweep_active;
+    bool                        rx_resweep_owed;
 
     /* Set only while a host feeds a stream the transport already completed
      * (pico_wt_conn_rx_replay_complete_begin/_end). */

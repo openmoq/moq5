@@ -40,7 +40,8 @@ install(DIRECTORY include/moq
     PATTERN "loc.hpp" EXCLUDE
     PATTERN "msf.hpp" EXCLUDE
     PATTERN "cmaf.hpp" EXCLUDE
-    PATTERN "mpeg2ts.hpp" EXCLUDE)
+    PATTERN "mpeg2ts.hpp" EXCLUDE
+    PATTERN "media_player.hpp" EXCLUDE)
 
 if(TARGET moq::loc)
     install(FILES include/moq/loc.hpp
@@ -59,6 +60,15 @@ endif()
 
 if(TARGET moq::mpeg2ts)
     install(FILES include/moq/mpeg2ts.hpp
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moq)
+endif()
+
+# <moq/media_player.hpp> wraps the service tier's player. It is opt-in, not
+# part of moq::cpp's link interface: a consumer links moq::service next to
+# moq::cpp (find_package(libmoq COMPONENTS service)), so core-only moq::cpp
+# users never take on the service tier.
+if(TARGET moq::service AND TARGET moq::playback)
+    install(FILES include/moq/media_player.hpp
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moq)
 endif()
 
@@ -169,6 +179,10 @@ if(MOQ_BUILD_TESTS)
     add_executable(test_cpp_extended_views tests/test_extended_views.cpp)
     target_link_libraries(test_cpp_extended_views PRIVATE moq::cpp)
     add_test(NAME cpp_extended_views COMMAND test_cpp_extended_views)
+    add_executable(test_cpp_outgoing_subgroup_terminal tests/test_outgoing_subgroup_terminal.cpp)
+    target_link_libraries(test_cpp_outgoing_subgroup_terminal PRIVATE moq::cpp)
+    add_test(NAME cpp_outgoing_subgroup_terminal COMMAND test_cpp_outgoing_subgroup_terminal)
+    set_tests_properties(cpp_outgoing_subgroup_terminal PROPERTIES TIMEOUT 30)
 
     if(TARGET moq::loc)
         add_executable(test_cpp_loc tests/test_loc.cpp)
@@ -194,6 +208,29 @@ if(MOQ_BUILD_TESTS)
         add_test(NAME cpp_mpeg2ts COMMAND test_cpp_mpeg2ts)
     endif()
 
+    if(TARGET moq::service AND TARGET moq::playback)
+        # The C++ player over a scripted C player, in one TU: it defines the
+        # moq_media_player_* functions itself, so it takes the C header's
+        # include paths without linking the service library.
+        add_executable(test_cpp_media_player_fake tests/test_media_player_fake.cpp)
+        target_link_libraries(test_cpp_media_player_fake PRIVATE moq::cpp moq::playback)
+        target_include_directories(test_cpp_media_player_fake PRIVATE
+            $<TARGET_PROPERTY:moq-service,INTERFACE_INCLUDE_DIRECTORIES>)
+        add_test(NAME cpp_media_player_fake COMMAND test_cpp_media_player_fake)
+
+        if(TARGET moq::adapter-picoquic-threaded AND MOQ_PICOQUIC_SOURCE_DIR)
+            add_executable(test_cpp_media_player_service tests/test_media_player_service.cpp)
+            target_link_libraries(test_cpp_media_player_service PRIVATE
+                moq::cpp moq::service moq::adapter-picoquic-threaded moq::loc moq::msf)
+            add_test(NAME cpp_media_player_service
+                COMMAND test_cpp_media_player_service
+                    --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                    --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            set_tests_properties(cpp_media_player_service PROPERTIES
+                LABELS "network" TIMEOUT 60 RESOURCE_LOCK service_network)
+        endif()
+    endif()
+
     # Out-of-tree consumer smoke test
     set(_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
@@ -210,4 +247,79 @@ if(MOQ_BUILD_TESTS)
             "-DPICOTLS_PREFIX=${MOQ_PICOTLS_PREFIX}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer_test.cmake")
     moq_test_reject_consumer_warnings(cpp_consumer)
+
+    # The C++ player against an INSTALLED SDK (this tree's library type and
+    # the CTest configuration): picoquic and libmoq are installed to a
+    # test-owned prefix and the consumer links moq::cpp and moq::service from
+    # there only. Both children take this tree's full build context (the
+    # same preload cpp_consumer uses) and its OpenSSL selection.
+    if(TARGET moq::service AND TARGET moq::playback AND MOQ_PICOQUIC_SOURCE_DIR)
+        include(${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerProviderContext.cmake)
+        set(_cpp_player_openssl_context
+            "${CMAKE_CURRENT_BINARY_DIR}/player-consumer-openssl-context.cmake")
+        moq_write_consumer_openssl_context("${_cpp_player_openssl_context}")
+        # The parent's resolved picotls selection, preloaded into the child
+        # picoquic build so its own discovery never falls back to another
+        # picotls (an entry the parent did not resolve is left out; the
+        # runner then requires the child not to have found one either).
+        set(_cpp_player_picotls_context
+            "${CMAKE_CURRENT_BINARY_DIR}/player-consumer-picotls-context.cmake")
+        set(_cpp_player_picotls "# picotls selection of the parent build.\n")
+        foreach(_spec "PTLS_INCLUDE_DIR|PATH" "PTLS_CORE_LIBRARY|FILEPATH"
+                "PTLS_MINICRYPTO_LIBRARY|FILEPATH" "PTLS_OPENSSL_LIBRARY|FILEPATH"
+                "PTLS_FUSION_LIBRARY|FILEPATH")
+            string(REPLACE "|" ";" _spec "${_spec}")
+            list(GET _spec 0 _var)
+            list(GET _spec 1 _type)
+            if(DEFINED ${_var} AND NOT "${${_var}}" STREQUAL "" AND
+               NOT "${${_var}}" MATCHES "-NOTFOUND$")
+                string(APPEND _cpp_player_picotls
+                    "set(${_var} [==[${${_var}}]==] CACHE ${_type} \"Parent picotls selection\")\n")
+            endif()
+        endforeach()
+        file(WRITE "${_cpp_player_picotls_context}" "${_cpp_player_picotls}")
+        include(${PROJECT_SOURCE_DIR}/tests/cmake/PicoquicInstallStaging.cmake)
+        moq_picoquic_install_staging(_cpp_player_install_staging)
+        # Service imports the managed WT components when they were installed.
+        # Pin their package just as the runner pins its installed picoquic;
+        # an ambient WT SDK must not satisfy this producer's consumer test.
+        set(_cpp_player_wtquic_dir "")
+        if(TARGET moq::adapter-wtquic-msquic-managed OR
+           TARGET moq::adapter-wtquic-network-managed)
+            if(NOT wtquic_DIR OR wtquic_DIR MATCHES "-NOTFOUND$")
+                message(FATAL_ERROR
+                    "The installed player consumer requires the selected wtquic_DIR")
+            endif()
+            set(_cpp_player_wtquic_dir "${wtquic_DIR}")
+        endif()
+        add_test(NAME cpp_player_install_consumer
+            COMMAND bash
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_player_install_consumer.sh"
+                "${CMAKE_COMMAND}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/player_consumer"
+                "${PROJECT_BINARY_DIR}"
+                "${MOQ_PICOQUIC_SOURCE_DIR}"
+                "$<CONFIG>"
+                "${CMAKE_GENERATOR}"
+                "${_consumer_context}"
+                "${_cpp_player_openssl_context}"
+                "${_cpp_player_install_staging}"
+                "${CMAKE_INSTALL_INCLUDEDIR}"
+                "${CMAKE_INSTALL_LIBDIR}"
+                "${PTLS_INCLUDE_DIR}"
+                "${MOQ_PTLS_LIB_DIR}"
+                "${MOQ_PICOTLS_PREFIX}"
+                "${CMAKE_CURRENT_BINARY_DIR}/player-install-consumer-work-$<CONFIG>"
+                "${_cpp_player_picotls_context}"
+                "${_cpp_player_wtquic_dir}")
+        set_tests_properties(cpp_player_install_consumer
+            PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
+        moq_test_reject_consumer_warnings(cpp_player_install_consumer)
+
+        # The runner's path and configuration rules, without a build.
+        add_test(NAME cpp_player_install_consumer_rules
+            COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_player_consumer_lib.sh")
+        set_tests_properties(cpp_player_install_consumer_rules
+            PROPERTIES TIMEOUT 30 LABELS "tooling")
+    endif()
 endif()

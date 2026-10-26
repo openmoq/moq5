@@ -29,6 +29,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>   /* Sleep */
+#endif
 
 /* Async-signal-safe: the handler only sets a flag. The send loop checks it
  * each iteration. (Do NOT call libmoq from a signal handler --
@@ -160,15 +163,16 @@ int main(int argc, char **argv)
 
     /* Decoder init config. A real sender passes the encoder's extradata here
      * -- e.g. H.264/HEVC SPS/PPS/VPS, an AAC AudioSpecificConfig, or a CMAF
-     * init segment. Under AUTO, the draft-22 companion carries every track's
-     * init bytes in the catalog's root initDataList, referenced by initRef.
-     * The legacy companion on drafts 16/18 keeps RAW/LOC init bytes inline on
-     * the track entry; CMAF and MPEG-TS use initDataList/initRef there too.
-     * Tracks with identical init bytes share a list entry with a stable id.
-     * Either way the receiver resolves it to desc.init_data at TRACK_ADDED; it
-     * is NOT per-object LOC metadata. These are placeholder bytes (the payloads
-     * below are placeholders too); leave init_data empty if the codec carries
-     * its parameter sets in-band. The buffer is copied during add_track. */
+     * init segment. Every companion on drafts 16/18/22, including explicit
+     * LEGACY and unresolved AUTO, emits version "draft-01" and carries supplied
+     * init in root initDataList, referenced by initRef. Identical bytes share a
+     * stable id. An init-bearing late add needs a full independent catalog.
+     * The receiver resolves it to desc.init_data at TRACK_ADDED. This is not
+     * per-object LOC metadata; the service does not repeat it in media objects.
+     * These bytes and the payloads below are placeholders. RAW may leave init
+     * empty for in-band parameter sets; CMAF requires a nonempty header at
+     * add_track even with validate_cmaf=false. Missing init returns INVAL with
+     * a NULL handle and leaves the sender unchanged. The buffer is copied. */
     static const uint8_t example_init_data[] = { 0x01, 0x42, 0xe0, 0x1e };
     tc.init_data.data = example_init_data;
     tc.init_data.len = sizeof(example_init_data);
@@ -230,8 +234,12 @@ int main(int argc, char **argv)
             break;
         }
 
+#ifdef _WIN32
+        Sleep(33);                              /* ~30 fps pacing */
+#else
         struct timespec ts = { 0, 33333000 };   /* ~30 fps pacing */
         nanosleep(&ts, NULL);
+#endif
     }
 
     printf("wrote %llu objects\n", sent);

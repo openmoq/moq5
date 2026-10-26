@@ -564,8 +564,8 @@ if(MOQ_BUILD_TESTS)
         target_link_libraries(test_msquic_flush PRIVATE
             moq::core msquic::msquic Threads::Threads)
 
-        # Compile the actual endpoint TU with a typed query stub. Unused
-        # backend functions are discarded, not satisfied by test exports.
+        # Compile the actual endpoint TU with a scripted query and typed,
+        # aborting managed shims, including when ASan retains the registry.
         add_executable(test_msquic_flush_endpoint
             tests/test_msquic_flush_endpoint.c)
         target_include_directories(test_msquic_flush_endpoint PRIVATE
@@ -652,6 +652,15 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(fake_msq_history PROPERTIES
             LABELS "msquic;sansio"
             TIMEOUT 30)
+        if(UNIX)
+            target_compile_definitions(test_fake_msq_history PRIVATE
+                MOQ_FAKE_MSQ_POSIX_GUARDS=1)
+            add_test(NAME fake_msq_history_terminal_guards
+                COMMAND test_fake_msq_history --terminal-guards)
+            set_tests_properties(fake_msq_history_terminal_guards PROPERTIES
+                LABELS "msquic;sansio"
+                TIMEOUT 30)
+        endif()
 
         # Size-qualified config-prefix derivation on the production path:
         # a prefix-sized cfg defaults every appended field, a cfg sized

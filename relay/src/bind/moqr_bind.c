@@ -9,6 +9,7 @@
 #include "moqr_bind_metadata.h"
 #include "moqr_bind_retrieval.h"
 #include "../core/retrieve_internal.h"
+#include "../core/props_codec_internal.h"
 #include "../../../core/src/spi/core_spi.h"
 
 #include <moq/rcbuf.h>
@@ -103,6 +104,12 @@ typedef struct b_dsub {
     moqr_sub_t rsub;
     uint64_t   upd_id;       /* the update the held answer names          */
     uint64_t   streams_opened; /* lifetime application data streams       */
+    /* The track this subscription's SUBSCRIBE_OK answered for: its
+     * generation-checked handle, renewed when the retained identity is
+     * replaced. A Joining FETCH on the subscription is served only for that
+     * retained identity. */
+    bool         has_ident;
+    moqr_track_t ident_track;
 } b_dsub_t;
 
 /* A deferred discovery decision that came back ALLOW: the offer it
@@ -124,9 +131,15 @@ typedef struct b_dgrant {
 
 typedef struct b_sg {
     bool                  used;
+    /* Suppression belongs to this exact owner/key, not the reusable session
+     * pool slot. Source seals do not retire numeric keys. */
+    bool                  stopped;
     uint64_t              sub_raw;
+    moqr_sub_t            rsub;
     uint64_t              group, subgroup;
+    uint32_t              core_list;
     moq_subgroup_handle_t h;
+    moq_stream_ref_t       stopped_ref;
     /* Chunked-delivery write progress on this downstream subgroup:
      * whether begin_object has shipped for the in-flight object, its id, and the
      * next chunk index to write. Held across a downstream WOULD_BLOCK so
@@ -137,6 +150,12 @@ typedef struct b_sg {
     /* The downstream stream was opened with PROPERTIES, so it can carry an
      * object with properties. */
     bool                  props;
+    /* The stream was opened for the record of object open_obj and nothing
+     * has been written on it since: that record, offered again after the
+     * session refused its first write, starts this stream rather than
+     * finding one it does not continue. */
+    bool                  unwritten;
+    uint64_t              open_obj;
     /* A reset with reset_wire is owed on this stream (its Track turned out
      * malformed while the session could not take the reset): every later
      * close of the stream is that reset, never a FIN or another code. */
@@ -178,10 +197,6 @@ typedef struct b_fetch {
      * serve are Timed-Out rather than Unknown where the draft has that
      * marker. */
     uint64_t        fill_deadline_us;
-    /* FETCH: the draft's fetch stream has End of Timed-Out Range. */
-    bool            fetch_timed_out_ok;
-    /* FETCH: held at an Object still arriving, waiting until the deadline. */
-    bool            fetch_held_pending;
     /* fill: the generation-pinned parent and remaining inclusive window.
      * Descending fills visit one group per window; source claims serve a
      * prefix within that window before local retrieval takes over. */
@@ -350,6 +365,7 @@ typedef struct b_fwd_item {
     uint64_t               group, subgroup, object;
     moq_rcbuf_t           *payload;      /* OWNED ref stolen from the event */
     moq_rcbuf_t           *properties;   /* OWNED ref or NULL               */
+    uint8_t                properties_codec; /* the upstream connection's */
     uint64_t               charged;      /* bytes charged to the pool       */
 } b_fwd_item_t;
 
@@ -382,6 +398,7 @@ typedef struct b_fwd {
     uint64_t       ok_end_group, ok_end_object;
     uint8_t       *props;          /* owned copy of Track Properties */
     size_t         props_len;
+    uint8_t        props_codec;    /* MOQR_PROPS_CODEC_* of the upstream's draft */
     moq_request_error_t err_code;
     bool           err_can_retry;
     uint64_t       err_retry_after_ms;
@@ -453,7 +470,20 @@ typedef struct b_ann {
     moq_bytes_t  parts[32];
     uint8_t     *bytes;
     size_t       bytes_len;
+    bool         discovered;
+    moq_ns_sub_handle_t discovery;
+    moq_cluster_metadata_t cluster; /* latest received state, in conn path pool */
+    bool cluster_pending;
+    bool cluster_initial;
+    moqr_grant_res_t cluster_grant;
 } b_ann_t;
+
+/* What one peer was actually told, independent of current best-route state. */
+typedef struct b_cadv {
+    b_ann_t ann;
+    moqr_cluster_advertisement_id_t source_advertisement;
+    uint64_t origin;
+} b_cadv_t;
 
 /* A namespace update held for retry. draft-18 Section 6.2 makes the NAMESPACE
  * owed to a matching prefix subscriber a MUST, so a blocked control path may
@@ -484,6 +514,7 @@ typedef struct b_nsans {
     uint32_t         conn;        /* connection slot                      */
     uint64_t         handle;      /* the updated request                  */
     uint64_t         update_id;
+    bool             cluster_applied;
     uint64_t         error_code;  /* reject only                          */
     moqr_grant_res_t gres;        /* an announcement's new grant, if any  */
 } b_nsans_t;
@@ -527,6 +558,9 @@ typedef struct b_meta_publish {
 #define B_PARK_ACTION_CAP 1u   /* session action queue full: capacity gate  */
 #define B_PARK_SESSION_SG 2u   /* session subgroup pool: one try per pump   */
 
+#define B_RETRY_REFUSAL (1u << 0)
+#define B_RETRY_CANCEL  (1u << 1)
+
 #define B_DRAFT_16 0u
 #define B_DRAFT_18 1u
 #define B_DRAFT_22 2u
@@ -535,6 +569,7 @@ typedef struct b_conn {
     bool           used;
     bool           closed;
     bool           detach_pending;   /* close blocked on intent space   */
+    bool           events_pending;   /* refusal pressure interrupted drain */
     bool           bind_sg_waiting;  /* a delivery blocked on this conn's
                                       * subgroup-slot pool (B_DELIVER_BLOCKED_
                                       * BIND_SG): the ONLY state that makes a
@@ -550,6 +585,10 @@ typedef struct b_conn {
      * is encoded for the peer that reads it. Rides the bool padding — no size
      * cost. */
     uint8_t        wire_draft;       /* B_DRAFT_*                       */
+    /* B_RETRY_*: a held refusal or owed upstream cancellation. Each bit is
+     * cleared only by the walk that finds none left. Sharing one byte keeps
+     * both scan hints in the padding before park_cap. */
+    uint8_t        retry_pending;
     size_t         park_cap;         /* ACTION_CAP: capacity floor when
                                       * parked; retry only above it     */
 #ifdef MOQR_BIND_TESTING
@@ -581,17 +620,50 @@ typedef struct b_conn {
     b_usub_t      *usubs;
     b_pub_t       *pubs;
     b_ann_t       *anns;
+    b_cadv_t      *cluster_adverts;
+    uint64_t      *cluster_paths;
+    bool           cluster_peer_ready;
+    bool           cluster_negotiated;
+    bool           cluster_cost_override;
+    bool           cluster_discovery_closed;
+    bool           cluster_discovery_retiring;
+    bool           cluster_discovery_cancel_owed;
+    uint64_t       cluster_cost;
+    uint64_t       cluster_correlation;
+    uint64_t       cluster_peer_hop;
+    moq_ns_sub_handle_t cluster_discovery;
     b_fetch_t     *fetches;
     b_refusal_t   *refusals;   /* held refusals, n_refusals entries      */
     uint32_t       refusals_reserved;   /* entries promised to parked auths */
+    /* One past the highest fetch slot marked used since the table was last
+     * cleared: every slot at or above it is unused, so the per-pump fetch
+     * walks stop there instead of at n_fetches. Raised when a slot is
+     * marked used, lowered only by bind_fetch_pump's trailing trim. Rides
+     * the padding after refusals_reserved — no size cost. */
+    uint32_t       fetch_hw;
     uint64_t       requests_seen;    /* inbound peer requests observed (d16
                                       * request-id consumption proxy)     */
 } b_conn_t;
+
+/* The only way a fetch slot becomes used: it also keeps fetch_hw above the
+ * slot, so the per-pump walks bounded by it still reach it. */
+static void
+bind_fetch_mark_used(b_conn_t *cn, b_fetch_t *bf)
+{
+    uint32_t slot = (uint32_t)(bf - cn->fetches);
+    bf->used = true;
+    if (slot >= cn->fetch_hw) {
+        cn->fetch_hw = slot + 1u;
+    }
+}
 
 struct moqr_bind {
     moq_alloc_t  alloc;
     b_dgrant_t   dgrants[BIND_DGRANTS];
     moqr_core_t *core;
+    moqr_cluster_info_t cluster_info;
+    uint64_t *cluster_hops; /* max received path plus this relay's append */
+    uint64_t cluster_next_discovery;
     /* The request namespace / name of the event being handled, copied out of
      * session event memory (see bind_stash_ftn). */
     moq_bytes_t  stash_parts[32];
@@ -1371,6 +1443,41 @@ moqr_bind_debug_blocked_aggregate(const moqr_bind_t *b,
     return MOQR_OK;
 }
 
+bool
+moqr_bind_debug_scan_bounds_ok(const moqr_bind_t *b)
+{
+    for (uint32_t ci = 0; ci < b->max_conns; ci++) {
+        const b_conn_t *cn = &b->conns[ci];
+        if (!cn->used) {
+            continue;
+        }
+        for (uint32_t fi = cn->fetch_hw; fi < b->n_fetches; fi++) {
+            if (cn->fetches[fi].used) {
+                return false;
+            }
+        }
+        for (uint32_t i = 0; !(cn->retry_pending & B_RETRY_REFUSAL) &&
+                             i < b->n_refusals; i++) {
+            if (cn->refusals[i].used) {
+                return false;
+            }
+        }
+        for (uint32_t i = 0; !(cn->retry_pending & B_RETRY_CANCEL) &&
+                             i < b->n_usubs; i++) {
+            if (cn->usubs[i].used && cn->usubs[i].cancel_owed) {
+                return false;
+            }
+        }
+        for (uint32_t i = 0; !(cn->retry_pending & B_RETRY_CANCEL) &&
+                             i < b->n_pubs; i++) {
+            if (cn->pubs[i].used && cn->pubs[i].cancel_owed) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 /* Test-only downstream subgroup-pool occupancy for one conn slot. */
 uint32_t
 moqr_bind_debug_conn_open_sgs(const moqr_bind_t *b, uint32_t slot)
@@ -1523,10 +1630,40 @@ moqr_bind_cfg_resolve(const moqr_bind_cfg_t *cfg,
  * bind tables. */
 #define BIND_ANN_BYTES_MAX 4096u
 
-moqr_result_t
+static moqr_result_t bind_cluster_capacity(const moqr_bind_cfg_t *cfg,
+    const moqr_core_limits_t *lim, const moqr_cluster_info_t *cluster_info,
+    moqr_bind_capacity_t *out);
+
+moq_result_t
 moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
-                            const moqr_core_limits_t *lim,
-                            moqr_bind_capacity_t *out)
+    const moqr_core_limits_t *lim, moqr_bind_capacity_t *out, size_t out_size)
+{
+    moqr_cluster_info_t cluster = {0};
+    cluster.struct_size = sizeof(cluster);
+    if (cfg != NULL && BIND_CFG_HAS(cfg, core) && cfg->core != NULL)
+        (void)moqr_core_cluster_info(cfg->core, &cluster, sizeof(cluster));
+    return moqr_bind_cluster_capacity_describe(cfg, lim, &cluster, out, out_size);
+}
+
+moq_result_t
+moqr_bind_cluster_capacity_describe(const moqr_bind_cfg_t *cfg,
+    const moqr_core_limits_t *lim, const moqr_cluster_info_t *cluster_info,
+    moqr_bind_capacity_t *out, size_t out_size)
+{
+    if (out == NULL || out_size < MOQR_BIND_CAPACITY_V0_SIZE) return MOQ_ERR_INVAL;
+    moqr_cluster_info_t cluster = {0};
+    if (cluster_info != NULL && !moqr_cluster_read(cluster_info, MOQR_CLUSTER_INFO_V0_SIZE,
+                                                  &cluster, sizeof(cluster))) return MOQ_ERR_INVAL;
+    moqr_bind_capacity_t value = {0};
+    moqr_result_t rc = bind_cluster_capacity(cfg, lim, &cluster, &value);
+    if (rc == MOQR_OK) moqr_cluster_write(out, out_size, &value, sizeof(value));
+    return moqr_result_public(rc);
+}
+
+static moqr_result_t
+bind_cluster_capacity(const moqr_bind_cfg_t *cfg,
+    const moqr_core_limits_t *lim, const moqr_cluster_info_t *cluster_info,
+    moqr_bind_capacity_t *out)
 {
     if (out == NULL) {
         return MOQR_ERR_INVAL;
@@ -1560,6 +1697,15 @@ moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
                      moqr_cap_mul(bl.max_conns,
                                   moqr_cap_add(sizeof(b_conn_t),
                                                per_conn))));
+    const moqr_cluster_info_t cluster = cluster_info != NULL
+        ? *cluster_info : (moqr_cluster_info_t){0};
+    if (cluster.enabled && cluster.max_hops == 0) return MOQR_ERR_INVAL;
+    if (cluster.enabled) {
+        out->structure_bytes = moqr_cap_add(out->structure_bytes,
+            moqr_cap_add(moqr_cap_mul((uint64_t)cluster.max_hops + 1u, sizeof(uint64_t)),
+                moqr_cap_mul(moqr_cap_mul(bl.max_conns, bl.n_anns),
+                    moqr_cap_add(sizeof(b_cadv_t), moqr_cap_mul(cluster.max_hops, sizeof(uint64_t))))));
+    }
     /* Delivery scheduling bitsets: ready + parked, one bit per conn slot. */
     out->structure_bytes = moqr_cap_add(
         out->structure_bytes,
@@ -1579,9 +1725,11 @@ moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
         ann_slots = lim->max_ns_nodes;
     }
     out->announce_bytes = moqr_cap_mul(ann_slots, BIND_ANN_BYTES_MAX);
-    /* The namespace payload sidecar: one entry per deferral-ring slot, plus
-     * the suffix bytes every slot could own at once. One held suffix is
-     * bounded by the same full-track-name cap an announce is. */
+    if (cluster.enabled) {
+        const uint64_t slots = moqr_cap_mul(bl.max_conns, bl.n_anns);
+        const uint64_t incoming = slots; /* includes not-yet-admitted candidates */
+        out->announce_bytes = moqr_cap_mul(moqr_cap_add(incoming, slots), BIND_ANN_BYTES_MAX);
+    }
     out->structure_bytes = moqr_cap_add(
         out->structure_bytes, moqr_cap_mul(bl.nsu_cap, sizeof(b_nsu_t)));
     out->announce_bytes = moqr_cap_add(
@@ -1647,6 +1795,7 @@ moqr_bind_create(const moqr_bind_cfg_t *cfg, moqr_bind_t **out)
     memset(b, 0, sizeof(*b));
     b->alloc = *a;
     b->core = core;
+    moqr_core_cluster_info(core, &b->cluster_info, sizeof(b->cluster_info));
     /* Default map sizes FOLLOW the core's admission limits, so the
      * binding can never be under-provisioned relative to what the core
      * will admit. Explicit cfg values still win (tests use tiny maps to
@@ -1824,6 +1973,14 @@ moqr_bind_create(const moqr_bind_cfg_t *cfg, moqr_bind_t **out)
         moqr_bind_destroy(b);
         return MOQR_ERR_NOMEM;
     }
+    if (b->cluster_info.enabled) {
+        b->cluster_hops = b->alloc.alloc(
+            ((size_t)b->cluster_info.max_hops + 1u) * sizeof(uint64_t), b->alloc.ctx);
+        if (b->cluster_hops == NULL) {
+            moqr_bind_destroy(b);
+            return MOQR_ERR_NOMEM;
+        }
+    }
     for (uint32_t i = 0; i < b->max_conns; i++) {
         b_conn_t *cn = &b->conns[i];
         /* Allocate each per-connection table and zero it IMMEDIATELY, before the
@@ -1848,6 +2005,14 @@ moqr_bind_create(const moqr_bind_cfg_t *cfg, moqr_bind_t **out)
         BIND_ALLOC_TABLE(usubs, b->n_usubs);
         BIND_ALLOC_TABLE(pubs, b->n_pubs);
         BIND_ALLOC_TABLE(anns, b->n_anns);
+        if (b->cluster_info.enabled) {
+            BIND_ALLOC_TABLE(cluster_adverts, b->n_anns);
+            if ((size_t)b->n_anns > SIZE_MAX / sizeof(uint64_t) / b->cluster_info.max_hops) {
+                moqr_bind_destroy(b);
+                return MOQR_ERR_INVAL;
+            }
+            BIND_ALLOC_TABLE(cluster_paths, (size_t)b->n_anns * b->cluster_info.max_hops);
+        }
         BIND_ALLOC_TABLE(fetches, b->n_fetches);
         BIND_ALLOC_TABLE(refusals, b->n_refusals);
 #undef BIND_ALLOC_TABLE
@@ -1926,7 +2091,7 @@ bind_nsu_store(moqr_bind_t *b, uint32_t slot, moqr_intent_t *parked)
     if (parked->value > parked->ns_count) {
         return false;
     }
-    uint32_t off = parked->value;
+    uint32_t off = b->cluster_info.enabled ? 0u : parked->value;
     uint32_t suffix_count = parked->ns_count - off;
     if (suffix_count > 32) {
         return false;
@@ -2151,6 +2316,7 @@ static void bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
                                     const moq_fetch_request_event_t *fq,
                                     const moqr_fetch_req_t *freq,
                                     const moq_fetch_request_options_t *fo,
+                                    const moqr_track_t *join_track,
                                     uint64_t now_us);
 static bool bind_standalone_cancelled(moqr_bind_t *b, b_conn_t *cn,
                                       moq_fetch_t fetch);
@@ -2160,7 +2326,8 @@ static const moq_fetch_request_options_t *bind_fetch_options(const moq_event_t *
 static void bind_fetch_range(const moq_fetch_request_options_t *fo,
                              moqr_fetch_req_t *freq);
 static void fwd_admit(moqr_bind_t *b, b_conn_t *cn,
-                      const moq_fetch_request_event_t *fq, uint64_t now_us);
+                      const moq_fetch_request_event_t *fq,
+                      const moq_fetch_request_options_t *fo, uint64_t now_us);
 static bool fwd_on_up_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                              uint64_t now_us);
 static bool fwd_on_down_cancelled(moqr_bind_t *b, b_conn_t *cn, uint64_t handle);
@@ -2251,29 +2418,104 @@ bind_meta_input(const b_conn_t *cn, uint64_t handle, uint64_t gen,
     return input;
 }
 
-/* Validated Track Properties share the opaque vi64 representation in D18
- * and D22. Preserve the bytes, source profile and destination validation;
- * this is not a mandatory-property override or a LOC/media conversion. Empty
- * sets have no representation to convert. No nonempty D16 cross-profile
- * compatibility is implied. */
-static bool
-bind_meta_can_replay(const moqr_bind_meta_ref_t *pin, moq_version_t version)
+#ifdef MOQR_BIND_TESTING
+#define FWD_DBG(b, field) ((b)->dbg_fwd.field++)
+#else
+#define FWD_DBG(b, field) ((void)0)
+#endif
+
+/* The Key-Value-Pair integer codec `version` writes: QUIC varints in
+ * draft-16, vi64 in draft-18 and draft-22; UNKNOWN for any other. */
+static uint8_t
+bind_version_codec(moq_version_t version)
 {
+    if (version == MOQ_VERSION_DRAFT_16) return MOQR_PROPS_CODEC_QUIC_VARINT;
+    if (version == MOQ_VERSION_DRAFT_18 || version == MOQ_VERSION_DRAFT_22)
+        return MOQR_PROPS_CODEC_VI64;
+    return MOQR_PROPS_CODEC_UNKNOWN;
+}
+
+/* A converted Track Property set, owned until bind_track_props_release. */
+typedef struct b_props_tmp {
+    uint8_t *buf;
+    size_t   len;
+} b_props_tmp_t;
+
+static void
+bind_track_props_release(moqr_bind_t *b, b_props_tmp_t *tmp)
+{
+    if (tmp->buf != NULL) b->alloc.free(tmp->buf, tmp->len, b->alloc.ctx);
+    tmp->buf = NULL;
+    tmp->len = 0;
+}
+
+/* A Track Property set read in `src` as `dst` writes it, for one session
+ * call that borrows it: `in` itself when both codecs read it alike (or it is
+ * empty), else a converted copy in *tmp that the caller releases after the
+ * call. `in` is never changed. False, with nothing held and *out empty, when
+ * the set is not representable in `dst`, does not parse in `src`, has no
+ * stated codec, or the copy cannot be allocated. */
+static bool
+bind_track_props_out(moqr_bind_t *b, uint8_t src, uint8_t dst, moq_bytes_t in,
+                     moq_bytes_t *out, b_props_tmp_t *tmp)
+{
+    tmp->buf = NULL;
+    tmp->len = 0;
+    *out = in;
+    if (in.len == 0) {
+        *out = (moq_bytes_t){ NULL, 0 };
+        return true;
+    }
+    size_t need = 0;
+    moqr_props_conv_t r = moqr_core_internal_props_convert(src, dst, in.data, in.len, NULL, 0,
+                                                           &need);
+    if (r == MOQR_PROPS_CONV_SAME) return true;
+    *out = (moq_bytes_t){ NULL, 0 };
+    if (r != MOQR_PROPS_CONV_CONVERTED || need == 0) {
+        FWD_DBG(b, track_props_refused);
+        return false;
+    }
+    uint8_t *buf = b->alloc.alloc(need, b->alloc.ctx);
+    size_t got = 0;
+    if (buf == NULL ||
+        moqr_core_internal_props_convert(src, dst, in.data, in.len, buf, need, &got) !=
+            MOQR_PROPS_CONV_CONVERTED ||
+        got != need) {
+        if (buf != NULL) b->alloc.free(buf, need, b->alloc.ctx);
+        FWD_DBG(b, track_props_refused);
+        return false;
+    }
+    FWD_DBG(b, track_props_converted);
+    tmp->buf = buf;
+    tmp->len = need;
+    *out = (moq_bytes_t){ buf, need };
+    return true;
+}
+
+/* The pinned Track Property set as `version` carries it, through
+ * bind_track_props_out from the draft that stated it: the pin stays the
+ * exact revision it names, whatever the destination reads. An empty set
+ * has no representation to convert; anything but EMPTY or PRESENT (an
+ * ACK, UNAVAILABLE) cannot be stated. */
+static bool
+bind_meta_out(moqr_bind_t *b, const moqr_bind_meta_ref_t *pin, moq_version_t version,
+              moq_bytes_t *out, b_props_tmp_t *tmp)
+{
+    tmp->buf = NULL;
+    tmp->len = 0;
+    *out = (moq_bytes_t){ NULL, 0 };
     if (pin == NULL) return false;
     if (pin->state == MOQR_BIND_META_EMPTY) return true;
     if (pin->state != MOQR_BIND_META_PRESENT) return false;
-    bool source_18_22 = pin->wire_version == MOQ_VERSION_DRAFT_18 ||
-                        pin->wire_version == MOQ_VERSION_DRAFT_22;
-    bool destination_18_22 = version == MOQ_VERSION_DRAFT_18 ||
-                             version == MOQ_VERSION_DRAFT_22;
-    return pin->wire_version == version || (source_18_22 && destination_18_22);
+    return bind_track_props_out(b, bind_version_codec(pin->wire_version),
+                                bind_version_codec(version), pin->bytes, out, tmp);
 }
 
 /* The Track Properties a reply this relay originates for an established
  * track states (TRACK_STATUS_OK, FETCH_OK; draft-22 §7.7): the track's
  * recorded set, or EMPTY when this binding does not manage the source's
  * metadata. A managed track with nothing usable recorded stays UNAVAILABLE,
- * which bind_meta_can_replay refuses, as it refuses an ACK. */
+ * which bind_meta_out refuses, as it refuses an ACK. */
 static void
 bind_meta_reply_pin(moqr_bind_t *b, moqr_track_t track, moqr_bind_meta_ref_t *pin)
 {
@@ -2287,20 +2529,32 @@ bind_meta_reply_pin(moqr_bind_t *b, moqr_track_t track, moqr_bind_meta_ref_t *pi
     pin->state = MOQR_BIND_META_EMPTY;
 }
 
+moqr_result_t
+moqr_bind_meta_reply(moqr_bind_t *b, moqr_track_t track, moqr_bind_meta_ref_t *out)
+{
+    if (b == NULL || out == NULL) return MOQR_ERR_INVAL;
+    memset(out, 0, sizeof(*out));
+    bind_meta_reply_pin(b, track, out);
+    return MOQR_OK;
+}
+
 /* The properties of a FETCH_OK this relay originates from the core fetch
- * `cfetch`, retained in *pin for the call. False when the track's set cannot
- * be stated on this session; the fetch is refused rather than answered
- * without them. */
+ * `cfetch`, retained in *pin for the call and written to *out as this
+ * session carries them (bind_meta_out; *tmp released after the call). False
+ * when the track's set cannot be stated on this session; the fetch is
+ * refused rather than answered without them. */
 static bool
 bind_fetch_ok_pin(moqr_bind_t *b, const b_conn_t *cn, moqr_fetch_t cfetch,
-                  moqr_bind_meta_ref_t *pin)
+                  moqr_bind_meta_ref_t *pin, moq_bytes_t *out, b_props_tmp_t *tmp)
 {
+    tmp->buf = NULL;
+    tmp->len = 0;
     moqr_track_t track;
     uint64_t gen;
     if (moqr_core_internal_fetch_track(b->core, cfetch, &track, &gen) != MOQR_OK)
         return false;
     bind_meta_reply_pin(b, track, pin);
-    return bind_meta_can_replay(pin, moq_session_version(cn->session));
+    return bind_meta_out(b, pin, moq_session_version(cn->session), out, tmp);
 }
 
 /* Runs for every fresh scalar BEFORE the blocked fast path. PUBLISH input
@@ -2618,6 +2872,8 @@ ann_clear_slot(moqr_bind_t *b, b_conn_t *cn, uint32_t slot)
     memset(&cn->anns[slot], 0, sizeof(cn->anns[slot]));
 }
 
+static void bind_cluster_adverts_clear(moqr_bind_t *b, b_conn_t *cn, uint64_t handle);
+
 static void
 ann_clear_all(moqr_bind_t *b, b_conn_t *cn)
 {
@@ -2655,6 +2911,8 @@ bind_ann_withdraw(moqr_bind_t *b, b_conn_t *cn, uint64_t raw, uint64_t now_us)
     }
     if (urc == MOQR_OK || urc == MOQR_ERR_STALE_HANDLE ||
         urc == MOQR_ERR_WRONG_STATE) {
+        if (cn->anns[ann_slot].cluster_grant.gen != 0)
+            moqr_core_grant_abort(b->core, cn->anns[ann_slot].cluster_grant);
         ann_clear_slot(b, cn, (uint32_t)ann_slot);
     } else {
         b->session_errors++;
@@ -2738,6 +2996,34 @@ ns_equal(moqr_ns_t a, moqr_ns_t b)
     return true;
 }
 
+static void
+bind_cluster_adverts_clear(moqr_bind_t *b, b_conn_t *cn, uint64_t handle)
+{
+    if (cn->cluster_adverts == NULL) return;
+    for (uint32_t i = 0; i < b->n_anns; i++) {
+        b_cadv_t *a = &cn->cluster_adverts[i];
+        if (!a->ann.used || (handle != 0 && a->ann.ann_raw != handle)) continue;
+        if (a->ann.bytes != NULL)
+            b->alloc.free(a->ann.bytes, a->ann.bytes_len, b->alloc.ctx);
+        memset(a, 0, sizeof(*a));
+    }
+}
+
+static moqr_result_t
+bind_cluster_announce_current(moqr_bind_t *b, b_conn_t *cn, moqr_ns_t ns, uint64_t raw)
+{
+    int slot = ann_find(b, cn, raw);
+    if (slot >= 0 && cn->anns[slot].discovered)
+        return moqr_result_legacy(moqr_core_announce_cluster(b->core, cn->binding, ns, raw,
+                                          &cn->anns[slot].cluster, false));
+    moq_cluster_metadata_t metadata = {0};
+    moq_result_t rc = moq_session_namespace_cluster(cn->session,
+        (moq_announcement_t){raw}, &metadata, sizeof(metadata));
+    if (rc != MOQ_OK && cn->cluster_negotiated) return MOQR_ERR_WRONG_STATE;
+    return moqr_result_legacy(moqr_core_announce_cluster(b->core, cn->binding, ns, raw,
+        cn->cluster_negotiated ? &metadata : NULL, false));
+}
+
 static bool
 conn_has_other_announce(const moqr_bind_t *b, const b_conn_t *cn,
                         uint64_t raw, moqr_ns_t ns)
@@ -2762,6 +3048,10 @@ bind_announce(moqr_bind_t *b, b_conn_t *cn, moqr_ns_t ns, uint64_t raw,
               uint64_t now_us)
 {
     moqr_result_t rc;
+    if (b->cluster_info.enabled) {
+        BIND_CALL_RETRY(rc, bind_cluster_announce_current(b, cn, ns, raw));
+        return rc;
+    }
     BIND_CALL_RETRY(rc, moqr_core_announce_ex(b->core, cn->binding, ns, raw));
     if (rc != MOQR_ERR_WRONG_STATE ||
         conn_has_other_announce(b, cn, raw, ns)) {
@@ -2915,6 +3205,7 @@ conn_detach(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
         b->session_errors++;
     }
     ann_clear_all(b, cn);
+    bind_cluster_adverts_clear(b, cn, 0);
     usub_release_all(b, cn);
     cn->used = false;
     cn->detach_pending = false;
@@ -2959,6 +3250,12 @@ moqr_bind_destroy(moqr_bind_t *b)
                 a.free(cn->anns, (size_t)b->n_anns * sizeof(*cn->anns),
                        a.ctx);
             }
+            if (cn->cluster_paths != NULL)
+                a.free(cn->cluster_paths, (size_t)b->n_anns * b->cluster_info.max_hops * sizeof(uint64_t), a.ctx);
+            if (cn->cluster_adverts != NULL) {
+                bind_cluster_adverts_clear(b, cn, 0);
+                a.free(cn->cluster_adverts, (size_t)b->n_anns * sizeof(*cn->cluster_adverts), a.ctx);
+            }
             if (cn->fetches != NULL) {
                 a.free(cn->fetches, (size_t)b->n_fetches * sizeof(*cn->fetches),
                        a.ctx);
@@ -2970,6 +3267,8 @@ moqr_bind_destroy(moqr_bind_t *b)
         }
         a.free(b->conns, (size_t)b->max_conns * sizeof(*b->conns), a.ctx);
     }
+    if (b->cluster_hops != NULL)
+        a.free(b->cluster_hops, ((size_t)b->cluster_info.max_hops + 1u) * sizeof(uint64_t), a.ctx);
     if (b->fwd != NULL) {
         /* Memory-only: owned references the transactions still hold are
          * released without any session call. */
@@ -3084,9 +3383,9 @@ conn_by_cookie(moqr_bind_t *b, uint64_t cookie)
     return cn->used ? cn : NULL;
 }
 
-moqr_result_t
-moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
-                    moq_version_t version)
+static moqr_result_t
+bind_conn_open_cluster(moqr_bind_t *b, moq_session_t *session,
+                    moq_version_t version, const moqr_bind_cluster_peer_cfg_t *cluster)
 {
     if (b == NULL || session == NULL) {
         return MOQR_ERR_INVAL;
@@ -3104,6 +3403,10 @@ moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
     case MOQ_VERSION_DRAFT_22: draft = B_DRAFT_22; break;
     default:                   return MOQR_ERR_INVAL;
     }
+    moq_cluster_info_t ci;
+    if (moq_session_cluster_info(session, &ci, sizeof(ci)) == MOQ_OK && ci.enabled &&
+        (!b->cluster_info.enabled || ci.local_hop_id != b->cluster_info.local_hop_id))
+        return MOQR_ERR_INVAL;
     if (conn_by_session(b, session) != NULL) {
         return MOQR_ERR_INVAL;   /* duplicate attach */
     }
@@ -3124,6 +3427,15 @@ moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
             cn->session = session;
             cn->wire_draft = draft;
             cn->binding = binding;
+            cn->cluster_peer_ready = false;
+            cn->cluster_discovery_closed = false;
+            cn->cluster_discovery_retiring = false;
+            cn->cluster_discovery_cancel_owed = false;
+            cn->cluster_negotiated = false;
+            cn->cluster_discovery = (moq_ns_sub_handle_t){0};
+            cn->cluster_cost_override = cluster != NULL && cluster->has_relay_cost;
+            cn->cluster_cost = cluster != NULL ? cluster->relay_cost : 1;
+            cn->cluster_correlation = cluster != NULL ? cluster->correlation_id : 0;
             bind_dl_clear(b->dl_ready, i);
             bind_dl_clear(b->dl_parked, i);
             cn->park_reason = B_PARK_NONE;
@@ -3141,8 +3453,10 @@ moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
             usub_release_all(b, cn);   /* owned keys, then the clean table */
             memset(cn->pubs, 0, (size_t)b->n_pubs * sizeof(*cn->pubs));
             memset(cn->fetches, 0, (size_t)b->n_fetches * sizeof(*cn->fetches));
+            cn->fetch_hw = 0;
             memset(cn->refusals, 0, (size_t)b->n_refusals * sizeof(*cn->refusals));
             cn->refusals_reserved = 0;
+            cn->retry_pending = 0;
             /* The relay answers every downstream subscription update itself
              * (bind_update_answer), so nothing is acknowledged before the
              * relay has decided. */
@@ -3159,6 +3473,40 @@ moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session,
         }
     }
     return MOQR_ERR_CAPACITY;
+}
+
+moqr_result_t
+moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session, moq_version_t version)
+{
+    return bind_conn_open_cluster(b, session, version, NULL);
+}
+
+void
+moqr_bind_cluster_peer_cfg_init_sized(moqr_bind_cluster_peer_cfg_t *cfg, size_t size)
+{
+    if (cfg == NULL || size < sizeof(uint32_t)) return;
+    const moqr_bind_cluster_peer_cfg_t value = {0};
+    moqr_cluster_write(cfg, size, &value, sizeof(value));
+}
+
+moq_result_t
+moqr_bind_conn_open_cluster(moqr_bind_t *b, moq_session_t *session,
+    moq_version_t version, const moqr_bind_cluster_peer_cfg_t *cfg)
+{
+    moqr_bind_cluster_peer_cfg_t value = {0};
+    if (cfg != NULL && !moqr_cluster_read(cfg, MOQR_BIND_CLUSTER_PEER_CFG_V0_SIZE,
+                                         &value, sizeof(value))) return MOQ_ERR_INVAL;
+    return moqr_result_public(bind_conn_open_cluster(b, session, version, &value));
+}
+
+/* The integer codec of the Object and Track Properties a connection reads
+ * and writes: its negotiated draft's (draft-16 (i); draft-18 and draft-22
+ * vi64). */
+static uint8_t
+bind_props_codec(const b_conn_t *cn)
+{
+    return cn->wire_draft == B_DRAFT_16 ? MOQR_PROPS_CODEC_QUIC_VARINT
+                                        : MOQR_PROPS_CODEC_VI64;
 }
 
 moq_version_t
@@ -3785,6 +4133,10 @@ bind_update_answer_pump(moqr_bind_t *b, uint64_t now_us)
         for (uint32_t i = 0; i < b->n_dsubs; i++) {
             b_dsub_t *ds = &cn->dsubs[i];
             if (!ds->used || ds->upd_answer == B_UPD_NONE) {
+                continue;
+            }
+            if (cn->events_pending) {
+                held++;
                 continue;
             }
             if (bind_update_answer_give(b, cn, ds, now_us) == B_UPD_HELD) {
@@ -4753,6 +5105,19 @@ bind_ring_holds_ns(const moqr_bind_t *b, uint64_t bcookie, uint64_t handle)
 
 /* One attempt to accept a held update. true when the entry is settled
  * (answered, refused, or moot); false while it must still be held. */
+static moqr_result_t
+bind_cluster_update_current(moqr_bind_t *b, b_conn_t *cn, uint64_t handle)
+{
+    int slot = ann_find(b, cn, handle);
+    if (slot < 0) return MOQR_ERR_STALE_HANDLE;
+    moq_namespace_update_record_t rec;
+    if (moq_session_namespace_owed_update(cn->session,
+            (moq_announcement_t){handle}, &rec, sizeof(rec)) != MOQ_OK)
+        return MOQR_ERR_STALE_HANDLE;
+    return moqr_result_legacy(moqr_core_announce_cluster(b->core, cn->binding,
+        cn->anns[slot].ns, handle, &rec.cluster, true));
+}
+
 static bool
 bind_nsu_commit(moqr_bind_t *b, b_conn_t *cn, b_nsans_t *e, uint64_t now_us)
 {
@@ -4834,6 +5199,18 @@ bind_nsu_commit(moqr_bind_t *b, b_conn_t *cn, b_nsans_t *e, uint64_t now_us)
     if (family == B_NSU_NS && v.prefix && bind_ring_holds_ns(b, bcookie, handle)) {
         moqr_core_ns_update_abort(b->core, &nprep);
         return false;   /* an old-prefix notification goes first */
+    }
+    if (family == B_NSU_ANN && b->cluster_info.enabled && !e->cluster_applied) {
+        BIND_CALL_RETRY(crc, bind_cluster_update_current(b, cn, handle));
+        if (crc == MOQR_ERR_WOULD_BLOCK) return false;
+        if (crc != MOQR_OK) {
+            bind_nsans_drop(b, e);
+            bind_nsu_reject(b, cn, family, handle, id,
+                crc == MOQR_ERR_NOMEM || crc == MOQR_ERR_CAPACITY
+                    ? MOQ_REQUEST_ERROR_EXCESSIVE_LOAD : MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
+            return true;
+        }
+        e->cluster_applied = true;
     }
     moq_result_t arc = bind_nsu_answer(cn, family, handle, id, false, 0, now_us);
     if (arc != MOQ_OK) {
@@ -5028,6 +5405,7 @@ bind_nsu_pump(moqr_bind_t *b, uint64_t now_us)
             bind_nsans_drop(b, e);
             continue;
         }
+        if (cn->events_pending) continue;
         if (e->initial) {
             bind_tracks_answer_held(b, cn, e, now_us);
             continue;
@@ -5293,10 +5671,20 @@ bind_discovery_pump(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
         bool reserved = slot >= 0 &&
                         moqr_core_internal_sub_reserve(b->core) == MOQR_OK;
         if (reserved) {
+            /* Asked for, the track's properties are all stated or the offer
+             * is not made (a relay includes all of them, d16 §2.5, d18 §2.5,
+             * d22 §7.7): a set this draft cannot carry, or a required record
+             * that is not available, is reported like a track without a
+             * subscription. An unmanaged track's set is EMPTY. */
             moqr_bind_meta_ref_t props;
             memset(&props, 0, sizeof(props));
+            b_props_tmp_t ptmp = { NULL, 0 };
+            moq_bytes_t pout = { NULL, 0 };
+            bool statable = true;
             if (d.include_properties) {
-                (void)moqr_bind_meta_latest(b, d.track, &props);
+                bind_meta_reply_pin(b, d.track, &props);
+                statable = bind_meta_out(b, &props, moq_session_version(cn->session), &pout,
+                                         &ptmp);
             }
             moq_publish_cfg_t pc;
             moq_publish_cfg_init_sized(&pc, sizeof(pc));
@@ -5316,11 +5704,13 @@ bind_discovery_pump(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                 pc.has_group_order = true;
                 pc.group_order = (moq_group_order_t)d.group_order;
             }
-            if (props.state == MOQR_BIND_META_PRESENT &&
-                bind_meta_can_replay(&props, moq_session_version(cn->session))) {
-                pc.track_properties = props.bytes;
+            pc.track_properties = pout;
+            if (statable) {
+                prc = moq_session_publish(cn->session, &pc, now_us, &pub);
+            } else {
+                FWD_DBG(b, publish_withheld);
             }
-            prc = moq_session_publish(cn->session, &pc, now_us, &pub);
+            bind_track_props_release(b, &ptmp);
             moqr_bind_meta_release(b, &props);
         }
         if (reserved && prc != MOQ_OK) {
@@ -5329,6 +5719,7 @@ bind_discovery_pump(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
         if (prc == MOQ_ERR_WOULD_BLOCK) {
             /* The same match is offered again next pump: a held ALLOW stays
              * held; a decision made now is made again then. */
+            FWD_DBG(b, discovery_retried);
             if (gres.gen != 0 &&
                 !(held && bind_dgrant_put(b, cn, d.cookie, d.track._opaque,
                                           d.track_gen, d.input_gen, gres))) {
@@ -5407,7 +5798,8 @@ bind_discovery_pump(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
             cn->session, (moq_track_sub_handle_t){ ._opaque = d.cookie },
             &suffix, d.name, now_us);
         if (src == MOQ_ERR_WOULD_BLOCK) {
-            return;
+            FWD_DBG(b, discovery_retried);
+            return;   /* the match is reported again next pump */
         }
         if (src != MOQ_OK && !fwd_result_is_gone(src)) {
             b->session_errors++;
@@ -5696,19 +6088,36 @@ bind_ingest_track(moqr_bind_t *b, b_conn_t *cn, moq_subscription_t sub,
     if (moq_subscription_is_valid(sub)) {
         for (uint32_t i = 0; i < b->n_usubs; i++) {
             if (cn->usubs[i].used && cn->usubs[i].ssub._opaque == sub._opaque) {
-                return cn->usubs[i].cancel_owed ? MOQR_TRACK_INVALID
-                                                : cn->usubs[i].track;
+                uint64_t current;
+                return !cn->usubs[i].cancel_owed &&
+                    moqr_core_track_current_generation(b->core, cn->usubs[i].track, &current) == MOQR_OK &&
+                    current == cn->usubs[i].track_gen ? cn->usubs[i].track : MOQR_TRACK_INVALID;
             }
         }
     } else if (moq_publication_is_valid(pub)) {
         for (uint32_t i = 0; i < b->n_pubs; i++) {
             if (cn->pubs[i].used && cn->pubs[i].pub_raw == pub._opaque) {
-                return cn->pubs[i].cancel_owed ? MOQR_TRACK_INVALID
-                                               : cn->pubs[i].track;
+                uint64_t current;
+                return !cn->pubs[i].cancel_owed &&
+                    moqr_core_track_current_generation(b->core, cn->pubs[i].track, &current) == MOQR_OK &&
+                    current == cn->pubs[i].track_gen ? cn->pubs[i].track : MOQR_TRACK_INVALID;
             }
         }
     }
     return MOQR_TRACK_INVALID;
+}
+
+/* A request terminal can arrive after a source was replaced while its
+ * cancellation waited for output credit. The retained track handle alone
+ * does not authorize effects on its new source. An intentionally idled
+ * source still owns cleanup of its old retained log and cached FETCHes. */
+static bool
+bind_terminal_owns_track(moqr_bind_t *b, moqr_track_t track, uint64_t source_gen)
+{
+    uint64_t current = 0;
+    return (moqr_core_track_current_generation(b->core, track, &current) == MOQR_OK &&
+            current == source_gen) ||
+           moqr_core_internal_source_idle(b->core, track, source_gen);
 }
 
 static void bind_track_malformed(moqr_bind_t *b, b_conn_t *cn,
@@ -5914,13 +6323,334 @@ bind_tracks_options(const moq_event_t *ev)
     return sq->options;
 }
 
+/* Resolve negotiated peer state once, then originate root discovery after
+ * SETUP authorization has been handled. Neither operation opens a transport. */
+static void bind_cluster_sync(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us, bool discover)
+{
+    if (!b->cluster_info.enabled || moq_session_state(cn->session) != MOQ_SESS_ESTABLISHED)
+        return;
+    moq_cluster_info_t info;
+    if (moq_session_cluster_info(cn->session, &info, sizeof(info)) != MOQ_OK)
+        return;
+    if (!cn->cluster_peer_ready) {
+        uint64_t cost = cn->cluster_cost_override ? cn->cluster_cost : info.peer_relay_cost;
+        moqr_cluster_peer_cfg_t peer;
+        moqr_cluster_peer_cfg_init(&peer);
+        peer.negotiated = info.negotiated;
+        peer.peer_hop_id = info.peer_hop_id;
+        peer.effective_relay_cost = cost;
+        peer.correlation_id = cn->cluster_correlation;
+        if (moqr_core_binding_set_cluster(b->core, cn->binding, &peer) != MOQ_OK) {
+            b->session_errors++;
+            (void)moq_session_close(cn->session, BIND_SESSION_INTERNAL_ERROR,
+                                    "cluster peer configuration failed", now_us);
+            conn_detach(b, cn, now_us);
+            return;
+        }
+        cn->cluster_negotiated = info.negotiated;
+        cn->cluster_peer_hop = info.peer_hop_id;
+        cn->cluster_peer_ready = true;
+    }
+    if (discover && cn->cluster_negotiated && cn->cluster_discovery._opaque == 0) {
+        moq_subscribe_namespace_cfg_t cfg;
+        moq_subscribe_namespace_cfg_init(&cfg);
+        cfg.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
+        moq_result_t rc =
+            moq_session_subscribe_namespace(cn->session, &cfg, now_us, &cn->cluster_discovery);
+        if (rc != MOQ_OK && rc != MOQ_ERR_WOULD_BLOCK && rc != MOQ_ERR_REQUEST_BLOCKED) {
+            b->session_errors++;
+            (void)moq_session_close(cn->session, BIND_SESSION_INTERNAL_ERROR,
+                                    "cluster discovery failed", now_us);
+            conn_detach(b, cn, now_us);
+        }
+    }
+}
+
+static void bind_cluster_discovery_end(moqr_bind_t *b, b_conn_t *cn, uint64_t handle,
+                                       uint64_t now_us)
+{
+    for (uint32_t i = 0; i < b->n_anns; i++) {
+        b_ann_t *a = &cn->anns[i];
+        if (a->used && a->discovered && a->discovery._opaque == handle)
+            (void)bind_ann_withdraw(b, cn, a->ann_raw, now_us);
+    }
+    cn->cluster_discovery_closed = true;
+    cn->cluster_discovery_retiring = false;
+    for (uint32_t i = 0; i < b->n_anns; i++) {
+        const b_ann_t *a = &cn->anns[i];
+        if (a->used && a->discovered && a->discovery._opaque == handle)
+            cn->cluster_discovery_retiring = true;
+    }
+    /* Keep the terminal handle: rediscovery is a host reconnect policy,
+     * not a tight loop against a peer that rejected discovery. */
+}
+
+static void bind_cluster_discovery_cancel(moqr_bind_t *b, b_conn_t *cn, moq_ns_sub_handle_t handle,
+                                          uint64_t now_us)
+{
+    moq_result_t rc = moq_session_cancel_namespace_sub(cn->session, handle, now_us);
+    cn->cluster_discovery_cancel_owed = rc == MOQ_ERR_WOULD_BLOCK;
+    bind_cluster_discovery_end(b, cn, handle._opaque, now_us);
+}
+
+/* The latest candidate lives in an eager per-slot path buffer. Updating
+ * metadata cannot allocate or replace the engine's old route until admitted. */
+static void bind_cluster_apply_ann(moqr_bind_t *b, b_conn_t *cn, uint32_t slot, uint64_t now_us)
+{
+    b_ann_t *a = &cn->anns[slot];
+    if (!a->used || !a->discovered || !a->cluster_pending)
+        return;
+    moqr_result_t rc;
+    BIND_CALL_RETRY(rc, moqr_result_legacy(moqr_core_announce_cluster(b->core, cn->binding, a->ns, a->ann_raw,
+                                                   &a->cluster, !a->cluster_initial)));
+    if (rc == MOQR_ERR_WOULD_BLOCK)
+        return;
+    if (rc == MOQR_OK) {
+        a->cluster_pending = false;
+        a->cluster_initial = false;
+        if (a->cluster_grant.gen != 0) {
+            moqr_grant_res_t grant = a->cluster_grant;
+            a->cluster_grant.gen = 0;
+            if (moqr_core_grant_commit(b->core, grant, 0) != MOQR_OK)
+                bind_cluster_discovery_cancel(b, cn, a->discovery, now_us);
+        }
+        return;
+    }
+    bool loop = false;
+    for (size_t i = 0; i < a->cluster.hop_count; i++)
+        if (b->cluster_info.local_hop_id != 0 &&
+            a->cluster.hop_ids[i] == b->cluster_info.local_hop_id)
+            loop = true;
+    if (loop) {
+        /* A looping replacement invalidates this route, while unrelated
+         * advertisements on its discovery stream remain usable. */
+        a->cluster_pending = false;
+        (void)bind_ann_withdraw(b, cn, a->ann_raw, now_us);
+    } else {
+        bind_cluster_discovery_cancel(b, cn, a->discovery, now_us);
+    }
+}
+
+static void bind_cluster_found(moqr_bind_t *b, b_conn_t *cn,
+                               const moq_namespace_found_event_t *found, uint64_t now_us)
+{
+    if (cn->cluster_discovery_closed || !cn->cluster_negotiated ||
+        found->handle._opaque != cn->cluster_discovery._opaque)
+        return;
+    const moq_ns_sub_handle_t discovery = found->handle;
+    moqr_ns_t ns = {found->track_namespace_suffix.parts, found->track_namespace_suffix.count};
+    if (found->cluster.hop_count == 0 || found->cluster.hop_ids == NULL ||
+        found->cluster.hop_count > b->cluster_info.max_hops) {
+        bind_cluster_discovery_cancel(b, cn, discovery, now_us);
+        return;
+    }
+    int slot = -1;
+    for (uint32_t i = 0; i < b->n_anns; i++) {
+        b_ann_t *a = &cn->anns[i];
+        if (a->used && a->discovered && a->discovery._opaque == discovery._opaque &&
+            ns_equal(a->ns, ns)) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        uint64_t err = 0, ticket = 0, lease = 0;
+        bind_auth_result_t auth =
+            bind_authorize(b, cn, MOQR_AUTH_PUBLISH_NAMESPACE, ns, (moq_bytes_t){0}, NULL, 0,
+                           now_us, &err, &ticket, &lease);
+        if (auth != BIND_AUTH_ALLOW || b->cluster_next_discovery == UINT64_C(0x0fffffffffffffff)) {
+            /* A response advertisement has no per-advertisement rejection.
+             * DENY/DEFER ends discovery without installing unauthorized routes. */
+            bind_cluster_discovery_cancel(b, cn, discovery, now_us);
+            return;
+        }
+        uint64_t raw = UINT64_C(0xf000000000000000) | ++b->cluster_next_discovery;
+        slot = ann_store(b, cn, raw, ns);
+        if (slot < 0) {
+            bind_cluster_discovery_cancel(b, cn, discovery, now_us);
+            return;
+        }
+        b_ann_t *a = &cn->anns[slot];
+        a->discovered = true;
+        a->discovery = discovery;
+        a->cluster_initial = true;
+        moqr_park_req_t request;
+        bind_park_init(&request, cn, b, MOQR_AUTH_PUBLISH_NAMESPACE, a->ns, (moq_bytes_t){0}, raw);
+        if (bind_grant_reserve(b, &request, NULL, 0, lease, now_us, &a->cluster_grant) != MOQR_OK) {
+            ann_clear_slot(b, cn, (uint32_t)slot);
+            bind_cluster_discovery_cancel(b, cn, discovery, now_us);
+            return;
+        }
+    }
+    /* A metadata update changes neither the authorized namespace nor the
+     * publisher lifetime. Its existing grant continues tick-based renewal;
+     * it must not need a second grant slot for an unchanged authorization. */
+    b_ann_t *a = &cn->anns[slot];
+    uint64_t *path = cn->cluster_paths + (size_t)slot * b->cluster_info.max_hops;
+    memcpy(path, found->cluster.hop_ids, found->cluster.hop_count * sizeof(uint64_t));
+    a->cluster = found->cluster;
+    a->cluster.hop_ids = path;
+    a->cluster_pending = true;
+    bind_cluster_apply_ann(b, cn, (uint32_t)slot, now_us);
+}
+
+/* Send the route currently eligible for this recipient. Durable advertisement
+ * identity is recorded separately so a blocked origin change resumes after
+ * its withdrawal and never repeats DONE or splices publishers. */
+static moq_result_t bind_cluster_namespace(moqr_bind_t *b, b_conn_t *cn, const moqr_intent_t *it,
+                                           uint64_t now_us)
+{
+    moqr_ns_t ns = {it->ns_parts, it->ns_count};
+    moq_namespace_t suffix = {it->ns_parts + it->value, it->ns_count - (size_t)it->value};
+    moq_ns_sub_handle_t handle = {it->cookie};
+    b_cadv_t *old = NULL, *free_slot = NULL;
+    for (uint32_t i = 0; i < b->n_anns; i++) {
+        b_cadv_t *a = &cn->cluster_adverts[i];
+        if (!a->ann.used) {
+            if (free_slot == NULL)
+                free_slot = a;
+        } else if (a->ann.ann_raw == it->cookie && ns_equal(a->ann.ns, ns))
+            old = a;
+    }
+    moqr_cluster_route_t route;
+    moq_result_t selected = moqr_core_cluster_route(b->core, cn->binding, ns, &route, sizeof(route));
+    if (selected != MOQ_OK && selected != MOQ_DONE)
+        return MOQ_ERR_INVAL;
+    bool gone = selected == MOQ_DONE || route.prefix_count != ns.count;
+    bool changed =
+        old != NULL && !gone &&
+        (old->origin != route.origin_id ||
+         (route.origin_id == 0 && !moqr_cluster_advertisement_id_eq(old->source_advertisement, route.advertisement)));
+    if (old != NULL && (gone || changed)) {
+        moq_result_t rc = moq_session_send_namespace_done(cn->session, handle, &suffix, now_us);
+        if (rc != MOQ_OK)
+            return rc;
+        if (old->ann.bytes != NULL)
+            b->alloc.free(old->ann.bytes, old->ann.bytes_len, b->alloc.ctx);
+        memset(old, 0, sizeof(*old));
+        free_slot = old;
+        old = NULL;
+    }
+    if (gone || (old != NULL && !cn->cluster_negotiated))
+        return MOQ_OK;
+    if (route.metadata.hop_count > b->cluster_info.max_hops || route.metadata.hop_ids == NULL)
+        return MOQ_ERR_INVAL;
+    memcpy(b->cluster_hops, route.metadata.hop_ids, route.metadata.hop_count * sizeof(uint64_t));
+    b->cluster_hops[route.metadata.hop_count] = b->cluster_info.local_hop_id;
+    moq_cluster_metadata_t metadata = route.metadata;
+    metadata.hop_ids = b->cluster_hops;
+    metadata.hop_count++;
+    b_cadv_t candidate;
+    memset(&candidate, 0, sizeof(candidate));
+    if (old == NULL) {
+        if (free_slot == NULL)
+            return MOQ_ERR_NOMEM;
+        size_t size = 0;
+        for (size_t i = 0; i < ns.count; i++)
+            size += ns.parts[i].len;
+        if (size > BIND_ANN_BYTES_MAX)
+            return MOQ_ERR_INVAL;
+        if (size != 0) {
+            candidate.ann.bytes = b->alloc.alloc(size, b->alloc.ctx);
+            if (candidate.ann.bytes == NULL)
+                return MOQ_ERR_NOMEM;
+        }
+        candidate.ann.bytes_len = size;
+        candidate.ann.ns.count = ns.count;
+        size_t at = 0;
+        for (size_t i = 0; i < ns.count; i++) {
+            candidate.ann.parts[i] = (moq_bytes_t){candidate.ann.bytes + at, ns.parts[i].len};
+            memcpy(candidate.ann.bytes + at, ns.parts[i].data, ns.parts[i].len);
+            at += ns.parts[i].len;
+        }
+    }
+    moq_result_t rc = cn->cluster_negotiated
+                          ? moq_session_send_namespace_cluster(cn->session, handle, &suffix,
+                                                               &metadata, sizeof(metadata), now_us)
+                          : moq_session_send_namespace(cn->session, handle, &suffix, now_us);
+    if (rc != MOQ_OK) {
+        if (candidate.ann.bytes != NULL)
+            b->alloc.free(candidate.ann.bytes, candidate.ann.bytes_len, b->alloc.ctx);
+        return rc;
+    }
+    if (old == NULL) {
+        *free_slot = candidate;
+        old = free_slot;
+        old->ann.ns.parts = old->ann.parts;
+        old->ann.used = true;
+        old->ann.ann_raw = it->cookie;
+    }
+    old->origin = route.origin_id;
+    old->source_advertisement = route.advertisement;
+    return MOQ_OK;
+}
+
 static void
 bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
               uint64_t now_us)
 {
     moq_bytes_t nsbuf[32];
     b->events_translated++;
+    bind_cluster_sync(b, cn, now_us, false);
+    if (cn->closed || !cn->used) return;
     switch (ev->kind) {
+    case MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED: {
+        if (ev->detail_size < MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE) {
+            break;
+        }
+        const moq_outgoing_subgroup_terminated_event_t *te =
+            &ev->u.outgoing_subgroup_terminated;
+        if (te->cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING &&
+            te->cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT) break;
+        bool pub = moq_publication_is_valid(te->pub);
+        bool sub = moq_subscription_is_valid(te->sub);
+        if (pub == sub) break;
+        uint64_t owner = pub ? te->pub._opaque : te->sub._opaque;
+        if (bind_cookie_is_publication(owner) != pub) break;
+        for (uint32_t i = 0; i < b->n_sgs; i++) {
+            b_sg_t *sg = &cn->sgs[i];
+            if (!sg->used || sg->sub_raw != owner ||
+                !moq_subgroup_eq(sg->h, te->subgroup) ||
+                sg->group != te->group_id || sg->subgroup != te->subgroup_id) {
+                continue;
+            }
+            if (sg->stopped) break;   /* keep the first exact terminal identity */
+            sg->stopped = true;
+            sg->stopped_ref = te->stream_ref;
+            sg->obj_begun = false;
+            sg->obj_id = 0;
+            sg->next_chunk = 0;
+            sg->reset_owed = false;
+            sg->reset_wire = 0;
+            /* The failed write's capacity floor is obsolete: reconciliation
+             * needs no action space, and may preserve a sibling's hold. */
+            uint32_t ci = (uint32_t)(cn - b->conns);
+            bind_dl_clear(b->dl_parked, ci);
+            cn->park_reason = B_PARK_NONE;
+            cn->park_cap = 0;
+            bind_dl_set(b->dl_ready, ci);
+            break;
+        }
+        break;
+    }
+    case MOQ_EVENT_NAMESPACE_FOUND:
+        bind_cluster_found(b, cn, &ev->u.namespace_found, now_us);
+        break;
+    case MOQ_EVENT_NAMESPACE_GONE: {
+        const moq_namespace_gone_event_t *gone = &ev->u.namespace_gone;
+        moqr_ns_t ns = {gone->track_namespace_suffix.parts, gone->track_namespace_suffix.count};
+        for (uint32_t i = 0; i < b->n_anns; i++) {
+            b_ann_t *a = &cn->anns[i];
+            if (a->used && a->discovered && a->discovery._opaque == gone->handle._opaque && ns_equal(a->ns, ns)) {
+                (void)bind_ann_withdraw(b, cn, a->ann_raw, now_us); break;
+            }
+        }
+        break;
+    }
+    case MOQ_EVENT_NS_SUB_ERROR:
+        if (ev->u.ns_sub_error.handle._opaque == cn->cluster_discovery._opaque)
+            bind_cluster_discovery_end(b, cn, cn->cluster_discovery._opaque, now_us);
+        break;
     case MOQ_EVENT_NAMESPACE_PUBLISHED: {
         const moq_namespace_published_event_t *np =
             &ev->u.namespace_published;
@@ -6126,6 +6856,11 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                     continue;
                 }
                 moqr_track_t track = cn->usubs[i].track;
+                if (!bind_terminal_owns_track(b, track, cn->usubs[i].track_gen)) {
+                    usub_release(b, &cn->usubs[i]);
+                    tracked = true;
+                    continue;
+                }
                 moqr_result_t mrc;
                 b->malformed_tracks++;
                 bind_reset_track_streams(b, track, now_us);
@@ -6352,6 +7087,7 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
         d.end_of_group = ob->end_of_group;
         d.first_object = ob->first_object;
         d.subgroup_properties = ob->subgroup_properties;
+        d.properties_codec = bind_props_codec(cn);
         d.payload = ob->payload;        /* ownership transfers on OK */
         d.properties = ob->properties;
         d.now_us = now_us;
@@ -6404,6 +7140,7 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
             d.end_of_group = oc->end_of_group;
             d.first_object = oc->first_object;
             d.subgroup_properties = oc->subgroup_properties;
+            d.properties_codec = bind_props_codec(cn);
             d.payload = NULL;
             d.properties = oc->properties;   /* ownership transfers on OK */
             d.now_us = now_us;
@@ -6433,6 +7170,7 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
             d.end_of_group = oc->end_of_group;
             d.first_object = oc->first_object;
             d.subgroup_properties = oc->subgroup_properties;
+            d.properties_codec = bind_props_codec(cn);
             d.obj_state = MOQR_OBJ_OPEN;
             d.declared_len = oc->payload_length;
             d.properties = oc->properties;   /* ownership transfers on OK */
@@ -6481,16 +7219,32 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
          * increfs the slice; the event keeps its ref (freed by event cleanup).
          * Fail-closed: an append failure abandons the record, no half-state. */
         if (oc->chunk != NULL) {
-            if (moqr_core_append_chunk(b->core, track, oc->group_id,
+            moqr_result_t arc =
+                moqr_core_append_chunk(b->core, track, oc->group_id,
                                        oc->subgroup_id, oc->object_id,
-                                       oc->chunk) != MOQR_OK) {
-                moqr_reset_desc_t stopd;
-                if (moqr_reset_desc_internal(MOQR_RESET_CODE_STOPPED,
-                                             &stopd) == MOQR_OK) {
-                    (void)moqr_core_abandon_record(b->core, track,
+                                       oc->chunk);
+            if (arc != MOQR_OK) {
+                /* The chunk is not held, so the object is lost here. Refused
+                 * for capacity, with nothing older left to reclaim, it is
+                 * lost to the relay's bounded cache: the record and its
+                 * subgroup's stream end with the eviction cause, as a refused
+                 * ingest does, so no subscriber's stream goes on past the
+                 * lost object or ends with a FIN, and a later object of the
+                 * subgroup starts a new stream. Any other refusal (a chunk
+                 * past the declared length, a record no longer OPEN) ends the
+                 * record alone, as a local STOP does. */
+                bool lost = arc == MOQR_ERR_CAPACITY;
+                moqr_reset_desc_t cause;
+                if (moqr_reset_desc_internal(lost ? MOQR_RESET_CODE_EVICTED
+                                                  : MOQR_RESET_CODE_STOPPED,
+                                             &cause) == MOQR_OK &&
+                    moqr_core_abandon_record(b->core, track, oc->group_id,
+                                             oc->subgroup_id, oc->object_id,
+                                             cause) == MOQR_OK &&
+                    lost) {
+                    (void)moqr_core_reset_subgroup(b->core, track,
                                                    oc->group_id,
-                                                   oc->subgroup_id,
-                                                   oc->object_id, stopd);
+                                                   oc->subgroup_id, cause);
                 }
                 b->ingest_refusals++;
                 break;
@@ -6501,7 +7255,16 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
          * abandon stores the terminal cause code: a genuine upstream RESET
          * forwards the publisher's oc->error_code; STOP / a relay-initiated
          * abandon uses a relay-defined code. Downstream delivery
-         * propagates it. */
+         * propagates it.
+         *
+         * An upstream RESET also ends the subgroup's stream, and this chunk
+         * is the session's only report of it (a reset is reported once, on
+         * one surface): the subgroup's list ends with the same reset, so a
+         * subscription that never began this object is still closed with a
+         * reset after the retained objects. Only the source whose OPEN record
+         * this abandoned ends the list; a copy's terminal from another source
+         * finds no OPEN record of its own. STOP and a failed complete end the
+         * record alone. */
         if (oc->end) {
             moqr_result_t erc = MOQR_OK;
             if (oc->terminal == MOQ_OBJECT_TERMINAL_NORMAL) {
@@ -6519,11 +7282,14 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                                      MOQR_RESET_CODE_STOPPED, &rdesc) ==
                                  MOQR_OK;
                 }
-                if (have_rdesc) {
-                    (void)moqr_core_abandon_record(b->core, track,
+                if (have_rdesc &&
+                    moqr_core_abandon_record(b->core, track, oc->group_id,
+                                             oc->subgroup_id, oc->object_id,
+                                             rdesc) == MOQR_OK &&
+                    oc->terminal == MOQ_OBJECT_TERMINAL_RESET) {
+                    (void)moqr_core_reset_subgroup(b->core, track,
                                                    oc->group_id,
-                                                   oc->subgroup_id,
-                                                   oc->object_id, rdesc);
+                                                   oc->subgroup_id, rdesc);
                 }
                 if (erc != MOQR_OK) {
                     b->ingest_refusals++;
@@ -6534,14 +7300,19 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
     }
 #ifdef MOQ_EVENT_SUBGROUP_RESET
     case MOQ_EVENT_SUBGROUP_RESET: {
-        /* The upstream subgroup stream RESET in whole-object receive mode:
-         * the session dropped the partial object (no OBJECT_RECEIVED for
-         * it), so this event is the only ingest-side evidence the stream
-         * ended. Terminate the (group, subgroup) ledger abnormally with the
-         * publisher's code — retained COMPLETE records stay servable and
-         * each subscription's downstream subgroup is reset (never FIN'd)
-         * once it has consumed them. Streaming receive mode surfaces resets
-         * as terminal OBJECT_CHUNKs and never reaches here. */
+        /* An upstream subgroup stream RESET that no surfaced object terminal
+         * carries: in whole-object receive mode (the session dropped the
+         * partial object, no OBJECT_RECEIVED for it), and in streaming mode
+         * a stream reset between objects or after its last object, an object
+         * suppressed by Forward State 0, or a shared stream's subscriptions
+         * the object in flight did not match. This event is then the only
+         * ingest-side evidence the stream ended. Terminate the (group,
+         * subgroup) ledger abnormally with the publisher's code — retained
+         * COMPLETE records stay servable and each subscription's downstream
+         * subgroup is reset (never FIN'd) once it has consumed them. A reset
+         * that cuts a surfaced streaming object off arrives as that object's
+         * terminal OBJECT_CHUNK instead; where both arrive (a shared stream)
+         * the list keeps the first terminal recorded. */
         moq_subgroup_reset_event_t *sr = &ev->u.subgroup_reset;
         moqr_track_t track = bind_ingest_track(b, cn, sr->sub, sr->pub);
         if (moqr_track_is_valid(track)) {
@@ -6603,6 +7374,11 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                 ev->detail_size >= offsetof(moq_publish_finished_event_t, cause) +
                                        sizeof(ev->u.publish_finished.cause) &&
                 ev->u.publish_finished.cause == MOQ_REQUEST_TERMINAL_MALFORMED_TRACK;
+            if (malformed && !bind_terminal_owns_track(
+                    b, cn->pubs[i].track, cn->pubs[i].track_gen)) {
+                cn->pubs[i].used = false;
+                continue;
+            }
             if (malformed) {
                 b->malformed_tracks++;
                 bind_reset_track_streams(b, cn->pubs[i].track, now_us);
@@ -6796,11 +7572,10 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
             break;
         }
         /* Then reject unsupported shapes: a join of a PUBLISH-initiated
-         * subscription, and descending order except for a draft-22
-         * standalone FETCH. */
+         * subscription, and a descending join. */
         if (fq->joining_pub._opaque != 0 ||
             (fq->group_order == MOQ_GROUP_ORDER_DESCENDING &&
-             (cn->wire_draft != B_DRAFT_22 || fq->joining_sub._opaque != 0))) {
+             fq->joining_sub._opaque != 0)) {
             bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_NOT_SUPPORTED, now_us);
             break;
         }
@@ -6809,12 +7584,11 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
          * authorized there; the empty-identity authorization above cannot
          * admit a join by itself). */
         if (fq->joining_sub._opaque != 0) {
-            fwd_admit(b, cn, fq, now_us);
+            fwd_admit(b, cn, fq, bind_fetch_options(ev), now_us);
             break;
         }
-        /* Plan against the core retained cursor. A range stated relative to
-         * the Largest Object resolves against this relay's own Largest, in
-         * the same call that plans it. */
+        /* A range stated relative to the Largest Object resolves against
+         * this relay's own Largest, in the same call that plans it. */
         const moq_fetch_request_options_t *fo = bind_fetch_options(ev);
         moqr_fetch_req_t freq;
         moqr_fetch_req_init(&freq);
@@ -6835,54 +7609,12 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
         /* An Object still arriving is waited for, up to the deadline. */
         freq.report_pending = true;
         bind_fetch_range(fo, &freq);
-        if (cn->wire_draft == B_DRAFT_22) {
-            /* Served from cache and, for what it does not hold, upstream
-             * (draft-22 3.2.3). */
-            bind_standalone_request(b, cn, fq, &freq, fo, now_us);
-            break;
-        }
-        moqr_fetch_t cfetch;
-        moqr_fetch_plan_t plan;
-        moqr_result_t forc = moqr_core_fetch_open(b->core, cn->binding, &freq,
-                                                  now_us, &cfetch, &plan);
-        if (forc != MOQR_OK) {
-            bind_reject_admission(b, cn, MOQR_AUTH_FETCH, fq->fetch._opaque,
-                                  forc, now_us);
-            break;
-        }
-        if (plan.admit == MOQR_FETCH_REJECT) {
-            /* DOES_NOT_EXIST / INVALID_RANGE */
-            bind_fetch_refuse(b, cn, fq->fetch, plan.error_code, now_us);
-            break;
-        }
-        /* ACCEPT: park it in the conn fetch table; bind_fetch_pump drives
-         * accept_fetch -> stream objects -> end_fetch on the network thread. */
-        int fi = -1;
-        for (uint32_t i = 0; i < b->n_fetches; i++) {
-            if (!cn->fetches[i].used) {
-                fi = (int)i;
-                break;
-            }
-        }
-        if (fi < 0) {   /* impossible: the bind table matches the core pool */
-            (void)moqr_core_fetch_close(b->core, cfetch);
-            bind_fetch_refuse(b, cn, fq->fetch,
-                              MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
-            break;
-        }
-        b_fetch_t *bf = &cn->fetches[fi];
-        bf->used = true;
-        bf->state = BF_NEEDS_OK;
-        bf->sfetch = fq->fetch;
-        bf->cfetch = cfetch;
-        bf->eot = plan.end_of_track;
-        bf->end_group = plan.end_group;
-        bf->end_object = plan.end_object;
-        bf->fill_deadline_us = bind_wait_deadline(
-            b, now_us, fo != NULL && (fo->flags & MOQ_FETCH_REQUEST_HAS_FILL_TIMEOUT) != 0,
-            fo != NULL ? fo->fill_timeout_ms : 0);
-        bf->fetch_timed_out_ok = cn->wire_draft == B_DRAFT_22;
-        bf->fetch_held_pending = false;
+        /* Served from cache and, for what it does not hold, upstream, on
+         * every draft: the responder serves the available Objects in order
+         * and waits for upstream confirmation of the ones it does not hold
+         * (draft-16 9.16.3, draft-18 10.12.3, draft-22 3.2.3). The shard owning
+         * the track answers it when that is another shard. */
+        bind_standalone_request(b, cn, fq, &freq, fo, NULL, now_us);
         break;
     }
     case MOQ_EVENT_FILL_REQUEST:
@@ -6943,6 +7675,12 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
     case MOQ_EVENT_NAMESPACE_SUBSCRIPTION_TERMINATED: {
         const moq_ns_subscription_terminated_event_t *nt =
             &ev->u.ns_subscription_terminated;
+        if (nt->local_role == MOQ_REQUEST_ROLE_REQUESTER &&
+            nt->handle._opaque == cn->cluster_discovery._opaque) {
+            bind_cluster_discovery_end(b, cn, nt->handle._opaque, now_us);
+            break;
+        }
+        bind_cluster_adverts_clear(b, cn, nt->handle._opaque);
         if (cn->wire_draft != B_DRAFT_22 ||
             nt->local_role != MOQ_REQUEST_ROLE_RESPONDER) {
             break;
@@ -7202,6 +7940,10 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
     if (cn == NULL || cn->closed) {
         return true; /* moot: the target session is gone or tearing down */
     }
+    if (cn->events_pending && bind_intent_deferrable(it->kind)) {
+        *defer = *it;
+        return false;
+    }
     switch (it->kind) {
     case MOQR_INTENT_ACCEPT_SUB: {
         if (bind_cookie_is_publication(it->cookie)) {
@@ -7220,7 +7962,10 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
         /* Reserve the tracking slot BEFORE accepting on the wire: a sub
          * the binding cannot track must be refused, never orphaned. */
         int slot = dsub_free_slot(b, cn);
-        if (slot < 0 || !bind_meta_can_replay(pin, moq_session_version(cn->session))) {
+        b_props_tmp_t ptmp = { NULL, 0 };
+        moq_bytes_t pout = { NULL, 0 };
+        if (slot < 0 ||
+            !bind_meta_out(b, pin, moq_session_version(cn->session), &pout, &ptmp)) {
             /* An ownership/representation limit, not an unsupported request
              * type (D22 Section 12.3). */
             return bind_refuse_unaccepted_sub(b, cn, it, slot < 0, now_us,
@@ -7228,12 +7973,13 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
         }
         moq_accept_subscribe_cfg_t cfg;
         moq_accept_subscribe_cfg_init(&cfg);
-        cfg.track_properties = pin->bytes;
+        cfg.track_properties = pout;
         cfg.has_largest = it->has_largest;
         cfg.largest_group = it->largest_group;
         cfg.largest_object = it->largest_object;
         moq_result_t arc =
             moq_session_accept_subscribe(cn->session, ssub, &cfg, now_us);
+        bind_track_props_release(b, &ptmp);
         if (arc == MOQ_ERR_WOULD_BLOCK) {
             *defer = *it; /* slot NOT committed; the retry re-reserves */
             return false;
@@ -7253,6 +7999,10 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
         cn->dsubs[slot].used = true;
         cn->dsubs[slot].sub_raw = it->cookie;
         cn->dsubs[slot].rsub = it->sub;
+        uint64_t source_gen = 0;
+        cn->dsubs[slot].has_ident =
+            moqr_core_sub_track(b->core, it->sub, &cn->dsubs[slot].ident_track,
+                                &source_gen) == MOQR_OK;
         return true;
     }
     case MOQR_INTENT_REJECT_SUB: {
@@ -7322,6 +8072,11 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
          * only once the terminal is actually on the wire. */
         for (uint32_t i = 0; i < b->n_sgs; i++) {
             if (!cn->sgs[i].used || cn->sgs[i].sub_raw != it->cookie) {
+                continue;
+            }
+            if (cn->sgs[i].stopped) {
+                memset(&cn->sgs[i], 0, sizeof(cn->sgs[i]));
+                bind_dl_rearm_on_slot_release(b, cn);
                 continue;
             }
             moq_result_t crc;
@@ -7500,19 +8255,38 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
         return true;
     }
     case MOQR_INTENT_UPSTREAM_UNSUBSCRIBE:
-        /* NOT deferrable: moq_session_unsubscribe WOULD_BLOCKs on UNSUBSCRIBE
-         * tombstone-capacity exhaustion (session_subscribe.c), which persists
-         * until late responses reclaim tombstones — not a transient full
-         * queue. Parking it would deadlock the retry head. It is upstream
-         * cleanup, not a downstream terminal: a dropped unsubscribe leaks an
-         * unwanted upstream subscription (bounded, per-track), never hangs a
-         * peer. Best-effort, as before. */
+        /* Retire only this source generation. A replacement can already own
+         * the same retained track when this queued intent reaches the bind. */
         for (uint32_t i = 0; i < b->n_usubs; i++) {
-            if (cn->usubs[i].used &&
-                moqr_track_eq(cn->usubs[i].track, it->track)) {
-                (void)moq_session_unsubscribe(cn->session, cn->usubs[i].ssub,
-                                              now_us);
-                usub_release(b, &cn->usubs[i]);
+            b_usub_t *us = &cn->usubs[i];
+            if (!us->used || !moqr_track_eq(us->track, it->track) ||
+                us->track_gen != it->track_gen) continue;
+            if (bind_cancel_settled(b, cn, bind_cancel_upstream_sub(cn, us->ssub, now_us),
+                                    "obsolete source cancellation failed", now_us)) {
+                usub_release(b, us);
+            } else {
+                us->cancel_owed = true;
+                cn->retry_pending |= B_RETRY_CANCEL;
+            }
+        }
+        for (uint32_t i = 0; i < b->n_pubs; i++) {
+            b_pub_t *bp = &cn->pubs[i];
+            if (!bp->used || !moqr_track_eq(bp->track, it->track) ||
+                bp->track_gen != it->track_gen) continue;
+            moq_publication_t pub = {bp->pub_raw};
+            uint64_t code = bp->cancel_code;
+            if (!bp->cancel_owed)
+                (void)moqr_reset_encode(moqr_bind_conn_version(b, cn->session),
+                                        MOQR_RESET_CANCELLED, &code);
+            b_meta_publish_t *mp = bind_meta_pub_find(b, cn, pub._opaque);
+            if (mp != NULL) bind_meta_pub_release(b, mp);
+            if (bind_cancel_settled(b, cn, bind_cancel_upstream_pub(cn, pub, code, now_us),
+                                    "obsolete source cancellation failed", now_us)) {
+                memset(bp, 0, sizeof(*bp));
+            } else {
+                bp->cancel_owed = true;
+                bp->cancel_code = code;
+                cn->retry_pending |= B_RETRY_CANCEL;
             }
         }
         return true;
@@ -7609,8 +8383,9 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
             !bind_ns_sub_accept_held(b, cn, it->cookie)) {
             moq_namespace_t suffix = { .parts = suffix_ns.parts,
                                        .count = suffix_ns.count };
-            moq_result_t rc =
-                is_gone
+            moq_result_t rc = b->cluster_info.enabled
+                ? bind_cluster_namespace(b, cn, it, now_us)
+                : is_gone
                     ? moq_session_send_namespace_done(cn->session, h, &suffix,
                                                       now_us)
                     : moq_session_send_namespace(cn->session, h, &suffix,
@@ -7675,7 +8450,10 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
         const moqr_bind_meta_ref_t *pin = b->metadata_executing;
         /* Draft-16's answer (a REQUEST_OK) has no field for them at all. */
         const bool stated = moq_session_version(cn->session) != MOQ_VERSION_DRAFT_16;
-        if (stated && !bind_meta_can_replay(pin, moq_session_version(cn->session))) {
+        b_props_tmp_t ptmp = { NULL, 0 };
+        moq_bytes_t pout = { NULL, 0 };
+        if (stated &&
+            !bind_meta_out(b, pin, moq_session_version(cn->session), &pout, &ptmp)) {
             /* The track's properties cannot be stated on this session, so
              * the status is refused rather than answered without them, as an
              * ACK would be (§7.7). */
@@ -7689,9 +8467,10 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
         cfg.has_largest = it->has_largest;
         cfg.largest_group = it->largest_group;
         cfg.largest_object = it->largest_object;
-        if (stated) cfg.track_properties = pin->bytes;
+        if (stated) cfg.track_properties = pout;
         moq_result_t trc =
             moq_session_accept_track_status(cn->session, h, &cfg, now_us);
+        bind_track_props_release(b, &ptmp);
         if (trc == MOQ_ERR_WOULD_BLOCK) {
             *defer = *it;
             return false;
@@ -7720,21 +8499,63 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
 
 /* -- delivery -------------------------------------------------------------------- */
 
-/* An ACCEPTED fetch hit an unrecoverable session error (eviction TOO_OLD, or a
- * write/accept/FIN failure). The session has no per-fetch abort, and the peer
- * has been (or is about to be) admitted, so its liveness demands a terminal:
- * hard-close the session (a
- * visible transport close reaches the peer) and detach the conn. binding_close
- * inside conn_detach retires the conn's core fetch cursors. A per-fetch reset /
- * range markers is a later refinement. Returns after detaching — the caller must
- * stop touching this conn. */
 /* -- Forwarded Joining FETCH implementation (see the b_fwd_t comment) -------- */
 
-#ifdef MOQR_BIND_TESTING
-#define FWD_DBG(b, field) ((b)->dbg_fwd.field++)
-#else
-#define FWD_DBG(b, field) ((void)0)
-#endif
+/* The Object Properties `props`, stated in `codec`, as `cn` writes them: the
+ * same buffer when its draft reads them unchanged (an empty block, or the
+ * same codec), else a converted copy in *owned: an ordinary owning rcbuf
+ * (moq_rcbuf_create, the allocator held by value under the rcbuf lifetime
+ * contract), so a session action that keeps it outlives nothing of the
+ * binding. The caller drops its reference once the write call returns; the
+ * conversion is redone on a retry after MOQ_ERR_WOULD_BLOCK, bounded
+ * transient work. MOQ_ERR_UNSUPPORTED when the block cannot be
+ * carried to this draft (an integer it cannot represent, Immutable
+ * Properties that would read differently, or a nonempty block of unknown
+ * codec), MOQ_ERR_PROTO when the block does not parse in its own codec (a
+ * malformed Track the ingest did not catch), MOQ_ERR_NOMEM when the copy
+ * cannot be made: the caller fails this request through its own local
+ * failure path. */
+static moq_result_t
+bind_props_out(moqr_bind_t *b, const b_conn_t *cn, const moq_rcbuf_t *props,
+               uint8_t codec, moq_rcbuf_t **out, moq_rcbuf_t **owned)
+{
+    *owned = NULL;
+    *out = (moq_rcbuf_t *)(void *)props;
+    if (props == NULL || moq_rcbuf_len(props) == 0) return MOQ_OK;
+    const uint8_t *in = moq_rcbuf_data(props);
+    size_t len = moq_rcbuf_len(props), need = 0;
+    uint8_t dst = bind_props_codec(cn);
+    moqr_props_conv_t r = moqr_core_internal_props_convert(codec, dst, in, len, NULL, 0,
+                                                           &need);
+    if (r == MOQR_PROPS_CONV_SAME) return MOQ_OK;
+    if (r == MOQR_PROPS_CONV_MALFORMED) {
+        FWD_DBG(b, props_malformed);
+        return MOQ_ERR_PROTO;
+    }
+    if (r != MOQR_PROPS_CONV_CONVERTED || need == 0) {
+        FWD_DBG(b, props_refused);
+        return MOQ_ERR_UNSUPPORTED;
+    }
+    uint8_t *buf = b->alloc.alloc(need, b->alloc.ctx);
+    if (buf == NULL) {
+        FWD_DBG(b, props_refused);
+        return MOQ_ERR_NOMEM;
+    }
+    size_t got = 0;
+    moq_rcbuf_t *rb = NULL;
+    bool ok = moqr_core_internal_props_convert(codec, dst, in, len, buf, need, &got) ==
+                  MOQR_PROPS_CONV_CONVERTED && got == need &&
+              moq_rcbuf_create(&b->alloc, buf, need, &rb) == MOQ_OK;
+    b->alloc.free(buf, need, b->alloc.ctx);   /* the rcbuf holds its own copy */
+    if (!ok) {
+        FWD_DBG(b, props_refused);
+        return MOQ_ERR_NOMEM;
+    }
+    FWD_DBG(b, props_converted);
+    *out = rb;
+    *owned = rb;
+    return MOQ_OK;
+}
 
 static uint64_t
 conn_cookie(const moqr_bind_t *b, const b_conn_t *cn)
@@ -8106,15 +8927,16 @@ retrieve_admit(moqr_bind_t *b, moqr_retrieve_cursor_t *c)
     }
     moq_bytes_t parts[32], name;
     moqr_ns_t ns;
-    if (source.subscription != NULL) {
+    if (source.subscription != NULL && source.subscription->has_key) {
         const b_usub_t *us = source.subscription;
-        if (!us->has_key) return MOQR_ERR_CAPACITY;
         ns = (moqr_ns_t){ .parts = us->parts, .count = us->ns_count };
         name = us->name;
     } else {
-        /* Accepted PUBLISH tracking carries the full retained-track identity.
-         * Copy its core-owned key now; never keep those borrowed views in a
-         * transaction or infer source validity from a live connection alone. */
+        /* An accepted PUBLISH, or an upstream subscription that could not keep
+         * its own copy of the key, names the full retained-track identity
+         * through the core. Copy that core-owned key now; never keep those
+         * borrowed views in a transaction or infer source validity from a
+         * live connection alone. */
         moqr_result_t rc = moqr_core_track_key(b->core, c->request.track,
             c->request.track_gen, parts, 32, &ns, &name);
         if (rc != MOQR_OK) return rc;
@@ -8508,6 +9330,7 @@ retrieve_collection_front(moqr_retrieve_cursor_t *c, const b_fwd_t *t)
             object.status = MOQR_OBJ_NORMAL;
             object.payload = it->payload;
             object.properties = it->properties;
+            object.properties_codec = it->properties_codec;
             retrieve_object(c, &object);
         }
         return;
@@ -8964,6 +9787,7 @@ bind_terminal_hold(moqr_bind_t *b, b_conn_t *cn, const b_refusal_t *want)
         b_refusal_t *r = &cn->refusals[i];
         if (!r->used) {
             *r = *want;
+            cn->retry_pending |= B_RETRY_REFUSAL;
             FWD_DBG(b, refusals_parked);
             return;
         }
@@ -9064,9 +9888,10 @@ bind_fetch_refuse(moqr_bind_t *b, b_conn_t *cn, moq_fetch_t fetch,
 static uint32_t
 bind_refusal_free(const moqr_bind_t *b, const b_conn_t *cn)
 {
-    uint32_t free_slots = 0;
-    for (uint32_t i = 0; i < b->n_refusals; i++) {
-        free_slots += cn->refusals[i].used ? 0u : 1u;
+    uint32_t free_slots = b->n_refusals;
+    for (uint32_t i = 0; (cn->retry_pending & B_RETRY_REFUSAL) &&
+                         i < b->n_refusals; i++) {
+        free_slots -= cn->refusals[i].used ? 1u : 0u;
     }
     return free_slots > cn->refusals_reserved
                ? free_slots - cn->refusals_reserved
@@ -9100,7 +9925,8 @@ bind_refusal_pump(moqr_bind_t *b, uint64_t now_us)
 {
     for (uint32_t ci = 0; ci < b->max_conns; ci++) {
         b_conn_t *cn = &b->conns[ci];
-        if (!cn->used || cn->closed || cn->session == NULL) {
+        if (!cn->used || cn->closed || cn->session == NULL ||
+            !(cn->retry_pending & B_RETRY_REFUSAL)) {
             continue;
         }
         for (uint32_t i = 0; i < b->n_refusals; i++) {
@@ -9148,6 +9974,14 @@ bind_refusal_pump(moqr_bind_t *b, uint64_t now_us)
             }
             memset(r, 0, sizeof(*r));
         }
+        /* Re-read rather than tracked through the walk: a retry above may
+         * hold another terminal in an entry the walk already passed. */
+        bool held = false;
+        for (uint32_t i = 0; !held && i < b->n_refusals; i++) {
+            held = cn->refusals[i].used;
+        }
+        cn->retry_pending = (uint8_t)((cn->retry_pending & ~B_RETRY_REFUSAL) |
+                                      (held ? B_RETRY_REFUSAL : 0u));
     }
 }
 
@@ -9541,7 +10375,7 @@ bind_fill_request(moqr_bind_t *b, b_conn_t *cn,
         bind_fill_fail(b, cn, fr->fill, now_us);
         return;
     }
-    bf->used = true;
+    bind_fetch_mark_used(cn, bf);
 }
 
 /* The child ended on the session side (its FIN or RESET committed, the peer
@@ -9629,8 +10463,12 @@ bind_fill_retrieve_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf,
         oc.datagram = moq_session_supports_fetch_datagram(cn->session)
                           ? it.object.datagram_pref : false;
         oc.payload = (moq_rcbuf_t *)(void *)it.object.payload;
-        oc.properties = (moq_rcbuf_t *)(void *)it.object.properties;
-        rc = moq_session_write_fill_object(cn->session, bf->sfill, &oc, now_us);
+        moq_rcbuf_t *props_own = NULL;
+        rc = bind_props_out(b, cn, it.object.properties, it.object.properties_codec,
+                            &oc.properties, &props_own);
+        if (rc == MOQ_OK)
+            rc = moq_session_write_fill_object(cn->session, bf->sfill, &oc, now_us);
+        if (props_own != NULL) moq_rcbuf_decref(props_own);
     } else {
         bf->state = BF_FILL_NEEDS_ABORT;
         return true;
@@ -9793,8 +10631,12 @@ bind_fill_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_us)
                           ? it.rec.datagram_pref
                           : false;
         oc.payload = (moq_rcbuf_t *)(void *)it.rec.payload;
-        oc.properties = (moq_rcbuf_t *)(void *)it.rec.properties;
-        rc = moq_session_write_fill_object(cn->session, bf->sfill, &oc, now_us);
+        moq_rcbuf_t *props_own = NULL;
+        rc = bind_props_out(b, cn, it.rec.properties, it.rec.properties_codec,
+                            &oc.properties, &props_own);
+        if (rc == MOQ_OK)
+            rc = moq_session_write_fill_object(cn->session, bf->sfill, &oc, now_us);
+        if (props_own != NULL) moq_rcbuf_decref(props_own);
         if (rc == MOQ_ERR_WOULD_BLOCK) {
             return false;   /* HOLD: not committed; the re-peek re-emits it */
         }
@@ -9838,16 +10680,17 @@ bind_fill_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_us)
     }
 }
 
-/* -- draft-22 standalone FETCH ------------------------------------------------ *
- * A standalone FETCH is admitted once, by this core's retrieval owner or by
- * the shard that owns the track, and answered with FETCH_OK at once: its End
- * Location is known at admission. Its range is then covered in the requested
- * group order through the shared retrieval cursor: Objects this relay holds
- * are served from its cache, and every run it does not hold is retrieved with
- * an upstream FETCH for exactly that run (draft-22 3.2.3), all against the
- * request's one total wait budget (9.20.5). A run nothing can serve by then
- * is marked Timed-Out and the response continues; a FILL_TIMEOUT of 0
- * therefore serves what is held and marks the rest at once. An upstream
+/* -- standalone FETCH --------------------------------------------------------- *
+ * A standalone FETCH, on every draft, is admitted once, by this core's
+ * retrieval owner or by the shard that owns the track, and answered with
+ * FETCH_OK at once: its End Location is known at admission. Its range is then
+ * covered in the requested group order through the shared retrieval cursor:
+ * Objects this relay holds are served from its cache, and every run it does
+ * not hold is retrieved with an upstream FETCH for exactly that run (draft-22
+ * 3.2.3), all against the request's one total wait budget (9.20.5). A run
+ * nothing can serve by then is marked Timed-Out (Unknown on a draft without
+ * that marker) and the response continues; a FILL_TIMEOUT of 0 therefore
+ * serves what is held and marks the rest at once. An upstream
  * FETCH that fails resets this response with UNKNOWN_OBJECT_STATUS (3.2.2),
  * and any local failure resets it with INTERNAL_ERROR: both are
  * request-local, never a session close or a FIN over missing Objects. The
@@ -9871,16 +10714,23 @@ bind_fetch_free_slot(moqr_bind_t *b, b_conn_t *cn)
 }
 
 /* Admission. The FETCH is already authorized; its range form is resolved by
- * whichever core owns the track. */
+ * whichever core owns the track. A Joining FETCH answered this way (see
+ * fwd_admit) passes the retained identity its subscription was answered for
+ * as join_track: a name that now resolves to another retained identity, here
+ * or at the shard that owns the track, is refused, never served from that
+ * one. A request refused for room is refused as capacity, as a join's
+ * forwarded form is. */
 static void
 bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
                         const moq_fetch_request_event_t *fq,
                         const moqr_fetch_req_t *freq,
-                        const moq_fetch_request_options_t *fo, uint64_t now_us)
+                        const moq_fetch_request_options_t *fo,
+                        const moqr_track_t *join_track, uint64_t now_us)
 {
     b_fetch_t *bf = bind_fetch_free_slot(b, cn);
     if (bf == NULL) {
-        bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
+        bind_reject_admission(b, cn, MOQR_AUTH_FETCH, fq->fetch._opaque,
+                              MOQR_ERR_CAPACITY, now_us);
         return;
     }
     const uint64_t deadline = bind_wait_deadline(
@@ -9897,7 +10747,13 @@ bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
                                                         now_us, &owner, &plan);
     if (rc != MOQR_OK) {
         /* The FETCH pool is full (or the request cannot be planned): this
-         * request alone is refused. */
+         * request alone is refused, a full pool as capacity (with its retry
+         * hint), as a join's forwarded form is. */
+        if (rc == MOQR_ERR_CAPACITY) {
+            bind_reject_admission(b, cn, MOQR_AUTH_FETCH, fq->fetch._opaque,
+                                  MOQR_ERR_CAPACITY, now_us);
+            return;
+        }
         bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
         return;
     }
@@ -9906,6 +10762,17 @@ bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
             moqr_retrieve_standalone_query_t q;
             memset(&q, 0, sizeof(q));
             q.remote_cookie = plan.remote_cookie;
+            if (b->cluster_info.enabled) {
+                moqr_cluster_route_t selected;
+                if (moqr_core_cluster_route(b->core, cn->binding, req.ns, &selected, sizeof(selected)) != MOQ_OK) {
+                    bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_DOES_NOT_EXIST, now_us);
+                    return;
+                }
+                q.cluster_selected = true;
+                q.cluster_source_advertisement = selected.advertisement;
+                q.cluster_requester_hop_id = cn->cluster_peer_hop;
+                q.cluster_requester_correlation_id = cn->cluster_correlation;
+            }
             q.ns = req.ns;
             q.name = req.name;
             q.start_group = req.start_group;
@@ -9917,10 +10784,15 @@ bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
             q.group_order = order;
             q.subscriber_priority = req.subscriber_priority;
             q.deadline_us = deadline;
+            q.join = join_track != NULL;
+            if (join_track != NULL) {
+                q.join_track = *join_track;
+            }
             uint64_t handle = 0;
-            if (b->sa_src.open(b->sa_src.ctx, &q, &handle) == MOQR_OK) {
+            moqr_result_t orc = b->sa_src.open(b->sa_src.ctx, &q, &handle);
+            if (orc == MOQR_OK) {
                 memset(bf, 0, sizeof(*bf));
-                bf->used = true;
+                bind_fetch_mark_used(cn, bf);
                 bf->standalone = true;
                 bf->sa_remote = true;
                 bf->sa_handle = handle;
@@ -9930,9 +10802,23 @@ bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
                 bf->fill_deadline_us = deadline;
                 return;
             }
-            plan.wire.error_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+            if (orc == MOQR_ERR_CAPACITY) {
+                /* No retrieval slot here to route it through. */
+                bind_reject_admission(b, cn, MOQR_AUTH_FETCH, fq->fetch._opaque,
+                                      MOQR_ERR_CAPACITY, now_us);
+                return;
+            }
+            plan.wire.error_code = join_track != NULL && orc == MOQR_ERR_STALE_HANDLE
+                                       ? MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID
+                                       : MOQ_REQUEST_ERROR_INTERNAL_ERROR;
         }
         bind_fetch_refuse(b, cn, fq->fetch, plan.wire.error_code, now_us);
+        return;
+    }
+    if (join_track != NULL && !moqr_track_eq(plan.track, *join_track)) {
+        (void)moqr_core_fetch_close(b->core, owner);
+        bind_fetch_refuse(b, cn, fq->fetch,
+                          MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID, now_us);
         return;
     }
     memset(bf, 0, sizeof(*bf));
@@ -9968,7 +10854,7 @@ bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
         bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
         return;
     }
-    bf->used = true;
+    bind_fetch_mark_used(cn, bf);
 }
 
 /* The subscriber cancelled (draft-22 3.2.4): nothing more is owed on the
@@ -10071,8 +10957,12 @@ bind_standalone_item(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_u
         oc.datagram = moq_session_supports_fetch_datagram(cn->session)
                           ? it.object.datagram_pref : false;
         oc.payload = (moq_rcbuf_t *)(void *)it.object.payload;
-        oc.properties = (moq_rcbuf_t *)(void *)it.object.properties;
-        rc = moq_session_write_fetch_object(cn->session, bf->sfetch, &oc, now_us);
+        moq_rcbuf_t *props_own = NULL;
+        rc = bind_props_out(b, cn, it.object.properties, it.object.properties_codec,
+                            &oc.properties, &props_own);
+        if (rc == MOQ_OK)
+            rc = moq_session_write_fetch_object(cn->session, bf->sfetch, &oc, now_us);
+        if (props_own != NULL) moq_rcbuf_decref(props_own);
     } else if (it.kind == MOQR_RETRIEVE_GAP) {
         if (it.gap_kind == MOQ_FETCH_RANGE_NON_EXISTENT) {
             /* Unmarked, a gap in a FETCH response says these Objects do not
@@ -10092,7 +10982,16 @@ bind_standalone_item(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_u
                 }
                 bf->response_ne_pending = false;
             }
-            rc = bind_fetch_write_range(cn, bf->sfetch, it.gap_kind, it.end, now_us);
+            /* Draft-16 and draft-18 have no End of Timed-Out Range. A run
+             * whose status was not confirmed upstream within the wait budget
+             * is of unknown status, which a FETCH response there reports as
+             * a range of unknown Objects while it goes on serving the known
+             * ones (draft-16 9.16.3, draft-18 10.12.3). */
+            moq_fetch_range_kind_t kind = it.gap_kind;
+            if (kind == MOQ_FETCH_RANGE_TIMED_OUT && cn->wire_draft != B_DRAFT_22) {
+                kind = MOQ_FETCH_RANGE_UNKNOWN;
+            }
+            rc = bind_fetch_write_range(cn, bf->sfetch, kind, it.end, now_us);
         }
     } else {
         bind_standalone_abort(b, cn, bf, MOQR_RESET_INTERNAL_ERROR);
@@ -10139,11 +11038,21 @@ bind_standalone_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_u
         if (prc != MOQR_OK || plan.wire.admit != MOQR_FETCH_ACCEPT ||
             retrieve_loc_cmp(plan.start, plan.end) > 0) {
             moq_fetch_t fetch = bf->sfetch;
+            /* No room at the owner (no retrieval slot, or its FETCH pool
+             * full) is refused as capacity, as a full pool here is. */
+            bool room = prc == MOQR_ERR_CAPACITY ||
+                        (prc == MOQR_OK && plan.wire.admit == MOQR_FETCH_REJECT &&
+                         plan.capacity);
             uint64_t code = prc == MOQR_OK && plan.wire.admit == MOQR_FETCH_REJECT
                                 ? plan.wire.error_code
                                 : MOQ_REQUEST_ERROR_INTERNAL_ERROR;
             bind_fill_release(b, bf);
-            bind_fetch_refuse(b, cn, fetch, code, now_us);
+            if (room) {
+                bind_reject_admission(b, cn, MOQR_AUTH_FETCH, fetch._opaque,
+                                      MOQR_ERR_CAPACITY, now_us);
+            } else {
+                bind_fetch_refuse(b, cn, fetch, code, now_us);
+            }
             return true;
         }
         bf->eot = plan.wire.end_of_track;
@@ -10156,10 +11065,29 @@ bind_standalone_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_u
         return true;
     }
     case BF_NEEDS_OK: {
-        /* A local track's properties are stated (§7.7). One another shard
-         * owns has its record there, and this answer carries none. */
+        /* The track's properties are stated (§7.7): a local track's from its
+         * reply pin, one another shard owns from the snapshot its owner took
+         * at admission. A set this session cannot carry refuses the fetch
+         * before FETCH_OK. */
         moqr_bind_meta_ref_t pin = {0};
-        if (!bf->sa_remote && !bind_fetch_ok_pin(b, cn, bf->cfetch, &pin)) {
+        b_props_tmp_t ptmp = { NULL, 0 };
+        moq_bytes_t pout = { NULL, 0 };
+        bool stated;
+        if (bf->sa_remote) {
+            moqr_retrieve_standalone_plan_t sp;
+            memset(&sp, 0, sizeof(sp));
+            moqr_bind_meta_ref_t snap = {0};
+            if (b->sa_src.plan(b->sa_src.ctx, bf->sa_handle, &sp) == MOQR_OK) {
+                snap.state = sp.meta_state;
+                snap.wire_version = sp.meta_wire_version;
+                snap.bytes = sp.meta_bytes;
+            }
+            stated = bind_meta_out(b, &snap, moq_session_version(cn->session), &pout,
+                                   &ptmp);
+        } else {
+            stated = bind_fetch_ok_pin(b, cn, bf->cfetch, &pin, &pout, &ptmp);
+        }
+        if (!stated) {
             moqr_bind_meta_release(b, &pin);
             moq_fetch_t fetch = bf->sfetch;
             bind_fill_release(b, bf);
@@ -10171,8 +11099,9 @@ bind_standalone_step(moqr_bind_t *b, b_conn_t *cn, b_fetch_t *bf, uint64_t now_u
         ac.end_of_track = bf->eot;
         ac.end_group = bf->end_group;
         ac.end_object = bf->end_object;
-        ac.track_properties = pin.bytes;
+        ac.track_properties = pout;
         rc = moq_session_accept_fetch(cn->session, bf->sfetch, &ac, now_us);
+        bind_track_props_release(b, &ptmp);
         moqr_bind_meta_release(b, &pin);
         if (rc == MOQ_ERR_WOULD_BLOCK) return false;
         if (rc == MOQ_OK) {
@@ -10231,59 +11160,60 @@ bind_refusal_conn_gone(moqr_bind_t *b, b_conn_t *cn)
     }
 }
 
-/* Admit a downstream Joining FETCH as a forwarding transaction, or reject it
- * on the wire. The joined subscription is resolved ONCE to its track identity
- * and generation; the resolved namespace/name is what the fetch is authorized
- * against (fail-closed) and what the upstream request names. The upstream
- * source is the connection whose upstream subscription carries that exact
- * (track, generation): a replaced origin has a new generation and is never
- * addressed by an older transaction. */
+/* Admit a downstream Joining FETCH, or refuse it on the wire. The session has
+ * resolved its range against the joined subscription's saved Largest
+ * (draft-16 9.16.2.1); that range is never widened or resolved again here.
+ * The joined subscription is resolved ONCE, and only to the retained
+ * identity its SUBSCRIBE_OK answered for: a track whose retained identity has
+ * been replaced since is no longer that subscription's, so the join is
+ * refused rather than answered from the replacement. The fetch is authorized
+ * against that track's full name (fail-closed).
+ *
+ * Through an upstream subscription that kept its track key and carries the
+ * track's source generation, the join is one bounded upstream transaction:
+ * the source answers the whole range. Any other join -- a track that arrived
+ * by PUBLISH, an upstream subscription that could not keep its key, a track
+ * with no live source, one another shard owns -- is answered as a standalone
+ * FETCH of that range is (bind_standalone_request): retained Objects from the
+ * cache, each run the cache does not hold confirmed with the track's live
+ * source within the request's wait budget, and a run there is no source to
+ * confirm marked Unknown (9.16.3). A missing upstream subscription is not
+ * evidence that the track does not exist. */
 static void
 fwd_admit(moqr_bind_t *b, b_conn_t *cn, const moq_fetch_request_event_t *fq,
-          uint64_t now_us)
+          const moq_fetch_request_options_t *fo, uint64_t now_us)
 {
-    /* 1. Resolve the joined subscription. */
-    moqr_sub_t rsub = MOQR_SUB_INVALID;
+    /* 1. Resolve the joined subscription to its retained identity. */
+    const b_dsub_t *ds = NULL;
     for (uint32_t i = 0; i < b->n_dsubs; i++) {
         if (cn->dsubs[i].used &&
             cn->dsubs[i].sub_raw == fq->joining_sub._opaque) {
-            rsub = cn->dsubs[i].rsub;
+            ds = &cn->dsubs[i];
             break;
         }
     }
     moqr_track_t track = { 0 };
     uint64_t track_gen = 0;
-    b_conn_t *ucn = NULL;
-    const b_usub_t *us = NULL;
-    bool resolved = moqr_sub_is_valid(rsub) &&
-                    moqr_core_sub_track(b->core, rsub, &track, &track_gen) ==
-                        MOQR_OK;
-    if (resolved) {
-        for (uint32_t ci = 0; ci < b->max_conns && us == NULL; ci++) {
-            b_conn_t *c = &b->conns[ci];
-            if (!c->used || c->closed || c->session == NULL) {
-                continue;
-            }
-            for (uint32_t i = 0; i < b->n_usubs; i++) {
-                if (c->usubs[i].used && c->usubs[i].has_key &&
-                    moqr_track_eq(c->usubs[i].track, track) &&
-                    c->usubs[i].track_gen == track_gen) {
-                    ucn = c;
-                    us = &c->usubs[i];
-                    break;
-                }
-            }
-        }
+    bool resolved = ds != NULL && ds->has_ident && moqr_sub_is_valid(ds->rsub) &&
+                    moqr_core_sub_track(b->core, ds->rsub, &track, &track_gen) ==
+                        MOQR_OK &&
+                    moqr_track_eq(track, ds->ident_track);
+    /* Its full name, borrowed from the core until its next mutating call. */
+    moq_bytes_t kparts[32];
+    moqr_ns_t kns = { NULL, 0 };
+    moq_bytes_t kname = { NULL, 0 };
+    if (resolved &&
+        moqr_core_track_key(b->core, track, track_gen, kparts, 32, &kns,
+                            &kname) != MOQR_OK) {
+        resolved = false;
     }
     /* 2. Authorize on the RESOLVED identity (fail-closed). An unresolvable
-     * join is authorized on the empty identity exactly as before, so the
-     * request's existence is never a pre-auth oracle. */
-    moqr_ns_t ans = us != NULL ? (moqr_ns_t){ us->parts, us->ns_count }
-                               : (moqr_ns_t){ NULL, 0 };
-    moq_bytes_t aname = us != NULL ? us->name : (moq_bytes_t){ NULL, 0 };
+     * join is authorized on the empty identity, so the request's existence
+     * is never a pre-auth oracle. */
     uint64_t ferr = 0;
     uint64_t ftkt = 0;
-    if (bind_authorize(b, cn, MOQR_AUTH_FETCH, ans, aname, fq->tokens,
+    if (bind_authorize(b, cn, MOQR_AUTH_FETCH, resolved ? kns : (moqr_ns_t){ NULL, 0 },
+                       resolved ? kname : (moq_bytes_t){ NULL, 0 }, fq->tokens,
                        fq->token_count, now_us, &ferr, &ftkt, NULL) !=
         BIND_AUTH_ALLOW) {
         bind_fetch_refuse(b, cn, fq->fetch,
@@ -10295,11 +11225,37 @@ fwd_admit(moqr_bind_t *b, b_conn_t *cn, const moq_fetch_request_event_t *fq,
                           MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID, now_us);
         return;
     }
+    b_conn_t *ucn = NULL;
+    const b_usub_t *us = NULL;
+    for (uint32_t ci = 0; ci < b->max_conns && us == NULL; ci++) {
+        b_conn_t *c = &b->conns[ci];
+        if (!c->used || c->closed || c->session == NULL) {
+            continue;
+        }
+        for (uint32_t i = 0; i < b->n_usubs; i++) {
+            if (c->usubs[i].used && c->usubs[i].has_key &&
+                moqr_track_eq(c->usubs[i].track, track) &&
+                c->usubs[i].track_gen == track_gen) {
+                ucn = c;
+                us = &c->usubs[i];
+                break;
+            }
+        }
+    }
     if (us == NULL) {
-        /* No upstream subscription carries this exact source generation
-         * (origin gone, replaced, or its key could not be retained). */
-        bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_DOES_NOT_EXIST, now_us);
-        FWD_DBG(b, rejected_no_upstream);
+        moqr_fetch_req_t freq;
+        moqr_fetch_req_init(&freq);
+        freq.ns = kns;
+        freq.name = kname;
+        freq.start_group = fq->start_group;
+        freq.start_object = fq->start_object;
+        freq.end_group = fq->end_group;
+        freq.end_object = fq->end_object;
+        freq.group_order = MOQR_GROUP_ORDER_ASCENDING;
+        freq.subscriber_priority = fq->subscriber_priority;
+        freq.cookie = fq->fetch._opaque;
+        bind_standalone_request(b, cn, fq, &freq, fo, &track, now_us);
+        FWD_DBG(b, joins_retrieved);
         return;
     }
     /* 3. A transaction slot. */
@@ -10496,6 +11452,7 @@ fwd_on_up_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev, uint64_t now_us)
         if (t->consumer == FW_CONSUMER_FILL ||
             fwd_copy(b, t, ok->track_properties.data,
                      ok->track_properties.len, &t->props, &t->props_len)) {
+            t->props_codec = bind_props_codec(cn);
             t->ok_seen = true;
             t->ok_eot = ok->end_of_track;
             t->ok_end_group = ok->end_group;
@@ -10555,6 +11512,7 @@ fwd_on_up_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev, uint64_t now_us)
         it->group = o->group_id;
         it->subgroup = o->subgroup_id;
         it->object = o->object_id;
+        it->properties_codec = bind_props_codec(cn);
         it->publisher_priority = o->publisher_priority;
         it->datagram = o->datagram;
         t->n_items++;
@@ -10684,6 +11642,10 @@ bind_fwd_pump(moqr_bind_t *b, uint64_t now_us)
         if (!t->used) {
             continue;
         }
+        b_conn_t *pending_up = conn_by_cookie(b, t->u_cookie);
+        b_conn_t *pending_down = conn_by_cookie(b, t->d_cookie);
+        if ((pending_up != NULL && pending_up->events_pending) ||
+            (pending_down != NULL && pending_down->events_pending)) continue;
         /* -- upstream side -- */
         if (t->consumer == FW_CONSUMER_FILL) {
             if (t->end == FW_END_NONE && !retrieve_fwd_current(b, t)) {
@@ -10837,10 +11799,25 @@ bind_fwd_pump(moqr_bind_t *b, uint64_t now_us)
                 ac.end_group = t->ok_end_group;
                 ac.end_object = t->ok_end_object;
                 ac.empty = (t->n_items == 0);
-                ac.track_properties = (moq_bytes_t){ t->props, t->props_len };
+                b_props_tmp_t ptmp = { NULL, 0 };
+                if (!bind_track_props_out(b, t->props_codec, bind_props_codec(dcn),
+                                          (moq_bytes_t){ t->props, t->props_len },
+                                          &ac.track_properties, &ptmp)) {
+                    /* The upstream's Track Properties cannot be stated on
+                     * this downstream's draft: nothing reached the wire, so
+                     * the request is refused rather than answered without
+                     * them. */
+                    t->end = FW_END_ERROR;
+                    t->err_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+                    t->err_can_retry = false;
+                    t->err_retry_after_ms = 0;
+                    t->d = FW_D_PENDING;
+                    continue;
+                }
                 moq_result_t rc = moq_session_accept_fetch(dcn->session,
                                                            t->sfetch, &ac,
                                                            now_us);
+                bind_track_props_release(b, &ptmp);
                 if (rc == MOQ_ERR_WOULD_BLOCK) {
                     FWD_DBG(b, retried_accept);
                     break;
@@ -10887,17 +11864,20 @@ bind_fwd_pump(moqr_bind_t *b, uint64_t now_us)
                         oc.datagram = moq_session_supports_fetch_datagram(
                                           dcn->session) ? it->datagram : false;
                         oc.payload = it->payload;
-                        oc.properties = it->properties;
+                        moq_rcbuf_t *props_own = NULL;
+                        rc = bind_props_out(b, dcn, it->properties, it->properties_codec,
+                                            &oc.properties, &props_own);
 #ifdef MOQR_BIND_TESTING
-                        if (atomic_load(&bind_dbg_fail_fwd_writes) > 0 &&
+                        if (rc == MOQ_OK && atomic_load(&bind_dbg_fail_fwd_writes) > 0 &&
                             atomic_fetch_sub(&bind_dbg_fail_fwd_writes, 1) == 1) {
                             rc = MOQ_ERR_INVAL;   /* injected: unencodable */
                         } else
 #endif
-                        {
+                        if (rc == MOQ_OK) {
                             rc = moq_session_write_fetch_object(
                                 dcn->session, t->sfetch, &oc, now_us);
                         }
+                        if (props_own != NULL) moq_rcbuf_decref(props_own);
                     }
                     if (rc == MOQ_ERR_WOULD_BLOCK) {
                         FWD_DBG(b, retried_write);
@@ -11081,21 +12061,6 @@ bind_fetch_range(const moq_fetch_request_options_t *fo, moqr_fetch_req_t *freq)
     }
 }
 
-/* The End of Range kind for Locations a FETCH does not serve. A FETCH waits
- * only for an Object still arriving, so a Location the relay cannot vouch for
- * is marked at once: Unknown, a state the relay cannot determine (3.2.2),
- * while the FETCH's wait budget lasts, and Timed-Out once it is spent (3.2.3)
- * -- at once under a FILL_TIMEOUT of 0, which asks for any unavailable Object
- * to be reported Timed-Out (9.20.5). Only a draft whose fetch stream has End
- * of Timed-Out Range gets it; the others say Unknown throughout. */
-static moq_fetch_range_kind_t
-bind_fetch_unserved_kind(const b_fetch_t *bf, uint64_t now_us)
-{
-    return bf->fetch_timed_out_ok && now_us >= bf->fill_deadline_us
-               ? MOQ_FETCH_RANGE_TIMED_OUT
-               : MOQ_FETCH_RANGE_UNKNOWN;
-}
-
 /* Every downstream subgroup stream still open for a subscription to `track`
  * is reset with MALFORMED_TRACK, before the subscriptions end: the Track is
  * malformed, so nothing more is sent on them, and a reset stream counts
@@ -11122,6 +12087,12 @@ bind_reset_track_streams(moqr_bind_t *b, moqr_track_t track, uint64_t now_us)
             }
             for (uint32_t i = 0; i < b->n_sgs; i++) {
                 if (!cn->sgs[i].used || cn->sgs[i].sub_raw != ds->sub_raw) continue;
+                if (cn->sgs[i].stopped) continue;
+                if (cn->events_pending) {
+                    cn->sgs[i].reset_owed = true;
+                    cn->sgs[i].reset_wire = wire;
+                    continue;
+                }
                 moq_result_t rrc = moq_session_reset_subgroup(cn->session,
                                                               cn->sgs[i].h, wire,
                                                               now_us);
@@ -11280,6 +12251,7 @@ bind_track_malformed(moqr_bind_t *b, b_conn_t *cn, moq_subscription_t sub,
             usub_release(b, us);
         } else {
             us->cancel_owed = true;
+            cn->retry_pending |= B_RETRY_CANCEL;
         }
     } else if (bp != NULL) {
         uint64_t code = MOQ_STREAM_ERROR_MALFORMED_TRACK;
@@ -11293,6 +12265,7 @@ bind_track_malformed(moqr_bind_t *b, b_conn_t *cn, moq_subscription_t sub,
         } else {
             bp->cancel_owed = true;
             bp->cancel_code = code;
+            cn->retry_pending |= B_RETRY_CANCEL;
         }
     }
 }
@@ -11351,6 +12324,9 @@ bind_cancel_upstream_pub(b_conn_t *cn, moq_publication_t pub, uint64_t code,
 static void
 bind_retry_owed_cancels(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
 {
+    if (!(cn->retry_pending & B_RETRY_CANCEL)) {
+        return;   /* nothing was marked owed since a walk last found none */
+    }
     for (uint32_t i = 0; i < b->n_usubs; i++) {
         b_usub_t *us = &cn->usubs[i];
         if (!us->used || !us->cancel_owed) continue;
@@ -11369,21 +12345,23 @@ bind_retry_owed_cancels(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
             memset(bp, 0, sizeof(*bp));
         }
     }
-}
-
-static void
-bind_fetch_terminate(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
-{
-    b->session_errors++;
-    (void)moq_session_close(cn->session, BIND_SESSION_INTERNAL_ERROR,
-                            "fetch error", now_us);
-    conn_detach(b, cn, now_us);
+    /* Re-read rather than tracked through the walks: a settlement above may
+     * mark another entry owed, possibly one already passed. */
+    bool owed = false;
+    for (uint32_t i = 0; !owed && i < b->n_usubs; i++) {
+        owed = cn->usubs[i].used && cn->usubs[i].cancel_owed;
+    }
+    for (uint32_t i = 0; !owed && i < b->n_pubs; i++) {
+        owed = cn->pubs[i].used && cn->pubs[i].cancel_owed;
+    }
+    cn->retry_pending = (uint8_t)((cn->retry_pending & ~B_RETRY_CANCEL) |
+                                  (owed ? B_RETRY_CANCEL : 0u));
 }
 
 static void
 bind_fetch_pump(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
 {
-    for (uint32_t fi = 0; fi < b->n_fetches; fi++) {
+    for (uint32_t fi = 0; fi < cn->fetch_hw; fi++) {
         b_fetch_t *bf = &cn->fetches[fi];
         if (!bf->used) {
             continue;
@@ -11406,189 +12384,11 @@ bind_fetch_pump(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
             }
             continue;
         }
-        /* Drive this fetch as far as the session queue allows; every step holds
-         * (breaks, retried next pump) on WOULD_BLOCK with no state advance. */
-        for (uint32_t guard = 0; guard < 512; guard++) {
-            if (bf->state == BF_FETCH_NEEDS_ABORT) {
-                moq_result_t arc = moq_session_abort_fetch(
-                    cn->session, bf->sfetch, bf->sa_abort_code, now_us);
-                if (arc == MOQ_ERR_WOULD_BLOCK) {
-                    break;
-                }
-                if (arc != MOQ_OK && !fwd_result_is_gone(arc)) {
-                    b->session_errors++;
-                }
-                (void)moqr_core_fetch_close(b->core, bf->cfetch);
-                memset(bf, 0, sizeof(*bf));
-                break;
-            }
-            if (bf->state == BF_NEEDS_OK) {
-                /* The track's properties are stated (§7.7); a set this
-                 * session cannot carry refuses the fetch instead. */
-                moqr_bind_meta_ref_t pin = {0};
-                if (!bind_fetch_ok_pin(b, cn, bf->cfetch, &pin)) {
-                    moqr_bind_meta_release(b, &pin);
-                    moq_fetch_t sf = bf->sfetch;
-                    (void)moqr_core_fetch_close(b->core, bf->cfetch);
-                    memset(bf, 0, sizeof(*bf));
-                    bind_fetch_refuse(b, cn, sf,
-                                      MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
-                    break;
-                }
-                moq_accept_fetch_cfg_t ac;
-                moq_accept_fetch_cfg_init(&ac);
-                ac.end_of_track = bf->eot;
-                ac.end_group = bf->end_group;
-                ac.end_object = bf->end_object;
-                ac.track_properties = pin.bytes;
-                moq_result_t rc = moq_session_accept_fetch(cn->session,
-                                                           bf->sfetch, &ac,
-                                                           now_us);
-                moqr_bind_meta_release(b, &pin);
-                if (rc == MOQ_ERR_WOULD_BLOCK) {
-                    break;
-                }
-                if (rc == MOQ_ERR_INVAL) {
-                    /* The session holds the End against the request's form
-                     * and refused it: the fetch is still pending, so it is
-                     * answered with a refusal instead of a FETCH_OK. */
-                    moq_fetch_t sf = bf->sfetch;
-                    (void)moqr_core_fetch_close(b->core, bf->cfetch);
-                    memset(bf, 0, sizeof(*bf));
-                    b->session_errors++;
-                    bind_fetch_refuse(b, cn, sf,
-                                      MOQ_REQUEST_ERROR_INTERNAL_ERROR, now_us);
-                    break;
-                }
-                if (rc != MOQ_OK) {
-                    bind_fetch_terminate(b, cn, now_us);   /* FETCH_OK failed */
-                    return;
-                }
-                bf->state = BF_STREAMING;
-                continue;
-            }
-            if (bf->state == BF_STREAMING) {
-                moqr_fetch_item_t it;
-                moqr_result_t prc = moqr_core_fetch_peek(b->core, bf->cfetch,
-                                                         now_us, &it);
-                if (prc == MOQR_ERR_WOULD_BLOCK) {
-                    break;   /* pin budget momentarily full; retry next pump */
-                }
-                if (prc != MOQR_OK) {
-                    /* TOO_OLD / CAPACITY: the accepted range was lost mid-fetch
-                     * (only reachable under ACTIVE-track capacity eviction; the
-                     * lifetime guard pins WARM tracks). The peer already saw
-                     * FETCH_OK, so a clean END would FIN a truncated range and a
-                     * silent drop would hang it — give it a terminal via a hard
-                     * close. */
-                    bind_fetch_terminate(b, cn, now_us);
-                    return;
-                }
-                bf->fetch_held_pending = false;
-                if (it.kind == MOQR_FETCH_ITEM_END) {
-                    bf->state = BF_NEEDS_FIN;
-                    continue;
-                }
-                if (it.kind == MOQR_FETCH_ITEM_PENDING &&
-                    now_us < bf->fill_deadline_us) {
-                    /* An Object still arriving that the range includes: it is
-                     * served in full once it completes (3.2), waited for
-                     * until the FETCH's deadline (moqr_bind_next_deadline_us
-                     * wakes the binding then). */
-                    bf->fetch_held_pending = true;
-                    break;
-                }
-                if (it.kind == MOQR_FETCH_ITEM_MARKER ||
-                    it.kind == MOQR_FETCH_ITEM_GAP ||
-                    it.kind == MOQR_FETCH_ITEM_UNKNOWN ||
-                    it.kind == MOQR_FETCH_ITEM_PENDING) {
-                    /* Locations the response will not serve: the evicted
-                     * prefix (before the first retained group), a hole, a
-                     * run the log has no evidence about, or an Object still
-                     * arriving at the deadline. In every draft an unmarked
-                     * gap in a FETCH response says the skipped Objects do
-                     * not exist, so each is marked, at once (a FETCH does
-                     * not wait for upstream), with bind_fetch_unserved_kind.
-                     * A run ending with its group goes through the
-                     * profile-owned seam that knows the draft's last object
-                     * id. Same retry model as objects: HOLD on WOULD_BLOCK
-                     * (re-peek re-emits it), terminal on any hard error, and
-                     * commit (the cursor advance) ONLY after the session
-                     * write succeeds. */
-                    const moq_fetch_range_kind_t kind =
-                        bind_fetch_unserved_kind(bf, now_us);
-                    moq_result_t mrc;
-                    if (it.kind == MOQR_FETCH_ITEM_MARKER) {
-                        mrc = moq_session_write_fetch_range_before_group(
-                            cn->session, bf->sfetch, kind, it.marker_group,
-                            now_us);
-                    } else if (it.rec.object_id == UINT64_MAX &&
-                               it.rec.group_id != UINT64_MAX) {
-                        mrc = moq_session_write_fetch_range_before_group(
-                            cn->session, bf->sfetch, kind,
-                            it.rec.group_id + 1u, now_us);
-                    } else {
-                        mrc = moq_session_write_fetch_range(
-                            cn->session, bf->sfetch, kind, it.rec.group_id,
-                            it.rec.object_id, now_us);
-                    }
-                    if (mrc == MOQ_ERR_WOULD_BLOCK) {
-                        break;   /* HOLD: do not commit */
-                    }
-                    if (mrc != MOQ_OK) {
-                        bind_fetch_terminate(b, cn, now_us);
-                        return;
-                    }
-                    (void)moqr_core_fetch_commit(b->core, bf->cfetch);
-                    continue;
-                }
-                moq_fetch_object_cfg_t oc;
-                moq_fetch_object_cfg_init(&oc);
-                oc.group_id = it.rec.group_id;
-                oc.subgroup_id = it.rec.subgroup_id;
-                oc.object_id = it.rec.object_id;
-                oc.publisher_priority = it.rec.publisher_priority;
-                /* Datagram preference is forwarding metadata, not object
-                 * identity. Draft-18 fetch headers can encode it; draft-16
-                 * cannot, so for a draft-16 fetcher clear the bit and serve the
-                 * object normally (same group/object/payload) rather than fail
-                 * the write. The capability query never leaks the version. */
-                oc.datagram = moq_session_supports_fetch_datagram(cn->session)
-                                  ? it.rec.datagram_pref
-                                  : false;
-                oc.payload = (moq_rcbuf_t *)(void *)it.rec.payload;
-                oc.properties = (moq_rcbuf_t *)(void *)it.rec.properties;
-                moq_result_t wrc = moq_session_write_fetch_object(
-                    cn->session, bf->sfetch, &oc, now_us);
-                if (wrc == MOQ_ERR_WOULD_BLOCK) {
-                    break;   /* HOLD: do not commit; re-peek re-emits it */
-                }
-                if (wrc != MOQ_OK) {
-                    /* The object cannot be written (defensive: the cursor only
-                     * yields encodable NORMAL objects, and the datagram bit is
-                     * already cleared for a draft-16 fetcher), so the fetch
-                     * cannot complete: terminal. */
-                    bind_fetch_terminate(b, cn, now_us);
-                    return;
-                }
-                (void)moqr_core_fetch_commit(b->core, bf->cfetch);
-                b->deliveries_written++;
-                continue;
-            }
-            /* BF_NEEDS_FIN */
-            moq_result_t rc = moq_session_end_fetch(cn->session, bf->sfetch,
-                                                    now_us);
-            if (rc == MOQ_ERR_WOULD_BLOCK) {
-                break;
-            }
-            if (rc != MOQ_OK) {
-                bind_fetch_terminate(b, cn, now_us);   /* FIN failed: terminal */
-                return;
-            }
-            (void)moqr_core_fetch_close(b->core, bf->cfetch);
-            bf->used = false;
-            break;
-        }
+        /* Every fetch the binding admits is a fill or a standalone FETCH. */
+    }
+    /* Slots released at the top end no longer bound the walks. */
+    while (cn->fetch_hw > 0 && !cn->fetches[cn->fetch_hw - 1u].used) {
+        cn->fetch_hw--;
     }
 }
 
@@ -11610,6 +12410,23 @@ oc_from_result(moq_result_t wrc)
                                         : MOQR_DELIVERY_STREAM_ERROR;
 }
 
+/* A live delivery whose Object Properties cannot be written on this
+ * connection's draft (bind_props_out refused with `why`): its subscription
+ * alone ends, by the next delivery scan before anything else of it is
+ * delivered -- with MALFORMED_TRACK when the block is malformed in its own
+ * codec, else INTERNAL_ERROR (the done's registry has no status naming a
+ * destination that cannot carry valid properties); the record, of which
+ * nothing went downstream, is released. */
+static moqr_delivery_outcome_t
+bind_props_refused(moqr_bind_t *b, const moqr_delivery_t *d, moq_result_t why)
+{
+    (void)moqr_core_internal_sub_fail(
+        b->core, d->sub,
+        bind_local_pd(why == MOQ_ERR_PROTO ? MOQR_PD_MALFORMED_TRACK
+                                           : MOQR_PD_INTERNAL_ERROR));
+    return MOQR_DELIVERY_REFUSED_UNBEGUN;
+}
+
 static moqr_delivery_outcome_t
 bind_write_chunked(moqr_bind_t *b, b_conn_t *cn, const moqr_delivery_t *d,
                    b_sg_t *sg, uint64_t now_us)
@@ -11619,9 +12436,15 @@ bind_write_chunked(moqr_bind_t *b, b_conn_t *cn, const moqr_delivery_t *d,
         moq_begin_object_cfg_init(&bc);
         bc.object_id = d->rec.object_id;
         bc.payload_length = d->rec.declared_len;   /* known at open (OPEN too) */
-        bc.properties = (moq_rcbuf_t *)(void *)d->rec.properties;
+        moq_rcbuf_t *props_own = NULL;
+        moq_result_t prc = bind_props_out(b, cn, d->rec.properties,
+                                          d->rec.properties_codec, &bc.properties,
+                                          &props_own);
+        if (prc != MOQ_OK)
+            return bind_props_refused(b, d, prc);
         moq_result_t brc =
             moq_session_begin_object_ex(cn->session, sg->h, &bc, now_us);
+        if (props_own != NULL) moq_rcbuf_decref(props_own);
         if (brc == MOQ_ERR_WOULD_BLOCK) {
             return MOQR_DELIVERY_WOULD_BLOCK;   /* subgroup stays OPEN, retry */
         }
@@ -11670,8 +12493,15 @@ bind_write_chunked(moqr_bind_t *b, b_conn_t *cn, const moqr_delivery_t *d,
         return MOQR_DELIVERY_STALLED;
     }
     moq_result_t erc = moq_session_end_object(cn->session, sg->h, now_us);
+    if (erc == MOQ_ERR_WOULD_BLOCK) {
+        if (moqr_core_delivery_note_emitted(b->core, cn->binding,
+                                            sg->next_chunk, now_us) != MOQR_OK) {
+            return MOQR_DELIVERY_STREAM_ERROR;
+        }
+        return MOQR_DELIVERY_WOULD_BLOCK;
+    }
     if (erc != MOQ_OK) {
-        return MOQR_DELIVERY_STREAM_ERROR;   /* end_object never WOULD_BLOCKs */
+        return MOQR_DELIVERY_STREAM_ERROR;
     }
     sg->obj_begun = false;   /* object complete; the slot can begin the next */
     return MOQR_DELIVERY_DELIVERED;
@@ -11709,6 +12539,38 @@ bind_confirm_delivery(moqr_bind_t *b, b_conn_t *cn,
     return false;
 }
 
+/* Bounded exact-key work is independent of Forward, live-edge growth and
+ * ordinary record priority. It cannot consume a sibling's outstanding item. */
+static bool
+bind_discard_stopped(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
+{
+    for (uint32_t i = 0; i < b->n_sgs; i++) {
+        b_sg_t *sg = &cn->sgs[i];
+        if (!sg->used || !sg->stopped) continue;
+        bool retired = false, more = false;
+        moqr_result_t rc = moqr_core_internal_discard_subgroup(
+            b->core, cn->binding, sg->rsub, sg->group, sg->subgroup,
+            sg->core_list, 256u, now_us, &retired, &more);
+        if (rc == MOQR_ERR_CAPACITY) more = true;
+        else if (rc != MOQR_OK && !(rc == MOQR_ERR_STALE_HANDLE && retired)) {
+            b->session_errors++;
+            (void)moq_session_close(cn->session, BIND_SESSION_INTERNAL_ERROR,
+                                    "stopped cursor mismatch", now_us);
+            conn_detach(b, cn, now_us);
+            return false;
+        }
+        if (retired) {
+            memset(sg, 0, sizeof(*sg));
+            bind_dl_rearm_on_slot_release(b, cn);
+        }
+        if (more) {
+            b->budget_pending = true;
+            bind_dl_set(b->dl_ready, (uint32_t)(cn - b->conns));
+        }
+    }
+    return true;
+}
+
 /* One delivery pass over a connection, ending in exactly one outcome that
  * tells Phase F how to reschedule it. STALLED and ABANDONED remain in-loop
  * continuations (sibling subscriptions keep being served in the same pass);
@@ -11725,9 +12587,28 @@ typedef enum b_deliver_outcome {
     B_DELIVER_CLOSED,             /* conn detached or consistency failure   */
 } b_deliver_outcome_t;
 
+typedef struct b_delivery_capacity {
+    const moqr_bind_t *bind;
+    const b_conn_t *conn;
+} b_delivery_capacity_t;
+
+static bool
+bind_delivery_eligible(void *ctx, uint64_t cookie, const moqr_record_view_t *rec)
+{
+    const b_delivery_capacity_t *cap = ctx;
+    if (rec->datagram_pref || rec->obj_state == MOQR_OBJ_ABANDONED) return true;
+    for (uint32_t i = 0; i < cap->bind->n_sgs; i++) {
+        const b_sg_t *sg = &cap->conn->sgs[i];
+        if (!sg->used || (sg->sub_raw == cookie && sg->group == rec->group_id &&
+                         sg->subgroup == rec->subgroup_id)) return true;
+    }
+    return false;
+}
+
 static b_deliver_outcome_t
 bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
 {
+    b_delivery_capacity_t cap = { .bind = b, .conn = cn };
     for (uint32_t guard = 0; guard < 256; guard++) {
         moqr_delivery_t d;
         moqr_result_t drc;
@@ -11739,10 +12620,23 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
         } else
 #endif
         {
-            drc = moqr_core_next_delivery(b->core, cn->binding, now_us, &d);
+            if (cn->bind_sg_waiting) {
+                for (uint32_t si = 0; si < b->n_sgs; si++) {
+                    if (!cn->sgs[si].used) {
+                        cn->bind_sg_waiting = false;
+                        break;
+                    }
+                }
+            }
+            drc = cn->bind_sg_waiting
+                ? moqr_core_internal_next_eligible(b->core, cn->binding,
+                                                    now_us, &d,
+                                                    bind_delivery_eligible, &cap)
+                : moqr_core_next_delivery(b->core, cn->binding, now_us, &d);
         }
         if (drc != MOQR_OK) {
             if (drc == MOQR_DONE) {
+                if (cn->bind_sg_waiting) return B_DELIVER_BLOCKED_BIND_SG;
                 return B_DELIVER_DRAINED;   /* nothing NOW; a mark re-arms */
             }
             if (drc == MOQR_ERR_CAPACITY) {
@@ -11784,11 +12678,12 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
             }
         }
         bool rec_props = false, rec_gap = false;
+        uint32_t rec_list = 0;
         moqr_reset_desc_t rec_gap_reset = moqr_reset_desc_none();
         if (d.notice == MOQR_DELIVERY_NOTICE_NONE) {
             (void)moqr_core_internal_delivery_flags(b->core, cn->binding,
                                                     &rec_props, &rec_gap,
-                                                    &rec_gap_reset);
+                                                    &rec_gap_reset, &rec_list);
         }
         /* Recordless acknowledged notices precede record work. The close IS
          * the payload here, so the notice is acknowledged (DELIVERED) only
@@ -11814,6 +12709,16 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                          * strictly ascending, so a lower group can still be
                          * live only at/above it. */
                         : cn->sgs[i].group >= d.oldest_group) {
+                    continue;
+                }
+                if (cn->sgs[i].stopped) {
+                    /* This stream already has its session-owned terminal.
+                     * A SEAL ack leaves suppression intact for later source
+                     * lifetimes. Only authoritative eviction frees the key. */
+                    if (d.notice == MOQR_DELIVERY_NOTICE_EVICT_WATERMARK) {
+                        memset(&cn->sgs[i], 0, sizeof(cn->sgs[i]));
+                        bind_dl_rearm_on_slot_release(b, cn);
+                    }
                     continue;
                 }
                 /* A reset-flavored seal closes abnormally, forwarding the
@@ -11918,9 +12823,17 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
             } else {
                 const uint8_t *pb = NULL;
                 size_t pl = 0;
-                if (d.rec.properties != NULL) {
-                    pb = moq_rcbuf_data(d.rec.properties);
-                    pl = moq_rcbuf_len(d.rec.properties);
+                moq_rcbuf_t *wp = NULL, *props_own = NULL;
+                wrc = bind_props_out(b, cn, d.rec.properties, d.rec.properties_codec,
+                                     &wp, &props_own);
+                if (wrc != MOQ_OK) {
+                    if (props_own != NULL) moq_rcbuf_decref(props_own);
+                    oc = bind_props_refused(b, &d, wrc);
+                    goto confirm;
+                }
+                if (wp != NULL) {
+                    pb = moq_rcbuf_data(wp);
+                    pl = moq_rcbuf_len(wp);
                 }
                 wrc = bind_cookie_is_publication(d.sub_cookie)
                     ? moq_session_send_pub_object_datagram(
@@ -11933,6 +12846,7 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                           cn->session, ssub, d.rec.group_id, d.rec.object_id,
                           d.rec.publisher_priority, d.rec.end_of_group,
                           (moq_rcbuf_t *)(void *)d.rec.payload, pb, pl, now_us);
+                if (props_own != NULL) moq_rcbuf_decref(props_own);
             }
             oc = oc_from_result(wrc);
         } else {
@@ -11948,7 +12862,9 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                     freei = (int)i;
                 }
             }
-            if (d.rec.obj_state == MOQR_OBJ_ABANDONED && d.evicted_reset) {
+            if (sgi >= 0 && cn->sgs[sgi].stopped && !d.evicted_reset) {
+                oc = MOQR_DELIVERY_DISCARDED;
+            } else if (d.rec.obj_state == MOQR_OBJ_ABANDONED && d.evicted_reset) {
                 /* The whole group was evicted while begun downstream: reset EVERY
                  * begun subgroup of the group so no peer stream is left with a
                  * begun object and no terminal. Retry-safe — a reset subgroup is
@@ -11959,6 +12875,7 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                 for (uint32_t i = 0; i < b->n_sgs; i++) {
                     if (!cn->sgs[i].used || cn->sgs[i].sub_raw != d.sub_cookie ||
                         cn->sgs[i].group != d.rec.group_id ||
+                        cn->sgs[i].stopped ||
                         !cn->sgs[i].obj_begun) {
                         continue;
                     }
@@ -12064,10 +12981,15 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                  * known to be the next object (§11.3.2: the relay "MUST
                  * reset the Subgroup stream and open a new one to forward
                  * it"); or it has properties the stream was opened without.
-                 * A record already begun on the stream continues there. */
+                 * A record already begun on the stream continues there, and
+                 * one whose first write the session refused right after
+                 * opening the stream for it starts there: the stream has
+                 * carried nothing it could fail to continue. */
                 if (sgi >= 0 &&
                     !(cn->sgs[sgi].obj_begun &&
                       cn->sgs[sgi].obj_id == d.rec.object_id) &&
+                    !(cn->sgs[sgi].unwritten &&
+                      cn->sgs[sgi].open_obj == d.rec.object_id) &&
                     (rec_gap ||
                      (d.rec.properties != NULL && !cn->sgs[sgi].props))) {
                     moqr_reset_desc_t rd = moqr_reset_desc_none();
@@ -12171,6 +13093,10 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                                 now_us)) {
                             return B_DELIVER_CLOSED;
                         }
+                        if (!cn->bind_sg_waiting) {
+                            cn->bind_sg_waiting = true;
+                            continue;   /* maintenance gets the next selection */
+                        }
                         return B_DELIVER_BLOCKED_BIND_SG;
                     }
                     b_dsub_t *ds = dsub_find(b, cn, d.sub_cookie);
@@ -12237,7 +13163,10 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                         ds->streams_opened, cn->wire_draft);
                     sgi = freei;
                     cn->sgs[sgi].used = true;
+                    cn->sgs[sgi].stopped = false;
                     cn->sgs[sgi].sub_raw = d.sub_cookie;
+                    cn->sgs[sgi].rsub = d.sub;
+                    cn->sgs[sgi].core_list = rec_list;
                     cn->sgs[sgi].group = d.rec.group_id;
                     cn->sgs[sgi].subgroup = d.rec.subgroup_id;
                     cn->sgs[sgi].h = h;
@@ -12245,8 +13174,14 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                     cn->sgs[sgi].obj_id = 0;
                     cn->sgs[sgi].next_chunk = 0;
                     cn->sgs[sgi].props = sc.object_properties;
+                    cn->sgs[sgi].unwritten = true;
+                    cn->sgs[sgi].open_obj = d.rec.object_id;
+                    cn->sgs[sgi].reset_owed = false;
+                    cn->sgs[sgi].reset_wire = 0;
+                    cn->bind_sg_waiting = false;
                 }
-                if (d.rec.chunk_count > 0) {
+                if (d.rec.chunk_count > 0 || d.rec.obj_state == MOQR_OBJ_OPEN ||
+                    cn->sgs[sgi].obj_begun) {
                     /* Chunked record: stream the batch. Returns DELIVERED after
                      * end_object (COMPLETE), STALLED at the live edge (OPEN),
                      * WOULD_BLOCK to hold, or STREAM_ERROR. */
@@ -12260,9 +13195,20 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                     moq_object_cfg_init(&ocfg);
                     ocfg.object_id = d.rec.object_id;
                     ocfg.payload = (moq_rcbuf_t *)(void *)d.rec.payload;
-                    ocfg.properties = (moq_rcbuf_t *)(void *)d.rec.properties;
-                    oc = oc_from_result(moq_session_write_object_ex(
-                        cn->session, cn->sgs[sgi].h, &ocfg, now_us));
+                    moq_rcbuf_t *props_own = NULL;
+                    moq_result_t prc = bind_props_out(b, cn, d.rec.properties,
+                                                      d.rec.properties_codec,
+                                                      &ocfg.properties, &props_own);
+                    if (prc != MOQ_OK) {
+                        oc = bind_props_refused(b, &d, prc);
+                    } else {
+                        oc = oc_from_result(moq_session_write_object_ex(
+                            cn->session, cn->sgs[sgi].h, &ocfg, now_us));
+                    }
+                    if (props_own != NULL) moq_rcbuf_decref(props_own);
+                }
+                if (oc == MOQR_DELIVERY_DELIVERED || cn->sgs[sgi].obj_begun) {
+                    cn->sgs[sgi].unwritten = false;   /* the stream carries it */
                 }
                 /* NO inline graceful close here — every graceful subgroup
                  * closure rides the acknowledged SEAL notice, whose close
@@ -12276,6 +13222,7 @@ bind_deliver(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us)
                  * downstream open, never a per-record terminal. */
             }
         }
+    confirm:
         if (!bind_confirm_delivery(b, cn, oc, now_us)) {
             return B_DELIVER_CLOSED;
         }
@@ -12382,12 +13329,15 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
         return MOQR_ERR_INVAL;
     }
     b->in_pump = true;
-    /* Per-pump flag, not sticky: a pass below reports it when the
-     * 256-delivery guard expired with work remaining — the ONE outcome
-     * whose leftover work no future event re-signals AND whose retry needs
-     * nothing but another pump. The runtime turns it into one further
-     * coalesced self-wake (see moqr_bind_pump_budget_pending). */
+    /* A bounded delivery/discard pass, or refusal recovery with events still
+     * undrained, may owe another pump without an external edge. The runtime
+     * turns that debt into one coalesced self-wake. */
     b->budget_pending = false;
+    for (uint32_t i = 0; i < b->max_conns; i++) {
+        if (b->conns[i].used && !b->conns[i].closed) {
+            b->conns[i].events_pending = true;
+        }
+    }
     /* Held rendezvous SUBSCRIBEs past their deadline end before any event
      * of this pump -- a source among them included -- is consumed. */
     (void)moqr_core_internal_rendezvous_expire(b->core, now_us);
@@ -12407,6 +13357,7 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
             n = moq_session_poll_events(cn->session, b->pump_events,
                                         BIND_PUMP_EVENT_POLL);
             if (n == 0) {
+                cn->events_pending = false;
                 break;
             }
             for (size_t e = 0; e < n; e++) {
@@ -12426,9 +13377,29 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
         }
         /* Re-check the grant every pump (not only when events arrive): a peer
          * blocked at its ceiling sends nothing until the grant reaches it. */
-        if (cn->used && !cn->closed && cn->session != NULL) {
+        if (cn->used && !cn->closed && !cn->events_pending && cn->session != NULL) {
+            if (!cn->cluster_discovery_closed && b->cluster_info.enabled) {
+                for (uint32_t a = 0; a < b->n_anns && cn->used && !cn->closed; a++)
+                    bind_cluster_apply_ann(b, cn, a, now_us);
+            }
+            if (!cn->used || cn->closed) continue;
+            if (cn->cluster_discovery_cancel_owed)
+                bind_cluster_discovery_cancel(b, cn, cn->cluster_discovery, now_us);
+            else if (cn->cluster_discovery_retiring)
+                bind_cluster_discovery_end(b, cn, cn->cluster_discovery._opaque, now_us);
+            bind_cluster_sync(b, cn, now_us, true);
+            if (!cn->used || cn->closed) continue;
             bind_maybe_grant_capacity(b, cn, now_us);
             bind_retry_owed_cancels(b, cn, now_us);
+        }
+    }
+    /* All source connections have ingested their events now. A subscriber
+     * earlier in the connection table must also reconcile bytes that arrived
+     * on a later source, even while paused with no ordinary delivery. */
+    for (uint32_t i = 0; i < b->max_conns; i++) {
+        b_conn_t *cn = &b->conns[i];
+        if (cn->used && !cn->closed && !cn->events_pending) {
+            (void)bind_discard_stopped(b, cn, now_us);
         }
     }
     (void)moqr_core_tick(b->core, now_us);
@@ -12461,13 +13432,20 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
                                         rev->session_cookie);
             continue;
         }
+        if (rcn->events_pending) continue;
         moq_cancel_namespace_cfg_t ccfg;
         moq_cancel_namespace_cfg_init(&ccfg);
         ccfg.error_code = rev->error_code;
-        moq_result_t crc = moq_session_cancel_namespace(
-            rcn->session,
-            (moq_announcement_t){ ._opaque = rev->session_cookie }, &ccfg,
-            now_us);
+        int source_ann = ann_find(b, rcn, rev->session_cookie);
+        bool discovered = source_ann >= 0 && rcn->anns[source_ann].discovered;
+        moq_ns_sub_handle_t discovery = discovered
+            ? rcn->anns[source_ann].discovery : (moq_ns_sub_handle_t){0};
+        moq_result_t crc = discovered
+            ? moq_session_cancel_namespace_sub(rcn->session, discovery, now_us)
+            : moq_session_cancel_namespace(rcn->session,
+                (moq_announcement_t){ ._opaque = rev->session_cookie }, &ccfg, now_us);
+        if (discovered && crc != MOQ_ERR_WOULD_BLOCK)
+            bind_cluster_discovery_end(b, rcn, discovery._opaque, now_us);
         if (crc == MOQ_OK) {
             int ann_slot = ann_find(b, rcn, rev->session_cookie);
             if (ann_slot >= 0) {
@@ -12512,7 +13490,8 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
     bind_nsu_pump(b, now_us);
     for (uint32_t i = 0; i < b->max_conns; i++) {
         b_conn_t *cn = &b->conns[i];
-        if (cn->used && !cn->closed && cn->wire_draft == B_DRAFT_22) {
+        if (cn->used && !cn->closed && !cn->events_pending &&
+            cn->wire_draft == B_DRAFT_22) {
             bind_discovery_pump(b, cn, now_us);
         }
     }
@@ -12537,7 +13516,7 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
         } while (got == 64);
         for (uint32_t i = 0; i < b->max_conns; i++) {
             b_conn_t *cn = &b->conns[i];
-            if (cn->used && !cn->closed) {
+            if (cn->used && !cn->closed && !cn->events_pending) {
                 bool ready = bind_dl_test(b->dl_ready, i);
                 bool parked = bind_dl_test(b->dl_parked, i);
                 bool attempt;
@@ -12624,7 +13603,6 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
                          * pump, so the starvation bound is exactly the
                          * old one (guard x ready bindings). Not a pool block:
                          * the self-rearm above already schedules the retry. */
-                        cn->bind_sg_waiting = false;
                         bind_dl_set(b->dl_ready, i);
                         break;
                     case B_DELIVER_CLOSED:
@@ -12641,7 +13619,7 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
             }
             /* The fetch half is untouched: per open connection, every
              * pump, exactly as before. */
-            if (cn->used && !cn->closed) {
+            if (cn->used && !cn->closed && !cn->events_pending) {
                 bind_fetch_pump(b, cn, now_us);
             }
         }
@@ -12651,6 +13629,14 @@ moqr_bind_pump(moqr_bind_t *b, uint64_t now_us)
          * pump; nothing else is bound to bring a later one, so they would
          * otherwise wait for an unrelated event. */
         (void)bind_execute_intents(b, now_us);
+    }
+    /* Refusal recovery permits another event drain; it does not prove that
+     * the deferred terminal event was seen. Preserve ready/park state and
+     * arrange the next pump before any delivery can use an old handle. */
+    for (uint32_t i = 0; i < b->max_conns; i++) {
+        b_conn_t *cn = &b->conns[i];
+        if (cn->used && !cn->closed && cn->events_pending &&
+            bind_refusal_can_poll(b, cn)) b->budget_pending = true;
     }
     b->in_pump = false;
     return MOQR_OK;
@@ -12780,7 +13766,7 @@ moqr_bind_next_deadline_us(const moqr_bind_t *b)
         if (!cn->used || cn->closed) {
             continue;
         }
-        for (uint32_t fi = 0; fi < b->n_fetches; fi++) {
+        for (uint32_t fi = 0; fi < cn->fetch_hw; fi++) {
             const b_fetch_t *bf = &cn->fetches[fi];
             /* A fill reading through a fill source that reports its own
              * deadlines leaves its deadline to the source, which knows
@@ -12801,12 +13787,6 @@ moqr_bind_next_deadline_us(const moqr_bind_t *b)
                 bf->retrieval.live) {
                 uint64_t d = moqr_bind_retrieve_next_deadline(&bf->retrieval);
                 if (d < next) next = d;
-            }
-            /* A FETCH waiting for an Object still arriving gives up on it
-             * at its deadline. */
-            if (bf->used && !bf->fill && bf->state == BF_STREAMING &&
-                bf->fetch_held_pending && bf->fill_deadline_us < next) {
-                next = bf->fill_deadline_us;
             }
         }
     }
@@ -12862,6 +13842,10 @@ moqr_bind_pump_continuation_pending(const moqr_bind_t *b)
         const b_conn_t *cn = &b->conns[i];
         if (!cn->used || cn->closed) {
             continue;
+        }
+        if (cn->events_pending) {
+            if (bind_refusal_can_poll(b, cn)) return true;
+            continue;   /* retained readiness cannot outrun the event drain */
         }
         if (bind_dl_test(b->dl_ready, i)) {
             return true;   /* a live connection has residual ready work */

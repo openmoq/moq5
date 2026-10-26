@@ -25,6 +25,8 @@
 #include <moq/session.h>
 #include <moq/rcbuf.h>
 #include <moq/transport_bridge.h>
+#include <moq/control_d18.h>
+#include <moq/vi64.h>
 #include "held_bridge_driver.h"
 #include "../../../tests/unit/test_binding_support.h"
 
@@ -46,8 +48,10 @@ static uint64_t g_time = 1000;
 static uint64_t g_next_uni = 2;     /* client-initiated uni: 2, 6, 10 .. */
 static uint64_t g_next_bidi = 4;    /* client-initiated bidi after the WT CONNECT stream 0 */
 static uint64_t g_reset_code = 0;
+static uint64_t g_peer_stop_code = 0;
 static uint64_t g_rx_window = 65535;
 static uint64_t g_tp_streams_uni = 64;   /* initial_max_stream_id_unidir */
+static uint64_t g_tp_streams_bidi = 0;
 static uint32_t g_client_max_events = 64;   /* the fetcher session's event queue */
 static picoquic_state_enum g_cnx_state = picoquic_state_ready;
 
@@ -63,9 +67,11 @@ static void calls_clear(void) { g_calls_n = 0; g_calls[0] = 0; }
 static int g_reset_rc = 0;   /* what the next resets answer */
 static int g_reset_at_rc = 0;
 static int g_stop_rc = 0;    /* what the next stops answer, unless refused */
+static uint64_t g_stop_once_sid = UINT64_MAX;
+static int g_stop_once_rc = 0;
 static int g_stream_ctx_rc = 0;
 static void *g_last_stream_ctx;
-static uint64_t g_last_reset_code, g_last_reliable_size;
+static uint64_t g_last_reset_sid, g_last_reset_code, g_last_reliable_size;
 static bool g_reset_at_enabled = false;
 
 picoquic_quic_t *picoquic_get_quic_ctx(picoquic_cnx_t *c) { (void)c; return NULL; }
@@ -73,7 +79,7 @@ picoquic_quic_t *picoquic_get_quic_ctx(picoquic_cnx_t *c) { (void)c; return NULL
 int picoquic_enable_stream_send_commit(picoquic_cnx_t *c, uint64_t sid)
 { (void)c; (void)sid; return 0; }
 int picoquic_get_remote_stop_error(picoquic_cnx_t *c, uint64_t sid, uint64_t *out)
-{ (void)c; (void)sid; *out = 0; return 0; }
+{ (void)c; (void)sid; *out = g_peer_stop_code; return 0; }
 void h3zero_delete_stream(picoquic_cnx_t *c, h3zero_callback_ctx_t *h3, h3zero_stream_ctx_t *sc)
 { (void)c; (void)h3; sc->path_callback = NULL; sc->path_callback_ctx = NULL; }
 #endif
@@ -92,16 +98,18 @@ picoquic_tp_t const *picoquic_get_transport_parameters(picoquic_cnx_t *c, int ge
       tp.initial_max_stream_data_bidi_remote = g_rx_window;
       tp.initial_max_stream_data_bidi_local = g_rx_window;
       tp.initial_max_stream_id_unidir = g_tp_streams_uni;
+      tp.initial_max_stream_id_bidir = g_tp_streams_bidi;
       tp.is_reset_stream_at_enabled = g_reset_at_enabled;
       return &tp; }
 
 /* h3zero stream contexts: a pool keyed by stream id */
-#define SC_MAX 96
+#define SC_MAX 256
 static h3zero_stream_ctx_t g_sc[SC_MAX];
 static int g_sc_n = 0;
 static h3zero_stream_ctx_t *sc_get(uint64_t sid)
 {
     for (int i = 0; i < g_sc_n; i++) if (g_sc[i].stream_id == sid) return &g_sc[i];
+    CHECK(g_sc_n < SC_MAX);
     if (g_sc_n >= SC_MAX) return NULL;
     h3zero_stream_ctx_t *sc = &g_sc[g_sc_n++];
     memset(sc, 0, sizeof(*sc));
@@ -157,7 +165,10 @@ static void act_set(uint64_t sid, int on)
             if (!on) { g_active[i] = g_active[--g_active_n]; }
             return;
         }
-    if (on && g_active_n < ACT_MAX) g_active[g_active_n++] = sid;
+    if (on) {
+        CHECK(g_active_n < ACT_MAX);
+        if (g_active_n < ACT_MAX) g_active[g_active_n++] = sid;
+    }
 }
 int picoquic_mark_active_stream(picoquic_cnx_t *c, uint64_t sid, int active, void *v)
     { (void)c; (void)v; call_log('M'); act_set(sid, active); return 0; }
@@ -169,14 +180,14 @@ uint8_t *picoquic_provide_stream_data_buffer(void *ctx, size_t nb, int is_fin, i
 
 /* STOP_SENDING / RESET issued by the adapter (the fetcher side). */
 #define SIG_MAX 64
-static struct { uint64_t sid; uint64_t code; } g_stops[SIG_MAX];
+static struct { uint64_t sid; uint64_t code; bool accepted; } g_stops[SIG_MAX];
 static int g_stop_n = 0, g_stop_seen = 0;
 static int g_reset_n = 0;
 int picoquic_reset_stream(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)
-    { (void)c; (void)sid; call_log('R'); g_reset_n++;
+    { (void)c; call_log('R'); g_reset_n++; g_last_reset_sid = sid;
       g_last_reset_code = ec; g_last_reliable_size = 0; return g_reset_rc; }
 int picoquic_reset_stream_at(picoquic_cnx_t *c, uint64_t sid, uint64_t ec, uint64_t reliable_size)
-    { (void)c; (void)sid; call_log('R'); g_reset_n++;
+    { (void)c; call_log('R'); g_reset_n++; g_last_reset_sid = sid;
       g_last_reset_code = ec; g_last_reliable_size = reliable_size; return g_reset_at_rc; }
 int picowt_reset_stream(picoquic_cnx_t *cnx, h3zero_stream_ctx_t *stream_ctx, uint64_t local_stream_error)
     { int rc = picoquic_reset_stream_at(cnx, stream_ctx->stream_id,
@@ -193,24 +204,53 @@ static bool g_stop_refused = false;
 int picoquic_set_app_stream_ctx(picoquic_cnx_t *c, uint64_t sid, void *ctx)
     { (void)c; (void)sid; call_log('C'); g_last_stream_ctx = ctx; return g_stream_ctx_rc; }
 int picoquic_stop_sending(picoquic_cnx_t *c, uint64_t sid, uint64_t ec)
-    { (void)c; call_log('S'); if (g_stop_n < SIG_MAX) { g_stops[g_stop_n].sid = sid; g_stops[g_stop_n].code = ec; g_stop_n++; }
-      return g_stop_refused ? -1 : g_stop_rc; }
+{
+    (void)c; call_log('S');
+    int rc = g_stop_rc;
+    if (g_stop_once_sid != UINT64_MAX && sid == g_stop_once_sid) {
+        rc = g_stop_once_rc;
+        g_stop_once_sid = UINT64_MAX;
+    }
+    if (g_stop_refused) rc = -1;
+    CHECK(g_stop_n < SIG_MAX);
+    if (g_stop_n < SIG_MAX) {
+        g_stops[g_stop_n].sid = sid;
+        g_stops[g_stop_n].code = ec;
+        g_stops[g_stop_n].accepted = rc == 0;
+        g_stop_n++;
+    }
+    return rc;
+}
+
+/* Pair exact per-SID counts with an exact total to exclude every unexpected
+ * stream, duplicate call, code change and false claim of provider acceptance. */
+static void check_stop(uint64_t sid, uint64_t code, int expected, bool accepted)
+{
+    int count = 0;
+    for (int i = 0; i < g_stop_n; i++) {
+        if (g_stops[i].sid != sid) continue;
+        count++;
+        CHECK(g_stops[i].code == code && g_stops[i].accepted == accepted);
+    }
+    CHECK(count == expected);
+}
 
 /* Flow-control instrumentation: app-flow-control takeover and grants per stream. */
-#define FC_MAX 64
+#define FC_MAX 256
 static struct { uint64_t sid; int use; int open_calls; uint64_t open_total; } g_fc[FC_MAX];
 static int g_fc_n = 0;
 static int fc_slot(uint64_t sid)
     { for (int i = 0; i < g_fc_n; i++) if (g_fc[i].sid == sid) return i;
-      if (g_fc_n < FC_MAX) { g_fc[g_fc_n].sid = sid; g_fc[g_fc_n].use = -1; return g_fc_n++; } return 0; }
+      if (g_fc_n < FC_MAX) { g_fc[g_fc_n].sid = sid; g_fc[g_fc_n].use = -1; return g_fc_n++; }
+      CHECK(false && "flow-control recorder full"); return -1; }
 static int fc_use(uint64_t sid)
     { for (int i = 0; i < g_fc_n; i++) if (g_fc[i].sid == sid) return g_fc[i].use; return -1; }
 static int fc_open_calls(uint64_t sid)
     { for (int i = 0; i < g_fc_n; i++) if (g_fc[i].sid == sid) return g_fc[i].open_calls; return 0; }
 int picoquic_set_app_flow_control(picoquic_cnx_t *c, uint64_t sid, int use)
-    { (void)c; int s = fc_slot(sid); g_fc[s].use = use; return 0; }
+    { (void)c; int s = fc_slot(sid); if (s < 0) return -1; g_fc[s].use = use; return 0; }
 int picoquic_open_flow_control(picoquic_cnx_t *c, uint64_t sid, uint64_t sz)
-    { (void)c; int s = fc_slot(sid); g_fc[s].open_calls++; g_fc[s].open_total += sz; return 0; }
+    { (void)c; int s = fc_slot(sid); if (s < 0) return -1; g_fc[s].open_calls++; g_fc[s].open_total += sz; return 0; }
 
 /* -- Counting allocator with failure injection ------------------------- */
 
@@ -292,7 +332,7 @@ static void obs_merge(obs_t *t, const obs_t *c)
 
 /* -- The rig --------------------------------------------------------------- */
 
-#define UNI_MAX 32
+#define UNI_MAX 96
 typedef struct rig {
     moq_version_t   version;
     moq_alloc_t     alloc;
@@ -317,6 +357,7 @@ typedef struct rxs {
     bool active, paused, held_input, buf_fin, fin_blocked, held_fin, rx_complete;
     uint64_t blocked, delivered, granted, budget;
     size_t held_len, buf_len;
+    uint8_t prefix_len;
     const uint8_t *buf;
 } rxs_t;
 
@@ -331,6 +372,7 @@ static bool rx_state(rig_t *r, uint64_t sid, rxs_t *out)
         out->rx_complete = st->rx_complete;
         out->blocked = st->blocked; out->delivered = st->delivered; out->granted = st->granted;
         out->budget = st->budget; out->held_len = st->held_len; out->buf_len = st->buf_len; out->buf = st->buf;
+        out->prefix_len = st->uni_prefix.len;
         return true;
     }
     return false;
@@ -349,10 +391,16 @@ static uint64_t rig_opid(rig_t *r, uint64_t sid)
 
 static picoquic_cnx_t *const CNX = (picoquic_cnx_t *)(uintptr_t)0xDEAD;
 
-static void deliver(rig_t *r, uint64_t sid, const uint8_t *data, size_t len, bool fin)
+static int deliver(rig_t *r, uint64_t sid, const uint8_t *data, size_t len, bool fin)
 {
     h3zero_stream_ctx_t *sc = sc_get(sid);
-    (void)moq_pico_wt_callback(CNX, (uint8_t *)data, len,
+    if (!sc) return -1;
+    if (sid != r->ad->control_stream_id) {
+        /* h3zero binds incoming WT streams from their parsed session prefix. */
+        sc->path_callback = moq_pico_wt_callback;
+        sc->path_callback_ctx = r->ad;
+    }
+    return moq_pico_wt_callback(CNX, (uint8_t *)data, len,
                                fin ? picohttp_callback_post_fin : picohttp_callback_post_data, sc, r->ad);
 }
 static void reset_cb(rig_t *r, uint64_t sid)
@@ -391,9 +439,11 @@ static void relay_client_sends(rig_t *r)
 static void relay_server_ops(rig_t *r)
 {
     (void)held_bridge_service(r->sb, 0);
+    CHECK(!r->sep.overflowed && !r->sep.truncated);
     for (size_t i = 0; i < r->sep.count; i++) {
         fake_op_t *op = &r->sep.ops[i];
         if (op->kind == FAKE_OP_OPEN_UNI) {
+            CHECK(r->n_unis < UNI_MAX);
             if (r->n_unis < UNI_MAX) {
                 r->unis[r->n_unis].opid = op->stream_id;
                 r->unis[r->n_unis].sid = 3u + 4u * (uint64_t)r->n_unis;   /* real server uni ids */
@@ -404,6 +454,7 @@ static void relay_server_ops(rig_t *r)
             if (sid == UINT64_MAX) {
                 deliver(r, op->stream_id, op->data, op->data_len, op->fin);   /* one of the fetcher's streams */
             } else if (op->stream_id == r->capture_opid) {
+                CHECK(op->data_len <= sizeof(r->cap) - r->cap_len);
                 if (r->cap_len + op->data_len <= sizeof(r->cap)) {
                     memcpy(r->cap + r->cap_len, op->data, op->data_len);
                     r->cap_len += op->data_len;
@@ -424,7 +475,7 @@ static void relay_client_stops(rig_t *r)
 {
     for (; g_stop_seen < g_stop_n; g_stop_seen++) {
         uint64_t opid = rig_opid(r, g_stops[g_stop_seen].sid);
-        if (opid == UINT64_MAX || r->hold_client) continue;
+        if (opid == UINT64_MAX || r->hold_client || !g_stops[g_stop_seen].accepted) continue;
         (void)moq_transport_bridge_on_peer_stop_sending(r->sb, opid, g_stops[g_stop_seen].code, 0);
     }
 }
@@ -440,7 +491,9 @@ static void pump(rig_t *r, int rounds)
     }
 }
 
-static bool rig_up(rig_t *r, moq_version_t version)
+static bool rig_up_config(rig_t *r, moq_version_t version,
+                          uint64_t uni_credit, uint32_t outgoing_subgroups,
+                          bool request_pressure)
 {
     memset(r, 0, sizeof(*r));
     r->version = version;
@@ -448,8 +501,11 @@ static bool rig_up(rig_t *r, moq_version_t version)
     r->alloc = (moq_alloc_t){ NULL, ca, cr, cf };
     g_next_uni = 2; g_next_bidi = 4; g_active_n = 0; g_fc_n = 0; memset(g_fc, 0, sizeof(g_fc));
     g_stop_n = 0; g_stop_seen = 0; g_reset_n = 0; g_realloc_calls = 0; g_fail_realloc_after = -1;
+    g_stop_once_sid = UINT64_MAX; g_stop_once_rc = 0;
     g_stop_refused = false;
-    g_tp_streams_uni = 64;
+    g_tp_streams_uni = uni_credit;
+    g_tp_streams_bidi = request_pressure ? 256 : 0;
+    g_peer_stop_code = 0;
     g_cnx_state = picoquic_state_ready; g_sc_n = 0;
     memset(&g_h3, 0, sizeof(g_h3)); memset(&g_prefix, 0, sizeof(g_prefix));
 
@@ -457,7 +513,8 @@ static bool rig_up(rig_t *r, moq_version_t version)
     moq_session_cfg_init_sized(&cc, sizeof(cc), &r->alloc, MOQ_PERSPECTIVE_CLIENT);
     cc.version = version;
     cc.send_request_capacity = true;
-    cc.initial_request_capacity = 64;
+    cc.initial_request_capacity = request_pressure ? 512 : 64;
+    cc.max_subscriptions = request_pressure ? 256 : 0;
     cc.max_data_streams = 2;
     cc.max_fetches = 32;
     cc.max_events = g_client_max_events;
@@ -478,8 +535,10 @@ static bool rig_up(rig_t *r, moq_version_t version)
     moq_session_cfg_init_sized(&sc, sizeof(sc), moq_alloc_default(), MOQ_PERSPECTIVE_SERVER);
     sc.version = version;
     sc.send_request_capacity = true;
-    sc.initial_request_capacity = 64;
+    sc.initial_request_capacity = request_pressure ? 512 : 64;
+    sc.max_subscriptions = request_pressure ? 256 : 0;
     sc.max_fetches = 32;
+    sc.max_open_subgroups = outgoing_subgroups;
     sc.max_events = 64;
     if (moq_session_create(&sc, 0, &r->sv) < 0) return false;
     if (test_bind_if_required(r->sv) < 0) return false;
@@ -487,6 +546,7 @@ static bool rig_up(rig_t *r, moq_version_t version)
     held_endpoint_init(&r->sep, 1000, 1);
     moq_transport_bridge_cfg_t bcfg;
     moq_transport_bridge_cfg_init(&bcfg, moq_alloc_default());
+    if (request_pressure) bcfg.max_streams = 256;
     if (held_bridge_create(&bcfg, r->sv, &r->sep.vtable, &r->sep, &r->sb) != MOQ_OK) return false;
 
     if (moq_session_start(r->c, 0) < 0) return false;
@@ -497,6 +557,17 @@ static bool rig_up(rig_t *r, moq_version_t version)
     while (moq_session_poll_events(r->sv, &ev, 1) > 0) moq_event_cleanup(&ev);
     return moq_session_state(r->c) == MOQ_SESS_ESTABLISHED &&
            moq_session_state(r->sv) == MOQ_SESS_ESTABLISHED && !moq_pico_wt_conn_is_fatal(r->ad);
+}
+
+static bool rig_up_limits(rig_t *r, moq_version_t version,
+                          uint64_t uni_credit, uint32_t outgoing_subgroups)
+{
+    return rig_up_config(r, version, uni_credit, outgoing_subgroups, false);
+}
+
+static bool rig_up(rig_t *r, moq_version_t version)
+{
+    return rig_up_limits(r, version, 64, 64);
 }
 
 static void rig_down(rig_t *r)
@@ -589,6 +660,1072 @@ static uint64_t capture_response(rig_t *r, moq_fetch_t sfh, bool end)
     uint64_t sid = rig_sid(r, opid);
     CHECK(sid != UINT64_MAX && r->cap_len > 0 && (!end || r->cap_fin));
     return sid;
+}
+
+/* The sweep controls below keep the fetch owner as well as every object's
+ * position/payload: object zero on two responses is not one duplicate. */
+typedef struct sweep_obs {
+    int ok[3], objects[3], complete[3], goaway;
+} sweep_obs_t;
+
+static void sweep_drain(rig_t *r, const moq_fetch_t *owners, size_t n,
+                         sweep_obs_t *o)
+{
+    moq_event_t ev;
+    while (moq_session_poll_events(r->c, &ev, 1) > 0) {
+        moq_fetch_t owner = MOQ_FETCH_INVALID;
+        switch (ev.kind) {
+        case MOQ_EVENT_FETCH_OK: owner = ev.u.fetch_ok.fetch; break;
+        case MOQ_EVENT_FETCH_OBJECT: owner = ev.u.fetch_object.fetch; break;
+        case MOQ_EVENT_FETCH_COMPLETE: owner = ev.u.fetch_complete.fetch; break;
+        case MOQ_EVENT_GOAWAY: CHECK(++o->goaway == 1); break;
+        default: CHECK(false && "unexpected event in paired sweep"); break;
+        }
+        if (moq_fetch_is_valid(owner)) {
+            size_t k = 0;
+            while (k < n && owners[k]._opaque != owner._opaque) k++;
+            CHECK(k < n && k < 3);
+            if (k < n && k < 3) {
+                if (ev.kind == MOQ_EVENT_FETCH_OK) CHECK(++o->ok[k] == 1);
+                else if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) CHECK(++o->complete[k] == 1);
+                else {
+                    const moq_fetch_object_event_t *obj = &ev.u.fetch_object;
+                    CHECK(obj->object_id == (uint64_t)o->objects[k]++);
+                    CHECK(obj->group_id == 0 && obj->subgroup_id == 0 &&
+                          obj->publisher_priority == 100 && !obj->datagram);
+                    CHECK(obj->payload && moq_rcbuf_len(obj->payload) == 16);
+                    if (obj->payload && moq_rcbuf_len(obj->payload) == 16) {
+                        const uint8_t *bytes = moq_rcbuf_data(obj->payload);
+                        for (size_t j = 0; j < 16; j++)
+                            CHECK(bytes[j] == (uint8_t)(0xd0 + obj->object_id));
+                    }
+                }
+            }
+        } else CHECK(ev.kind == MOQ_EVENT_GOAWAY);
+        moq_event_cleanup(&ev);
+    }
+}
+
+static moq_pico_wt_conn_t *g_sweep_conn;
+static uint64_t g_sweep_waiter = UINT64_MAX;
+static int g_sweep_calls;
+
+static void count_sweep(moq_pico_wt_conn_t *c)
+{
+    CHECK(c == g_sweep_conn && c->rx_sweep_active && !c->rx_resweep_owed);
+    g_sweep_calls++;
+    if (g_sweep_waiter != UINT64_MAX) {
+        CHECK(g_sweep_calls <= 2);
+        CHECK(moq_transport_bridge_stream_has_pending(c->bridge, g_sweep_waiter) ==
+              (g_sweep_calls == 1));
+    }
+}
+
+/* Return a scalar index; never keep a receive-record pointer across service. */
+static size_t rx_index(const rig_t *r, uint64_t sid)
+{
+    for (size_t i = 0; i < r->ad->rx_count; i++)
+        if (r->ad->rx[i].active && r->ad->rx[i].stream_id == sid) return i;
+    return SIZE_MAX;
+}
+
+/* The earliest data record waits for capacity. A later record has retained
+ * session input followed by an adapter-owned FIN. One external service drains
+ * that input, skips the still-blocked early waiter, then replays the later FIN.
+ * Its nested service must be followed by a fresh sweep from index zero. */
+static int row_nested_fin_resweep(moq_version_t v)
+{
+    int before = failures;
+    rig_t r;
+    g_end_object = 100;
+    bool up = rig_up(&r, v);
+    CHECK(up);
+    if (!up) goto out;
+    moq_fetch_t fh[3], sfh[3];
+    /* act_set removes by swapping the last active stream into its place.
+     * Pair each request before issuing another; arrival order of a batch
+     * does not establish the client/server owner correspondence. */
+    for (int k = 0; k < 3; k++) {
+        int setup_before = failures;
+        moq_result_t rc = issue_fetch(r.c, &fh[k]);
+        CHECK(rc == MOQ_OK);
+        if (rc != MOQ_OK) goto out;
+        pump(&r, 4);
+        int got = 0;
+        moq_event_t ev;
+        while (moq_session_poll_events(r.sv, &ev, 1) > 0) {
+            CHECK(ev.kind == MOQ_EVENT_FETCH_REQUEST);
+            if (ev.kind == MOQ_EVENT_FETCH_REQUEST) {
+                CHECK(got == 0);
+                if (got++ == 0) {
+                    sfh[k] = ev.u.fetch_request.fetch;
+                    CHECK(moq_fetch_is_valid(sfh[k]));
+                    for (int j = 0; j < k; j++)
+                        CHECK(sfh[k]._opaque != sfh[j]._opaque);
+                }
+            }
+            moq_event_cleanup(&ev);
+        }
+        CHECK(got == 1);
+        if (failures != setup_before) goto out;
+    }
+    sweep_obs_t o = { 0 };
+    uint64_t waiter = capture_response(&r, sfh[2], false);
+    uint64_t type = 0;
+    CHECK(waiter != UINT64_MAX && r.cap_len > 1 && r.cap_len < sizeof(r.cap));
+    if (waiter == UINT64_MAX || r.cap_len <= 1 || r.cap_len >= sizeof(r.cap)) goto out;
+    CHECK(moq_vi64_decode(r.cap, r.cap_len, &type) == 1 && type == 0x05);
+    if (type != 0x05 || r.cap[0] != 0x05) goto out;
+    uint8_t wide[8192];
+    size_t wide_len = r.cap_len + 1;
+    wide[0] = 0x80;
+    memcpy(wide + 1, r.cap, r.cap_len);
+    CHECK(moq_vi64_decode(wide, wide_len, &type) == 2 && type == 0x05);
+    CHECK(moq_vi64_decode(wide, 1, &type) == 0);
+    r.capture_opid = UINT64_MAX;
+    CHECK(deliver(&r, waiter, wide, 1, false) == 0);
+    rxs_t st;
+    CHECK(rx_state(&r, waiter, &st) && !st.paused && st.prefix_len == 1);
+    sweep_drain(&r, fh, 3, &o);
+    CHECK(o.ok[2] == 1 && o.objects[2] == 0);
+
+    /* Keep the other core receive entry occupied throughout the recovery. */
+    uint64_t blocker = capture_response(&r, sfh[0], false);
+    if (blocker == UINT64_MAX || r.cap_len == 0) goto out;
+    r.capture_opid = UINT64_MAX;
+    CHECK(deliver(&r, blocker, r.cap, r.cap_len, false) == 0);
+    sweep_drain(&r, fh, 3, &o);
+    CHECK(o.ok[0] == 1 && o.objects[0] == 1 && o.complete[0] == 0);
+
+    uint64_t later = capture_response(&r, sfh[1], false);
+    if (later == UINT64_MAX || r.cap_len == 0) goto out;
+    for (int i = 1; i < 70; i++) {
+        CHECK(write_obj(r.sv, sfh[1], (uint64_t)i) == MOQ_OK);
+        if (i % 16 == 15) pump(&r, 1);
+    }
+    pump(&r, 1);
+    r.capture_opid = UINT64_MAX;
+    sweep_drain(&r, fh, 3, &o);       /* no FETCH_OK occupies the 64 event slots */
+    CHECK(o.ok[1] == 1 && o.objects[1] == 0 && !r.cap_fin);
+    CHECK(deliver(&r, later, r.cap, r.cap_len, false) == 0);
+    CHECK(rx_state(&r, later, &st) && st.paused && !st.held_input &&
+          st.blocked == r.cap_len && st.buf_len == 0);
+    CHECK(moq_session_end_fetch(r.sv, sfh[1], 0) == MOQ_OK);
+    relay_server_ops(&r);            /* a real FIN queues behind retained input */
+    CHECK(rx_state(&r, later, &st) && st.paused && st.buf_fin && st.buf_len == 0);
+    CHECK(!moq_session_can_admit_data_stream(r.c));
+    CHECK(deliver(&r, waiter, wide + 1, wide_len - 1, false) == 0);
+    CHECK(rx_state(&r, waiter, &st) && st.held_input && st.held_len == wide_len - 1 &&
+          !st.held_fin && !st.buf_fin && st.blocked == 0);
+    CHECK(st.buf && st.buf_len == wide_len - 1 &&
+          memcmp(st.buf, wide + 1, wide_len - 1) == 0);
+    CHECK(rx_index(&r, waiter) < rx_index(&r, later) && rx_index(&r, later) != SIZE_MAX);
+    sweep_drain(&r, fh, 3, &o);       /* poll only: still no service after freeing slots */
+    CHECK(o.objects[1] == 64 && o.objects[2] == 0 && o.complete[1] == 0);
+    int grants = fc_open_calls(waiter);
+
+    g_sweep_conn = r.ad; g_sweep_waiter = waiter; g_sweep_calls = 0;
+    pw_test_sweep_observer = count_sweep;
+    CHECK(moq_pico_wt_service(r.ad, g_time) == 0);     /* the only progress call */
+    pw_test_sweep_observer = NULL;
+    CHECK(g_sweep_calls == 2 && !r.ad->rx_sweep_active && !r.ad->rx_resweep_owed);
+    CHECK(rx_state(&r, waiter, &st) && !st.paused && !st.held_input &&
+          st.buf_len == 0 && st.blocked == 0 && st.prefix_len == 0 && st.delivered == wide_len);
+    CHECK(!rx_state(&r, later, &st));
+    CHECK(rx_state(&r, blocker, &st) && !st.paused);
+    sweep_drain(&r, fh, 3, &o);
+    CHECK(o.objects[0] == 1 && o.objects[1] == 70 && o.objects[2] == 1);
+    CHECK(o.complete[0] == 0 && o.complete[1] == 1 && o.complete[2] == 0 && o.goaway == 0);
+    CHECK(g_stop_n == 0 && g_reset_n == 0 && fc_open_calls(waiter) == grants);
+    CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
+out:
+    pw_test_sweep_observer = NULL; g_sweep_conn = NULL; g_sweep_waiter = UINT64_MAX;
+    rig_down(&r);
+    g_end_object = 3;
+    if (failures == before) printf("PASS: pw nested FIN full resweep draft-%d\n",
+                                  v == MOQ_VERSION_DRAFT_18 ? 18 : 22);
+    return failures - before;
+}
+
+static int service_only_callback(rig_t *r, bool datagram)
+{
+    if (datagram) {
+        uint8_t padding[MOQ_VI64_MAX_LEN];
+        size_t n = moq_vi64_encode(MOQ_D18_PADDING_DATAGRAM, padding, sizeof(padding));
+        CHECK(n > 0);
+        return moq_pico_wt_callback(CNX, padding, n, picohttp_callback_post_datagram,
+                                    sc_get(r->ad->control_stream_id), r->ad);
+    }
+    /* The non-closing capsule stub does not parse this unknown capsule.
+     * This control exercises callback service pairing, not picowt parsing. */
+    static const uint8_t capsule[] = { 0x01, 0x00 };
+    return deliver(r, r->ad->control_stream_id, capsule, sizeof(capsule), false);
+}
+
+/* A capsule/datagram alone clears retained control and replays its waiter.
+ * The pre-drain call proves unchanged H/prefix state causes just one sweep. */
+static int row_callback_resweep(moq_version_t v, bool datagram)
+{
+    int before = failures;
+    rig_t r;
+    g_client_max_events = 2;
+    bool up = rig_up(&r, v);
+    g_client_max_events = 64;
+    CHECK(up);
+    if (!up) goto out;
+    moq_fetch_t fh[2], sfh[2];
+    bool fetched = fetch_all(&r, 2, fh, sfh);
+    CHECK(fetched);
+    if (!fetched) goto out;
+    uint64_t waiter = capture_response(&r, sfh[0], false);
+    uint8_t all[8192]; size_t total = r.cap_len;
+    memcpy(all, r.cap, total);
+    uint64_t collecting = capture_response(&r, sfh[1], false);
+    r.capture_opid = UINT64_MAX;
+    CHECK(waiter != UINT64_MAX && collecting != UINT64_MAX && total > 1 && r.cap_len > 1);
+    if (waiter == UINT64_MAX || collecting == UINT64_MAX || total <= 1 || r.cap_len <= 1) goto out;
+    CHECK(moq_session_goaway(r.sv, NULL, 0, 0) == MOQ_OK);
+    relay_server_ops(&r);        /* two unpolled FETCH_OK events block GOAWAY */
+    CHECK(moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
+    static const uint8_t prefix = 0x80;      /* incomplete, valid two-byte vi64 */
+    CHECK(deliver(&r, collecting, &prefix, 1, false) == 0);
+    CHECK(deliver(&r, waiter, all, total, false) == 0);
+    rxs_t held, st;
+    CHECK(rx_state(&r, waiter, &held) && held.held_input && held.held_len == total &&
+          held.buf_len == total && held.buf && memcmp(held.buf, all, total) == 0 &&
+          !held.held_fin && !held.buf_fin && held.blocked == 0);
+    CHECK(rx_state(&r, collecting, &st) && st.prefix_len == 1 && !st.paused);
+    int grants = fc_open_calls(waiter), prefix_grants = fc_open_calls(collecting);
+    g_sweep_conn = r.ad; g_sweep_waiter = UINT64_MAX; g_sweep_calls = 0;
+    pw_test_sweep_observer = count_sweep;
+    CHECK(service_only_callback(&r, datagram) == 0);
+    CHECK(g_sweep_calls == 1 && !r.ad->rx_sweep_active && !r.ad->rx_resweep_owed);
+    CHECK(rx_state(&r, waiter, &st) && st.held_input && st.held_len == total &&
+          st.buf == held.buf && st.buf_len == total && st.buf && memcmp(st.buf, all, total) == 0 &&
+          !st.held_fin && !st.buf_fin && st.blocked == 0 && st.delivered == total);
+    CHECK(rx_state(&r, collecting, &st) && st.prefix_len == 1 && !st.paused &&
+          st.delivered == 1 && st.buf_len == 0);
+    CHECK(moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
+    sweep_obs_t o = { 0 };
+    sweep_drain(&r, fh, 2, &o);
+    CHECK(o.ok[0] == 1 && o.ok[1] == 1 && o.objects[0] == 0 && o.goaway == 0);
+
+    g_sweep_calls = 0;
+    CHECK(service_only_callback(&r, datagram) == 0);  /* no later service/callback */
+    pw_test_sweep_observer = NULL;
+    CHECK(g_sweep_calls == 1 && !r.ad->rx_sweep_active && !r.ad->rx_resweep_owed);
+    CHECK(rx_state(&r, waiter, &st) && !st.paused && !st.held_input &&
+          st.buf_len == 0 && st.blocked == 0 && st.delivered == total);
+    CHECK(rx_state(&r, collecting, &st) && st.prefix_len == 1 && !st.paused &&
+          st.delivered == 1 && st.buf_len == 0);
+    sweep_drain(&r, fh, 2, &o);
+    CHECK(o.objects[0] == 1 && o.objects[1] == 0 && o.goaway == 1 &&
+          o.complete[0] == 0 && o.complete[1] == 0);
+    CHECK(moq_session_state(r.c) == MOQ_SESS_DRAINING && !moq_pico_wt_conn_is_fatal(r.ad));
+    CHECK(g_stop_n == 0 && g_reset_n == 0 && fc_open_calls(waiter) == grants &&
+          fc_open_calls(collecting) == prefix_grants);
+out:
+    pw_test_sweep_observer = NULL; g_sweep_conn = NULL;
+    rig_down(&r);
+    if (failures == before) printf("PASS: pw %s paired sweep draft-%d\n",
+                                  datagram ? "datagram" : "capsule",
+                                  v == MOQ_VERSION_DRAFT_18 ? 18 : 22);
+    return failures - before;
+}
+
+/* Ordinary attach has no hold table on e92. This forward-behavior baseline
+ * asks production admission to bound known-data holds at the existing policy
+ * size, not to overflow an already allocated default table. One subscription
+ * keeps request mappings out of the capacity prerequisite. */
+#define PRODUCTION_HOLDS 64
+#define PRODUCTION_STREAMS (2 + PRODUCTION_HOLDS + 1)
+
+typedef struct production_obs {
+    int ok, goaway, objects[PRODUCTION_STREAMS][2], fins[PRODUCTION_STREAMS];
+    uint64_t order[4 * PRODUCTION_STREAMS];
+    size_t n;
+} production_obs_t;
+
+static void production_body(uint8_t body[16], uint64_t group, uint64_t object)
+{
+    for (size_t i = 0; i < 16; i++)
+        body[i] = (uint8_t)(3 * group + object + i);
+}
+
+static moq_result_t production_write(rig_t *r, moq_subgroup_handle_t sg,
+                                      uint64_t group, uint64_t object)
+{
+    uint8_t body[16];
+    production_body(body, group, object);
+    moq_rcbuf_t *payload = NULL;
+    moq_result_t rc = moq_rcbuf_create(moq_alloc_default(), body, sizeof(body), &payload);
+    if (rc != MOQ_OK) return rc;
+    rc = moq_session_write_object(r->sv, sg, object, payload, 0);
+    moq_rcbuf_decref(payload);
+    return rc;
+}
+
+static void production_drain(rig_t *r, moq_subscription_t sub,
+                              production_obs_t *o)
+{
+    moq_event_t ev;
+    while (moq_session_poll_events(r->c, &ev, 1) > 0) {
+        uint64_t identity = UINT64_MAX;
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_OK) {
+            CHECK(ev.u.subscribe_ok.sub._opaque == sub._opaque);
+            o->ok++;
+        } else if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+            const moq_object_received_event_t *e = &ev.u.object_received;
+            CHECK(e->sub._opaque == sub._opaque && !moq_publication_is_valid(e->pub));
+            CHECK(e->group_id < PRODUCTION_STREAMS && e->subgroup_id == 0);
+            CHECK(e->object_id < 2 && e->publisher_priority == 100);
+            CHECK(e->status == MOQ_OBJECT_NORMAL && !e->datagram && !e->end_of_group);
+            CHECK(e->first_object == (r->version != MOQ_VERSION_DRAFT_16 && e->object_id == 0));
+            uint8_t body[16];
+            production_body(body, e->group_id, e->object_id);
+            CHECK(e->payload && moq_rcbuf_len(e->payload) == sizeof(body) &&
+                  memcmp(moq_rcbuf_data(e->payload), body, sizeof(body)) == 0);
+            if (e->group_id < PRODUCTION_STREAMS && e->object_id < 2)
+                CHECK(++o->objects[e->group_id][e->object_id] == 1);
+            identity = 4 * e->group_id + e->object_id;
+        } else if (ev.kind == MOQ_EVENT_SUBGROUP_FINISHED) {
+            const moq_subgroup_finished_event_t *e = &ev.u.subgroup_finished;
+            CHECK(e->sub._opaque == sub._opaque && !moq_publication_is_valid(e->pub));
+            CHECK(e->group_id < PRODUCTION_STREAMS && e->subgroup_id == 0 && !e->end_of_group);
+            if (e->group_id < PRODUCTION_STREAMS) {
+                CHECK(o->objects[e->group_id][0] == 1);
+                CHECK(++o->fins[e->group_id] == 1);
+            }
+            identity = 4 * e->group_id + 2;
+        } else if (ev.kind == MOQ_EVENT_GOAWAY) {
+            o->goaway++;
+        } else {
+            CHECK(ev.kind == MOQ_EVENT_REQUEST_READY);
+        }
+        if (identity != UINT64_MAX) {
+            CHECK(o->n < sizeof(o->order) / sizeof(o->order[0]));
+            if (o->n < sizeof(o->order) / sizeof(o->order[0]))
+                o->order[o->n++] = identity;
+        }
+        moq_event_cleanup(&ev);
+    }
+}
+
+static bool production_subscribe(rig_t *r, moq_subscription_t *client,
+                                  moq_subscription_t *server)
+{
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_subscribe_cfg_t cfg;
+    moq_subscribe_cfg_init(&cfg);
+    cfg.track_namespace = (moq_namespace_t){ .parts = parts, .count = 1 };
+    cfg.track_name = MOQ_BYTES_LITERAL("capacity");
+    cfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+    if (moq_session_subscribe(r->c, &cfg, 0, client) != MOQ_OK) return false;
+    pump(r, 4);
+    int requests = 0;
+    moq_event_t ev;
+    while (moq_session_poll_events(r->sv, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
+            *server = ev.u.subscribe_request.sub;
+            requests++;
+        } else {
+            CHECK(ev.kind == MOQ_EVENT_REQUEST_READY);
+        }
+        moq_event_cleanup(&ev);
+    }
+    if (requests != 1) return false;
+    moq_accept_subscribe_cfg_t ac;
+    moq_accept_subscribe_cfg_init(&ac);
+    if (moq_session_accept_subscribe(r->sv, *server, &ac, 0) != MOQ_OK) return false;
+    pump(r, 4);
+    return true;
+}
+
+/* Capture only bytes actually produced for a real new subgroup. */
+static bool production_capture(rig_t *r, moq_subscription_t server,
+                                uint64_t group, bool fin,
+                                moq_subgroup_handle_t *sg, uint64_t *sid)
+{
+    uint64_t opid = r->sep.next_uni_id;
+    r->capture_opid = opid;
+    r->cap_len = 0;
+    r->cap_fin = false;
+    moq_subgroup_cfg_t cfg;
+    moq_subgroup_cfg_init(&cfg);
+    cfg.group_id = group;
+    cfg.publisher_priority = 100;
+    cfg.first_object = true;
+    if (moq_session_open_subgroup(r->sv, server, &cfg, 0, sg) != MOQ_OK ||
+        production_write(r, *sg, group, 0) != MOQ_OK ||
+        (fin && moq_session_close_subgroup(r->sv, *sg, 0) != MOQ_OK))
+        return false;
+    pump(r, 2);
+    r->capture_opid = UINT64_MAX;
+    *sid = rig_sid(r, opid);
+    return *sid != UINT64_MAX && r->cap_len > 0 && r->cap_fin == fin;
+}
+
+static int row_production_bounded_admission(moq_version_t v)
+{
+    int before = failures;
+    rig_t r;
+    /* Set permission before attach. At most 67 data + two controls + one
+     * request mapping are live: well below the unmodified default 128 map. */
+    bool up = rig_up_limits(&r, v, 96, 80);
+    CHECK(up);
+    if (!up) { rig_down(&r); return failures - before; }
+    r.hold_client = true;       /* peer may deliver its terminal after our STOP */
+    moq_subscription_t client = MOQ_SUBSCRIPTION_INVALID;
+    moq_subscription_t server = MOQ_SUBSCRIPTION_INVALID;
+    bool subscribed = production_subscribe(&r, &client, &server);
+    CHECK(subscribed);
+    if (!subscribed) { rig_down(&r); return failures - before; }
+    production_obs_t o = { 0 };
+    production_drain(&r, client, &o);
+    CHECK(o.ok == 1 && o.n == 0);
+    moq_subgroup_handle_t sg[PRODUCTION_STREAMS];
+    uint64_t sid[PRODUCTION_STREAMS];
+    int grants[PRODUCTION_STREAMS];
+    rxs_t held_at_arrival[PRODUCTION_HOLDS] = { 0 };
+    const uint64_t code = v == MOQ_VERSION_DRAFT_16 ? MOQ_STREAM_ERROR_CANCELLED
+                                                    : MOQ_STREAM_ERROR_EXCESSIVE_LOAD;
+    uint64_t wire_code = 0;
+    CHECK(pico_wt_moq_err_to_wt(code, &wire_code));
+    uint8_t oldest[8192];
+    size_t oldest_len = 0;
+
+    for (int i = 0; i < PRODUCTION_STREAMS; i++) {
+        bool fin = i == 2;     /* oldest hold owns an exact chunk with FIN */
+        bool captured = production_capture(&r, server, (uint64_t)i, fin, &sg[i], &sid[i]);
+        CHECK(captured);
+        if (!captured) { rig_down(&r); return failures - before; }
+        CHECK(sid[i] == 3u + 4u * ((uint64_t)i + (v != MOQ_VERSION_DRAFT_16)));
+        if (i == 2) {
+            oldest_len = r.cap_len;
+            memcpy(oldest, r.cap, oldest_len);
+        }
+        grants[i] = fc_open_calls(sid[i]);
+        CHECK(deliver(&r, sid[i], r.cap, r.cap_len, fin) == 0);
+        if (i >= 2) {
+            CHECK(fc_use(sid[i]) == 1);
+            CHECK(fc_open_calls(sid[i]) == grants[i]);
+        }
+        if (i < 2) {
+            production_drain(&r, client, &o);
+            CHECK(o.objects[i][0] == 1 && o.fins[i] == 0);
+        } else if (i < PRODUCTION_STREAMS - 1) {
+            rxs_t st;
+            bool tracked = rx_state(&r, sid[i], &st);
+            CHECK(tracked);
+            if (tracked) {
+                CHECK(st.paused && st.held_input && st.blocked == 0);
+                CHECK(st.held_len == r.cap_len && st.held_fin == fin && st.buf_fin == fin);
+                CHECK(st.buf_len == r.cap_len && st.buf &&
+                      memcmp(st.buf, r.cap, r.cap_len) == 0);
+                held_at_arrival[i - 2] = st;
+            }
+            /* WT services the new hold in this callback.
+             * Equal priorities select the two admitted refs in order. */
+            const int first = i >= 2 ? 1 : 0;
+            const int second = i >= 3 ? 1 : 0;
+            CHECK(g_stop_n == first + second && g_reset_n == 0);
+            check_stop(sid[0], wire_code, first, true);
+            check_stop(sid[1], wire_code, second, true);
+        }
+        CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
+        CHECK(moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
+        if (i >= 1) CHECK(!moq_session_can_admit_data_stream(r.c));
+    }
+    production_drain(&r, client, &o);
+    CHECK(o.n == 2 && o.order[0] == 0 && o.order[1] == 4);
+
+    const int rejected = PRODUCTION_STREAMS - 1;
+    for (int n = 0; n < 3; n++) CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+    /* Two pressure victims still occupy RX; the 65th hold is refused. */
+    CHECK(g_stop_n == 3 && g_reset_n == 0);
+    check_stop(sid[0], wire_code, 1, true);
+    check_stop(sid[1], wire_code, 1, true);
+    check_stop(sid[rejected], wire_code, 1, true);
+    CHECK(!moq_session_can_admit_data_stream(r.c));
+
+    /* Repeated service cannot grant held-stream credit or duplicate a STOP. */
+    for (int n = 0; n < 3; n++) CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+    for (int i = 2; i < PRODUCTION_STREAMS; i++) {
+        CHECK(fc_open_calls(sid[i]) == grants[i]);
+        if (i == rejected) continue;
+        rxs_t held;
+        bool present = rx_state(&r, sid[i], &held);
+        CHECK(present);
+        if (present) {
+            const rxs_t *saved = &held_at_arrival[i - 2];
+            CHECK(held.paused && held.held_input && held.blocked == 0);
+            CHECK(held.held_len == saved->held_len && held.held_fin == saved->held_fin &&
+                  held.buf_fin == saved->buf_fin && held.buf_len == saved->buf_len &&
+                  held.buf == saved->buf);
+        }
+    }
+    CHECK(!moq_session_can_admit_data_stream(r.c));
+    CHECK(g_stop_n == 3 && g_reset_n == 0);
+    check_stop(sid[0], wire_code, 1, true);
+    check_stop(sid[1], wire_code, 1, true);
+    check_stop(sid[rejected], wire_code, 1, true);
+    CHECK(production_write(&r, sg[1], 1, 1) == MOQ_OK);
+    pump(&r, 2);
+    production_drain(&r, client, &o);
+    /* Accepted pressure STOP discards this later object, without losing either
+     * healthy object already delivered before cancellation. */
+    CHECK(o.n == 2 && o.order[0] == 0 && o.order[1] == 4);
+    CHECK(o.objects[0][0] == 1 && o.objects[1][0] == 1 && o.objects[1][1] == 0);
+
+    /* The refused live stream's later FIN must discard, never deliver it.
+     * No redundant STOP is demanded for a receive half already terminal. */
+    CHECK(moq_session_close_subgroup(r.sv, sg[rejected], 0) == MOQ_OK);
+    relay_server_ops(&r);
+    for (int n = 0; n < 3; n++) CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+    rxs_t rejected_state;
+    bool tracked = rx_state(&r, sid[rejected], &rejected_state);
+    CHECK(!tracked || (!rejected_state.held_input && rejected_state.buf_len == 0));
+    CHECK(g_stop_n == 3 && g_reset_n == 0);
+    check_stop(sid[0], wire_code, 1, true);
+    check_stop(sid[1], wire_code, 1, true);
+    check_stop(sid[rejected], wire_code, 1, true);
+
+    /* Releasing one admitted entry is the only new peer input. Neither held
+     * stream is fed again by the fixture: service replays bytes and FIN. */
+    rxs_t oldest_state;
+    tracked = rx_state(&r, sid[2], &oldest_state);
+    CHECK(tracked);
+    if (tracked) {
+        CHECK(oldest_state.held_input && oldest_state.held_fin &&
+              oldest_state.buf_len == oldest_len && oldest_state.buf &&
+              memcmp(oldest_state.buf, oldest, oldest_len) == 0);
+    }
+    CHECK(moq_session_close_subgroup(r.sv, sg[0], 0) == MOQ_OK);
+    relay_server_ops(&r);
+    for (int n = 0; n < 8; n++) CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+    production_drain(&r, client, &o);
+    CHECK(o.n == 5);
+    CHECK(o.order[0] == 0 && o.order[1] == 4 && o.order[2] == 8 &&
+          o.order[3] == 10 && o.order[4] == 12);
+    CHECK(o.objects[2][0] == 1 && o.objects[3][0] == 1 && o.objects[1][1] == 0);
+    CHECK(o.fins[0] == 0 && o.fins[1] == 0 && o.fins[2] == 1 && o.fins[3] == 0);
+    /* The real terminal freed group 0. Oldest-held group 2 finishes, group 3
+     * delivers its object, then becomes the next eligible pressure victim. */
+    CHECK(g_stop_n == 4 && g_reset_n == 0);
+    check_stop(sid[0], wire_code, 1, true);
+    check_stop(sid[1], wire_code, 1, true);
+    check_stop(sid[rejected], wire_code, 1, true);
+    check_stop(sid[3], wire_code, 1, true);
+    for (int i = 4; i < PRODUCTION_STREAMS; i++)
+        CHECK(o.objects[i][0] == 0 && o.fins[i] == 0);
+    tracked = rx_state(&r, sid[2], &oldest_state);
+    CHECK(!tracked || (!oldest_state.held_input && oldest_state.buf_len == 0));
+    rxs_t next_state;
+    tracked = rx_state(&r, sid[4], &next_state);
+    CHECK(tracked && next_state.held_input);
+    CHECK(!moq_session_can_admit_data_stream(r.c));
+    CHECK(!moq_pico_wt_conn_is_fatal(r.ad) && moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
+
+    /* The control channel still progresses with the remaining holds parked. */
+    CHECK(moq_session_goaway(r.sv, NULL, 0, 0) == MOQ_OK);
+    pump(&r, 3);
+    production_drain(&r, client, &o);
+    CHECK(o.ok == 1 && o.goaway == 1 && o.n == 5);
+    CHECK(moq_session_state(r.c) == MOQ_SESS_DRAINING && !moq_pico_wt_conn_is_fatal(r.ad));
+    CHECK(g_stop_n == 4 && g_reset_n == 0);
+    check_stop(sid[0], wire_code, 1, true);
+    check_stop(sid[1], wire_code, 1, true);
+    check_stop(sid[rejected], wire_code, 1, true);
+    check_stop(sid[3], wire_code, 1, true);
+    CHECK(fc_open_calls(sid[rejected]) == grants[rejected]);
+    rig_down(&r);
+    if (failures == before) printf("PASS: pw production bounded admission draft-%d\n",
+                                  v == MOQ_VERSION_DRAFT_16 ? 16 : v == MOQ_VERSION_DRAFT_18 ? 18 : 22);
+    return failures - before;
+}
+
+/* A full event queue defers GOAWAY. Incomplete UNI types still collect with
+ * OK; completed types take one of the 64 holds or are refused immediately,
+ * BEFORE control drains. Split input holds/refuses only its completing chunk,
+ * never the already accepted prefix. */
+static int row_deferred_admission(moq_version_t v, bool split, int stop_rc, bool refuse)
+{
+    int before = failures;
+    rig_t r;
+    g_client_max_events = 1;
+    bool up = rig_up_limits(&r, v, 96, 80);
+    g_client_max_events = 64;
+    CHECK(up);
+    if (!up) { rig_down(&r); return failures - before; }
+    r.hold_client = true;
+    moq_subscription_t client = MOQ_SUBSCRIPTION_INVALID;
+    moq_subscription_t server = MOQ_SUBSCRIPTION_INVALID;
+    bool subscribed = production_subscribe(&r, &client, &server);
+    CHECK(subscribed);
+    if (!subscribed) { rig_down(&r); return failures - before; }
+    production_obs_t o = { 0 };
+    production_drain(&r, client, &o);
+    moq_subgroup_handle_t sg[PRODUCTION_STREAMS];
+    uint64_t sid[PRODUCTION_STREAMS];
+    int grants[PRODUCTION_STREAMS];
+    const int streams = PRODUCTION_STREAMS - (refuse ? 0 : 1);
+    const int last = streams - 1;
+    const uint8_t *last_buf = NULL;
+    const uint64_t code = MOQ_STREAM_ERROR_EXCESSIVE_LOAD;
+    uint64_t wire_code = 0;
+    CHECK(pico_wt_moq_err_to_wt(code, &wire_code));
+    for (int i = 0; i < streams; i++) {
+        bool captured = production_capture(&r, server, (uint64_t)i, false, &sg[i], &sid[i]);
+        CHECK(captured);
+        if (!captured) goto out;
+        grants[i] = fc_open_calls(sid[i]);
+        if (split && i == last) {
+            /* A valid non-minimal type exposes collection separately from
+             * the bounded disposition of the completing callback. */
+            uint64_t type = 0, expanded_type = 0;
+            size_t type_len = moq_vi64_decode(r.cap, r.cap_len, &type);
+            CHECK(r.cap_len > 2 && r.cap_len < sizeof(r.cap) &&
+                  type_len == 1 && type <= 0x7f);
+            if (r.cap_len <= 2 || r.cap_len >= sizeof(r.cap) ||
+                type_len != 1 || type > 0x7f) goto out;
+            memmove(r.cap + 1, r.cap, r.cap_len);
+            r.cap[0] = 0x80;
+            r.cap_len++;
+            size_t expanded_len = moq_vi64_decode(r.cap, r.cap_len, &expanded_type);
+            CHECK(expanded_len == 2 && expanded_type == type);
+            if (expanded_len != 2 || expanded_type != type) goto out;
+            size_t fragment_len = moq_vi64_decode(r.cap, 1, &expanded_type);
+            CHECK(fragment_len == 0);
+            if (fragment_len != 0) goto out;
+            CHECK(deliver(&r, sid[i], r.cap, 1, false) == 0);
+            for (int n = 0; n < 3; n++) {
+                rxs_t prefix;
+                CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+                CHECK(rx_state(&r, sid[i], &prefix));
+                CHECK(!prefix.paused && !prefix.held_input && prefix.prefix_len == 1 &&
+                      prefix.delivered == 1 && prefix.blocked == 0 && prefix.buf_len == 0);
+                CHECK(g_stop_n == 0 && g_reset_n == 0 &&
+                      fc_open_calls(sid[i]) == grants[i]);
+            }
+            if (refuse) {
+                g_stop_once_sid = sid[i];
+                g_stop_once_rc = stop_rc;
+            }
+            CHECK(deliver(&r, sid[i], r.cap + 1, r.cap_len - 1, false) ==
+                  (refuse && stop_rc == -1 ? -1 : 0));
+        } else {
+            if (refuse && i == last) {
+                g_stop_once_sid = sid[i];
+                g_stop_once_rc = stop_rc;
+            }
+            CHECK(deliver(&r, sid[i], r.cap, r.cap_len, false) ==
+                  (refuse && i == last && stop_rc == -1 ? -1 : 0));
+        }
+        if (i == 0) production_drain(&r, client, &o);
+        if (i == 1) {
+            /* Keep object(1) queued: GOAWAY cannot emit its event yet. */
+            CHECK(moq_session_goaway(r.sv, NULL, 0, 0) == MOQ_OK);
+            relay_server_ops(&r);
+            CHECK(moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
+        }
+        if (refuse && i == last) {
+            CHECK(g_stop_once_sid == UINT64_MAX);
+            CHECK(g_stop_n == 1 && g_reset_n == 0);
+            check_stop(sid[last], wire_code, 1, stop_rc == 0);
+            check_stop(sid[0], wire_code, 0, true);
+            check_stop(sid[1], wire_code, 0, true);
+            CHECK(moq_pico_wt_conn_is_fatal(r.ad) == (stop_rc == -1));
+            CHECK(fc_use(sid[i]) == 1 && fc_open_calls(sid[i]) == grants[i]);
+            CHECK(o.n == 1 && o.goaway == 0);
+            if (stop_rc == -1) goto out;
+            CHECK(moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
+            rxs_t stopped;
+            bool tracked = rx_state(&r, sid[i], &stopped);
+            if (stop_rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) CHECK(!tracked);
+            else CHECK(tracked && !stopped.paused && !stopped.held_input &&
+                       stopped.buf_len == 0 && stopped.prefix_len == 0);
+            continue;
+        }
+        if (i >= 2) {
+            rxs_t st;
+            bool tracked = rx_state(&r, sid[i], &st);
+            CHECK(tracked);
+            if (tracked) {
+                size_t prefix = split && i == last ? 1 : 0;
+                size_t held = r.cap_len - prefix;
+                CHECK(st.paused && st.held_input && st.held_len == held && st.blocked == 0);
+                CHECK(!st.held_fin && !st.buf_fin && st.delivered == r.cap_len);
+                CHECK(st.buf_len == held && st.buf &&
+                      memcmp(st.buf, r.cap + prefix, held) == 0);
+                if (i == last) last_buf = st.buf;
+            }
+            CHECK(fc_use(sid[i]) == 1 && fc_open_calls(sid[i]) == grants[i]);
+        }
+        CHECK(g_stop_n == 0 && g_reset_n == 0 && !moq_pico_wt_conn_is_fatal(r.ad));
+    }
+    CHECK(o.n == 1 && o.goaway == 0);
+    /* Pending GOAWAY must still suppress all F cancellation. */
+    CHECK(g_stop_n == (refuse ? 1 : 0) && g_reset_n == 0);
+    check_stop(sid[0], wire_code, 0, true);
+    check_stop(sid[1], wire_code, 0, true);
+    check_stop(sid[last], wire_code, refuse ? 1 : 0, stop_rc == 0);
+    production_drain(&r, client, &o);       /* free the queued object slot */
+    CHECK(o.n == 2);
+    for (int n = 0; n < 8; n++) {
+        (void)moq_pico_wt_service(r.ad, g_time);
+        if (moq_pico_wt_conn_is_fatal(r.ad)) break;
+        production_drain(&r, client, &o);
+    }
+    /* Clearing control permits exactly two pressure STOPs. Acceptance does
+     * not release either RX entry; the held input remains adapter-owned. */
+    CHECK(g_stop_n == (refuse ? 3 : 2) && g_reset_n == 0);
+    check_stop(sid[0], wire_code, 1, true);
+    check_stop(sid[1], wire_code, 1, true);
+    check_stop(sid[last], wire_code, refuse ? 1 : 0, stop_rc == 0);
+    CHECK(!moq_session_can_admit_data_stream(r.c));
+    if (!refuse) {
+        rxs_t held;
+        bool tracked = rx_state(&r, sid[last], &held);
+        CHECK(tracked && split);
+        if (tracked) {
+            CHECK(held.held_input && held.held_len == r.cap_len - 1 && held.blocked == 0);
+            CHECK(held.buf == last_buf && held.buf_len == r.cap_len - 1 &&
+                  held.buf && memcmp(held.buf, r.cap + 1, r.cap_len - 1) == 0);
+        }
+        CHECK(g_stop_n == 2 && g_reset_n == 0 && o.n == 2 && o.goaway == 1);
+        check_stop(sid[0], wire_code, 1, true);
+        check_stop(sid[1], wire_code, 1, true);
+        check_stop(sid[last], wire_code, 0, true);
+        CHECK(fc_open_calls(sid[last]) == grants[last]);
+        CHECK(pico_wt_moq_err_to_wt(0, &g_reset_code));
+        reset_cb(&r, sid[last]);  /* real zero-code peer RESET settles this hold */
+        CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+        production_drain(&r, client, &o);
+        CHECK(!rx_state(&r, sid[last], &held));
+        CHECK(g_stop_n == 2 && g_reset_n == 0 && o.n == 2 && o.goaway == 1);
+        check_stop(sid[0], wire_code, 1, true);
+        check_stop(sid[1], wire_code, 1, true);
+        check_stop(sid[last], wire_code, 0, true);
+        CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
+        goto out;
+    }
+    CHECK(moq_pico_wt_conn_is_fatal(r.ad) == (stop_rc == -1));
+    if (stop_rc == -1) goto out;
+    CHECK(o.n == 2 && o.goaway == 1 && moq_session_state(r.c) == MOQ_SESS_DRAINING);
+    rxs_t st;
+    bool tracked = rx_state(&r, sid[last], &st);
+    if (stop_rc == PICOQUIC_ERROR_STREAM_ALREADY_CLOSED) {
+        CHECK(!tracked);
+    } else {
+        CHECK(tracked && !st.held_input && !st.paused && st.buf_len == 0);
+    }
+    CHECK(fc_open_calls(sid[last]) == grants[last]);
+    if (stop_rc == 0) {
+        /* A successful STOP still awaits a real native receive terminal.
+         * Repeated input before that terminal is discarded, never re-admitted. */
+        CHECK(deliver(&r, sid[last], r.cap, r.cap_len, false) == 0);
+        CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+        production_drain(&r, client, &o);
+        CHECK(o.n == 2 && g_stop_n == 3 && g_reset_n == 0);
+        check_stop(sid[0], wire_code, 1, true);
+        check_stop(sid[1], wire_code, 1, true);
+        check_stop(sid[last], wire_code, 1, true);
+        CHECK(fc_open_calls(sid[last]) == grants[last]);
+        CHECK(moq_session_close_subgroup(r.sv, sg[last], 0) == MOQ_OK);
+        relay_server_ops(&r);
+        CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+        CHECK(!rx_state(&r, sid[last], &st));
+    }
+    production_drain(&r, client, &o);
+    CHECK(o.n == 2 && o.goaway == 1 && g_stop_n == 3 && g_reset_n == 0);
+    check_stop(sid[0], wire_code, 1, true);
+    check_stop(sid[1], wire_code, 1, true);
+    check_stop(sid[last], wire_code, 1, stop_rc == 0);
+    CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
+out:
+    g_stop_once_sid = UINT64_MAX; g_stop_once_rc = 0;
+    g_stop_rc = 0;
+    rig_down(&r);
+    if (failures == before) printf("PASS: pw deferred admission %s stop=%d draft-%d\n",
+                                  split ? "split-prefix" : "whole", stop_rc,
+                                  v == MOQ_VERSION_DRAFT_18 ? 18 : 22);
+    return failures - before;
+}
+
+/* Request pressure is mapping pressure, never the core data pool. Two uni
+ * controls plus 126 pending request bidis fill the ordinary 128-entry map. */
+#define REQUEST_MAPPED 126
+#define REQUEST_HELD 64
+#define REQUEST_STREAMS (REQUEST_MAPPED + REQUEST_HELD + 1)
+
+typedef struct request_obs {
+    moq_subscription_t received[REQUEST_STREAMS];
+    int seen[REQUEST_STREAMS], order[REQUEST_STREAMS], n, cancelled, goaway;
+    bool allow_cancel;
+} request_obs_t;
+
+static void request_drain(rig_t *r, request_obs_t *o)
+{
+    moq_event_t ev;
+    while (moq_session_poll_events(r->c, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
+            const moq_subscribe_request_event_t *e = &ev.u.subscribe_request;
+            CHECK(e->track_namespace.count == 1);
+            if (e->track_namespace.count == 1) {
+                CHECK(e->track_namespace.parts[0].len == 4 &&
+                      memcmp(e->track_namespace.parts[0].data, "live", 4) == 0);
+            }
+            bool name_ok = e->track_name.len == 4 &&
+                           e->track_name.data[0] == 'r' && e->track_name.data[3] == 'q';
+            CHECK(name_ok);
+            unsigned index = name_ok ? ((unsigned)e->track_name.data[1] << 8) |
+                                       e->track_name.data[2] : REQUEST_STREAMS;
+            CHECK(index < REQUEST_STREAMS && moq_subscription_is_valid(e->sub));
+            if (index < REQUEST_STREAMS) {
+                CHECK(++o->seen[index] == 1);
+                for (int k = 0; k < REQUEST_STREAMS; k++)
+                    if (o->seen[k] && (unsigned)k != index)
+                        CHECK(o->received[k]._opaque != e->sub._opaque);
+                o->received[index] = e->sub;
+                CHECK(o->n < REQUEST_STREAMS);
+                if (o->n < REQUEST_STREAMS) o->order[o->n++] = (int)index;
+            }
+        } else if (ev.kind == MOQ_EVENT_UNSUBSCRIBED) {
+            CHECK(o->allow_cancel && ev.u.unsubscribed.sub._opaque == o->received[0]._opaque);
+            CHECK(ev.u.unsubscribed.cause == MOQ_REQUEST_TERMINAL_PEER_RESET_STREAM);
+            CHECK(ev.u.unsubscribed.stream_error_code == MOQ_STREAM_ERROR_CANCELLED);
+            CHECK(++o->cancelled == 1);
+        } else if (ev.kind == MOQ_EVENT_GOAWAY) {
+            CHECK(++o->goaway == 1);
+        } else {
+            CHECK(ev.kind == MOQ_EVENT_REQUEST_READY);
+        }
+        moq_event_cleanup(&ev);
+    }
+}
+
+/* Only this collector drives request output: fake endpoint IDs are opaque.
+ * Each actual OPEN_BIDI is assigned one small server-initiated native ID by
+ * the row; unlike the FETCH rig there are no locally initiated responses. */
+static bool request_capture(rig_t *r, unsigned index,
+                              moq_subscription_t *owner, uint64_t *peer_opid)
+{
+    uint8_t name[] = { 'r', (uint8_t)(index >> 8), (uint8_t)index, 'q' };
+    moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("live") };
+    moq_subscribe_cfg_t cfg;
+    moq_subscribe_cfg_init(&cfg);
+    cfg.track_namespace = (moq_namespace_t){ .parts = parts, .count = 1 };
+    cfg.track_name = (moq_bytes_t){ .data = name, .len = sizeof(name) };
+    cfg.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+    moq_result_t rc = moq_session_subscribe(r->sv, &cfg, 0, owner);
+    CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) return false;
+    rc = held_bridge_service(r->sb, 0);
+    CHECK(rc == MOQ_OK && !r->sep.overflowed && !r->sep.truncated);
+    if (rc != MOQ_OK || r->sep.overflowed || r->sep.truncated) return false;
+    int opened = 0;
+    *peer_opid = UINT64_MAX;
+    r->cap_len = 0;
+    r->cap_fin = false;
+    for (size_t k = 0; k < r->sep.count; k++) {
+        const fake_op_t *op = &r->sep.ops[k];
+        if (op->kind == FAKE_OP_OPEN_BIDI) {
+            *peer_opid = op->stream_id;
+            opened++;
+        } else if (op->kind == FAKE_OP_WRITE && op->stream_id == *peer_opid) {
+            CHECK(op->data_len <= sizeof(r->cap) - r->cap_len);
+            if (op->data_len > sizeof(r->cap) - r->cap_len) return false;
+            memcpy(r->cap + r->cap_len, op->data, op->data_len);
+            r->cap_len += op->data_len;
+            r->cap_fin |= op->fin;
+        } else {
+            CHECK(false && "unexpected request output");
+            return false;
+        }
+    }
+    fake_endpoint_clear_ops(&r->sep);
+    return opened == 1 && *peer_opid == 1u + index && r->cap_len > 0 && !r->cap_fin;
+}
+
+/* D18 3.3.2 / D22 6.4.2.3 permit cancellation before acknowledgement.
+ * Use the requester's public operation and its real emitted RESET/STOP,
+ * delivering RESET first so the one terminal has an exact causal identity. */
+static bool request_peer_cancel(rig_t *r, moq_subscription_t owner,
+                                uint64_t peer_opid, uint64_t sid)
+{
+    moq_result_t rc = moq_session_unsubscribe(r->sv, owner, 0);
+    CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) return false;
+    rc = held_bridge_service(r->sb, 0);
+    CHECK(rc == MOQ_OK && !r->sep.overflowed && !r->sep.truncated);
+    if (rc != MOQ_OK || r->sep.overflowed || r->sep.truncated) return false;
+    int resets = 0, stops = 0;
+    for (size_t k = 0; k < r->sep.count; k++) {
+        const fake_op_t *op = &r->sep.ops[k];
+        CHECK(op->stream_id == peer_opid && op->error_code == MOQ_STREAM_ERROR_CANCELLED);
+        if (op->kind == FAKE_OP_RESET) resets++;
+        else if (op->kind == FAKE_OP_STOP) stops++;
+        else CHECK(false && "unexpected peer cancellation output");
+    }
+    fake_endpoint_clear_ops(&r->sep);
+    CHECK(resets == 1 && stops == 1);
+    if (resets != 1 || stops != 1) return false;
+    CHECK(pico_wt_moq_err_to_wt(MOQ_STREAM_ERROR_CANCELLED, &g_reset_code));
+    g_peer_stop_code = g_reset_code;
+    h3zero_stream_ctx_t *sc = sc_get(sid);
+    if (!sc) return false;
+    CHECK(moq_pico_wt_callback(CNX, NULL, 0, picohttp_callback_reset, sc, r->ad) == 0);
+    CHECK(moq_pico_wt_callback(CNX, NULL, 0, picohttp_callback_stop_sending, sc, r->ad) == 0);
+    return !moq_pico_wt_conn_is_fatal(r->ad);
+}
+
+static int row_production_request_admission_mode(moq_version_t v, bool reset_failure)
+{
+    int before = failures;
+    CHECK(v != MOQ_VERSION_DRAFT_16);    /* never cancel the shared control bidi */
+    rig_t r;
+    /* Credits/owners are configured before attach. The peer bridge has 256
+     * maps so it can generate all 191 valid requests; the adapter stays 128. */
+    bool up = rig_up_config(&r, v, 64, 64, true);
+    CHECK(up);
+    if (!up) { rig_down(&r); return failures - before; }
+    CHECK(g_tp_streams_bidi >= REQUEST_STREAMS);
+    /* These profiles use native bidi credit, not MAX_REQUEST_ID; the legacy
+     * capacity observer deliberately reports zero (profile_d18.c). */
+    CHECK(moq_session_local_request_capacity(r.c) == 0);
+    CHECK(moq_session_peer_request_capacity(r.sv) == 0);
+    request_obs_t o = { 0 };
+    moq_subscription_t owner[REQUEST_STREAMS];
+    uint64_t peer_opid[REQUEST_STREAMS], sid[REQUEST_STREAMS];
+    int grants[REQUEST_STREAMS];
+    uint8_t oldest[8192];
+    size_t oldest_len = 0;
+
+    for (unsigned i = 0; i < REQUEST_STREAMS; i++) {
+        bool captured = request_capture(&r, i, &owner[i], &peer_opid[i]);
+        CHECK(captured);
+        if (!captured) goto out;
+        sid[i] = 1u + 4u * i;
+        if (i == REQUEST_MAPPED) {
+            oldest_len = r.cap_len;
+            memcpy(oldest, r.cap, oldest_len);
+        }
+        CHECK(moq_session_can_admit_data_stream(r.c)); /* not receive-pool pressure */
+        grants[i] = fc_open_calls(sid[i]);
+        if (reset_failure && i == REQUEST_STREAMS - 1) g_reset_rc = g_reset_at_rc = -1;
+        int callback_rc = deliver(&r, sid[i], r.cap, r.cap_len, false);
+        bool fatal = moq_pico_wt_conn_is_fatal(r.ad);
+        CHECK(fc_use(sid[i]) == 1 && fc_open_calls(sid[i]) == grants[i]);
+        if (callback_rc != 0 || fatal) {
+            if (reset_failure && i == REQUEST_STREAMS - 1) {
+                uint64_t wire_code = 0;
+                CHECK(pico_wt_moq_err_to_wt(MOQ_STREAM_ERROR_EXCESSIVE_LOAD, &wire_code));
+                CHECK(fatal && o.n == REQUEST_MAPPED && o.seen[i] == 0);
+                CHECK(g_stop_n == 1 && g_reset_n == 1);
+                if (g_stop_n > 0)
+                    CHECK(g_stops[0].sid == sid[i] && g_stops[0].code == wire_code);
+                CHECK(g_last_reset_sid == sid[i] && g_last_reset_code == wire_code);
+                goto out;
+            }
+            /* Stop at the FIRST divergence, before any further arrival or
+             * service can turn a known map failure into setup cascades. */
+            fprintf(stderr, "BOUNDARY: pw request draft-%d index=%u sid=%llu received=%d callback=%d fatal=%d\n",
+                    v == MOQ_VERSION_DRAFT_18 ? 18 : 22, i,
+                    (unsigned long long)sid[i], o.n, callback_rc, (int)fatal);
+            CHECK(i == REQUEST_MAPPED && o.n == REQUEST_MAPPED);
+            CHECK(callback_rc == 0 && !fatal);   /* e92: first over-map request */
+            goto out;
+        }
+        for (int n = 0; n < 2; n++) CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+        request_drain(&r, &o);
+        CHECK(moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
+        if (i < REQUEST_MAPPED) {
+            CHECK(o.n == (int)i + 1 && o.order[i] == (int)i);
+        } else {
+            CHECK(o.n == REQUEST_MAPPED);
+            if (i < REQUEST_STREAMS - 1) {
+                rxs_t st;
+                bool tracked = rx_state(&r, sid[i], &st);
+                CHECK(tracked);
+                if (tracked) {
+                    CHECK(st.held_input && st.paused && st.blocked == 0 &&
+                          st.held_len == r.cap_len && !st.held_fin && !st.buf_fin);
+                    CHECK(st.buf_len == r.cap_len && st.buf &&
+                          memcmp(st.buf, r.cap, r.cap_len) == 0);
+                }
+            }
+        }
+        if (i < REQUEST_STREAMS - 1) CHECK(g_stop_n == 0 && g_reset_n == 0);
+    }
+
+    CHECK(!reset_failure);       /* a refused own RESET must fail the transport */
+    uint64_t overload = 0;
+    CHECK(pico_wt_moq_err_to_wt(MOQ_STREAM_ERROR_EXCESSIVE_LOAD, &overload));
+    CHECK(g_stop_n == 1 && g_reset_n == 1);
+    if (g_stop_n > 0) {
+        CHECK(g_stops[0].sid == sid[REQUEST_STREAMS - 1] && g_stops[0].code == overload);
+    }
+    if (g_reset_n > 0) {
+        CHECK(g_last_reset_sid == sid[REQUEST_STREAMS - 1] && g_last_reset_code == overload);
+    }
+    rxs_t st;
+    bool tracked = rx_state(&r, sid[REQUEST_STREAMS - 1], &st);
+    CHECK(!tracked || (!st.held_input && st.buf_len == 0));
+    for (int n = 0; n < 3; n++) CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+    request_drain(&r, &o);
+    CHECK(o.n == REQUEST_MAPPED && o.cancelled == 0);
+    CHECK(g_stop_n == 1 && g_reset_n == 1);
+    for (int i = REQUEST_MAPPED; i < REQUEST_STREAMS; i++)
+        CHECK(fc_open_calls(sid[i]) == grants[i]);
+
+    tracked = rx_state(&r, sid[REQUEST_MAPPED], &st);
+    CHECK(tracked);
+    if (tracked) {
+        CHECK(st.held_input && st.buf_len == oldest_len && st.buf &&
+              memcmp(st.buf, oldest, oldest_len) == 0);
+    }
+    o.allow_cancel = true;
+    bool cancelled = request_peer_cancel(&r, owner[0], peer_opid[0], sid[0]);
+    CHECK(cancelled);
+    if (!cancelled) goto out;
+    /* No held request is delivered again by the fixture: only the actual
+     * peer's cancellation above and subsequent service make room. */
+    for (int n = 0; n < 8; n++) CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+    request_drain(&r, &o);
+    CHECK(o.cancelled == 1 && o.n == REQUEST_MAPPED + 1);
+    for (int i = 0; i <= REQUEST_MAPPED; i++)
+        CHECK(o.seen[i] == 1 && o.order[i] == i);
+    for (int i = REQUEST_MAPPED + 1; i < REQUEST_STREAMS; i++) CHECK(o.seen[i] == 0);
+    CHECK(g_stop_n == 1 && g_reset_n == 2);
+    uint64_t cancel_code = 0;
+    CHECK(pico_wt_moq_err_to_wt(MOQ_STREAM_ERROR_CANCELLED, &cancel_code));
+    CHECK(g_last_reset_sid == sid[0] && g_last_reset_code == cancel_code);
+    tracked = rx_state(&r, sid[REQUEST_MAPPED + 1], &st);
+    CHECK(tracked && st.held_input);
+    CHECK(moq_session_can_admit_data_stream(r.c));
+    CHECK(!moq_pico_wt_conn_is_fatal(r.ad) && moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
+
+    /* The existing control stream needs no new map despite request pressure. */
+    CHECK(moq_session_goaway(r.sv, NULL, 0, 0) == MOQ_OK);
+    relay_server_ops(&r);
+    for (int n = 0; n < 3; n++) CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+    request_drain(&r, &o);
+    CHECK(o.n == REQUEST_MAPPED + 1 && o.cancelled == 1 && o.goaway == 1);
+    CHECK(g_stop_n == 1 && g_reset_n == 2);
+    CHECK(fc_open_calls(sid[REQUEST_STREAMS - 1]) == grants[REQUEST_STREAMS - 1]);
+    CHECK(moq_session_state(r.c) == MOQ_SESS_DRAINING && !moq_pico_wt_conn_is_fatal(r.ad));
+out:
+    g_reset_rc = g_reset_at_rc = 0;
+    rig_down(&r);
+    if (failures == before) printf("PASS: pw production request admission%s draft-%d\n",
+                                  reset_failure ? " RESET-failure" : "",
+                                  v == MOQ_VERSION_DRAFT_18 ? 18 : 22);
+    return failures - before;
+}
+
+static int row_production_request_admission(moq_version_t v)
+{
+    return row_production_request_admission_mode(v, false);
 }
 
 /* -- rows -------------------------------------------------------------------- */
@@ -811,6 +1948,12 @@ static int row_retained_and_deferred_fin(moq_version_t v, bool fin_while_held)
     printf("retained %s control: total=%zu paused=%d blocked=%llu held=%d\n", lbl, total, (int)st.paused,
            (unsigned long long)st.blocked, (int)st.held_input);
     CHECK(st.paused && !st.held_input && st.blocked == total && st.buf_len == 0);
+    /* A provider-positive receive terminal with code zero must not discard
+     * the chunk already owned by the core; its existing inventory still drains. */
+    g_stop_rc = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+    CHECK(r.ad->endpoint_ops.stop_sending(&r.ad->endpoint_ctx, s0, 0) == MOQ_TRANSPORT_OK);
+    g_stop_rc = 0;
+    CHECK(rx_state(&r, s0, &st) && st.paused && !st.held_input && st.blocked == total);
     for (int i = 0; i < 12; i++) { memset(&co, 0, sizeof(co)); drain(r.c, &co); obs_merge(&tot, &co); pump(&r, 1); }
     CHECK(inventory_exact(&tot, 70) && tot.ok == 1 && tot.complete == 0);
     CHECK(rx_state(&r, s0, &st) && !st.paused && st.blocked == 0);
@@ -1186,6 +2329,7 @@ static int row_terminal_cancel(moq_version_t v, tc_shape_t shape)
     }
     int stops_before = g_stop_n;
     g_stop_refused = shape != TC_LIVE;
+    int grants_before = fc_open_calls(sid);
     memset(&co, 0, sizeof(co));
     drain(r.c, &co);
 
@@ -1216,7 +2360,13 @@ static int row_terminal_cancel(moq_version_t v, tc_shape_t shape)
         } else {
             CHECK(stops == 0);               /* no STOP_SENDING reaches picoquic */
         }
-        CHECK(!tracked);                     /* held bytes and the queue behind dropped */
+        if (shape == TC_LIVE) {
+            CHECK(tracked && !st.held_input && !st.paused && st.buf_len == 0);
+            CHECK(fc_open_calls(sid) == grants_before);
+            CHECK(deliver(&r, sid, all + 2, total - 2, false) == 0);
+        } else {
+            CHECK(!tracked);
+        }
         CHECK(co.object == 0 && after.object == 0 && after.complete == 0);   /* never delivered */
         /* Later passes replay nothing and stop nothing more. */
         g_time += 10;
@@ -1224,6 +2374,14 @@ static int row_terminal_cancel(moq_version_t v, tc_shape_t shape)
         memset(&after, 0, sizeof(after));
         drain(r.c, &after);
         CHECK(after.object == 0 && after.complete == 0 && after.error == 0);
+        if (shape == TC_LIVE) {
+            CHECK(rx_state(&r, sid, &st) && !st.held_input && st.buf_len == 0);
+            CHECK(fc_open_calls(sid) == grants_before);
+            h3zero_stream_ctx_t *sc = sc_get(sid);
+            size_t terminals = r.ad->stream_terminal_count;
+            CHECK(moq_pico_wt_callback(CNX, NULL, 0, picohttp_callback_free, sc, r.ad) == 0);
+            CHECK(r.ad->stream_terminal_count == terminals + 1);
+        }
         CHECK(!rx_state(&r, sid, &st));
         CHECK(g_stop_n - stops_before == stops);
         CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
@@ -1251,7 +2409,8 @@ static int row_tp_fixed(moq_version_t v, bool change)
     }
     CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
     if (change) g_tp_streams_uni = 65;
-    (void)moq_pico_wt_service(r.ad, g_time);
+    CHECK(moq_pico_wt_service(r.ad, g_time) == (change ? -1 : 0));
+    CHECK(!r.ad->rx_sweep_active && !r.ad->rx_resweep_owed);
     printf("tp fixed %s %s: fatal=%d\n", lbl, change ? "changed" : "unchanged", (int)moq_pico_wt_conn_is_fatal(r.ad));
     CHECK(moq_pico_wt_conn_is_fatal(r.ad) == change);
     g_tp_streams_uni = 64;
@@ -1755,13 +2914,28 @@ int main(void)
         (void)row_tp_fixed(versions[i], false);
         (void)row_tp_fixed(versions[i], true);
         (void)row_tp_unreadable(versions[i]);
+        (void)row_production_bounded_admission(versions[i]);
+        if (versions[i] != MOQ_VERSION_DRAFT_16)
+            (void)row_production_request_admission(versions[i]);
+        if (versions[i] != MOQ_VERSION_DRAFT_16) {
+            (void)row_deferred_admission(versions[i], false, 0, true);
+            (void)row_deferred_admission(versions[i], true, 0, true);
+        }
     }
     for (int i = 1; i < nv; i++) {
         (void)row_prefix(versions[i]);
         (void)row_deferred_behind_control(versions[i], false);
         (void)row_deferred_behind_control(versions[i], true);
+        (void)row_nested_fin_resweep(versions[i]);
+        (void)row_callback_resweep(versions[i], false);
+        (void)row_callback_resweep(versions[i], true);
     }
     (void)row_endpoint_classification();
+    (void)row_deferred_admission(versions[nv - 1], false, -1, true);
+    (void)row_deferred_admission(versions[nv - 1], true,
+                                PICOQUIC_ERROR_STREAM_ALREADY_CLOSED, true);
+    (void)row_deferred_admission(versions[nv - 1], true, 0, false);
+    (void)row_production_request_admission_mode(versions[nv - 1], true);
     (void)row_endpoint_deferred_capacity();
     if (failures == 0) printf("PASS: test_pico_wt_hold_input\n");
     else fprintf(stderr, "FAILED: test_pico_wt_hold_input (%d)\n", failures);

@@ -949,7 +949,43 @@ int main(void)
 
     /* == 5. Descending FETCH guard ===================================== */
 
-    /* 5a. Draft-18: DESCENDING is refused (ascending-only data plane). */
+    /* 5a. The ascending control: the same request with GROUP_ORDER 1. */
+    {
+        moq_session_t *s = make_started(MOQ_PERSPECTIVE_CLIENT, 0);
+        feed_setup(s, NULL, 0);
+        { moq_event_t e; while (moq_session_poll_events(s,&e,1)>0) moq_event_cleanup(&e); }
+        { moq_action_t a; while (moq_session_poll_actions(s,&a,1)>0) moq_action_cleanup(&a); }
+        moq_fetch_cfg_t fc;
+        moq_fetch_cfg_init(&fc);
+        moq_bytes_t parts[] = { MOQ_BYTES_LITERAL("ns") };
+        fc.track_namespace = (moq_namespace_t){ parts, 1 };
+        fc.track_name = MOQ_BYTES_LITERAL("t");
+        fc.end_group = 1;
+        fc.group_order = MOQ_GROUP_ORDER_ASCENDING;
+        moq_fetch_t h;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_fetch(s, &fc, 1, &h), (int)MOQ_OK);
+        static const uint8_t want_fetch[] = {
+            0x16, 0x00, 0x0f, 0x00, 0x01, 0x01, 0x02, 'n', 's', 0x01, 't',
+            0x00, 0x00, 0x01, 0x00, 0x01, 0x22, 0x01
+        };
+        bool sent = false;
+        moq_action_t a;
+        while (moq_session_poll_actions(s, &a, 1) > 0) {
+            if (a.kind == MOQ_ACTION_OPEN_BIDI_STREAM)
+                sent = a.u.open_bidi_stream.len == sizeof(want_fetch) &&
+                       memcmp(a.u.open_bidi_stream.data, want_fetch, sizeof(want_fetch)) == 0;
+            moq_action_cleanup(&a);
+        }
+        MOQ_TEST_CHECK(sent);
+        moq_session_destroy(s);
+    }
+
+    /* 5b. Draft-18 originates a descending FETCH and reads its response
+     * (10.12, 10.13, 11.4.4): the request is exactly the bytes below, and a
+     * hand-written response of groups 1 then 0 -- Group ID Delta read as
+     * prior - (delta + 1) when descending (11.4.4.1) -- surfaces as those
+     * Objects, in that order, then the completion. Every value fits a
+     * one-byte vi64 (1.4.1). */
     {
         moq_session_t *s = make_started(MOQ_PERSPECTIVE_CLIENT, 0);
         feed_setup(s, NULL, 0);
@@ -963,15 +999,75 @@ int main(void)
         fc.end_group = 1;
         fc.group_order = MOQ_GROUP_ORDER_DESCENDING;
         moq_fetch_t h;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_session_fetch(s, &fc, 1, &h),
-                              (int)MOQ_ERR_INVAL);
-        fc.group_order = MOQ_GROUP_ORDER_ASCENDING;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_session_fetch(s, &fc, 1, &h),
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_fetch(s, &fc, 1, &h), (int)MOQ_OK);
+        /* FETCH: Type 0x16, Length 15, Request ID 0, Standalone, Namespace
+         * {ns}, Name t, Start 0:0, End 1:0 (all of group 1), one Parameter:
+         * GROUP_ORDER (0x22) = 2. */
+        static const uint8_t want_fetch[] = {
+            0x16, 0x00, 0x0f, 0x00, 0x01, 0x01, 0x02, 'n', 's', 0x01, 't',
+            0x00, 0x00, 0x01, 0x00, 0x01, 0x22, 0x02
+        };
+        moq_stream_ref_t req = { 0 };
+        bool sent = false;
+        {
+            moq_action_t a;
+            while (moq_session_poll_actions(s, &a, 1) > 0) {
+                if (a.kind == MOQ_ACTION_OPEN_BIDI_STREAM) {
+                    req = a.u.open_bidi_stream.stream_ref;
+                    sent = a.u.open_bidi_stream.len == sizeof(want_fetch) &&
+                           memcmp(a.u.open_bidi_stream.data, want_fetch,
+                                  sizeof(want_fetch)) == 0;
+                }
+                moq_action_cleanup(&a);
+            }
+        }
+        MOQ_TEST_CHECK(sent);
+        /* FETCH_OK: Type 0x18, Length 4, End Of Track 0, End 1:0, no
+         * Parameters, no Track Properties. */
+        static const uint8_t ok[] = { 0x18, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00 };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_bidi_stream_bytes(s, req, ok, sizeof(ok),
+                                                                    false, 2), (int)MOQ_OK);
+        /* FETCH_HEADER (0x05, Request ID 0), then
+         *   1:0  flags 0x1C (Group ID Delta, Object ID Delta, Priority):
+         *        Group 1, Object 0, priority 0x80, payload "a"
+         *   1:1  flags 0x00: same group, Object prior + 1, payload "b"
+         *   0:0  flags 0x0C: Group 1 - (0 + 1) = 0, Object 0, payload "c"
+         *   0:1  flags 0x00: payload "d" */
+        static const uint8_t data[] = {
+            0x05, 0x00,
+            0x1C, 0x01, 0x00, 0x80, 0x01, 'a',
+            0x00, 0x01, 'b',
+            0x0C, 0x00, 0x00, 0x01, 'c',
+            0x00, 0x01, 'd'
+        };
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_bytes(s, moq_stream_ref_from_u64(0x51),
+                                                             data, sizeof(data), true, 3),
                               (int)MOQ_OK);
+        static const uint64_t wg[] = { 1, 1, 0, 0 }, wo[] = { 0, 1, 0, 1 };
+        static const char wp[] = { 'a', 'b', 'c', 'd' };
+        int n_ok = 0, n_obj = 0, n_done = 0, bad = 0;
+        moq_event_t ev;
+        while (moq_session_poll_events(s, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_FETCH_OK) {
+                n_ok++;
+                bad += ev.u.fetch_ok.end_group != 1 || ev.u.fetch_ok.end_object != 0;
+            } else if (ev.kind == MOQ_EVENT_FETCH_OBJECT) {
+                const moq_fetch_object_event_t *fo = &ev.u.fetch_object;
+                bad += n_obj >= 4 || fo->group_id != wg[n_obj] || fo->object_id != wo[n_obj] ||
+                       fo->payload == NULL || moq_rcbuf_len(fo->payload) != 1 ||
+                       moq_rcbuf_data(fo->payload)[0] != (uint8_t)wp[n_obj];
+                n_obj++;
+            } else if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) {
+                n_done++;
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(n_ok == 1 && n_obj == 4 && n_done == 1 && bad == 0);
+        MOQ_TEST_CHECK_EQ_INT((int)s->state, (int)MOQ_SESS_ESTABLISHED);
         moq_session_destroy(s);
     }
 
-    /* 5b. Draft-16 still accepts DESCENDING (absolute group ids on the wire). */
+    /* 5c. Draft-16 still accepts DESCENDING (absolute group ids on the wire). */
     {
         moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
         cfg.alloc = moq_alloc_default();

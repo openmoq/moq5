@@ -52,6 +52,8 @@ target_compile_definitions(moq-msf PRIVATE MOQ_BUILDING)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(moq-msf PRIVATE -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+elseif(MSVC)
+    target_compile_options(moq-msf PRIVATE $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:/WX>)
 endif()
 
 if(MOQ_BUILD_TESTS)

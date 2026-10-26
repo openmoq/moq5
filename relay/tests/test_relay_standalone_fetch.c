@@ -105,10 +105,32 @@ rfs_subscribe(rfs_bind_t *t, conn_t *cn, moq_subscription_t *out)
     return moq_session_subscribe(cn->peer, &cfg, t->rig.now, out) == MOQ_OK;
 }
 
-/* The origin's draft; the subscriber always speaks draft-22. */
+/* The origin's draft, and the FETCH subscriber's. A subscriber on a draft
+ * without FILL_TIMEOUT waits the relay's default (set to the 100 ms these
+ * rows ask for), and a run unavailable at the deadline is Unknown there,
+ * where draft-22 says Timed-Out. */
 static moq_version_t rfs_origin_version = MOQ_VERSION_DRAFT_22;
+static moq_version_t rfs_consumer_version = MOQ_VERSION_DRAFT_22;
+
+/* UNKNOWN_OBJECT_STATUS on the wire, from the local drafts' tables: 0x4 in
+ * draft-16 (13.4.4), 0x6 in draft-18 (15.10.4) and draft-22. */
+static uint64_t
+rfs_unknown_status_code(void)
+{
+    return rfs_consumer_version == MOQ_VERSION_DRAFT_16 ? 0x4u : 0x6u;
+}
+
+static uint32_t
+rfs_unavailable_kind(void)
+{
+    return rfs_consumer_version == MOQ_VERSION_DRAFT_22 ? MOQ_FETCH_RANGE_TIMED_OUT
+                                                       : MOQ_FETCH_RANGE_UNKNOWN;
+}
 /* Track Properties the origin's PUBLISH carries (empty: none). */
 static moq_bytes_t rfs_publish_properties;
+/* The origin states its Object Properties as draft-16 integers: Type 124 is
+ * two bytes there (40 7c), one in vi64 (7c); the subscriber reads vi64. */
+static bool rfs_origin_d16_props;
 
 static bool
 rfs_create(rfs_bind_t *t, bool pull, bool streaming, unsigned consumer_actions)
@@ -117,14 +139,17 @@ rfs_create(rfs_bind_t *t, bool pull, bool streaming, unsigned consumer_actions)
     relay_bind_test_ca_init(&t->alloc);
     t->pull = pull;
     relay_bind_test_linger_us = 1000000;
+    if (rfs_consumer_version != MOQ_VERSION_DRAFT_22)
+        relay_bind_test_fill_timeout_default_ms = 100;
     moqr_result_t rc = relay_bind_test_rig_create(&t->rig, &t->alloc);
     relay_bind_test_linger_us = 0;
+    relay_bind_test_fill_timeout_default_ms = 0;
     if (rc != MOQR_OK) return false;
     relay_bind_test_server_streaming_objects = streaming;
     t->origin = relay_bind_test_rig_connect(&t->rig, rfs_origin_version);
     relay_bind_test_server_streaming_objects = false;
     relay_bind_test_max_actions = consumer_actions;
-    t->consumer = relay_bind_test_rig_connect(&t->rig, MOQ_VERSION_DRAFT_22);
+    t->consumer = relay_bind_test_rig_connect(&t->rig, rfs_consumer_version);
     relay_bind_test_max_actions = 0;
     if (t->origin == NULL || t->consumer == NULL) return false;
     rfs_pump(t, 6);
@@ -160,14 +185,16 @@ static bool
 rfs_live_end(rfs_bind_t *t, uint8_t group, uint8_t object, bool end_group)
 {
     uint8_t body[] = { 0x52, group, object, 0xc3, 0, 0xfe };
-    static const uint8_t props[] = { 0x7c, 0x23 };
+    static const uint8_t vi64[] = { 0x7c, 0x23 }, quic[] = { 0x40, 0x7c, 0x23 };
+    const uint8_t *props = rfs_origin_d16_props ? quic : vi64;
+    size_t props_len = rfs_origin_d16_props ? sizeof(quic) : sizeof(vi64);
     moq_rcbuf_t *payload = NULL;
     if (moq_rcbuf_create(&t->alloc.vt, body, sizeof(body), &payload) != MOQ_OK) return false;
     moq_result_t rc = t->pull
         ? moq_session_send_object_datagram(t->origin->peer, t->upstream, group, object,
-            73, end_group, payload, props, sizeof(props), t->rig.now)
+            73, end_group, payload, props, props_len, t->rig.now)
         : moq_session_send_pub_object_datagram(t->origin->peer, t->pub, group, object,
-            73, end_group, payload, props, sizeof(props), t->rig.now);
+            73, end_group, payload, props, props_len, t->rig.now);
     moq_rcbuf_decref(payload);
     rfs_pump(t, 4);
     return rc == MOQ_OK && t->rig.failures == 0;
@@ -190,7 +217,9 @@ rfs_issue(rfs_bind_t *t, uint64_t sg, uint64_t so, uint64_t eg, uint64_t eo,
     cfg.track_name = B("v");
     cfg.start_group = sg; cfg.start_object = so; cfg.end_group = eg; cfg.end_object = eo;
     cfg.group_order = descending ? MOQ_GROUP_ORDER_DESCENDING : MOQ_GROUP_ORDER_ASCENDING;
-    cfg.has_fill_timeout = true; cfg.fill_timeout_ms = timeout;
+    if (rfs_consumer_version == MOQ_VERSION_DRAFT_22) {
+        cfg.has_fill_timeout = true; cfg.fill_timeout_ms = timeout;
+    }
     cfg.has_subscriber_priority = true; cfg.subscriber_priority = 61;
     return moq_session_fetch(t->consumer->peer, &cfg, t->rig.now, out) == MOQ_OK;
 }
@@ -210,10 +239,12 @@ rfs_reply_end(rfs_bind_t *t, unsigned index, bool finish)
 {
     const rfs_request_t *r = &t->origin_obs.requests[index];
     uint8_t body[] = { 0x52, (uint8_t)r->sg, (uint8_t)r->so, 0xa1, 0, 0xfe };
-    static const uint8_t props[] = { 0x7c, 0x31 };
+    static const uint8_t vi64[] = { 0x7c, 0x31 }, quic[] = { 0x40, 0x7c, 0x31 };
     moq_rcbuf_t *payload = NULL, *properties = NULL;
     bool ok = moq_rcbuf_create(&t->alloc.vt, body, sizeof(body), &payload) == MOQ_OK &&
-        moq_rcbuf_create(&t->alloc.vt, props, sizeof(props), &properties) == MOQ_OK;
+        moq_rcbuf_create(&t->alloc.vt, rfs_origin_d16_props ? quic : vi64,
+                         rfs_origin_d16_props ? sizeof(quic) : sizeof(vi64),
+                         &properties) == MOQ_OK;
     if (ok) {
         moq_fetch_object_cfg_t cfg;
         moq_fetch_object_cfg_init(&cfg);
@@ -236,10 +267,15 @@ static bool
 rfs_object(const rfs_event_t *e, uint8_t group, uint8_t object, bool retained)
 {
     uint8_t body[] = { 0x52, group, object, retained ? 0xa1 : 0xc3, 0, 0xfe };
-    uint8_t props[] = { 0x7c, retained ? 0x31 : 0x23 };
+    /* Type 124 in the subscriber's integers: 40 7c on draft-16, 7c in vi64. */
+    uint8_t q[] = { 0x40, 0x7c, retained ? 0x31 : 0x23 };
+    uint8_t v[] = { 0x7c, retained ? 0x31 : 0x23 };
+    bool d16 = rfs_consumer_version == MOQ_VERSION_DRAFT_16;
+    const uint8_t *props = d16 ? q : v;
+    size_t plen = d16 ? sizeof(q) : sizeof(v);
     return e != NULL && e->group == group && e->object == object &&
-        e->bytes == sizeof(body) && e->properties == sizeof(props) &&
-        memcmp(e->body, body, sizeof(body)) == 0 && memcmp(e->props, props, sizeof(props)) == 0;
+        e->bytes == sizeof(body) && e->properties == plen &&
+        memcmp(e->body, body, sizeof(body)) == 0 && memcmp(e->props, props, plen) == 0;
 }
 
 static bool
@@ -323,7 +359,7 @@ rfs_case(const char *row)
             const rfs_event_t *gap = rfs_nth(&t.downstream, fetch, MOQ_EVENT_FETCH_GAP, 0);
             RFS_NEED(rfs_count(&t.downstream, fetch, MOQ_EVENT_FETCH_GAP) == 1 &&
                 gap != NULL && gap->group == 0 && gap->object == 1 &&
-                (gap->code == MOQ_FETCH_RANGE_TIMED_OUT ||
+                (gap->code == rfs_unavailable_kind() ||
                  (absent && gap->code == MOQ_FETCH_RANGE_UNKNOWN)) &&
                 rfs_object(rfs_nth(&t.downstream, fetch, MOQ_EVENT_FETCH_OBJECT, 1), 0, 2, false),
                 "exact-unavailable-gap-tail");
@@ -357,6 +393,10 @@ rfs_case(const char *row)
         RFS_NEED(rfs_count(&t.downstream, fetch, MOQ_EVENT_FETCH_RESET) == 1 &&
             rfs_count(&t.downstream, fetch, MOQ_EVENT_FETCH_COMPLETE) == 0 && rfs_alive(&t),
             "request-local-source-terminal");
+        const rfs_event_t *rst = rfs_nth(&t.downstream, fetch, MOQ_EVENT_FETCH_RESET, 0);
+        printf("OBS: %s reset code=0x%llx\n", row, rst ? (unsigned long long)rst->code : 0ull);
+        RFS_NEED(rst != NULL && rst->code == rfs_unknown_status_code(),
+            "source-terminal-unknown-object-status");
         RFS_FIX(rfs_issue(&t, 0, 2, 0, 3, 0, false, &other));
         rfs_pump(&t, 12);
         RFS_NEED(rfs_count(&t.downstream, other, MOQ_EVENT_FETCH_COMPLETE) == 1,
@@ -423,7 +463,7 @@ rfs_case(const char *row)
             const rfs_event_t *gap = rfs_nth(&t.downstream, fetch, MOQ_EVENT_FETCH_GAP, 0);
             RFS_NEED(rfs_count(&t.downstream, fetch, MOQ_EVENT_FETCH_GAP) == 1 &&
                 gap != NULL && gap->group == 0 && gap->object == 3 &&
-                gap->code == MOQ_FETCH_RANGE_TIMED_OUT && t.origin_obs.cancelled == 1,
+                gap->code == rfs_unavailable_kind() && t.origin_obs.cancelled == 1,
                 "one-budget-timeout-tail");
         } else {
             RFS_FIX(rfs_accept(&t, 1) && rfs_reply(&t, 1));
@@ -734,6 +774,13 @@ rfs_abort_blocked(void)
     RFS_NEED(rfs_count(&t.downstream, fetch, MOQ_EVENT_FETCH_RESET) == 1 &&
         rfs_count(&t.downstream, fetch, MOQ_EVENT_FETCH_COMPLETE) == 0 && rfs_alive(&t),
         "blocked-reset-retried");
+    {
+        const rfs_event_t *rst = rfs_nth(&t.downstream, fetch, MOQ_EVENT_FETCH_RESET, 0);
+        printf("OBS: abort-blocked reset code=0x%llx\n",
+            rst ? (unsigned long long)rst->code : 0ull);
+        RFS_NEED(rst != NULL && rst->code == rfs_unknown_status_code(),
+            "blocked-reset-unknown-object-status");
+    }
     RFS_NEED(t.live == 6, "subscription-delivery-intact");
     moqr_bind_stats_t bs;
     moqr_bind_get_stats(t.rig.bind, &bs);
@@ -814,15 +861,308 @@ cleanup:
     return rfs_finish(&t, row, missing);
 }
 
+/* The same over a draft-16 origin: the cached live Objects and the one the
+ * upstream FETCH collects all reach the draft-22 subscriber with their
+ * properties in its integer encoding, in order. */
+static int
+rfs_d16_origin(void)
+{
+    const char *row = "d16-origin";
+    const char *missing = NULL;
+    rfs_bind_t t = {0};
+    moq_fetch_t fetch = {0};
+    rfs_origin_version = MOQ_VERSION_DRAFT_16;
+    rfs_origin_d16_props = true;
+    bool created = rfs_create(&t, false, false, 0);
+    rfs_origin_version = MOQ_VERSION_DRAFT_22;
+    RFS_FIX(created);
+    RFS_FIX(rfs_live(&t, 0, 0) && rfs_live(&t, 0, 2));
+    RFS_FIX(rfs_issue(&t, 0, 0, 0, 3, 100, false, &fetch));
+    rfs_pump(&t, 16);
+    const rfs_request_t *r = &t.origin_obs.requests[0];
+    RFS_NEED(t.origin_obs.nr == 1 && r->sg == 0 && r->so == 1 && r->eg == 0 && r->eo == 2,
+        "d16-upstream-request");
+    RFS_FIX(rfs_accept(&t, 0) && rfs_reply(&t, 0));
+    rfs_pump(&t, 12);
+    RFS_NEED(rfs_count(&t.downstream, fetch, MOQ_EVENT_FETCH_COMPLETE) == 1 &&
+        rfs_count(&t.downstream, fetch, MOQ_EVENT_FETCH_OBJECT) == 3 && rfs_alive(&t),
+        "one-complete");
+    for (unsigned i = 0; i < 3; i++) {
+        RFS_NEED(rfs_object(rfs_nth(&t.downstream, fetch, MOQ_EVENT_FETCH_OBJECT, i),
+            0, (uint8_t)i, i == 1), "ordered-converted-properties");
+    }
+cleanup:
+    rfs_origin_d16_props = false;
+    return rfs_finish(&t, row, missing);
+}
+
+/* -- a draft-18 descending FETCH from an independently encoded peer ------- *
+ * Served for any draft-18 peer, not only one built on libmoq. The
+ * consumer's transport is held and the test is that peer: the FETCH is written byte by byte from the
+ * draft-18 message layout (10.12, 10.2, 1.4.1) into the relay's session for
+ * that connection, and the response is read straight from that session's
+ * actions and parsed here from the draft-18 FETCH_OK and Fetch Object layouts
+ * (10.13, 11.4.4) -- none of libmoq's draft-18 codec is used on either side. The cache holds 0:0, 0:2, 1:0 and 1:2; the relay must
+ * fetch 1:1 and then 0:1 upstream and serve groups 1 then 0, each in Object
+ * order, with the properties converted to the subscriber's (vi64) form. */
+
+typedef struct rfs_wire {
+    uint8_t  ctl[256];       /* the request stream's bytes (FETCH_OK) */
+    size_t   ctl_len;
+    uint8_t  data[4096];     /* the response data stream's bytes */
+    size_t   data_len;
+    uint64_t data_ref;
+    int      data_streams, resets;
+    bool     data_fin;
+} rfs_wire_t;
+
+static void
+rfs_wire_collect(moq_session_t *rs, uint64_t req_ref, rfs_wire_t *w)
+{
+    moq_action_t a;
+    while (moq_session_poll_actions(rs, &a, 1) == 1) {
+        if (a.kind == MOQ_ACTION_SEND_BIDI_STREAM &&
+            a.u.send_bidi_stream.stream_ref._v == req_ref) {
+            size_t n = a.u.send_bidi_stream.len;
+            if (w->ctl_len + n <= sizeof(w->ctl)) {
+                memcpy(w->ctl + w->ctl_len, a.u.send_bidi_stream.data, n);
+                w->ctl_len += n;
+            }
+        } else if (a.kind == MOQ_ACTION_SEND_DATA) {
+            const moq_send_data_action_t *d = &a.u.send_data;
+            uint64_t ref = d->stream_ref._v;
+            if (w->data_streams == 0) {
+                w->data_ref = ref;
+                w->data_streams = 1;
+            }
+            if (ref == w->data_ref) {
+                size_t hl = d->header_len, pl = d->payload ? moq_rcbuf_len(d->payload) : 0;
+                if (w->data_len + hl + pl <= sizeof(w->data)) {
+                    memcpy(w->data + w->data_len, d->header, hl);
+                    w->data_len += hl;
+                    if (pl) memcpy(w->data + w->data_len, moq_rcbuf_data(d->payload), pl);
+                    w->data_len += pl;
+                }
+                if (d->fin) w->data_fin = true;
+            } else {
+                w->data_streams++;
+            }
+        } else if (a.kind == MOQ_ACTION_RESET_DATA) {
+            w->resets++;
+        }
+        moq_action_cleanup(&a);
+    }
+}
+
+typedef struct rfs_wire_obj {
+    uint64_t group, object;
+    uint8_t  props[8], body[8];
+    size_t   props_len, body_len;
+} rfs_wire_obj_t;
+
+/* A draft-18 variable-length integer (1.4.1): the leading 1 bits of the
+ * first byte give the extra length; nine bytes carry a full 64 bits. */
+static bool
+rfs_vi(const uint8_t *b, size_t n, size_t *pos, uint64_t *out)
+{
+    if (*pos >= n) return false;
+    uint8_t first = b[*pos];
+    unsigned ones = 0;
+    while (ones < 8 && (first & (0x80u >> ones)) != 0) ones++;
+    size_t len = ones + 1u;
+    if (len > n - *pos) return false;
+    uint64_t v = ones >= 7 ? 0 : (uint64_t)(first & (0xFFu >> (ones + 1u)));
+    for (size_t i = 1; i < len; i++) v = (v << 8) | b[*pos + i];
+    *out = v;
+    *pos += len;
+    return true;
+}
+
+/* Parse FETCH_HEADER and the Objects after it; false on anything that is not
+ * an Object (an End of Range included) or does not parse. */
+static bool
+rfs_wire_parse(const rfs_wire_t *w, bool descending, uint64_t *req_id, rfs_wire_obj_t *objs,
+               int cap, int *n_out)
+{
+    size_t pos = 0;
+    uint64_t type = 0;
+    if (!rfs_vi(w->data, w->data_len, &pos, &type) || type != 0x05) return false;
+    if (!rfs_vi(w->data, w->data_len, &pos, req_id)) return false;
+    int n = 0;
+    uint64_t pg = 0, po = 0;
+    while (pos < w->data_len) {
+        uint64_t flags = 0, v = 0;
+        if (!rfs_vi(w->data, w->data_len, &pos, &flags) || flags >= 128 || n == cap)
+            return false;
+        rfs_wire_obj_t *o = &objs[n];
+        memset(o, 0, sizeof(*o));
+        if (flags & 0x08) {
+            if (!rfs_vi(w->data, w->data_len, &pos, &v)) return false;
+            o->group = n == 0 ? v : descending ? pg - (v + 1) : pg + v + 1;
+        } else {
+            if (n == 0) return false;
+            o->group = pg;
+        }
+        if ((flags & 0x40) == 0 && (flags & 0x03) == 0x03 &&
+            !rfs_vi(w->data, w->data_len, &pos, &v)) return false;   /* Subgroup ID */
+        if (flags & 0x04) {
+            if (!rfs_vi(w->data, w->data_len, &pos, &v)) return false;
+            o->object = n == 0 || (flags & 0x08) ? v : po + v;
+        } else {
+            if (n == 0) return false;
+            o->object = po + 1;
+        }
+        if (flags & 0x10) {
+            if (pos >= w->data_len) return false;
+            pos++;   /* Publisher Priority */
+        }
+        if (flags & 0x20) {
+            if (!rfs_vi(w->data, w->data_len, &pos, &v) || v > sizeof(o->props) ||
+                v > w->data_len - pos) return false;
+            memcpy(o->props, w->data + pos, (size_t)v);
+            o->props_len = (size_t)v;
+            pos += (size_t)v;
+        }
+        if (!rfs_vi(w->data, w->data_len, &pos, &v) || v > sizeof(o->body) ||
+            v > w->data_len - pos) return false;
+        memcpy(o->body, w->data + pos, (size_t)v);
+        o->body_len = (size_t)v;
+        pos += (size_t)v;
+        pg = o->group;
+        po = o->object;
+        n++;
+    }
+    *n_out = n;
+    return true;
+}
+
+/* d18_origin: the origin speaks draft-18 too, so the runs the relay does not
+ * hold are fetched with a draft-18 descending FETCH of its own. */
+static int
+rfs_d18_descending_wire(bool d18_origin)
+{
+    const char *row = d18_origin ? "d18-descending-wire-d18-origin" : "d18-descending-wire";
+    const char *missing = NULL;
+    rfs_bind_t t = {0};
+    rfs_consumer_version = MOQ_VERSION_DRAFT_18;
+    if (d18_origin) rfs_origin_version = MOQ_VERSION_DRAFT_18;
+    bool created = rfs_create(&t, false, false, 0);
+    RFS_FIX(created);
+    RFS_FIX(rfs_live(&t, 0, 0) && rfs_live_end(&t, 0, 2, true));
+    RFS_FIX(rfs_live(&t, 1, 0) && rfs_live_end(&t, 1, 2, true));
+    t.consumer->frozen = true;
+    /* FETCH (10.12, Figure 15) -- every value fits a one-byte vi64:
+     * Request ID 0, Fetch Type 1 (Standalone), Track Namespace {live, cam},
+     * Track Name v, Start 0:0, End 1:3 (the end plus one), and two
+     * Parameters in ascending Type: SUBSCRIBER_PRIORITY (0x20) = 61,
+     * GROUP_ORDER (0x22, delta 2) = 2 (descending, 10.2.8). */
+    static const uint8_t payload[] = {
+        0x00, 0x01,                                     /* Request ID, Type */
+        0x02, 0x04, 'l', 'i', 'v', 'e', 0x03, 'c', 'a', 'm',   /* Namespace */
+        0x01, 'v',                                      /* Track Name */
+        0x00, 0x00, 0x01, 0x03,                         /* Start, End */
+        0x02, 0x20, 61, 0x02, 0x02,                     /* Parameters */
+    };
+    uint8_t buf[3 + sizeof(payload)];
+    buf[0] = 0x16;                                      /* Type: FETCH */
+    buf[1] = 0x00;
+    buf[2] = (uint8_t)sizeof(payload);                  /* Length (16) */
+    memcpy(buf + 3, payload, sizeof(payload));
+    const uint64_t req_ref = 0x9000;
+    RFS_FIX(moq_session_on_bidi_stream_bytes(t.consumer->rsess, moq_stream_ref_from_u64(req_ref),
+                                             buf, sizeof(buf), false, t.rig.now) == MOQ_OK);
+    rfs_wire_t w;
+    memset(&w, 0, sizeof(w));
+    unsigned answered = 0;
+    for (int i = 0; i < 48; i++) {
+        rfs_pump(&t, 1);
+        rfs_wire_collect(t.consumer->rsess, req_ref, &w);
+        while (answered < t.origin_obs.nr) {
+            RFS_FIX(rfs_accept(&t, answered) && rfs_reply(&t, answered));
+            answered++;
+        }
+    }
+    printf("OBS: %s upstream=%u ctl=%zu data=%zu fin=%d streams=%d resets=%d\n", row,
+           t.origin_obs.nr, w.ctl_len, w.data_len, (int)w.data_fin, w.data_streams, w.resets);
+    /* FETCH_OK on the request stream (10.13, Figure 16): vi64 Type 0x18,
+     * 16-bit Length, End Of Track (8), End Location -- here 1:3 -- then the
+     * Parameters count and Track Properties. */
+    size_t cpos = 0;
+    uint64_t ctype = 0;
+    RFS_NEED(rfs_vi(w.ctl, w.ctl_len, &cpos, &ctype) && ctype == 0x18 &&
+                 w.ctl_len >= cpos + 2, "fetch-ok-first");
+    if (missing == NULL) {
+        size_t clen = ((size_t)w.ctl[cpos] << 8) | w.ctl[cpos + 1];
+        size_t p = cpos + 2, pend = p + clen;
+        uint64_t eg = 0, eo = 0, np = 0;
+        RFS_NEED(pend <= w.ctl_len && p < pend && w.ctl[p] == 0 /* End Of Track */ &&
+                     (p++, rfs_vi(w.ctl, pend, &p, &eg)) && rfs_vi(w.ctl, pend, &p, &eo) &&
+                     eg == 1 && eo == 3 && rfs_vi(w.ctl, pend, &p, &np) && np == 0,
+                 "fetch-ok-fields");
+    }
+    RFS_NEED(t.origin_obs.nr == 2 &&
+                 rfs_request_exact(&t.origin_obs.requests[0], 1, 1, MOQ_GROUP_ORDER_DESCENDING) &&
+                 rfs_request_exact(&t.origin_obs.requests[1], 0, 1, MOQ_GROUP_ORDER_DESCENDING),
+             "upstream-runs-descending");
+    rfs_wire_obj_t objs[8];
+    int n = 0;
+    uint64_t rid = UINT64_MAX;
+    RFS_NEED(w.data_fin && w.resets == 0 && w.data_streams == 1 &&
+                 rfs_wire_parse(&w, true, &rid, objs, 8, &n) && rid == 0,
+             "one-stream-objects-only");
+    static const uint64_t want_g[] = { 1, 1, 1, 0, 0, 0 }, want_o[] = { 0, 1, 2, 0, 1, 2 };
+    bool order_ok = n == 6;
+    for (int i = 0; order_ok && i < 6; i++) {
+        bool retained = want_o[i] == 1;   /* the run fetched upstream */
+        uint8_t body[] = { 0x52, (uint8_t)want_g[i], (uint8_t)want_o[i], retained ? 0xa1 : 0xc3,
+                           0, 0xfe };
+        uint8_t props[] = { 0x7c, retained ? 0x31 : 0x23 };
+        order_ok = objs[i].group == want_g[i] && objs[i].object == want_o[i] &&
+                   objs[i].body_len == sizeof(body) &&
+                   memcmp(objs[i].body, body, sizeof(body)) == 0 &&
+                   objs[i].props_len == sizeof(props) &&
+                   memcmp(objs[i].props, props, sizeof(props)) == 0;
+        if (!order_ok)
+            printf("OBS: %s object %d = %llu:%llu props=%zu body=%zu\n", row, i,
+                   (unsigned long long)objs[i].group, (unsigned long long)objs[i].object,
+                   objs[i].props_len, objs[i].body_len);
+    }
+    RFS_NEED(order_ok, "groups-descending-objects-ascending-exact");
+cleanup:
+    rfs_consumer_version = MOQ_VERSION_DRAFT_22;
+    rfs_origin_version = MOQ_VERSION_DRAFT_22;
+    return rfs_finish(&t, row, missing);
+}
+
 int
 main(int argc, char **argv)
 {
     if (argc != 2) return 2;
+    const char *row = argv[1];
+    /* d18x:<row>: the same row with a draft-18 origin and subscriber, so the
+     * relay's upstream FETCH is a draft-18 one too. */
+    if (strncmp(row, "d18x:", 5) == 0) {
+        rfs_origin_version = MOQ_VERSION_DRAFT_18;
+        rfs_consumer_version = MOQ_VERSION_DRAFT_18;
+        return rfs_case(row + 5);
+    }
+    /* d16:<row> / d18:<row>: the same row for a draft-16/18 FETCH subscriber. */
+    if (strncmp(row, "d16:", 4) == 0 || strncmp(row, "d18:", 4) == 0) {
+        rfs_consumer_version = row[2] == '6' ? MOQ_VERSION_DRAFT_16 : MOQ_VERSION_DRAFT_18;
+        row += 4;
+        if (strcmp(row, "cancel-cached") == 0) return rfs_cached_cancel();
+        if (strcmp(row, "abort-blocked") == 0) return rfs_abort_blocked();
+        return rfs_case(row);
+    }
+    if (strcmp(argv[1], "d18-descending-wire") == 0) return rfs_d18_descending_wire(false);
+    if (strcmp(argv[1], "d18-descending-wire-d18-origin") == 0)
+        return rfs_d18_descending_wire(true);
     if (strcmp(argv[1], "cancel-cached") == 0) return rfs_cached_cancel();
     if (strcmp(argv[1], "descending-groups") == 0) return rfs_descending_groups();
     if (strcmp(argv[1], "evicted-range") == 0) return rfs_evicted_range();
     if (strcmp(argv[1], "abort-blocked") == 0) return rfs_abort_blocked();
     if (strcmp(argv[1], "d18-origin") == 0) return rfs_d18_origin();
+    if (strcmp(argv[1], "d16-origin") == 0) return rfs_d16_origin();
     if (strcmp(argv[1], "source-lost") == 0) return rfs_source_lost();
     if (strcmp(argv[1], "expired-zero") == 0) return rfs_expired(false);
     if (strcmp(argv[1], "expired-budget") == 0) return rfs_expired(true);
@@ -830,7 +1170,7 @@ main(int argc, char **argv)
     if (strcmp(argv[1], "coalesce-control") == 0) return rfs_coalesce(false);
     if (strcmp(argv[1], "legacy") == 0) {
         int failures = fetch_flow(MOQ_VERSION_DRAFT_16) + fetch_flow(MOQ_VERSION_DRAFT_18);
-        failures += fetch_error_terminates() + chunked_fetch_oom_terminates();
+        failures += fetch_evicted_marked_unknown() + chunked_fetch_oom_terminates();
         return failures != 0 ? 2 : 0;
     }
     static const char *const cases[] = { "publish-gap", "pull-gap", "cached-only",

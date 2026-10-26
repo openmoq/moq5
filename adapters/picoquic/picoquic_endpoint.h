@@ -54,6 +54,9 @@ typedef struct {
      * adapter restores what a stopped receive half needs; nonzero likewise
      * fails the call. */
     bool               (*rx_terminal_discard)(void *owner, uint64_t stream_id);
+    /* Provider-confirmed receive-half terminal on STOP (not whole-stream
+     * closure): discard only held/refused input, without installing a watch. */
+    void               (*rx_stop_terminal)(void *owner, uint64_t stream_id);
     int                (*rx_stopped)(void *owner, uint64_t stream_id);
     int                (*rx_rebind)(void *owner, uint64_t stream_id);
     void                *rx_owner;
@@ -92,6 +95,40 @@ void moq_pq_conn_get_send_stats(const moq_pq_conn_t *conn,
  * fact via moq_pq_conn_cfg_t.after_callback. A NULL conn reports true.
  */
 bool moq_pq_conn_cnx_released(const moq_pq_conn_t *conn);
+
+/*
+ * True while the connection's bridge holds an outbound action the transport
+ * has not taken (moq_transport_bridge_has_outbound_pending), which a graceful
+ * drain must wait out (implemented in moq_picoquic.c). PRIVATE, like
+ * moq_pq_conn_cnx_released. A NULL conn reports false. Network thread only.
+ */
+bool moq_pq_conn_outbound_pending(const moq_pq_conn_t *conn);
+
+/*
+ * How many picoquic callbacks other than prepare_to_send the connection has
+ * received: stream data, terminals, datagrams, closes. A count unchanged
+ * since a service pass means the connection has no new input for the next
+ * one. PRIVATE, like moq_pq_conn_cnx_released. A NULL conn reports 0.
+ * Network thread only.
+ */
+uint64_t moq_pq_conn_event_count(const moq_pq_conn_t *conn);
+
+/*
+ * True once the session's MOQ_EVENT_SESSION_CLOSED has been transferred to the
+ * application by a poll (moq_transport_bridge_terminal_facts' observed fact),
+ * not merely queued. PRIVATE, like moq_pq_conn_cnx_released. A NULL conn
+ * reports false. Network thread only.
+ */
+bool moq_pq_conn_terminal_observed(const moq_pq_conn_t *conn);
+
+/*
+ * Stop routing picoquic callbacks to this adapter and drop its copy of the
+ * cnx, leaving the bridge and session in place. For a connection whose
+ * transport the owner has finished with -- closed by the peer, or closed with
+ * picoquic_close() by the owner -- while the session must stay readable.
+ * Idempotent; a no-op once the cnx is released. PRIVATE. Network thread only.
+ */
+void moq_pq_conn_release_transport(moq_pq_conn_t *conn);
 
 /* Returns 0 on success, -1 on allocation failure (queue create). queue_cap
  * bounds the outbound queue (0 = MOQ_PQ_SEND_QUEUE_CAP_DEFAULT). */

@@ -40,6 +40,89 @@
 
 static int failures = 0;
 
+/* Pre-TS public allocation, including the actual record alignment on ILP32;
+ * standalone uint64_t alignment is not a substitute for this sizeof. */
+typedef struct frozen_receiver_cfg {
+    uint32_t struct_size;
+    const moq_endpoint_cfg_t *endpoint;
+    moq_namespace_t namespace_;
+    moq_bytes_t catalog_track;
+    bool auto_subscribe;
+    moq_media_time_mode_t time_mode;
+    moq_media_overflow_cfg_t overflow;
+    uint32_t max_track_events;
+} frozen_receiver_cfg_t;
+
+_Static_assert(MOQ_MEDIA_RECEIVER_CFG_V0_SIZE == sizeof(frozen_receiver_cfg_t),
+               "receiver V0 floor must equal the frozen client allocation");
+
+/* Frozen pre-auth TS client allocation, independently declared so append
+ * checks include the old ABI's tail padding (not just its last field). Compile
+ * this fixture for LP64, ARM32 and i386, with normal and short enums. */
+typedef struct frozen_ts_receiver_cfg {
+    uint32_t struct_size;
+    const moq_endpoint_cfg_t *endpoint;
+    moq_namespace_t namespace_;
+    moq_bytes_t catalog_track;
+    bool auto_subscribe;
+    moq_media_time_mode_t time_mode;
+    moq_media_overflow_cfg_t overflow;
+    uint32_t max_track_events;
+    uint8_t reserved_cfg[4];
+    uint32_t mpeg2ts_reorder_slots;
+    uint64_t mpeg2ts_reorder_window_us;
+    bool mpeg2ts_strip_prefix;
+    bool mpeg2ts_join_psi;
+} frozen_ts_receiver_cfg_t;
+
+_Static_assert(offsetof(moq_media_receiver_cfg_t, resource_auth) >=
+               sizeof(frozen_ts_receiver_cfg_t), "auth overlaps old TS allocation");
+#define CHECK_TS_MEMBER(member) \
+    _Static_assert(offsetof(moq_media_receiver_cfg_t, member) == \
+                   offsetof(frozen_ts_receiver_cfg_t, member), \
+                   "old TS member moved: " #member)
+CHECK_TS_MEMBER(struct_size);
+CHECK_TS_MEMBER(endpoint);
+CHECK_TS_MEMBER(namespace_);
+CHECK_TS_MEMBER(catalog_track);
+CHECK_TS_MEMBER(auto_subscribe);
+CHECK_TS_MEMBER(time_mode);
+CHECK_TS_MEMBER(overflow);
+CHECK_TS_MEMBER(max_track_events);
+CHECK_TS_MEMBER(mpeg2ts_reorder_slots);
+CHECK_TS_MEMBER(mpeg2ts_reorder_window_us);
+CHECK_TS_MEMBER(mpeg2ts_strip_prefix);
+CHECK_TS_MEMBER(mpeg2ts_join_psi);
+#undef CHECK_TS_MEMBER
+
+typedef struct frozen_companion_receiver_cfg {
+    frozen_ts_receiver_cfg_t prefix;
+    _Alignas(uint64_t) moq_media_companion_profile_t companion_profile;
+} frozen_companion_receiver_cfg_t;
+_Static_assert(offsetof(moq_media_receiver_cfg_t, companion_profile) ==
+               offsetof(frozen_companion_receiver_cfg_t, companion_profile),
+               "old companion field moved");
+_Static_assert(offsetof(moq_media_receiver_cfg_t, resource_auth) >=
+               sizeof(frozen_companion_receiver_cfg_t),
+               "auth overlaps the complete companion allocation");
+
+typedef struct frozen_stream_receiver_cfg {
+    frozen_ts_receiver_cfg_t prefix;
+    _Alignas(uint64_t) moq_media_companion_profile_t companion_profile;
+    uint8_t reserved_companion[4];
+    uint32_t max_stream_terminals;
+    bool surface_stream_terminals;
+} frozen_stream_receiver_cfg_t;
+_Static_assert(offsetof(moq_media_receiver_cfg_t, max_stream_terminals) ==
+               offsetof(frozen_stream_receiver_cfg_t, max_stream_terminals),
+               "old stream-terminal limit moved");
+_Static_assert(offsetof(moq_media_receiver_cfg_t, surface_stream_terminals) ==
+               offsetof(frozen_stream_receiver_cfg_t, surface_stream_terminals),
+               "old stream-terminal enable moved");
+_Static_assert(offsetof(moq_media_receiver_cfg_t, resource_auth) >=
+               sizeof(frozen_stream_receiver_cfg_t),
+               "auth overlaps the complete stream-terminal allocation");
+
 /* Test seams (media_receiver.c / endpoint.c, MOQ_MEDIA_RECEIVER_TESTING). */
 moq_result_t moq_media_receiver_test_construct(const moq_media_receiver_cfg_t *cfg,
                                                moq_media_receiver_t **out);
@@ -551,6 +634,157 @@ static void test_b10_ilp32_events_product_wrap(void)
 }
 #endif
 
+static int auth_outcomes;
+
+static void test_auth_old_allocation(void)
+{
+    union {
+        frozen_stream_receiver_cfg_t alignment;
+        unsigned char bytes[sizeof(frozen_stream_receiver_cfg_t) + 16];
+    } storage;
+    void (*const initializers[])(moq_media_receiver_cfg_t *, size_t) = {
+        moq_media_receiver_cfg_init_sized,
+        moq_media_receiver_cfg_init_live_sized,
+        moq_media_receiver_cfg_init_flow_control_sized
+    };
+    const moq_bytes_t parts[] = {{NS0, 4}};
+    for (size_t i = 0; i < sizeof(initializers) / sizeof(initializers[0]); ++i) {
+        memset(&storage, 0xa5, sizeof(storage));
+        moq_media_receiver_cfg_t *cfg = (moq_media_receiver_cfg_t *)(void *)storage.bytes;
+        initializers[i](cfg, sizeof(frozen_stream_receiver_cfg_t));
+        frozen_stream_receiver_cfg_t old;
+        memcpy(&old, storage.bytes, sizeof(old));
+        ROW("auth.old", "stamp", old.prefix.struct_size == sizeof(old));
+        ROW("auth.old", "companion_default", old.companion_profile == MOQ_MEDIA_COMPANION_AUTO);
+        ROW("auth.old", "lane_default", !old.surface_stream_terminals && old.max_stream_terminals == 0);
+        ROW("auth.old", "preset", old.prefix.overflow.policy == (i == 0 ?
+            MOQ_MEDIA_OVERFLOW_UNSET : i == 1 ? MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME :
+            MOQ_MEDIA_OVERFLOW_FLOW_CONTROL));
+        old.prefix.namespace_ = (moq_namespace_t){parts, 1};
+        old.prefix.overflow.policy = MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME;
+        old.max_stream_terminals = 2;
+        old.surface_stream_terminals = true;
+        memcpy(storage.bytes, &old, sizeof(old));
+        size_t end = offsetof(frozen_stream_receiver_cfg_t, surface_stream_terminals) + sizeof(bool);
+        memset(storage.bytes + end, 0xa5, sizeof(old) - end);
+        unsigned char before[sizeof(storage.bytes)];
+        memcpy(before, storage.bytes, sizeof(before));
+        arm(-1);
+        moq_media_receiver_t *r = NULL;
+        ROW("auth.old", "anonymous", moq_media_receiver_test_construct(cfg, &r) == MOQ_OK);
+        if (r) {
+            moq_media_receiver_info_t info = {0};
+            ROW("auth.old", "info", moq_media_receiver_get_info(r, &info, sizeof(info)) == MOQ_OK);
+            ROW("auth.old", "lane_preserved", info.surface_stream_terminals && info.max_stream_terminals == 2);
+            moq_media_receiver_test_free(r);
+        }
+        ROW("auth.old", "balanced", outstanding() == 0 && ledger_clean());
+        disarm();
+        ROW("auth.old", "input_preserved", memcmp(before, storage.bytes, sizeof(before)) == 0);
+        for (size_t n = sizeof(old); n < sizeof(storage.bytes); ++n)
+            ROW("auth.old", "initializer_canary", storage.bytes[n] == 0xa5);
+    }
+}
+
+static void construction_auth_outcome(void *ctx,
+                                      const moq_media_auth_outcome_info_t *info)
+{
+    (void)ctx;
+    (void)info;
+    auth_outcomes++;
+}
+
+static void test_auth_construction(void)
+{
+    moq_bytes_t parts[2] = { { NS0, 4 }, { NS1, 4 } };
+    uint8_t value[] = { 0, 0xff, 0x80 };
+    moq_auth_token_t token = {
+        .token_type = 7, .token_value = { value, sizeof(value) }
+    };
+    moq_media_auth_cfg_t auth;
+    moq_media_auth_cfg_init(&auth);
+    auth.tokens = &token;
+    auth.token_count = 1;
+    auth.on_outcome = construction_auth_outcome;
+    moq_media_receiver_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    base_cfg(&cfg, MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME, parts, 2);
+    cfg.struct_size = sizeof(cfg);
+    cfg.resource_auth = &auth;
+    moq_endpoint_cfg_t ep_cfg;
+    owning_cfg(&cfg, &ep_cfg);
+
+    const char *what = "auth.invalid_before_connect";
+    auth.on_outcome = NULL;
+    arm(-1);
+    arm_connect(MOQ_ERR_UNSUPPORTED);
+    moq_media_receiver_t *r = NULL;
+    moq_result_t rc = moq_media_receiver_create(&cfg, &r);
+    disarm_connect(); disarm();
+    ROW(what, "invalid", rc == MOQ_ERR_INVAL && r == NULL);
+    ROW(what, "no_connect_or_allocation", g_connect.calls == 0 && g_ledger.requests == 0);
+    ROW(what, "clean", ledger_clean() && outstanding() == 0);
+    auth.on_outcome = construction_auth_outcome;
+
+    what = "auth.copy_failure_before_connect";
+    arm(0);
+    arm_connect(MOQ_ERR_UNSUPPORTED);
+    rc = moq_media_receiver_create(&cfg, &r);
+    disarm_connect(); disarm();
+    ROW(what, "nomem", rc == MOQ_ERR_NOMEM && r == NULL);
+    ROW(what, "no_connect", g_connect.calls == 0);
+    ROW(what, "one_copy_attempt", g_ledger.requests == 1 && g_ledger.refused == 1);
+    ROW(what, "clean", ledger_clean() && outstanding() == 0);
+
+    what = "auth.connect_failure_frees_copy";
+    arm(-1);
+    arm_connect(MOQ_ERR_UNSUPPORTED);
+    rc = moq_media_receiver_create(&cfg, &r);
+    disarm_connect(); disarm();
+    ROW(what, "boundary_result", rc == MOQ_ERR_UNSUPPORTED && r == NULL);
+    ROW(what, "one_connect", g_connect.calls == 1);
+    ROW(what, "owned_copy_freed", g_ledger.supplied == 1 && g_ledger.freed == 1);
+    ROW(what, "clean", ledger_clean() && outstanding() == 0);
+
+    /* Every incomplete pointer prefix is absent, not a partially read source. */
+    auth.on_outcome = NULL;
+    for (size_t n = 0; n < sizeof(cfg.resource_auth); n++) {
+        what = "auth.partial_pointer_absent";
+        cfg.struct_size = (uint32_t)(offsetof(moq_media_receiver_cfg_t, resource_auth) + n);
+        arm(-1);
+        arm_connect(MOQ_ERR_UNSUPPORTED);
+        rc = moq_media_receiver_create(&cfg, &r);
+        disarm_connect(); disarm();
+        ROW(what, "anonymous_boundary", rc == MOQ_ERR_UNSUPPORTED && r == NULL);
+        ROW(what, "one_connect_no_copy", g_connect.calls == 1 && g_ledger.requests == 0);
+        ROW(what, "clean", ledger_clean() && outstanding() == 0);
+    }
+    auth.on_outcome = construction_auth_outcome;
+    cfg.struct_size = sizeof(cfg);
+
+    /* Copy plus the existing seven receiver allocations: each failure must
+     * unwind through the captured allocator, without notifying the app. */
+    for (int fail = 0; fail < 8; fail++) {
+        what = "auth.construction_unwind";
+        arm(fail);
+        rc = moq_media_receiver_test_construct(&cfg, &r);
+        disarm();
+        ROW(what, "nomem", rc == MOQ_ERR_NOMEM && r == NULL);
+        if (r) moq_media_receiver_test_free(r);
+        ROW(what, "nominated_failure", g_ledger.refused == (fail == 2 ? 2 : 1));
+        ROW(what, "clean", ledger_clean() && outstanding() == 0);
+    }
+    what = "auth.captured_allocator";
+    arm(-1);
+    rc = moq_media_receiver_test_construct(&cfg, &r);
+    disarm();
+    ROW(what, "constructed", rc == MOQ_OK && r != NULL);
+    ROW(what, "copy_and_receiver_owned", g_ledger.supplied == 8);
+    if (r) moq_media_receiver_test_free(r);
+    ROW(what, "clean", ledger_clean() && outstanding() == 0);
+    ROW(what, "no_construction_outcome", auth_outcomes == 0);
+}
+
 int main(void)
 {
     test_b1_flow_control_ring_wrap();
@@ -570,6 +804,8 @@ int main(void)
     test_b7_public_attach_counts();
     test_b8_namespace_count_unrepresentable();
     test_b9_create_refused_connect_control();
+    test_auth_old_allocation();
+    test_auth_construction();
     if (failures) {
         fprintf(stderr, "media_receiver_construct_arith: %d failure(s)\n", failures);
         return 1;

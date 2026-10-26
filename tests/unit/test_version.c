@@ -13,6 +13,8 @@ int main(void)
     MOQ_TEST_CHECK(strcmp(moq_strerror(MOQ_DONE), "done") == 0);
     MOQ_TEST_CHECK(strcmp(moq_strerror(MOQ_ERR_NOMEM), "out of memory") == 0);
     MOQ_TEST_CHECK(MOQ_ERR_LIMIT == -16);
+    MOQ_TEST_CHECK(MOQ_ERR_CAPACITY == -17);
+    MOQ_TEST_CHECK(strcmp(moq_strerror(MOQ_ERR_CAPACITY), "admission capacity refused") == 0);
     MOQ_TEST_CHECK(strcmp(moq_strerror(MOQ_ERR_LIMIT), "limit reached") == 0);
     MOQ_TEST_CHECK(strcmp(moq_strerror(-12345), "unknown error") == 0);
 

@@ -4,7 +4,8 @@
  * another stream is dropped when identical and otherwise makes the Track
  * malformed — the downstream subscription ends with PUBLISH_DONE
  * MALFORMED_TRACK, the upstream request is cancelled and the copy is never
- * delivered. Every cancellation and reset the malformation owes is kept
+ * delivered; a reset of a copy's own stream ends the copy alone, never the
+ * subgroup it copies. Every cancellation and reset the malformation owes is kept
  * until the session takes it, exactly once, including against a full send
  * buffer; a FETCH or fill still being served, and a forwarded Joining
  * FETCH held mid-replay, is reset with MALFORMED_TRACK. Alongside: ingest
@@ -556,6 +557,92 @@ relay_dup_copy_interleaved(void)
     }
     R_CHECK(&w.rig, !w.s_ps.session_closed && !w.pub_ps.session_closed);
     return mrig_close(&w, &a, "relay_dup_copy_interleaved", v);
+}
+
+/* A copy ignored uncompared -- the ninth while eight are being compared -- of
+ * a complete object whose subgroup is still open, arriving on a second stream
+ * of that subgroup, which is then reset mid-object: the reset ends the copy
+ * alone. Only the source whose OPEN record a reset abandons ends the
+ * subgroup's list, so the subgroup goes on: its next object is delivered and
+ * its stream ends with the publisher's FIN, never with the copy's reset. */
+static int
+relay_dup_copy_reset_live(void)
+{
+    const moq_version_t v = MOQ_VERSION_DRAFT_22;
+    ca_t a;
+    relay_bind_test_ca_init(&a);
+    relay_bind_test_server_streaming_objects = true;
+    relay_bind_test_accept_track_alias = 9;
+    mrig_t w;
+    bool ok = mrig_open(&w, &a, v);
+    relay_bind_test_server_streaming_objects = false;
+    relay_bind_test_accept_track_alias = 0;
+    const char *name = "relay_dup_copy_reset_live";
+    if (!ok) {
+        printf("FAIL: %s fixture\n", name);
+        relay_bind_test_rig_destroy(&w.rig);
+        return 1;
+    }
+    static const uint8_t body[6] = { 'o', 'n', 'e', 'o', 'n', 'e' };
+    /* Ten retained Objects, Object sg of Subgroup {g, sg}; {1, 4} stays
+     * open. */
+    moq_subgroup_handle_t live;
+    memset(&live, 0, sizeof(live));
+    for (uint64_t g = 0; g < 2; g++) {
+        for (uint64_t sg = 0; sg < 5; sg++) {
+            moq_subgroup_handle_t h = mrig_open_sg(&w, g, sg, false);
+            mrig_write(&w, h, sg, body, sizeof(body));
+            if (g == 1 && sg == 4) {
+                live = h;
+            } else {
+                R_CHECK(&w.rig, moq_session_close_subgroup(w.pub->peer, h,
+                                                           w.rig.now) == MOQ_OK);
+            }
+            mrig_settle(&w);
+        }
+    }
+    R_CHECK(&w.rig, w.s_ps.objects == 10);
+    /* Eight unfinished identical copies hold every comparison owner. */
+    moq_subgroup_handle_t hs[8];
+    for (int k = 0; k < 8; k++) {
+        hs[k] = mrig_begin_copy(&w, (uint64_t)(k / 5), (uint64_t)(k % 5), body[0]);
+        mrig_settle(&w);
+    }
+    /* The ninth, of Object 4 of the open Subgroup {1, 4}, on a stream of its
+     * own: SUBGROUP_HEADER (alias 9, Group 1, Subgroup 4, priority 0), then
+     * Object 4 (delta 4, length 6) and its first byte. It finds no owner;
+     * then its stream is reset. */
+    static const uint8_t copy[] = { 0x14, 9, 1, 4, 0, 0x04, 0x06, 'X' };
+    const uint64_t s9 = 0x7F00008u;
+    mrig_inject(&w, s9, copy, sizeof(copy), false);
+    mrig_settle(&w);
+    (void)moq_session_on_data_reset(w.pub->rsess, moq_stream_ref_from_u64(s9),
+                                    0x7, w.rig.now);
+    mrig_settle(&w);
+    R_CHECK(&w.rig, w.s_ps.subgroup_resets == 0);
+    /* The subgroup goes on: Object 5, then the FIN. */
+    mrig_write(&w, live, 5, body, sizeof(body));
+    R_CHECK(&w.rig, moq_session_close_subgroup(w.pub->peer, live, w.rig.now) ==
+                        MOQ_OK);
+    mrig_settle(&w);
+    for (int k = 0; k < 8; k++) {
+        mrig_end_copy(&w, hs[k], body + 1);
+        mrig_settle(&w);
+    }
+    R_CHECK(&w.rig, w.s_ps.objects == 11);
+    R_CHECK(&w.rig, w.s_ps.last_group == 1 && w.s_ps.last_object == 5);
+    R_CHECK(&w.rig, w.s_ps.done_count == 0 && w.pub_ps.unsubscribed == 0);
+    R_CHECK(&w.rig, w.s_ps.subgroup_resets == 0);
+    int fins14 = 0;
+    for (int i = 0; i < w.s_ps.finished_count && i < 16; i++) {
+        if (w.s_ps.finished_gsg[i][0] == 1 && w.s_ps.finished_gsg[i][1] == 4) {
+            fins14++;
+        }
+    }
+    R_CHECK(&w.rig, fins14 == 1);
+    R_CHECK(&w.rig, w.s_ps.subgroup_finished == 10);
+    R_CHECK(&w.rig, !w.s_ps.session_closed && !w.pub_ps.session_closed);
+    return mrig_close(&w, &a, name, v);
 }
 
 
@@ -1121,34 +1208,28 @@ relay_max_cache_duration(moq_version_t v)
         relay_bind_test_rig_pump(&w.rig, 8);
         relay_bind_test_peer_drain(&w.rig, late, &l_ps, false, false, 0, 0);
     }
-    if (v == MOQ_VERSION_DRAFT_22) {
-        /* Draft-22: the expired Object is unknown, so the relay asks the
-         * origin for it within the FETCH's wait budget; nothing past it is
-         * served and the FETCH does not end meanwhile. This origin never
-         * answers: once the budget is spent the run is Timed-Out from
-         * {0,0} (object 1 has expired by then as well). */
-        R_CHECK(&w.rig, l_ps.fdlv_n == 0 && l_ps.fgap_n == 0 &&
-                            l_ps.fetch_complete == 0);
-        w.rig.now += 60000000;
-        for (int i = 0; i < 6; i++) {
-            relay_bind_test_rig_pump(&w.rig, 8);
-            relay_bind_test_peer_drain(&w.rig, late, &l_ps, false, false, 0, 0);
-        }
-        R_CHECK(&w.rig, l_ps.fdlv_n == 0);
-        R_CHECK(&w.rig, l_ps.fgap_n >= 1 &&
-                            l_ps.fgap[0].kind == MOQ_FETCH_RANGE_TIMED_OUT &&
-                            l_ps.fgap[0].group == 0 && l_ps.fgap[0].object == 0);
-        R_CHECK(&w.rig, l_ps.fetch_complete == 1);
-    } else {
-        /* The expired Object is reported unknown, never passed over as
-         * if it did not exist; the fresh one is served after it. */
-        R_CHECK(&w.rig, l_ps.fgap_n == 1 &&
-                            l_ps.fgap[0].kind == MOQ_FETCH_RANGE_UNKNOWN &&
-                            l_ps.fgap[0].group == 0 && l_ps.fgap[0].object == 0);
-        R_CHECK(&w.rig, l_ps.fdlv_n == 1);
-        R_CHECK(&w.rig, l_ps.fdlv_n < 1 || l_ps.fdlv[0].object == 1);
-        R_CHECK(&w.rig, l_ps.fetch_complete == 1);
+    /* The expired Object is unknown, so the relay asks the origin for it
+     * within the FETCH's wait budget; nothing past it is served and the FETCH
+     * does not end meanwhile. This origin never answers: once the budget is
+     * spent the run from {0,0} is Timed-Out on draft-22, and on the drafts
+     * without that marker it is Unknown -- never passed over as if it did not
+     * exist (object 1 has expired by then as well). */
+    R_CHECK(&w.rig, l_ps.fdlv_n == 0 && l_ps.fgap_n == 0 && l_ps.fetch_complete == 0);
+    w.rig.now += 60000000;
+    for (int i = 0; i < 6; i++) {
+        relay_bind_test_rig_pump(&w.rig, 8);
+        relay_bind_test_peer_drain(&w.rig, late, &l_ps, false, false, 0, 0);
     }
+    printf("relay_max_cache_duration(d%u): objects=%d gaps=%d kind=%u at %llu:%llu complete=%d\n",
+           (unsigned)v, l_ps.fdlv_n, l_ps.fgap_n, l_ps.fgap_n ? (unsigned)l_ps.fgap[0].kind : 0u,
+           l_ps.fgap_n ? (unsigned long long)l_ps.fgap[0].group : 0ull,
+           l_ps.fgap_n ? (unsigned long long)l_ps.fgap[0].object : 0ull, l_ps.fetch_complete);
+    R_CHECK(&w.rig, l_ps.fdlv_n == 0);
+    R_CHECK(&w.rig, l_ps.fgap_n >= 1 &&
+                        l_ps.fgap[0].kind == (v == MOQ_VERSION_DRAFT_22 ? MOQ_FETCH_RANGE_TIMED_OUT
+                                                                       : MOQ_FETCH_RANGE_UNKNOWN) &&
+                        l_ps.fgap[0].group == 0 && l_ps.fgap[0].object == 0);
+    R_CHECK(&w.rig, l_ps.fetch_complete == 1);
     return mrig_close(&w, &a, "relay_max_cache_duration", v);
 }
 
@@ -1483,6 +1564,7 @@ relay_track_integrity(moq_version_t v)
     failures += relay_dup_owner_policy(v, 1);
     if (v == MOQ_VERSION_DRAFT_22) {
         failures += relay_dup_copy_interleaved();
+        failures += relay_dup_copy_reset_live();
         failures += relay_malformed_fill();
     }
     if (v != MOQ_VERSION_DRAFT_22) {

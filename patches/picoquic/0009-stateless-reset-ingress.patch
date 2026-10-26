@@ -1,0 +1,475 @@
+Detect stateless resets behind another connection's ID; allow not sending them.
+
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
+0008.
+
+- A packet associated with a connection by its leading bytes but not
+  decryptable was compared with that connection's token only, so a reset for
+  connection B whose leading bytes happen to name connection A was missed
+  (RFC 9000 Section 10.3.1). The comparison in
+  picoquic_parse_header_and_decrypt now falls through to the pairs
+  registered for the remote address, and the connection it names is the one
+  reset. Its direct comparison uses picoquic_constant_time_memcmp.
+- picoquic_set_stateless_reset_sending(quic, 0) makes a context never answer
+  an unassociated packet with a stateless reset (Section 10.3, a MAY) while
+  it keeps receiving and detecting them: an application running several
+  contexts on one port leaves the answer to the context that owns the
+  connection. picoquic_set_default_stateless_reset_min_interval remains a
+  rate limit and cannot disable sending.
+
+The registered-pair refresh and the table comparison come from 0004.
+Tests (picoquic_ct): stateless_reset_after_rebinding,
+stateless_reset_other_cnx_prefix and stateless_reset_sending_disabled, each
+through picoquic_incoming_packet. In LibMoQ:
+adapters/picoquic/tests/test_pq_stateless_reset_contract.c.
+
+diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
+index a6d214ef..68bf66cc 100644
+--- a/UnitTest1/unittest1.cpp
++++ b/UnitTest1/unittest1.cpp
+@@ -1367,6 +1367,27 @@ namespace UnitTest1
+             Assert::AreEqual(ret, 0);
+         }
+ 
++        TEST_METHOD(stateless_reset_after_rebinding)
++        {
++            int ret = stateless_reset_after_rebinding_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
++        TEST_METHOD(stateless_reset_other_cnx_prefix)
++        {
++            int ret = stateless_reset_other_cnx_prefix_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
++        TEST_METHOD(stateless_reset_sending_disabled)
++        {
++            int ret = stateless_reset_sending_disabled_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
+         TEST_METHOD(stateless_reset_detect)
+         {
+             int ret = stateless_reset_detect_test();
+diff --git a/picoquic/packet.c b/picoquic/packet.c
+index eb2a4f1b..1c5d5ecb 100644
+--- a/picoquic/packet.c
++++ b/picoquic/packet.c
+@@ -833,11 +833,32 @@ int picoquic_parse_header_and_decrypt(
+                     }
+ 
+                     if (decoded_length > (length - ph->offset)) {
++                        picoquic_cnx_t* reset_cnx = NULL;
++
+                         if (ph->ptype == picoquic_packet_1rtt_protected &&
+-                            length >= PICOQUIC_RESET_PACKET_MIN_SIZE &&
+-                            memcmp(bytes + length - PICOQUIC_RESET_SECRET_SIZE,
+-                                (*pcnx)->path[0]->first_tuple->p_remote_cnxid->reset_secret, PICOQUIC_RESET_SECRET_SIZE) == 0) {
++                            length >= PICOQUIC_RESET_PACKET_MIN_SIZE) {
++                            /* RFC 9000 section 10.3.1: a packet that cannot be decrypted is
++                             * compared with this connection's token, then with every token
++                             * registered for the remote address, since its leading bytes may
++                             * name another connection. Compared without leaking the token. */
++                            const uint8_t* token = bytes + length - PICOQUIC_RESET_SECRET_SIZE;
++
++                            if ((*pcnx)->path[0]->first_tuple->p_remote_cnxid != NULL &&
++                                picoquic_constant_time_memcmp(token,
++                                    (*pcnx)->path[0]->first_tuple->p_remote_cnxid->reset_secret, PICOQUIC_RESET_SECRET_SIZE) == 0) {
++                                reset_cnx = *pcnx;
++                            }
++                            else {
++                                reset_cnx = picoquic_cnx_by_secret(quic, token, addr_from);
++                            }
++                        }
++
++                        if (reset_cnx != NULL) {
+                             ret = PICOQUIC_ERROR_STATELESS_RESET;
++                            if (reset_cnx != *pcnx) {
++                                picoquic_log_app_message(*pcnx, "Decrypt error, reset secret of another connection, ret = %d", ret);
++                                *pcnx = reset_cnx;
++                            }
+                             picoquic_log_app_message(*pcnx, "Decrypt error, matching reset secret, ret = %d", ret);
+                         }
+                         else {
+@@ -1112,6 +1133,7 @@ void picoquic_process_unexpected_cnxid(
+     if (length > PICOQUIC_RESET_PACKET_MIN_SIZE && 
+         length <= PICOQUIC_MAX_PACKET_SIZE &&
+         ph->ptype == picoquic_packet_1rtt_protected &&
++        !quic->is_stateless_reset_disabled &&
+         quic->stateless_reset_next_time <= current_time) {
+         picoquic_stateless_packet_t* sp = picoquic_create_stateless_packet(quic);
+         if (sp != NULL) {
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+index 19215218..486c1e2d 100644
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -998,6 +998,14 @@ void picoquic_set_default_callback(picoquic_quic_t * quic, picoquic_stream_data_
+  */
+ void picoquic_set_default_stateless_reset_min_interval(picoquic_quic_t* quic, uint64_t min_interval_usec);
+ 
++/* Whether this context answers packets it cannot associate with a connection
++ * by sending a stateless reset (RFC 9000 section 10.3, a MAY). Enabled by
++ * default. Receiving and detecting stateless resets is unaffected. An
++ * application running several contexts on one port disables it on the
++ * contexts that do not own a connection, so only the owner answers.
++ */
++void picoquic_set_stateless_reset_sending(picoquic_quic_t* quic, int is_enabled);
++
+ /* Set and get the maximum number of simultaneously logged connections.
+ * If that number is too high, the maximum number of open files will be hit 
+ * at random places in the code. A small value means that some connections may
+diff --git a/picoquic/picoquic_internal.h b/picoquic/picoquic_internal.h
+index c5a81396..ea258b0b 100644
+--- a/picoquic/picoquic_internal.h
++++ b/picoquic/picoquic_internal.h
+@@ -572,6 +572,7 @@ typedef struct st_picoquic_quic_t {
+     uint64_t cwin_max; /* max value of cwin per connection */
+     /* Flags */
+     unsigned int check_token : 1;
++    unsigned int is_stateless_reset_disabled : 1; /* never send stateless resets */
+     unsigned int force_check_token : 1;
+     unsigned int provide_token : 1;
+     unsigned int unconditional_cnx_id : 1;
+diff --git a/picoquic/quicctx.c b/picoquic/quicctx.c
+index 2c84a945..1e502969 100644
+--- a/picoquic/quicctx.c
++++ b/picoquic/quicctx.c
+@@ -4542,6 +4542,12 @@ void picoquic_set_default_stateless_reset_min_interval(picoquic_quic_t* quic, ui
+     quic->stateless_reset_min_interval = min_interval_usec;
+ }
+ 
++void picoquic_set_stateless_reset_sending(picoquic_quic_t* quic, int is_enabled)
++{
++    PICOQUIC_THREAD_CHECK(quic);
++    quic->is_stateless_reset_disabled = (is_enabled) ? 0 : 1;
++}
++
+ void picoquic_set_callback(picoquic_cnx_t* cnx,
+     picoquic_stream_data_cb_fn callback_fn, void* callback_ctx)
+ {
+diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
+index 68cc9118..a43d12fa 100644
+--- a/picoquic_t/picoquic_t.c
++++ b/picoquic_t/picoquic_t.c
+@@ -314,6 +314,9 @@ static const picoquic_test_def_t test_table[] = {
+     { "stateless_reset_bad", stateless_reset_bad_test },
+     { "stateless_reset_client", stateless_reset_client_test },
+     { "stateless_reset_handshake", stateless_reset_handshake_test },
++    { "stateless_reset_after_rebinding", stateless_reset_after_rebinding_test },
++    { "stateless_reset_other_cnx_prefix", stateless_reset_other_cnx_prefix_test },
++    { "stateless_reset_sending_disabled", stateless_reset_sending_disabled_test },
+     { "stateless_reset_detect", stateless_reset_detect_test },
+     { "stateless_reset_detect_callback", stateless_reset_detect_callback_test },
+     { "stateless_reset_detect_vn", stateless_reset_detect_vn_test },
+diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
+index fc7791b5..59e05516 100644
+--- a/picoquictest/picoquictest.h
++++ b/picoquictest/picoquictest.h
+@@ -115,6 +115,9 @@ int stateless_reset_test(void);
+ int stateless_reset_bad_test(void);
+ int stateless_reset_client_test(void);
+ int stateless_reset_handshake_test(void);
++int stateless_reset_after_rebinding_test(void);
++int stateless_reset_other_cnx_prefix_test(void);
++int stateless_reset_sending_disabled_test(void);
+ int stateless_reset_detect_test(void);
+ int stateless_reset_detect_callback_test(void);
+ int stateless_reset_detect_vn_test(void);
+diff --git a/picoquictest/tls_api_test.c b/picoquictest/tls_api_test.c
+index 90db7ef4..9c99827b 100644
+--- a/picoquictest/tls_api_test.c
++++ b/picoquictest/tls_api_test.c
+@@ -3622,6 +3622,289 @@ int stateless_reset_client_test(void)
+ }
+ 
+ 
++/*
++* Stateless reset after NAT rebinding.
++* The client's address changes; the server validates the new path and
++* sends to it with a connection ID the client issued. A stateless reset
++* carrying that connection ID's token then arrives from the new address,
++* as the client would send one after losing its state. RFC 9000 section
++* 10.3.1: a token for a connection ID in use, from the address the server
++* sends to, must be recognized.
++*/
++int stateless_reset_after_rebinding_test(void)
++{
++    uint64_t simulated_time = 0;
++    uint64_t loss_mask = 0;
++    uint64_t next_time = 0;
++    int nb_inactive = 0;
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    int ret = tls_api_init_ctx(&test_ctx, 0, PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN, &simulated_time, NULL, NULL, 0, 0, 0);
++    uint8_t buffer[128];
++
++    if (ret == 0) {
++        ret = tls_api_connection_loop(test_ctx, &loss_mask, 0, &simulated_time);
++    }
++
++    if (ret == 0) {
++        ret = tls_api_synch_to_empty_loop(test_ctx, &simulated_time, 2048, PICOQUIC_NB_PATH_TARGET, 1);
++    }
++
++    /* Change the client address, then exchange data on the new path */
++    if (ret == 0) {
++        test_ctx->client_addr_natted = test_ctx->client_addr;
++        test_ctx->client_addr_natted.sin_port += 17;
++        test_ctx->client_use_nat = 1;
++        ret = test_api_init_send_recv_scenario(test_ctx, test_scenario_q_and_r, sizeof(test_scenario_q_and_r));
++    }
++
++    if (ret == 0) {
++        ret = tls_api_data_sending_loop(test_ctx, &loss_mask, &simulated_time, 0);
++    }
++
++    if (ret == 0) {
++        ret = tls_api_one_scenario_verify(test_ctx);
++    }
++
++    /* Wait until the server sends to the new address on a validated tuple */
++    next_time = simulated_time + 3000000;
++    while (ret == 0 && simulated_time < next_time && TEST_CLIENT_READY && TEST_SERVER_READY &&
++        (test_ctx->cnx_server->path[0]->first_tuple->challenge_verified != 1 ||
++            ((struct sockaddr_in*)&test_ctx->cnx_server->path[0]->first_tuple->peer_addr)->sin_port !=
++            test_ctx->client_addr_natted.sin_port)) {
++        int was_active = 0;
++
++        ret = tls_api_one_sim_round(test_ctx, &simulated_time, next_time, &was_active);
++
++        if (was_active) {
++            nb_inactive = 0;
++        }
++        else {
++            nb_inactive++;
++            if (nb_inactive > 256) {
++                break;
++            }
++        }
++    }
++
++    if (ret == 0 && !(TEST_CLIENT_READY && TEST_SERVER_READY)) {
++        DBG_PRINTF("%s", "Connection not ready after NAT rebinding");
++        ret = -1;
++    }
++
++    if (ret == 0 && (test_ctx->cnx_server->path[0]->first_tuple->challenge_verified != 1 ||
++        ((struct sockaddr_in*)&test_ctx->cnx_server->path[0]->first_tuple->peer_addr)->sin_port !=
++        test_ctx->client_addr_natted.sin_port)) {
++        DBG_PRINTF("%s", "Server did not move to the new address");
++        ret = -1;
++    }
++
++    /* The server now sends with a connection ID the client issued, which carries a token */
++    if (ret == 0 && test_ctx->cnx_server->path[0]->first_tuple->p_remote_cnxid->sequence == 0) {
++        DBG_PRINTF("%s", "Server still uses the client's initial connection ID");
++        ret = -1;
++    }
++
++    /* The reset the client would send, from the new address */
++    if (ret == 0) {
++        uint8_t token[PICOQUIC_RESET_SECRET_SIZE];
++        picoquic_remote_cnxid_t* r_cid = test_ctx->cnx_server->path[0]->first_tuple->p_remote_cnxid;
++
++        ret = picoquic_create_cnxid_reset_secret(test_ctx->qclient, &r_cid->cnx_id, token);
++        if (ret == 0 && memcmp(token, r_cid->reset_secret, PICOQUIC_RESET_SECRET_SIZE) != 0) {
++            DBG_PRINTF("%s", "Server holds a different token than the client would send");
++            ret = -1;
++        }
++        if (ret == 0) {
++            buffer[0] = 0x41;
++            memset(buffer + 1, 0xcc, sizeof(buffer) - 1 - PICOQUIC_RESET_SECRET_SIZE);
++            memcpy(buffer + sizeof(buffer) - PICOQUIC_RESET_SECRET_SIZE, token, PICOQUIC_RESET_SECRET_SIZE);
++            ret = picoquic_incoming_packet(test_ctx->qserver, buffer, sizeof(buffer),
++                (struct sockaddr*)(&test_ctx->client_addr_natted),
++                (struct sockaddr*)(&test_ctx->server_addr), 0, test_ctx->recv_ecn_server,
++                simulated_time);
++        }
++    }
++
++    if (ret == 0 && (test_ctx->cnx_server == NULL ||
++        test_ctx->cnx_server->cnx_state != picoquic_state_disconnected || !test_ctx->reset_received)) {
++        DBG_PRINTF("%s", "Stateless reset from the new address was not detected");
++        ret = -1;
++    }
++
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++        test_ctx = NULL;
++    }
++
++    return ret;
++}
++
++/*
++* Stateless reset whose leading bytes name another connection.
++* Two connections from one client address, both on connection IDs the
++* client issued. A reset for connection B is sent with connection A's
++* connection ID in front of B's token, so the server associates the
++* datagram with A and cannot decrypt it. RFC 9000 section 10.3.1: the
++* comparison against the tokens for the remote address must still be
++* performed, so B is reset and A is untouched.
++*/
++int stateless_reset_other_cnx_prefix_test(void)
++{
++    uint64_t simulated_time = 0;
++    uint64_t loss_mask = 0;
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    picoquic_cnx_t* cnx_client_a = NULL;
++    picoquic_cnx_t* cnx_server_a = NULL;
++    picoquic_cnx_t* cnx_client_b = NULL;
++    picoquic_cnx_t* cnx_server_b = NULL;
++    int ret = tls_api_init_ctx(&test_ctx, 0, PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN, &simulated_time, NULL, NULL, 0, 0, 0);
++    uint8_t buffer[128];
++
++    if (ret == 0) {
++        ret = tls_api_connection_loop(test_ctx, &loss_mask, 0, &simulated_time);
++    }
++
++    if (ret == 0) {
++        ret = tls_api_synch_to_empty_loop(test_ctx, &simulated_time, 2048, PICOQUIC_NB_PATH_TARGET, 1);
++    }
++
++    /* A second connection from the same client address, established through
++     * the harness in place of the first, then the first is restored */
++    if (ret == 0) {
++        cnx_client_a = test_ctx->cnx_client;
++        cnx_server_a = test_ctx->cnx_server;
++        cnx_client_b = picoquic_create_cnx(test_ctx->qclient, picoquic_null_connection_id, picoquic_null_connection_id,
++            (struct sockaddr*)&test_ctx->server_addr, simulated_time, 0, PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN, 1);
++        if (cnx_client_b == NULL || picoquic_start_client_cnx(cnx_client_b) != 0) {
++            ret = -1;
++        }
++        else {
++            test_ctx->cnx_client = cnx_client_b;
++            test_ctx->cnx_server = NULL;
++            ret = tls_api_connection_loop(test_ctx, &loss_mask, 0, &simulated_time);
++            if (ret == 0) {
++                ret = tls_api_synch_to_empty_loop(test_ctx, &simulated_time, 2048, PICOQUIC_NB_PATH_TARGET, 1);
++            }
++            cnx_server_b = test_ctx->cnx_server;
++            test_ctx->cnx_client = cnx_client_a;
++            test_ctx->cnx_server = cnx_server_a;
++        }
++    }
++
++    if (ret == 0 && (cnx_server_b == NULL || cnx_server_b == cnx_server_a ||
++        cnx_client_b->cnx_state != picoquic_state_ready || cnx_server_b->cnx_state != picoquic_state_ready)) {
++        DBG_PRINTF("%s", "Second connection not ready");
++        ret = -1;
++    }
++
++    /* Both server connections move to connection IDs the client issued, which carry tokens */
++    if (ret == 0) {
++        if (picoquic_refresh_path_connection_id(test_ctx->cnx_server, 0) != 0 ||
++            picoquic_refresh_path_connection_id(cnx_server_b, 0) != 0) {
++            DBG_PRINTF("%s", "Could not refresh the server connection IDs");
++            ret = -1;
++        }
++    }
++
++    /* B's reset, with A's connection ID in front */
++    if (ret == 0) {
++        uint8_t token[PICOQUIC_RESET_SECRET_SIZE];
++        picoquic_connection_id_t a_cid = test_ctx->cnx_server->path[0]->first_tuple->p_local_cnxid->cnx_id;
++        picoquic_remote_cnxid_t* b_r_cid = cnx_server_b->path[0]->first_tuple->p_remote_cnxid;
++        size_t byte_index = 0;
++
++        ret = picoquic_create_cnxid_reset_secret(test_ctx->qclient, &b_r_cid->cnx_id, token);
++        if (ret == 0 && memcmp(token, b_r_cid->reset_secret, PICOQUIC_RESET_SECRET_SIZE) != 0) {
++            DBG_PRINTF("%s", "Server holds a different token than the client would send");
++            ret = -1;
++        }
++        if (ret == 0) {
++            buffer[byte_index++] = 0x41;
++            byte_index += picoquic_format_connection_id(&buffer[byte_index], sizeof(buffer) - byte_index, a_cid);
++            memset(buffer + byte_index, 0xcc, sizeof(buffer) - byte_index - PICOQUIC_RESET_SECRET_SIZE);
++            memcpy(buffer + sizeof(buffer) - PICOQUIC_RESET_SECRET_SIZE, token, PICOQUIC_RESET_SECRET_SIZE);
++            ret = picoquic_incoming_packet(test_ctx->qserver, buffer, sizeof(buffer),
++                (struct sockaddr*)(&test_ctx->client_addr),
++                (struct sockaddr*)(&test_ctx->server_addr), 0, test_ctx->recv_ecn_server,
++                simulated_time);
++        }
++    }
++
++    if (ret == 0 && (cnx_server_b->cnx_state != picoquic_state_disconnected || !test_ctx->reset_received)) {
++        DBG_PRINTF("%s", "Reset for connection B was not detected");
++        ret = -1;
++    }
++
++    if (ret == 0 && test_ctx->cnx_server->cnx_state != picoquic_state_ready) {
++        DBG_PRINTF("%s", "Connection A was affected by B's reset");
++        ret = -1;
++    }
++
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++        test_ctx = NULL;
++    }
++
++    return ret;
++}
++
++/*
++* Stateless reset sending disabled.
++* The server context is set never to send stateless resets. Its connection
++* is deleted while the client keeps sending: no reset reaches the client,
++* which stays connected, and the server queues no stateless packet.
++*/
++int stateless_reset_sending_disabled_test(void)
++{
++    uint64_t simulated_time = 0;
++    uint64_t loss_mask = 0;
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    int ret = tls_api_init_ctx(&test_ctx, 0, PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN, &simulated_time, NULL, NULL, 0, 0, 0);
++    uint8_t buffer[128];
++    int was_active = 0;
++
++    if (ret == 0) {
++        picoquic_set_stateless_reset_sending(test_ctx->qserver, 0);
++        ret = tls_api_connection_loop(test_ctx, &loss_mask, 0, &simulated_time);
++    }
++
++    if (ret == 0) {
++        ret = wait_client_connection_ready(test_ctx, &simulated_time);
++    }
++
++    if (ret == 0) {
++        picoquic_delete_cnx(test_ctx->cnx_server);
++        test_ctx->cnx_server = NULL;
++
++        memset(buffer, 0xaa, sizeof(buffer));
++        ret = picoquic_add_to_stream(test_ctx->cnx_client, 4,
++            buffer, sizeof(buffer), 1);
++    }
++
++    for (int i = 0; ret == 0 && i < 64 && test_ctx->cnx_client->cnx_state != picoquic_state_disconnected; i++) {
++        was_active = 0;
++
++        ret = tls_api_one_sim_round(test_ctx, &simulated_time, 0, &was_active);
++    }
++
++    if (ret == 0 && (test_ctx->reset_received || test_ctx->qserver->pending_stateless_packet != NULL)) {
++        DBG_PRINTF("%s", "A stateless reset was sent although sending is disabled");
++        ret = -1;
++    }
++
++    if (ret == 0 && test_ctx->cnx_client->cnx_state == picoquic_state_disconnected) {
++        DBG_PRINTF("%s", "Client disconnected although no reset was sent");
++        ret = -1;
++    }
++
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++        test_ctx = NULL;
++    }
++
++    return ret;
++}
++
+ /*
+ * Server reset handshake test.
+ * Verify that the server does not send a reset in response to

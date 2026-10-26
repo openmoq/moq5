@@ -129,6 +129,15 @@ typedef struct moq_sub_cfg {
 #endif
     uint32_t max_fills;
     uint32_t max_fill_items;
+    /* Appended after max_fill_items, which ends the struct on every target:
+     * queue a moq_sub_stream_terminal_t for every terminal of a stream
+     * carrying a subgroup of an active track, for
+     * moq_sub_poll_stream_terminal(), in a lane of max_stream_terminals
+     * records (0 selects max_objects). false (the default) queues none and
+     * changes nothing else. Read as one block, only when struct_size covers
+     * surface_stream_terminals. */
+    uint32_t max_stream_terminals;
+    bool     surface_stream_terminals;
 } moq_sub_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen v0 prefix (the
@@ -389,6 +398,12 @@ typedef struct moq_sub_update_cfg {
     uint32_t               reserved;
     uint64_t               object_delivery_timeout_ms;
     uint64_t               subgroup_delivery_timeout_ms;
+    /* Appended after the complete D22 timeout block: subscription-update
+     * credentials (D16/D18/D22), borrowed for the call and encoded before
+     * success. Use the sized initializer. An absent pair means anonymous;
+     * a size ending inside the pointer/count pair is INVAL. */
+    const moq_auth_token_t *auth_tokens;
+    size_t                 auth_token_count;
 } moq_sub_update_cfg_t;
 
 /* Pointer-only initializer: zeroes and stamps ONLY the frozen v0 prefix
@@ -446,6 +461,23 @@ MOQ_API moq_result_t moq_sub_poll_object(
 
 MOQ_API void moq_sub_object_cleanup(moq_sub_object_t *obj);
 
+/*
+ * Whether the facade still retains received input for `track` that a poll
+ * will return: a queued or pending LIVE object or chunk, or a queued or
+ * pending FILL object of one of its fills. Fill CREATED, GAP and TERMINAL
+ * items, Group ends, stream terminals, fill request slots and outstanding
+ * requests are not input. A snapshot of what is retained now, not a
+ * promise about what may still arrive, and not a test of whether the
+ * track may be released (moq_sub_release_track decides that).
+ *
+ * False for NULL, for a track this subscriber does not own, and for a
+ * released track. Observes only: no mutation, allocation, callback or
+ * session advancement. Called on the subscriber's executor, as every call
+ * here.
+ */
+MOQ_API bool moq_sub_track_has_queued_input(const moq_subscriber_t *sub,
+                                            const moq_sub_track_t *track);
+
 /* -- Group ends --------------------------------------------------- */
 
 /* The end of a Group on a subscription: a subgroup whose header carried the
@@ -477,6 +509,75 @@ typedef struct moq_sub_group_end {
 MOQ_API moq_result_t moq_sub_poll_group_end(
     moq_subscriber_t *sub,
     moq_sub_group_end_t *out);
+
+/* -- Stream terminals --------------------------------------------- */
+
+/* How the stream carrying a subgroup of a subscription ended. */
+typedef uint32_t moq_sub_stream_terminal_kind_t;
+/* FIN on a subgroup whose header carried END_OF_GROUP: the stream's last
+ * Object is the Group's largest, so no Object above it exists. */
+#define MOQ_SUB_STREAM_FIN_END_OF_GROUP 1u
+/* FIN without END_OF_GROUP: the stream ended cleanly; nothing follows
+ * about the Group. */
+#define MOQ_SUB_STREAM_FIN              2u
+/* RESET_STREAM: delivery ended incomplete. The Objects of the subgroup
+ * after the last one the stream completed were not delivered by it; they
+ * may still arrive another way. */
+#define MOQ_SUB_STREAM_RESET            3u
+
+/* One terminal of a stream carrying a subgroup. Plain values; nothing to
+ * clean up. */
+typedef struct moq_sub_stream_terminal {
+    uint32_t                       struct_size;
+    moq_sub_stream_terminal_kind_t kind;
+    moq_sub_track_t               *track;
+    uint64_t                       group_id;
+    uint64_t                       subgroup_id;
+    /* RESET only: the peer's RESET_STREAM code. */
+    uint64_t                       error_code;
+    /* The last Object the stream carried (completely, for RESET); absent
+     * when it carried none, or for a RESET that cut an Object short whose
+     * predecessor on the stream is not known. */
+    bool                           has_last_object;
+    /* RESET only: the reset cut this Object's payload short, so neither it
+     * nor any later Object of the subgroup was delivered by the stream. */
+    bool                           has_cut_object;
+    uint8_t                        _reserved[6];
+    uint64_t                       last_object_id;
+    uint64_t                       cut_object_id;
+} moq_sub_stream_terminal_t;
+
+/* Frozen v0 floor: the complete layout through cut_object_id. */
+#define MOQ_SUB_STREAM_TERMINAL_V0_SIZE \
+    (offsetof(moq_sub_stream_terminal_t, cut_object_id) + sizeof(uint64_t))
+
+/*
+ * Poll the next stream terminal. Terminals are queued only when
+ * moq_sub_cfg_t.surface_stream_terminals is set, and only for an active
+ * track: one record per terminal of a stream carrying a subgroup, in
+ * session event order, never coalesced.
+ *
+ * Ordering: a terminal becomes pollable only once every object and chunk
+ * the facade queued before it has been returned by moq_sub_poll_object()
+ * or moq_sub_poll_chunk(), so every object the stream delivered has been
+ * handed to the caller first. A caller that applies facts in order polls
+ * terminals after each object or chunk it polls; one that stores polled
+ * objects for later settles those before applying a later terminal. A full
+ * lane holds moq_sub_tick() at MOQ_ERR_WOULD_BLOCK, like the object queue;
+ * no terminal is dropped.
+ *
+ * Retirement: while a terminal naming a track is queued, or held for a
+ * full lane, moq_sub_release_track() refuses that track with
+ * MOQ_ERR_WRONG_STATE, so a record never names a reused slot.
+ *
+ * `out_size` is the caller's sizeof; one below the v0 floor is
+ * MOQ_ERR_ABI_MISMATCH and dequeues nothing. Returns MOQ_OK and fills out,
+ * MOQ_DONE when no terminal is pollable, MOQ_ERR_INVAL for a NULL argument.
+ */
+MOQ_API moq_result_t moq_sub_poll_stream_terminal(
+    moq_subscriber_t *sub,
+    moq_sub_stream_terminal_t *out,
+    size_t out_size);
 
 /* -- Stats ----------------------------------------------------------- */
 
@@ -702,9 +803,30 @@ typedef struct moq_sub_joining_fetch_cfg {
     moq_group_order_t group_order;
     bool              has_subscriber_priority;
     uint8_t           subscriber_priority;
+    /* FETCH credentials (D16/D18), borrowed for the call and encoded before
+     * success. D22 retains its UNSUPPORTED joining-fetch result. The aligned
+     * append preserves the previous allocation including its tail padding.
+     * An absent pair means anonymous; a partial pair is INVAL. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_auth_token_t *auth_tokens;
+    size_t                 auth_token_count;
 } moq_sub_joining_fetch_cfg_t;
 
+#define MOQ_SUB_JOINING_FETCH_CFG_V0_SIZE \
+    offsetof(moq_sub_joining_fetch_cfg_t, auth_tokens)
+
+/* Zero/stamp only the frozen prefix through subscriber_priority, including
+ * its trailing padding. Auth fields stay disabled. Safe for old allocations. */
 MOQ_API void moq_sub_joining_fetch_cfg_init(moq_sub_joining_fetch_cfg_t *cfg);
+
+/* Zero/stamp min(cfg_size, sizeof current struct). No write if NULL or size
+ * cannot hold struct_size. Required to enable the credential tail. */
+MOQ_API void moq_sub_joining_fetch_cfg_init_sized(moq_sub_joining_fetch_cfg_t *cfg,
+                                               size_t cfg_size);
 
 MOQ_API moq_result_t moq_sub_joining_fetch(
     moq_subscriber_t *sub,

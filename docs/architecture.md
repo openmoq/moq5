@@ -387,7 +387,7 @@ event plumbing into track-oriented APIs.
 
 ### Publisher scope
 
-A `moq_publisher_t` owns exactly one `moq_session_t`. On drafts 16 and 18
+A `moq_publisher_t` is attached to exactly one `moq_session_t`. On drafts 16 and 18
 the session allows one subscription per track and role, so a second
 same-track subscribe is rejected before the facade sees it. On draft-22 the
 facade accepts further subscriptions to a track it serves
@@ -400,6 +400,24 @@ The publisher facade serves a fill from the track's retained group
 ([publisher-retained-groups.md](publisher-retained-groups.md)) or fails it
 on the wire; it never leaves a fill unanswered.
 
+### Publisher progress
+
+Use `moq_pub_tick` as the session's sole event consumer, or use an application
+FIFO dispatcher with `moq_pub_handle_event` and `moq_pub_flush`. Flush never
+polls. Both modes use bounded progress rounds on every draft: drain actions,
+drive staged work, and continue event dispatch while output is blocked.
+`MOQ_ERR_WOULD_BLOCK` reports remaining obligations; it is not a reason to
+spin until OK or to stop consuming events that can return credit. Yield when
+nothing progressed. The [manual pump sequence](integration-patterns.md#manual-publisher-pump)
+describes event ownership and cleanup.
+
+Initial subscription decisions use fixed per-parent owners and run the
+authorizer once. Each retained FETCH has its own bounded immutable snapshot,
+so one blocked response does not serialize all event polling. Generic request
+answers use fixed storage derived from the session pools and keep wire-answer
+FIFO order. These bounds do not promise completion while transport credit,
+event dispatch or an application decision remains unavailable.
+
 ### Deferred subscribe authorization
 
 In `MOQ_PUB_CALLBACK` mode, the `on_subscribe` callback may return
@@ -408,15 +426,22 @@ facade stores the pending subscription and the caller resolves it
 later via `moq_pub_resolve_deferred()`.
 
 Constraints:
+
 - One deferred request per publisher at a time. When the slot is
   occupied, `info->deferred` is NULL and the callback must return
   ACCEPT or REJECT synchronously.
 - `deferred_id` from `info->deferred_id` must be passed back to
   `resolve_deferred`; mismatched IDs return `MOQ_ERR_STALE_HANDLE`.
-- Deferred handles become stale after: resolve, peer unsubscribe,
-  session close, or track removal.
-- If resolve returns `MOQ_ERR_WOULD_BLOCK`, `moq_pub_flush` or
-  `moq_pub_tick` retries the accept/reject.
+- Once resolution records the decision, its `deferred_id` is stale. This also
+  holds when resolution returns `MOQ_ERR_WOULD_BLOCK` for output credit or
+  `MOQ_ERR_NOMEM` for destination allocation. Continue flush/tick progress
+  rounds after the limiting resource becomes available; do not replay
+  `resolve_deferred`. Peer unsubscribe, session close and track removal also
+  invalidate the deferred decision.
+- Recording the decision transfers its retry responsibility to the publisher;
+  it does not promise that the accept/reject has reached the peer. An
+  unresolved authorizer keeps flush reporting `MOQ_ERR_WOULD_BLOCK` on every
+  draft, while the driver continues dispatching other FIFO events.
 
 ### Subscription updates
 

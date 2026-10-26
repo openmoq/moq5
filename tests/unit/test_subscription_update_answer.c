@@ -849,8 +849,8 @@ static int test_would_block(moq_version_t v)
     uint32_t covered = sentry(&p)->owed_update.count;
     MOQ_TEST_CHECK_EQ_U64(covered, v == MOQ_VERSION_DRAFT_22 ? 1 : 2);
 
-    /* Accept: the send buffer holds all but one byte of the answer (with
-     * more than one acknowledgement owed, so a partial answer would fit). */
+    /* A batch larger than the entire send buffer cannot become writable
+     * by draining it. Refuse permanently without a partial answer. */
     if (covered > 1) {
         uint8_t buf[64];
         moq_buf_writer_t w;
@@ -865,14 +865,16 @@ static int test_would_block(moq_version_t v)
         size_t cap0 = p.sv->send_cap;
         MOQ_TEST_CHECK_EQ_SIZE(queued_actions(p.sv), 0);
         p.sv->send_cap = p.sv->send_len + covered * one - 1;
-        MOQ_TEST_CHECK_EQ_INT((int)accept_upd(&p, id, 4), (int)MOQ_ERR_WOULD_BLOCK);
+        MOQ_TEST_CHECK_EQ_INT((int)accept_upd(&p, id, 4), (int)MOQ_ERR_BUFFER);
         p.sv->send_cap = cap0;
         MOQ_TEST_CHECK_EQ_SIZE(queued_actions(p.sv), 0);
         MOQ_TEST_CHECK(sentry(&p)->owed_update.owed && sentry(&p)->forward);
     }
 
-    /* Accept: one slot short of an acknowledgement per covered update. */
-    occupy_queue(&p, 0, covered - 1, 4);
+    /* All acknowledgments share one action. A full queue still refuses
+     * the whole answer without applying its cumulative update. */
+    occupy_queue(&p, 0, 0, 4);
+    MOQ_TEST_CHECK_EQ_SIZE(action_queue_avail(p.sv), 0);
     size_t q0 = queued_actions(p.sv);
     MOQ_TEST_CHECK_EQ_INT((int)accept_upd(&p, id, 4), (int)MOQ_ERR_WOULD_BLOCK);
     MOQ_TEST_CHECK_EQ_SIZE(queued_actions(p.sv), q0);

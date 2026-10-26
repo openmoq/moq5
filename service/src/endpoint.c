@@ -56,7 +56,7 @@
 #include "../../core/src/base/uri_internal.h"
 
 #include <assert.h>
-#include <pthread.h>
+#include "../../adapters/common/moq_posix_compat.h"   /* pthread + clock_gettime (Windows shim) */
 #include <stdatomic.h>
 #include <time.h>   /* clock_gettime: drain deadline (service tier may use the wall clock) */
 #include <string.h>
@@ -517,8 +517,9 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
             return MOQ_ERR_INVAL;
         for (size_t i = 0; i < cfg->setup_auth_token_count; i++) {
             const moq_auth_token_t *t = &cfg->setup_auth_tokens[i];
-            if (t->token_type > MOQ_QUIC_VARINT_MAX ||
-                (t->token_value.len && !t->token_value.data) ||
+            /* The selected session profile checks Token Type width after
+             * negotiation; D18/D22 carry every uint64_t via vi64. */
+            if ((t->token_value.len && !t->token_value.data) ||
                 t->token_value.len > UINT16_MAX)
                 return MOQ_ERR_INVAL;
         }
@@ -660,6 +661,12 @@ typedef struct ep_backend_vtable {
     void          (*terminal)(void *facade,
                               moq_endpoint_terminal_reason_t *reason,
                               uint64_t *detail);
+    /* Discard the cached drain observation, so drain_state reports success
+     * only from a facade pass that begins afterwards. Called on the managed
+     * context, under ep->mu, when a pump cycle newly finds every hook quiet
+     * for a drain request -- before that quiet is published. NULL for a
+     * backend whose drain_state observes live (MsQuic) or cannot drain. */
+    void          (*drain_invalidate)(void *facade);
 } ep_backend_vtable_t;
 
 /* drain_state return codes. */
@@ -711,6 +718,12 @@ struct moq_endpoint {
      * slot is free. */
     moq_endpoint_hook_ops_t hook_ops[MOQ_ENDPOINT_HOOK_KIND_COUNT];
     void                   *hook_ctx[MOQ_ENDPOINT_HOOK_KIND_COUNT];
+    /* Graceful drain. drain_req counts moq_endpoint_drain() requests;
+     * drain_quiet is the latest request a pump cycle that began after it
+     * observed with every hook quiet (no owed output), published only after
+     * the facade's cached drain observation was invalidated. */
+    _Atomic uint64_t        drain_req;
+    _Atomic uint64_t        drain_quiet;
 
     /* Sticky interrupt latch: lone atomic, settable from any thread. */
     atomic_bool interrupted;
@@ -822,6 +835,8 @@ static moq_version_t ep_facade_negotiated_version(const moq_endpoint_t *ep);
 static void ep_pump_cycle(moq_endpoint_t *ep, moq_session_t *session,
                           uint64_t now_us)
 {
+    /* The drain request this cycle began under (see drain_quiet). */
+    uint64_t drain_req = atomic_load(&ep->drain_req);
     /* Header §5.4 (normative, exactly-once): an accepted post() task runs with
      * session == NULL ONLY during stop()/terminal drain (ep_drain_terminal).
      * A managed facade can pump this cycle BEFORE its session is published --
@@ -865,6 +880,25 @@ static void ep_pump_cycle(moq_endpoint_t *ep, moq_session_t *session,
     for (int k = 0; k < MOQ_ENDPOINT_HOOK_KIND_COUNT; k++) {
         if (ep->hook_ops[k].pump)
             ep->hook_ops[k].pump(ep, session, now_us, ep->hook_ctx[k]);
+    }
+    /* With a live session and every hook quiet after its pump, the output the
+     * hooks owed before drain_req (end-of-track markers, objects for subscribed
+     * tracks, other lifecycle work) has been handed to the session; media a
+     * hook retains for a future subscriber is not owed and is not counted.
+     * A newly satisfied request first invalidates the facade's cached drain
+     * observation, then is published: a success can then only come from a
+     * facade pass that began after this point, never one that predates the
+     * output just handed over. */
+    bool quiet = session != NULL;
+    for (int k = 0; quiet && k < MOQ_ENDPOINT_HOOK_KIND_COUNT; k++) {
+        if (ep->hook_ops[k].pump && ep->hook_ops[k].has_pending_output &&
+            ep->hook_ops[k].has_pending_output(ep->hook_ctx[k]))
+            quiet = false;
+    }
+    if (quiet && drain_req > atomic_load(&ep->drain_quiet)) {
+        if (ep->vt && ep->facade && ep->vt->drain_invalidate)
+            ep->vt->drain_invalidate(ep->facade);
+        atomic_store(&ep->drain_quiet, drain_req);
     }
     pthread_mutex_unlock(&ep->mu);
 }
@@ -1044,7 +1078,7 @@ static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
 /* -- Terminal-reason classification --------------------------------- *
  * Turn a facade's raw terminal signals into a transport-agnostic reason. The
  * generic form (mvfst/proxygen) knows only PROTOCOL vs generic transport; the
- * picoquic form additionally reads picoquic's captured local error to tell a
+ * picoquic form additionally reads the captured QUIC transport error to tell a
  * TLS/certificate failure apart from a plain transport failure. */
 #if defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
@@ -1070,7 +1104,6 @@ static void ep_classify_generic(bool is_fatal, uint64_t fatal_code,
 
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
     defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
-#include <picoquic.h>   /* picoquic_is_handshake_error */
 static void ep_classify_pico(bool is_fatal, uint64_t fatal_code,
                              bool clean_closed, uint64_t terminal_error,
                              moq_endpoint_terminal_reason_t *reason,
@@ -1082,7 +1115,7 @@ static void ep_classify_pico(bool is_fatal, uint64_t fatal_code,
         return;
     }
     if (is_fatal) {
-        if (picoquic_is_handshake_error(terminal_error)) {
+        if (terminal_error >= 0x100u && terminal_error <= 0x1ffu) {
             /* QUIC CRYPTO_ERROR: low byte is the TLS alert. Certificate-related
              * alerts (picotls PTLS_ALERT_*): 42 bad_certificate,
              * 44 certificate_revoked, 45 certificate_expired,
@@ -1130,6 +1163,7 @@ static const ep_backend_vtable_t PQ_VT = {
     pq_vt_wait, pq_vt_wake, pq_vt_negver, pq_vt_is_fatal,
     pq_vt_fatal_code, pq_vt_clean_closed, pq_vt_drain_state, pq_vt_stop,
     pq_vt_destroy, pq_vt_terminal,
+    pq_vt_wake,   /* drain_invalidate: the threaded wake invalidates */
 };
 #endif
 
@@ -1152,6 +1186,7 @@ static const ep_backend_vtable_t WT_VT = {
     wt_vt_wait, wt_vt_wake, wt_vt_negver, wt_vt_is_fatal,
     wt_vt_fatal_code, wt_vt_clean_closed, wt_vt_drain_state, wt_vt_stop,
     wt_vt_destroy, wt_vt_terminal,
+    wt_vt_wake,   /* drain_invalidate: the managed wake invalidates */
 };
 #endif
 
@@ -1177,6 +1212,7 @@ static const ep_backend_vtable_t MVFST_VT = {
     mvfst_vt_wait, mvfst_vt_wake, mvfst_vt_negver, mvfst_vt_is_fatal,
     mvfst_vt_fatal_code, mvfst_vt_clean_closed, mvfst_vt_drain_state,
     mvfst_vt_stop, mvfst_vt_destroy, mvfst_vt_terminal,
+    NULL,         /* drain_invalidate */
 };
 #endif
 
@@ -1216,6 +1252,7 @@ static const ep_backend_vtable_t MSQUIC_VT = {
     msquic_vt_wait, msquic_vt_wake, msquic_vt_negver, msquic_vt_is_fatal,
     msquic_vt_fatal_code, msquic_vt_clean_closed, msquic_vt_drain_state,
     msquic_vt_stop, msquic_vt_destroy, msquic_vt_terminal,
+    NULL,         /* drain_invalidate */
 };
 #endif
 
@@ -1239,6 +1276,7 @@ static const ep_backend_vtable_t PROXYGEN_VT = {
     proxygen_vt_wait, proxygen_vt_wake, proxygen_vt_negver, proxygen_vt_is_fatal,
     proxygen_vt_fatal_code, proxygen_vt_clean_closed, proxygen_vt_drain_state,
     proxygen_vt_stop, proxygen_vt_destroy, proxygen_vt_terminal,
+    NULL,         /* drain_invalidate */
 };
 #endif
 
@@ -1311,6 +1349,7 @@ static const ep_backend_vtable_t WTQUIC_NETWORK_VT = {
     wtquic_network_vt_wait, wtquic_network_vt_wake, wtquic_network_vt_negver, wtquic_network_vt_is_fatal,
     wtquic_network_vt_fatal_code, wtquic_network_vt_clean_closed, wtquic_network_vt_drain_state,
     wtquic_network_vt_stop, wtquic_network_vt_destroy, wtquic_network_vt_terminal,
+    NULL,         /* drain_invalidate */
 };
 #endif
 
@@ -1352,6 +1391,7 @@ static const ep_backend_vtable_t WTQUIC_MSQUIC_VT = {
     wtquic_msquic_vt_wait, wtquic_msquic_vt_wake, wtquic_msquic_vt_negver, wtquic_msquic_vt_is_fatal,
     wtquic_msquic_vt_fatal_code, wtquic_msquic_vt_clean_closed, wtquic_msquic_vt_drain_state,
     wtquic_msquic_vt_stop, wtquic_msquic_vt_destroy, wtquic_msquic_vt_terminal,
+    NULL,         /* drain_invalidate */
 };
 #endif
 
@@ -2376,6 +2416,12 @@ static uint64_t ep_mono_now_us(void)
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
 
+#if defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
+/* Test-only: with the scripted drain backend installed, hold the drain after
+ * its closed check and before it reads the quiet request. */
+static void test_drain_checked(moq_endpoint_t *ep);
+#endif
+
 moq_result_t moq_endpoint_drain(moq_endpoint_t *ep, uint64_t timeout_us)
 {
     if (!ep) return MOQ_ERR_INVAL;
@@ -2394,6 +2440,14 @@ moq_result_t moq_endpoint_drain(moq_endpoint_t *ep, uint64_t timeout_us)
     if (ds == EP_DRAIN_CLOSED) return MOQ_ERR_CLOSED;
     if (ds == EP_DRAIN_FAILED) return MOQ_ERR_INTERNAL;
 
+    /* This request: success needs a pump cycle begun after it with every hook
+     * quiet, and the facade's flush/ACK observation from a pass begun after
+     * the wake below (a wake invalidates the facade's cached state), so a
+     * snapshot from before work the caller just queued -- an end-of-track
+     * marker still in a hook's queue -- is never reused. */
+    uint64_t want = atomic_fetch_add(&ep->drain_req, 1) + 1;
+    ep_facade_wake(ep);
+
     uint64_t start = ep_mono_now_us();
     for (;;) {
         if (atomic_load(&ep->interrupted)) return MOQ_ERR_INTERRUPTED;
@@ -2403,13 +2457,21 @@ moq_result_t moq_endpoint_drain(moq_endpoint_t *ep, uint64_t timeout_us)
          * tail may have been truncated -- report CLOSED even if a (possibly
          * stale) backlog snapshot now reads empty. */
         if (moq_endpoint_is_closed(ep)) return MOQ_ERR_CLOSED;
+#if defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
+        test_drain_checked(ep);
+#endif
 
+        /* Quiet first, then a fresh probe: a DONE read before the matching
+         * quiet was published may predate the invalidation that quiet
+         * implies, so it never counts. */
+        bool quiet = atomic_load(&ep->drain_quiet) >= want;
         ds = ep_facade_drain_state(ep);
         if (ds == EP_DRAIN_UNSUPPORTED) return MOQ_ERR_UNSUPPORTED;
         if (ds == EP_DRAIN_WRONG_THREAD) return MOQ_ERR_WRONG_STATE;
         if (ds == EP_DRAIN_CLOSED) return MOQ_ERR_CLOSED;
         if (ds == EP_DRAIN_FAILED) return MOQ_ERR_INTERNAL;
-        if (ds == EP_DRAIN_DONE) return MOQ_OK;
+        if (quiet && ds == EP_DRAIN_DONE)
+            return MOQ_OK;
 
         uint64_t elapsed = ep_mono_now_us() - start;
         if (elapsed >= timeout_us) return MOQ_DONE;
@@ -2625,10 +2687,22 @@ moq_endpoint_t *moq_endpoint_test_make_bare(void)
 void moq_endpoint_test_free_bare(moq_endpoint_t *ep)
 {
     if (!ep) return;
+    /* A noted GOAWAY URI is the endpoint's, as moq_endpoint_destroy frees it. */
+    if (ep->goaway_uri) ep->alloc.free(ep->goaway_uri, ep->goaway_uri_len, ep->alloc.ctx);
     pthread_mutex_destroy(&ep->mu);
     moq_alloc_t alloc = ep->alloc;
     alloc.free(ep, sizeof(*ep), alloc.ctx);
 }
+
+#ifdef MOQ_SERVICE_HAVE_PQ_THREADED
+/* Borrow a fixture-owned facade; free_bare leaves its lifetime to the test. */
+void moq_endpoint_test_attach_picoquic(moq_endpoint_t *ep, moq_pq_threaded_t *t);
+void moq_endpoint_test_attach_picoquic(moq_endpoint_t *ep, moq_pq_threaded_t *t)
+{
+    ep->vt = &PQ_VT;
+    ep->facade = t;
+}
+#endif
 
 void moq_endpoint_test_lock_mu(moq_endpoint_t *ep)   { pthread_mutex_lock(&ep->mu); }
 void moq_endpoint_test_unlock_mu(moq_endpoint_t *ep) { pthread_mutex_unlock(&ep->mu); }
@@ -2658,6 +2732,16 @@ void moq_endpoint_test_pump_cycle(moq_endpoint_t *ep, moq_session_t *session,
                                   uint64_t now_us)
 {
     ep_pump_cycle(ep, session, now_us);
+}
+
+/* Mark the endpoint stopped, as a closed connection leaves it: its state
+ * reads CLOSED from then on. */
+void moq_endpoint_test_set_stopped(moq_endpoint_t *ep);
+void moq_endpoint_test_set_stopped(moq_endpoint_t *ep)
+{
+    pthread_mutex_lock(&ep->mu);
+    ep->stopped = true;
+    pthread_mutex_unlock(&ep->mu);
 }
 
 /* Run the terminal drain (the sole NULL-session task drain, §5.4): every queued
@@ -2695,6 +2779,289 @@ void moq_endpoint_test_set_facade_version(moq_endpoint_t *ep, moq_version_t v)
     test_facade_version = v;
     ep->vt = &test_facade_vt;
     ep->facade = ep;
+}
+
+/* A facade stand-in whose wait really sleeps: until woken or for the
+ * timeout, like a managed transport's. Lets a bare endpoint's waiters be
+ * tested for their timing, wakes and interrupts. */
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    bool            woken;
+} test_wait_facade_t;
+static test_wait_facade_t test_wait_facade = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, false };
+static moq_result_t test_wait_facade_wait(void *facade, uint64_t timeout_us)
+{
+    test_wait_facade_t *w = (test_wait_facade_t *)facade;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t ns = (uint64_t)ts.tv_nsec + (timeout_us % 1000000u) * 1000u;
+    ts.tv_sec += (time_t)(timeout_us / 1000000u + ns / 1000000000u);
+    ts.tv_nsec = (long)(ns % 1000000000u);
+    pthread_mutex_lock(&w->mu);
+    int rc = 0;
+    while (!w->woken && rc == 0) rc = pthread_cond_timedwait(&w->cv, &w->mu, &ts);
+    bool woken = w->woken;
+    w->woken = false;
+    pthread_mutex_unlock(&w->mu);
+    return woken ? MOQ_OK : MOQ_DONE;
+}
+static void test_wait_facade_wake(void *facade)
+{
+    test_wait_facade_t *w = (test_wait_facade_t *)facade;
+    pthread_mutex_lock(&w->mu);
+    w->woken = true;
+    pthread_cond_broadcast(&w->cv);
+    pthread_mutex_unlock(&w->mu);
+}
+static const ep_backend_vtable_t test_wait_facade_vt = {
+    .wait = test_wait_facade_wait,
+    .wake = test_wait_facade_wake,
+    .negotiated_version = test_facade_negotiated,
+    .is_fatal = test_facade_false,
+    .clean_closed = test_facade_false,
+};
+void moq_endpoint_test_set_waitable(moq_endpoint_t *ep);
+void moq_endpoint_test_set_waitable(moq_endpoint_t *ep)
+{
+    pthread_mutex_lock(&test_wait_facade.mu);
+    test_wait_facade.woken = false;
+    pthread_mutex_unlock(&test_wait_facade.mu);
+    ep->vt = &test_wait_facade_vt;
+    ep->facade = &test_wait_facade;
+}
+
+/* A drain-capable facade stand-in with a latched observation, as the picoquic
+ * backends keep one: drain_state reads what a pass last published,
+ * drain_invalidate clears it, and the test publishes each later pass's
+ * result. Either step can be held at a gate -- a probe after it read its
+ * result (from a chosen probe on: a drain's first probe is its preflight,
+ * before it takes its request ticket), an invalidation before it clears --
+ * so a test can stop the consumer or the producer exactly at the boundary
+ * it is checking. wake only wakes; wait sleeps until woken or for its
+ * timeout. */
+enum { TEST_DRAIN_GATE_PROBE = 0, TEST_DRAIN_GATE_INVALIDATE = 1,
+       TEST_DRAIN_GATE_CHECKED = 2, TEST_DRAIN_GATES = 3 };
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    int             state;
+    uint64_t        probe_gate_from;   /* park probes from this one on; 0 off */
+    bool            gate[TEST_DRAIN_GATES], parked[TEST_DRAIN_GATES],
+                    release[TEST_DRAIN_GATES];
+    uint64_t        probes, invalidations, wakes, checked;
+    bool            woken;
+} test_drain_backend_t;
+static test_drain_backend_t test_drain_backend = {
+    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, EP_DRAIN_PENDING, 0,
+    { false, false, false }, { false, false, false }, { false, false, false },
+    0, 0, 0, 0, false };
+static void test_drain_park(test_drain_backend_t *b, int which)
+{
+    if (!b->gate[which]) return;
+    b->parked[which] = true;
+    pthread_cond_broadcast(&b->cv);
+    while (!b->release[which]) pthread_cond_wait(&b->cv, &b->mu);
+    b->release[which] = false;
+    b->parked[which] = false;
+}
+static int test_drain_backend_state(void *facade)
+{
+    test_drain_backend_t *b = (test_drain_backend_t *)facade;
+    pthread_mutex_lock(&b->mu);
+    int s = b->state;
+    b->probes++;
+    pthread_cond_broadcast(&b->cv);
+    b->gate[TEST_DRAIN_GATE_PROBE] =
+        b->probe_gate_from != 0 && b->probes >= b->probe_gate_from;
+    test_drain_park(b, TEST_DRAIN_GATE_PROBE);
+    pthread_mutex_unlock(&b->mu);
+    return s;
+}
+static void test_drain_backend_invalidate(void *facade)
+{
+    test_drain_backend_t *b = (test_drain_backend_t *)facade;
+    pthread_mutex_lock(&b->mu);
+    test_drain_park(b, TEST_DRAIN_GATE_INVALIDATE);
+    b->state = EP_DRAIN_PENDING;
+    b->invalidations++;
+    pthread_cond_broadcast(&b->cv);
+    pthread_mutex_unlock(&b->mu);
+}
+static void test_drain_backend_wake(void *facade)
+{
+    test_drain_backend_t *b = (test_drain_backend_t *)facade;
+    pthread_mutex_lock(&b->mu);
+    b->wakes++;
+    b->woken = true;
+    pthread_cond_broadcast(&b->cv);
+    pthread_mutex_unlock(&b->mu);
+}
+static moq_result_t test_drain_backend_wait(void *facade, uint64_t timeout_us)
+{
+    test_drain_backend_t *b = (test_drain_backend_t *)facade;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t ns = (uint64_t)ts.tv_nsec + (timeout_us % 1000000u) * 1000u;
+    ts.tv_sec += (time_t)(timeout_us / 1000000u + ns / 1000000000u);
+    ts.tv_nsec = (long)(ns % 1000000000u);
+    pthread_mutex_lock(&b->mu);
+    int rc = 0;
+    while (!b->woken && rc == 0) rc = pthread_cond_timedwait(&b->cv, &b->mu, &ts);
+    bool woken = b->woken;
+    b->woken = false;
+    pthread_mutex_unlock(&b->mu);
+    return woken ? MOQ_OK : MOQ_DONE;
+}
+static const ep_backend_vtable_t test_drain_backend_vt;
+/* A drain past its closed check, before it reads the quiet request: counted,
+ * and held there while that gate is on. Holds no endpoint lock. */
+static void test_drain_checked(moq_endpoint_t *ep)
+{
+    if (ep->vt != &test_drain_backend_vt) return;
+    test_drain_backend_t *b = &test_drain_backend;
+    pthread_mutex_lock(&b->mu);
+    b->checked++;
+    pthread_cond_broadcast(&b->cv);
+    test_drain_park(b, TEST_DRAIN_GATE_CHECKED);
+    pthread_mutex_unlock(&b->mu);
+}
+static const ep_backend_vtable_t test_drain_backend_vt = {
+    .wait = test_drain_backend_wait,
+    .wake = test_drain_backend_wake,
+    .negotiated_version = test_facade_negotiated,
+    .is_fatal = test_facade_false,
+    .clean_closed = test_facade_false,
+    .drain_state = test_drain_backend_state,
+    .drain_invalidate = test_drain_backend_invalidate,
+};
+void moq_endpoint_test_set_drain_backend(moq_endpoint_t *ep, int state);
+void moq_endpoint_test_set_drain_backend(moq_endpoint_t *ep, int state)
+{
+    test_drain_backend_t *b = &test_drain_backend;
+    pthread_mutex_lock(&b->mu);
+    b->state = state;
+    b->probe_gate_from = 0;
+    for (int i = 0; i < TEST_DRAIN_GATES; i++)
+        b->gate[i] = b->parked[i] = b->release[i] = false;
+    b->probes = b->invalidations = b->wakes = b->checked = 0;
+    b->woken = false;
+    pthread_mutex_unlock(&b->mu);
+    ep->vt = &test_drain_backend_vt;
+    ep->facade = b;
+}
+/* What a later facade pass observed. */
+void moq_endpoint_test_drain_backend_publish(int state);
+void moq_endpoint_test_drain_backend_publish(int state)
+{
+    test_drain_backend_t *b = &test_drain_backend;
+    pthread_mutex_lock(&b->mu);
+    b->state = state;
+    pthread_cond_broadcast(&b->cv);
+    pthread_mutex_unlock(&b->mu);
+}
+/* Hold the next drain past its closed check (before its quiet read). */
+void moq_endpoint_test_drain_backend_gate_checked(bool on);
+void moq_endpoint_test_drain_backend_gate_checked(bool on)
+{
+    test_drain_backend_t *b = &test_drain_backend;
+    pthread_mutex_lock(&b->mu);
+    b->gate[TEST_DRAIN_GATE_CHECKED] = on;
+    pthread_mutex_unlock(&b->mu);
+}
+/* Drain requests taken so far (each call's ticket). */
+uint64_t moq_endpoint_test_drain_req(moq_endpoint_t *ep);
+uint64_t moq_endpoint_test_drain_req(moq_endpoint_t *ep)
+{
+    return atomic_load(&ep->drain_req);
+}
+/* Hold the invalidation (before it clears) while on. */
+void moq_endpoint_test_drain_backend_gate_invalidate(bool on);
+void moq_endpoint_test_drain_backend_gate_invalidate(bool on)
+{
+    test_drain_backend_t *b = &test_drain_backend;
+    pthread_mutex_lock(&b->mu);
+    b->gate[TEST_DRAIN_GATE_INVALIDATE] = on;
+    pthread_mutex_unlock(&b->mu);
+}
+/* Hold probe number `n` (counting from 1) and every later one, after each
+ * read its result, until released; 0 turns it off. */
+void moq_endpoint_test_drain_backend_gate_probe_from(uint64_t n);
+void moq_endpoint_test_drain_backend_gate_probe_from(uint64_t n)
+{
+    test_drain_backend_t *b = &test_drain_backend;
+    pthread_mutex_lock(&b->mu);
+    b->probe_gate_from = n;
+    pthread_mutex_unlock(&b->mu);
+}
+/* Wait (bounded) until the gated step is parked; true when it is. */
+bool moq_endpoint_test_drain_backend_wait_parked(int which, uint64_t timeout_us);
+bool moq_endpoint_test_drain_backend_wait_parked(int which, uint64_t timeout_us)
+{
+    test_drain_backend_t *b = &test_drain_backend;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t ns = (uint64_t)ts.tv_nsec + (timeout_us % 1000000u) * 1000u;
+    ts.tv_sec += (time_t)(timeout_us / 1000000u + ns / 1000000000u);
+    ts.tv_nsec = (long)(ns % 1000000000u);
+    pthread_mutex_lock(&b->mu);
+    int rc = 0;
+    while (!b->parked[which] && rc == 0) rc = pthread_cond_timedwait(&b->cv, &b->mu, &ts);
+    bool parked = b->parked[which];
+    pthread_mutex_unlock(&b->mu);
+    return parked;
+}
+void moq_endpoint_test_drain_backend_release(int which);
+void moq_endpoint_test_drain_backend_release(int which)
+{
+    test_drain_backend_t *b = &test_drain_backend;
+    pthread_mutex_lock(&b->mu);
+    if (which == TEST_DRAIN_GATE_PROBE) b->probe_gate_from = 0;
+    b->gate[which] = false;
+    b->release[which] = true;
+    pthread_cond_broadcast(&b->cv);
+    pthread_mutex_unlock(&b->mu);
+}
+/* Wait (bounded) until the probe count exceeds `after`; returns the count. */
+uint64_t moq_endpoint_test_drain_backend_wait_probes(uint64_t after, uint64_t timeout_us);
+uint64_t moq_endpoint_test_drain_backend_wait_probes(uint64_t after, uint64_t timeout_us)
+{
+    test_drain_backend_t *b = &test_drain_backend;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t ns = (uint64_t)ts.tv_nsec + (timeout_us % 1000000u) * 1000u;
+    ts.tv_sec += (time_t)(timeout_us / 1000000u + ns / 1000000000u);
+    ts.tv_nsec = (long)(ns % 1000000000u);
+    pthread_mutex_lock(&b->mu);
+    int rc = 0;
+    while (b->probes <= after && rc == 0) rc = pthread_cond_timedwait(&b->cv, &b->mu, &ts);
+    uint64_t n = b->probes;
+    pthread_mutex_unlock(&b->mu);
+    return n;
+}
+/* The latest drain request published as quiet (lock-free read, as the
+ * drain itself reads it). */
+uint64_t moq_endpoint_test_drain_quiet(moq_endpoint_t *ep);
+uint64_t moq_endpoint_test_drain_quiet(moq_endpoint_t *ep)
+{
+    return atomic_load(&ep->drain_quiet);
+}
+/* The managed facade the endpoint drives (fixed at connect), for a test that
+ * reaches the backend's own testing seams. */
+void *moq_endpoint_test_facade(moq_endpoint_t *ep);
+void *moq_endpoint_test_facade(moq_endpoint_t *ep)
+{
+    return ep ? ep->facade : NULL;
+}
+uint64_t moq_endpoint_test_drain_backend_invalidations(void);
+uint64_t moq_endpoint_test_drain_backend_invalidations(void)
+{
+    test_drain_backend_t *b = &test_drain_backend;
+    pthread_mutex_lock(&b->mu);
+    uint64_t n = b->invalidations;
+    pthread_mutex_unlock(&b->mu);
+    return n;
 }
 
 /* The version offer a bare endpoint reports (no ALPN tokens). */

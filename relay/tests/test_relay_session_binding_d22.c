@@ -348,6 +348,293 @@ draft22_fill_served(void)
     return f + rig.failures;
 }
 
+/* A fill served to a draft-22 subscriber from a draft-16 origin's Track:
+ * every retained Object reaches the fill with its properties in vi64
+ * (Type 0x10 = 1000 is 10 43 E8 as the origin wrote it, 10 83 E8 here). */
+static int
+draft22_fill_from_d16(void)
+{
+    static const uint8_t q1000[] = { 0x10, 0x43, 0xE8 }, v1000[] = { 0x10, 0x83, 0xE8 };
+    ca_t a;
+    relay_bind_test_ca_init(&a);
+    rig_t rig;
+    if (relay_bind_test_rig_create(&rig, &a) != MOQR_OK) {
+        printf("FAIL: draft22_fill_from_d16 rig create\n");
+        return 1;
+    }
+    d22_track_t t;
+    relay_bind_test_d22_track_setup(&rig, &t, MOQ_VERSION_DRAFT_16, 0);
+    for (uint64_t g = 0; g < 2; g++) {
+        moq_subgroup_cfg_t sgc;
+        moq_subgroup_cfg_init(&sgc);
+        sgc.group_id = g;
+        sgc.object_properties = true;
+        moq_subgroup_handle_t sgh;
+        R_CHECK(&rig, moq_session_open_subgroup(t.pub->peer, t.pub_ps.up_sub, &sgc, rig.now,
+                                                &sgh) == MOQ_OK);
+        for (uint64_t o = 0; o < 3; o++) {
+            uint8_t body[3] = { 0xF1, (uint8_t)g, (uint8_t)o };
+            moq_rcbuf_t *pl = NULL, *pr = NULL;
+            R_CHECK(&rig, moq_rcbuf_create(&a.vt, body, sizeof(body), &pl) == MOQ_OK);
+            R_CHECK(&rig, moq_rcbuf_create(&a.vt, q1000, sizeof(q1000), &pr) == MOQ_OK);
+            moq_object_cfg_t oc;
+            moq_object_cfg_init(&oc);
+            oc.object_id = o;
+            oc.payload = pl;
+            oc.properties = pr;
+            R_CHECK(&rig, moq_session_write_object_ex(t.pub->peer, sgh, &oc, rig.now) ==
+                              MOQ_OK);
+            moq_rcbuf_decref(pl);
+            moq_rcbuf_decref(pr);
+        }
+        R_CHECK(&rig, moq_session_close_subgroup(t.pub->peer, sgh, rig.now) == MOQ_OK);
+        relay_bind_test_rig_pump(&rig, 4);
+    }
+    conn_t *sub = relay_bind_test_rig_connect(&rig, MOQ_VERSION_DRAFT_22);
+    R_CHECK(&rig, sub != NULL);
+    relay_bind_test_rig_pump(&rig, 4);
+    while (true) {
+        moq_event_t ev;
+        if (moq_session_poll_events(sub->peer, &ev, 1) == 0) break;
+        moq_event_cleanup(&ev);
+    }
+    moq_location_filter_cfg_t loc, floc;
+    moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_NEXT_OBJECT;
+    moq_location_filter_cfg_init(&floc);
+    floc.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    moq_fill_cfg_t fill;
+    moq_fill_cfg_init(&fill);
+    fill.location = &floc;
+    moq_subscription_t h;
+    R_CHECK(&rig, relay_bind_test_d22_subscribe(&rig, sub, &t, &loc, &fill, &h) == MOQ_OK);
+    int fill_objects = 0, exact = 0, terminals = 0, closed = 0, tails = 0;
+    for (int i = 0; i < 16; i++) {
+        relay_bind_test_rig_cycle(&rig);
+        /* The tail of group 0 past the retained Objects: answered empty, as
+         * draft-16 states it. */
+        moq_event_t oev;
+        while (moq_session_poll_events(t.pub->peer, &oev, 1) == 1) {
+            if (oev.kind == MOQ_EVENT_FETCH_REQUEST) {
+                tails++;
+                moq_accept_fetch_cfg_t accept;
+                moq_accept_fetch_cfg_init(&accept);
+                accept.end_group = 0;
+                accept.end_object = 0;
+                accept.empty = true;
+                R_CHECK(&rig, moq_session_accept_fetch(t.pub->peer, oev.u.fetch_request.fetch,
+                                                       &accept, rig.now) == MOQ_OK);
+            }
+            moq_event_cleanup(&oev);
+        }
+        moq_event_t ev;
+        while (moq_session_poll_events(sub->peer, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_FILL_OBJECT) {
+                const moq_rcbuf_t *pr = ev.u.fill_object.properties;
+                fill_objects++;
+                if (pr != NULL && moq_rcbuf_len(pr) == sizeof(v1000) &&
+                    memcmp(moq_rcbuf_data(pr), v1000, sizeof(v1000)) == 0)
+                    exact++;
+            } else if (ev.kind == MOQ_EVENT_FILL_TERMINAL) {
+                terminals++;
+            } else if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
+                closed++;
+            }
+            moq_event_cleanup(&ev);
+        }
+    }
+    moqr_bind_fwd_debug_t st;
+    moqr_bind_debug_fwd_stats(rig.bind, &st);
+    printf("draft22_fill_from_d16: fill_objects=%d exact=%d terminals=%d closed=%d "
+           "converted=%llu refused=%llu\n", fill_objects, exact, terminals, closed,
+           (unsigned long long)st.props_converted, (unsigned long long)st.props_refused);
+    R_CHECK(&rig, fill_objects == 6 && exact == 6 && terminals == 1 && closed == 0 &&
+                      tails <= 1);
+    R_CHECK(&rig, st.props_converted >= 6 && st.props_refused == 0);
+    int f = rig.failures;
+    relay_bind_test_rig_destroy(&rig);
+    R_CHECK(&rig, a.live == 0);
+    if (f == 0 && rig.failures == 0) printf("PASS: draft22_fill_from_d16\n");
+    return f + rig.failures;
+}
+
+/* A fill source with only the public item interface (no typed peek): the
+ * binding writes the Object it serves with the Object Properties in the
+ * fill subscriber's draft, from the codec the source states. The source
+ * claims Object 0 of the range; the relay's log serves the rest.
+ *   convert     draft-16 bytes (QUIC varint), converted to vi64
+ *   same        vi64 bytes, byte-exact; an Object without properties too
+ *   unsupported an Immutable entry the vi64 draft would read differently:
+ *               the fill alone is aborted
+ *   blocked     the fill subscriber's actions are saturated: the write meets
+ *               WOULD_BLOCK, the Object is re-read and written once
+ *   empty       an empty block with no stated codec: delivered without
+ *               properties (an empty set reads alike in every codec) */
+typedef enum { PUB_SRC_CONVERT, PUB_SRC_SAME, PUB_SRC_UNSUPPORTED, PUB_SRC_BLOCKED,
+               PUB_SRC_EMPTY, PUB_SRC_MODES } pub_src_mode_t;
+
+typedef struct pub_src {
+    rig_t *rig;
+    pub_src_mode_t mode;
+    moqr_bind_fill_claim_t claim;
+    moq_rcbuf_t *payload, *props;
+    uint8_t codec;
+    unsigned opens, peeks, commits, closes;
+    bool live, done;
+} pub_src_t;
+
+static moqr_result_t
+pub_src_open(void *ctx, const moqr_bind_fill_query_t *q, moqr_bind_fill_claim_t *claim)
+{
+    pub_src_t *s = ctx;
+    R_CHECK(s->rig, !s->live && s->opens == 0);
+    s->opens++;
+    s->live = true;
+    s->claim.handle = UINT64_C(5165);
+    s->claim.end_group = q->start_group;
+    s->claim.end_object = q->start_object;   /* Object 0 only */
+    *claim = s->claim;
+    return MOQR_OK;
+}
+
+static moqr_result_t
+pub_src_peek(void *ctx, uint64_t handle, uint64_t now_us, moqr_fetch_item_t *out)
+{
+    pub_src_t *s = ctx;
+    (void)now_us;
+    R_CHECK(s->rig, s->live && handle == s->claim.handle);
+    s->peeks++;
+    memset(out, 0, sizeof(*out));
+    if (s->done) {
+        out->kind = MOQR_FETCH_ITEM_END;
+        return MOQR_OK;
+    }
+    out->kind = MOQR_FETCH_ITEM_OBJECT;
+    out->rec.group_id = 0;
+    out->rec.object_id = 0;
+    out->rec.publisher_priority = 7;
+    out->rec.payload = s->payload;
+    out->rec.properties = s->props;
+    out->rec.properties_codec = s->codec;
+    return MOQR_OK;
+}
+
+static moqr_result_t
+pub_src_commit(void *ctx, uint64_t handle)
+{
+    pub_src_t *s = ctx;
+    R_CHECK(s->rig, s->live && handle == s->claim.handle && !s->done);
+    s->commits++;
+    s->done = true;
+    return MOQR_OK;
+}
+
+static void
+pub_src_close(void *ctx, uint64_t handle)
+{
+    pub_src_t *s = ctx;
+    R_CHECK(s->rig, s->live && handle == s->claim.handle);
+    s->closes++;
+    s->live = false;
+}
+
+static int
+draft22_fill_public_source(pub_src_mode_t mode)
+{
+    static const char *const names[PUB_SRC_MODES] = {
+        "convert", "same", "unsupported", "blocked", "empty"
+    };
+    static const uint8_t q1000[] = { 0x10, 0x43, 0xE8 }, v1000[] = { 0x10, 0x83, 0xE8 };
+    static const uint8_t qimm[] = { 0x0B, 0x03, 0x40, 0x7A, 0x02 };
+    static const uint8_t body[] = { 0xF5, 0x00, 0x51 };
+    ca_t a;
+    relay_bind_test_ca_init(&a);
+    rig_t rig;
+    if (relay_bind_test_rig_create(&rig, &a) != MOQR_OK) return 1;
+    d22_track_t t;
+    relay_bind_test_d22_track_setup(&rig, &t, MOQ_VERSION_DRAFT_22, 1);
+    /* blocked: a two-action queue, so the fill's Object write waits for
+     * the transport to drain the stream open before it. */
+    relay_bind_test_max_actions = mode == PUB_SRC_BLOCKED ? 2 : 0;
+    conn_t *sub = relay_bind_test_rig_connect(&rig, MOQ_VERSION_DRAFT_22);
+    relay_bind_test_max_actions = 0;
+    R_CHECK(&rig, sub != NULL);
+    relay_bind_test_rig_pump(&rig, 4);
+    pub_src_t src;
+    memset(&src, 0, sizeof(src));
+    src.rig = &rig;
+    src.mode = mode;
+    R_CHECK(&rig, moq_rcbuf_create(&a.vt, body, sizeof(body), &src.payload) == MOQ_OK);
+    const uint8_t *pb = mode == PUB_SRC_SAME ? v1000 : mode == PUB_SRC_UNSUPPORTED ? qimm
+                                                                                  : q1000;
+    size_t pl = mode == PUB_SRC_UNSUPPORTED ? sizeof(qimm) : mode == PUB_SRC_EMPTY ? 0 : 3;
+    R_CHECK(&rig, moq_rcbuf_create(&a.vt, pb, pl, &src.props) == MOQ_OK);
+    src.codec = mode == PUB_SRC_SAME    ? MOQR_PROPS_CODEC_VI64
+              : mode == PUB_SRC_EMPTY   ? MOQR_PROPS_CODEC_UNKNOWN
+                                        : MOQR_PROPS_CODEC_QUIC_VARINT;
+    moqr_bind_fill_source_t callbacks = {
+        .struct_size = sizeof(callbacks), .ctx = &src, .open = pub_src_open,
+        .peek = pub_src_peek, .commit = pub_src_commit, .close = pub_src_close
+    };
+    R_CHECK(&rig, moqr_bind_set_fill_source(rig.bind, &callbacks) == MOQR_OK);
+    moq_subscription_t h;
+    R_CHECK(&rig, relay_bind_test_d22_subscribe_fill(&rig, sub, &t, true, 0, &h) == MOQ_OK);
+    int fill_objects = 0, exact0 = 0, plain = 0, terminals = 0, closed = 0;
+    uint32_t reason = 0;
+    for (int i = 0; i < 24; i++) {
+        relay_bind_test_rig_cycle(&rig);
+        moq_event_t ev;
+        while (moq_session_poll_events(sub->peer, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_FILL_OBJECT) {
+                const moq_fill_object_event_t *fo = &ev.u.fill_object;
+                fill_objects++;
+                size_t n = fo->properties ? moq_rcbuf_len(fo->properties) : 0;
+                if (fo->object_id == 0) {
+                    exact0 += mode == PUB_SRC_EMPTY
+                                  ? n == 0
+                                  : n == 3 && memcmp(moq_rcbuf_data(fo->properties), v1000, 3) == 0;
+                } else {
+                    plain += n == 0;
+                }
+            } else if (ev.kind == MOQ_EVENT_FILL_TERMINAL) {
+                terminals++;
+                reason = ev.u.fill_terminal.reason;
+            } else if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
+                closed++;
+            }
+            moq_event_cleanup(&ev);
+        }
+    }
+    moqr_bind_fwd_debug_t st;
+    moqr_bind_debug_fwd_stats(rig.bind, &st);
+    printf("draft22_fill_public_source(%s): opens=%u peeks=%u commits=%u closes=%u "
+           "fill_objects=%d exact0=%d plain=%d terminals=%d reason=%u closed=%d "
+           "converted=%llu refused=%llu\n", names[mode], src.opens, src.peeks, src.commits,
+           src.closes, fill_objects, exact0, plain, terminals, (unsigned)reason, closed,
+           (unsigned long long)st.props_converted, (unsigned long long)st.props_refused);
+    R_CHECK(&rig, src.opens == 1 && src.closes == 1 && closed == 0 &&
+                      moq_session_state(sub->peer) == MOQ_SESS_ESTABLISHED);
+    if (mode == PUB_SRC_UNSUPPORTED) {
+        R_CHECK(&rig, src.commits == 0 && fill_objects == 0 && terminals == 1 &&
+                          reason != MOQ_FILL_COMPLETE && st.props_refused == 1);
+    } else {
+        R_CHECK(&rig, src.commits == 1 && fill_objects == 3 && exact0 == 1 && plain == 2 &&
+                          terminals == 1 && reason == MOQ_FILL_COMPLETE);
+        R_CHECK(&rig, mode == PUB_SRC_SAME || mode == PUB_SRC_EMPTY
+                          ? st.props_converted == 0 && st.props_refused == 0
+                          : st.props_converted >= 1);
+        /* Each write attempt re-reads the Object and converts it again. */
+        if (mode == PUB_SRC_BLOCKED) R_CHECK(&rig, src.peeks >= 3 && st.props_converted >= 2);
+    }
+    R_CHECK(&rig, moqr_bind_set_fill_source(rig.bind, NULL) == MOQR_OK);
+    moq_rcbuf_decref(src.payload);
+    moq_rcbuf_decref(src.props);
+    relay_bind_test_rig_destroy(&rig);
+    R_CHECK(&rig, a.live == 0);
+    printf("%s: draft22_fill_public_source(%s)\n", rig.failures ? "FAIL" : "PASS", names[mode]);
+    return rig.failures;
+}
+
 /* The origin advertises a catalog published before the relay subscribed:
  * Largest is {2,0}, but the relay has never ingested an Object. A relative
  * fill must retrieve that exact Object, not wait for it on the live feed. */
@@ -3093,6 +3380,9 @@ main(int argc, char **argv)
     failures += draft_range_end(MOQ_VERSION_DRAFT_18);
     failures += draft_range_end(MOQ_VERSION_DRAFT_22);
     failures += draft22_fill_served();
+    failures += draft22_fill_from_d16();
+    for (int m = 0; m < PUB_SRC_MODES; m++)
+        failures += draft22_fill_public_source((pub_src_mode_t)m);
     failures += draft22_fill_before_upstream_subscription(false, false);
     failures += draft22_fill_before_upstream_subscription(true, false);
     failures += draft22_fill_before_upstream_subscription(false, true);

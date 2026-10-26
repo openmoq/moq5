@@ -3670,7 +3670,7 @@ static moq_result_t d16_encode_subscribe(moq_session_t *s,
 
     if (param_count > D16_MAX_MSG_PARAMS) {
         s->output_scratch_len = scratch_saved;
-        return MOQ_ERR_INVAL;
+        return MOQ_ERR_BUFFER;
     }
     moq_result_t rc = moq_d16_encode_subscribe(w, args->request_id,
         &args->track_namespace, args->track_name, params, param_count);
@@ -3790,9 +3790,12 @@ static moq_result_t d16_encode_request_update_op(moq_session_t *s,
     size_t scratch_saved = s->output_scratch_len;
 
     if (args->auth_token_count > 0) {
-        if (args->auth_token_count > D16_MAX_MSG_PARAMS - 5)
-            return MOQ_ERR_INVAL;
-        params_cap = args->auth_token_count + 5;
+        size_t extra_count = (size_t)args->has_delivery_timeout +
+            (size_t)args->has_forward + (size_t)args->has_subscriber_priority +
+            (size_t)args->has_filter + (size_t)args->has_new_group_request;
+        if (args->auth_token_count > D16_MAX_MSG_PARAMS - extra_count)
+            return MOQ_ERR_BUFFER;
+        params_cap = args->auth_token_count + extra_count;
         params = (moq_kvp_entry_t *)scratch_alloc_aligned(
             s, params_cap * sizeof(moq_kvp_entry_t),
             _Alignof(moq_kvp_entry_t));
@@ -3917,7 +3920,7 @@ static moq_result_t d16_encode_publish_namespace_op(moq_session_t *s,
     }
     if (tok_count > D16_MAX_MSG_PARAMS) {
         s->output_scratch_len = scratch_saved;
-        return MOQ_ERR_INVAL;
+        return MOQ_ERR_BUFFER;
     }
     moq_result_t rc = moq_d16_encode_publish_namespace(w, args->request_id,
         &args->track_namespace, params, tok_count);
@@ -3990,7 +3993,7 @@ static moq_result_t d16_encode_publish_op(moq_session_t *s,
 
     if (param_count > D16_MAX_MSG_PARAMS) {
         s->output_scratch_len = scratch_saved;
-        return MOQ_ERR_INVAL;
+        return MOQ_ERR_BUFFER;
     }
 
     moq_d16_publish_t pub = {
@@ -4212,7 +4215,7 @@ static moq_result_t d16_encode_track_status_op(moq_session_t *s,
     }
     if (tok_count > D16_MAX_MSG_PARAMS) {
         s->output_scratch_len = scratch_saved;
-        return MOQ_ERR_INVAL;
+        return MOQ_ERR_BUFFER;
     }
     moq_result_t rc = moq_d16_encode_track_status(w, args->request_id,
         &args->track_namespace, args->track_name, params, tok_count);
@@ -4464,7 +4467,7 @@ static moq_result_t d16_encode_subscribe_namespace(
     }
     if (tok_count > D16_MAX_MSG_PARAMS) {
         s->output_scratch_len = scratch_saved;
-        return MOQ_ERR_INVAL;
+        return MOQ_ERR_BUFFER;
     }
     moq_result_t rc = moq_d16_encode_subscribe_namespace(
         w, args->request_id, &args->prefix,
@@ -4645,6 +4648,31 @@ static moq_result_t d16_encode_object_payload_prefix_op(moq_session_t *s,
 
 /* -- D16 inbound data-plane decode --------------------------------- */
 
+/* §11.2: an Object makes its Track malformed when one of its Extension
+ * Headers cannot be parsed, or when Immutable Extensions (0xB) contain
+ * another Immutable Extensions key. The contents of Immutable Extensions are
+ * read as the same Key-Value-Pair sequence; every other odd-typed value stays
+ * opaque. MOQ_MALFORMED_NONE when neither applies. */
+#define D16_EXT_IMMUTABLE 0x0Bu
+static uint8_t d16_object_extensions_malformed(const uint8_t *data, size_t len)
+{
+    moq_kvp_decoder_t dec;
+    moq_kvp_decoder_init(&dec, data, len);
+    moq_kvp_entry_t e;
+    moq_result_t rc;
+    while ((rc = moq_kvp_decode_next(&dec, &e)) == MOQ_OK) {
+        if (e.type != D16_EXT_IMMUTABLE) continue;
+        moq_kvp_decoder_t inner;
+        moq_kvp_decoder_init(&inner, e.value, e.value_len);
+        moq_kvp_entry_t ie;
+        moq_result_t irc;
+        while ((irc = moq_kvp_decode_next(&inner, &ie)) == MOQ_OK)
+            if (ie.type == D16_EXT_IMMUTABLE) return MOQ_MALFORMED_NESTED_IMMUTABLE;
+        if (irc != MOQ_DONE) return MOQ_MALFORMED_PROPS_UNPARSEABLE;
+    }
+    return rc == MOQ_DONE ? MOQ_MALFORMED_NONE : MOQ_MALFORMED_PROPS_UNPARSEABLE;
+}
+
 static moq_result_t d16_decode_object_header(moq_session_t *s,
                                               moq_buf_reader_t *r,
                                               bool has_extensions,
@@ -4668,17 +4696,12 @@ static moq_result_t d16_decode_object_header(moq_session_t *s,
             return MOQ_ERR_BUFFER;
         if (ext_len > 0) {
             const uint8_t *ext_ptr = moq_buf_reader_ptr(r);
-            moq_kvp_decoder_t kvp_dec;
-            moq_kvp_decoder_init(&kvp_dec, ext_ptr, (size_t)ext_len);
-            moq_kvp_entry_t kvp_entry;
-            moq_result_t kvp_rc;
-            while ((kvp_rc = moq_kvp_decode_next(&kvp_dec, &kvp_entry)) == MOQ_OK)
-                ;
-            /* §11.2 "A Key-Value-Pair cannot be parsed" makes the Track
-             * malformed (§2.4.2), not the session. */
-            if (kvp_rc != MOQ_DONE) {
+            /* A §11.2 violation makes the Track malformed (§2.4.2), not the
+             * session. */
+            uint8_t why = d16_object_extensions_malformed(ext_ptr, (size_t)ext_len);
+            if (why != MOQ_MALFORMED_NONE) {
                 if (!track_scoped) return MOQ_ERR_PROTO;
-                out->malformed = MOQ_MALFORMED_PROPS_UNPARSEABLE;
+                out->malformed = why;
             }
             out->has_properties = true;
             out->properties = ext_ptr;
@@ -4811,7 +4834,7 @@ static moq_result_t d16_encode_fetch(moq_session_t *s,
     };
     if (param_count > D16_MAX_MSG_PARAMS) {
         s->output_scratch_len = scratch_saved;
-        return MOQ_ERR_INVAL;
+        return MOQ_ERR_BUFFER;
     }
     moq_result_t rc = moq_d16_encode_fetch(w, &fetch, params, param_count);
     s->output_scratch_len = scratch_saved;
@@ -4916,6 +4939,9 @@ static moq_result_t d16_decode_fetch_object_op(moq_session_t *s,
     out->payload_len = wire_out.payload_len;
     out->properties = wire_out.extensions;
     out->properties_len = wire_out.extensions_len;
+    if (wire_out.extensions_len > 0)
+        out->malformed = d16_object_extensions_malformed(wire_out.extensions,
+                                                         wire_out.extensions_len);
     return MOQ_OK;
 }
 
@@ -5094,6 +5120,7 @@ static moq_result_t d16_decode_object_datagram_op(moq_session_t *s,
     if (dg.has_extensions) {
         out->properties     = dg.extensions;
         out->properties_len = dg.extensions_len;
+        out->malformed = d16_object_extensions_malformed(dg.extensions, dg.extensions_len);
     }
     out->payload     = dg.payload;
     out->payload_len = dg.payload_len;
@@ -5245,6 +5272,7 @@ static const moq_profile_ops_t d16_ops = {
     .publish_initial_parameters      = false,
     .publish_ok_carries_params       = true,
     .supports_joining_fetch          = true,
+    .commit_subscribe_update_location = NULL,
     .supports_fill                   = false,
     .stream_count_unknown            = MOQ_QUIC_VARINT_MAX,
     .subgroup_timer_at_fin           = false,
@@ -5259,6 +5287,7 @@ static const moq_profile_ops_t d16_ops = {
     .going_away_request_error        = MOQ_REQUEST_ERROR_INTERNAL_ERROR,
     .capacity_request_error          = MOQ_REQUEST_ERROR_INTERNAL_ERROR,
     .capacity_request_error_retryable = false,
+    .resource_limit_stream_error     = MOQ_STREAM_ERROR_CANCELLED,
     .reserved_session_namespaces     = false,
     .relative_group_clamps           = false,
     .binding_requirements            = 0,

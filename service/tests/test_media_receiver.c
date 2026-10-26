@@ -18,9 +18,165 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures = 0;
+
+/* -- server publishers ------------------------------------------------ *
+ *
+ * Every server pump's publisher facade is the test's to destroy, while
+ * its session still exists (picoquic_threaded.h): in the pump that still
+ * iterates its session once it is closed, or between stop and destroy.
+ * Each is registered with the server and session it serves, and allocates
+ * through a counting allocator, so the run ends with every publisher
+ * released and every byte returned. Pump threads and the test thread share
+ * the registry under its mutex. */
+static atomic_long g_pub_blocks;   /* live publisher blocks */
+static atomic_bool g_pub_refuse;   /* refuse the next realloc */
+
+static void *pub_alloc(size_t n, void *ctx)
+{
+    (void)ctx;
+    void *p = malloc(n ? n : 1);
+    if (p) atomic_fetch_add(&g_pub_blocks, 1);
+    return p;
+}
+
+/* A realloc of NULL is a new block; a resize keeps the count; a refused
+ * one leaves the old block, counted, as it was. Whether there was an old
+ * block is decided before the call: its pointer is not read after a
+ * successful resize. */
+static void *pub_realloc(void *p, size_t o, size_t n, void *ctx)
+{
+    (void)o;
+    (void)ctx;
+    if (atomic_exchange(&g_pub_refuse, false)) return NULL;
+    bool fresh = p == NULL;
+    void *r = realloc(p, n ? n : 1);
+    if (r && fresh) atomic_fetch_add(&g_pub_blocks, 1);
+    return r;
+}
+
+static void pub_free(void *p, size_t n, void *ctx)
+{
+    (void)n;
+    (void)ctx;
+    if (p) atomic_fetch_sub(&g_pub_blocks, 1);
+    free(p);
+}
+static const moq_alloc_t k_pub_alloc = { .ctx = NULL, .alloc = pub_alloc,
+                                         .realloc = pub_realloc, .free = pub_free };
+
+#define FIXTURE_PUBS_MAX 8
+static struct {
+    moq_pq_threaded_t *srv;
+    moq_publisher_t  **slot;
+    moq_session_t     *session;
+} g_fixture_pubs[FIXTURE_PUBS_MAX];
+static pthread_mutex_t g_fixture_pubs_mu = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int g_fixture_pubs_lost;   /* a session gone unobserved */
+
+/* Create a pump's publisher on `session` and register it. */
+static moq_result_t fixture_pub_create(moq_pq_threaded_t *srv, moq_session_t *session,
+                                       const moq_pub_cfg_t *cfg, moq_publisher_t **slot)
+{
+    pthread_mutex_lock(&g_fixture_pubs_mu);
+    int free_i = -1;
+    for (int i = 0; i < FIXTURE_PUBS_MAX && free_i < 0; i++)
+        if (!g_fixture_pubs[i].slot) free_i = i;
+    moq_result_t rc = MOQ_ERR_LIMIT;
+    if (free_i >= 0) {
+        rc = moq_pub_create(session, &k_pub_alloc, cfg, slot);
+        if (rc == MOQ_OK) {
+            g_fixture_pubs[free_i].srv = srv;
+            g_fixture_pubs[free_i].slot = slot;
+            g_fixture_pubs[free_i].session = session;
+        }
+    }
+    pthread_mutex_unlock(&g_fixture_pubs_mu);
+    return rc;
+}
+
+/* At the top of a pump: release each of `srv`'s publishers whose session
+ * is closed while the lane still iterates it. One whose session is gone
+ * without that observation is not touched (it would be a use after free)
+ * and fails the run. A pump creates no publisher on a closed session: it
+ * is pruned once the pump returns. */
+static void fixture_pub_pump(moq_pq_threaded_t *srv, moq_pq_threaded_lane_t *lane)
+{
+    pthread_mutex_lock(&g_fixture_pubs_mu);
+    for (int i = 0; i < FIXTURE_PUBS_MAX; i++) {
+        if (!g_fixture_pubs[i].slot || g_fixture_pubs[i].srv != srv) continue;
+        bool live = false;
+        for (moq_pq_threaded_conn_t *c = moq_pq_threaded_lane_next_conn(lane, NULL); c;
+             c = moq_pq_threaded_lane_next_conn(lane, c))
+            if (moq_pq_threaded_conn_session(c) == g_fixture_pubs[i].session) live = true;
+        if (live && moq_session_state(g_fixture_pubs[i].session) != MOQ_SESS_CLOSED) continue;
+        if (live) moq_pub_destroy(*g_fixture_pubs[i].slot);
+        else atomic_fetch_add(&g_fixture_pubs_lost, 1);
+        *g_fixture_pubs[i].slot = NULL;
+        memset(&g_fixture_pubs[i], 0, sizeof(g_fixture_pubs[i]));
+    }
+    pthread_mutex_unlock(&g_fixture_pubs_mu);
+}
+
+/* Stop `srv`, destroy the publishers it still serves (their sessions
+ * live until destroy), then destroy it. */
+static void server_stop(moq_pq_threaded_t *srv)
+{
+    moq_pq_threaded_stop(srv);
+    pthread_mutex_lock(&g_fixture_pubs_mu);
+    for (int i = 0; i < FIXTURE_PUBS_MAX; i++) {
+        if (!g_fixture_pubs[i].slot || g_fixture_pubs[i].srv != srv) continue;
+        moq_pub_destroy(*g_fixture_pubs[i].slot);
+        *g_fixture_pubs[i].slot = NULL;
+        memset(&g_fixture_pubs[i], 0, sizeof(g_fixture_pubs[i]));
+    }
+    pthread_mutex_unlock(&g_fixture_pubs_mu);
+    moq_pq_threaded_destroy(srv);
+}
+
+/* How many publishers `srv` still has registered. */
+static int fixture_pubs_of(moq_pq_threaded_t *srv)
+{
+    int n = 0;
+    pthread_mutex_lock(&g_fixture_pubs_mu);
+    for (int i = 0; i < FIXTURE_PUBS_MAX; i++)
+        n += g_fixture_pubs[i].slot && g_fixture_pubs[i].srv == srv;
+    pthread_mutex_unlock(&g_fixture_pubs_mu);
+    return n;
+}
+
+/* The counting allocator itself: a realloc of NULL counts a new block, a
+ * resize keeps the count, a refused resize leaves the block and the count,
+ * and a free ends it. */
+static void check_pub_allocator(void)
+{
+    long base = atomic_load(&g_pub_blocks);
+    void *a = k_pub_alloc.realloc(NULL, 0, 16, NULL);
+    MOQ_TEST_CHECK(a != NULL && atomic_load(&g_pub_blocks) == base + 1);
+    void *b = k_pub_alloc.realloc(a, 16, 4096, NULL);
+    MOQ_TEST_CHECK(b != NULL && atomic_load(&g_pub_blocks) == base + 1);
+    atomic_store(&g_pub_refuse, true);
+    MOQ_TEST_CHECK(k_pub_alloc.realloc(b, 4096, 8192, NULL) == NULL);
+    MOQ_TEST_CHECK(atomic_load(&g_pub_blocks) == base + 1);
+    void *c = k_pub_alloc.alloc(8, NULL);
+    MOQ_TEST_CHECK(c != NULL && atomic_load(&g_pub_blocks) == base + 2);
+    k_pub_alloc.free(c, 8, NULL);
+    k_pub_alloc.free(b, 4096, NULL);
+    MOQ_TEST_CHECK(atomic_load(&g_pub_blocks) == base);
+}
+
+/* Every publisher released, none lost, every byte returned. */
+static bool fixture_pubs_released(void)
+{
+    bool any = false;
+    pthread_mutex_lock(&g_fixture_pubs_mu);
+    for (int i = 0; i < FIXTURE_PUBS_MAX; i++) any = any || g_fixture_pubs[i].slot;
+    pthread_mutex_unlock(&g_fixture_pubs_mu);
+    return !any && atomic_load(&g_fixture_pubs_lost) == 0 && atomic_load(&g_pub_blocks) == 0;
+}
 
 /* -- catalog-publishing server (direct facade) ----------------------- */
 
@@ -43,6 +199,10 @@ typedef struct {
     atomic_int       publish_target;   /* test thread raises; pump catches up */
     atomic_bool      media_subscribed; /* latched when the media track ever
                                           has a subscriber server-side */
+    atomic_bool      media_forward_off; /* the media subscriber's last update
+                                           set Forward 0 */
+    atomic_int       fwd0_target_seen;  /* the highest target the publish pump
+                                           read while that held */
     atomic_bool      catalog_subscribed; /* same latch for the catalog track */
     int              published;
     /* Deliberately malformed normal media objects for the class-MEDIA parse
@@ -173,16 +333,16 @@ static sap_srv_state_t g_sap;
 static int sap_server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                        uint64_t now_us, void *ctx)
 {
-    (void)lane;
     sap_srv_state_t *st = (sap_srv_state_t *)ctx;
     moq_session_t *session = moq_pq_threaded_session(t);
-    if (!session) return 0;
+    fixture_pub_pump(t, lane);
+    if (!session || moq_session_state(session) == MOQ_SESS_CLOSED) return 0;
 
     if (!st->pub) {
         moq_pub_cfg_t pcfg;
         moq_pub_cfg_init_sized(&pcfg, sizeof(pcfg));
         pcfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
-        if (moq_pub_create(session, moq_alloc_default(), &pcfg, &st->pub)
+        if (fixture_pub_create(t, session, &pcfg, &st->pub)
             != MOQ_OK) { st->failed = true; return -1; }
         moq_bytes_t parts[] = {
             MOQ_BYTES_LITERAL("svc"), MOQ_BYTES_LITERAL("demo") };
@@ -344,16 +504,16 @@ static mt_srv_state_t g_mt;
 static int mt_server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                        uint64_t now_us, void *ctx)
 {
-    (void)lane;
     mt_srv_state_t *st = (mt_srv_state_t *)ctx;
     moq_session_t *session = moq_pq_threaded_session(t);
-    if (!session) return 0;
+    fixture_pub_pump(t, lane);
+    if (!session || moq_session_state(session) == MOQ_SESS_CLOSED) return 0;
 
     if (!st->pub) {
         moq_pub_cfg_t pcfg;
         moq_pub_cfg_init_sized(&pcfg, sizeof(pcfg));
         pcfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
-        if (moq_pub_create(session, moq_alloc_default(), &pcfg, &st->pub)
+        if (fixture_pub_create(t, session, &pcfg, &st->pub)
             != MOQ_OK) { st->failed = true; return -1; }
         moq_bytes_t parts[] = {
             MOQ_BYTES_LITERAL("svc"), MOQ_BYTES_LITERAL("demo") };
@@ -443,16 +603,16 @@ static af_srv_state_t g_af;
 static int af_server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                           uint64_t now_us, void *ctx)
 {
-    (void)lane;
     af_srv_state_t *st = (af_srv_state_t *)ctx;
     moq_session_t *session = moq_pq_threaded_session(t);
-    if (!session) return 0;
+    fixture_pub_pump(t, lane);
+    if (!session || moq_session_state(session) == MOQ_SESS_CLOSED) return 0;
 
     if (!st->pub) {
         moq_pub_cfg_t pcfg;
         moq_pub_cfg_init_sized(&pcfg, sizeof(pcfg));
         pcfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
-        if (moq_pub_create(session, moq_alloc_default(), &pcfg, &st->pub)
+        if (fixture_pub_create(t, session, &pcfg, &st->pub)
             != MOQ_OK) { st->failed = true; return -1; }
         moq_bytes_t parts[] = {
             MOQ_BYTES_LITERAL("svc"), MOQ_BYTES_LITERAL("demo") };
@@ -527,14 +687,21 @@ static int af_server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
 #define OBJ_PAYLOAD_LEN 16
 
 /* Publish LOC objects up to the requested target. Holds off until the
- * receiver's subscription is established server-side: live objects
- * written with no subscriber are (correctly) not delivered, and the
- * data-path scenarios must not lose their fixed targets to that race. */
+ * receiver's subscription is established server-side, and while its Forward
+ * state is 0: live objects written with no subscriber, or at Forward 0, are
+ * (correctly) not delivered, and the data-path scenarios must not lose their
+ * fixed targets to either race. */
 static bool srv_publish_media(srv_state_t *st, uint64_t now_us)
 {
     if (!moq_pub_has_subscriber(st->pub, st->media_track)) return true;
     atomic_store(&st->media_subscribed, true);
     int target = atomic_load(&st->publish_target);
+    /* Both are written on this (the server's) thread, so the flag matches
+     * the subscriber state the writes below would meet. */
+    bool forward_off = atomic_load(&st->media_forward_off);
+    if (forward_off && target > atomic_load(&st->fwd0_target_seen))
+        atomic_store(&st->fwd0_target_seen, target);
+    if (forward_off) return true;
     while (st->published < target) {
         int i = st->published;
         moq_loc_headers_t h;
@@ -569,8 +736,8 @@ static bool srv_publish_media(srv_state_t *st, uint64_t now_us)
         moq_rcbuf_decref(payload);
         if (props) moq_rcbuf_decref(props);
         if (wrc == MOQ_ERR_WOULD_BLOCK) return true;   /* retry next pump */
-        /* WRONG_STATE = the subscriber paused us (forward=0): the session
-         * refuses subgroup writes until forward is restored. Retry. */
+        /* WRONG_STATE: the track refuses the write in its current state.
+         * Retry next pump. */
         if (wrc == MOQ_ERR_WRONG_STATE) return true;
         if (wrc != MOQ_OK) return false;
         st->published++;
@@ -610,19 +777,47 @@ static bool srv_publish_media(srv_state_t *st, uint64_t now_us)
 
 static srv_state_t g_srv;
 
+/* Raise the server's publish target and wake its network thread: the pump
+ * publishes only when that thread runs, which an idle connection otherwise
+ * leaves to picoquic's next timer (up to 10 s). */
+static void srv_raise_target(moq_pq_threaded_t *srv, int target)
+{
+    atomic_store(&g_srv.publish_target, target);
+    MOQ_TEST_CHECK_EQ_INT(moq_pq_threaded_wake(srv), MOQ_OK);
+}
+
+static uint64_t mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+/* The media subscriber's Forward state, as the server's session sees it. */
+static void srv_subscriber_updated(void *ctx, moq_pub_track_t *track,
+                                   const moq_pub_subscribe_update_info_t *info)
+{
+    srv_state_t *st = (srv_state_t *)ctx;
+    if (track == st->media_track && info->has_forward)
+        atomic_store(&st->media_forward_off, !info->forward);
+}
+
 static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                        uint64_t now_us, void *ctx)
 {
-    (void)lane;
     srv_state_t *st = (srv_state_t *)ctx;
     moq_session_t *session = moq_pq_threaded_session(t);
-    if (!session) return 0;
+    fixture_pub_pump(t, lane);
+    if (!session || moq_session_state(session) == MOQ_SESS_CLOSED) return 0;
 
     if (!st->pub) {
         moq_pub_cfg_t pcfg;
         moq_pub_cfg_init_sized(&pcfg, sizeof(pcfg));
         pcfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
-        if (moq_pub_create(session, moq_alloc_default(), &pcfg,
+        pcfg.callbacks.struct_size = sizeof(pcfg.callbacks);
+        pcfg.callbacks.ctx = st;
+        pcfg.callbacks.on_subscriber_updated = srv_subscriber_updated;
+        if (fixture_pub_create(t, session, &pcfg,
                            &st->pub) != MOQ_OK) {
             st->failed = true;
             return -1;
@@ -768,15 +963,15 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
 static int reject_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                        uint64_t now_us, void *ctx)
 {
-    (void)lane;
     srv_state_t *st = (srv_state_t *)ctx;
     moq_session_t *session = moq_pq_threaded_session(t);
-    if (!session) return 0;
+    fixture_pub_pump(t, lane);
+    if (!session || moq_session_state(session) == MOQ_SESS_CLOSED) return 0;
     if (!st->pub) {
         moq_pub_cfg_t pcfg;
         moq_pub_cfg_init_sized(&pcfg, sizeof(pcfg));
         pcfg.accept_mode = MOQ_PUB_REJECT_ALL;
-        if (moq_pub_create(session, moq_alloc_default(), &pcfg,
+        if (fixture_pub_create(t, session, &pcfg,
                            &st->pub) != MOQ_OK) {
             st->failed = true;
             return -1;
@@ -931,17 +1126,19 @@ static moq_endpoint_cfg_t ep_cfg(char *urlbuf, size_t cap, int port)
     return c;
 }
 
-/* Start a media server + a create-owned receiver for the data path. */
-static bool start_media_pair(const char *cert, const char *key,
-                             moq_media_overflow_policy_t policy,
-                             uint32_t max_objects, uint64_t max_bytes,
-                             moq_media_time_mode_t time_mode,
-                             moq_pq_threaded_t **out_srv,
-                             moq_media_receiver_t **out_r)
+/* Start a media server serving catalog_json + a create-owned receiver for the
+ * data path. */
+static bool start_media_pair_catalog(const char *cert, const char *key,
+                                     const char *catalog_json,
+                                     moq_media_overflow_policy_t policy,
+                                     uint32_t max_objects, uint64_t max_bytes,
+                                     moq_media_time_mode_t time_mode,
+                                     moq_pq_threaded_t **out_srv,
+                                     moq_media_receiver_t **out_r)
 {
     int port = 0;
     memset(&g_srv, 0, sizeof(g_srv));
-    g_srv.catalog_json = k_media_catalog_json;
+    g_srv.catalog_json = catalog_json;
     g_srv.media_track_name = "v";
     moq_pq_threaded_t *srv = start_server_with(cert, key, server_pump,
                                                &g_srv, &port);
@@ -960,13 +1157,25 @@ static bool start_media_pair(const char *cert, const char *key,
     cfg.overflow.max_bytes = max_bytes;
     moq_media_receiver_t *r = NULL;
     if (moq_media_receiver_create(&cfg, &r) != MOQ_OK) {
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
         return false;
     }
     *out_srv = srv;
     *out_r = r;
     return true;
+}
+
+/* Start a media server serving the live LOC catalog + a receiver. */
+static bool start_media_pair(const char *cert, const char *key,
+                             moq_media_overflow_policy_t policy,
+                             uint32_t max_objects, uint64_t max_bytes,
+                             moq_media_time_mode_t time_mode,
+                             moq_pq_threaded_t **out_srv,
+                             moq_media_receiver_t **out_r)
+{
+    return start_media_pair_catalog(cert, key, k_media_catalog_json, policy,
+                                    max_objects, max_bytes, time_mode,
+                                    out_srv, out_r);
 }
 
 /* Drain track events until CATALOG_READY; return the single track handle.
@@ -1081,8 +1290,7 @@ static bool discover_first_init(const char *cert, const char *key,
         }
         moq_media_receiver_destroy(r);
     }
-    moq_pq_threaded_stop(srv);
-    moq_pq_threaded_destroy(srv);
+    server_stop(srv);
     return has_init;
 }
 
@@ -1093,6 +1301,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--cert") && i + 1 < argc) cert = argv[++i];
         else if (!strcmp(argv[i], "--key") && i + 1 < argc) key = argv[++i];
     }
+    check_pub_allocator();
     if (!cert || !key) {
         fprintf(stderr, "usage: --cert <pem> --key <pem>\n");
         return 1;
@@ -1267,10 +1476,8 @@ int main(int argc, char **argv)
         moq_media_receiver_destroy(r);
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_stop(ep), (int)MOQ_OK);
         moq_endpoint_destroy(ep);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
         MOQ_TEST_CHECK(!g_srv.failed);
-        if (g_srv.pub) { /* freed with the server's session by teardown */ }
     }
 
     /* == catalog discovered via joining FETCH (no live subscribe object) =
@@ -1310,8 +1517,7 @@ int main(int argc, char **argv)
         }
 
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
         MOQ_TEST_CHECK(!g_srv.failed);
     }
 
@@ -1357,8 +1563,7 @@ int main(int argc, char **argv)
                               (int)MOQ_ERR_CLOSED);
 
         moq_media_receiver_destroy(r);   /* owns + stops its endpoint */
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
     /* == catalog subscription rejected: receiver terminalizes ========== */
@@ -1393,8 +1598,7 @@ int main(int argc, char **argv)
                               (int)MOQ_ERR_CLOSED);
 
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
     /* == attach to a terminal endpoint is refused, no attachment kept == *
@@ -1437,8 +1641,28 @@ int main(int argc, char **argv)
         /* No attachment was retained: stop succeeds immediately. */
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_stop(ep), (int)MOQ_OK);
         moq_endpoint_destroy(ep);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
+    }
+
+    /* == a server stopped under a live connection ======================
+     * Its publisher is still registered and its session still open when
+     * stop returns: server_stop destroys the publisher before the server
+     * destroys the session, and every block comes back. */
+    {
+        moq_pq_threaded_t *srv = NULL;
+        moq_media_receiver_t *r = NULL;
+        MOQ_TEST_CHECK(start_media_pair(cert, key,
+            MOQ_MEDIA_OVERFLOW_DROP_GROUP, 0, 0, MOQ_MEDIA_TIME_RAW,
+            &srv, &r));
+        if (!srv || !r) return 1;
+        MOQ_TEST_CHECK(drain_until_ready(r) != NULL);
+        MOQ_TEST_CHECK_EQ_INT(fixture_pubs_of(srv), 1);
+        MOQ_TEST_CHECK(atomic_load(&g_pub_blocks) > 0);
+        server_stop(srv);
+        MOQ_TEST_CHECK_EQ_INT(fixture_pubs_of(srv), 0);
+        MOQ_TEST_CHECK(g_srv.pub == NULL);
+        MOQ_TEST_CHECK(atomic_load(&g_pub_blocks) == 0);
+        moq_media_receiver_destroy(r);
     }
 
     /* == data path: auto_subscribe delivers parsed objects ============= */
@@ -1453,7 +1677,7 @@ int main(int argc, char **argv)
         moq_media_track_t *track = drain_until_ready(r);
         MOQ_TEST_CHECK(track != NULL);
 
-        atomic_store(&g_srv.publish_target, 6);   /* two whole groups */
+        srv_raise_target(srv, 6);   /* two whole groups */
         MOQ_TEST_CHECK(wait_received(r, 6, 200));
 
         for (int i = 0; i < 6; i++) {
@@ -1498,8 +1722,7 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
 
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
         MOQ_TEST_CHECK(!g_srv.failed);
     }
 
@@ -1572,8 +1795,7 @@ int main(int argc, char **argv)
         }
 
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
         MOQ_TEST_CHECK(!g_srv.failed);
     }
 
@@ -1593,7 +1815,7 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK(track != NULL);
 
         /* Deliver the live phase first. */
-        atomic_store(&g_srv.publish_target, 6);
+        srv_raise_target(srv, 6);
         MOQ_TEST_CHECK(wait_received(r, 6, 200));
 
         /* Convert: finish live subscribers (Track Ended) + VOD catalog. */
@@ -1653,8 +1875,7 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
 
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
         MOQ_TEST_CHECK(!g_srv.failed);
     }
 
@@ -1671,7 +1892,7 @@ int main(int argc, char **argv)
         moq_media_track_t *track = drain_until_ready(r);
         MOQ_TEST_CHECK(track != NULL);
 
-        atomic_store(&g_srv.publish_target, 6);
+        srv_raise_target(srv, 6);
         MOQ_TEST_CHECK(wait_received(r, 6, 200));
 
         /* Finish with a non-Track-Ended status (0x3 Subscription Ended): no VOD
@@ -1701,8 +1922,76 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK_EQ_INT((int)ts, (int)MOQ_MEDIA_TRACK_STATE_ENDED);
 
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
+        MOQ_TEST_CHECK(!g_srv.failed);
+    }
+
+    /* == a track that was never live ends on Track Ended: the live->VOD
+     *    re-arm (MSF §11.3) applies only to a track that was live, so a
+     *    VOD track finished with Track Ended terminalizes (TRACK_ENDED)
+     *    instead of re-subscribing for a conversion that cannot follow. */
+    {
+        moq_pq_threaded_t *srv = NULL;
+        moq_media_receiver_t *r = NULL;
+        MOQ_TEST_CHECK(start_media_pair_catalog(cert, key,
+            k_media_vod_catalog_json, MOQ_MEDIA_OVERFLOW_DROP_GROUP, 0, 0,
+            MOQ_MEDIA_TIME_RAW, &srv, &r));
+        if (!srv || !r) return 1;
+
+        moq_media_track_t *track = drain_until_ready(r);
+        MOQ_TEST_CHECK(track != NULL);
+        const moq_media_track_desc_t *d = moq_media_track_desc_get(track);
+        MOQ_TEST_CHECK(d && !d->is_live);
+
+        srv_raise_target(srv, 6);
+        MOQ_TEST_CHECK(wait_received(r, 6, 200));
+
+        g_srv.vod_catalog_json = NULL;
+        g_srv.convert_status = MOQ_PUB_DONE_TRACK_ENDED;
+        atomic_store(&g_srv.convert_after, 6);
+        MOQ_TEST_CHECK_EQ_INT(moq_pq_threaded_wake(srv), MOQ_OK);
+
+        int ended = 0, objects = 0;
+        bool seen[2][3] = { { false } };
+        for (int i = 0; i < 300 && ended == 0; i++) {
+            (void)moq_media_receiver_wait(r, 100000);
+            moq_media_object_t obj;
+            while (moq_media_receiver_poll_object(r, &obj, sizeof(obj)) == MOQ_OK) {
+                MOQ_TEST_CHECK(obj.track == track);
+                MOQ_TEST_CHECK(obj.group_id < 2 && obj.object_id < 3);
+                if (obj.group_id < 2 && obj.object_id < 3) {
+                    MOQ_TEST_CHECK(!seen[obj.group_id][obj.object_id]);
+                    seen[obj.group_id][obj.object_id] = true;
+                }
+                objects++;
+                moq_media_object_cleanup(&obj);
+            }
+            moq_media_track_event_t ev;
+            while (moq_media_receiver_poll_track(r, &ev, sizeof(ev)) == MOQ_OK) {
+                if (ev.track == track && ev.kind == MOQ_MEDIA_TRACK_ENDED) {
+                    ended++;
+                    MOQ_TEST_CHECK(ev.has_done_status);
+                    MOQ_TEST_CHECK_EQ_U64(ev.done_status, MOQ_PUB_DONE_TRACK_ENDED);
+                }
+            }
+            if (moq_media_receiver_is_fatal(r)) break;
+        }
+        MOQ_TEST_CHECK_EQ_INT(ended, 1);
+        MOQ_TEST_CHECK_EQ_INT(objects, 6);
+        MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
+
+        moq_media_track_state_t ts = MOQ_MEDIA_TRACK_STATE_ACTIVE;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_media_receiver_track_state(r, track, &ts), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)ts, (int)MOQ_MEDIA_TRACK_STATE_ENDED);
+
+        MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_subscribe_track(r, track, NULL),
+                              MOQ_ERR_WRONG_STATE);
+        /* The scripted peer proves no replacement SUBSCRIBE or replayed group
+         * after this terminal, without a wall-clock negative assertion. */
+
+        moq_media_receiver_destroy(r);
+        server_stop(srv);
         MOQ_TEST_CHECK(!g_srv.failed);
     }
 
@@ -1716,7 +2005,7 @@ int main(int argc, char **argv)
         if (!srv || !r) return 1;
         MOQ_TEST_CHECK(drain_until_ready(r) != NULL);
 
-        atomic_store(&g_srv.publish_target, 9);   /* three groups, cap 4 */
+        srv_raise_target(srv, 9);   /* three groups, cap 4 */
         MOQ_TEST_CHECK(wait_received(r, 9, 200));
 
         moq_media_receiver_stats_t st;
@@ -1736,8 +2025,7 @@ int main(int argc, char **argv)
         moq_media_object_cleanup(&obj);
 
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
     /* == stalled consumer: DROP_TO_KEYFRAME keeps a decodable head ====== */
@@ -1750,7 +2038,7 @@ int main(int argc, char **argv)
         if (!srv || !r) return 1;
         MOQ_TEST_CHECK(drain_until_ready(r) != NULL);
 
-        atomic_store(&g_srv.publish_target, 9);
+        srv_raise_target(srv, 9);
         MOQ_TEST_CHECK(wait_received(r, 9, 200));
 
         moq_media_receiver_stats_t st;
@@ -1766,11 +2054,13 @@ int main(int argc, char **argv)
         moq_media_object_cleanup(&obj);
 
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
-    /* == FLOW_CONTROL: pause on pressure, resume on drain, no drops ===== */
+    /* == FLOW_CONTROL: pause on pressure, resume on drain, no drops =====
+     * The next three objects are asked for while the server's subscriber is
+     * at Forward 0, so they reach the receiver only if the source holds them
+     * until the resume arrives: at Forward 0 a write is skipped, not sent. */
     {
         moq_pq_threaded_t *srv = NULL;
         moq_media_receiver_t *r = NULL;
@@ -1782,7 +2072,7 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK(track != NULL);
 
         /* 6 objects against cap 4 (absorb ceiling 6): pauses, drops none. */
-        atomic_store(&g_srv.publish_target, 6);
+        srv_raise_target(srv, 6);
         MOQ_TEST_CHECK(wait_received(r, 6, 200));
 
         moq_media_receiver_stats_t st;
@@ -1796,47 +2086,51 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK(st.pause_transitions >= 1);
         MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
 
+        /* The pause reached the server: its subscriber is at Forward 0. */
+        uint64_t deadline = mono_us() + 10000000u;
+        while (!atomic_load(&g_srv.media_forward_off) && mono_us() < deadline)
+            usleep(1000);
+        MOQ_TEST_CHECK(atomic_load(&g_srv.media_forward_off));
+
+        /* Ask for objects 6..8 now, and see the publish pump read that
+         * target while Forward 0 still held. */
+        srv_raise_target(srv, 9);
+        deadline = mono_us() + 10000000u;
+        while (atomic_load(&g_srv.fwd0_target_seen) < 9 && mono_us() < deadline)
+            usleep(1000);
+        MOQ_TEST_CHECK_EQ_INT(atomic_load(&g_srv.fwd0_target_seen), 9);
+
         /* Drain everything: the receiver resumes below the low-water mark
-         * and new objects flow again. */
+         * and objects 6..8 follow the resume. Each object arrives exactly
+         * once (order across group streams is not assumed). The loop is
+         * bounded by elapsed time: wait() returns at once while anything
+         * else is pollable, so a count of waits bounds nothing. */
         int got = 0;
+        unsigned seen = 0;   /* object i sets bit i */
         moq_media_object_t obj;
-        for (int w = 0; w < 200 && got < 6; w++) {
+        deadline = mono_us() + 10000000u;
+        while (got < 9 && mono_us() < deadline) {
             if (moq_media_receiver_poll_object(r, &obj, sizeof(obj)) == MOQ_OK) {
+                unsigned id = obj.payload.data ? obj.payload.data[0] : 99u;
+                MOQ_TEST_CHECK(id < 9 && !(seen & (1u << id)));
+                if (id < 9) seen |= 1u << id;
                 moq_media_object_cleanup(&obj);
                 got++;
             } else {
                 (void)moq_media_receiver_wait(r, 50000);
             }
         }
-        MOQ_TEST_CHECK_EQ_INT(got, 6);
+        MOQ_TEST_CHECK_EQ_INT(got, 9);
+        MOQ_TEST_CHECK_EQ_INT((int)seen, 0x1ff);
 
-        bool resumed = false;
-        for (int i = 0; i < 100 && !resumed; i++) {
-            (void)moq_media_receiver_get_stats(r, &st, sizeof(st));
-            resumed = !st.paused;
-            if (!resumed) usleep(50000);
-        }
-        MOQ_TEST_CHECK(resumed);
-
-        atomic_store(&g_srv.publish_target, 9);
-        got = 0;
-        for (int w = 0; w < 200 && got < 3; w++) {
-            if (moq_media_receiver_poll_object(r, &obj, sizeof(obj)) == MOQ_OK) {
-                MOQ_TEST_CHECK(obj.payload.data &&
-                               obj.payload.data[0] >= 6);
-                moq_media_object_cleanup(&obj);
-                got++;
-            } else {
-                (void)moq_media_receiver_wait(r, 50000);
-            }
-        }
-        MOQ_TEST_CHECK_EQ_INT(got, 3);
         (void)moq_media_receiver_get_stats(r, &st, sizeof(st));
+        MOQ_TEST_CHECK(!st.paused);
+        MOQ_TEST_CHECK(st.pause_transitions >= 2);
         MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
+        MOQ_TEST_CHECK(!atomic_load(&g_srv.media_forward_off));
 
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
     /* == byte budget enforced + destroy with queued objects ============= */
@@ -1851,7 +2145,7 @@ int main(int argc, char **argv)
         if (!srv || !r) return 1;
         MOQ_TEST_CHECK(drain_until_ready(r) != NULL);
 
-        atomic_store(&g_srv.publish_target, 6);
+        srv_raise_target(srv, 6);
         MOQ_TEST_CHECK(wait_received(r, 6, 200));
 
         moq_media_receiver_stats_t st;
@@ -1863,8 +2157,7 @@ int main(int argc, char **argv)
         /* Destroy WITHOUT draining: queued rcbufs/samples must release
          * cleanly (ASAN guards this scenario). */
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
     /* == oversized object: the byte budget is hard even when empty ====== *
@@ -1880,7 +2173,7 @@ int main(int argc, char **argv)
         if (!srv || !r) return 1;
         MOQ_TEST_CHECK(drain_until_ready(r) != NULL);
 
-        atomic_store(&g_srv.publish_target, 3);
+        srv_raise_target(srv, 3);
         MOQ_TEST_CHECK(wait_received(r, 3, 200));
 
         moq_media_receiver_stats_t st;
@@ -1897,8 +2190,7 @@ int main(int argc, char **argv)
             (int)moq_media_receiver_poll_object(r, &obj, sizeof(obj)), (int)MOQ_DONE);
 
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
     /* == discovery fatal blocks auto_subscribe in the same cycle ======== *
@@ -1943,8 +2235,7 @@ int main(int argc, char **argv)
         MOQ_TEST_CHECK(!atomic_load(&g_srv.media_subscribed));
 
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
     /* == SHARED_EPOCH: reported times rebased to one receiver epoch ===== */
@@ -1957,7 +2248,7 @@ int main(int argc, char **argv)
         if (!srv || !r) return 1;
         MOQ_TEST_CHECK(drain_until_ready(r) != NULL);
 
-        atomic_store(&g_srv.publish_target, 2);
+        srv_raise_target(srv, 2);
         MOQ_TEST_CHECK(wait_received(r, 2, 200));
 
         moq_media_object_t obj;
@@ -1971,8 +2262,7 @@ int main(int argc, char **argv)
         moq_media_object_cleanup(&obj);
 
         moq_media_receiver_destroy(r);
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
     /* == RAW/LOC catalog initData survives to TRACK_ADDED ================ *
@@ -2051,8 +2341,7 @@ int main(int argc, char **argv)
             MOQ_TEST_CHECK(has_init);
 
             moq_media_receiver_destroy(r);
-            moq_pq_threaded_stop(srv);
-            moq_pq_threaded_destroy(srv);
+            server_stop(srv);
         }
         moq_rcbuf_decref(b64);
     }
@@ -2174,8 +2463,7 @@ int main(int argc, char **argv)
             }
             moq_media_receiver_destroy(r);
         }
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
     /* == CMSF §4.2: protected CMAF init params surfaced via desc.init ==== *
@@ -2254,8 +2542,7 @@ int main(int argc, char **argv)
             MOQ_TEST_CHECK(kidok);
             moq_media_receiver_destroy(r);
         }
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
         moq_rcbuf_decref(b64);
     }
 
@@ -2503,8 +2790,7 @@ int main(int argc, char **argv)
             MOQ_TEST_CHECK(!g_sap.failed);
             moq_media_receiver_destroy(r);
         }
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
     /* == media timeline (MSF §7.1.1): discovery, explicit subscribe, typed
@@ -2662,8 +2948,7 @@ int main(int argc, char **argv)
             MOQ_TEST_CHECK(!g_mt.failed);
             moq_media_receiver_destroy(r);
         }
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
     /* == parse-drop anti-flood + coalescing: many malformed objects on one
@@ -2758,10 +3043,10 @@ int main(int argc, char **argv)
             MOQ_TEST_CHECK(!g_af.failed);
             moq_media_receiver_destroy(r);
         }
-        moq_pq_threaded_stop(srv);
-        moq_pq_threaded_destroy(srv);
+        server_stop(srv);
     }
 
+    MOQ_TEST_CHECK(fixture_pubs_released());
     MOQ_TEST_PASS("media_receiver");
     return failures != 0;
 }

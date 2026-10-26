@@ -37,6 +37,7 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
     /// @unchecked: an immutable value copy; the Thread is identity-only.
     struct Snapshot: @unchecked Sendable {
         var waitEntries = 0
+        var waitTimeouts: [UInt64] = []   /* each waitForActivity's timeout */
         var wakeCount = 0
         var drainCalls: [UInt64] = []
         var stopCount = 0
@@ -64,6 +65,11 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
 
     // Recorders (cond-guarded; exposed only via snapshot()).
     private var r = Snapshot()
+
+    /// When true, waitForActivity returns .timeout once a timeout below the
+    /// engine's 60 s slice elapses, as a real transport's wait does, so a
+    /// caller that keeps asking for short waits shows up in waitEntries.
+    var honorsTimeouts = false
 
     /// Test hook: called when stop() runs, for cross-backend
     /// teardown-ordering assertions.
@@ -170,12 +176,22 @@ final class ScriptedEndpointBackend: EndpointBackend, @unchecked Sendable {
         if r.waitActive { r.violations.append("re-entrant waitForActivity") }
         r.waitActive = true
         r.waitEntries += 1
+        r.waitTimeouts.append(timeoutMicroseconds)
         cond.broadcast()                    /* unblock awaitCondition observers */
+        let until = honorsTimeouts && timeoutMicroseconds < 60_000_000
+            ? Date().addingTimeInterval(Double(timeoutMicroseconds) / 1_000_000) : nil
+        var timedOut = false
         while !wakeFlag && !interrupted && scriptedState != .closed {
-            cond.wait()
+            if let until {
+                if !cond.wait(until: until) { timedOut = true; break }
+            } else {
+                cond.wait()
+            }
         }
         let result: EndpointWaitResult
-        if interrupted {
+        if timedOut && !wakeFlag && !interrupted && scriptedState != .closed {
+            result = .timeout
+        } else if interrupted {
             result = .interrupted           /* latch wins; activity stays retained */
         } else if scriptedState == .closed {
             result = .closed

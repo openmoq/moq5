@@ -1,0 +1,101 @@
+Classify a reset or stop of a terminal or unknown stream by the ID's state.
+
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
+0007.
+
+0003 supplies the direction checks and refuses a stop before its context
+changes. Upstream PR2279 already classifies absent retired reset IDs; that
+replacement is no longer supplied here. This retains range checks, the
+STOP classification and the complete contract declaration. Stream IDs are
+never reused (RFC 9000 Section 2.1), and picoquic keeps each type's creation
+boundary:
+
+- An ID outside the 62-bit range answers PICOQUIC_ERROR_INVALID_STREAM_ID.
+- An absent ID below its type's boundary answers
+  PICOQUIC_ERROR_STREAM_ALREADY_CLOSED: that part is terminal and no frame is
+  sent (Section 3.3). Any other absent ID stays
+  PICOQUIC_ERROR_INVALID_STREAM_ID.
+- A stop of a live stream whose receiving part is terminal -- reset by the
+  peer, or read up to its final size (Section 3.2) -- answers
+  PICOQUIC_ERROR_STREAM_ALREADY_CLOSED before the stream or its context
+  changes.
+
+Nothing is created, allocated or queued on any refusal.
+PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED advertises the contract in
+picoquic.h.
+Tests: adapters/picoquic/tests/test_pq_stop_release.c (reset and stop
+contract rows) and test_pq_hold_input.c (call order, bounded).
+
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+index a70d08a4..10d10bac 100644
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -1709,6 +1709,17 @@ int picoquic_add_to_stream_with_ctx(picoquic_cnx_t * cnx, uint64_t stream_id, co
+  * the stream is invalid, e.g., if attempting to reset a stream that was not
+  * yet created.
+  */
++#define PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED 1
++/* picoquic_reset_stream, picoquic_reset_stream_at and picoquic_stop_sending
++ * classify the stream ID before touching anything. A part already terminal
++ * answers PICOQUIC_ERROR_STREAM_ALREADY_CLOSED with no frame and no change to
++ * the stream or its application context: for a reset, a sending part whose
++ * bytes and FIN are all acknowledged; for a stop, a receiving part reset by
++ * the peer or read up to its final size; for either, a stream opened and
++ * since retired. An ID never opened, out of range, or naming a part this
++ * endpoint does not have (a reset of a peer-initiated unidirectional stream,
++ * a stop of a local one) answers PICOQUIC_ERROR_INVALID_STREAM_ID. Neither
++ * answer creates a stream. */
+ int picoquic_reset_stream(picoquic_cnx_t* cnx,
+     uint64_t stream_id, uint64_t local_stream_error);
+ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+diff --git a/picoquic/streams.c b/picoquic/streams.c
+index 5bc13867..91a8f799 100644
+--- a/picoquic/streams.c
++++ b/picoquic/streams.c
+@@ -497,8 +497,10 @@ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+     if (reliable_size > 0 && !cnx->is_reset_stream_at_enabled) {
+         ret = PICOQUIC_ERROR_ILLEGAL_TRANSPORT_EXTENSION;
+     }
+-    else if (!IS_BIDIR_STREAM_ID(stream_id) && !IS_LOCAL_STREAM_ID(stream_id, cnx->client_mode)) {
+-        /* A peer-initiated unidirectional stream has no sending part to reset:
++    else if (stream_id >= ((uint64_t)1 << 62) ||
++        (!IS_BIDIR_STREAM_ID(stream_id) && !IS_LOCAL_STREAM_ID(stream_id, cnx->client_mode))) {
++        /* Beyond the 62-bit range (RFC 9000 Section 2.1), or a peer-initiated
++         * unidirectional stream, which has no sending part to reset:
+          * the peer closes the connection on a RESET_STREAM for its send-only
+          * stream (RFC 9000 Section 19.4). */
+         ret = PICOQUIC_ERROR_INVALID_STREAM_ID;
+@@ -585,17 +587,27 @@ int picoquic_stop_sending(picoquic_cnx_t* cnx,
+     picoquic_stream_head_t* stream = NULL;
+     PICOQUIC_THREAD_CHECK(cnx->quic);
+ 
+-    if (!IS_BIDIR_STREAM_ID(stream_id) && IS_LOCAL_STREAM_ID(stream_id, cnx->client_mode)) {
+-        /* A local unidirectional stream has no receiving part to stop: the
++    if (stream_id >= ((uint64_t)1 << 62) ||
++        (!IS_BIDIR_STREAM_ID(stream_id) && IS_LOCAL_STREAM_ID(stream_id, cnx->client_mode))) {
++        /* Beyond the 62-bit range (RFC 9000 Section 2.1), or a local
++         * unidirectional stream, which has no receiving part to stop: the
+          * peer closes the connection on a STOP_SENDING for its receive-only
+          * stream (RFC 9000 Section 19.5). */
+         ret = PICOQUIC_ERROR_INVALID_STREAM_ID;
+     }
+     else if ((stream = picoquic_find_stream(cnx, stream_id)) == NULL) {
+-        ret = PICOQUIC_ERROR_INVALID_STREAM_ID;
+-    }
+-    else if (stream->reset_received) {
+-        /* Refused: the stream and its application context are left as they are. */
++        /* As for a reset: an absent ID below its type's creation boundary
++         * was opened and has since been retired, so its receiving part is
++         * already terminal and no frame is due. */
++        ret = (stream_id < cnx->next_stream_id[STREAM_TYPE_FROM_ID(stream_id)]) ?
++            PICOQUIC_ERROR_STREAM_ALREADY_CLOSED : PICOQUIC_ERROR_INVALID_STREAM_ID;
++    }
++    else if (stream->reset_received ||
++        (stream->fin_received && stream->consumed_offset >= stream->fin_offset)) {
++        /* The receiving part is terminal -- "Reset Recvd", or every byte
++         * up to the final size delivered (RFC 9000 Section 3.2): nothing is
++         * left to stop. Refused before the stream or its application context
++         * changes. */
+         ret = PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
+     }
+     else {

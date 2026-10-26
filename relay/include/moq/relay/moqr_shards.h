@@ -32,7 +32,12 @@
  * onto a per-origin pseudo-binding, and a LOCAL publisher that loses the
  * rendezvous is force-withdrawn from its own shard (announce + sourced tracks
  * purged, subscribers terminated with GOING_AWAY, a publisher cancel queued) so
- * the winner's mirror can install. At K == 1 no manager entities are
+ * the winner's mirror can install. With clustering enabled, the manager instead
+ * mirrors every original route, preserving its source lifetime, requester
+ * exclusions, received path, and fully charged cost. An internal shard crossing
+ * adds neither a network hop nor a link charge, and never withdraws an
+ * alternative merely because another shard has a better route.
+ * At K == 1 no manager entities are
  * built, so the runtime is a pure pass-through to a single moqr_bind_pump —
  * behaviour identical to a single-shard relay.
  *
@@ -88,7 +93,9 @@ typedef struct moqr_shards_cfg {
     /* Per directed shard-pair control-mailbox capacity (namespaces in flight);
      * 0 = default. A full mailbox is cursor lag, never loss — the journal holds
      * the durable state and the sender re-exports when space frees. Tests set this
-     * small to exercise the backpressure path. */
+     * small to exercise the backpressure path. Cluster mode also reserves one
+     * allocation-free withdrawal record per directed mailbox, so admission
+     * pressure cannot block capacity-releasing withdrawal. */
     uint32_t           mailbox_entries;
     /* Per-shard candidate-set journal capacity (namespaces tracked); 0 = default
      * (the core's max_ns_nodes). A shard's journal can exceed its trie nodes (it
@@ -166,6 +173,13 @@ typedef struct moqr_shards_cfg {
      * than in bind_cfg because bind_cfg is embedded above at a fixed size. */
     uint64_t           fill_timeout_default_ms;
     uint64_t           fill_timeout_max_ms;
+    /* Cluster configuration grows only at this tail: embedded templates are
+     * fixed ABI prefixes. Internal mirrors preserve the received path and
+     * charged cost; shards together are one network relay hop. */
+    bool               cluster_enabled;
+    uint64_t           cluster_hop_id;
+    uint32_t           max_cluster_routes; /* 0 = core default */
+    uint32_t           max_cluster_hops;   /* 0 = core default */
 } moqr_shards_cfg_t;
 
 /* The pure, prefix-safe resolution moqr_shards_create applies to a config —
@@ -213,7 +227,8 @@ typedef struct moqr_shards_capacity {
     uint64_t channel_byte_ceiling;   /* K^2 x (data cap + control-exempt
                                         canon/Track Properties + headers)  */
     uint64_t canon_byte_ceiling;     /* mailbox + journal + pending keys,
-                                        + routed FETCH keys (admission)    */
+                                        + routed FETCH keys and their Track
+                                        Properties copies (admission)      */
     uint64_t staging_byte_ceiling;   /* one/shard, incl. metadata + header */
     uint64_t relay_alloc_ceiling;    /* total of the above                 */
     uint32_t usable_bindings_per_shard;
@@ -256,7 +271,8 @@ MOQR_API moqr_owner_t  moqr_shards_place(const moqr_shards_t *s,
  * runtime calls, one caller per shard. `pushed_dst_mask` (optional) is zeroed,
  * then reports the WAKE SET for this step: bit d for every destination shard
  * whose control mailbox or demand channel accepted an outbound push, PLUS bit
- * p for every producer shard whose p->this demand channel regained capacity
+ * p for every producer shard whose p->this demand channel (or cluster control
+ * mailbox) regained capacity
  * through a durable pop (the producer credit — a lane held on channel-full
  * must never wait for an idle sweep), PLUS this shard's OWN bit when the step
  * left local work no external event re-signals (a pump pass that ended on its

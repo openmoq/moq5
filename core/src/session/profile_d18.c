@@ -1241,8 +1241,8 @@ static moq_result_t d18_object_props(const uint8_t *pp, size_t len,
  * FETCH_HEADER (Request ID) leads a fetch data uni; objects follow with a vi64
  * Serialization Flags field. Object Properties (0x20) and the Datagram forwarding-
  * preference bit (0x40, §11.4.4.1 -- the subgroup LSBs are ignored) are supported
- * in both directions. Group reconstruction uses the request's retained order;
- * draft-18's local descending-request refusal remains a separate policy. */
+ * in both directions. Group reconstruction uses the request's retained order:
+ * a descending response's Group ID Delta counts down (11.4.4.1). */
 #define D18_FETCH_OBJ_SUBGROUP_MASK  0x03u
 #define D18_FETCH_OBJ_OBJECT_DELTA   0x04u
 #define D18_FETCH_OBJ_GROUP_DELTA    0x08u
@@ -2348,6 +2348,21 @@ static moq_request_error_t d18_semantic_request_error(uint64_t raw)
     return MOQ_REQUEST_ERROR_INTERNAL_ERROR;
 }
 
+/* Section 5.1: a Forward 0 -> 1 acknowledgement replaces the Joining
+ * Location with exactly the communicated snapshot, not live history. The
+ * caller has committed the response/event but has not changed Forward. */
+static void d18_commit_subscribe_update_location(moq_session_t *s, int slot,
+    bool has_forward, bool forward, bool has_largest,
+    uint64_t largest_group, uint64_t largest_object)
+{
+    moq_sub_entry_t *e = &s->subs[slot];
+    if (has_forward && !e->forward && forward) {
+        e->has_largest = has_largest;
+        e->largest_group = has_largest ? largest_group : 0;
+        e->largest_object = has_largest ? largest_object : 0;
+    }
+}
+
 static const moq_profile_ops_t d18_ops = {
     .version                 = MOQ_VERSION_DRAFT_18,
     .state_size              = sizeof(moq_d18_profile_state_t),
@@ -2363,7 +2378,7 @@ static const moq_profile_ops_t d18_ops = {
     .fetch_datagram_supported = true,   /* fetch object header carries the datagram bit */
     .request_error_wire_max  = MOQ_VI64_MAX,
     .semantic_request_error  = d18_semantic_request_error,
-    .fetch_descending_supported = false,   /* retained local selection policy */
+    .fetch_descending_supported = true,   /* response deltas in request order */
     .uses_uni_control_channel = true,
     .wire_ready               = true,
     .request_retains_pending_original_input = false,
@@ -2375,6 +2390,7 @@ static const moq_profile_ops_t d18_ops = {
     .publish_initial_parameters = false,
     .publish_ok_carries_params = true,
     .supports_joining_fetch   = true,
+    .commit_subscribe_update_location = d18_commit_subscribe_update_location,
     .supports_fill            = false,
     .stream_count_unknown     = MOQ_QUIC_VARINT_MAX,
     .subgroup_timer_at_fin    = true,
@@ -2388,6 +2404,7 @@ static const moq_profile_ops_t d18_ops = {
     .going_away_request_error       = MOQ_REQUEST_ERROR_GOING_AWAY,
     .capacity_request_error         = MOQ_REQUEST_ERROR_EXCESSIVE_LOAD,
     .capacity_request_error_retryable = true,
+    .resource_limit_stream_error    = MOQ_STREAM_ERROR_EXCESSIVE_LOAD,
     .reserved_session_namespaces    = true,
     .binding_requirements     = 0,
     .auth_token_type_max      = UINT64_MAX,   /* §10.2.2: vi64 */

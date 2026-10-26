@@ -49,6 +49,12 @@ uint64_t moqr_shards_debug_remote_demand_refused(moqr_shards_t *s, uint16_t shar
  * K == 1. An acknowledged demand stays counted for as long as its track is
  * ACTIVE — the entry is the cancel notice's durable home. */
 uint32_t moqr_shards_debug_pending_demand(moqr_shards_t *s, uint16_t shard);
+/* The standalone retrievals' retained Track Properties copies on `shard`:
+ * how many owner-side and requester-side slots hold one, and the highest
+ * reference count among them (1: each held by its slot alone). */
+void moqr_shards_debug_retrieval_meta(moqr_shards_t *s, uint16_t shard,
+                                      uint32_t *owner_held, uint32_t *requester_held,
+                                      uint32_t *max_refs);
 
 /* Count of owner DONE answers this shard resolved into its own core as the
  * REQUESTER (pre-ACK refusals and post-ACK terminals both), with the last

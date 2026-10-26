@@ -358,8 +358,9 @@ write_single(const moqr_core_stats_t *core, const moqr_bind_stats_t *bind,
                  "Deliveries written to downstream sessions.", base,
                  (unsigned long long)bind->deliveries_written);
         counter1(&w, "moqrelay_ingest_refusals_total",
-                 "Ingest records refused as too old or out of order.", base,
-                 (unsigned long long)bind->ingest_refusals);
+                 "Ingest operations refused: objects or chunks too old, out "
+                 "of order or over capacity; not distinct objects lost.",
+                 base, (unsigned long long)bind->ingest_refusals);
         counter1(&w, "moqrelay_session_errors_total",
                  "Unexpected session-call failures.", base,
                  (unsigned long long)bind->session_errors);
@@ -801,7 +802,8 @@ write_multi(const moqr_snapshot_view_t *vs, uint32_t n, moqr_obs_format_t fmt,
               "Deliveries written to downstream sessions.", "counter", vs, n,
               cbases, mv_has_bind, mvg_writes, MV_AGG_SUM);
     mv_family(&w, "moqrelay_ingest_refusals_total",
-              "Ingest records refused as too old or out of order.",
+              "Ingest operations refused: objects or chunks too old, out of "
+              "order or over capacity; not distinct objects lost.",
               "counter", vs, n, cbases, mv_has_bind, mvg_ing_ref, MV_AGG_SUM);
     mv_family(&w, "moqrelay_session_errors_total",
               "Unexpected session-call failures.", "counter", vs, n, cbases,

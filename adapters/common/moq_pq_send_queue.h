@@ -13,14 +13,15 @@
  *   - a FIN flag on the final chunk (a zero-length chunk carries a bare FIN).
  * All are released exactly once on drain, drop, or destroy.
  *
- * An aggregate byte cap bounds the buffered backlog, as a low-water mark: a
+ * An aggregate cap bounds retained payload bytes plus one unit per standalone
+ * zero-byte FIN marker. Adding FIN to an existing chunk needs no unit. As a
+ * low-water mark, a
  * push is refused once the backlog has reached the cap, so the bridge
  * retries; below it a push is accepted whole, so the backlog overshoots the
  * cap by at most one write and a large object is never passed over by
- * smaller ones. A newly opened prioritized stream also waits while 127
- * prioritized streams hold bytes, so distinct keys among them keep distinct
- * transport priority levels; streams already sending are never refused for
- * this.
+ * smaller ones. Priority ranking never adds an admission limit: excess
+ * distinct keys share the least urgent native level rather than preventing
+ * a ready stream from starting behind peers that still hold bytes.
  *
  * Transport-agnostic (no picoquic dependency): the endpoint owns the picoquic
  * glue (mark_active_stream / provide_stream_data_buffer). Single-threaded:
@@ -46,8 +47,8 @@ extern "C" {
 
 typedef struct moq_pq_send_queue moq_pq_send_queue_t;
 
-/* `sid` was just opened: its first push waits for a free priority level (see
- * above). Returns 0, or -1 on allocation failure. */
+/* Record that `sid` was just opened. Its first accepted push makes it eligible
+ * for priority ranking. Returns 0, or -1 on allocation failure. */
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((visibility("hidden")))
 #endif
@@ -63,9 +64,10 @@ int moq_pq_send_queue_set_key(moq_pq_send_queue_t *q, uint64_t sid,
                               uint32_t key);
 
 /* Rank the recorded keys once and apply each changed transport priority.
- * Equal keys round-robin. Beyond 126 better pending streams ranks coalesce,
- * never reverse. The callback must return zero on success. Returns 0, or -1
- * on callback or allocation failure. */
+ * Equal keys round-robin. Data ranks start at level 2; keys with 126 or more
+ * distinct better keys share the last level (254), without reversing order.
+ * Control traffic uses level 0. The callback must return zero on success.
+ * Returns 0, or -1 on callback or allocation failure. */
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((visibility("hidden")))
 #endif
@@ -79,7 +81,7 @@ __attribute__((visibility("hidden")))
 int moq_pq_send_queue_priority(moq_pq_send_queue_t *q, uint64_t sid,
     uint32_t key, int (*apply)(void *, uint64_t, uint8_t), void *ctx);
 
-/* Create with an aggregate byte cap (0 -> MOQ_PQ_SEND_QUEUE_CAP_DEFAULT, also
+/* Create with an aggregate backlog cap (0 -> MOQ_PQ_SEND_QUEUE_CAP_DEFAULT, also
  * overridable by the internal env var MOQ_PQ_STREAM_QUEUE_BYTES). Returns NULL
  * on allocation failure. */
 moq_pq_send_queue_t *moq_pq_send_queue_create(const moq_alloc_t *alloc,
@@ -130,10 +132,19 @@ void moq_pq_send_queue_drop(moq_pq_send_queue_t *q, uint64_t sid);
 uint64_t moq_pq_send_queue_truncate(moq_pq_send_queue_t *q, uint64_t sid,
                                     uint64_t reliable);
 
+/* True when the aggregate cap is reached, so push_copy and push_rcbuf refuse
+ * every push adding bytes (a bare FIN may still collapse onto a queued
+ * chunk). Changes nothing. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+bool moq_pq_send_queue_budget_full(const moq_pq_send_queue_t *q);
+
 /* Aggregate bytes currently buffered across all streams (test/telemetry). */
 uint64_t moq_pq_send_queue_queued_bytes(const moq_pq_send_queue_t *q);
 
-/* Telemetry: peak aggregate backlog, and pushes refused for hitting the cap. */
+/* Telemetry: peak payload bytes, and pushes refused for hitting the combined
+ * byte/standalone-FIN cap. queued_bytes/high_water exclude marker charges. */
 uint64_t moq_pq_send_queue_high_water(const moq_pq_send_queue_t *q);
 uint64_t moq_pq_send_queue_would_block_count(const moq_pq_send_queue_t *q);
 

@@ -141,7 +141,7 @@ _Static_assert(offsetof(moq_media_track_event_t, delivery_initiating_request_id)
 _Static_assert(offsetof(moq_media_track_event_t, fill_unreported_loss_causes) ==
                sizeof(ts_event_before_fill_loss_t),
                "fill loss summary must start at the complete preceding sizeof");
-_Static_assert(sizeof(moq_media_track_event_t) ==
+_Static_assert(offsetof(moq_media_track_event_t, has_done_status) ==
                sizeof(ts_event_before_fill_loss_t) + 24,
                "fill loss summary is 24 bytes with no padding");
 #endif

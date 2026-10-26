@@ -1,0 +1,19 @@
+[package]
+name = "moq5-fake-tests"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "moq5 ownership, threading and layout rows against a scripted service provider"
+
+[features]
+# The player's rows, against an SDK with the player (MOQ_BUILD_PLAYBACK=ON):
+# run.sh compiles the provider's player fakes when the SDK carries its header.
+player = ["moq5/player", "moq5-sys/player"]
+
+[dependencies]
+moq5 = { path = "../../moq5" }
+moq5-sys = { path = "../../moq5-sys" }
+
+[build-dependencies]
+cc = "1"

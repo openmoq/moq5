@@ -114,7 +114,8 @@ static const shard_field_t k_shard[] = {
 static const char *
 listener_kind(const char *transport)
 {
-    if (strcmp(transport, "msquic") == 0) {
+    if (strcmp(transport, "msquic") == 0 ||
+        strcmp(transport, "picoquic") == 0) {
         return "raw";
     }
     if (strcmp(transport, "wtquic-msquic") == 0) {

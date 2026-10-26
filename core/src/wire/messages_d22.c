@@ -48,7 +48,14 @@ static moq_result_t layout(uint64_t type, const moq_d22_message_context_t *ctx,
     case MOQ_D22_PUBLISH_STATE_NOTIFY:
         *scope = MOQ_D22_SCOPE_NOTIFY;
         *fields = HAS_PARAMS; break;
-    case MOQ_D22_NAMESPACE: case MOQ_D22_NAMESPACE_DONE:
+    case MOQ_D22_NAMESPACE:
+        *fields = HAS_NS;
+        if (ctx->cluster) {
+            *fields |= HAS_PARAMS;
+            *scope = MOQ_D22_SCOPE_NAMESPACE;
+        }
+        break;
+    case MOQ_D22_NAMESPACE_DONE:
         *fields = HAS_NS; break;
     case MOQ_D22_PUBLISH_SKIPPED:
         *fields = HAS_NS|HAS_NAME; break;

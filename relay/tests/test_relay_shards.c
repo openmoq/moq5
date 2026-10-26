@@ -1989,6 +1989,8 @@ typedef struct dl_probe {
     uint8_t  notice;
     bool     sg_end;
     moqr_reset_desc_t reset;
+    bool     seal_reset;      /* a SEAL notice's terminal is a reset */
+    moqr_reset_desc_t seal_desc;
 } dl_probe_t;
 
 static moqr_result_t
@@ -2012,6 +2014,10 @@ pull_one(moqr_shards_t *s, uint16_t i, moqr_binding_t b, dl_probe_t *out)
     out->notice = d.notice;
     out->sg_end = d.subgroup_end;
     out->reset = d.rec.reset;
+    if (d.notice == MOQR_DELIVERY_NOTICE_SEAL) {   /* defined for it alone */
+        out->seal_reset = d.seal_reset;
+        out->seal_desc = d.seal_reset_desc;
+    }
     if (d.rec.payload != NULL) {
         out->len = moq_rcbuf_len(d.rec.payload);
         out->first = moq_rcbuf_data(d.rec.payload)[0];
@@ -4000,15 +4006,21 @@ test_shards_cap_admission_delta(void)
     moqr_shards_capacity_t con, coff;
     MOQ_TEST_CHECK(moqr_shards_capacity_describe(&on, &con) == MOQR_OK);
     MOQ_TEST_CHECK(moqr_shards_capacity_describe(&off, &coff) == MOQR_OK);
-    /* The delta lives in the structure term and, for the full-track key a
-     * requester retrieval slot holds while it routes a standalone FETCH to
-     * the owning shard, in the canon term: exactly K x max_fetches x 4232.
+    /* The delta lives in the structure term and, for what retrieval slots
+     * own, in the canon term: the full-track key a requester slot holds while
+     * it routes a standalone FETCH to the owning shard, K x max_fetches x
+     * 4232, and one Track Properties copy per owner and requester slot.
      * Channels and staging are admission-independent. The structure delta
      * scales exactly with K — pinning it as K x (progress tables + row
      * bitmap + retrieval tables), with no other term able to absorb it. */
     moqr_core_limits_t cl;
     MOQ_TEST_CHECK(moqr_core_limits_resolve(&on.core_cfg, &cl) == MOQR_OK);
-    const uint64_t keys = 2ull * cl.max_fetches * 4232ull;
+    /* And each retrieval slot, owner and requester side, may hold one
+     * Track Properties copy of a full set (2^16 bytes) plus its header. */
+    size_t hdr = 0;
+    MOQ_TEST_CHECK(moq_rcbuf_allocation_size(0, &hdr) == MOQ_OK);
+    const uint64_t keys = 2ull * cl.max_fetches * 4232ull +
+                          2ull * 2ull * cl.max_fetches * ((1ull << 16) + hdr);
     MOQ_TEST_CHECK(keys > 0);
     MOQ_TEST_CHECK_EQ_U64(con.channel_byte_ceiling, coff.channel_byte_ceiling);
     MOQ_TEST_CHECK_EQ_U64(con.canon_byte_ceiling - coff.canon_byte_ceiling, keys);
@@ -5216,9 +5228,59 @@ test_shards_term_eog_vs_seal(void)
     return failures;
 }
 
-/* The eviction watermark crosses ahead of newer records: tracked subgroups
- * below it close (sealed) at the requester before its own budget catches
- * up, and the notice applies exactly once across cap-1 retries. */
+/* The eviction cause, as the requester records it. */
+static moqr_reset_desc_t
+evicted_cause(void)
+{
+    moqr_reset_desc_t d = moqr_reset_desc_none();
+    (void)moqr_reset_desc_internal(MOQR_RESET_CODE_EVICTED, &d);
+    return d;
+}
+
+static bool
+same_cause(moqr_reset_desc_t a, moqr_reset_desc_t b)
+{
+    return a.tag == b.tag && a.value == b.value;
+}
+
+static bool
+is_seal(const dl_probe_t *p, uint64_t group, uint64_t subgroup)
+{
+    return p->notice == MOQR_DELIVERY_NOTICE_SEAL && p->group == group &&
+           p->subgroup == subgroup;
+}
+
+/* Everything shard i's TEST binding has deliverable now, in order (at most
+ * `cap`). */
+static size_t
+pull_all(moqr_shards_t *s, uint16_t i, moqr_binding_t b, dl_probe_t *out,
+         size_t cap)
+{
+    size_t n = 0;
+    while (n < cap && pull_one(s, i, b, &out[n]) == MOQR_OK) {
+        n++;
+    }
+    return n;
+}
+
+/* The SEAL notices for (group, subgroup) among `n` pulled deliveries. */
+static size_t
+seals_of(const dl_probe_t *p, size_t n, uint64_t group, uint64_t subgroup)
+{
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        k += is_seal(&p[i], group, subgroup) ? 1u : 0u;
+    }
+    return k;
+}
+
+/* The eviction watermark crosses ahead of newer records. A tracked subgroup
+ * below it that never got its SG_SEAL is reset at the requester, never
+ * sealed: the owner evicted the group, so nothing proves the requester holds
+ * all of the subgroup (a FIN says every object was delivered). Its retained
+ * record stays servable and comes first, before the requester's own budget
+ * catches up; then the terminal, a reset with the eviction cause, exactly
+ * once across cap-1 retries. */
 static int
 test_shards_term_evict_watermark(void)
 {
@@ -5259,9 +5321,23 @@ test_shards_term_evict_watermark(void)
     MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);   /* ...applied */
     dl_probe_t pr;
     MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);
-    MOQ_TEST_CHECK_EQ_U64(pr.group, 0);
-    MOQ_TEST_CHECK(pr.sg_end);   /* closed by the crossed watermark */
+    MOQ_TEST_CHECK(pr.notice == MOQR_DELIVERY_NOTICE_NONE && pr.group == 0 &&
+                   pr.subgroup == 0 && pr.object == 0);
+    MOQ_TEST_CHECK(pr.len == 16 && pr.first == 0x74);
+    MOQ_TEST_CHECK(!pr.sg_end);   /* not its subgroup's clean end */
+    MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);
+    MOQ_TEST_CHECK(is_seal(&pr, 0, 0));
+    MOQ_TEST_CHECK(pr.seal_reset && same_cause(pr.seal_desc, evicted_cause()));
+    MOQ_TEST_CHECK(!pr.sg_end);
     step_n(s, 10);   /* group 5 follows through */
+    dl_probe_t rest[8];
+    size_t n = pull_all(s, 1, d1, rest, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(seals_of(rest, n, 0, 0), (size_t)0);   /* once */
+    size_t g5 = 0;
+    for (size_t i = 0; i < n; i++) {
+        g5 += rest[i].notice == MOQR_DELIVERY_NOTICE_NONE && rest[i].group == 5;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(g5, (size_t)1);
     MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_owner_progress_slots(s, 0), 0);
     moqr_core_stats_t st;
     moqr_core_get_stats(moqr_shards_core(s, 1), &st);
@@ -5459,9 +5535,12 @@ test_shards_term_group_evict_reset(void)
 
 /* Mixed-group eviction is two-stage, like the local bind: GRP_RESET resets
  * only the BEGUN subgroup and must retain the completed-but-unsealed one's
- * progress slot, so the GRP_EVICT behind it can still find and seal that
- * stream — exactly once, before the requester's own budget evicts the
- * group. */
+ * progress slot, so the GRP_EVICT behind it can still find that stream and
+ * reset it — the owner evicted the rest of the subgroup with the group —
+ * exactly once, before the requester's own budget evicts the group. The
+ * begun subgroup ends with the reset its abandoned object carries: this
+ * subscriber never began that object, so the subgroup's terminal is the one
+ * thing that closes its stream. */
 static int
 test_shards_term_group_reset_mixed(void)
 {
@@ -5509,14 +5588,38 @@ test_shards_term_group_reset_mixed(void)
     MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_requester_open_objects(s, 1), 0);
     MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);   /* GRP_EVICT out */
     MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);   /* ...applied */
-    /* The watermark found the retained slot and sealed the completed
+    /* The watermark found the retained slot and reset the completed
      * subgroup while its record is still locally retained. */
-    dl_probe_t pr;
-    MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);
-    MOQ_TEST_CHECK_EQ_U64(pr.group, 0);
-    MOQ_TEST_CHECK_EQ_U64(pr.subgroup, 0);
-    MOQ_TEST_CHECK(pr.sg_end);   /* sealed by GRP_EVICT, exactly once */
+    dl_probe_t pr[8];
+    size_t n = pull_all(s, 1, d1, pr, 8);
+    size_t rec0 = n, seal0 = n;
+    size_t recs_sg1 = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (pr[i].notice == MOQR_DELIVERY_NOTICE_NONE && pr[i].group == 0) {
+            if (pr[i].subgroup == 0) {
+                rec0 = i;
+                MOQ_TEST_CHECK(pr[i].object == 0 && pr[i].len == 16 &&
+                               pr[i].first == 0x7D && !pr[i].sg_end);
+            } else {
+                recs_sg1++;
+            }
+        }
+        if (is_seal(&pr[i], 0, 0)) {
+            seal0 = i;
+        }
+        if (is_seal(&pr[i], 0, 0) || is_seal(&pr[i], 0, 1)) {
+            MOQ_TEST_CHECK(pr[i].seal_reset &&
+                           same_cause(pr[i].seal_desc, evicted_cause()));
+        }
+    }
+    MOQ_TEST_CHECK(rec0 < seal0 && seal0 < n);   /* the record, then the reset */
+    MOQ_TEST_CHECK_EQ_SIZE(seals_of(pr, n, 0, 0), (size_t)1);
+    MOQ_TEST_CHECK_EQ_SIZE(seals_of(pr, n, 0, 1), (size_t)1);
+    MOQ_TEST_CHECK_EQ_SIZE(recs_sg1, (size_t)0);   /* never begun: not sent */
     step_n(s, 12);   /* groups 5 and 9 follow through */
+    n = pull_all(s, 1, d1, pr, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(seals_of(pr, n, 0, 0) + seals_of(pr, n, 0, 1),
+                           (size_t)0);
     moqr_core_stats_t st;
     moqr_core_get_stats(moqr_shards_core(s, 1), &st);
     MOQ_TEST_CHECK_EQ_U64(st.subs_active, 1);
@@ -5525,6 +5628,265 @@ test_shards_term_group_reset_mixed(void)
     moqr_shards_destroy(s);
     MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
     MOQ_TEST_PASS("shards_term_group_reset_mixed");
+    return failures;
+}
+
+/* Whole objects cross with no progress slot, so the requester's journal is
+ * the only place the watermark reaches them: their unsealed subgroup is
+ * reset with the eviction cause after its retained records, none of which
+ * reads as the subgroup's clean end. The reset notice is held across
+ * downstream backpressure, replayed verbatim and acknowledged once. */
+static int
+test_shards_term_evict_whole(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_shards_cfg_t cfg;
+    shards_cfg(&cfg, &a, 2, 0);
+    cfg.admit_remote_demand = true;
+    cfg.core_cfg.log_budget.max_groups = 1;
+    cfg.demand_channel_entries = 1;
+    moqr_shards_t *s = NULL;
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_OK);
+    moqr_binding_t p0 = pub_open(s, 0);
+    MOQ_TEST_CHECK(ann(s, 0, p0, "tsJ") == MOQR_OK);
+    moqr_track_t ot;
+    MOQ_TEST_CHECK(pub_track_h(s, 0, p0, "tsJ", &ot) == MOQR_OK);
+    step_n(s, 8);
+    moqr_binding_t d1 = sub_open(s, 1, 2);
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(do_subscribe(s, 1, d1, "tsJ", 7, &sub) == MOQR_OK);
+    step_n(s, 6);
+    for (uint64_t o = 0; o < 2; o++) {
+        MOQ_TEST_CHECK(pub_obj(s, &a, 0, ot, 0, 0, o, (uint8_t)(0x90 + o), 8,
+                               0, 0, 0, false, false) == MOQR_OK);
+    }
+    step_n(s, 10);
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_owner_progress_slots(s, 0), 0);
+    MOQ_TEST_CHECK(pub_obj(s, &a, 0, ot, 5, 0, 0, 0x95, 8, 0, 0, 0, false,
+                           false) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);   /* GRP_EVICT out */
+    MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);   /* ...applied */
+    dl_probe_t pr;
+    for (uint64_t o = 0; o < 2; o++) {
+        MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);
+        MOQ_TEST_CHECK(pr.notice == MOQR_DELIVERY_NOTICE_NONE &&
+                       pr.group == 0 && pr.subgroup == 0 && pr.object == o);
+        MOQ_TEST_CHECK(pr.len == 8 && pr.first == (uint8_t)(0x90 + o));
+        MOQ_TEST_CHECK(!pr.sg_end);
+    }
+    moqr_core_t *c1 = moqr_shards_core(s, 1);
+    moqr_delivery_t d;
+    MOQ_TEST_CHECK(moqr_core_next_delivery(c1, d1, 1000, &d) == MOQR_OK);
+    MOQ_TEST_CHECK(d.notice == MOQR_DELIVERY_NOTICE_SEAL &&
+                   d.rec.group_id == 0 && d.rec.subgroup_id == 0 &&
+                   d.seal_reset && !d.subgroup_end &&
+                   same_cause(d.seal_reset_desc, evicted_cause()));
+    MOQ_TEST_CHECK(moqr_core_delivery_done(c1, d1, MOQR_DELIVERY_WOULD_BLOCK,
+                                           1000) == MOQR_OK);
+    MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);   /* held, replayed */
+    MOQ_TEST_CHECK(is_seal(&pr, 0, 0) && pr.seal_reset &&
+                   same_cause(pr.seal_desc, evicted_cause()));
+    step_n(s, 10);   /* group 5 follows through */
+    dl_probe_t rest[8];
+    size_t n = pull_all(s, 1, d1, rest, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(seals_of(rest, n, 0, 0), (size_t)0);   /* once */
+    size_t g5 = 0;
+    for (size_t i = 0; i < n; i++) {
+        g5 += rest[i].notice == MOQR_DELIVERY_NOTICE_NONE && rest[i].group == 5;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(g5, (size_t)1);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(c1, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.subs_active, 1);
+    MOQ_TEST_CHECK_EQ_U64(dch_total(s, 2), 0);
+    moqr_shards_destroy(s);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("shards_term_evict_whole");
+    return failures;
+}
+
+/* A subscriber that took a subgroup's first object but never began the
+ * next, still arriving when the owner evicted the group, holds a stream the
+ * abandoned object can never close for it. The subgroup's own terminal
+ * does, as soon as the watermark lands rather than when the requester
+ * evicts the group itself: the reset that object carries. */
+static int
+test_shards_term_evict_abandoned_unbegun(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_shards_cfg_t cfg;
+    shards_cfg(&cfg, &a, 2, 0);
+    cfg.admit_remote_demand = true;
+    cfg.core_cfg.log_budget.max_groups = 1;
+    cfg.demand_channel_entries = 1;
+    moqr_shards_t *s = NULL;
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_OK);
+    moqr_binding_t p0 = pub_open(s, 0);
+    MOQ_TEST_CHECK(ann(s, 0, p0, "tsU") == MOQR_OK);
+    moqr_track_t ot;
+    MOQ_TEST_CHECK(pub_track_h(s, 0, p0, "tsU", &ot) == MOQR_OK);
+    step_n(s, 8);
+    moqr_binding_t d1 = sub_open(s, 1, 2);
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(do_subscribe(s, 1, d1, "tsU", 7, &sub) == MOQR_OK);
+    step_n(s, 6);
+    MOQ_TEST_CHECK(pub_obj(s, &a, 0, ot, 0, 0, 0, 0xA0, 8, 0, 0, 0, false,
+                           false) == MOQR_OK);
+    step_n(s, 10);
+    dl_probe_t pr;
+    MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);
+    MOQ_TEST_CHECK(pr.notice == MOQR_DELIVERY_NOTICE_NONE && pr.group == 0 &&
+                   pr.object == 0 && !pr.sg_end);
+    /* The next object streams in; this subscriber does not begin it. */
+    MOQ_TEST_CHECK(pub_open_rec(s, &a, 0, ot, 0, 0, 1, 32, false, 0, 0) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(pub_chunk(s, &a, 0, ot, 0, 0, 1, 0xA1, 16) == MOQR_OK);
+    step_n(s, 10);
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_requester_open_objects(s, 1), 1);
+    MOQ_TEST_CHECK(pub_obj(s, &a, 0, ot, 5, 0, 0, 0xA5, 8, 0, 0, 0, false,
+                           false) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);   /* GRP_RESET out */
+    MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);   /* ...applied */
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_requester_open_objects(s, 1), 0);
+    MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);   /* GRP_EVICT out */
+    MOQ_TEST_CHECK(moqr_shards_step(s, 1000) == MOQR_OK);   /* ...applied */
+    /* The abandoned object is passed over unbegun; the reset comes next. */
+    MOQ_TEST_CHECK(pull_one(s, 1, d1, &pr) == MOQR_OK);
+    MOQ_TEST_CHECK(is_seal(&pr, 0, 0));
+    MOQ_TEST_CHECK(pr.seal_reset && same_cause(pr.seal_desc, evicted_cause()));
+    step_n(s, 10);   /* group 5 follows through */
+    dl_probe_t rest[8];
+    size_t n = pull_all(s, 1, d1, rest, 8);
+    MOQ_TEST_CHECK_EQ_SIZE(seals_of(rest, n, 0, 0), (size_t)0);   /* once */
+    for (size_t i = 0; i < n; i++) {
+        MOQ_TEST_CHECK(rest[i].notice != MOQR_DELIVERY_NOTICE_NONE ||
+                       rest[i].group != 0);
+    }
+    MOQ_TEST_CHECK_EQ_U64(dch_total(s, 2), 0);
+    moqr_shards_destroy(s);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("shards_term_evict_abandoned_unbegun");
+    return failures;
+}
+
+/* One evicted group with every terminal shape. A subgroup whose FIN already
+ * crossed keeps it; one whose upstream reset already crossed keeps that
+ * code; the two that had not ended, whole objects with no slot and chunked
+ * with one, are reset with the eviction cause. Every retained record still
+ * arrives, each subgroup's terminal exactly once. The group above the
+ * watermark is untouched until a later watermark covers it, which resets
+ * only what it newly covers. */
+static int
+test_shards_term_evict_mixed(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_shards_cfg_t cfg;
+    shards_cfg(&cfg, &a, 2, 0);
+    cfg.admit_remote_demand = true;
+    cfg.core_cfg.log_budget.max_groups = 2;
+    cfg.demand_channel_entries = 1;
+    moqr_shards_t *s = NULL;
+    MOQ_TEST_CHECK(moqr_shards_create(&cfg, &s) == MOQR_OK);
+    moqr_binding_t p0 = pub_open(s, 0);
+    MOQ_TEST_CHECK(ann(s, 0, p0, "tsM") == MOQR_OK);
+    moqr_track_t ot;
+    MOQ_TEST_CHECK(pub_track_h(s, 0, p0, "tsM", &ot) == MOQR_OK);
+    step_n(s, 8);
+    moqr_binding_t d1 = sub_open(s, 1, 2);
+    moqr_sub_t sub;
+    MOQ_TEST_CHECK(do_subscribe(s, 1, d1, "tsM", 7, &sub) == MOQR_OK);
+    step_n(s, 6);
+    moqr_core_t *c0 = moqr_shards_core(s, 0);
+    const moqr_reset_desc_t upstream = rd_wire(0x7);
+    MOQ_TEST_CHECK(pub_obj(s, &a, 0, ot, 0, 0, 0, 0xB0, 8, 0, 0, 0, false,
+                           false) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_seal_subgroup(c0, ot, 0, 0) == MOQR_OK);
+    MOQ_TEST_CHECK(pub_obj(s, &a, 0, ot, 0, 1, 1, 0xB1, 8, 0, 0, 0, false,
+                           false) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_reset_subgroup(c0, ot, 0, 1, upstream) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(pub_obj(s, &a, 0, ot, 0, 2, 2, 0xB2, 8, 0, 0, 0, false,
+                           false) == MOQR_OK);
+    MOQ_TEST_CHECK(pub_open_rec(s, &a, 0, ot, 0, 3, 3, 16, false, 0, 0) ==
+                   MOQR_OK);
+    MOQ_TEST_CHECK(pub_chunk(s, &a, 0, ot, 0, 3, 3, 0xB3, 16) == MOQR_OK);
+    MOQ_TEST_CHECK(pub_complete(s, 0, ot, 0, 3, 3) == MOQR_OK);
+    MOQ_TEST_CHECK(pub_obj(s, &a, 0, ot, 1, 0, 0, 0xC0, 8, 0, 0, 0, false,
+                           false) == MOQR_OK);
+    step_n(s, 24);
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_owner_progress_slots(s, 0), 1);
+
+    /* Group 9 evicts group 0 at the owner. */
+    MOQ_TEST_CHECK(pub_obj(s, &a, 0, ot, 9, 0, 0, 0xC9, 8, 0, 0, 0, false,
+                           false) == MOQR_OK);
+    step_n(s, 2);   /* GRP_EVICT out and applied, group 9 not yet */
+    dl_probe_t pr[16];
+    size_t n = pull_all(s, 1, d1, pr, 16);
+    size_t recs[2] = { 0, 0 };
+    for (size_t i = 0; i < n; i++) {
+        if (pr[i].notice != MOQR_DELIVERY_NOTICE_NONE) {
+            continue;
+        }
+        /* Only the subgroup whose FIN crossed has a record that reads as
+         * its clean end. */
+        bool fin_list = pr[i].group == 0 && pr[i].subgroup == 0;
+        MOQ_TEST_CHECK(pr[i].group <= 1 && pr[i].sg_end == fin_list);
+        if (pr[i].group <= 1) {
+            recs[pr[i].group]++;
+        }
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(recs[0], (size_t)4);
+    MOQ_TEST_CHECK_EQ_SIZE(recs[1], (size_t)1);
+    for (uint64_t sg = 0; sg < 4; sg++) {
+        MOQ_TEST_CHECK_EQ_SIZE(seals_of(pr, n, 0, sg), (size_t)1);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(seals_of(pr, n, 1, 0), (size_t)0);
+    for (size_t i = 0; i < n; i++) {
+        if (is_seal(&pr[i], 0, 0)) {
+            MOQ_TEST_CHECK(!pr[i].seal_reset && pr[i].sg_end);   /* the FIN */
+        } else if (is_seal(&pr[i], 0, 1)) {
+            MOQ_TEST_CHECK(pr[i].seal_reset &&
+                           same_cause(pr[i].seal_desc, upstream));
+        } else if (is_seal(&pr[i], 0, 2) || is_seal(&pr[i], 0, 3)) {
+            MOQ_TEST_CHECK(pr[i].seal_reset &&
+                           same_cause(pr[i].seal_desc, evicted_cause()));
+        }
+    }
+
+    /* Group 9 arrives; then group 10 evicts group 1 at the owner. */
+    step_n(s, 10);
+    n = pull_all(s, 1, d1, pr, 16);
+    for (uint64_t sg = 0; sg < 4; sg++) {
+        MOQ_TEST_CHECK_EQ_SIZE(seals_of(pr, n, 0, sg), (size_t)0);
+    }
+    MOQ_TEST_CHECK(pub_obj(s, &a, 0, ot, 10, 0, 0, 0xCA, 8, 0, 0, 0, false,
+                           false) == MOQR_OK);
+    step_n(s, 2);
+    n = pull_all(s, 1, d1, pr, 16);
+    MOQ_TEST_CHECK_EQ_SIZE(seals_of(pr, n, 1, 0), (size_t)1);
+    for (size_t i = 0; i < n; i++) {
+        if (is_seal(&pr[i], 1, 0)) {
+            MOQ_TEST_CHECK(pr[i].seal_reset &&
+                           same_cause(pr[i].seal_desc, evicted_cause()));
+        }
+    }
+    step_n(s, 10);
+    n = pull_all(s, 1, d1, pr, 16);
+    MOQ_TEST_CHECK_EQ_SIZE(seals_of(pr, n, 1, 0), (size_t)0);
+    moqr_core_stats_t st;
+    moqr_core_get_stats(moqr_shards_core(s, 1), &st);
+    MOQ_TEST_CHECK_EQ_U64(st.subs_active, 1);
+    MOQ_TEST_CHECK_EQ_U64(moqr_shards_debug_owner_progress_slots(s, 0), 0);
+    MOQ_TEST_CHECK_EQ_U64(dch_total(s, 2), 0);
+    moqr_shards_destroy(s);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("shards_term_evict_mixed");
     return failures;
 }
 
@@ -7298,6 +7660,9 @@ main(void)
     failures += test_shards_term_reset_code_wide();
     failures += test_shards_term_group_evict_reset();
     failures += test_shards_term_group_reset_mixed();
+    failures += test_shards_term_evict_whole();
+    failures += test_shards_term_evict_abandoned_unbegun();
+    failures += test_shards_term_evict_mixed();
     failures += test_shards_term_zero_byte_budget();
     failures += test_shards_term_destroy_queued();
     failures += test_shards_term_cancel_matrix();

@@ -74,6 +74,27 @@ cmake -S . -B build-relay-dual \
 cmake --build build-relay-dual --target moq5-relay
 ```
 
+To also serve raw QUIC on PicoQUIC (`listener.transport: "picoquic"`), add the
+threaded PicoQUIC server to the same build; the MsQuic adapter is still
+required, and stays the default:
+
+```bash
+eval "$(scripts/setup_picoquic_deps.sh)"
+cmake -S . -B build-relay-pq -Dmsquic_DIR="$msquic_DIR" \
+    -DMOQ_BUILD_RELAY=ON -DMOQ_BUILD_ADAPTER_MSQUIC=ON \
+    -DMOQ_BUILD_MSQUIC_MANAGED=ON -DMOQ_BUILD_ADAPTER_PICOQUIC=ON \
+    -DMOQ_BUILD_PQ_THREADED=ON \
+    -DMOQ_PICOQUIC_SOURCE_DIR="$MOQ_PICOQUIC_SOURCE_DIR" \
+    -DMOQ_PICOTLS_PREFIX="$MOQ_PICOTLS_PREFIX"
+cmake --build build-relay-pq --target moq5-relay
+```
+
+A configuration naming `"picoquic"` is refused by a build without it. The
+PicoQUIC listener serves raw QUIC only (no `webtransport` object beside it)
+on one lane (`listener.lanes` above 1 is refused: several picoquic contexts on
+one port are routed by address, not connection ID); `listener.picoquic` sets
+its congestion controller and socket buffer size.
+
 The WTQuic recipe pins `644644727ed7ba853c3f14450dd42a9e8a40d7e4`, which includes
 typed callback registration, the accounted receive/bounded stream admission
 APIs, and the reliable local-flush and send-commitment APIs. It applies no

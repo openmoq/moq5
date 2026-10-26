@@ -2,40 +2,144 @@
 
 import AVFoundation
 import CoreMedia
+import MoQService
 #if canImport(AVFAudio) && (os(iOS) || os(tvOS))
 import AVFAudio
 #endif
 
-/// SimplePlayer's audio/video render + sync layer.
+/// A renderer a sample is enqueued into.
+@MainActor
+protocol SampleRenderer: AnyObject {
+    var isReadyForMoreMediaData: Bool { get }
+    /// The renderer can no longer decode (a bad unit or configuration).
+    var hasFailed: Bool { get }
+    func enqueue(_ sample: CMSampleBuffer)
+    func flush()
+}
+
+/// What enqueueing one sample came to.
+enum EnqueueOutcome: Equatable {
+    case enqueued
+    /// The renderer failed, before or on this sample; it is not received.
+    case failed
+    case cancelled
+}
+
+/// Enqueue `sample` once `renderer` has room. Waiting here is the player's
+/// backpressure: no further output is pulled until this returns. A renderer
+/// that fails while it is waited on ends the wait: a failed renderer never
+/// becomes ready again by itself.
+@MainActor
+func enqueueWhenReady(_ sample: CMSampleBuffer, into renderer: SampleRenderer) async
+    -> EnqueueOutcome {
+    while true {
+        if renderer.hasFailed { return .failed }
+        if Task.isCancelled { return .cancelled }
+        if renderer.isReadyForMoreMediaData {
+            renderer.enqueue(sample)
+            return renderer.hasFailed ? .failed : .enqueued
+        }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+}
+
+/// How waiting for a finite presentation to finish came out.
+enum SettleOutcome: Equatable {
+    /// The clock reached the end: everything enqueued has presented.
+    case presented
+    /// A renderer failed before the end presented.
+    case failed
+    /// The clock did not reach the end: it never started, stopped, or did
+    /// not advance by the time the end was due.
+    case notPresented
+    case cancelled
+}
+
+/// The presentation clock a settlement watches.
+@MainActor
+protocol PresentationClock: AnyObject {
+    /// The clock's media time, or nil when no timeline drives it.
+    var mediaTime: Duration? { get }
+    /// The host time (monotonic microseconds since boot) at which media
+    /// time `end` presents on the clock's mapping; nil when no timeline
+    /// drives it or its rate is not positive.
+    func hostTime(presenting end: Duration) -> UInt64?
+}
+
+/// Wait until media time `end` has presented. It has once its host time on
+/// the mapping has come and the clock reads `end` or later: a clock reading
+/// alone is not enough, since a mapping just set takes effect on the
+/// timebase later, and until then the clock still reads its old time. The
+/// wait is bounded: it lasts until that host time plus `grace` for the
+/// timebase to catch up. A renderer that fails meanwhile, or cancellation,
+/// ends it first.
+@MainActor
+func settlePresentation(through end: Duration, clock: PresentationClock,
+                        renderers: [SampleRenderer], grace: Duration = .milliseconds(250),
+                        hostNow: () -> UInt64 = { DispatchTime.now().uptimeNanoseconds / 1_000 })
+    async -> SettleOutcome {
+    guard let due = clock.hostTime(presenting: end) else { return .notPresented }
+    let graceUS = UInt64(grace.components.seconds) * 1_000_000 +
+                  UInt64(grace.components.attoseconds / 1_000_000_000_000)
+    let deadline = due > UInt64.max - graceUS ? UInt64.max : due + graceUS
+    while true {
+        if Task.isCancelled { return .cancelled }
+        if renderers.contains(where: { $0.hasFailed }) { return .failed }
+        let host = hostNow()
+        if host >= due, let now = clock.mediaTime, now >= end { return .presented }
+        if host >= deadline { return .notPresented }
+        /* Sleep toward the end's due time, in steps short enough to notice
+         * a failure or a cancellation promptly. */
+        let wait = min(deadline - host, due > host ? due - host : 10_000, 10_000)
+        try? await Task.sleep(for: .microseconds(Int64(min(wait, UInt64(Int64.max)))))
+    }
+}
+
+/// Where the player's outputs are rendered.
+@MainActor
+protocol RenderSink: AnyObject {
+    /// The renderer for a track kind; nil for audio until it is attached.
+    func renderer(video: Bool) -> SampleRenderer?
+    func attachAudio()
+    /// Start the clock on a timeline's mapping; one timeline drives it.
+    func apply(_ timeline: WatchTimeline)
+    /// Whether `timelineID` is the timeline driving the clock.
+    func drives(_ timelineID: UInt32) -> Bool
+    /// Wait until media time `end` has been presented (settlePresentation).
+    func settle(through end: Duration) async -> SettleOutcome
+    func stop()
+}
+
+/// SimplePlayer's audio/video render layer, clocked by the media player.
 ///
-/// One `AVSampleBufferRenderSynchronizer` owns a single timebase shared by the
-/// video display layer and — when the stream carries audio — an audio renderer:
+/// One `AVSampleBufferRenderSynchronizer` owns the timebase shared by the
+/// video display layer and, when the stream carries audio, an audio
+/// renderer. The player decides *when* media presents: its `TIMELINE`
+/// output maps media time onto the host clock (`anchorMedia` presents at
+/// `anchorLocalMicroseconds`, at `rate`), and this pipeline hands that
+/// mapping to the synchronizer, so every sample presents at its own
+/// presentation time on that mapping. The player's cushion is the startup
+/// buffer: the first unit is released ahead of its presentation time.
 ///
-///  - **Audio present → video is timed to audio.** Once an audio renderer is
-///    attached, the synchronizer slaves its clock to the audio hardware, so
-///    video presents against the audio timeline (the correct master for A/V).
-///  - **No audio → video is timed independently.** The timebase runs on the
-///    host clock, started at the first frame's PTS, so video plays paced by its
-///    own stream timeline.
-///
-/// Running the shared timebase is also the proper cure for the "frozen on the
-/// first frame" trap: `AVSampleBufferDisplayLayer`'s own control timebase starts
-/// stopped, so a bare enqueue never advances — the synchronizer drives it.
-///
-/// Nothing here is hardcoded to a fixed track: renderers are keyed by media
-/// role, each sample buffer carries its own per-object format description, and
-/// the source video track can change without rebuilding the pipeline — the shape
-/// a later ABR rendition switch will need.
+/// Running the shared timebase is also what keeps the display layer from
+/// freezing on its first frame: its own control timebase starts stopped.
 @available(iOS 16.0, macOS 13.0, tvOS 16.0, *)
-final class RenderPipeline {
+@MainActor
+final class RenderPipeline: RenderSink, PresentationClock {
 
     let displayLayer: AVSampleBufferDisplayLayer
     private let synchronizer = AVSampleBufferRenderSynchronizer()
-    private var audioRenderer: AVSampleBufferAudioRenderer?
-    private var started = false
+    private let video: VideoRenderer
+    private var audio: AudioRenderer?
+    /// The timeline driving the synchronizer, and its mapping. The
+    /// synchronizer has one clock, so a second, independent timeline is not
+    /// applied.
+    private var timelineID: UInt32?
+    private var timeline: WatchTimeline?
 
     init(displayLayer: AVSampleBufferDisplayLayer) {
         self.displayLayer = displayLayer
+        self.video = VideoRenderer(layer: displayLayer)
         // Clear any frame left over from a prior session before this one's
         // timebase takes over.
         if #available(iOS 17.0, macOS 14.0, tvOS 17.0, *) {
@@ -44,70 +148,81 @@ final class RenderPipeline {
         } else {
             displayLayer.flushAndRemoveImage()
         }
-        synchronizer.addRenderer(videoRenderer)
+        /* The player decides when media presents: its TIMELINE, released a
+         * cushion ahead, starts the clock. Renderer preroll must not hold
+         * that start back: a finite stream's last units can leave a renderer
+         * below its preroll with no more media coming. */
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
+        synchronizer.addRenderer(video.rendering)
     }
 
-    /// Attach an audio renderer. The synchronizer then uses the audio clock as
-    /// the master timebase, so video follows audio.
+    func renderer(video isVideo: Bool) -> SampleRenderer? {
+        isVideo ? video : audio
+    }
+
+    /// Attach an audio renderer; the synchronizer then follows the audio
+    /// device's clock while keeping the player's mapping.
     func attachAudio() {
-        guard audioRenderer == nil else { return }
+        guard audio == nil else { return }
         configureAudioSession()
-        let renderer = AVSampleBufferAudioRenderer()
-        audioRenderer = renderer
-        synchronizer.addRenderer(renderer)
+        let renderer = AudioRenderer()
+        audio = renderer
+        synchronizer.addRenderer(renderer.renderer)
     }
 
-    func enqueueVideo(_ sample: CMSampleBuffer) {
-        startIfNeeded(at: CMSampleBufferGetPresentationTimeStamp(sample))
-        let renderer = videoRenderer
-        if renderer.isReadyForMoreMediaData { renderer.enqueue(sample) }
+    /// Start the clock on the player's mapping: at host time
+    /// `anchorLocalMicroseconds` the timebase reads `anchorMedia`. The
+    /// player's clock is the host clock (monotonic microseconds since boot).
+    func apply(_ timeline: WatchTimeline) {
+        guard timelineID == nil || timelineID == timeline.timelineID else { return }
+        timelineID = timeline.timelineID
+        self.timeline = timeline
+        synchronizer.setRate(
+            Float(timeline.rate),
+            time: cmTime(timeline.anchorMedia),
+            atHostTime: CMTime(value: Int64(timeline.anchorLocalMicroseconds),
+                               timescale: 1_000_000))
     }
 
-    func enqueueAudio(_ sample: CMSampleBuffer) {
-        guard let audioRenderer else { return }
-        startIfNeeded(at: CMSampleBufferGetPresentationTimeStamp(sample))
-        if audioRenderer.isReadyForMoreMediaData { audioRenderer.enqueue(sample) }
+    func drives(_ timelineID: UInt32) -> Bool { self.timelineID == timelineID }
+
+    func settle(through end: Duration) async -> SettleOutcome {
+        var renderers: [SampleRenderer] = [video]
+        if let audio { renderers.append(audio) }
+        return await settlePresentation(through: end, clock: self, renderers: renderers)
+    }
+
+    var mediaTime: Duration? {
+        guard timeline != nil else { return nil }
+        let t = synchronizer.currentTime()
+        guard t.isNumeric else { return nil }
+        return .microseconds(CMTimeConvertScale(t, timescale: 1_000_000,
+                                                method: .roundTowardNegativeInfinity).value)
+    }
+
+    func hostTime(presenting end: Duration) -> UInt64? {
+        guard let timeline, timeline.rate > 0 else { return nil }
+        let offset = Double((end - timeline.anchorMedia) / .microseconds(1)) / timeline.rate
+        let host = Double(timeline.anchorLocalMicroseconds) + offset
+        return host <= 0 ? 0 : UInt64(host)
     }
 
     /// Stop the clock and detach renderers so the shared display layer is free
     /// to join a fresh pipeline on the next connection.
     func stop() {
         synchronizer.setRate(0, time: .zero)
-        videoRenderer.flush()
-        audioRenderer?.flush()
-        synchronizer.removeRenderer(videoRenderer, at: .invalid)
-        if let audioRenderer {
-            synchronizer.removeRenderer(audioRenderer, at: .invalid)
+        video.flush()
+        audio?.flush()
+        synchronizer.removeRenderer(video.rendering, at: .invalid)
+        if let audio {
+            synchronizer.removeRenderer(audio.renderer, at: .invalid)
         }
     }
 
-    /// Start the shared clock at the first presented PTS, so playback is
-    /// calibrated to the stream's own timeline regardless of its epoch.
-    /// A small startup buffer. The shared clock starts this far BEHIND the
-    /// first sample so arriving media lands ahead of it (see startIfNeeded).
-    private let startupLead = CMTime(value: 300, timescale: 1000)  // 0.3 s
-
-    private func startIfNeeded(at pts: CMTime) {
-        guard !started, pts.isNumeric else { return }
-        started = true
-        // Start the clock a beat BEHIND the first sample, not exactly on it.
-        // With zero lead the free-running clock immediately outpaces real-time
-        // network delivery (~tens of ms of latency), so every later buffer
-        // arrives a hair late and the renderer drops it — silent audio, most
-        // visibly on a mid-stream rejoin where no initial burst builds headroom.
-        // The lead is a playback buffer that gives arriving media room to land
-        // ahead of the clock; it also absorbs jitter.
-        synchronizer.setRate(1.0, time: pts - startupLead)
-    }
-
-    /// iOS 17 / macOS 14 moved queued rendering off the layer onto
-    /// `sampleBufferRenderer`; gate to avoid the deprecated path while still
-    /// supporting the iOS 16 / macOS 13 floor.
-    private var videoRenderer: AVQueuedSampleBufferRendering {
-        if #available(iOS 17.0, macOS 14.0, tvOS 17.0, *) {
-            return displayLayer.sampleBufferRenderer
-        }
-        return displayLayer
+    private func cmTime(_ duration: Duration) -> CMTime {
+        let (seconds, attoseconds) = duration.components
+        return CMTime(value: seconds * 1_000_000 + attoseconds / 1_000_000_000_000,
+                      timescale: 1_000_000)
     }
 
     private func configureAudioSession() {
@@ -119,6 +234,42 @@ final class RenderPipeline {
         try? session.setActive(true)
         #endif
     }
+}
+
+/// The display layer's renderer. iOS 17 / macOS 14 moved queued rendering
+/// off the layer onto `sampleBufferRenderer`; gated to avoid the deprecated
+/// path while still supporting the iOS 16 / macOS 13 floor.
+@available(iOS 16.0, macOS 13.0, tvOS 16.0, *)
+@MainActor
+final class VideoRenderer: SampleRenderer {
+    private let layer: AVSampleBufferDisplayLayer
+    init(layer: AVSampleBufferDisplayLayer) { self.layer = layer }
+
+    var rendering: AVQueuedSampleBufferRendering {
+        if #available(iOS 17.0, macOS 14.0, tvOS 17.0, *) {
+            return layer.sampleBufferRenderer
+        }
+        return layer
+    }
+    var isReadyForMoreMediaData: Bool { rendering.isReadyForMoreMediaData }
+    var hasFailed: Bool {
+        if #available(iOS 17.0, macOS 14.0, tvOS 17.0, *) {
+            return layer.sampleBufferRenderer.status == .failed
+        }
+        return layer.status == .failed
+    }
+    func enqueue(_ sample: CMSampleBuffer) { rendering.enqueue(sample) }
+    func flush() { rendering.flush() }
+}
+
+@available(iOS 16.0, macOS 13.0, tvOS 16.0, *)
+@MainActor
+final class AudioRenderer: SampleRenderer {
+    let renderer = AVSampleBufferAudioRenderer()
+    var isReadyForMoreMediaData: Bool { renderer.isReadyForMoreMediaData }
+    var hasFailed: Bool { renderer.status == .failed }
+    func enqueue(_ sample: CMSampleBuffer) { renderer.enqueue(sample) }
+    func flush() { renderer.flush() }
 }
 
 #endif  /* canImport(AVFoundation) && canImport(CoreMedia) */

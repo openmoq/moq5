@@ -397,10 +397,11 @@ class Sender:
         live sender answers even when it is terminal -- terminal is not the
         same as closed -- while a closed owner is refused.
 
-        `sap_records_evicted` is None when the service's stamped prefix does
-        not cover that whole appended field. A stamped zero is a present zero.
-        `last_error` is historical data, including an unknown negative code,
-        and is never raised.
+        `sap_records_evicted` and `completion_error` are each None when the
+        service's stamped prefix does not cover that whole appended field. A
+        stamped zero is a present zero. `last_error` and `completion_error`
+        are historical data, including an unknown negative code, and are never
+        raised; `completion_error` 0 does not mean a completion succeeded.
         """
         return SenderStats(*_call(_native.sender_stats, self.__handle))
 

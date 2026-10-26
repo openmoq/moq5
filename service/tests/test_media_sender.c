@@ -13,6 +13,7 @@
 #include <moq/loc.h>
 #include <moq/wire.h>   /* MOQ_QUIC_VARINT_MAX */
 #include "test_support.h"
+#include "media_sender_cmaf_init.h"
 #include "endpoint_offer_expect.h"
 #include "media_builders.h"  /* shared CENC-protected init builder */
 
@@ -81,6 +82,14 @@ typedef struct {
                                      must arrive via publication-forward demand */
     bool         pub_cat_ok;      /* accepted the catalog track's PUBLISH */
     moq_publication_t pub_cat;    /* its handle (capture key in push mode) */
+    /* Push mode, the media track "v": its publication and what arrived on it
+     * (under mu): normal objects, END_OF_TRACK status objects, and its
+     * completion message. */
+    bool         pub_v_ok;
+    moq_publication_t pub_v;
+    int          pv_objs, pv_eot, pv_finished;
+    uint64_t     pv_fin_status, pv_fin_streams;
+    int          pv_fin_cause;
     /* Push-mode bootstrap (draft-18 10.2.11): the catalog PUBLISH's advertised
      * LARGEST_OBJECT, and the FETCH the consumer pulls the retained catalog
      * with -- standalone by default, or keyed on the publication when
@@ -266,10 +275,15 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
             const bool  lg_present = pr->has_largest;
             const uint64_t lg_group = pr->largest_group;
             const uint64_t lg_object = pr->largest_object;
+            const bool is_v = pr->track_name.len == 1 && pr->track_name.data[0] == 'v';
             moq_accept_publish_cfg_t acc;
             moq_accept_publish_cfg_init(&acc);
-            if (moq_session_accept_publish(session, cand, &acc,
-                                           now_us) == MOQ_OK && is_catalog) {
+            moq_result_t arc = moq_session_accept_publish(session, cand, &acc, now_us);
+            if (arc == MOQ_OK && is_v) {
+                st->pub_v = cand;
+                st->pub_v_ok = true;
+            }
+            if (arc == MOQ_OK && is_catalog) {
                 st->pub_cat = cand;
                 st->pub_cat_ok = true;
                 pthread_mutex_lock(&st->mu);
@@ -304,6 +318,11 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                        moq_publication_eq(o->pub, st->pub_cat)) {
                 /* Push mode: catalog generations ride the PUBLICATION. */
                 srv_capture_catalog(st, o->group_id, o->object_id, o->payload);
+            } else if (st->pub_v_ok && moq_publication_eq(o->pub, st->pub_v)) {
+                pthread_mutex_lock(&st->mu);
+                if (o->status == MOQ_OBJECT_NORMAL) st->pv_objs++;
+                else if (o->status == MOQ_OBJECT_END_OF_TRACK) st->pv_eot++;
+                pthread_mutex_unlock(&st->mu);
             } else if (st->a_subscribed && moq_subscription_eq(o->sub, st->sub_a)) {
                 pthread_mutex_lock(&st->mu);
                 st->a_count++;
@@ -384,6 +403,14 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                 }
                 pthread_mutex_unlock(&st->mu);
             }
+        } else if (ev.kind == MOQ_EVENT_PUBLISH_FINISHED && st->pub_v_ok &&
+                   moq_publication_eq(ev.u.publish_finished.pub, st->pub_v)) {
+            pthread_mutex_lock(&st->mu);
+            st->pv_finished++;
+            st->pv_fin_status = ev.u.publish_finished.status_code;
+            st->pv_fin_streams = ev.u.publish_finished.stream_count;
+            st->pv_fin_cause = (int)ev.u.publish_finished.cause;
+            pthread_mutex_unlock(&st->mu);
         } else if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) {
             /* MSF §11.3 step 1: a converting track's live subscription is
              * completed with a status code (Track Ended = 0x2). Capture it per
@@ -1234,43 +1261,7 @@ static size_t build_cmaf_obj(uint8_t *out, uint32_t track_id, uint32_t sflags)
 /* Minimal AVC init segment whose tkhd carries track_id. */
 static size_t build_cmaf_init(uint8_t *buf, uint32_t track_id)
 {
-    static const uint8_t avcc[] = { 0x01 };
-    size_t p = 0;
-    p += box_hdr_(buf + p, 20, "ftyp");
-    memcpy(buf + p, "isom", 4); p += 4; wr32be(buf + p, 0); p += 4;
-    memcpy(buf + p, "isom", 4); p += 4;
-
-    size_t avcc_box = 8 + sizeof(avcc);
-    size_t avc1 = 8 + 78 + avcc_box;
-    size_t stsd = 8 + 8 + avc1;
-    size_t stbl = 8 + stsd;
-    size_t minf = 8 + stbl;
-    size_t mdhd = 8 + 4 + 12;
-    size_t mdia = 8 + mdhd + minf;
-    size_t tkhd = 24;
-    size_t trak = 8 + tkhd + mdia;
-    size_t moov = 8 + trak;
-
-    p += box_hdr_(buf + p, (uint32_t)moov, "moov");
-    p += box_hdr_(buf + p, (uint32_t)trak, "trak");
-    p += box_hdr_(buf + p, (uint32_t)tkhd, "tkhd");
-    wr32be(buf + p, 0); p += 4;            /* version+flags */
-    wr32be(buf + p, 0); p += 4;            /* creation */
-    wr32be(buf + p, 0); p += 4;            /* modification */
-    wr32be(buf + p, track_id); p += 4;     /* track_ID */
-    p += box_hdr_(buf + p, (uint32_t)mdia, "mdia");
-    p += box_hdr_(buf + p, (uint32_t)mdhd, "mdhd");
-    wr32be(buf + p, 0); p += 4; wr32be(buf + p, 0); p += 4;
-    wr32be(buf + p, 0); p += 4; wr32be(buf + p, 90000); p += 4;
-    p += box_hdr_(buf + p, (uint32_t)minf, "minf");
-    p += box_hdr_(buf + p, (uint32_t)stbl, "stbl");
-    p += box_hdr_(buf + p, (uint32_t)stsd, "stsd");
-    wr32be(buf + p, 0); p += 4; wr32be(buf + p, 1); p += 4;
-    p += box_hdr_(buf + p, (uint32_t)avc1, "avc1");
-    memset(buf + p, 0, 78); p += 78;
-    p += box_hdr_(buf + p, (uint32_t)avcc_box, "avcC");
-    memcpy(buf + p, avcc, sizeof(avcc)); p += sizeof(avcc);
-    return p;
+    return sender_test_cmaf_init(buf, track_id);
 }
 
 static moq_rcbuf_t *mkbuf_bytes(const uint8_t *d, size_t n)
@@ -1280,9 +1271,9 @@ static moq_rcbuf_t *mkbuf_bytes(const uint8_t *d, size_t n)
     return b;
 }
 
-/* Create a pre-ready CMAF sender, add a CMAF track (optionally with an init
- * segment carrying init_tid), write one object, return the write result. */
-static moq_result_t try_cmaf_write(bool validate, bool with_init,
+/* Create a pre-ready CMAF sender with a required header. A targeted init_tid
+ * tests ID matching; otherwise use the object ID. Return the write result. */
+static moq_result_t try_cmaf_write(bool validate, bool targeted_init_id,
                                    uint32_t init_tid, uint32_t obj_tid,
                                    uint32_t obj_sflags, bool starts_group,
                                    bool malformed)
@@ -1306,10 +1297,16 @@ static moq_result_t try_cmaf_write(bool validate, bool with_init,
     tc.codec = MOQ_BYTES_LITERAL("avc1.640028");
     tc.bitrate = 1500000;             /* MSF-01 5.2.22: required for video */
     tc.timescale = 90000;
-    if (with_init)
-        tc.init_data = (moq_bytes_t){ initbuf, build_cmaf_init(initbuf, init_tid) };
+    tc.init_data = (moq_bytes_t){ initbuf,
+        build_cmaf_init(initbuf, targeted_init_id ? init_tid : obj_tid) };
     moq_media_track_t *v = NULL;
-    moq_media_sender_add_track(s, &tc, &v);
+    moq_result_t added = moq_media_sender_add_track(s, &tc, &v);
+    MOQ_TEST_CHECK_EQ_INT((int)added, (int)MOQ_OK);
+    MOQ_TEST_CHECK(v != NULL);
+    if (added != MOQ_OK || !v) {
+        moq_media_sender_destroy(s);
+        return MOQ_ERR_INTERNAL;
+    }
 
     moq_rcbuf_t *b;
     if (malformed) {
@@ -1350,8 +1347,16 @@ static moq_result_t cmaf_write_default_cfg(bool set_passthrough, bool malformed)
     tc.codec = MOQ_BYTES_LITERAL("avc1.640028");
     tc.bitrate = 1500000;
     tc.timescale = 90000;
+    uint8_t initbuf[256];
+    tc.init_data = (moq_bytes_t){ initbuf, build_cmaf_init(initbuf, 1) };
     moq_media_track_t *v = NULL;
-    moq_media_sender_add_track(s, &tc, &v);
+    moq_result_t added = moq_media_sender_add_track(s, &tc, &v);
+    MOQ_TEST_CHECK_EQ_INT((int)added, (int)MOQ_OK);
+    MOQ_TEST_CHECK(v != NULL);
+    if (added != MOQ_OK || !v) {
+        moq_media_sender_destroy(s);
+        return MOQ_ERR_INTERNAL;
+    }
 
     moq_rcbuf_t *b;
     if (malformed) {
@@ -1391,11 +1396,19 @@ static moq_result_t try_cmaf_write_sap(bool validate, bool starts_group,
     tc.codec = MOQ_BYTES_LITERAL("avc1.640028");
     tc.bitrate = 1500000;             /* MSF-01 5.2.22: required for video */
     tc.timescale = 90000;
+    uint8_t initbuf[256];
+    tc.init_data = (moq_bytes_t){ initbuf, build_cmaf_init(initbuf, 1) };
     moq_media_track_t *v = NULL;
-    moq_media_sender_add_track(s, &tc, &v);
+    moq_result_t added = moq_media_sender_add_track(s, &tc, &v);
+    MOQ_TEST_CHECK_EQ_INT((int)added, (int)MOQ_OK);
+    MOQ_TEST_CHECK(v != NULL);
+    if (added != MOQ_OK || !v) {
+        moq_media_sender_destroy(s);
+        return MOQ_ERR_INTERNAL;
+    }
 
     uint8_t objbuf[256];
-    size_t objlen = build_cmaf_obj(objbuf, 0, 0x02000000);  /* valid sync object */
+    size_t objlen = build_cmaf_obj(objbuf, 1, 0x02000000);  /* valid sync object */
     moq_rcbuf_t *b = mkbuf_bytes(objbuf, objlen);
     moq_media_send_object_t o = mkobj(b, true, starts_group, false);
     o.has_sap_type = has_sap;
@@ -3148,6 +3161,90 @@ int main(int argc, char **argv)
         MOQ_TEST_PASS("push_catalog_updates_no_subscriber");
     }
 
+    /* == PUSH mode: a finite publication ends with TRACK_ENDED ========= *
+     * Over real raw QUIC, the sender publishes "v" (the peer accepts every
+     * PUBLISH and subscribes nothing), writes three groups of four objects,
+     * ends the track and drains while still attached. The drain succeeds and
+     * the peer has every object and exactly one completion for the
+     * publication: a completion message (cause 0) with TRACK_ENDED (0x2) and
+     * the exact count of the three streams opened -- the PUBLISH path ends
+     * by that message, not by an in-band END_OF_TRACK object. */
+    for (int d18 = 0; d18 < 2; d18++) {
+        int port = 0;
+        memset(&g_srv, 0, sizeof(g_srv));
+        g_srv.push_mode = true;
+        g_srv.offer_d18 = d18 != 0;
+        moq_pq_threaded_t *srv = start_server(cert, key, &g_srv, &port);
+        MOQ_TEST_CHECK(srv != NULL);
+        if (!srv) return 1;
+        char url[64];
+        moq_endpoint_cfg_t ec = ep_cfg(url, sizeof(url), port);
+        const moq_version_t offer = d18 ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_16;
+        ec.versions.struct_size = sizeof(moq_version_offer_t);
+        ec.versions.policy = MOQ_VERSION_POLICY_EXACT;
+        ec.versions.versions = &offer;
+        ec.versions.version_count = 1;
+        moq_endpoint_t *ep = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_connect(&ec, &ep), (int)MOQ_OK);
+        moq_bytes_t parts[2];
+        moq_media_sender_cfg_t cfg;
+        fill_cfg(&cfg, parts);
+        cfg.publish_tracks = true;
+        moq_media_sender_t *s = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_attach(ep, &cfg, &s), (int)MOQ_OK);
+        moq_media_track_t *v = NULL;
+        if (s) add_video_track(s, &v);
+        bool up = s && v && wait_ready(s, 300);
+        MOQ_TEST_CHECK(up);
+        for (int g = 0; up && g < 3; g++)
+            for (int i = 0; i < 4; i++) {
+                moq_rcbuf_t *b = mkbuf(64, (uint8_t)(g * 4 + i));
+                moq_media_send_object_t o = mkobj(b, i == 0, i == 0, i == 3);
+                moq_result_t rc = moq_media_sender_write(s, v, &o);
+                if (rc != MOQ_OK) moq_rcbuf_decref(b);
+                MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+            }
+        if (up) {
+            MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_end_track(s, v), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_drain(ep, 10000000), (int)MOQ_OK);
+            moq_media_sender_stats_t st;
+            MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_get_stats(s, &st, sizeof(st)),
+                                  (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(st.objects_sent, 12);
+            MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 0);
+            /* Transport acknowledgement is not the peer having processed it:
+             * wait (bounded) for its completion event. */
+            int finished = 0;
+            for (int i = 0; i < 200 && !finished; i++) {
+                pthread_mutex_lock(&g_srv.mu);
+                finished = g_srv.pv_finished;
+                pthread_mutex_unlock(&g_srv.mu);
+                if (!finished) usleep(10000);
+            }
+            pthread_mutex_lock(&g_srv.mu);
+            /* A publication ends on its data plane first: its END_OF_TRACK
+             * on a stream of its own, then PUBLISH_DONE, whose Stream Count
+             * includes that stream (three media streams and the end's). */
+            MOQ_TEST_CHECK_EQ_INT(g_srv.pv_objs, 12);
+            MOQ_TEST_CHECK_EQ_INT(g_srv.pv_eot, 1);
+            MOQ_TEST_CHECK_EQ_INT(g_srv.pv_finished, 1);
+            MOQ_TEST_CHECK_EQ_INT(g_srv.pv_fin_cause, 0);
+            MOQ_TEST_CHECK_EQ_U64(g_srv.pv_fin_status, 0x2);
+            MOQ_TEST_CHECK_EQ_U64(g_srv.pv_fin_streams, 4);
+            pthread_mutex_unlock(&g_srv.mu);
+            MOQ_TEST_CHECK_EQ_INT((int)atomic_load(&g_srv.session_version),
+                                  d18 ? (int)MOQ_VERSION_DRAFT_18 : (int)MOQ_VERSION_DRAFT_16);
+        }
+        if (s) moq_media_sender_destroy(s);
+        if (ep) {
+            moq_endpoint_stop(ep);
+            moq_endpoint_destroy(ep);
+        }
+        moq_pq_threaded_stop(srv);
+        moq_pq_threaded_destroy(srv);
+        MOQ_TEST_PASS(d18 ? "push_finite_publication_d18" : "push_finite_publication_d16");
+    }
+
     /* == PUSH transport/facade coverage: advertisement -> STANDALONE FETCH == *
      * draft-18 10.2.11: a publisher that has published Objects MUST include
      * LARGEST_OBJECT, and 5.1.2 defines it as the largest Location the sending
@@ -3584,7 +3681,7 @@ int main(int argc, char **argv)
     /* == init_data survives add_track -> published catalog ============== *
      * A RAW/LOC track's init_data must be encoded into the catalog the sender
      * publishes (any packaging). The server captures the catalog payload; we
-     * parse it and confirm the "video" track's initData decodes to the bytes
+     * parse it and confirm the "video" track's initRef resolves to the bytes
      * passed to add_track. */
     {
         int port = 0;
@@ -3641,10 +3738,14 @@ int main(int argc, char **argv)
                 moq_msf_catalog_find_role(&catalog, "video");
             MOQ_TEST_CHECK(vt != NULL);
             if (vt) {
-                MOQ_TEST_CHECK(vt->has_init_data && vt->init_data.len > 0);
+                MOQ_TEST_CHECK(catalog.version_form == MOQ_MSF_VERSION_FORM_DRAFT_NAME);
+                MOQ_TEST_CHECK(vt->has_init_ref && !vt->has_init_data);
+                const moq_msf_init_data_entry_t *entry =
+                    moq_msf_catalog_find_init_data(&catalog, vt->init_ref);
+                MOQ_TEST_CHECK(entry != NULL);
                 moq_rcbuf_t *decoded = NULL;
-                MOQ_TEST_CHECK_EQ_INT((int)moq_msf_decode_init_data(
-                    al, vt->init_data, &decoded), (int)MOQ_OK);
+                if (entry) MOQ_TEST_CHECK_EQ_INT((int)moq_msf_decode_init_data(
+                    al, entry->data, &decoded), (int)MOQ_OK);
                 if (decoded) {
                     MOQ_TEST_CHECK_EQ_U64(moq_rcbuf_len(decoded),
                                           sizeof(extradata));
@@ -3653,7 +3754,7 @@ int main(int argc, char **argv)
                     moq_rcbuf_decref(decoded);
                 }
                 /* Default config authors NO CMSF metadata: a track/catalog with
-                 * none configured emits none (byte-compatible with pre-CMSF). */
+                 * none configured emits none. */
                 MOQ_TEST_CHECK_EQ_U64(catalog.content_protection_count, 0);
                 MOQ_TEST_CHECK(!vt->has_max_grp_sap && !vt->has_max_obj_sap);
                 MOQ_TEST_CHECK_EQ_U64(vt->cp_ref_id_count, 0);
@@ -3762,7 +3863,7 @@ int main(int argc, char **argv)
         /* validate on: malformed CMAF object rejected, no ownership taken. */
         MOQ_TEST_CHECK_EQ_INT(
             (int)try_cmaf_write(true, false, 0, 0, 0, true, true), (int)MOQ_ERR_PROTO);
-        /* validate on, no init: a well-formed object is accepted. */
+        /* validate on, matching default header: a well-formed object is accepted. */
         MOQ_TEST_CHECK_EQ_INT(
             (int)try_cmaf_write(true, false, 0, 1, 0x02000000, true, false), (int)MOQ_OK);
         /* validate on: a group-start object that is known not to be a SAP is

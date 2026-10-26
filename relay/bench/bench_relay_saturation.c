@@ -1209,6 +1209,11 @@ typedef struct sat_life {
     bool        lane_error, b0_violation, pin_failed;
     uint64_t    endpoint_skew_ns, elapsed_ns;
     double      skew_fraction;
+    /* A structural (--verify) snapshot: its verdict is the exact lifetime
+     * counts, terminals and bounds. The lanes' end-time spread is still
+     * recorded but is no verdict there -- it is the host scheduler's, not the
+     * relay's; a measured run is rejected for it. */
+    bool        structural;
 
     /* Open-loop (knee) generator-validity inputs (ignored on ceiling). */
     bool        is_knee;
@@ -1423,7 +1428,7 @@ sat_decide(const sat_life_t *v)
     if (v->peak_bytes > v->capacity_ceiling) {
         return "over-capacity-ceiling";
     }
-    if (v->elapsed_ns > 0 &&
+    if (!v->structural && v->elapsed_ns > 0 &&
         (double)v->endpoint_skew_ns > v->skew_fraction * (double)v->elapsed_ns) {
         return "endpoint-skew";
     }
@@ -1940,6 +1945,7 @@ sat_run_one(const sat_cfg_t *c, int base_cpu, sat_result_t *out)
     life.endpoint_skew_ns = out->endpoint_skew_ns;
     life.elapsed_ns = out->elapsed_ns;
     life.skew_fraction = c->skew_fraction;
+    life.structural = c->verify;
     life.is_knee = out->is_knee;
     life.requested_lambda = out->requested_lambda;
     life.actual_offered_rate = out->actual_offered_rate;
@@ -2587,6 +2593,59 @@ sat_verify(void)
                 ok = 0;
             }
         }
+        /* The same excessive lane skew (ten windows) is a verdict only for a
+         * measured snapshot. A structural snapshot records it and still fails
+         * on every exact gate: a leak, a wrong clone count, a delivery
+         * deficit, a capacity violation. */
+        {
+            sat_life_t sk;
+            sat_life_good(&sk, SHAPE_WHOLE);
+            sk.endpoint_skew_ns = 10u * sk.elapsed_ns;
+            const char *measured = sat_decide(&sk);
+            sk.structural = true;
+            const char *structural = sat_decide(&sk);
+            if (measured == NULL || strcmp(measured, "endpoint-skew") != 0 ||
+                structural != NULL) {
+                printf("FAIL: skew verdict measured='%s' structural='%s'\n",
+                       measured ? measured : "valid",
+                       structural ? structural : "valid");
+                ok = 0;
+            }
+            struct { const char *name; int field; const char *want; } sc[] = {
+                { "leak", 0, "allocator-leak" },
+                { "clone count", 1, "clone-count" },
+                { "delivery deficit", 2, "delivered-bytes-total" },
+                { "over ceiling", 3, "over-capacity-ceiling" },
+                { "property count", 4, "property-copy-count" },
+            };
+            for (size_t i = 0; i < sizeof(sc) / sizeof(sc[0]); i++) {
+                sat_life_t v = sk;   /* structural, excessive skew */
+                if (sc[i].field == 0) v.final_live = 1;
+                if (sc[i].field == 1) v.cross_shard_copies -= 1;
+                if (sc[i].field == 2) v.dlv_bytes[1] -= 1;
+                if (sc[i].field == 3) v.peak_bytes = v.capacity_ceiling + 1u;
+                if (sc[i].field == 4) {
+                    /* A 9-byte property set on every Object, one copy short. */
+                    uint64_t rd = v.remote_demands, prd = v.produced;
+                    v.property = 9;
+                    v.owner_pump_bytes = rd * prd * ((uint64_t)v.payload + 9u);
+                    v.timed_bytes = v.timed_obj * ((uint64_t)v.payload + 9u);
+                    v.property_copies = (int64_t)(rd * prd);
+                    const char *full = sat_decide(&v);
+                    if (full != NULL) {
+                        printf("FAIL: structural property snapshot -> '%s'\n", full);
+                        ok = 0;
+                    }
+                    v.property_copies -= 1;
+                }
+                const char *r = sat_decide(&v);
+                if (r == NULL || strcmp(r, sc[i].want) != 0) {
+                    printf("FAIL: structural '%s' -> '%s' (want '%s')\n", sc[i].name,
+                           r ? r : "valid", sc[i].want);
+                    ok = 0;
+                }
+            }
+        }
         /* Call-site cross-checks: the validator RECOMPUTES the window
          * population and the scheduled-deadline count, so production deriving
          * either from the wrong source (owner's live progress read; attempt
@@ -2968,6 +3027,10 @@ sat_verify(void)
          * exact delivered-bytes total (== total_subs·produced·payload). So the
          * fanout relationship is proven exactly, not by a >1.5x heuristic. */
         SAT_CHECK(o1.valid && o2.valid);
+        if (!o1.valid || !o2.valid) {
+            printf("  F-vs-2F invalid: F=%s 2F=%s\n", o1.valid ? "valid" : o1.invalid_reason,
+                   o2.valid ? "valid" : o2.invalid_reason);
+        }
         SAT_CHECK(o1.cross_shard_copies >= 0 && o2.cross_shard_copies >= 0);
         SAT_CHECK((uint64_t)(o1.clones_per_object + 0.5) == o1.remote_demands);
         SAT_CHECK((uint64_t)(o2.clones_per_object + 0.5) == o2.remote_demands);

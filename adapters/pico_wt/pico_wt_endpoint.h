@@ -104,9 +104,9 @@ typedef struct {
     void (*on_bidi_opened)(void *ctx, uint64_t stream_id);
     void (*on_uni_opened)(void *ctx, uint64_t stream_id);
     /* Private (adapter-owned) notification: a LOCAL stop_sending cancelled our
-     * receive direction on this stream, so tracked receive state must be
-     * dropped (retained bytes must never be replayed for a stream the
-     * application just stopped). Invoked ONLY after picoquic_stop_sending
+     * receive direction on this stream, so retained bytes must be discarded;
+     * a held/refused stream keeps a payload-free slot until its actual end.
+     * Invoked ONLY after picoquic_stop_sending
      * returns success; a failed stop leaves receive state untouched. */
     void (*on_local_stop_sending)(void *ctx, uint64_t stream_id);
     /* Private (adapter-owned) question asked before a stop_sending: true
@@ -114,6 +114,9 @@ typedef struct {
      * terminal at the transport, in which case the adapter has discarded what
      * it held for the stream and no STOP_SENDING is sent. */
     bool (*rx_terminal_discard)(void *ctx, uint64_t stream_id);
+    /* Provider-confirmed receive-half terminal on STOP, not whole-bidi
+     * closure. Discards held/refused adapter input, never core-owned work. */
+    void (*rx_stop_terminal)(void *ctx, uint64_t stream_id);
     void *cb_ctx;
 
     /* App callback set on locally-created WT data streams so h3zero

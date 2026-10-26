@@ -244,6 +244,11 @@ if(MOQ_BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/cli/main.c)
         set_tests_properties(relay_signal_order
             PROPERTIES LABELS "relay" TIMEOUT 30)
+        add_test(NAME relay_coord_wake_order COMMAND ${MOQR_WIRE_BASH}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_coord_wake_order.sh
+            ${CMAKE_CURRENT_SOURCE_DIR}/cli/main.c)
+        set_tests_properties(relay_coord_wake_order
+            PROPERTIES LABELS "relay" TIMEOUT 30)
         add_test(NAME relay_log_sink_wiring COMMAND ${MOQR_WIRE_BASH}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_log_sink_wiring.sh
             ${CMAKE_CURRENT_SOURCE_DIR}/cli/main.c
@@ -463,10 +468,12 @@ endif()
 
 # Relay-owned benchmarks are defined by relay/bench.
 
-# The relay executable: needs the MsQuic managed server (the production
+# The relay executable: needs the MsQuic managed server (the default
 # transport). The core, binding, and every test above build with zero
-# transport deps. Without the msquic-managed target the executable is simply
-# not built — there is no picoquic fallback.
+# transport deps. Without the msquic-managed target the executable is not
+# built. Where the threaded PicoQUIC server is also built, the executable can
+# serve raw QUIC on it instead (listener.transport "picoquic"); it is never
+# chosen implicitly.
 if(NOT TARGET moq::adapter-msquic-managed)
     message(STATUS
         "moq5-relay executable disabled: enable MOQ_BUILD_ADAPTER_MSQUIC=ON "
@@ -490,6 +497,10 @@ if(TARGET moq::adapter-msquic-managed)
         # The construction-and-create step depends on the WebTransport header,
         # so it joins the build only where that facade does.
         target_sources(moq5-relay PRIVATE cli/wtcfg.c)
+    endif()
+    if(TARGET moq::adapter-picoquic-threaded)
+        target_link_libraries(moq5-relay PRIVATE moq::adapter-picoquic-threaded)
+        target_compile_definitions(moq5-relay PRIVATE MOQR_HAVE_PICOQUIC)
     endif()
 
     # What the WebTransport transport is handed, captured at the create call.
@@ -873,6 +884,116 @@ if(TARGET moq::adapter-msquic-managed)
                     ${MOQR_TEST_CERT} ${MOQR_TEST_KEY} dual_split)
             set_tests_properties(relay_fill_deadline_dual_wt
                 relay_fill_deadline_dual_split PROPERTIES TIMEOUT 60)
+        endif()
+        # The production relay over the PicoQUIC listener: the real serve
+        # composition, real clients on either transport, every draft.
+        if(TARGET moq::adapter-picoquic-threaded)
+            add_executable(test_relay_pq_serve
+                tests/test_relay_pq_serve.c tests/pq_serve_cli_tu.c
+                cli/admin_listen.c cli/cliargs.c cli/config.c
+                cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c
+                cli/versions.c cli/lanestats.c cli/logevent.c cli/servelog.c
+                cli/snapshot.c cli/broker.c cli/conn_reap.c)
+            target_compile_definitions(test_relay_pq_serve PRIVATE
+                MOQR_PUMP_TESTING MOQR_HAVE_PICOQUIC)
+            target_link_libraries(test_relay_pq_serve PRIVATE moqr-admin
+                moq::adapter-msquic-managed moq::adapter-picoquic-threaded
+                Threads::Threads)
+            target_include_directories(test_relay_pq_serve PRIVATE
+                cli ${PROJECT_SOURCE_DIR}/media/msf/vendor)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_relay_pq_serve PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            foreach(_d 16 18 22)
+                add_test(NAME relay_pq_serve_d${_d}
+                    COMMAND test_relay_pq_serve ${MOQR_TEST_CERT}
+                        ${MOQR_TEST_KEY} ${_d} 1 pq pq)
+                set_tests_properties(relay_pq_serve_d${_d}
+                    PROPERTIES TIMEOUT 120 LABELS "relay;picoquic")
+            endforeach()
+            # The serve coordinator wakes for its own work (signals, row
+            # publications) over the production PicoQUIC serve, with no
+            # client and the health fallback disabled.
+            add_executable(test_relay_coord_wake
+                tests/test_relay_coord_wake.c tests/pq_serve_cli_tu.c
+                cli/admin_listen.c cli/cliargs.c cli/config.c
+                cli/admin_listen_size.c cli/info_doc.c cli/shards_doc.c
+                cli/versions.c cli/lanestats.c cli/logevent.c cli/servelog.c
+                cli/snapshot.c cli/broker.c cli/conn_reap.c)
+            target_compile_definitions(test_relay_coord_wake PRIVATE
+                MOQR_PUMP_TESTING MOQR_HAVE_PICOQUIC)
+            target_link_libraries(test_relay_coord_wake PRIVATE moqr-admin
+                moq::adapter-msquic-managed moq::adapter-picoquic-threaded
+                Threads::Threads)
+            target_include_directories(test_relay_coord_wake PRIVATE
+                cli ${PROJECT_SOURCE_DIR}/media/msf/vendor)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_relay_coord_wake PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME relay_coord_wake
+                COMMAND test_relay_coord_wake ${MOQR_TEST_CERT} ${MOQR_TEST_KEY})
+            set_tests_properties(relay_coord_wake
+                PROPERTIES TIMEOUT 240 LABELS "relay;picoquic")
+            # A serve that cannot be settled ends the process before another
+            # case can reuse its state.
+            add_test(NAME relay_coord_wake_stuck_control
+                COMMAND test_relay_coord_wake ${MOQR_TEST_CERT} ${MOQR_TEST_KEY}
+                    control-stuck)
+            set_tests_properties(relay_coord_wake_stuck_control
+                PROPERTIES TIMEOUT 60 LABELS "relay;picoquic")
+            # Traffic while serve is still publishing its facade.
+            add_test(NAME relay_pq_serve_d18_early_traffic
+                COMMAND test_relay_pq_serve ${MOQR_TEST_CERT} ${MOQR_TEST_KEY}
+                    18 1 pq pq early)
+            set_tests_properties(relay_pq_serve_d18_early_traffic
+                PROPERTIES TIMEOUT 120 LABELS "relay;picoquic")
+            # A binding detach over a PicoQUIC connection's close, plain and
+            # held by the core's close hold: the retained session stays valid
+            # until the reap pass releases it. The core and binding are the
+            # test-internals builds.
+            add_executable(test_relay_pq_held_detach
+                tests/test_relay_pq_held_detach.c cli/conn_reap.c
+                $<TARGET_OBJECTS:moq-relay-bind-test-internals>)
+            target_compile_definitions(test_relay_pq_held_detach PRIVATE
+                MOQR_HAVE_PICOQUIC)
+            target_link_libraries(test_relay_pq_held_detach PRIVATE
+                moq-relay-core-test-internals
+                moq::adapter-msquic-managed moq::adapter-picoquic-threaded
+                Threads::Threads)
+            target_include_directories(test_relay_pq_held_detach PRIVATE cli)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_relay_pq_held_detach PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            foreach(_row plain held)
+                add_test(NAME relay_pq_detach_${_row}
+                    COMMAND test_relay_pq_held_detach ${MOQR_TEST_CERT}
+                        ${MOQR_TEST_KEY} ${_row})
+                set_tests_properties(relay_pq_detach_${_row}
+                    PROPERTIES TIMEOUT 120 LABELS "relay;picoquic")
+            endforeach()
+            add_test(NAME relay_pq_bind_addr
+                COMMAND test_relay_pq_serve bind_addr)
+            set_tests_properties(relay_pq_bind_addr
+                PROPERTIES LABELS "relay;picoquic")
+            add_test(NAME relay_pq_capacity
+                COMMAND test_relay_pq_serve capacity)
+            set_tests_properties(relay_pq_capacity
+                PROPERTIES LABELS "relay;picoquic")
+            add_test(NAME relay_pq_serve_d18_msquic_publisher
+                COMMAND test_relay_pq_serve ${MOQR_TEST_CERT} ${MOQR_TEST_KEY}
+                    18 1 msquic pq)
+            add_test(NAME relay_pq_serve_d18_msquic_subscriber
+                COMMAND test_relay_pq_serve ${MOQR_TEST_CERT} ${MOQR_TEST_KEY}
+                    18 1 pq msquic)
+            set_tests_properties(relay_pq_serve_d18_msquic_publisher
+                relay_pq_serve_d18_msquic_subscriber
+                PROPERTIES TIMEOUT 120 LABELS "relay;picoquic")
         endif()
         add_test(NAME relay_loopback_same_d18
             COMMAND test_relay_loopback

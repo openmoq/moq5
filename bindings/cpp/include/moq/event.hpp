@@ -679,6 +679,20 @@ struct unknown {
 
 namespace extended_event {
 
+/* Copied identity of an outgoing subgroup whose reset was committed locally.
+ * Exactly one of sub/pub is valid. The handles identify a possibly retired
+ * generation; no provider acceptance, peer ACK or owner liveness is implied. */
+struct outgoing_subgroup_terminated {
+    subgroup_handle subgroup;
+    subscription sub;
+    publication pub;
+    uint64_t group_id;
+    uint64_t subgroup_id;
+    stream_ref stream;
+    uint64_t error_code; /* Exact reset code; zero is valid. */
+    outgoing_subgroup_terminal_cause cause;
+};
+
 /* Copied, pointer-free selected parameters, independent of the native epoch.
  * Flags preserve presence (including explicit NONE) and future flag bits;
  * a selected but short nested location is unavailable, not reconstructed. */
@@ -958,6 +972,7 @@ using extended_event_variant = std::variant<
     extended_event::namespace_update_result,
     extended_event::ns_sub_update_result,
     extended_event::subscribe_tracks_update_result,
+    extended_event::outgoing_subgroup_terminated,
     event::unknown>;
 // clang-format on
 
@@ -1712,7 +1727,8 @@ public:
                 update_record_view(d.update)};
         }
         case MOQ_EVENT_NAMESPACE_UPDATE_RESULT: {
-            if (e.detail_size < sizeof(moq_namespace_update_result_event_t))
+            if (e.detail_size < offsetof(moq_namespace_update_result_event_t, expires_ms) +
+                                sizeof(e.u.namespace_update_result.expires_ms))
                 return event::unknown{e.kind};
             const auto &d = e.u.namespace_update_result;
             return extended_event::namespace_update_result{
@@ -1731,6 +1747,16 @@ public:
             const auto &d = e.u.subscribe_tracks_update_result;
             return extended_event::subscribe_tracks_update_result{
                 update_conclusion_from_c(d), track_sub_handle(d.handle)};
+        }
+        case MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED: {
+            if (e.detail_size < MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE)
+                return event::unknown{e.kind};
+            const auto &d = e.u.outgoing_subgroup_terminated;
+            return extended_event::outgoing_subgroup_terminated{
+                subgroup_handle(d.subgroup), subscription(d.sub),
+                publication(d.pub), d.group_id, d.subgroup_id,
+                stream_ref(d.stream_ref), d.error_code,
+                static_cast<outgoing_subgroup_terminal_cause>(d.cause)};
         }
         default:
             return event::unknown{e.kind};

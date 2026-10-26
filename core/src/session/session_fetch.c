@@ -1641,6 +1641,14 @@ static bool fetch_deferred_end_allowed(const moq_fetch_entry_t *e,
     return true;
 }
 
+/* Classify only the first bytes of a fresh stream, through its profile. */
+bool bridge_session_is_fetch_header(
+    const moq_session_t *s, const moq_send_data_action_t *data)
+{
+    return s->profile->classify_data_stream(data->header, data->header_len) ==
+        MOQ_STREAM_KIND_FETCH;
+}
+
 /* A FETCH response stream's key: its single stream needs no group order.
  * The publisher priority is a placeholder; each object's travels in its
  * SEND_DATA scheduling_priority. */
@@ -2019,11 +2027,9 @@ moq_result_t moq_session_fetch(moq_session_t *s,
             return MOQ_ERR_WRONG_STATE;
         if (s->subs[jsub].filter_type != MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT)
             return MOQ_ERR_INVAL;
-        /* The joining start is derived from the subscription's *current* largest
-         * location. has_largest is stamped only by SUBSCRIBE_OK / accept (at
-         * ESTABLISHED) and cleared on slot alloc/free, so a pending or reused
-         * subscription has no current largest and is rejected here -- it can
-         * never carry a prior occupant's stale largest into this computation. */
+        /* Use the saved Joining Location: establishment stamps it, and D18
+         * replaces it on a Forward 0 -> 1 ACK. Slot allocation/free clears it,
+         * so a reused subscription cannot inherit its predecessor's value. */
         if (!s->subs[jsub].has_largest)
             return MOQ_ERR_INVAL;
         joining_wire_request_id = s->subs[jsub].request_id;
@@ -2053,9 +2059,8 @@ moq_result_t moq_session_fetch(moq_session_t *s,
         cfg->group_order != MOQ_GROUP_ORDER_ASCENDING &&
         cfg->group_order != MOQ_GROUP_ORDER_DESCENDING)
         return MOQ_ERR_INVAL;
-    /* A profile whose fetch data plane cannot reconstruct a descending response
-     * (draft-18: ascending-only group deltas) must not request one it would
-     * mis-decode; refuse up front rather than desync on the reply. */
+    /* A profile whose fetch data plane cannot reconstruct a descending
+     * response must not request one; refused before anything is sent. */
     if (cfg->group_order == MOQ_GROUP_ORDER_DESCENDING &&
         !s->profile->fetch_descending_supported)
         return MOQ_ERR_INVAL;
@@ -2148,6 +2153,14 @@ moq_result_t moq_session_fetch(moq_session_t *s,
                              s->send_cap - s->send_len);
 
         moq_result_t rc2 = s->profile->encode_fetch(s, &w, &args);
+        if (rc2 == MOQ_ERR_BUFFER && s->send_len > 0) {
+            moq_buf_writer_t probe;
+            rc2 = send_probe_begin(s, &probe);
+            if (rc2 == MOQ_OK) {
+                rc2 = s->profile->encode_fetch(s, &probe, &args);
+                rc2 = send_probe_end(s, &probe, rc2);
+            }
+        }
         if (rc2 < 0) {
             s->profile->abort_request(s, &req_ep);
             FETCH_DROP_KEY();

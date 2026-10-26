@@ -156,6 +156,8 @@ set_target_properties(moq-adapter-picoquic PROPERTIES
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(moq-adapter-picoquic PRIVATE
         -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+elseif(MSVC)
+    target_compile_options(moq-adapter-picoquic PRIVATE $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:/WX>)
 endif()
 
 # -- Install ------------------------------------------------------------
@@ -215,7 +217,33 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqAdapterTargets-install.cmake
 # -- Threaded helper (optional) ------------------------------------------
 
 if(MOQ_BUILD_PQ_THREADED)
-    add_library(moq-adapter-picoquic-threaded moq_picoquic_threaded.c)
+    # The threaded facade and its lane group (pq_lane_group.c): one source
+    # list, compiled into the library and again into its test-internals.
+    set(_pq_threaded_sources moq_picoquic_threaded.c)
+    if(WIN32)
+        list(APPEND _pq_threaded_sources pq_lane_group_unsupported.c)
+    else()
+        list(APPEND _pq_threaded_sources pq_lane_group.c pq_cid_route.c
+            pq_inbox.c pq_group_crypto.c)
+    endif()
+    # The lane group's keyed primitives (pq_group_crypto.c) come from the
+    # adapter's TLS backend through picotls's public API.
+    function(moq_pq_threaded_backend target)
+        if(_moq_pq_verify_backend STREQUAL "openssl")
+            target_include_directories(${target}
+                PRIVATE ${MOQ_PTLS_OPENSSL_INCLUDE_DIR})
+            target_compile_definitions(${target}
+                PRIVATE MOQ_PICOQUIC_VERIFY_OPENSSL)
+        elseif(_moq_pq_verify_backend STREQUAL "mbedtls")
+            target_include_directories(${target}
+                SYSTEM PRIVATE
+                    ${MOQ_PICOQUIC_MBEDTLS_INCLUDE_DIR}
+                    ${PTLS_INCLUDE_DIR})
+            target_compile_definitions(${target}
+                PRIVATE MOQ_PICOQUIC_VERIFY_MBEDTLS)
+        endif()
+    endfunction()
+    add_library(moq-adapter-picoquic-threaded ${_pq_threaded_sources})
     add_library(moq::adapter-picoquic-threaded ALIAS moq-adapter-picoquic-threaded)
 
     target_include_directories(moq-adapter-picoquic-threaded
@@ -242,6 +270,7 @@ if(MOQ_BUILD_PQ_THREADED)
     target_link_libraries(moq-adapter-picoquic-threaded
         PUBLIC moq::adapter-picoquic Threads::Threads)
 
+    moq_pq_threaded_backend(moq-adapter-picoquic-threaded)
     set_target_properties(moq-adapter-picoquic-threaded PROPERTIES
         C_STANDARD 11
         C_STANDARD_REQUIRED ON)
@@ -249,6 +278,8 @@ if(MOQ_BUILD_PQ_THREADED)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(moq-adapter-picoquic-threaded PRIVATE
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    elseif(MSVC)
+        target_compile_options(moq-adapter-picoquic-threaded PRIVATE $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:/WX>)
     endif()
 
     install(TARGETS moq-adapter-picoquic-threaded
@@ -484,6 +515,21 @@ if(MOQ_BUILD_TESTS)
     endif()
     add_test(NAME pq_conformance COMMAND test_pq_conformance)
 
+    # The send-half acknowledgement a graceful drain waits for, over
+    # picoquic's own SACK ranges (its private stream state: source tree only).
+    if(MOQ_PICOQUIC_SOURCE_DIR)
+        add_executable(test_pq_stream_acked tests/test_pq_stream_acked.c)
+        target_include_directories(test_pq_stream_acked PRIVATE
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_stream_acked PRIVATE $<BUILD_INTERFACE:${_PQ}>)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_stream_acked PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_stream_acked COMMAND test_pq_stream_acked)
+    endif()
+
     # Real-transport establishment in the deterministic simulator: genuine
     # QUIC packets and stream ids through the actual adapter + picoquic
     # stack (the seam the fake-pair suite cannot cover). Requires the
@@ -554,7 +600,7 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(pq_sim_scheduling PROPERTIES TIMEOUT 120)
 
         # Local-stream reset after FIN against the pinned, patched picoquic
-        # (patches/picoquic/0002): constructed stream/SACK rows plus packet
+        # (patches/picoquic/0003): constructed stream/SACK rows plus packet
         # rows over the simulated links. Provider-only; no adapter code.
         add_executable(test_pq_reset_after_fin tests/test_pq_reset_after_fin.c)
         target_include_directories(test_pq_reset_after_fin PRIVATE
@@ -575,7 +621,7 @@ if(MOQ_BUILD_TESTS)
         # RESET_STREAM_AT, by decoder and producer testing after a simulated
         # handshake, plus one real-packet row for the grant reaching the peer.
         # Provider-only; no adapter code. A provider without picoquic patch
-        # 0009 fails its policy rows.
+        # 0003 fails its policy rows.
         add_executable(test_pq_provider_stream_credit
             tests/test_pq_provider_stream_credit.c)
         target_include_directories(test_pq_provider_stream_credit PRIVATE
@@ -637,8 +683,62 @@ if(MOQ_BUILD_TESTS)
         add_test(NAME pq_stop_release COMMAND test_pq_stop_release)
         set_tests_properties(pq_stop_release PROPERTIES TIMEOUT 120)
 
+        # Shared send admission over real picoquic: the adapter's queue with
+        # a small budget, the capability advertised and withdrawn, what the
+        # subscriber receives compared, coalesced and standalone FINs while
+        # the budget is spent.
+        add_executable(test_pq_sim_shared_admission
+            tests/test_pq_sim_shared_admission.c moq_picoquic.c
+            picoquic_endpoint.c ../common/moq_pq_send_queue.c)
+        target_compile_definitions(test_pq_sim_shared_admission PRIVATE
+            MOQ_BUILDING MOQ_PICOQUIC_TESTING
+            PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+        target_include_directories(test_pq_sim_shared_admission PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../common
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/support
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_sim_shared_admission PRIVATE
+            moq::core
+            picoquic-test
+            ${_adapter_tls_link})
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_sim_shared_admission PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_sim_shared_admission COMMAND test_pq_sim_shared_admission)
+        set_tests_properties(pq_sim_shared_admission PROPERTIES TIMEOUT 300)
+
         include(${PROJECT_SOURCE_DIR}/cmake/MoqPicoquicTerminalTests.cmake)
         moq_add_picoquic_terminal_tests(pq moq::adapter-picoquic ${_adapter_tls_link})
+    endif()
+
+    # Source-mode builds carry patches/picoquic (see patches/picoquic/series);
+    # the contract below holds only with 0004 and 0009 applied.
+    if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR AND _PQ)
+        # The stateless-reset contract patches/picoquic/0009 carries: detection
+        # after a NAT rebinding and behind another connection's ID, and a
+        # context that never sends a reset. Public picoquic API only, so a
+        # picoquic without the patch fails here, not in a relay.
+        add_executable(test_pq_stateless_reset_contract
+            tests/test_pq_stateless_reset_contract.c)
+        target_compile_definitions(test_pq_stateless_reset_contract PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        target_include_directories(test_pq_stateless_reset_contract PRIVATE
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_stateless_reset_contract PRIVATE
+            ${_PQ} ${_adapter_tls_link})
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_stateless_reset_contract PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_stateless_reset_contract
+            COMMAND test_pq_stateless_reset_contract)
+        set_tests_properties(pq_stateless_reset_contract PROPERTIES TIMEOUT 120)
     endif()
 
     # Source-mode link-policy contract (see tests/source_mode_link_policy.cmake):
@@ -668,11 +768,17 @@ if(MOQ_BUILD_TESTS)
             picoquic_string_duplicate=moq_test_reason_duplicate)
         target_compile_options(pq_close_reason_sender PRIVATE
             $<TARGET_PROPERTY:${_PQ},COMPILE_OPTIONS>)
-        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-            target_compile_options(pq_close_reason_sender PRIVATE
-                -Wall -Wextra -Wpedantic
-                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
-        endif()
+        # Upstream picoquic's own source, rebuilt only to rename its string
+        # duplicator: it is compiled as the provider compiles it (options,
+        # definitions, include paths, language standard), not under
+        # LibMoQ's warning policy, which governs LibMoQ's own sources.
+        foreach(_pq_lang_prop C_STANDARD C_STANDARD_REQUIRED C_EXTENSIONS)
+            get_target_property(_pq_lang_value ${_PQ} ${_pq_lang_prop})
+            if(NOT _pq_lang_value STREQUAL "_pq_lang_value-NOTFOUND")
+                set_target_properties(pq_close_reason_sender PROPERTIES
+                    ${_pq_lang_prop} "${_pq_lang_value}")
+            endif()
+        endforeach()
         add_executable(test_pq_close_reason_oom
             tests/test_pq_close_reason_oom.c
             $<TARGET_OBJECTS:pq_close_reason_sender>)
@@ -709,6 +815,49 @@ endif()
 
 
 if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
+    # Compile the real facade/Windows shim against typed native-call fakes on
+    # a host with pthreads. No sockets/threads and no native Windows claim.
+    if(NOT WIN32)
+        add_executable(test_threaded_windows_model
+            tests/test_threaded_windows_model.c)
+        target_include_directories(test_threaded_windows_model PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/win32
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_compile_definitions(test_threaded_windows_model PRIVATE
+            MOQ_TEST_WIN32_FAKES)
+        if(EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+            target_compile_definitions(test_threaded_windows_model PRIVATE
+                MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        endif()
+        target_link_libraries(test_threaded_windows_model PRIVATE
+            moq::adapter-picoquic Threads::Threads)
+        set_target_properties(test_threaded_windows_model PROPERTIES
+            C_STANDARD 11 C_STANDARD_REQUIRED ON)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_threaded_windows_model PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME threaded_windows_wait_model
+            COMMAND test_threaded_windows_model wait)
+        add_test(NAME threaded_windows_startup_model
+            COMMAND test_threaded_windows_model startup)
+        set_tests_properties(threaded_windows_wait_model
+            threaded_windows_startup_model PROPERTIES TIMEOUT 30)
+        # Independent processes preserve causal evidence when old callers
+        # hit the exact unexpected-retry trap on their first failing row.
+        foreach(_win_row IN ITEMS public-clock public-shim public-native
+                public-infinite public-controls stop-clock stop-shim
+                stop-native stop-controls startup-clock startup-shim
+                startup-native startup-ready-clock windows-groups)
+            add_test(NAME threaded_windows_${_win_row}_model
+                COMMAND test_threaded_windows_model ${_win_row})
+            set_tests_properties(threaded_windows_${_win_row}_model
+                PROPERTIES TIMEOUT 30)
+        endforeach()
+    endif()
+
     add_executable(test_threaded_compile tests/test_threaded_compile.c)
     target_link_libraries(test_threaded_compile PRIVATE moq::adapter-picoquic-threaded)
     if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
@@ -818,13 +967,41 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     # land at packet ingestion, before the ordinary pump). Mirrors the mvfst
     # test-internals precedent.
     add_library(moq-adapter-picoquic-threaded-test-internals STATIC
-        moq_picoquic_threaded.c)
+        ${_pq_threaded_sources})
+    moq_pq_threaded_backend(moq-adapter-picoquic-threaded-test-internals)
     target_include_directories(moq-adapter-picoquic-threaded-test-internals
         PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
     target_include_directories(moq-adapter-picoquic-threaded-test-internals
         PRIVATE "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+    # The group crypto in this archive (pq_group_crypto.c) calls the picotls
+    # OpenSSL backend directly. A picotls built outside this tree reaches
+    # picoquic-core as plain archive paths, which carry no edge to the
+    # backend's crypto library, and picoquic-core lists its OpenSSL ahead of
+    # them. A linker that keeps a shared library only when something before it
+    # needs one (GNU ld's --as-needed) then leaves the backend archive's
+    # OpenSSL references unresolved in a test whose only OpenSSL user is that
+    # archive. So this archive also depends on the backend archive as an
+    # imported target that carries the edge, which places OpenSSL after it.
+    # The archive is then named twice, harmlessly for such a linker; Apple's
+    # linker needs no order and reports a library named twice, so there the
+    # archive is left to picoquic-core alone.
+    set(_pq_ptls_backend "")
+    if(_moq_pq_verify_backend STREQUAL "openssl" AND NOT APPLE AND
+       TARGET picoquic-core AND TARGET OpenSSL::Crypto)
+        get_target_property(_pq_core_links picoquic-core INTERFACE_LINK_LIBRARIES)
+        foreach(_item IN LISTS _pq_core_links)
+            if(_item MATCHES "(^|/)libpicotls-openssl\\.a$")
+                add_library(moq_pq_test_ptls_openssl STATIC IMPORTED)
+                set_target_properties(moq_pq_test_ptls_openssl PROPERTIES
+                    IMPORTED_LOCATION "${_item}"
+                    INTERFACE_LINK_LIBRARIES OpenSSL::Crypto)
+                set(_pq_ptls_backend moq_pq_test_ptls_openssl)
+                break()
+            endif()
+        endforeach()
+    endif()
     target_link_libraries(moq-adapter-picoquic-threaded-test-internals
-        PUBLIC moq::adapter-picoquic Threads::Threads)
+        PUBLIC ${_pq_ptls_backend} moq::adapter-picoquic Threads::Threads)
     target_compile_definitions(moq-adapter-picoquic-threaded-test-internals
         PRIVATE MOQ_PQ_THREADED_TESTING)
     set_target_properties(moq-adapter-picoquic-threaded-test-internals
@@ -848,6 +1025,210 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME threaded_lifecycle COMMAND test_threaded_lifecycle)
+
+    add_executable(test_threaded_terminal_error
+        tests/test_threaded_terminal_error.c)
+    target_link_libraries(test_threaded_terminal_error PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    target_include_directories(test_threaded_terminal_error PRIVATE
+        "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+    target_compile_definitions(test_threaded_terminal_error PRIVATE
+        MOQ_PQ_THREADED_TESTING)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_terminal_error PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME threaded_terminal_error COMMAND test_threaded_terminal_error)
+    set_tests_properties(threaded_terminal_error PROPERTIES TIMEOUT 30)
+
+    # A server receive with no connection input still pumps the application;
+    # only its pre-pump service is skipped.
+    add_executable(test_threaded_quiet_receive
+        tests/test_threaded_quiet_receive.c)
+    target_link_libraries(test_threaded_quiet_receive PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    target_include_directories(test_threaded_quiet_receive PRIVATE
+        "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+    target_compile_definitions(test_threaded_quiet_receive PRIVATE
+        MOQ_PQ_THREADED_TESTING)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_quiet_receive PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME threaded_quiet_receive COMMAND test_threaded_quiet_receive)
+    set_tests_properties(threaded_quiet_receive PROPERTIES TIMEOUT 30)
+
+    # Terminal retention until the application acknowledges, for every
+    # terminal cause, plus the per-connection user slot (test-internals for
+    # the service-failure seam).
+    add_executable(test_threaded_retain_terminal
+        tests/test_threaded_retain_terminal.c)
+    target_link_libraries(test_threaded_retain_terminal PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_retain_terminal PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_retain_terminal PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    foreach(_row peer_close app_close service_fatal cap cap_legacy legacy prefix
+                 client stop)
+        add_test(NAME threaded_retain_terminal_${_row}
+                 COMMAND test_threaded_retain_terminal ${_row})
+        set_tests_properties(threaded_retain_terminal_${_row}
+            PROPERTIES TIMEOUT 120)
+    endforeach()
+
+    # The facade's wake scheduling against a model of picoquic's select.
+    add_executable(test_pq_wake_sched tests/test_pq_wake_sched.c)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pq_wake_sched PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME pq_wake_sched COMMAND test_pq_wake_sched)
+
+    # POSIX lane-group backend coverage; not a Windows pass/skip surrogate.
+    if(NOT WIN32)
+        # The lane group's pure parts: the router over fake owner functions, the
+        # inbox under producers, and the connection IDs over the TLS backend.
+        add_executable(test_pq_cid_route tests/test_pq_cid_route.c pq_cid_route.c)
+        add_executable(test_pq_inbox tests/test_pq_inbox.c pq_inbox.c)
+        target_link_libraries(test_pq_inbox PRIVATE moq::core Threads::Threads)
+        add_executable(test_pq_recv_budget tests/test_pq_recv_budget.c)
+        # The group crypto is internal (hidden in the shared adapter), so the test
+        # takes it from the static test-internals archive, not the installed
+        # library's exported surface. The backend include lets its header's
+        # <picotls.h> compile.
+        add_executable(test_pq_group_crypto tests/test_pq_group_crypto.c)
+        target_include_directories(test_pq_group_crypto PRIVATE
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_group_crypto PRIVATE
+            moq-adapter-picoquic-threaded-test-internals)
+        moq_pq_threaded_backend(test_pq_group_crypto)
+        foreach(_t test_pq_cid_route test_pq_inbox test_pq_group_crypto test_pq_recv_budget)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(${_t} PRIVATE -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+        endforeach()
+        add_test(NAME pq_cid_route COMMAND test_pq_cid_route)
+        add_test(NAME pq_inbox COMMAND test_pq_inbox)
+        add_test(NAME pq_group_crypto COMMAND test_pq_group_crypto)
+        add_test(NAME pq_recv_budget COMMAND test_pq_recv_budget)
+        set_tests_properties(pq_inbox PROPERTIES TIMEOUT 120)
+    endif()
+
+
+    # The streaming_objects, socket_buffer_bytes and bind_address options, and
+    # the server's pump and wake behaviour.
+    add_executable(test_threaded_server_options
+        tests/test_threaded_server_options.c)
+    target_link_libraries(test_threaded_server_options PRIVATE
+        moq::adapter-picoquic-threaded Threads::Threads)
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_server_options PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_server_options PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    foreach(_row streaming_on streaming_off socket_buffer wake_pressure bind_v4
+                 bind_v6 socket_buffer_limit idle_wake idle_deadline)
+        add_test(NAME threaded_server_options_${_row}
+                 COMMAND test_threaded_server_options ${_row})
+        set_tests_properties(threaded_server_options_${_row}
+            PROPERTIES TIMEOUT 120)
+    endforeach()
+
+    # POSIX lane-group backend coverage; not a Windows pass/skip surrogate.
+    if(NOT WIN32)
+        # The lane group over loopback: real clients against a 4-lane server, a
+        # NAT rebinding through a proxy, a stop under load, the per-lane
+        # deadline, the group's admission total, and the bounds and accessors.
+        add_executable(test_threaded_lane_group tests/test_threaded_lane_group.c)
+        # Links the test-internals archive: stop_load places clients on lanes
+        # through its routing control. The white-box facade header is read, so the
+        # test sees the same testing layout as the archive.
+        target_compile_definitions(test_threaded_lane_group PRIVATE
+            MOQ_PQ_THREADED_TESTING
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        target_link_libraries(test_threaded_lane_group PRIVATE
+            moq-adapter-picoquic-threaded-test-internals Threads::Threads)
+        # The invariants row reads context settings the group re-asserts; the
+        # backend include provides <picotls.h> for that white-box check.
+        moq_pq_threaded_backend(test_threaded_lane_group)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_threaded_lane_group PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        foreach(_row spread rebind reset reset_crosslane reset_local reset_forwarded reset_controls stop_load deadline deadline_one admission limits invariants oom bind_specific)
+            add_test(NAME threaded_lane_group_${_row}
+                COMMAND test_threaded_lane_group ${_row})
+            set_tests_properties(threaded_lane_group_${_row} PROPERTIES TIMEOUT 120)
+        endforeach()
+    endif()
+
+    # The drain gate on session pending output at a parked pass boundary,
+    # for the client single-connection and server aggregate paths (stage
+    # hooks of the test-internals build).
+    add_executable(test_threaded_drain_gates tests/test_threaded_drain_gates.c)
+    target_link_libraries(test_threaded_drain_gates PRIVATE
+        moq-adapter-picoquic-threaded-test-internals Threads::Threads)
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_drain_gates PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_drain_gates PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME threaded_drain_gates COMMAND test_threaded_drain_gates)
+    set_tests_properties(threaded_drain_gates PROPERTIES TIMEOUT 120)
+
+    # What does and does not hold the drain: receive-only backlog, an open
+    # idle draft-18 request stream and a future timer do not; an unACKed FIN
+    # does.
+    add_executable(test_threaded_drain_controls tests/test_threaded_drain_controls.c)
+    target_link_libraries(test_threaded_drain_controls PRIVATE
+        moq-adapter-picoquic-threaded-test-internals Threads::Threads)
+    target_include_directories(test_threaded_drain_controls PRIVATE
+        "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        target_compile_definitions(test_threaded_drain_controls PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_threaded_drain_controls PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME threaded_drain_controls COMMAND test_threaded_drain_controls)
+    set_tests_properties(threaded_drain_controls PROPERTIES TIMEOUT 180)
+
+    # The drain holds while the session retains reliable lifecycle output: a
+    # draft-18 rejection that reaches a client whose event queue is full.
+    if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
+        add_executable(test_threaded_drain_retained tests/test_threaded_drain_retained.c)
+        target_link_libraries(test_threaded_drain_retained PRIVATE
+            moq-adapter-picoquic-threaded-test-internals Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_threaded_drain_retained PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME threaded_drain_retained
+            COMMAND test_threaded_drain_retained
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(threaded_drain_retained PROPERTIES TIMEOUT 120)
+    endif()
 
     # SETUP authorization tokens through the facade over real loopback: the
     # server's SETUP_COMPLETE carries the configured tokens by value; a set
@@ -941,6 +1322,92 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     endif()
     add_test(NAME threaded_keepalive COMMAND test_threaded_keepalive)
 
+    add_executable(test_pq_deadline tests/test_pq_deadline.c)
+    target_link_libraries(test_pq_deadline PRIVATE
+        moq-adapter-picoquic-threaded-test-internals)
+    target_include_directories(test_pq_deadline PRIVATE
+        "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+    # Builds a facade struct directly, so it must see the same layout as the
+    # test-internals archive (the testing-only fields change field offsets).
+    target_compile_definitions(test_pq_deadline PRIVATE MOQ_PQ_THREADED_TESTING)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pq_deadline PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME pq_deadline COMMAND test_pq_deadline)
+    set_tests_properties(pq_deadline PROPERTIES TIMEOUT 30)
+
+    # POSIX lane-group backend coverage; not a Windows pass/skip surrogate.
+    if(NOT WIN32)
+        # Drives construction to a lane-spawn failure after an earlier lane's
+        # worker is running, through the test-internals spawn seam, and confirms the
+        # unwind leaks no thread, descriptor or allocation. Public API only, so no
+        # facade-layout dependency: the seam symbols come from the archive.
+        add_executable(test_pq_lane_group_unwind tests/test_pq_lane_group_unwind.c)
+        target_link_libraries(test_pq_lane_group_unwind PRIVATE
+            moq-adapter-picoquic-threaded-test-internals Threads::Threads)
+        target_compile_definitions(test_pq_lane_group_unwind PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_lane_group_unwind PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_lane_group_unwind COMMAND test_pq_lane_group_unwind)
+        set_tests_properties(pq_lane_group_unwind PROPERTIES TIMEOUT 30)
+
+        # Drives one real receive turn through the test-internals seams: over two
+        # scripted sockets the per-turn budget is shared exactly fairly
+        # (pq_recv_turn), and over two real loopback sockets the turn reads within
+        # each socket's share (pq_recv_turn_native). The use of pq_recv_share, not
+        # its arithmetic; no connection context.
+        add_executable(test_pq_recv_turn tests/test_pq_recv_turn.c)
+        target_link_libraries(test_pq_recv_turn PRIVATE
+            moq-adapter-picoquic-threaded-test-internals Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_recv_turn PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_recv_turn COMMAND test_pq_recv_turn fair)
+        set_tests_properties(pq_recv_turn PROPERTIES TIMEOUT 30)
+        add_test(NAME pq_recv_turn_native COMMAND test_pq_recv_turn native)
+        set_tests_properties(pq_recv_turn_native PROPERTIES TIMEOUT 30)
+
+        # Reads a lane's detect-drop fold through the public lane-stats getter after
+        # presetting the counters through the test-internals seam, so the public
+        # projection's sum and saturation are covered, not only the helper.
+        add_executable(test_pq_lane_stats tests/test_pq_lane_stats.c)
+        target_link_libraries(test_pq_lane_stats PRIVATE
+            moq-adapter-picoquic-threaded-test-internals Threads::Threads)
+        target_compile_definitions(test_pq_lane_stats PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_lane_stats PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_lane_stats COMMAND test_pq_lane_stats)
+        set_tests_properties(pq_lane_stats PROPERTIES TIMEOUT 30)
+
+        # A raw picoquic client resumes against a real two-lane group server and
+        # confirms, with traffic, that the group refuses 0-RTT (its ticket forbids
+        # early data) while ordinary 1-RTT resumption works. Reads the client's
+        # resumption fields, so it needs the backend picoquic headers.
+        add_executable(test_pq_zero_rtt_refused tests/test_pq_zero_rtt_refused.c)
+        target_compile_definitions(test_pq_zero_rtt_refused PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        target_link_libraries(test_pq_zero_rtt_refused PRIVATE
+            moq::adapter-picoquic-threaded Threads::Threads)
+        moq_pq_threaded_backend(test_pq_zero_rtt_refused)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_zero_rtt_refused PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_zero_rtt_refused COMMAND test_pq_zero_rtt_refused)
+        set_tests_properties(pq_zero_rtt_refused PROPERTIES TIMEOUT 60)
+    endif()
+
     set(_threaded_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-threaded")
     set(_threaded_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-threaded-test-build")
     include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
@@ -1000,13 +1467,14 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
                 "${CMAKE_INSTALL_LIBDIR}"
                 "${CMAKE_CXX_FLAGS}"
                 "${_threaded_install_staging}"
+                "${CMAKE_INSTALL_INCLUDEDIR}"
                 "${_picoquic_abi_context}")
         set_tests_properties(adapter_threaded_install_consumer
             PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
     endif()
 
-    # End-to-end group order over real picoquic: publisher facade ->
-    # subscriber session, asserting the order groups complete in.
+    # Group-order negotiation and complete delivery over real picoquic in
+    # drafts 16, 18 and 22. Deterministic tests own the scheduling oracle.
     if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
         add_executable(test_group_order_e2e tests/test_group_order_e2e.c)
         target_link_libraries(test_group_order_e2e PRIVATE
@@ -1015,12 +1483,17 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
             ${PROJECT_SOURCE_DIR}/tests/unit)
         target_compile_options(test_group_order_e2e PRIVATE
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        add_test(NAME group_order_e2e_helpers
+            COMMAND test_group_order_e2e --self-test)
+        set_tests_properties(group_order_e2e_helpers PROPERTIES TIMEOUT 30)
         add_test(NAME group_order_e2e
             COMMAND test_group_order_e2e
                 --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
                 --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        # Twelve cases: 12 * (10 s receive + 1 s cleanup + 2 * 3 s stop)
+        # = 204 s, plus headroom for listener startup and scheduling.
         set_tests_properties(group_order_e2e PROPERTIES
-            LABELS "network" TIMEOUT 120 RESOURCE_LOCK service_network)
+            LABELS "network" TIMEOUT 240 RESOURCE_LOCK service_network)
     endif()
 endif()
 

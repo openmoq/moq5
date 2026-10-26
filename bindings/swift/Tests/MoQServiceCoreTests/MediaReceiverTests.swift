@@ -56,6 +56,23 @@ struct ReceiverAttachTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Closing a receiver again never removes a later receiver's hook")
+    func closeAgainKeepsTheLaterHook() async throws {
+        let rig = try makeRig()
+        await rig.receiver.close()
+        let laterBackend = ScriptedReceiverBackend()
+        let later = try MediaReceiver.attach(
+            to: rig.endpoint, configuration: .live(namespace: "live/x"),
+            backend: laterBackend)
+        await rig.receiver.close()                 /* again: a no-op */
+        /* The later receiver's teardown still runs at shutdown. */
+        await rig.endpoint.close()
+        #expect(laterBackend.snapshot().detachCalls == 1)
+        #expect(rig.receiverBackend.snapshot().detachCalls == 1)
+        _ = later
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Attach validates the configuration and rejects a closed endpoint")
     func attachValidation() async throws {
         let endpointBackend = ScriptedEndpointBackend()

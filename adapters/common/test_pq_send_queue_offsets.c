@@ -69,6 +69,9 @@ static void track_del(void *p, size_t n)
 }
 static void *ca(size_t n, void *c)
 { (void)c; note(n); void *p = malloc(n ? n : 1); track_add(p, n); return p; }
+/* The old block's record is found while its pointer is still valid; a
+ * successful realloc moves that record to the new block, a failed one
+ * leaves it as it was. */
 static void *cr(void *p, size_t o, size_t n, void *c)
 {
     (void)c;
@@ -79,10 +82,22 @@ static void *cr(void *p, size_t o, size_t n, void *c)
         g_refused_old = o; g_refused_new = n;
         return NULL;
     }
+    size_t rec = g_nblocks;
+    for (size_t i = 0; p && i < g_nblocks; i++)
+        if (g_blocks[i].p == p) { rec = i; break; }
     void *r = realloc(p, n ? n : 1);
     if (!r) return NULL;
-    track_del(p, o);
-    track_add(r, n);
+    if (!p) {
+        track_add(r, n);
+    } else if (rec == g_nblocks) {
+        g_size_mismatch++;   /* resizing a block this allocator never handed out */
+        track_add(r, n);
+    } else {
+        if (g_blocks[rec].n != o) g_size_mismatch++;
+        g_live_bytes -= g_blocks[rec].n;
+        g_blocks[rec].p = r; g_blocks[rec].n = n;
+        g_live_bytes += n;
+    }
     return r;
 }
 static void cf(void *p, size_t n, void *c) { (void)c; track_del(p, n); free(p); }
@@ -414,8 +429,35 @@ static void row_record_growth_refused(bool rcbuf)
     }
 }
 
+/* The accounting allocator itself: a successful realloc moves the block's
+ * record to the new size, a refused one leaves it, a realloc or free naming
+ * the wrong old size is a mismatch, and a free ends the record. */
+static void row_allocator_accounting(void)
+{
+    long blocks = g_live; size_t bytes = g_live_bytes;
+    int mismatches = g_size_mismatch;
+    void *a = AL.alloc(16, NULL);
+    CHECK(a != NULL && g_live == blocks + 1 && g_live_bytes == bytes + 16);
+    void *b = AL.realloc(a, 16, 64, NULL);
+    CHECK(b != NULL && g_live == blocks + 1 && g_live_bytes == bytes + 64);
+    g_refuse_realloc = 1;
+    CHECK(AL.realloc(b, 64, 128, NULL) == NULL);
+    CHECK(g_live == blocks + 1 && g_live_bytes == bytes + 64);
+    void *d = AL.realloc(b, 63, 32, NULL);
+    CHECK(d != NULL && g_size_mismatch == mismatches + 1);
+    CHECK(g_live == blocks + 1 && g_live_bytes == bytes + 32);
+    void *e = AL.realloc(NULL, 0, 8, NULL);
+    CHECK(e != NULL && g_live == blocks + 2 && g_live_bytes == bytes + 40);
+    AL.free(e, 8, NULL);
+    AL.free(d, 32, NULL);
+    CHECK(g_live == blocks && g_live_bytes == bytes);
+    CHECK(g_size_mismatch == mismatches + 1);
+    g_size_mismatch = mismatches;
+}
+
 int main(void)
 {
+    row_allocator_accounting();
     row_prefix_provided(false);
     row_prefix_provided(true);
     row_prefix_partial();

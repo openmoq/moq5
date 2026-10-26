@@ -36,8 +36,9 @@
  *   _create builds picoquic context and starts listening. A per-connection
  *   session and adapter are created lazily on the network thread as each client
  *   connects, up to cfg.max_connections (default 1024); a connection past the
- *   cap is rejected. Before the first client, on_lane_pump is not called and the
- *   legacy _session()/_conn() return NULL. Iterate connections with
+ *   cap is rejected. on_lane_pump runs whether or not a connection exists;
+ *   with none, lane iteration is empty and the legacy _session()/_conn()
+ *   return NULL. Iterate connections with
  *   moq_pq_threaded_lane_next_conn() (per-connection API below); the legacy
  *   _session()/_conn() return the FIRST live connection for single-connection
  *   convenience.
@@ -75,12 +76,18 @@ extern "C" {
 typedef struct moq_pq_threaded moq_pq_threaded_t;
 
 /* A lane is an exclusive access window over a set of the facade's
- * connections. picoquic_threaded runs a single network thread per facade,
- * so there is exactly ONE lane; cfg.lane_count > 1 is rejected at create()
- * with MOQ_ERR_UNSUPPORTED (the adapter does not fake concurrency behind
- * one serialized domain). The lane exists so the managed API matches the
- * shared lane shape across the msquic, mvfst, and picoquic adapters. */
+ * connections, served by one network thread. A facade has one lane, or, for
+ * a SERVER with cfg.lane_count > 1, a lane group: lane_count lanes on the
+ * one listener port, each with its own picoquic context, thread and
+ * connections. A connection is owned by one lane for its whole life; the
+ * group routes every datagram to its owner by connection ID whatever socket
+ * the kernel delivered it to, so a connection survives the peer's NAT
+ * rebinding and migration without changing lane. The lane shape matches the
+ * msquic and mvfst managed adapters. */
 typedef struct moq_pq_threaded_lane moq_pq_threaded_lane_t;
+
+/* The most lanes a group may have. */
+#define MOQ_PQ_THREADED_MAX_LANES 64u
 
 /* -- Configuration ------------------------------------------------ */
 
@@ -150,8 +157,9 @@ typedef struct moq_pq_threaded_cfg {
      * moq_pq_threaded_lane_next_conn().  All session/adapter/facade calls
      * are safe.
      *
-     * For server mode, on_lane_pump is NOT called until the first inbound
-     * connection has been accepted. Normally once per loop iteration;
+     * In server mode on_lane_pump runs once per loop iteration -- after
+     * receiving, after sending, on a wake, and when app_deadline_us is due --
+     * with or without accepted connections (with none, iteration is empty);
      * when a connection turns terminal in the post-pump service pass,
      * ONE extra sequential invocation runs in the same iteration so the
      * dead connection is observable before it is pruned (the terminal-
@@ -234,19 +242,35 @@ typedef struct moq_pq_threaded_cfg {
 
     /* Appended (struct_size append-only ABI) — lane count.
      *
-     * picoquic_threaded runs a single network thread per facade, so it
-     * supports exactly ONE lane. 0 or 1 = the single lane (the previous
-     * behavior). Any value > 1 fails create() with MOQ_ERR_UNSUPPORTED —
-     * the adapter does not fake concurrency behind one serialized domain.
-     * This is enforced for client and server facades alike. */
+     * 0 or 1 = one lane on one network thread. A SERVER with 2 ..
+     * MOQ_PQ_THREADED_MAX_LANES creates a lane group (see the lane
+     * typedef): lane_count contexts and threads on the listener port.
+     * A client's value > 1, or a server's beyond the maximum, fails
+     * create() with MOQ_ERR_UNSUPPORTED or MOQ_ERR_INVAL.
+     * Windows does not implement server lane groups: a valid server count
+     * 2..MAX returns MOQ_ERR_UNSUPPORTED, with NULL output and no acquired
+     * resources. Clients and servers with 0/1 retain their one-lane behavior.
+     *
+     * At more than one lane: on_lane_pump and on_activity run on each
+     * lane's thread, concurrently, with the shared context (key by
+     * moq_pq_threaded_lane_index); configure_quic runs once per lane's
+     * context on the creating thread, before any lane starts;
+     * max_connections is the group's total; app_deadline_us is folded by
+     * every lane (so it must be thread-safe) and app_lane_deadline_us by
+     * its lane only; a nonzero pump return or a lane's fatal error stops
+     * the whole group. The facade-level moq_pq_threaded_session, _conn and
+     * _negotiated_version return NULL / 0 for a group: a connection and its
+     * version are reached inside its lane's pump. Every per-connection call
+     * is valid only on the owning lane's thread, inside its pump. */
     uint32_t           lane_count;
 
     /* Appended (struct_size append-only ABI, read as ONE block through
      * app_deadline_ctx). Optional application service-deadline query: returns
      * the app's earliest pending time-based deadline (µs, this facade's clock),
-     * or UINT64_MAX for none. Folded into the packet loop's next wake after each
-     * pump, so a purely time-based service deadline (e.g. a periodic catalog
-     * refresh) wakes an otherwise-idle managed loop. MUST be pure/non-blocking
+     * or UINT64_MAX for none. Read before every wait of the packet loop (and
+     * after each pump), so a purely time-based service deadline (e.g. a
+     * periodic catalog refresh) wakes an otherwise-idle managed loop, a server
+     * with no connection included. MUST be pure/non-blocking
      * and MUST NOT re-enter the facade. NULL = none. The fold happens only
      * during a pump, so when application state changes the value this query
      * would return, the owner MUST issue a facade/lane wake (moq_pq_threaded_wake
@@ -320,6 +344,56 @@ typedef struct moq_pq_threaded_cfg {
      * carrying the target and any setup_auth_tokens must fit the session
      * send arena together. Set via moq_pq_threaded_cfg_init_sized. */
     const moq_connection_target_t *target;
+
+    /* Reserved: covers the tail padding the layout that ended at `target`
+     * leaves on targets that align pointers to four bytes and uint64_t to
+     * eight, so retain_terminal_until_ack lands at or past that old sizeof.
+     * Never read. */
+    uint32_t           _reserved_retain;
+    /* Appended (struct_size append-only ABI) — terminal retention.
+     * SERVER mode only: true on a client fails _create with MOQ_ERR_INVAL.
+     * false (the default): a terminal connection leaves iteration as described
+     * at moq_pq_threaded_lane_next_conn, and its session is destroyed then.
+     * true: a terminal connection -- closed by the peer, by the transport, by
+     * a service or bridge failure, or by moq_pq_threaded_conn_close -- stays
+     * in iteration, its MoQ session valid and closed, until the application
+     * acknowledges it with moq_picoquic_threaded_conn_ack_terminal; see there.
+     * The QUIC connection itself is closed and released exactly as with
+     * false; only this facade's record and the MoQ session are kept. Read
+     * only when struct_size covers it. Set via moq_pq_threaded_cfg_init_sized. */
+    bool               retain_terminal_until_ack;
+
+    /* Appended (struct_size append-only ABI) — object delivery, forwarded to
+     * moq_session_cfg_t.streaming_objects for every session this facade
+     * creates: true delivers objects as MOQ_EVENT_OBJECT_CHUNK as their bytes
+     * arrive, false (the default) as whole MOQ_EVENT_OBJECT_RECEIVED. */
+    bool               streaming_objects;
+
+    /* Appended (struct_size append-only ABI) — UDP socket buffer size for
+     * the facade's sockets, applied to both send and receive buffers
+     * (picoquic's socket_buffer_size). 0 = the operating-system default.
+     * At most INT32_MAX (what the socket option carries); a larger value
+     * fails _create with MOQ_ERR_INVAL. The operating system may grant less
+     * than it is asked for. */
+    uint32_t           socket_buffer_bytes;
+
+    /* Appended (struct_size append-only ABI) — SERVER listening address.
+     * NULL (the default) listens on every local address. Otherwise an
+     * AF_INET or AF_INET6 address (its port ignored; `port` applies) that the
+     * facade's sockets bind to and send from, and no socket is opened for the
+     * other family. Copied during _create. A client ignores it. */
+    const struct sockaddr *bind_address;
+
+    /* Appended (ONE ABI block, read only when struct_size covers THROUGH
+     * app_lane_deadline_ctx). A per-lane application deadline query, with
+     * the app_deadline_us contract: the earliest pending time-based deadline
+     * of lane `lane_index` (µs, this facade's clock) or UINT64_MAX, pure and
+     * non-blocking, folded into that lane's wait after every pump; a
+     * changed deadline is announced with a lane wake. A lane pumps for an
+     * instant once. With one lane it is queried with lane_index 0. NULL =
+     * none. Set via moq_pq_threaded_cfg_init_sized. */
+    uint64_t         (*app_lane_deadline_us)(void *ctx, uint32_t lane_index);
+    void              *app_lane_deadline_ctx;
     /* Appended: every connection's moq_pq_conn_cfg_t send_queue_cap_bytes
      * (see <moq/picoquic.h>). 0 = default. Set via
      * moq_pq_threaded_cfg_init_sized. */
@@ -363,6 +437,9 @@ void moq_pq_threaded_cfg_init_sized(moq_pq_threaded_cfg_t *cfg, size_t cfg_size)
  * On failure, no thread is running; _stop / _destroy are not needed.
  * Returns MOQ_ERR_NOMEM on allocation failure, MOQ_ERR_INVAL on bad
  * config, MOQ_ERR_INTERNAL on picoquic/thread setup failure.
+ * Server lane groups require a supported platform (including SO_REUSEPORT).
+ * On Windows, valid server lane_count 2..MAX returns MOQ_ERR_UNSUPPORTED
+ * before allocation, Winsock startup, sockets or threads; *out is NULL.
  */
 moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
                                      moq_pq_threaded_t **out);
@@ -419,15 +496,15 @@ typedef struct moq_pq_threaded_conn moq_pq_threaded_conn_t;
 
 /* -- Lanes ---------------------------------------------------------- */
 
-/* Number of lanes (always 1 for picoquic_threaded). */
+/* Number of lanes: 1, or cfg.lane_count for a lane group. */
 uint32_t moq_pq_threaded_lane_count(const moq_pq_threaded_t *t);
 
-/* The lane at `index` (only 0 is valid), or NULL if out of range. The
+/* The lane at `index` (0 .. lane_count-1), or NULL if out of range. The
  * returned pointer is stable for the facade's lifetime. */
 moq_pq_threaded_lane_t *moq_pq_threaded_lane(
     moq_pq_threaded_t *t, uint32_t index);
 
-/* The lane's index (0). */
+/* The lane's index. */
 uint32_t moq_pq_threaded_lane_index(const moq_pq_threaded_lane_t *lane);
 
 /* The lane that owns this connection. Valid inside on_lane_pump. */
@@ -435,8 +512,42 @@ moq_pq_threaded_lane_t *moq_pq_threaded_conn_lane(
     moq_pq_threaded_conn_t *conn);
 
 /* Ask the adapter to run this lane's pump. Safe from any thread;
- * coalesced. Same delivery as moq_pq_threaded_wake() (one lane). */
+ * coalesced. moq_pq_threaded_wake() wakes every lane. */
 moq_result_t moq_pq_threaded_lane_wake(moq_pq_threaded_lane_t *lane);
+
+/* A lane group's per-lane routing counters. Each field is a saturating
+ * count written by the lane itself, except the drops, which the lane that
+ * dropped a datagram destined here adds. A read is exact per field, not a
+ * snapshot across fields. Valid from create until destroy, from any
+ * thread. A facade with one lane has no routing plane: MOQ_ERR_UNSUPPORTED. */
+typedef struct moq_picoquic_threaded_lane_stats {
+    uint32_t struct_size;          /* set by the library: bytes written */
+    uint32_t reserved0;            /* written 0 */
+    uint64_t datagrams_received;   /* read from this lane's sockets */
+    uint64_t forwarded_out;        /* routed by this lane to another, enqueued */
+    uint64_t forwarded_in;         /* injected on this lane from its inbox */
+    uint64_t inbox_full_drops;     /* destined here; inbox full */
+    uint64_t inbox_closed_drops;   /* destined here; admission closed */
+    uint64_t inbox_discarded;      /* left in this lane's inbox at its exit */
+    uint64_t oversize_drops;       /* received here; larger than advertised */
+    uint64_t reset_fanout_out;     /* candidates this lane offered to others */
+    uint64_t reset_fanout_in;      /* candidates compared here with this lane's tokens */
+    uint64_t reset_fanout_skipped; /* candidates not offered: budget */
+    uint64_t detection_drops;      /* destined here; detection ring full or closed */
+    uint64_t detection_discarded;  /* left in this lane's detection ring at its exit */
+    uint64_t budget_rearms;        /* turns that ended with work remaining */
+} moq_picoquic_threaded_lane_stats_t;
+
+/* The frozen v0 floor of the record: out_size below it is MOQ_ERR_INVAL. */
+#define MOQ_PICOQUIC_THREADED_LANE_STATS_V0_SIZE \
+    (offsetof(moq_picoquic_threaded_lane_stats_t, budget_rearms) + sizeof(uint64_t))
+
+/* Write min(out_size, the library's record) bytes of `lane`'s counters into
+ * `out`, stamping struct_size with the bytes written; a longer caller record
+ * keeps its tail untouched. The caller need not initialise `out`. */
+MOQ_API moq_result_t moq_picoquic_threaded_lane_get_stats(
+    const moq_pq_threaded_lane_t *lane,
+    moq_picoquic_threaded_lane_stats_t *out, size_t out_size);
 
 /* -- Per-connection API (server multi-connection) ------------------- *
  * Mirrors the shared managed per-connection model. A moq_pq_threaded_conn_t
@@ -465,6 +576,8 @@ moq_result_t moq_pq_threaded_lane_wake(moq_pq_threaded_lane_t *lane);
  * never survives into a later loop iteration. App-requested closes
  * (moq_pq_threaded_conn_close) disappear after the current on_lane_pump, as
  * before -- the app initiated those.
+ * With cfg.retain_terminal_until_ack, every terminal connection instead stays
+ * in iteration until it is acknowledged (moq_picoquic_threaded_conn_ack_terminal).
  */
 moq_pq_threaded_conn_t *moq_pq_threaded_lane_next_conn(
     moq_pq_threaded_lane_t *lane, moq_pq_threaded_conn_t *prev);
@@ -486,7 +599,56 @@ moq_result_t moq_pq_threaded_conn_close(
     moq_pq_threaded_conn_t *conn, uint64_t error_code);
 
 /*
- * Number of active server connections. Safe from any thread.
+ * Opaque per-connection application slot; the facade never reads it, and
+ * never frees what it points to. NULL until set. Valid only inside
+ * on_lane_pump for a handle in the current iteration: outside it, set is a
+ * no-op and get returns NULL. Connection and session POINTER VALUES are not
+ * identities across a connection and its successor (a reclaimed record's
+ * memory may be reused), so per-connection state belongs here, not in maps
+ * keyed by address.
+ */
+MOQ_API void moq_picoquic_threaded_conn_set_user(moq_pq_threaded_conn_t *conn,
+                                                 void *user);
+MOQ_API void *moq_picoquic_threaded_conn_user(const moq_pq_threaded_conn_t *conn);
+
+/*
+ * SERVER, with cfg.retain_terminal_until_ack: tell the facade this terminal
+ * connection may be reclaimed. Before that, the connection stays in iteration
+ * with its session valid, and keeps counting toward cfg.max_connections.
+ *
+ * WHEN IT MAY BE CALLED. Only inside on_lane_pump, for a handle in the
+ * current iteration, once the connection is terminal AND its
+ * MOQ_EVENT_SESSION_CLOSED has been transferred to the application by a poll
+ * of its session; a queued-but-unpolled event is not enough. The pump that
+ * acknowledges need not be the one that polled.
+ *
+ * RESULTS.
+ *   MOQ_OK               accepted; also for a repeated call on the same handle
+ *                        within the callback.
+ *   MOQ_ERR_INVAL        conn == NULL.
+ *   MOQ_ERR_WRONG_STATE  outside on_lane_pump; retention not enabled (or a
+ *                        client facade); the connection is not terminal; or
+ *                        its SESSION_CLOSED has not been polled yet.
+ *
+ * HANDLE LIFETIME. After MOQ_OK the record and its session are reclaimed once
+ * the current on_lane_pump returns, never during it: the current iteration
+ * stays valid, and the handle must not be kept past the callback.
+ *
+ * IF IT IS NEVER CALLED. A terminal connection is never reclaimed because
+ * time passed; once retained connections reach cfg.max_connections, new
+ * connections are refused. A connection that failed before its MoQ session
+ * existed (an unmappable ALPN, a session or adapter that could not be
+ * created) was never accepted: it has no record, counts toward nothing and
+ * needs no acknowledgment. moq_pq_threaded_stop()/destroy() reclaim every
+ * record without acknowledgment.
+ */
+MOQ_API moq_result_t moq_picoquic_threaded_conn_ack_terminal(
+    moq_pq_threaded_conn_t *conn);
+
+/*
+ * Number of server connections in iteration: live, and with
+ * cfg.retain_terminal_until_ack also terminal ones not yet acknowledged.
+ * Safe from any thread.
  */
 size_t moq_pq_threaded_conn_count(const moq_pq_threaded_t *t);
 
@@ -498,9 +660,11 @@ size_t moq_pq_threaded_conn_count(const moq_pq_threaded_t *t);
  * So a failed cert verification is observable via is_fatal(). */
 bool     moq_pq_threaded_is_fatal(const moq_pq_threaded_t *t);
 uint64_t moq_pq_threaded_fatal_code(const moq_pq_threaded_t *t);
-/* The picoquic local error captured when a CLIENT connection failed during the
- * handshake (a QUIC CRYPTO_ERROR = 0x100|alert for a TLS failure, else a
- * transport code; 0 when there was no such failure). The service endpoint
+/* The QUIC transport error captured when a CLIENT connection fails before
+ * MoQ SETUP completes: the local error when nonzero, otherwise the peer's
+ * transport error. A CRYPTO_ERROR = 0x100|alert identifies a TLS failure;
+ * application-close codes are not returned here. Zero means no transport
+ * error was recorded, not necessarily success. The service endpoint
  * classifies it into a transport-agnostic terminal reason. Thread-safe. */
 uint64_t moq_pq_threaded_terminal_error(const moq_pq_threaded_t *t);
 

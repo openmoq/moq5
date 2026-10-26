@@ -287,6 +287,33 @@ and that is then reset cannot be attributed to its subscription.
 Session and bridge behaviour are pinned by `reset_reliable_size` and
 `bridge_reliable_reset` on drafts 16, 18 and 22.
 
+## Shared send admission
+
+An adapter whose send queue has one byte budget for the whole connection,
+and whose `write`/`write_payload` refuse only when that budget is spent,
+declares `MOQ_TRANSPORT_CAP_SHARED_ADMISSION`. Such a refusal is not about
+its stream: no write adding bytes to any stream can be accepted until the
+transport takes queued bytes, or until a reset drops some. With the
+capability, the bridge stops offering writes that add bytes for the rest of
+that hand-off of queued data; FIN-only writes, which the adapter may still
+mark on bytes it holds, and resets still go, and a reset it accepts there
+reopens the hand-off. Without it, a refused write holds back only its own
+stream and the bridge tries the next ready stream, as an adapter with a
+budget per stream needs. Open-stream credit, resets, control writes and
+`close_transport` keep their own results either way.
+
+| Adapter | Declares the capability | Tests |
+| --- | --- | --- |
+| picoquic | yes: one queue cap per connection (`send_queue_cap_bytes`) | `pq_priority_admission` (the queue's refusals), `pq_sim_shared_admission` (advertised and withdrawn over the simulator) |
+| pico_wt | yes: the same queue | `pq_priority_admission`, `pico_wt_shared_admission` |
+| MsQuic, mvfst, wtquic, proxygen | no | |
+
+The bridge's side is pinned by `bridge_shared_admission` (the model queue
+with and without the capability, FIN-only writes, resets and expiry while
+the budget is spent) and `bridge_shared_admission_suite` (the scheduling
+suite with the capability advertised, leaving out the rows that refuse per
+stream).
+
 ## Porting Checklist
 
 The recommended path for a new adapter is to implement the shared

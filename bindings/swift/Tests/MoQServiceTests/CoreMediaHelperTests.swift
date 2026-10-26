@@ -284,7 +284,7 @@ struct SampleBufferTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-    @Test("Video timing: pts/dts map at µs precision; framerate sets duration")
+    @Test("Video timing: pts maps at µs precision, a RAW dts is invalid; framerate sets duration")
     func videoTiming() throws {
         let format = try videoDescription().makeFormatDescription()
         let object = makeObject(media: [9], keyframe: true,
@@ -294,8 +294,9 @@ struct SampleBufferTests {
         #expect(CMSampleBufferGetNumSamples(sample) == 1)
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
         #expect(pts.value == 40_000 && pts.timescale == 1_000_000)
-        let dts = CMSampleBufferGetDecodeTimeStamp(sample)
-        #expect(dts.value == 33_000 && dts.timescale == 1_000_000)
+        /* LOC carries no decode timestamp: the object's decode time copies
+         * its media time, so the sample asserts none. */
+        #expect(!CMSampleBufferGetDecodeTimeStamp(sample).isValid)
         let duration = CMSampleBufferGetDuration(sample)
         #expect(duration.value == 33_333)   /* 1e9 / 30_000 µs */
 

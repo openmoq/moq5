@@ -6,6 +6,10 @@ add_test(NAME cmake_apple_abi_rules
     COMMAND ${CMAKE_COMMAND}
         "-DTEST_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/apple-abi-rules"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/AppleAbiProbeRulesTest.cmake")
+add_test(NAME cmake_picoquic_pkgconfig_provenance
+    COMMAND ${CMAKE_COMMAND} "-DSRC=${PROJECT_SOURCE_DIR}"
+        "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/picoquic-pkgconfig-provenance"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PicoquicPkgConfigProvenanceTest.cmake")
 add_test(NAME cmake_consumer_preload_argv
     COMMAND ${CMAKE_COMMAND} "-DCTEST=${CMAKE_CTEST_COMMAND}"
         "-DTEST_BUILD=${PROJECT_BINARY_DIR}"
@@ -17,6 +21,21 @@ add_test(NAME cmake_consumer_abi_bundle
         "-DTEST_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ConsumerAbiBundleTest.cmake")
 set_tests_properties(cmake_consumer_abi_bundle PROPERTIES TIMEOUT 60)
+
+# Configure-only models execute the production policy/configuration source.
+# The Windows branch is modeled on the host; it is not native qualification.
+add_test(NAME cmake_windows_owned_policy
+    COMMAND ${CMAKE_COMMAND} "-DMOQ_SOURCE=${PROJECT_SOURCE_DIR}"
+        "-DMOQ_WORK=${CMAKE_CURRENT_BINARY_DIR}/windows-owned-policy"
+        "-DMOQ_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsOwnedPolicyTest.cmake")
+add_test(NAME cmake_picoquic_component_selection
+    COMMAND ${CMAKE_COMMAND} "-DMOQ_SOURCE=${PROJECT_SOURCE_DIR}"
+        "-DMOQ_WORK=${CMAKE_CURRENT_BINARY_DIR}/picoquic-component-selection"
+        "-DMOQ_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PicoquicComponentSelectionTest.cmake")
+set_tests_properties(cmake_windows_owned_policy cmake_picoquic_component_selection
+    PROPERTIES TIMEOUT 120)
 
 # Installed package modules reach siblings through ${CMAKE_CURRENT_LIST_DIR}
 # only at a downstream configure, so check the installed set itself.
@@ -155,6 +174,15 @@ if(NOT WIN32)
     add_executable(moq_port_shadow support/port_shadow.c)
 endif()
 
+# FindPicoquic's one OpenSSL link identity, against a stand-in provider.
+add_test(NAME picoquic_openssl_link_identity
+    COMMAND ${CMAKE_COMMAND}
+        "-DMOQ_SOURCE=${PROJECT_SOURCE_DIR}"
+        "-DMOQ_WORK=${CMAKE_CURRENT_BINARY_DIR}/picoquic-openssl-identity"
+        "-DMOQ_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PicoquicOpenSSLIdentityTest.cmake")
+set_tests_properties(picoquic_openssl_link_identity PROPERTIES TIMEOUT 120)
+
 # -- C tests --------------------------------------------------------
 add_test(NAME picoquic_version_metadata
     COMMAND ${CMAKE_COMMAND}
@@ -272,11 +300,45 @@ target_link_libraries(test_scheduling PRIVATE moq-core)
 target_include_directories(test_scheduling PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME scheduling COMMAND test_scheduling)
+add_test(NAME bridge_retention_cancel COMMAND test_scheduling --retention-cancel)
+add_test(NAME bridge_fetch_priority COMMAND test_scheduling --fetch-priority)
+add_test(NAME bridge_fill_order COMMAND test_scheduling --fill-order)
+add_test(NAME bridge_fin_before_done COMMAND test_scheduling --fin-done)
+add_test(NAME bridge_retained_expiry COMMAND test_scheduling --retained-expiry)
+add_test(NAME bridge_shared_admission COMMAND test_scheduling --shared-admission)
+add_test(NAME bridge_shared_admission_suite COMMAND test_scheduling --shared-all)
+add_test(NAME bridge_pass_costs COMMAND test_scheduling --pass-costs)
+add_test(NAME bridge_scan_work COMMAND test_scheduling --scan-work)
+add_test(NAME bridge_expiry_walk COMMAND test_scheduling --expiry-walk)
+add_test(NAME session_queue_scans COMMAND test_scheduling --session-scans)
+# The same rows against the test-internals core, whose probe counters let
+# them assert how much of the stream table each walk read.
+add_executable(test_scheduling_work unit/test_scheduling.c)
+target_link_libraries(test_scheduling_work PRIVATE moq-core-test-internals)
+target_compile_definitions(test_scheduling_work PRIVATE
+    MOQ_SESSION_SWEEP_TESTING)
+target_include_directories(test_scheduling_work PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_pass_costs_work COMMAND test_scheduling_work --pass-costs)
+add_test(NAME bridge_scan_work_probes COMMAND test_scheduling_work --scan-work)
+add_test(NAME bridge_expiry_walk_probes COMMAND test_scheduling_work --expiry-walk)
+add_test(NAME session_queue_scans_probes COMMAND test_scheduling_work --session-scans)
+
+add_executable(test_stream_order unit/test_stream_order.c
+    ../core/src/bridge/stream_order.c)
+target_include_directories(test_stream_order PRIVATE ../core/include)
+add_test(NAME stream_order COMMAND test_stream_order)
 
 add_executable(test_pq_priority ../adapters/common/test_pq_priority.c
     ../adapters/common/moq_pq_send_queue.c)
 target_link_libraries(test_pq_priority PRIVATE moq::core)
 add_test(NAME pq_priority COMMAND test_pq_priority)
+
+add_executable(test_pq_priority_admission
+    ../adapters/common/test_pq_priority_admission.c
+    ../adapters/common/moq_pq_send_queue.c)
+target_link_libraries(test_pq_priority_admission PRIVATE moq::core)
+add_test(NAME pq_priority_admission COMMAND test_pq_priority_admission)
 
 # Fake-endpoint fidelity: every recorded-operation capacity loss and every
 # byte-bearing truncation is observable and sticky, so a fixture cannot
@@ -354,9 +416,51 @@ add_test(NAME bridge_required_hold COMMAND test_bridge_required_hold)
 target_link_libraries(test_bridge_hold_input PRIVATE moq-core-test-internals)
 target_include_directories(test_bridge_hold_input PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME bridge_hold_input COMMAND test_bridge_hold_input)
+add_executable(test_bridge_map_admission unit/test_bridge_map_admission.c)
+target_link_libraries(test_bridge_map_admission PRIVATE moq-core-test-internals)
+target_compile_definitions(test_bridge_map_admission PRIVATE MOQ_SESSION_SWEEP_TESTING)
+target_include_directories(test_bridge_map_admission PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_map_admission COMMAND test_bridge_map_admission)
+set_tests_properties(bridge_map_admission PROPERTIES TIMEOUT 30)
+# Private pressure selection and transactional STOP of an admitted subgroup.
+add_executable(test_receive_pressure unit/test_receive_pressure.c)
+target_link_libraries(test_receive_pressure PRIVATE moq-core-test-internals)
+target_compile_definitions(test_receive_pressure PRIVATE MOQ_SESSION_SWEEP_TESTING)
+add_test(NAME receive_pressure COMMAND test_receive_pressure)
+set_tests_properties(receive_pressure PROPERTIES TIMEOUT 30)
+set_tests_properties(receive_pressure PROPERTIES TIMEOUT 30)
+add_executable(test_bridge_pending_close unit/test_bridge_pending_close.c)
+target_link_libraries(test_bridge_pending_close PRIVATE moq-core-test-internals)
+target_compile_definitions(test_bridge_pending_close PRIVATE MOQ_SESSION_SWEEP_TESTING)
+target_include_directories(test_bridge_pending_close PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_pending_close COMMAND test_bridge_pending_close)
+set_tests_properties(bridge_pending_close PROPERTIES TIMEOUT 30)
+add_executable(test_bridge_uni_prefix unit/test_bridge_uni_prefix.c)
+target_link_libraries(test_bridge_uni_prefix PRIVATE moq-core-test-internals)
+target_compile_definitions(test_bridge_uni_prefix PRIVATE MOQ_SESSION_SWEEP_TESTING)
+target_include_directories(test_bridge_uni_prefix PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_uni_prefix COMMAND test_bridge_uni_prefix)
+set_tests_properties(bridge_uni_prefix PROPERTIES TIMEOUT 30)
+add_executable(test_bridge_receive_pressure unit/test_bridge_receive_pressure.c)
+target_link_libraries(test_bridge_receive_pressure PRIVATE moq-core-test-internals)
+target_compile_definitions(test_bridge_receive_pressure PRIVATE MOQ_SESSION_SWEEP_TESTING)
+target_include_directories(test_bridge_receive_pressure PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_receive_pressure COMMAND test_bridge_receive_pressure)
+set_tests_properties(bridge_receive_pressure PROPERTIES TIMEOUT 30)
+add_executable(test_bridge_admission_readiness unit/test_bridge_admission_readiness.c)
+target_link_libraries(test_bridge_admission_readiness PRIVATE moq-core-test-internals)
+target_compile_definitions(test_bridge_admission_readiness PRIVATE MOQ_SESSION_SWEEP_TESTING)
+target_include_directories(test_bridge_admission_readiness PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_admission_readiness COMMAND test_bridge_admission_readiness)
+set_tests_properties(bridge_admission_readiness PROPERTIES TIMEOUT 30)
 # FETCH and TRACK_STATUS request-stream lifecycle through two real bridges,
 # draft-16 controls and draft-18 rows: completion closes both halves, late
 # peer terminals and reordering are ordinary input, pressure is retried.
+add_executable(test_bridge_budget_pending_output unit/test_bridge_budget_pending_output.c)
+target_link_libraries(test_bridge_budget_pending_output PRIVATE moq-core-test-internals)
+target_include_directories(test_bridge_budget_pending_output PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME bridge_budget_pending_output COMMAND test_bridge_budget_pending_output)
 add_executable(test_bridge_request_lifecycle unit/test_bridge_request_lifecycle.c)
 target_link_libraries(test_bridge_request_lifecycle PRIVATE moq-core-test-internals)
 target_include_directories(test_bridge_request_lifecycle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
@@ -444,9 +548,26 @@ target_link_libraries(test_publisher_namespace_terminal_layout PRIVATE moq::core
 add_test(NAME publisher_namespace_terminal_layout COMMAND test_publisher_namespace_terminal_layout)
 set_tests_properties(publisher_namespace_terminal_layout PROPERTIES TIMEOUT 30)
 
+if(TARGET moq::sim)
+    foreach(_auth_test IN ITEMS facade_resource_auth request_auth_capacity request_auth_width)
+        add_executable(test_${_auth_test} unit/test_${_auth_test}.c)
+        target_link_libraries(test_${_auth_test} PRIVATE moq-core-test-internals moq::sim)
+        if(_auth_test STREQUAL "request_auth_capacity")
+            add_test(NAME ${_auth_test} COMMAND test_${_auth_test} capacity)
+        else()
+            add_test(NAME ${_auth_test} COMMAND test_${_auth_test})
+        endif()
+        set_tests_properties(${_auth_test} PROPERTIES TIMEOUT 30)
+    endforeach()
+endif()
 add_executable(test_session_publish unit/test_session_publish.c)
 target_link_libraries(test_session_publish PRIVATE moq-core-test-internals)
 add_test(NAME session_publish COMMAND test_session_publish)
+
+add_executable(test_coalesced_update_capacity unit/test_coalesced_update_capacity.c)
+target_link_libraries(test_coalesced_update_capacity PRIVATE moq::core)
+add_test(NAME coalesced_update_capacity COMMAND test_coalesced_update_capacity)
+set_tests_properties(coalesced_update_capacity PROPERTIES TIMEOUT 30)
 
 add_executable(test_issue44_rejected_update unit/test_issue44_rejected_update.c)
 target_link_libraries(test_issue44_rejected_update PRIVATE moq-core-test-internals)
@@ -481,6 +602,9 @@ add_test(NAME session_subgroup COMMAND test_session_subgroup)
 add_executable(test_session_receive unit/test_session_receive.c)
 target_link_libraries(test_session_receive PRIVATE moq-core-test-internals)
 add_test(NAME session_receive COMMAND test_session_receive)
+add_executable(test_subgroup_terminal_last_object unit/test_subgroup_terminal_last_object.c)
+target_link_libraries(test_subgroup_terminal_last_object PRIVATE moq-core-test-internals)
+add_test(NAME subgroup_terminal_last_object COMMAND test_subgroup_terminal_last_object)
 
 add_executable(test_session_namespace unit/test_session_namespace.c)
 target_link_libraries(test_session_namespace PRIVATE moq-core-test-internals)
@@ -786,6 +910,20 @@ if(TARGET moq::sim)
     target_compile_definitions(test_subgroup_stop_after_fin PRIVATE MOQ_SESSION_SWEEP_TESTING)
     add_test(NAME subgroup_stop_after_fin COMMAND test_subgroup_stop_after_fin)
     set_tests_properties(subgroup_stop_after_fin PROPERTIES TIMEOUT 30)
+    foreach(_terminal_test IN ITEMS outgoing_subgroup_terminal bridge_stop_terminal
+                                    bridge_terminal_pressure)
+        add_executable(test_${_terminal_test} unit/test_${_terminal_test}.c)
+        target_link_libraries(test_${_terminal_test} PRIVATE moq-core-test-internals moq::sim)
+        target_compile_definitions(test_${_terminal_test} PRIVATE MOQ_SESSION_SWEEP_TESTING)
+        target_include_directories(test_${_terminal_test} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+        add_test(NAME ${_terminal_test} COMMAND test_${_terminal_test})
+        set_tests_properties(${_terminal_test} PROPERTIES TIMEOUT 30)
+    endforeach()
+    add_executable(test_d18_joining_update_location unit/test_d18_joining_update_location.c)
+    target_link_libraries(test_d18_joining_update_location PRIVATE moq::core moq::sim)
+    add_test(NAME d18_joining_update_location COMMAND test_d18_joining_update_location)
+    set_tests_properties(d18_joining_update_location PROPERTIES TIMEOUT 30)
     add_executable(test_d22_fetch_ok unit/test_d22_fetch_ok.c)
     target_link_libraries(test_d22_fetch_ok PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME d22_fetch_ok COMMAND test_d22_fetch_ok)
@@ -954,6 +1092,26 @@ if(TARGET moq::sim)
     target_link_libraries(test_publisher PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME publisher COMMAND test_publisher)
 
+    add_executable(test_publisher_subgroup_terminal unit/test_publisher_subgroup_terminal.c)
+    target_link_libraries(test_publisher_subgroup_terminal PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME publisher_subgroup_terminal COMMAND test_publisher_subgroup_terminal)
+    set_tests_properties(publisher_subgroup_terminal PROPERTIES TIMEOUT 30)
+
+    # The directional pump is private in shared SimPair builds.
+    add_executable(test_publisher_response_ownership
+        unit/test_publisher_response_ownership.c
+        ${PROJECT_SOURCE_DIR}/sim/src/simpair.c
+        ${PROJECT_SOURCE_DIR}/sim/src/simpair_fault.c
+        ${PROJECT_SOURCE_DIR}/sim/src/simpair_delay.c
+        ${PROJECT_SOURCE_DIR}/sim/src/simpair_hold.c
+        ${PROJECT_SOURCE_DIR}/sim/src/simpair_pump.c)
+    target_link_libraries(test_publisher_response_ownership PRIVATE moq-core-test-internals)
+    target_compile_definitions(test_publisher_response_ownership PRIVATE MOQ_STATIC MOQ_SIM_BUILDING)
+    target_include_directories(test_publisher_response_ownership PRIVATE
+        ${PROJECT_SOURCE_DIR}/sim/include)
+    add_test(NAME publisher_response_ownership COMMAND test_publisher_response_ownership)
+    set_tests_properties(publisher_response_ownership PROPERTIES TIMEOUT 30)
+
     add_executable(test_publisher_admission_v1 unit/test_publisher_admission_v1.c)
     target_link_libraries(test_publisher_admission_v1 PRIVATE moq::core moq::sim)
     add_test(NAME publisher_admission_v1 COMMAND test_publisher_admission_v1)
@@ -1012,6 +1170,9 @@ if(TARGET moq::sim)
     add_executable(test_subscriber_group_end unit/test_subscriber_group_end.c)
     target_link_libraries(test_subscriber_group_end PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME subscriber_group_end COMMAND test_subscriber_group_end)
+    add_executable(test_subscriber_stream_terminals unit/test_subscriber_stream_terminals.c)
+    target_link_libraries(test_subscriber_stream_terminals PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME subscriber_stream_terminals COMMAND test_subscriber_stream_terminals)
 
     add_executable(test_subscriber_track_result unit/test_subscriber_track_result.c)
     target_link_libraries(test_subscriber_track_result PRIVATE moq::core moq::sim)
@@ -1102,6 +1263,10 @@ if(TARGET moq::sim)
     add_executable(test_ownership_graph unit/test_ownership_graph.c)
     target_link_libraries(test_ownership_graph PRIVATE moq-core-test-internals)
     add_test(NAME ownership_graph COMMAND test_ownership_graph)
+
+    add_executable(test_session_pending_output unit/test_session_pending_output.c)
+    target_link_libraries(test_session_pending_output PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME session_pending_output COMMAND test_session_pending_output)
 
     add_executable(test_d18_fin_handoff unit/test_d18_fin_handoff.c)
     target_link_libraries(test_d18_fin_handoff PRIVATE moq-core-test-internals)
@@ -1372,6 +1537,10 @@ target_link_libraries(test_oom PRIVATE moq::core)
 add_test(NAME oom COMMAND test_oom)
 
 # -- C++ compatibility test -----------------------------------------
+add_executable(test_publish_event_client unit/test_publish_event_client.c)
+target_link_libraries(test_publish_event_client PRIVATE moq::core)
+add_test(NAME publish_event_client COMMAND test_publish_event_client)
+
 enable_language(CXX)
 add_executable(test_cxx_compat unit/test_cxx_compat.cpp)
 target_link_libraries(test_cxx_compat PRIVATE moq::core)
@@ -1644,6 +1813,48 @@ if(TARGET moq::relay AND TARGET moq::sim AND TARGET moq-service-receiver-test-in
     set_tests_properties(media_receiver_finite_tail_ordering PROPERTIES TIMEOUT 120)
 endif()
 
+# The receiver's stream-terminal lane over a real publisher and SimPair.
+if(TARGET moq::sim AND TARGET moq-service-receiver-test-internals)
+    add_executable(test_media_receiver_stream_terminals
+        ${PROJECT_SOURCE_DIR}/service/tests/test_media_receiver_stream_terminals.c)
+    target_link_libraries(test_media_receiver_stream_terminals PRIVATE
+        moq-service-receiver-test-internals moq::sim)
+    if(TARGET moq::mpeg2ts)
+        target_include_directories(test_media_receiver_stream_terminals PRIVATE
+            ${PROJECT_SOURCE_DIR}/service/tests
+            ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
+        target_compile_definitions(test_media_receiver_stream_terminals PRIVATE
+            MOQ_TEST_HAVE_TS=1)
+    endif()
+    add_test(NAME media_receiver_stream_terminals
+        COMMAND test_media_receiver_stream_terminals)
+    set_tests_properties(media_receiver_stream_terminals PROPERTIES TIMEOUT 120)
+endif()
+
+# A completed broadcast on the receiver over a real publisher and SimPair.
+if(TARGET moq::sim AND TARGET moq-service-receiver-test-internals)
+    add_executable(test_media_receiver_completion
+        ${PROJECT_SOURCE_DIR}/service/tests/test_media_receiver_completion.c)
+    target_link_libraries(test_media_receiver_completion PRIVATE
+        moq-service-receiver-test-internals moq::sim)
+    target_include_directories(test_media_receiver_completion PRIVATE
+        ${PROJECT_SOURCE_DIR}/tests/unit)
+    add_test(NAME media_receiver_completion
+        COMMAND test_media_receiver_completion)
+    set_tests_properties(media_receiver_completion PROPERTIES TIMEOUT 120)
+endif()
+
+# The receiver surfaces the media player is built on.
+if(TARGET moq::sim AND TARGET moq-service-receiver-test-internals)
+    add_executable(test_media_receiver_player_support
+        ${PROJECT_SOURCE_DIR}/service/tests/test_media_receiver_player_support.c)
+    target_link_libraries(test_media_receiver_player_support PRIVATE
+        moq-service-receiver-test-internals moq::sim)
+    add_test(NAME media_receiver_player_support
+        COMMAND test_media_receiver_player_support)
+    set_tests_properties(media_receiver_player_support PROPERTIES TIMEOUT 120)
+endif()
+
 # -- Version lanes --------------------------------------------------
 # These protocol runners read MOQ_SIM_VERSION and explicitly configure their
 # session profile. Auth, request-credit and backpressure retain D16 fixtures;
@@ -1688,3 +1899,13 @@ foreach(lane_version IN ITEMS 18 22)
             LABELS "version-lane;d${lane_version}")
     endforeach()
 endforeach()
+
+add_executable(test_cluster_wire test_cluster_wire.c)
+target_link_libraries(test_cluster_wire PRIVATE moq-core-test-internals)
+add_test(NAME cluster_wire COMMAND test_cluster_wire)
+add_executable(test_cluster_session test_cluster_session.c unit/test_cluster_legacy_cfg.c)
+target_link_libraries(test_cluster_session PRIVATE moq-core-test-internals)
+add_test(NAME cluster_session COMMAND test_cluster_session)
+add_executable(test_cluster_work test_cluster_work.c)
+target_link_libraries(test_cluster_work PRIVATE moq-core-test-internals)
+add_test(NAME cluster_work COMMAND test_cluster_work)

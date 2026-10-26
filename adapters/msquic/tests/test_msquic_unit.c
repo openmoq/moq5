@@ -34,6 +34,7 @@ static int failures = 0;
 /* --- rig ---------------------------------------------------------------------- */
 
 struct rig {
+    fake_msq_count_alloc_t alloc;
     fake_msq_t fake;
     moq_session_t *session;
     moq_msquic_conn_t *conn;
@@ -46,16 +47,17 @@ static int rig_up_hooked(struct rig *r, moq_perspective_t persp,
     moq_session_cfg_t scfg;
 
     memset(r, 0, sizeof(*r));
+    fake_msq_count_alloc_init(&r->alloc);
     fake_msq_init(&r->fake, persp == MOQ_PERSPECTIVE_CLIENT);
 
-    moq_session_cfg_init_sized(&scfg, sizeof(scfg), moq_alloc_default(),
+    moq_session_cfg_init_sized(&scfg, sizeof(scfg), &r->alloc.api,
                                persp);
     if (moq_session_create(&scfg, 0, &r->session) < 0)
         return -1;
 
     moq_msquic_conn_cfg_t cfg;
     moq_msquic_conn_cfg_init_sized(&cfg, sizeof(cfg));
-    cfg.alloc = moq_alloc_default();
+    cfg.alloc = &r->alloc.api;
     cfg.session = r->session;
     cfg.api = fake_msq_table(&r->fake);
     cfg.hook = hook;
@@ -82,8 +84,9 @@ static int rig_up_events(struct rig *r, moq_perspective_t persp,
     moq_session_cfg_t scfg;
 
     memset(r, 0, sizeof(*r));
+    fake_msq_count_alloc_init(&r->alloc);
     fake_msq_init(&r->fake, persp == MOQ_PERSPECTIVE_CLIENT);
-    moq_session_cfg_init_sized(&scfg, sizeof(scfg), moq_alloc_default(),
+    moq_session_cfg_init_sized(&scfg, sizeof(scfg), &r->alloc.api,
                                persp);
     scfg.max_events = max_events;
     scfg.send_request_capacity = true;
@@ -93,7 +96,7 @@ static int rig_up_events(struct rig *r, moq_perspective_t persp,
 
     moq_msquic_conn_cfg_t cfg;
     moq_msquic_conn_cfg_init_sized(&cfg, sizeof(cfg));
-    cfg.alloc = moq_alloc_default();
+    cfg.alloc = &r->alloc.api;
     cfg.session = r->session;
     cfg.api = fake_msq_table(&r->fake);
     if (moq_msquic_conn_create(&cfg, &r->conn) != MOQ_OK)
@@ -107,10 +110,18 @@ static int rig_up_events(struct rig *r, moq_perspective_t persp,
 
 static void rig_down(struct rig *r)
 {
-    if (r->conn != NULL)
+    if (r->conn != NULL) {
+        fake_msq_cancel_pending(&r->fake, moq_msquic_conn_callback(), r->conn);
+        CHECK(fake_msq_pending_sends(&r->fake) == 0);
+        CHECK(fake_msq_pending_dgrams(&r->fake) == 0);
+        CHECK(r->fake.send_completions == (unsigned)r->fake.send_count);
+        CHECK(r->fake.dgram_completions == (unsigned)r->fake.dgram_count);
+        fake_msq_mark_connection_closed(&r->fake);
         moq_msquic_conn_destroy(r->conn);
+    }
     if (r->session != NULL)
         moq_session_destroy(r->session);
+    CHECK(atomic_load(&r->alloc.live_bytes) == 0);
 }
 
 static void deliver_connected(struct rig *r)
@@ -179,6 +190,8 @@ static void deliver_stream_event(fake_msq_stream_t *st,
 {
     QUIC_STREAM_EVENT ev;
 
+    if (type == QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE)
+        fake_msq_cancel_stream(st);
     memset(&ev, 0, sizeof(ev));
     ev.Type = type;
     if (type == QUIC_STREAM_EVENT_PEER_SEND_ABORTED)
@@ -2188,6 +2201,138 @@ static void t_flush_accounting(void)
         printf("PASS: flush accounting (accepted-only, exact bytes)\n");
 }
 
+struct teardown_retry {
+    struct rig *r;
+    uint64_t stream_id;
+    unsigned phase;
+};
+
+static void teardown_retry_hook(moq_msquic_conn_t *conn, void *ctx)
+{
+    struct teardown_retry *p = ctx;
+    static const uint8_t bytes[13] = { 0x51 };
+    if (p->phase == 1) {
+        p->phase = 2;
+        CHECK(p->r->ops->write(conn, p->stream_id, bytes, 11, false) ==
+              MOQ_TRANSPORT_OK);
+        CHECK(p->r->ops->send_datagram(conn, bytes, 7) == MOQ_TRANSPORT_OK);
+    } else if (p->phase == 2 && conn->pending_sends == 0 &&
+               conn->dgram_inflight == 1) {
+        /* A datagram final queues another stream batch after the first
+         * stream drain: teardown must revisit both kinds, not snapshot. */
+        p->phase = 3;
+        CHECK(p->r->ops->write(conn, p->stream_id, bytes, sizeof(bytes), false) ==
+              MOQ_TRANSPORT_OK);
+    }
+}
+
+static void t_teardown_ownership(void)
+{
+    int before = failures;
+    struct rig r;
+    struct teardown_retry retry = { .r = &r };
+    static const uint8_t bytes[16] = { 0x2a };
+    CHECK(rig_up_hooked(&r, MOQ_PERSPECTIVE_CLIENT,
+                        teardown_retry_hook, &retry) == 0);
+    deliver_streams_available(&r, 8, 8);
+    deliver_dgram_state(&r, true, 1200);
+    CHECK(r.ops->open_uni(r.conn, &retry.stream_id) == MOQ_TRANSPORT_OK);
+    moq_rcbuf_t *payload = NULL;
+    CHECK(moq_rcbuf_create(&r.alloc.api, bytes, sizeof(bytes), &payload) == MOQ_OK);
+    CHECK(r.ops->write_payload(r.conn, retry.stream_id, payload, false) ==
+          MOQ_TRANSPORT_OK);
+    CHECK(r.ops->write(r.conn, retry.stream_id, bytes, sizeof(bytes), false) ==
+          MOQ_TRANSPORT_OK);
+    moq_rcbuf_decref(payload);   /* only the accepted batch owns it now */
+    moq_msquic_test_flush(r.conn);
+    CHECK(r.ops->send_datagram(r.conn, bytes, 7) == MOQ_TRANSPORT_OK);
+    CHECK(fake_msq_pending_sends(&r.fake) == 1);
+    CHECK(fake_msq_pending_dgrams(&r.fake) == 1);
+    fake_msq_stream_t *stream = fake_msq_stream_at(&r.fake, 0);
+    CHECK(stream != NULL && !stream->closed && stream->shutdown_calls == 0);
+    retry.phase = 1;
+    fake_msq_cancel_pending(&r.fake, moq_msquic_conn_callback(), r.conn);
+    CHECK(retry.phase == 3);
+    CHECK(r.fake.send_count == 3 && r.fake.send_completions == 3);
+    CHECK(r.fake.send_cancellations == 3);
+    CHECK(r.fake.dgram_count == 2 && r.fake.dgram_completions == 2);
+    CHECK(r.fake.dgram_cancellations == 2);
+    CHECK(r.conn->pending_sends == 0 && r.conn->dgram_inflight == 0);
+    CHECK(stream != NULL && !stream->closed && stream->shutdown_calls == 0);
+    size_t settled = atomic_load(&r.alloc.live_bytes);
+    fake_msq_cancel_pending(&r.fake, moq_msquic_conn_callback(), r.conn);
+    CHECK(r.fake.send_completions == 3 && r.fake.dgram_completions == 2);
+    CHECK(atomic_load(&r.alloc.live_bytes) == settled);
+    QUIC_CONNECTION_EVENT ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.Type = QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE;
+    fake_msq_mark_shutdown_complete(&r.fake);
+    moq_msquic_conn_callback()(fake_msq_conn_handle(&r.fake), r.conn, &ev);
+    rig_down(&r);              /* tracked bytes, including rcbuf/copy, reach 0 */
+
+    CHECK(rig_up(&r, MOQ_PERSPECTIVE_CLIENT) == 0);
+    deliver_streams_available(&r, 8, 8);
+    deliver_dgram_state(&r, true, 1200);
+    size_t live = atomic_load(&r.alloc.live_bytes);
+    r.fake.dgram_send_fails = 1;
+    CHECK(r.ops->send_datagram(r.conn, bytes, sizeof(bytes)) == MOQ_TRANSPORT_DROPPED);
+    CHECK(atomic_load(&r.alloc.live_bytes) == live);
+    CHECK(r.ops->open_uni(r.conn, &retry.stream_id) == MOQ_TRANSPORT_OK);
+    r.fake.stream_send_fails = 1;
+    CHECK(r.ops->write(r.conn, retry.stream_id, bytes, sizeof(bytes), false) ==
+          MOQ_TRANSPORT_OK);
+    moq_msquic_test_flush(r.conn);
+    fake_msq_cancel_pending(&r.fake, moq_msquic_conn_callback(), r.conn);
+    CHECK(r.fake.send_count == 0 && r.fake.send_completions == 0);
+    CHECK(r.fake.dgram_count == 0 && r.fake.dgram_completions == 0);
+    rig_down(&r);
+    if (failures == before)
+        printf("PASS: teardown ownership (canceled, refused, quiescent, counted)\n");
+}
+
+static void t_teardown_missing_callbacks(void)
+{
+    int before = failures;
+    struct rig r;
+    static const uint8_t bytes[16] = { 0x42 };
+    uint64_t id = 0;
+    CHECK(rig_up(&r, MOQ_PERSPECTIVE_CLIENT) == 0);
+    deliver_streams_available(&r, 8, 8);
+    deliver_dgram_state(&r, true, 1200);
+    CHECK(r.ops->open_uni(r.conn, &id) == MOQ_TRANSPORT_OK);
+    moq_rcbuf_t *payload = NULL;
+    CHECK(moq_rcbuf_create(&r.alloc.api, bytes, sizeof(bytes), &payload) == MOQ_OK);
+    CHECK(r.ops->write_payload(r.conn, id, payload, false) == MOQ_TRANSPORT_OK);
+    CHECK(r.ops->write(r.conn, id, bytes, sizeof(bytes), false) == MOQ_TRANSPORT_OK);
+    moq_rcbuf_decref(payload);
+    moq_msquic_test_flush(r.conn);
+    CHECK(r.ops->send_datagram(r.conn, bytes, 7) == MOQ_TRANSPORT_OK);
+    CHECK(r.fake.send_count == 1 && r.fake.dgram_count == 1);
+    size_t borrowed = atomic_load(&r.alloc.live_bytes);
+
+    /* Model a broken provider that marks history settled without callbacks.
+     * Independent adapter/allocator observations must still report ownership. */
+    r.fake.sends[0].completed = r.fake.dgrams[0].completed = true;
+    r.fake.send_completions = r.fake.dgram_completions = 1;
+    fake_msq_cancel_pending(&r.fake, moq_msquic_conn_callback(), r.conn);
+    CHECK(fake_msq_pending_sends(&r.fake) == 0 &&
+          fake_msq_pending_dgrams(&r.fake) == 0);
+    CHECK(r.conn->pending_sends == 1 && r.conn->dgram_inflight == 1);
+    CHECK(atomic_load(&r.alloc.live_bytes) == borrowed);
+
+    /* Restore the fake's history before real cancellation; no terminal was
+     * delivered and the borrowed contexts are still alive. */
+    r.fake.sends[0].completed = r.fake.dgrams[0].completed = false;
+    r.fake.send_completions = r.fake.dgram_completions = 0;
+    fake_msq_cancel_pending(&r.fake, moq_msquic_conn_callback(), r.conn);
+    CHECK(r.fake.send_completions == 1 && r.fake.dgram_completions == 1);
+    CHECK(r.conn->pending_sends == 0 && r.conn->dgram_inflight == 0);
+    CHECK(atomic_load(&r.alloc.live_bytes) < borrowed);
+    rig_down(&r);
+    if (failures == before)
+        printf("PASS: teardown missing callbacks retain real ownership\n");
+}
+
 int main(void)
 {
     t_cfg_validation();
@@ -2225,6 +2370,8 @@ int main(void)
     t_datagram_cap();
     t_datagram_too_large();
     t_flush_accounting();
+    t_teardown_ownership();
+    t_teardown_missing_callbacks();
 
     if (failures == 0)
         printf("PASS: msquic_unit\n");

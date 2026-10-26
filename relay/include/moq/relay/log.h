@@ -106,8 +106,10 @@ typedef struct moqr_log_cfg {
     uint32_t           max_objects_per_group;    /* subgroup records +
                                                   * datagrams; 0 = def 4096 */
     uint32_t           max_cursors;              /* 0 = default 64         */
-    uint32_t           max_chunk_nodes;          /* OPEN-record chunk-node
-                                                  * pool; 0 = default 8192  */
+    uint32_t           max_chunk_nodes;          /* chunk-node pool: a node
+                                                  * per retained chunk of an
+                                                  * OPEN or COMPLETE chunked
+                                                  * record; 0 = default 8192 */
     moqr_trace_t      *trace;        /* optional; BORROWED, must outlive   */
     uint64_t           trace_id;     /* scalar track id in trace records   */
 } moqr_log_cfg_t;
@@ -133,6 +135,17 @@ MOQR_CORE_API moqr_result_t moqr_log_create(const moqr_log_cfg_t *cfg, moqr_log_
 MOQR_CORE_API void moqr_log_destroy(moqr_log_t *log);
 
 /* -- Append (ingest) ---------------------------------------------------- */
+
+/* The integer encoding of a record's Object Property bytes: the codec of the
+ * wire draft that carried them. A Key-Value-Pair's Delta Type, odd-type
+ * Length and even-type value are draft-16 (i), the QUIC variable-length
+ * integer, and draft-18/draft-22 (vi64). UNKNOWN states nothing: the log
+ * keeps such bytes opaquely, and a protocol-aware consumer must not convert
+ * or forward a nonempty UNKNOWN block onto any draft. An empty block needs
+ * no codec. Any other value is an invalid argument. */
+#define MOQR_PROPS_CODEC_UNKNOWN     0u
+#define MOQR_PROPS_CODEC_QUIC_VARINT 1u   /* draft-16                      */
+#define MOQR_PROPS_CODEC_VI64        2u   /* draft-18 and draft-22         */
 
 typedef struct moqr_log_append_desc {
     uint32_t          struct_size;
@@ -170,6 +183,13 @@ typedef struct moqr_log_append_desc {
      * otherwise the record is appended with the flag clear. */
     uint8_t           _reserved_desc[7];
     bool              subgroup_properties;
+    /* Never read: the descriptor's tail before properties_codec, which lies
+     * past the size every earlier descriptor was built with. */
+    uint8_t           _reserved_tail[7];
+    /* Appended. The codec of `properties` (MOQR_PROPS_CODEC_*). Read only
+     * when struct_size covers it; otherwise UNKNOWN. Any value other than
+     * the three codecs is MOQR_ERR_INVAL. */
+    uint8_t           properties_codec;
 } moqr_log_append_desc_t;
 
 /* The symbol clears and stamps the descriptor as a caller built before any
@@ -231,12 +251,17 @@ MOQR_CORE_API moqr_result_t moqr_log_open_record(moqr_log_t *log,
 
 /*
  * Append one payload chunk (zero-copy rcbuf slice) to an OPEN record. The log
- * increfs `chunk` and retains it; its bytes count against retained_bytes as
- * accepted. Errors: MOQR_ERR_TOO_OLD (the record's group was evicted),
- * MOQR_ERR_WRONG_STATE (no OPEN record at that identity), MOQR_ERR_INVAL
- * (bytes would exceed declared_len), MOQR_ERR_CAPACITY (chunk-node pool
- * exhausted, or bytes cannot fit even after evicting older groups). On any
- * error the caller keeps its ref and the record stays OPEN.
+ * increfs `chunk` and retains it; its bytes count against retained_bytes and
+ * it takes one chunk node, both as accepted. When the bytes or a node are
+ * short, older groups are evicted, oldest first and never the record's own
+ * or a newer one, until both fit. Errors: MOQR_ERR_TOO_OLD (the record's
+ * group was evicted), MOQR_ERR_WRONG_STATE (no OPEN record at that identity),
+ * MOQR_ERR_INVAL (bytes would exceed declared_len), MOQR_ERR_CAPACITY (no
+ * eviction can admit it: the record's group is the oldest left, or only
+ * nodes are short and no group older than the record's holds one -- every
+ * node in use is that group's or a newer group's -- in which case nothing is
+ * evicted). On any error the caller keeps its ref and the record stays OPEN;
+ * groups already evicted for it stay evicted.
  */
 MOQR_CORE_API moqr_result_t moqr_log_append_chunk(moqr_log_t *log, uint64_t group_id,
                                     uint64_t subgroup_id, uint64_t object_id,
@@ -273,13 +298,17 @@ MOQR_CORE_API size_t moqr_log_evict_groups(moqr_log_t *log, size_t max_groups);
 
 /* Record an authoritative upstream eviction watermark: every group below
  * `oldest_retained` is gone at the source, so nothing more will ever arrive
- * for that range. Locally retained groups below it remain SERVABLE — their
- * unsealed subgroup lists are sealed through the ordinary seal path (which
- * drives the usual late-FIN notices and downstream closes) — while the
+ * for that range. Locally retained groups below it remain SERVABLE, but a
+ * subgroup list that has not ended may lack objects the source evicted, so
+ * it is terminalized as a RESET, never sealed: its OPEN object, if any, is
+ * abandoned with MOQR_RESET_CODE_EVICTED, and the list ends with the cause
+ * of its abandoned last object, else with MOQR_RESET_CODE_EVICTED. A list
+ * that already ended keeps its terminal. Complete records are kept. The
  * log's eviction visibility (`any_evicted` / `max_evicted_group_id`)
  * advances over the ABSENT range so probes there answer MOQR_ERR_TOO_OLD —
  * "never will" — instead of MOQR_DONE — "not yet". Monotonic: a stale or
- * duplicate watermark is a no-op. Returns the number of lists sealed. */
+ * duplicate watermark is a no-op. Returns the number of lists newly
+ * terminalized. */
 MOQR_CORE_API size_t moqr_log_note_evicted_below(moqr_log_t *log, uint64_t oldest_retained);
 
 /* The first group id NOT covered by eviction knowledge: 0 when nothing was
@@ -330,6 +359,10 @@ typedef struct moqr_record_view {
                                       * padding, layout unchanged          */
     const moq_rcbuf_t *payload;      /* BORROWED; NULL for status/chunked   */
     const moq_rcbuf_t *properties;   /* BORROWED; NULL if none             */
+    /* The codec `properties` was stated in at ingest (MOQR_PROPS_CODEC_*),
+     * fixed for the record's life. This field changed the view's layout:
+     * code reading views is rebuilt against this header. */
+    uint8_t            properties_codec;
     /* Chunked records (chunk_count > 0): payload is NULL and the retained
      * bytes-so-far live in a chunk list read via moqr_log_view_chunk;
      * declared_len is the wire payload length. Whole-object records have

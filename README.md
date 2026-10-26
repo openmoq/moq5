@@ -76,6 +76,11 @@ interoperability evidence are in [docs/conformance.md](docs/conformance.md);
 the draft-22 wire format is in
 [docs/draft22-wire-reference.md](docs/draft22-wire-reference.md).
 
+MoQ Cluster draft-01 is available as an opt-in on draft-22 sessions and the
+reusable relay libraries. Hosts configure peer connections and drive the relay;
+see the [cluster setup guide](relay/README.md#cluster-routing) and
+[coverage and limits](docs/conformance.md#moq-cluster-draft-01).
+
 ## Media service tier
 
 For media applications, the service tier is the recommended API. It links only
@@ -114,6 +119,9 @@ below it.
 See [`examples/service/README.md`](examples/service/README.md) for the full
 contract, examples (`media_receive.c` / `media_send.c`), and build/consume
 instructions.
+
+For per-resource credentials, see [`docs/service-auth.md`](docs/service-auth.md).
+Endpoint SETUP credentials and resource credentials are configured separately.
 
 ## Transport adapters
 
@@ -199,6 +207,31 @@ facade the service still builds, but that transport returns
 > package does not ship the private header and will fail configuration with a
 > clear message.
 
+### Windows (MSVC)
+
+The core, service tier and picoquic raw-QUIC adapter (including the threaded
+facade) build with Visual Studio 2022 (17.5+). Neither OpenSSL nor pkg-config
+(which picotls requires) ships with the toolchain; vcpkg provides both:
+
+```sh
+vcpkg install openssl pkgconf --triplet x64-windows-static-md
+export OPENSSL_ROOT_DIR=<vcpkg>/installed/x64-windows-static-md
+export PKG_CONFIG=$OPENSSL_ROOT_DIR/tools/pkgconf/pkgconf.exe
+```
+
+Then run `scripts/setup_picoquic_deps.sh` from Git Bash and configure as on
+the other platforms, from a "x64 Native Tools" / Developer shell with
+`-G Ninja` (the hand-written build-tree target exports do not support
+multi-config generators such as Visual Studio's yet). Consumers of the
+installed package can use any generator; they only need `OPENSSL_ROOT_DIR`
+in addition to the usual `MOQ_PICOQUIC_SOURCE_DIR` / `MOQ_PICOTLS_PREFIX`.
+
+The raw picoquic managed facade supports clients and single-lane servers on
+Windows (`lane_count` 0 or 1). Windows server lane groups are unsupported:
+a valid count 2..`MOQ_PQ_THREADED_MAX_LANES` returns `MOQ_ERR_UNSUPPORTED`,
+with NULL output and no allocation, Winsock startup, sockets or threads.
+The POSIX group backend remains available on supported `SO_REUSEPORT` platforms.
+
 ## Packaging
 
 Install with `cmake --install`, then consume via
@@ -266,6 +299,7 @@ sim/            moq-sim: SimPair deterministic simulation + fault injection
 adapters/       picoquic, pico_wt, mvfst, msquic, wtquic, proxygen (+ shared helpers)
 bindings/cpp/   moq-cpp: header-only C++20 binding
 bindings/python/ CPython endpoint, receiver and sender over the installed service SDK
+bindings/rust/  moq5-sys (raw FFI) and moq5 (safe API) over the installed service SDK
 media/          loc, cmaf, mpeg2ts, msf catalog, media object, playback (parse helpers)
 tests/          unit, scenario, simulation, and adapter conformance tests
 fuzz/           fuzz targets and corpus
@@ -279,6 +313,11 @@ The [Python binding](bindings/python/README.md) provides synchronous endpoint,
 media receiver and media sender APIs over the installed service SDK. See its
 support statement for the available surface and qualification limits; asyncio
 remains separate follow-up work.
+
+The [Rust bindings](bindings/rust/README.md) are two crates: `moq5-sys`, raw
+FFI generated from the installed headers, and `moq5`, a safe API over the
+service tier (endpoint, media sender and receiver, CMAF parsing) whose types
+enforce the C API's ownership, teardown and threading rules.
 
 ## Author
 

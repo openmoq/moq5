@@ -1,0 +1,54 @@
+Keep the declared project version in source archives and subproject builds.
+
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2.
+
+The parent may not be a Git checkout, and its revision is not picoquic's. The
+package configuration and version files use project()'s version, and
+picoquic-config.cmake reports it as configured rather than as a path variable.
+Tests: tests/cmake/PicoquicVersionMetadata.cmake (CTest
+picoquic_version_metadata), in archive and subproject modes.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a7d2c346..b92d95fe 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -863,14 +863,9 @@ install(FILES
+ 
+ include(CMakePackageConfigHelpers)
+ 
+-execute_process(
+-    COMMAND git rev-parse --short HEAD
+-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+-    OUTPUT_VARIABLE GIT_HASH
+-    OUTPUT_STRIP_TRAILING_WHITESPACE
+-)
+-
+-set(PROJECT_VERSION "0.0.0-${GIT_HASH}")
++# Package metadata uses the version declared by project(). A Git revision is
++# not a usable package version: a source archive has none, and a parent
++# project's revision is not picoquic's.
+ message(STATUS "Project version: ${PROJECT_VERSION}")
+ 
+ if (NOT CMAKE_INSTALL_LIBDIR)
+@@ -881,7 +876,7 @@ set(INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Location of head
+ 
+ set(INSTALL_CONFIG_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME})
+ 
+-configure_package_config_file(${PROJECT_NAME}-config.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake PATH_VARS PROJECT_VERSION LIB_PATH INCLUDE_INSTALL_DIR INSTALL_DESTINATION ${INSTALL_CONFIG_DIR})
++configure_package_config_file(${PROJECT_NAME}-config.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake PATH_VARS LIB_PATH INCLUDE_INSTALL_DIR INSTALL_DESTINATION ${INSTALL_CONFIG_DIR})
+ write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config-version.cmake VERSION ${PROJECT_VERSION} COMPATIBILITY ExactVersion)
+ 
+ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config.cmake ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}-config-version.cmake DESTINATION ${INSTALL_CONFIG_DIR})
+diff --git a/picoquic-config.cmake.in b/picoquic-config.cmake.in
+index e1ea5c5d..6ce7654d 100644
+--- a/picoquic-config.cmake.in
++++ b/picoquic-config.cmake.in
+@@ -10,7 +10,7 @@ endif()
+ 
+ include("${CMAKE_CURRENT_LIST_DIR}/picoquic-targets.cmake")
+ 
+-set(picoquic_VERSION "@PACKAGE_PROJECT_VERSION@")
++set(picoquic_VERSION "@PROJECT_VERSION@")
+ set(picoquic_LIBRARIES "@PACKAGE_LIB_PATH@")
+ set(picoquic_INCLUDE_DIR "@PACKAGE_INCLUDE_INSTALL_DIR@")
+ 

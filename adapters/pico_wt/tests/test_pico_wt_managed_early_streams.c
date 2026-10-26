@@ -7,6 +7,9 @@
  *   - each delivery is kept -- bytes, a FIN, or the peer's STOP_SENDING -- in
  *     arrival order, and replayed in that order onto the stream rebound to
  *     the adapter;
+ *   - a real header-only stream arriving before the CONNECT response is
+ *     registered without a payload entry and rebound on acceptance; later
+ *     payload reaches the session through the provider receive path;
  *   - a stream beyond MOQ_PWM_EARLY_MAX_STREAMS, or one whose entry would pass
  *     MOQ_PWM_EARLY_MAX_ENTRIES or MOQ_PWM_EARLY_MAX_BYTES (payload plus node
  *     storage), is closed once with WT_BUFFERED_STREAM_REJECTED and detached
@@ -37,6 +40,7 @@
 #include "pico_wt_harness.h"
 #include <moq/buf.h>
 #include <moq/control_d18.h>
+#include <demoserver.h>
 
 #include <stdio.h>
 
@@ -48,8 +52,15 @@ static int failures;
 /* -- counting allocator ---------------------------------------------- */
 
 static long g_live;
+static bool g_fail_counted;
 static void *cnt_alloc(size_t n, void *ctx)
-{ (void)ctx; g_live++; return malloc(n); }
+{
+    (void)ctx;
+    if (g_fail_counted) { g_fail_counted = false; return NULL; }
+    void *p = malloc(n);
+    if (p) g_live++;
+    return p;
+}
 static void *cnt_realloc(void *p, size_t o, size_t n, void *ctx)
 { (void)o; (void)ctx; if (!p) g_live++; return realloc(p, n); }
 static void cnt_free(void *p, size_t n, void *ctx)
@@ -198,6 +209,33 @@ static void test_order_and_replay(void)
     }
     CHECK(m->early_head == NULL && m->early_entries == 0 &&
           m->early_bytes == 0 && m->early_ended);
+    CHECK(g_live == 0);
+    shell_free(m);
+}
+
+/* Unit coverage for empty registration, including duplicate registration.
+ * The real receive-path row below establishes whether a header reaches this
+ * admission logic; h3zero itself does not emit an empty path callback. */
+static void test_header_only_stream(void)
+{
+    moq_pico_wt_managed_t *m = shell();
+    h3zero_stream_ctx_t *u = stream(m, 0), *v = stream(m, 1);
+    CHECK(deliver(m, u, NULL, 0, DATA) == 0);
+    CHECK(deliver(m, u, NULL, 0, DATA) == 0);
+    CHECK(deliver(m, v, "z", 1, DATA) == 0);
+    CHECK(entries(m) == 1 && m->early_entries == 1);
+    CHECK(m->early_nstreams == 2);
+    CHECK(g_naborts == 0);
+
+    moq_pico_wt_managed_test_replay = rec_replay;
+    void *conn = (void *)(uintptr_t)0x2000;
+    pwm_early_replay(m, g_cnx, (moq_pico_wt_conn_t *)conn);
+    moq_pico_wt_managed_test_replay = NULL;
+
+    CHECK(u->path_callback == moq_pico_wt_callback && u->path_callback_ctx == conn);
+    CHECK(v->path_callback == moq_pico_wt_callback && v->path_callback_ctx == conn);
+    CHECK(g_ndeliv == 1);   /* the empty delivery is not replayed */
+    CHECK(g_ndeliv < 1 || g_deliv[0].sid == v->stream_id);
     CHECK(g_live == 0);
     shell_free(m);
 }
@@ -459,6 +497,327 @@ static const pw_rx_stream_t *rx_of(const moq_pico_wt_conn_t *c, uint64_t sid)
     for (size_t i = 0; i < c->rx_count; i++)
         if (c->rx[i].active && c->rx[i].stream_id == sid) return &c->rx[i];
     return NULL;
+}
+
+/* -- header-only streams before an actual CONNECT response ----------- */
+
+typedef struct {
+    pico_wt_harness_t h;
+    moq_pico_wt_managed_t *m;
+    bool refuse;
+} header_fixture_t;
+
+static int header_server_cb(picoquic_cnx_t *cnx, uint8_t *bytes,
+    size_t length, picohttp_call_back_event_t event,
+    h3zero_stream_ctx_t *sc, void *ctx)
+{
+    header_fixture_t *f = ctx;
+    (void)bytes; (void)length;
+    if (event != picohttp_callback_connect) return 0;
+    if (!picowt_is_webtransport_connect(sc)) return -1;
+    f->h.server_wt.h3_ctx = picoquic_get_callback_context(cnx);
+    f->h.server_wt.ctrl_ctx = sc;
+    if (h3zero_declare_stream_prefix(f->h.server_wt.h3_ctx, sc->stream_id,
+            header_server_cb, f) != 0 ||
+        picowt_select_wt_protocol(sc,
+            moq_alpn_for_version(MOQ_VERSION_DRAFT_18)) != 0)
+        return -1;
+    f->h.server_wt.connect_received = 1;
+    return f->refuse ? -1 : 0;
+}
+
+static int header_fixture_setup(header_fixture_t *f, bool refuse)
+{
+    memset(f, 0, sizeof(*f));
+    f->refuse = refuse;
+    f->m = shell();
+    if (!f->m) return -1;
+    moq_pico_wt_managed_t *m = f->m;
+    m->ctrl_ctx = NULL;
+    m->send_request_capacity = true;
+    m->initial_request_capacity = 10;
+    m->wt_protocols = (char *)moq_alpn_for_version(MOQ_VERSION_DRAFT_18);
+    moq_pico_wt_managed_test_abort_stream = NULL;
+    picoquic_solution_dir = PICOQUIC_SOURCE_DIR;
+    picoquic_connection_id_t cid = {
+        .id = {0x77, 0x74, 0xba, 0x95, 0, 0, 0, 0}, .id_len = 8};
+    f->h.path_table[0] = (picohttp_server_path_item_t){
+        .path = "/moq", .path_length = 4,
+        .path_callback = header_server_cb, .path_app_ctx = f,
+        .connect_protocol = H3ZERO_WEBTRANSPORT_H3_PROTOCOL,
+        .connect_protocol_length = sizeof(H3ZERO_WEBTRANSPORT_H3_PROTOCOL) - 1};
+    f->h.server_param.path_table = f->h.path_table;
+    f->h.server_param.path_table_nb = 1;
+    if (tls_api_init_ctx_ex(&f->h.test_ctx, PICOQUIC_INTERNAL_TEST_VERSION_1,
+            PICOQUIC_TEST_SNI, "h3", &f->h.now,
+            NULL, NULL, 0, 1, 0, &cid) != 0)
+        return -1;
+    m->cnx = f->h.test_ctx->cnx_client;
+    picoquic_set_default_idle_timeout(f->h.test_ctx->qclient, 30000);
+    picoquic_set_default_idle_timeout(f->h.test_ctx->qserver, 30000);
+    picowt_set_default_transport_parameters(f->h.test_ctx->qserver);
+    picowt_set_transport_parameters(m->cnx);
+
+    /* Use the same context/control-stream primitives as prepare_client_cnx,
+     * but advertise zero response credit BEFORE creating the CONNECT stream.
+     * The server can send WT uni/bidi headers, but no CONNECT response byte
+     * can arrive until this fixture explicitly grants credit. */
+    picoquic_tp_t tp = *picoquic_get_transport_parameters(m->cnx, 1);
+    tp.initial_max_stream_data_bidi_local = 0;
+    picoquic_set_transport_parameters(m->cnx, &tp);
+    m->h3_ctx = h3zero_callback_create_context(NULL);
+    if (!m->h3_ctx) return -1;
+    m->ctrl_ctx = picowt_set_control_stream(m->cnx, m->h3_ctx);
+    if (!m->ctrl_ctx) return -1;
+    picoquic_set_callback(m->cnx, managed_client_h3_callback, m);
+    if (picowt_connect(m->cnx, m->h3_ctx, m->ctrl_ctx, PICOQUIC_TEST_SNI,
+            "/moq", managed_client_wt_cb, m, m->wt_protocols) != 0)
+        return -1;
+    picoquic_set_alpn_select_fn_v2(f->h.test_ctx->qserver,
+        picoquic_demo_server_callback_select_alpn);
+    picoquic_set_default_callback(f->h.test_ctx->qserver,
+        h3zero_callback, &f->h.server_param);
+    if (picoquic_start_client_cnx(m->cnx) != 0 ||
+        tls_api_connection_loop(f->h.test_ctx, &f->h.loss_mask, 0,
+            &f->h.now) != 0)
+        return -1;
+    for (int i = 0; i < 2048 && !f->h.server_wt.connect_received; i++) {
+        int wa = 0;
+        if (tls_api_one_sim_round(f->h.test_ctx, &f->h.now,
+                f->h.now + 25000, &wa) != 0)
+            return -1;
+    }
+    picoquic_stream_head_t *response = f->h.test_ctx->cnx_server ?
+        picoquic_find_stream(f->h.test_ctx->cnx_server,
+            m->ctrl_ctx->stream_id) : NULL;
+    return f->h.server_wt.connect_received && response &&
+        response->maxdata_remote == 0 && response->sent_offset == 0 &&
+        !m->ctrl_ctx->ps.stream_state.header.status &&
+        !m->conn && !m->session && !m->early_ended && !m->fatal ? 0 : -1;
+}
+
+static void header_fixture_cleanup(header_fixture_t *f)
+{
+    if (f->m) {
+        moq_pico_wt_managed_t *m = f->m;
+        pwm_early_clear(m);
+        if (m->conn) moq_pico_wt_conn_destroy(m->conn);
+        if (m->session) moq_session_destroy(m->session);
+        m->conn = NULL;
+        m->session = NULL;
+        f->h.client_conn = NULL;
+        f->h.client_session = NULL;
+        if (m->h3_ctx) {
+            if (m->cnx) picoquic_set_callback(m->cnx, NULL, NULL);
+            pico_wt_h3_delete_context(m->cnx, m->h3_ctx);
+            m->h3_ctx = NULL;
+            m->ctrl_ctx = NULL;
+        }
+    }
+    pico_wt_harness_cleanup(&f->h);
+    if (f->m) shell_free(f->m);
+    f->m = NULL;
+    g_fail_counted = false;
+    moq_pico_wt_managed_test_abort_stream = rec_abort;
+    CHECK(g_live == 0);
+}
+
+static uint64_t header_open(header_fixture_t *f, int bidi)
+{
+    h3zero_stream_ctx_t *sc = picowt_create_local_stream(
+        f->h.test_ctx->cnx_server, bidi, f->h.server_wt.h3_ctx,
+        f->m->ctrl_ctx->stream_id);
+    CHECK(sc != NULL);
+    if (!sc) return UINT64_MAX;
+    uint64_t sid = sc->stream_id;
+    CHECK(pico_wt_harness_pump(&f->h, 100) == 0);
+    return sid;
+}
+
+static bool header_check_pending(header_fixture_t *f, uint64_t sid)
+{
+    moq_pico_wt_managed_t *m = f->m;
+    h3zero_stream_ctx_t *sc = h3zero_find_stream(m->h3_ctx, sid);
+    picoquic_stream_head_t *st = picoquic_find_stream(m->cnx, sid);
+    bool pending = sc && bound_to_facade(sc, m) &&
+        sc->ps.stream_state.control_stream_id == m->ctrl_ctx->stream_id &&
+        st && !st->fin_received && st->consumed_offset ==
+            2 + picoquic_frames_varint_encode_length(m->ctrl_ctx->stream_id) &&
+        !m->conn && !m->session && !m->early_ended && !m->fatal &&
+        m->ctrl_ctx->ps.stream_state.header.status == 0;
+    CHECK(pending);
+    return pending;
+}
+
+static uint64_t header_open_split_uni(header_fixture_t *f)
+{
+    picoquic_cnx_t *srv = f->h.test_ctx->cnx_server;
+    uint64_t sid = picoquic_get_next_local_stream_id(srv, 1);
+    uint8_t header[16];
+    uint8_t *end = picoquic_frames_varint_encode(header, header + sizeof(header),
+        h3zero_stream_type_webtransport);
+    if (end) end = picoquic_frames_varint_encode(end, header + sizeof(header),
+        f->m->ctrl_ctx->stream_id);
+    CHECK(end != NULL);
+    if (!end) return UINT64_MAX;
+    CHECK(picoquic_add_to_stream(srv, sid, header, 1, 0) == 0);
+    CHECK(pico_wt_harness_pump(&f->h, 100) == 0);
+    h3zero_stream_ctx_t *sc = h3zero_find_stream(f->m->h3_ctx, sid);
+    CHECK(sc && sc->path_callback == NULL);
+    CHECK(f->m->early_nstreams == 0 && f->m->early_entries == 0);
+    CHECK(picoquic_add_to_stream(srv, sid, header + 1,
+        (size_t)(end - header) - 1, 0) == 0);
+    CHECK(pico_wt_harness_pump(&f->h, 100) == 0);
+    return sid;
+}
+
+static void header_release_response(header_fixture_t *f)
+{
+    CHECK(picoquic_open_flow_control(f->m->cnx,
+        f->m->ctrl_ctx->stream_id, 65536) == 0);
+    CHECK(pico_wt_harness_pump(&f->h, 100) == 0);
+    f->h.client_conn = f->m->conn;
+    f->h.client_session = f->m->session;
+}
+
+/* No fabricated empty callback or acceptance: the provider receives only WT
+ * headers first, then the real HTTP response, then MoQ SETUP and FETCH. The
+ * predecessor still passes the wire-order prerequisites, but loses both
+ * payloads through stale facade callbacks instead of establishing a session
+ * and emitting exactly one FETCH request. */
+static void test_header_only_real_transport(void)
+{
+    header_fixture_t f;
+    if (header_fixture_setup(&f, false) != 0) {
+        CHECK(0 && "header fixture: CONNECT response held at zero credit");
+        header_fixture_cleanup(&f);
+        return;
+    }
+    moq_pico_wt_managed_t *m = f.m;
+    uint64_t usid = header_open_split_uni(&f), bsid = header_open(&f, 1);
+    bool uni_pending = header_check_pending(&f, usid);
+    bool bidi_pending = header_check_pending(&f, bsid);
+    if (!uni_pending || !bidi_pending) goto done;
+    printf("  header-only: real uni/bidi headers parsed, no FIN or payload, "
+           "CONNECT response withheld\n");
+    CHECK(m->early_nstreams == 2 && m->early_entries == 0 &&
+        m->early_bytes == 0 && g_live == 0);
+    header_release_response(&f);
+    CHECK(m->conn && m->session && !m->fatal && m->early_ended);
+    CHECK(m->ctrl_ctx->ps.stream_state.header.status == 200);
+    if (!m->conn || !m->session) goto done;
+    CHECK(m->early_nstreams == 0 && active_rx(m->conn) == 0);
+    h3zero_stream_ctx_t *u = h3zero_find_stream(m->h3_ctx, usid);
+    h3zero_stream_ctx_t *b = h3zero_find_stream(m->h3_ctx, bsid);
+    CHECK(u && u->path_callback == moq_pico_wt_callback &&
+        u->path_callback_ctx == m->conn);
+    CHECK(b && b->path_callback == moq_pico_wt_callback &&
+        b->path_callback_ctx == m->conn);
+
+    static const uint8_t setup[] = {0xaf, 0x00, 0x00, 0x00};
+    CHECK(picoquic_add_to_stream(f.h.test_ctx->cnx_server, usid,
+        setup, sizeof(setup), 0) == 0);
+    CHECK(pico_wt_harness_pump(&f.h, 100) == 0);
+    CHECK(moq_session_state(m->session) == MOQ_SESS_ESTABLISHED);
+    CHECK(rx_of(m->conn, usid) != NULL);
+
+    uint8_t msg[128];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, msg, sizeof(msg));
+    moq_bytes_t parts[] = {MOQ_BYTES_LITERAL("header-first")};
+    moq_d18_fetch_t fetch = {0};
+    fetch.request_id = 1;
+    fetch.fetch_type = 1;
+    fetch.track_namespace = (moq_namespace_t){parts, 1};
+    fetch.track_name = MOQ_BYTES_LITERAL("video");
+    fetch.end = (moq_d18_location_t){10, 0};
+    CHECK(moq_d18_encode_fetch(&w, &fetch) == MOQ_OK);
+    CHECK(picoquic_add_to_stream(f.h.test_ctx->cnx_server, bsid,
+        msg, moq_buf_writer_offset(&w), 0) == 0);
+    CHECK(pico_wt_harness_pump(&f.h, 100) == 0);
+    unsigned setups = 0, requests = 0;
+    moq_event_t ev;
+    while (moq_session_poll_events(m->session, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_SETUP_COMPLETE) setups++;
+        if (ev.kind == MOQ_EVENT_FETCH_REQUEST) requests++;
+        moq_event_cleanup(&ev);
+    }
+    CHECK(setups == 1 && requests == 1);
+    printf("  header-only: HTTP 200, SETUP events=%u, FETCH events=%u\n",
+        setups, requests);
+    CHECK(rx_of(m->conn, bsid) != NULL);
+    CHECK(!moq_pico_wt_conn_is_fatal(m->conn));
+    CHECK(pico_wt_harness_pump(&f.h, 100) == 0);
+    size_t remaining = moq_session_poll_events(m->session, &ev, 1);
+    CHECK(remaining == 0);
+    if (remaining) moq_event_cleanup(&ev);
+done:
+    header_fixture_cleanup(&f);
+}
+
+static void header_check_stopped(header_fixture_t *f, uint64_t sid,
+                                 uint64_t error)
+{
+    picoquic_stream_head_t *st = picoquic_find_stream(f->m->cnx, sid);
+    CHECK(st && st->stop_sending_requested && st->local_stop_error == error);
+    h3zero_stream_ctx_t *sc = h3zero_find_stream(f->m->h3_ctx, sid);
+    CHECK(sc && sc->path_callback == NULL && sc->path_callback_ctx == NULL);
+}
+
+/* Header-only admission consumes the same bounded slots as payload. Reset,
+ * allocation failure and an actual non-2xx response must release them without
+ * retaining a freed h3zero context or reopening a rejected stream. */
+static void test_header_only_limits_real_transport(void)
+{
+    header_fixture_t f;
+    if (header_fixture_setup(&f, true) != 0) {
+        CHECK(0 && "header refusal fixture setup");
+        header_fixture_cleanup(&f);
+        return;
+    }
+    moq_pico_wt_managed_t *m = f.m;
+    uint64_t sid[MOQ_PWM_EARLY_MAX_STREAMS];
+    for (size_t i = 0; i < MOQ_PWM_EARLY_MAX_STREAMS; i++) {
+        sid[i] = header_open(&f, 0);
+        header_check_pending(&f, sid[i]);
+    }
+    CHECK(m->early_nstreams == MOQ_PWM_EARLY_MAX_STREAMS);
+    CHECK(m->early_entries == 0 && m->early_bytes == 0 && g_live == 0);
+    uint64_t extra = header_open(&f, 0);
+    header_check_stopped(&f, extra, H3ZERO_WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
+    CHECK(m->early_nstreams == MOQ_PWM_EARLY_MAX_STREAMS);
+
+    CHECK(picoquic_reset_stream(f.h.test_ctx->cnx_server, sid[0], 42) == 0);
+    CHECK(pico_wt_harness_pump(&f.h, 100) == 0);
+    CHECK(pwm_early_slot(m, sid[0]) == SIZE_MAX);
+    CHECK(m->early_nstreams == MOQ_PWM_EARLY_MAX_STREAMS - 1);
+    CHECK(h3zero_find_stream(m->h3_ctx, sid[0]) == NULL);
+    sid[0] = header_open(&f, 0);
+    header_check_pending(&f, sid[0]);
+    CHECK(m->early_nstreams == MOQ_PWM_EARLY_MAX_STREAMS);
+
+    g_fail_counted = true;
+    CHECK(picoquic_add_to_stream(f.h.test_ctx->cnx_server, sid[1],
+        (const uint8_t *)"x", 1, 0) == 0);
+    CHECK(pico_wt_harness_pump(&f.h, 100) == 0);
+    CHECK(!g_fail_counted);
+    g_fail_counted = false;
+    header_check_stopped(&f, sid[1], H3ZERO_WEBTRANSPORT_BUFFERED_STREAM_REJECTED);
+    CHECK(pwm_early_slot(m, sid[1]) == SIZE_MAX);
+    CHECK(m->early_nstreams == MOQ_PWM_EARLY_MAX_STREAMS - 1);
+    CHECK(m->early_entries == 0 && m->early_bytes == 0 && g_live == 0);
+
+    header_release_response(&f);
+    CHECK(m->fatal && m->early_ended && !m->conn && !m->session);
+    CHECK(m->ctrl_ctx->ps.stream_state.header.status == 501);
+    CHECK(m->early_nstreams == 0 && m->early_entries == 0 && g_live == 0);
+    for (size_t i = 0; i < MOQ_PWM_EARLY_MAX_STREAMS; i++)
+        if (i != 1)
+            header_check_stopped(&f, sid[i], H3ZERO_WEBTRANSPORT_SESSION_GONE);
+    uint64_t late = header_open(&f, 0);
+    header_check_stopped(&f, late, H3ZERO_WEBTRANSPORT_SESSION_GONE);
+    CHECK(m->early_nstreams == 0 && m->early_bytes == 0 && g_live == 0);
+    header_fixture_cleanup(&f);
 }
 
 /* Whether picoquic leaves `sid`'s receive window to the application: 1 or 0,
@@ -842,7 +1201,7 @@ static void test_early_stop_real_adapter(void)
  * held chunk. So at the hold age both the completion record and the later
  * FIN show its receive half terminal -- this row does not single out either.
  * With held-stream records (the bridge is rebuilt with
- * MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT, which no shipped adapter declares), the
+ * MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT and this fixture's smaller limits), the
  * hold age cancels it: the held bytes are discarded, no STOP_SENDING reaches
  * picoquic for the retired stream, and nothing is fatal. */
 static void test_early_fin_held_cancel_real_adapter(void)
@@ -973,10 +1332,13 @@ int main(void)
 {
     moq_pico_wt_managed_test_abort_stream = rec_abort;
     test_order_and_replay();
+    test_header_only_stream();
     test_stream_limit();
     test_entry_and_storage_limits();
     test_reset_and_freed_context();
     test_connect_refused();
+    test_header_only_real_transport();
+    test_header_only_limits_real_transport();
     test_early_fin_real_transport(false);
     test_early_fin_real_transport(true);
     test_early_stop_real_adapter();

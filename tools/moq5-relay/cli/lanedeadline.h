@@ -62,13 +62,15 @@ moqr_cli_lane_deadlines_init(moqr_cli_lane_deadlines_t *d, uint32_t count)
  * instant instead would make the lane's doorbell find a due deadline on each pass
  * and pump without pause.
  *
- * A slot outside `count` is ignored.
+ * A slot outside `count` is ignored. The table's capacity bounds the slot
+ * too: `count` is a plain field, so the accessors do not rely on init having
+ * clamped it.
  */
 static inline void
 moqr_cli_lane_deadlines_publish(moqr_cli_lane_deadlines_t *d, uint32_t slot,
                                 uint64_t deadline_us, uint64_t now_us)
 {
-    if (slot >= d->count) {
+    if (slot >= d->count || slot >= MOQR_CLI_LANE_DEADLINE_SLOTS) {
         return;
     }
     atomic_store_explicit(&d->at_us[slot],
@@ -83,7 +85,7 @@ moqr_cli_lane_deadlines_publish(moqr_cli_lane_deadlines_t *d, uint32_t slot,
 static inline uint64_t
 moqr_cli_lane_deadlines_at(moqr_cli_lane_deadlines_t *d, uint32_t slot)
 {
-    if (slot >= d->count) {
+    if (slot >= d->count || slot >= MOQR_CLI_LANE_DEADLINE_SLOTS) {
         return UINT64_MAX;
     }
     return atomic_load_explicit(&d->at_us[slot], memory_order_relaxed);

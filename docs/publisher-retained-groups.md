@@ -123,56 +123,84 @@ The call succeeds only if:
 - the track is still joinable
 
 On success, libmoq owns one reference to each payload and properties
-buffer until the group is replaced, cleared by future API changes, or the
-track/publisher is destroyed.
+buffer until the group is replaced, cleared with `moq_pub_clear_retained_group`,
+or the track/publisher is destroyed. An admitted FETCH owns separate snapshot
+references, which can outlive the current cache.
 
 ## Usage Pattern
 
 For a catalog generation, write the generation to current subscribers and
-then retain the exact same object set for Joining FETCH:
+then retain the exact same object set for Joining FETCH. Keep the buffers and
+the next-object cursor in application state across driver rounds. This helper
+attempts at most two writes and one cache install; it never polls or spins on
+backpressure:
 
 ```c
-moq_pub_retained_object_t retained[2] = {
-    {
-        .object_id = 0,
-        .payload = independent_catalog,
-        .properties = NULL,
-        .end_of_group = true,
-    },
-    {
-        .object_id = 1,
-        .payload = delta_update,
-        .properties = NULL,
-        .end_of_group = true,
-    },
-};
+typedef struct catalog_update {
+    uint64_t group_id;
+    size_t next_object;                 /* initialize to zero once */
+    moq_pub_retained_object_t objects[2]; /* application-owned rcbuf refs */
+} catalog_update_t;
 
-for (size_t i = 0; i < 2; i++) {
-    moq_pub_object_cfg_t obj;
-    moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
-    obj.group_id = catalog_group_id;
-    obj.object_id = retained[i].object_id;
-    obj.payload = retained[i].payload;
-    obj.properties = retained[i].properties;
-    obj.end_of_group = retained[i].end_of_group;
+static moq_result_t publish_catalog_step(moq_publisher_t *pub,
+    moq_pub_track_t *track, catalog_update_t *update, uint64_t now_us)
+{
+    while (update->next_object < 2) {
+        const moq_pub_retained_object_t *o =
+            &update->objects[update->next_object];
+        moq_pub_object_cfg_t obj;
+        moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
+        obj.group_id = update->group_id;
+        obj.object_id = o->object_id;
+        obj.payload = o->payload;
+        obj.properties = o->properties;
+        obj.end_of_group = o->end_of_group;
 
-    moq_result_t rc = moq_pub_write_object_ex(pub, catalog_track, &obj, now_us);
-    if (rc != MOQ_OK && rc != MOQ_ERR_WOULD_BLOCK) {
-        /* handle fatal publish error */
+        moq_result_t rc = moq_pub_write_object_ex(pub, track, &obj, now_us);
+        if (rc != MOQ_OK) return rc;     /* same object on a WB retry */
+        ++update->next_object;
     }
-}
 
-moq_pub_retained_group_cfg_t rg;
-moq_pub_retained_group_cfg_init(&rg);
-rg.group_id = catalog_group_id;
-rg.objects = retained;
-rg.object_count = 2;
-
-moq_result_t rc = moq_pub_set_retained_group(pub, catalog_track, &rg);
-if (rc != MOQ_OK) {
-    /* retain failed; current subscribers may still have received the live write */
+    moq_pub_retained_group_cfg_t rg;
+    moq_pub_retained_group_cfg_init(&rg);
+    rg.group_id = update->group_id;
+    rg.objects = update->objects;
+    rg.object_count = 2;
+    return moq_pub_set_retained_group(pub, track, &rg);
 }
 ```
+
+Initialize the persistent state once, transferring the application's existing
+buffer references into it:
+
+```c
+catalog_update_t update = {
+    .group_id = catalog_group_id,
+    .next_object = 0,
+    .objects = {
+        {.object_id = 0, .payload = independent_catalog, .end_of_group = true},
+        {.object_id = 1, .payload = delta_update, .end_of_group = true},
+    },
+};
+```
+
+Call `publish_catalog_step(pub, catalog_track, &update, now_us)` after the
+normal tick or manual progress round. On `MOQ_ERR_WOULD_BLOCK`, keep this
+state and its bytes unchanged, return to the driver, and retry the helper
+after credit returns. Do not advance to another object or restart the cursor.
+Flush/tick progresses request answers and retirements; it does not retry this
+application write for you. Serialize other writes and cache changes on the
+same track until this update is settled.
+
+On `MOQ_OK`, the cache owns its references: release the application's
+payload/properties refs in `update.objects` and retire the update state. If
+the cache install fails after both writes, `next_object == 2` lets a later
+attempt retry only the install. Handle that error explicitly; live delivery
+and cache replacement are not atomic. Other write errors must also be handled,
+not skipped in order to send the next object. To abandon a partial write,
+complete the retryable `moq_pub_reset_group` operation or tear down the
+publisher before discarding the pending update; see the
+[publisher ownership guidance](integration-patterns.md#publisher-pattern).
 
 Service-level code normally should not duplicate this sequence. The media
 sender already stages catalog generations, writes them to active catalog
@@ -252,11 +280,27 @@ else.
 so it does not return `MOQ_ERR_WOULD_BLOCK`. It can return validation,
 state, or allocation errors.
 
-FETCH serving from the retained group is performed by `moq_pub_tick()`.
-If transport backpressure interrupts the FETCH response, the publisher
-keeps retry state and resumes on a later tick. The retained group is
-snapshotted for the FETCH, so replacing the retained group while a FETCH
-is in progress does not change the in-flight response.
+FETCH serving runs through `moq_pub_tick`, or through manual
+`moq_pub_handle_event` dispatch followed by `moq_pub_flush`. Every draft can
+own one immutable response snapshot per session FETCH slot, identified by the
+full generation-bearing handle. Each snapshot pins at most
+`MOQ_PUB_RETAINED_MAX_OBJECTS` payload/properties pairs within the source
+track's `max_retained_bytes` at admission. Total pinned response bytes are
+bounded by the sum of those per-owner limits, separately from current caches,
+fill budgets and transport buffers. Replacing or clearing a cache, or removing
+its track, does not change its snapshotted objects. Completion, cancellation or
+publisher teardown releases its snapshot references.
+
+Each progress pass visits occupied owners once in arrival order and skips
+blocked responses so independent work can proceed. In manual mode, drain
+actions, flush once, then keep dispatching normal FIFO events after
+`WOULD_BLOCK + CONSUMED`. The event is already owned: clean it up once and
+never replay it. Event dispatch can return the credit needed by a response
+or reset. Flush never polls, and waiting for it to return OK before polling
+again can prevent progress. Retry after credit returns and yield when no
+event, action or application progress exists. Tick callers also drain actions
+and retry in bounded driver rounds; see the
+[manual pump sequence](integration-patterns.md#manual-publisher-pump).
 
 ## Relay Limitation
 

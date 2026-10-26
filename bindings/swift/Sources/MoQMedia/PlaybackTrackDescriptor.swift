@@ -1,5 +1,6 @@
 import Foundation
 import MoQ
+import MoQTransportModel
 
 /// Everything a renderer needs to configure a playback track from
 /// an MSF catalog entry: the pipeline configuration, the codec kind,
@@ -40,7 +41,8 @@ extension MSFTrack {
         var cfg = PlaybackTrackConfiguration(
             mediaType: info.mediaType,
             packaging: info.packaging,
-            codec: codec)
+            codec: codec,
+            wireVersion: WireVersion(transportVersion))
         cfg.isLive = isLive
 
         var kind: CMAFCodecKind? = nil

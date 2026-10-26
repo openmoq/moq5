@@ -317,6 +317,8 @@ draft22_track_properties(bool with_properties)
  * carries none and is never refused for them. INCLUDE_PROPERTIES = 0
  * (draft-22) empties both answers. */
 static const uint8_t d16_tp_extensions[] = { 0x40, 0x78, 0x01 };
+/* The same set as draft-18 and draft-22 write it: Type 120 = 1 in vi64. */
+static const uint8_t d16_tp_as_vi64[] = { 0x78, 0x01 };
 
 typedef struct answer_props_peer {
     int status_ok, status_err, fetch_ok, fetch_err, closed;
@@ -325,6 +327,9 @@ typedef struct answer_props_peer {
     uint64_t status_group, status_object;
     uint8_t status_props[16], fetch_props[16];
     size_t status_len, fetch_len;
+    int sub_ok;
+    uint8_t sub_props[16];
+    size_t sub_len;
 } answer_props_peer_t;
 
 static void
@@ -349,6 +354,12 @@ answer_props_drain(rig_t *r, conn_t *cn, answer_props_peer_t *ps,
                 memcpy(ps->status_props, ok->track_properties.data, ps->status_len);
             break;
         }
+        case MOQ_EVENT_SUBSCRIBE_OK:
+            ps->sub_ok++;
+            ps->sub_len = ev.u.subscribe_ok.track_properties.len;
+            if (ps->sub_len <= sizeof(ps->sub_props) && ps->sub_len != 0)
+                memcpy(ps->sub_props, ev.u.subscribe_ok.track_properties.data, ps->sub_len);
+            break;
         case MOQ_EVENT_TRACK_STATUS_ERROR:
             ps->status_err++;
             ps->status_err_code = ev.u.track_status_error.error_code;
@@ -374,7 +385,8 @@ answer_props_drain(rig_t *r, conn_t *cn, answer_props_peer_t *ps,
     }
 }
 
-typedef enum { AP_NONE, AP_D22_SET, AP_D16_SET } ap_props_t;
+/* AP_VI64_SET: a vi64 set without Immutable Properties (Type 120 = 1). */
+typedef enum { AP_NONE, AP_D22_SET, AP_D16_SET, AP_VI64_SET } ap_props_t;
 
 static int
 relay_answer_properties(moq_version_t origin_version, moq_version_t requester_version,
@@ -386,7 +398,8 @@ relay_answer_properties(moq_version_t origin_version, moq_version_t requester_ve
     char label[96];
     snprintf(label, sizeof(label), "relay_answer_properties(d%d->d%d,%s,include=%d)",
              (int)(origin_version & 0xff), (int)(requester_version & 0xff),
-             kind == AP_NONE ? "none" : kind == AP_D22_SET ? "d22set" : "d16set",
+             kind == AP_NONE ? "none" : kind == AP_D22_SET ? "d22set"
+                                     : kind == AP_D16_SET ? "d16set" : "vi64set",
              include);
     if (relay_bind_test_rig_create(&rig, &a) != MOQR_OK) {
         printf("FIXTURE: %s rig create\n", label);
@@ -440,6 +453,8 @@ relay_answer_properties(moq_version_t origin_version, moq_version_t requester_ve
     else if (kind == AP_D16_SET)
         acfg.track_properties = (moq_bytes_t){ d16_tp_extensions,
                                                sizeof(d16_tp_extensions) };
+    else if (kind == AP_VI64_SET)
+        acfg.track_properties = (moq_bytes_t){ d16_tp_as_vi64, sizeof(d16_tp_as_vi64) };
     AP_REQUIRE(moq_session_accept_subscribe(origin->peer, osub, &acfg, rig.now) ==
                MOQ_OK);
     relay_bind_test_rig_pump(&rig, 6);
@@ -498,13 +513,21 @@ relay_answer_properties(moq_version_t origin_version, moq_version_t requester_ve
     size_t want_len = 0;
     bool replayable = true;
     if (kind == AP_D22_SET) {
+        /* Its Immutable Properties read differently as draft-16 integers,
+         * and are never rewritten: not representable there. */
         want = d22_tp_expected;
         want_len = sizeof(d22_tp_expected);
         replayable = requester_version != MOQ_VERSION_DRAFT_16;
     } else if (kind == AP_D16_SET) {
-        want = d16_tp_extensions;
-        want_len = sizeof(d16_tp_extensions);
-        replayable = requester_version == MOQ_VERSION_DRAFT_16;
+        /* Carried to draft-18/22 in their integer encoding. */
+        bool same = requester_version == MOQ_VERSION_DRAFT_16;
+        want = same ? d16_tp_extensions : d16_tp_as_vi64;
+        want_len = same ? sizeof(d16_tp_extensions) : sizeof(d16_tp_as_vi64);
+    } else if (kind == AP_VI64_SET) {
+        /* Carried to draft-16 in QUIC varints. */
+        bool to16 = requester_version == MOQ_VERSION_DRAFT_16;
+        want = to16 ? d16_tp_extensions : d16_tp_as_vi64;
+        want_len = to16 ? sizeof(d16_tp_extensions) : sizeof(d16_tp_as_vi64);
     }
     if (include == 0) want_len = 0;
     if (!replayable) {
@@ -557,9 +580,180 @@ relay_answer_properties_all(void)
     f += relay_answer_properties(v16, v16, AP_D16_SET, -1);
     f += relay_answer_properties(v16, v16, AP_NONE, -1);
     f += relay_answer_properties(v16, v18, AP_D16_SET, -1);
+    f += relay_answer_properties(v16, v22, AP_D16_SET, -1);
+    f += relay_answer_properties(v18, v16, AP_VI64_SET, -1);
+    f += relay_answer_properties(v22, v16, AP_VI64_SET, -1);
+    f += relay_answer_properties(v18, v22, AP_VI64_SET, -1);
     f += relay_answer_properties(v18, v16, AP_D22_SET, -1);
     f += relay_answer_properties(v16, v22, AP_NONE, -1);
     return f;
+}
+
+/* A draft-18 SUBSCRIBE_OK that cannot be written at once states the Track
+ * Properties revision its answer pinned, converted from the draft-16 set
+ * the origin stated, even after a newer revision replaces the track's
+ * latest: the conversion reads the pin, never the directory. The answer
+ * waits in the binding's one ordered queue behind NAMESPACE updates for a
+ * namespace subscriber whose transport is held; a SUBSCRIBE answered after
+ * the replacement states the newer revision, converted the same way. */
+static const uint8_t pinned_newer_d16[] = { 0x40, 0x7a, 0x02 };   /* Type 122 = 2 */
+static moqr_result_t metadata_lifetime_track(rig_t *r, moqr_binding_t observer, moqr_ns_t ns,
+                                             moq_bytes_t name, moqr_track_t *track,
+                                             uint64_t *gen);
+
+static int
+relay_answer_pinned_converted(void)
+{
+    const char *label = "relay_answer_pinned_converted(d16->d18)";
+    ca_t a;
+    relay_bind_test_ca_init(&a);
+    rig_t rig;
+    if (relay_bind_test_rig_create(&rig, &a) != MOQR_OK) {
+        printf("FIXTURE: %s rig create\n", label);
+        return 1;
+    }
+    enum { NS_FILL = 6 };
+    conn_t *origin = relay_bind_test_rig_connect(&rig, MOQ_VERSION_DRAFT_16);
+    conn_t *sub = relay_bind_test_rig_connect(&rig, MOQ_VERSION_DRAFT_16);
+    conn_t *req = relay_bind_test_rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    conn_t *late = relay_bind_test_rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    conn_t *ann2 = relay_bind_test_rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    relay_bind_test_max_actions = 3;
+    conn_t *nsx = relay_bind_test_rig_connect(&rig, MOQ_VERSION_DRAFT_18);
+    relay_bind_test_max_actions = 0;
+    answer_props_peer_t po = {0}, psub = {0}, preq = {0}, plate = {0}, pjunk = {0};
+    moq_subscription_t osub = MOQ_SUBSCRIPTION_INVALID;
+    moqr_bind_meta_ref_t latest = {0};
+    moqr_binding_t observer = MOQR_BINDING_INVALID;
+    bool replaced = false;
+#define PC_REQUIRE(expr)                                                      \
+    do {                                                                      \
+        if (!(expr)) {                                                        \
+            printf("FIXTURE: %s: %s\n", label, #expr);                        \
+            rig.failures++;                                                   \
+            goto cleanup;                                                     \
+        }                                                                     \
+    } while (0)
+    PC_REQUIRE(origin != NULL && sub != NULL && req != NULL && late != NULL &&
+               ann2 != NULL && nsx != NULL);
+    relay_bind_test_rig_pump(&rig, 4);
+    answer_props_drain(&rig, origin, &po, NULL);
+    answer_props_drain(&rig, sub, &psub, NULL);
+    answer_props_drain(&rig, req, &preq, NULL);
+    answer_props_drain(&rig, late, &plate, NULL);
+    answer_props_drain(&rig, ann2, &pjunk, NULL);
+    answer_props_drain(&rig, nsx, &pjunk, NULL);
+
+    moq_bytes_t ns[] = { B("props"), B("pinned") };
+    moq_publish_namespace_cfg_t pcfg;
+    moq_publish_namespace_cfg_init(&pcfg);
+    pcfg.track_namespace = (moq_namespace_t){ .parts = ns, .count = 2 };
+    moq_announcement_t ann;
+    PC_REQUIRE(moq_session_publish_namespace(origin->peer, &pcfg, rig.now, &ann) == MOQ_OK);
+    relay_bind_test_rig_pump(&rig, 4);
+    answer_props_drain(&rig, origin, &po, NULL);
+
+    moq_subscribe_cfg_t scfg;
+    moq_subscribe_cfg_init(&scfg);
+    scfg.track_namespace = (moq_namespace_t){ .parts = ns, .count = 2 };
+    scfg.track_name = B("video");
+    scfg.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    moq_subscription_t dsub;
+    PC_REQUIRE(moq_session_subscribe(sub->peer, &scfg, rig.now, &dsub) == MOQ_OK);
+    relay_bind_test_rig_pump(&rig, 4);
+    answer_props_drain(&rig, origin, &po, &osub);
+    PC_REQUIRE(osub._opaque != 0);
+    moq_accept_subscribe_cfg_t acfg;
+    moq_accept_subscribe_cfg_init(&acfg);
+    acfg.track_properties = (moq_bytes_t){ d16_tp_extensions, sizeof(d16_tp_extensions) };
+    PC_REQUIRE(moq_session_accept_subscribe(origin->peer, osub, &acfg, rig.now) == MOQ_OK);
+    relay_bind_test_rig_pump(&rig, 6);
+    answer_props_drain(&rig, sub, &psub, NULL);
+    PC_REQUIRE(psub.sub_ok == 1);
+
+    /* A namespace subscriber with a three-action queue, then held: the
+     * NAMESPACE updates for it fill its queue and the rest park in order. */
+    moq_bytes_t xp[] = { B("disc") };
+    moq_subscribe_namespace_cfg_t nscfg;
+    moq_subscribe_namespace_cfg_init(&nscfg);
+    nscfg.track_namespace_prefix = (moq_namespace_t){ .parts = xp, .count = 1 };
+    nscfg.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
+    moq_ns_sub_handle_t nsh;
+    moq_result_t nrc = moq_session_subscribe_namespace(nsx->peer, &nscfg, rig.now, &nsh);
+    PC_REQUIRE(nrc == MOQ_OK);
+    relay_bind_test_rig_pump(&rig, 6);
+    answer_props_drain(&rig, nsx, &pjunk, NULL);
+    nsx->frozen = true;
+    char nsname[NS_FILL][8];
+    for (int i = 0; i < NS_FILL; i++) {
+        snprintf(nsname[i], sizeof(nsname[i]), "n%d", i);
+        moq_bytes_t np[] = { B("disc"), B(nsname[i]) };
+        moq_publish_namespace_cfg_t c2;
+        moq_publish_namespace_cfg_init(&c2);
+        c2.track_namespace = (moq_namespace_t){ .parts = np, .count = 2 };
+        moq_announcement_t a2;
+        PC_REQUIRE(moq_session_publish_namespace(ann2->peer, &c2, rig.now, &a2) == MOQ_OK);
+        relay_bind_test_rig_pump(&rig, 2);
+        answer_props_drain(&rig, ann2, &pjunk, NULL);
+    }
+    moqr_bind_stats_t stats;
+    moq_subscription_t rsub;
+    PC_REQUIRE(moq_session_subscribe(req->peer, &scfg, rig.now, &rsub) == MOQ_OK);
+    relay_bind_test_rig_pump(&rig, 4);
+    answer_props_drain(&rig, req, &preq, NULL);
+    PC_REQUIRE(preq.sub_ok == 0);   /* parked behind the held updates */
+
+    /* A newer revision replaces the track's latest while the answer waits. */
+    PC_REQUIRE(moqr_core_binding_open(rig.core, 901, &observer) == MOQR_OK);
+    moqr_track_t track = MOQR_TRACK_INVALID;
+    uint64_t gen = 0;
+    PC_REQUIRE(metadata_lifetime_track(&rig, observer, (moqr_ns_t){ .parts = ns, .count = 2 },
+                                       B("video"), &track, &gen) == MOQR_OK);
+    PC_REQUIRE(moqr_bind_meta_latest(rig.bind, track, &latest) == MOQR_OK);
+    PC_REQUIRE(latest.state == MOQR_BIND_META_PRESENT &&
+               latest.wire_version == MOQ_VERSION_DRAFT_16);
+    moqr_bind_meta_ref_t newer = latest;
+    newer.bytes = (moq_bytes_t){ pinned_newer_d16, sizeof(pinned_newer_d16) };
+    uint64_t revision = 0;
+    PC_REQUIRE(moqr_bind_meta_replace(rig.bind, track, gen, &newer, rig.now, &revision) ==
+               MOQR_OK && revision > latest.revision);
+    replaced = true;
+    moqr_bind_meta_release(rig.bind, &latest);
+
+    nsx->frozen = false;
+    for (int i = 0; i < 32 && preq.sub_ok == 0; i++) {
+        relay_bind_test_rig_pump(&rig, 1);
+        answer_props_drain(&rig, req, &preq, NULL);
+        answer_props_drain(&rig, nsx, &pjunk, NULL);
+    }
+    PC_REQUIRE(moq_session_subscribe(late->peer, &scfg, rig.now, &rsub) == MOQ_OK);
+    for (int i = 0; i < 16 && plate.sub_ok == 0; i++) {
+        relay_bind_test_rig_pump(&rig, 1);
+        answer_props_drain(&rig, late, &plate, NULL);
+    }
+    moqr_bind_get_stats(rig.bind, &stats);
+    printf("%s: pinned sub_ok=%d len=%zu %02x %02x | late sub_ok=%d len=%zu %02x %02x | "
+           "session_errors=%llu\n",
+           label, preq.sub_ok, preq.sub_len, preq.sub_props[0], preq.sub_props[1],
+           plate.sub_ok, plate.sub_len, plate.sub_props[0], plate.sub_props[1],
+           (unsigned long long)stats.session_errors);
+    static const uint8_t newer_as_vi64[] = { 0x7a, 0x02 };
+    R_CHECK(&rig, preq.closed == 0 && preq.sub_ok == 1 &&
+                      preq.sub_len == sizeof(d16_tp_as_vi64) &&
+                      memcmp(preq.sub_props, d16_tp_as_vi64, sizeof(d16_tp_as_vi64)) == 0);
+    R_CHECK(&rig, plate.closed == 0 && plate.sub_ok == 1 &&
+                      plate.sub_len == sizeof(newer_as_vi64) &&
+                      memcmp(plate.sub_props, newer_as_vi64, sizeof(newer_as_vi64)) == 0);
+    R_CHECK(&rig, stats.session_errors == 0);
+
+cleanup:
+    (void)replaced;
+    moqr_bind_meta_release(rig.bind, &latest);
+    relay_bind_test_rig_destroy(&rig);
+    R_CHECK(&rig, a.live == 0);
+#undef PC_REQUIRE
+    printf("%s: %s\n", rig.failures == 0 ? "PASS" : "FAIL", label);
+    return rig.failures;
 }
 
 /* PUBLISH metadata uses the existing auth gate/ticket path, with identities
@@ -3512,6 +3706,7 @@ main(int argc, char **argv)
     failures += track_properties_profiles(MOQ_VERSION_DRAFT_22, MOQ_VERSION_DRAFT_18,
                                            true);
     failures += relay_answer_properties_all();
+    failures += relay_answer_pinned_converted();
     failures += draft22_push_track_properties(false, false);
     failures += draft22_push_track_properties(true, false);
     failures += draft22_push_track_properties(false, true);

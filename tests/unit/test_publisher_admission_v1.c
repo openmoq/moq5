@@ -670,9 +670,8 @@ static void decision(moq_version_t version, bool legacy, moq_pub_accept_decision
                     (choice == MOQ_PUB_DECISION_DEFER && deferred_accept);
     if (choice == MOQ_PUB_DECISION_DEFER) {
         CHECK(moq_pub_active_subscriptions(pub, o.track) == 0 && o.joined == 0);
-        /* D22 owns the unresolved decision in its parent's cell. */
-        NEED(moq_pub_flush(pub, now + 1) ==
-             (version == MOQ_VERSION_DRAFT_22 ? MOQ_ERR_WOULD_BLOCK : MOQ_OK));
+        /* An unresolved decision remains staged on every profile. */
+        NEED(moq_pub_flush(pub, now + 1) == MOQ_ERR_WOULD_BLOCK);
         NEED(moq_pub_resolve_deferred(pub, o.deferred, o.deferred_id,
                                      deferred_accept, MOQ_REQUEST_ERROR_UNAUTHORIZED, now + 2) == MOQ_OK);
         CHECK(moq_pub_resolve_deferred(pub, o.deferred, o.deferred_id,

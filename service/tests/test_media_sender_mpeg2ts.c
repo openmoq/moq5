@@ -22,6 +22,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +61,9 @@ size_t moq_media_sender_test_stage(moq_media_sender_t *s,
 void moq_media_sender_test_pump(moq_media_sender_t *s, moq_session_t *session,
                                 uint64_t now_us);
 void moq_media_sender_test_set_ts_yield_hook(void (*fn)(void *), void *ctx);
+bool moq_media_sender_test_complete_ts_step(moq_media_sender_t *s);
+bool moq_media_sender_test_complete_failed(moq_media_sender_t *s);
+bool moq_media_sender_test_has_pending_output(moq_media_sender_t *s);
 
 
 static moq_bytes_t g_ns_parts[2] = { { (const uint8_t *)"svc", 3 },
@@ -480,11 +484,12 @@ static void test_catalog_metadata(void)
 static void test_catalog_late_add(bool raw, bool with_init, bool d22)
 {
     int before = failures;
-    const bool full = !raw && with_init;
-    const char *name = d22 ? "ts_late_add_init_full_d22"
-                     : raw ? "ts_late_add_raw_legacy"
-                           : with_init ? "ts_late_add_init_full"
-                                       : "ts_late_add_no_init_delta";
+    const bool full = with_init;
+    const char *name = raw
+        ? (d22 ? (with_init ? "raw_late_add_full_d22" : "raw_late_add_delta_d22")
+               : (with_init ? "raw_late_add_full_legacy" : "raw_late_add_delta_legacy"))
+        : (d22 ? (with_init ? "ts_late_add_full_d22" : "ts_late_add_delta_d22")
+               : (with_init ? "ts_late_add_full_legacy" : "ts_late_add_delta_legacy"));
     moq_media_sender_t *s = d22 ? make_d22_sender()
                                 : make_sender(MOQ_MEDIA_SEND_BP_RETURN_WOULD_BLOCK, 0);
     MOQ_TEST_CHECK(s != NULL);
@@ -543,7 +548,15 @@ static void test_catalog_late_add(bool raw, bool with_init, bool d22)
         goto cleanup;
     }
 
-    /* A full generation is object 0; the legacy controls are base + ADD. */
+    char base_json[4096];
+    size_t base_len = moq_rcbuf_len(objs[0]);
+    MOQ_TEST_CHECK(base_len < sizeof(base_json));
+    if (base_len < sizeof(base_json)) {
+        memcpy(base_json, moq_rcbuf_data(objs[0]), base_len); base_json[base_len] = '\0';
+        MOQ_TEST_CHECK(strstr(base_json, "\"version\":\"draft-01\"") != NULL);
+        MOQ_TEST_CHECK(strstr(base_json, "\"initData\":") == NULL);
+    }
+    /* Init-bearing RAW and TS use a full generation; init-less adds use a delta. */
     moq_rcbuf_t *wire = objs[n - 1];
     MOQ_TEST_CHECK(wire != NULL);
     if (!wire) goto cleanup;
@@ -559,6 +572,13 @@ static void test_catalog_late_add(bool raw, bool with_init, bool d22)
         MOQ_TEST_CHECK(find_track(&cat, "base") != NULL);
         late = find_track(&cat, "late");
     } else {
+        char delta_json[2048];
+        size_t delta_len = moq_rcbuf_len(wire);
+        MOQ_TEST_CHECK(delta_len < sizeof(delta_json));
+        if (delta_len < sizeof(delta_json)) {
+            memcpy(delta_json, moq_rcbuf_data(wire), delta_len); delta_json[delta_len] = '\0';
+            MOQ_TEST_CHECK(strstr(delta_json, "\"version\"") == NULL);
+        }
         MOQ_TEST_CHECK(!cat.has_generated_at);
         MOQ_TEST_CHECK(cat.delta_update != NULL && cat.delta_update_count == 1);
         if (!cat.delta_update || cat.delta_update_count != 1) goto cleanup;
@@ -572,24 +592,23 @@ static void test_catalog_late_add(bool raw, bool with_init, bool d22)
     MOQ_TEST_CHECK(late != NULL);
     if (!late) goto cleanup;
     MOQ_TEST_CHECK(late->has_init_ref == full);
-    MOQ_TEST_CHECK(late->has_init_data == (raw && with_init));
+    MOQ_TEST_CHECK(!late->has_init_data);
     MOQ_TEST_CHECK_EQ_SIZE(cat.init_data_count, full ? 1 : 0);
     if (!full) {
-        if (raw) {
-            rc = moq_msf_decode_init_data(al, late->init_data, &decoded);
-            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
-            MOQ_TEST_CHECK(decoded && moq_rcbuf_len(decoded) == sizeof(raw_init) &&
-                           memcmp(moq_rcbuf_data(decoded), raw_init,
-                                  sizeof(raw_init)) == 0);
-        } else {
-            MOQ_TEST_CHECK(moq_msf_track_mpeg2ts_check(late, NULL) == MOQ_OK);
-        }
+        if (!raw) MOQ_TEST_CHECK(moq_msf_track_mpeg2ts_check(late, NULL) == MOQ_OK);
         goto cleanup;
     }
-    rc = moq_msf_track_mpeg2ts_init_data(al, &cat, late, &decoded, NULL);
+    const moq_msf_init_data_entry_t *entry =
+        moq_msf_catalog_find_init_data(&cat, late->init_ref);
+    MOQ_TEST_CHECK(entry != NULL);
+    if (!raw) rc = moq_msf_track_mpeg2ts_init_data(al, &cat, late, &decoded, NULL);
+    else if (entry) rc = moq_msf_decode_init_data(al, entry->data, &decoded);
+    else rc = MOQ_ERR_PROTO;
     MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
-    MOQ_TEST_CHECK(decoded && moq_rcbuf_len(decoded) == psi_len &&
-                   memcmp(moq_rcbuf_data(decoded), psi, psi_len) == 0);
+    const uint8_t *want_init = raw ? raw_init : psi;
+    const size_t want_len = raw ? sizeof(raw_init) : psi_len;
+    MOQ_TEST_CHECK(decoded && moq_rcbuf_len(decoded) == want_len &&
+                   memcmp(moq_rcbuf_data(decoded), want_init, want_len) == 0);
     if (decoded) { moq_rcbuf_decref(decoded); decoded = NULL; }
 
     /* Model commitment, then build the later independent refresh document.
@@ -612,10 +631,14 @@ static void test_catalog_late_add(bool raw, bool with_init, bool d22)
                    again->init_ref.len > 0 &&
                    memcmp(again->init_ref.data, late->init_ref.data,
                           again->init_ref.len) == 0);
-    rc = moq_msf_track_mpeg2ts_init_data(al, &refresh, again, &decoded, NULL);
+    entry = moq_msf_catalog_find_init_data(&refresh, again->init_ref);
+    MOQ_TEST_CHECK(entry != NULL);
+    if (!raw) rc = moq_msf_track_mpeg2ts_init_data(al, &refresh, again, &decoded, NULL);
+    else if (entry) rc = moq_msf_decode_init_data(al, entry->data, &decoded);
+    else rc = MOQ_ERR_PROTO;
     MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
-    MOQ_TEST_CHECK(decoded && moq_rcbuf_len(decoded) == psi_len &&
-                   memcmp(moq_rcbuf_data(decoded), psi, psi_len) == 0);
+    MOQ_TEST_CHECK(decoded && moq_rcbuf_len(decoded) == want_len &&
+                   memcmp(moq_rcbuf_data(decoded), want_init, want_len) == 0);
 cleanup:
     if (decoded) moq_rcbuf_decref(decoded);
     moq_msf_catalog_cleanup(al, &refresh);
@@ -1769,6 +1792,232 @@ static void test_track_stats_sum(void)
     if (failures == before) printf("PASS: ts_track_stats_sum\n");
 }
 
+/* -- complete() on a byte-stream track -------------------------------------- *
+ * complete() finishes the source as end_track does, but asynchronously, on
+ * the drain: the held Objects, then the packetizer's last ones, admitted
+ * without evicting queued media or waiting; a full queue keeps them parked
+ * for a later pump; a trailing partial packet is discarded and counted; a
+ * lost Object fails the completion; an in-flight writer keeps the source
+ * until its call returns, taking no byte after complete(). The step is run
+ * through a seam (the drain's own call, without a publisher). A failed
+ * completion owes nothing further, so once its queued media is settled it
+ * reports no work -- while another track's sendable end still does, and a
+ * healthy completion parked behind a full queue stays work. */
+typedef enum { TSC_TRAILING, TSC_FULL, TSC_FULL_DROP, TSC_FULL_BLOCK, TSC_NOMEM, TSC_REPEAT,
+               TSC_INFLIGHT, TSC_NOMEM_SIBLING } tsc_row_t;
+
+typedef struct tsc_hook {
+    moq_media_sender_t *s;
+    unsigned calls;
+    bool step_while_busy;
+} tsc_hook_t;
+
+static void tsc_complete_in_yield(void *ctx)
+{
+    tsc_hook_t *h = ctx;
+    if (h->calls++ != 1) return;   /* after the first Object was queued */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(h->s), (int)MOQ_OK);
+    /* The writer holds the source: the step leaves it alone. */
+    h->step_while_busy = moq_media_sender_test_complete_ts_step(h->s);
+}
+
+static moq_media_sender_t *tsc_sender(tsc_row_t row)
+{
+    if (row == TSC_NOMEM || row == TSC_NOMEM_SIBLING) return make_gated_sender();
+    moq_media_sender_cfg_t cfg;
+    moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
+    cfg.namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
+    cfg.backpressure = row == TSC_FULL_DROP    ? MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME
+                     : row == TSC_FULL_BLOCK ? MOQ_MEDIA_SEND_BP_BLOCK_TIMEOUT
+                                             : MOQ_MEDIA_SEND_BP_RETURN_WOULD_BLOCK;
+    cfg.block_timeout_us = 20000;
+    cfg.companion_profile = MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+    if (row == TSC_FULL || row == TSC_FULL_DROP || row == TSC_FULL_BLOCK)
+        cfg.queue_max_objects = 2;
+    return moq_media_sender_test_new_cfg(&cfg);
+}
+
+static void test_complete_ts(tsc_row_t row)
+{
+    static const char *const names[] = { "trailing", "full", "full_drop", "full_block",
+                                         "nomem", "repeat", "inflight", "nomem_sibling" };
+    bool nomem = row == TSC_NOMEM || row == TSC_NOMEM_SIBLING;
+    /* full_drop: the same under a drop policy (nothing lost); full_block:
+     * under BLOCK_TIMEOUT, where a write waits for room -- the completion,
+     * on the network thread, never does. */
+    bool full = row == TSC_FULL || row == TSC_FULL_DROP || row == TSC_FULL_BLOCK;
+    int before = failures;
+    static uint8_t stream[STREAM_MAX];
+    size_t len = make_stream(stream, 188, false);
+    moq_media_sender_t *s = tsc_sender(row);
+    if (!s) { failures++; return; }
+    moq_msf_mpeg2ts_t rec;
+    ts_rec(&rec, MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM, 188);
+    moq_media_track_t *t = add_bytes_track(s, &rec, full || nomem ? 3 : 64);
+    /* An unrelated track whose end is queued and sendable throughout. */
+    if (row == TSC_NOMEM_SIBLING) {
+        moq_msf_track_ext_t ext = { .kind = MOQ_MSF_EXT_MPEG2TS,
+                                    .u = { .mpeg2ts = &rec } };
+        ts_track_opts_t o;
+        memset(&o, 0, sizeof(o));
+        o.name = "side"; o.ext = &ext; o.ext_count = 1;
+        moq_media_track_t *u = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)add_track(s, &o, &u), (int)MOQ_OK);
+        MOQ_TEST_CHECK(u != NULL && moq_media_sender_end_track(s, u) == MOQ_OK);
+    }
+    moq_media_sender_test_set_ready(s);
+    static uint8_t taken[STREAM_MAX + 4 * 188];
+    size_t taken_len = 0, consumed = 0;
+    if (row == TSC_FULL) {
+        /* Fill the two-Object queue and hold Objects back. */
+        size_t off = 0;
+        for (int i = 0; i < 8 && off < len; i++) {
+            size_t c = 0;
+            if (write_ts(s, t, stream + off, len - off, false, &c) == MOQ_ERR_WOULD_BLOCK) break;
+            off += c;
+        }
+        consumed = off;
+    } else if (row == TSC_FULL_DROP || row == TSC_FULL_BLOCK) {
+        /* Exactly the queue's two Objects plus one complete Object the
+         * packetizer still holds (the flush hands it over). */
+        MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, t, stream, 9 * 188, false, &consumed),
+                              (int)MOQ_OK);
+    } else if (nomem) {
+        MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, t, stream, 4 * 188, false, &consumed),
+                              (int)MOQ_OK);
+    } else if (row == TSC_INFLIGHT) {
+        tsc_hook_t h = { s, 0, true };
+        moq_media_sender_test_set_ts_yield_hook(tsc_complete_in_yield, &h);
+        moq_result_t rc = write_ts(s, t, stream, len, false, &consumed);
+        moq_media_sender_test_set_ts_yield_hook(NULL, NULL);
+        /* Stopped at the next yield: what it took is reported, no more. */
+        MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_WRONG_STATE);
+        MOQ_TEST_CHECK(consumed > 0 && consumed < len);
+        MOQ_TEST_CHECK(!h.step_while_busy);
+    } else {
+        MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, t, stream, len, false, &consumed), (int)MOQ_OK);
+        /* ...and 100 bytes of a packet that never completes. */
+        size_t c = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, t, stream, 100, false, &c), (int)MOQ_OK);
+    }
+    moq_media_sender_track_stats_t st0;
+    MOQ_TEST_CHECK(moq_media_sender_get_track_stats(s, t, &st0, sizeof(st0)) == MOQ_OK);
+
+    if (row != TSC_INFLIGHT)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(s), (int)MOQ_OK);
+    if (row == TSC_REPEAT)
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(s), (int)MOQ_OK);
+    /* No byte is taken once complete() latched. */
+    size_t late = 0;
+    MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, t, stream, 188, false, &late),
+                          (int)MOQ_ERR_WRONG_STATE);
+    moq_media_sender_stats_t ss0;
+    MOQ_TEST_CHECK(moq_media_sender_get_stats(s, &ss0, sizeof(ss0)) == MOQ_OK);
+    if (nomem) g_refuse = true;
+    bool done = moq_media_sender_test_complete_ts_step(s);
+    if (nomem) {
+        g_refuse = false;
+        /* The last Object could not be copied: the completion fails and stays
+         * failed -- no end, no terminal catalog. */
+        MOQ_TEST_CHECK(!done && moq_media_sender_test_complete_failed(s));
+        MOQ_TEST_CHECK(!moq_media_sender_test_complete_ts_step(s));
+        moq_media_sender_stats_t ss;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(s, &ss, sizeof(ss)) == MOQ_OK &&
+                       ss.last_error == MOQ_ERR_NOMEM);
+        /* Settle what was really queued; then only the failed completion's
+         * obligations are left, which are no work -- unless another track's
+         * end is still to send. */
+        moq_rcbuf_t *hp = NULL;
+        while (moq_media_sender_test_emit_head(s, &hp)) {
+            if (hp) moq_rcbuf_decref(hp);
+            hp = NULL;
+        }
+        moq_media_sender_track_stats_t st;
+        MOQ_TEST_CHECK(moq_media_sender_get_track_stats(s, t, &st, sizeof(st)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(st.objects_queued, 0);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_test_has_pending_output(s),
+                              (int)(row == TSC_NOMEM_SIBLING));
+        MOQ_TEST_CHECK(moq_media_sender_test_complete_failed(s));
+        /* The completion's failure, exact and sticky through a repeated
+         * complete() and a refused write (neither records a failure). */
+        MOQ_TEST_CHECK_EQ_INT((int)ss.completion_error, (int)MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(s), (int)MOQ_OK);
+        size_t late2 = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)write_ts(s, t, stream, 188, false, &late2),
+                              (int)MOQ_ERR_WRONG_STATE);
+        moq_media_sender_stats_t ss2;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(s, &ss2, sizeof(ss2)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)ss2.completion_error, (int)MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK_EQ_INT((int)ss2.last_error, (int)MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK_EQ_U64(ss2.struct_size, sizeof(ss2));
+        /* An older caller's output, through sap_records_evicted or only the
+         * frozen v0 prefix: exactly that prefix is written and stamped, and
+         * nothing past it. */
+        static const size_t prefixes[2] = {
+            offsetof(moq_media_sender_stats_t, completion_error),
+            offsetof(moq_media_sender_stats_t, last_error) + sizeof(moq_result_t) };
+        for (int k = 0; k < 2; k++) {
+            unsigned char buf[sizeof(moq_media_sender_stats_t) + 16];
+            memset(buf, 0xA5, sizeof(buf));
+            MOQ_TEST_CHECK(moq_media_sender_get_stats(
+                s, (moq_media_sender_stats_t *)(void *)buf, prefixes[k]) == MOQ_OK);
+            uint32_t stamped;
+            memcpy(&stamped, buf, sizeof(stamped));
+            MOQ_TEST_CHECK_EQ_U64(stamped, prefixes[k]);
+            bool untouched = true;
+            for (size_t b = prefixes[k]; b < sizeof(buf); b++) untouched &= buf[b] == 0xA5;
+            MOQ_TEST_CHECK(untouched);
+        }
+    } else if (full) {
+        /* The queue is full: the held and last Objects stay parked, nothing
+         * is evicted, and each drained Object lets the next one in. */
+        moq_media_sender_track_stats_t st;
+        MOQ_TEST_CHECK(moq_media_sender_get_track_stats(s, t, &st, sizeof(st)) == MOQ_OK);
+        MOQ_TEST_CHECK(!done && st.objects_dropped == 0 && st.mpeg2ts_objects_parked >= 1);
+        /* Parked behind the full queue, the healthy completion is work. */
+        MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(s));
+        for (int i = 0; i < 64 && !done; i++) {
+            take_head(s, taken, &taken_len);
+            done = moq_media_sender_test_complete_ts_step(s);
+        }
+        MOQ_TEST_CHECK(done && !moq_media_sender_test_complete_failed(s));
+        moq_media_sender_stats_t ss1;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(s, &ss1, sizeof(ss1)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(ss1.backpressure_stalls, ss0.backpressure_stalls);
+    } else {
+        MOQ_TEST_CHECK(done && !moq_media_sender_test_complete_failed(s));
+    }
+    if (!nomem) {
+        /* A healthy completion records no failure. */
+        moq_media_sender_stats_t ssh;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(s, &ssh, sizeof(ssh)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)ssh.completion_error, (int)MOQ_OK);
+    }
+    if (row == TSC_REPEAT)
+        MOQ_TEST_CHECK(moq_media_sender_test_complete_ts_step(s));   /* idempotent */
+    if (!nomem) {
+        /* Every whole packet taken reaches the queue, in order: what was
+         * drained, then what is still queued. */
+        static obj_log_t lg;
+        memset(&lg, 0, sizeof(lg));
+        log_queue(s, &lg);
+        static uint8_t all[STREAM_MAX + 4 * 188];
+        memcpy(all, taken, taken_len);
+        memcpy(all + taken_len, lg.bytes, lg.len);
+        size_t whole = consumed - consumed % 188;
+        MOQ_TEST_CHECK_EQ_U64(taken_len + lg.len, whole);
+        MOQ_TEST_CHECK(taken_len + lg.len == whole && memcmp(all, stream, whole) == 0);
+        moq_media_sender_track_stats_t st;
+        MOQ_TEST_CHECK(moq_media_sender_get_track_stats(s, t, &st, sizeof(st)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(st.objects_dropped, 0);
+        MOQ_TEST_CHECK_EQ_U64(st.mpeg2ts_objects_parked, 0);
+        if (row == TSC_TRAILING || row == TSC_REPEAT)
+            MOQ_TEST_CHECK_EQ_U64(st.mpeg2ts_partial_bytes_discarded, 100);
+    }
+    moq_media_sender_test_free(s);
+    if (failures == before) printf("PASS: ts_complete_%s\n", names[row]);
+}
+
 #endif /* MOQ_TEST_HAVE_MPEG2TS */
 
 /* Every build has the TS entry points; without moq::mpeg2ts they refuse. */
@@ -1848,41 +2097,42 @@ static moq_simpair_t *companion_pair(moq_version_t version)
     return sp;
 }
 
-/* A CMAF track without init_data: accepted while an AUTO companion is
- * unresolved, and blocking it once it resolves to draft 22. */
+/* A rejected CMAF registration must not poison an AUTO sender. */
 static moq_result_t add_no_init_cmaf(moq_media_sender_t *s)
 {
     ts_track_opts_t o;
     memset(&o, 0, sizeof(o));
     o.name = "cmaf";
     o.packaging = MOQ_MEDIA_PACKAGING_CMAF;
-    moq_media_track_t *t = NULL;
-    return add_track(s, &o, &t);
+    moq_media_track_t *t = (moq_media_track_t *)(uintptr_t)1;
+    moq_result_t rc = add_track(s, &o, &t);
+    MOQ_TEST_CHECK(t == NULL);
+    return rc;
 }
 
-/* Rows: 0 explicit legacy on D22, 1 explicit D22 on D18, 2 AUTO on D22
- * blocked by a CMAF track without init_data, 3 explicit D22 before any draft
- * is observed -- each refused before a byte is taken. Controls: 4 legacy on
- * D18, 5 explicit D22 on D22, 6 AUTO on D22, 7 AUTO on D18, 8 unresolved AUTO
- * -- each takes the whole stream. */
+/* Explicit companion/draft mismatches refuse before taking bytes. Controls
+ * accept the whole stream, including AUTO after a missing-init CMAF registration
+ * was refused. Cover that registration both before and after the D22 latch. */
 static void test_companion_refusal(void)
 {
     int before = failures;
     static const struct {
         moq_media_companion_profile_t companion;
         moq_version_t version;       /* 0: no session observed */
-        bool blocker;
+        bool rejected_cmaf;
         bool refused;
     } rows[] = {
         { MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, MOQ_VERSION_DRAFT_22, false, true },
         { MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, MOQ_VERSION_DRAFT_18, false, true },
-        { MOQ_MEDIA_COMPANION_AUTO, MOQ_VERSION_DRAFT_22, true, true },
+        { MOQ_MEDIA_COMPANION_AUTO, MOQ_VERSION_DRAFT_22, true, false },
         { MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, 0, false, true },
         { MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, MOQ_VERSION_DRAFT_18, false, false },
         { MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, MOQ_VERSION_DRAFT_22, false, false },
         { MOQ_MEDIA_COMPANION_AUTO, MOQ_VERSION_DRAFT_22, false, false },
         { MOQ_MEDIA_COMPANION_AUTO, MOQ_VERSION_DRAFT_18, false, false },
         { MOQ_MEDIA_COMPANION_AUTO, 0, false, false },
+        { MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, MOQ_VERSION_DRAFT_16, false, false },
+        { MOQ_MEDIA_COMPANION_AUTO, MOQ_VERSION_DRAFT_16, false, false },
     };
     static uint8_t stream[STREAM_MAX];
     size_t len = make_stream(stream, 188, false);
@@ -1893,15 +2143,32 @@ static void test_companion_refusal(void)
         moq_msf_mpeg2ts_t rec;
         ts_rec(&rec, MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM, 188);
         moq_media_track_t *t = add_bytes_track(s, &rec, 4);
-        if (rows[i].blocker)
-            MOQ_TEST_CHECK_EQ_INT((int)add_no_init_cmaf(s), (int)MOQ_OK);
+        if (rows[i].rejected_cmaf)
+            MOQ_TEST_CHECK_EQ_INT((int)add_no_init_cmaf(s), (int)MOQ_ERR_INVAL);
         moq_simpair_t *sp = NULL;
         if (rows[i].version) {
             sp = companion_pair(rows[i].version);
             MOQ_TEST_CHECK(sp != NULL);
             if (sp) moq_media_sender_test_pump(s, moq_simpair_client(sp), 1000);
         }
+        if (rows[i].rejected_cmaf && sp)
+            MOQ_TEST_CHECK_EQ_INT((int)add_no_init_cmaf(s), (int)MOQ_ERR_INVAL);
         if (t && (sp || !rows[i].version)) {
+            moq_rcbuf_t *json = NULL;
+            MOQ_TEST_CHECK(moq_media_sender_test_build_catalog(s, &json) == MOQ_OK && json);
+            if (json) {
+                char text[2048];
+                size_t n = moq_rcbuf_len(json);
+                MOQ_TEST_CHECK(n < sizeof(text));
+                if (n < sizeof(text)) {
+                    memcpy(text, moq_rcbuf_data(json), n); text[n] = '\0';
+                    MOQ_TEST_CHECK(strstr(text, "\"version\":\"draft-01\"") != NULL);
+                    MOQ_TEST_CHECK(strstr(text, "\"packaging\":\"mpeg2ts\"") != NULL);
+                    MOQ_TEST_CHECK(strstr(text, "\"initData\":") == NULL);
+                    MOQ_TEST_CHECK(strstr(text, "\"initRef\":") == NULL);
+                }
+                moq_rcbuf_decref(json);
+            }
             /* One sync byte: on refusal it is not taken into the carry. */
             size_t consumed = 99;
             moq_result_t rc = write_ts(s, t, stream, 1, false, &consumed);
@@ -1937,10 +2204,10 @@ static void test_companion_refusal(void)
     if (failures == before) printf("PASS: ts_write_companion_refusal\n");
 }
 
-/* The session latches between Objects of one call -- while the writer has
- * released the sender -- and resolves an AUTO companion to a refusal (draft 22
- * with a CMAF track lacking init_data). The call stops there: no further byte
- * is taken, and the bytes already taken stay reported. */
+/* The session latches between Objects of one call while the writer releases
+ * the sender. Explicit LEGACY initially accepts writes before negotiation, then
+ * refuses the D22 mismatch. No further byte is taken; prior consumption stays
+ * reported. This preserves the partial-consumption oracle after early CMAF refusal. */
 typedef struct yield_latch {
     moq_media_sender_t *s;
     moq_simpair_t *sp;
@@ -1959,14 +2226,13 @@ static void test_companion_refusal_at_yield(void)
     int before = failures;
     static uint8_t stream[STREAM_MAX];
     size_t len = make_stream(stream, 188, false);
-    moq_media_sender_t *s = make_companion_sender(MOQ_MEDIA_COMPANION_AUTO);
+    moq_media_sender_t *s = make_companion_sender(MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01);
     moq_simpair_t *sp = companion_pair(MOQ_VERSION_DRAFT_22);
     MOQ_TEST_CHECK(s != NULL && sp != NULL);
     if (s && sp) {
         moq_msf_mpeg2ts_t rec;
         ts_rec(&rec, MOQ_MSF_MPEG2TS_MODE_UNMODIFIED_PROGRAM, 188);
         moq_media_track_t *t = add_bytes_track(s, &rec, 2);
-        MOQ_TEST_CHECK_EQ_INT((int)add_no_init_cmaf(s), (int)MOQ_OK);
         yield_latch_t y = { s, sp, 0 };
         moq_media_sender_test_set_ts_yield_hook(latch_in_yield, &y);
         size_t consumed = 0;
@@ -2003,6 +2269,10 @@ int main(void)
     test_catalog_late_add(false, true, false);
     test_catalog_late_add(false, false, false);
     test_catalog_late_add(true, true, false);
+    test_catalog_late_add(true, false, false);
+    test_catalog_late_add(true, true, true);
+    test_catalog_late_add(true, false, true);
+    test_catalog_late_add(false, false, true);
     test_catalog_late_add(false, true, true);
     test_track_cfg_abi();
     test_chunking();
@@ -2016,6 +2286,7 @@ int main(void)
     test_continuation_discard();
     test_lost_group_start();
     test_end_track_nomem();
+    for (int r = TSC_TRAILING; r <= TSC_NOMEM_SIBLING; r++) test_complete_ts((tsc_row_t)r);
     test_interrupt_keeps_output();
     test_proto_discards_carry();
     test_keyframe_stats();

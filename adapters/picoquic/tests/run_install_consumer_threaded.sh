@@ -28,7 +28,8 @@
 #  13  install libdir (CMAKE_INSTALL_LIBDIR: lib, lib64, lib/<arch>, …)
 #  14  C++ flags (may be empty)
 #  15  generated parent staging check
-#  16  test-owned toolchain/rules preload (required)
+#  16  install include dir (the parent's CMAKE_INSTALL_INCLUDEDIR)
+#  17  test-owned toolchain/rules preload (required)
 # Test-only: MOQ_TEST_KEEP_WORK=1 retains successful work and prints its path.
 # Unset or any other value preserves the default success cleanup.
 set -euo pipefail
@@ -38,8 +39,9 @@ PICOQUIC_SRC="$5"; PICOTLS_PREFIX="$6"; CC="$7"; CFLAGS="$8"; LDFLAGS="$9"
 BUILD_TYPE="${10}"; OPENSSL_ROOT="${11}"; WORK="${12}"; LIBDIR="${13}"
 CXXFLAGS="${14}"
 STAGING_CHECK="${15}"
+INCLUDEDIR="${16}"
 # Final argument: test-owned toolchain/rules preload, not installed metadata.
-ABI_PRELOAD="${16}"
+ABI_PRELOAD="${17}"
 
 P="$WORK/prefix"
 PQB="$WORK/pq-build"
@@ -48,7 +50,14 @@ CONB="$WORK/consumer-build"
 if [ -z "$PICOTLS_PREFIX" ]; then
     PICOTLS_PREFIX="$(cd "$PICOQUIC_SRC/../picotls/build" && pwd)"
 fi
-PTLS_SRC="$(dirname "$PICOTLS_PREFIX")"
+# picotls as picoquic's child build looks for it: an installed prefix keeps
+# headers and libraries in include/ and lib/; a checkout build directory
+# holds the libraries itself, with the headers in ../include.
+if [ -f "$PICOTLS_PREFIX/include/picotls.h" ] && [ -d "$PICOTLS_PREFIX/lib" ]; then
+    PTLS_SRC="$PICOTLS_PREFIX"; PTLS_LIB="$PICOTLS_PREFIX/lib"
+else
+    PTLS_SRC="$(dirname "$PICOTLS_PREFIX")"; PTLS_LIB="$PICOTLS_PREFIX"
+fi
 
 rm -rf "$WORK"
 mkdir -p "$WORK"
@@ -66,7 +75,8 @@ echo "== 1. install picoquic -> $P =="
     -DBUILD_PICO_SIM=OFF -Dpicoquic_BUILD_TESTS=OFF -DBUILD_LOGLIB=ON \
     -DCMAKE_INSTALL_PREFIX="$P" \
     -DPTLS_PREFIX="$PTLS_SRC" \
-    -DCMAKE_LIBRARY_PATH="$PICOTLS_PREFIX" \
+    -DPTLS_INCLUDE_DIR="$PTLS_SRC/include" \
+    -DCMAKE_LIBRARY_PATH="$PTLS_LIB" \
     "${ossl_arg[@]}" \
     -DCMAKE_C_COMPILER="$CC" \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
@@ -79,7 +89,7 @@ echo "== 2. install libmoq -> $P =="
 
 # Installed-header manifest: both public headers ship.
 for hdr in picoquic_threaded.h picoquic_verify.h; do
-    if [ ! -f "$P/include/moq/$hdr" ]; then
+    if [ ! -f "$P/$INCLUDEDIR/moq/$hdr" ]; then
         echo "FAIL: moq/$hdr was not installed"; exit 1
     fi
 done
@@ -96,8 +106,11 @@ echo "== 3A. CMake consumer (find_package adapter-picoquic-threaded) =="
     -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS" \
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
 "$CMAKE" --build "$CONB"
-"$CONB/moq_adapter_threaded_install_consumer_test"
-"$CONB/moq_adapter_threaded_install_consumer_cxx_test"
+# The consumer owns the loader path for this temporary install. On Linux,
+# an executable's RUNPATH does not cover transitive shared dependencies.
+# Keep caller-provided dependency directories after the installed libraries.
+LD_LIBRARY_PATH="$P/$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$CONB/moq_adapter_threaded_install_consumer_test"
+LD_LIBRARY_PATH="$P/$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$CONB/moq_adapter_threaded_install_consumer_cxx_test"
 
 echo "== 3B. pkg-config consumer (libmoq) =="
 if ! command -v pkg-config >/dev/null 2>&1; then
@@ -113,10 +126,26 @@ else
     echo "   cflags: $PC_CFLAGS"
     echo "   libs:   $PC_LIBS"
     # Guard: no source-tree include must leak through pkg-config cflags.
-    case "$PC_CFLAGS" in
-        *"$PICOQUIC_SRC"*|*"$PTLS_SRC"*)
-            echo "FAIL: pkg-config cflags leak a source-tree path"; exit 1;;
-    esac
+    # read decodes pkg-config's backslash escapes without evaluating shell code.
+    # Compare complete paths: /pico must not also match /out/picoquic/include.
+    pc_flags=()
+    read -a pc_flags <<< "$PC_CFLAGS"
+    for pc_flag in ${pc_flags[@]+"${pc_flags[@]}"}; do
+        case "$pc_flag" in
+            -I*) pc_path=${pc_flag#-I};;
+            -isystem*) pc_path=${pc_flag#-isystem};;
+            -iquote*) pc_path=${pc_flag#-iquote};;
+            -idirafter*) pc_path=${pc_flag#-idirafter};;
+            *) pc_path=$pc_flag;;
+        esac
+        for pc_root in "$PICOQUIC_SRC" "$PTLS_SRC"; do
+            pc_root=${pc_root%/}
+            case "$pc_path" in
+                "$pc_root"|"$pc_root"/*)
+                    echo "FAIL: pkg-config cflags leak a source-tree path"; exit 1;;
+            esac
+        done
+    done
     "$CC" $CFLAGS $PC_CFLAGS -c "$CONSUMER_MAIN" -o "$WORK/pkgc.o"
     # pkg-config does not choose the application's runtime search policy.
     runtime_flags=()
@@ -124,7 +153,7 @@ else
         Darwin|Linux) runtime_flags=("-Wl,-rpath,$P/$LIBDIR");;
     esac
     "$CC" $LDFLAGS "$WORK/pkgc.o" $PC_LIBS "${runtime_flags[@]}" -o "$WORK/pkgc-consumer"
-    "$WORK/pkgc-consumer"
+    LD_LIBRARY_PATH="$P/$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$WORK/pkgc-consumer"
 fi
 
 echo "== install-tree threaded consumer OK (CMake + pkg-config) =="

@@ -25,6 +25,7 @@
 #include <pico_webtransport.h>
 #include <h3zero_common.h>
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -213,15 +214,49 @@ static int client_loop_cb(picoquic_quic_t *quic,
     return 0;
 }
 
+/* Release what the client made, each once, in dependency order: the MoQ
+ * adapter connection and session, then the HTTP/3 context (with its
+ * streams) while its connection still exists, then the QUIC context, which
+ * frees the connection. picowt_prepare_client_cnx hands back what it made
+ * through its out-pointers even when it fails, so a partial preparation is
+ * released here too. */
+static void client_cleanup(client_ctx_t *c)
+{
+    if (c->conn) moq_pico_wt_conn_destroy(c->conn);
+    c->conn = NULL;
+    if (c->session) moq_session_destroy(c->session);
+    c->session = NULL;
+    if (c->h3_ctx) h3zero_callback_delete_context(c->cnx, c->h3_ctx);
+    c->h3_ctx = NULL;
+    c->ctrl_ctx = NULL;
+    if (c->quic) picoquic_free(c->quic);
+    c->quic = NULL;
+    c->cnx = NULL;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
         "usage: %s [--host H] [--port N] [--sni S] [--authority A] "
         "[--path /moq] [--timeout-sec N] [--insecure-skip-verify]\n"
+        "       [--fail-after prepare|connect|start]\n"
         "  --authority A           CONNECT :authority (default H:N, an IPv6\n"
         "                          literal bracketed); the SNI never stands in\n"
         "  --insecure-skip-verify  disable TLS certificate verification\n"
-        "                          (LOCAL/self-signed testing ONLY)\n", prog);
+        "                          (LOCAL/self-signed testing ONLY)\n"
+        "  --fail-after STEP       stop with failure right after STEP succeeds\n"
+        "                          (prepare, connect or start), through the\n"
+        "                          failure cleanup, printing \"fail-after: STEP\n"
+        "                          reached\" first (for its tests)\n", prog);
+}
+
+/* The --fail-after step requested is `step`: say so, so a test can tell
+ * this failure from any other, and fail. */
+static bool fail_here(const char *fail_after, const char *step)
+{
+    if (strcmp(fail_after, step) != 0) return false;
+    fprintf(stderr, "fail-after: %s reached\n", step);
+    return true;
 }
 
 int main(int argc, char **argv)
@@ -233,6 +268,7 @@ int main(int argc, char **argv)
     const char *path = "/moq";
     int timeout_sec = 5;
     int insecure_skip_verify = 0;   /* TLS verification ON by default */
+    const char *fail_after = "";
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
@@ -247,7 +283,14 @@ int main(int argc, char **argv)
             timeout_sec = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--insecure-skip-verify"))
             insecure_skip_verify = 1;
+        else if (!strcmp(argv[i], "--fail-after") && i + 1 < argc)
+            fail_after = argv[++i];
         else { usage(argv[0]); return 2; }
+    }
+    if (*fail_after && strcmp(fail_after, "prepare") != 0 &&
+        strcmp(fail_after, "connect") != 0 && strcmp(fail_after, "start") != 0) {
+        usage(argv[0]);
+        return 2;
     }
 
     /* The CONNECT names the authority of the https URI it targets
@@ -294,7 +337,11 @@ int main(int argc, char **argv)
             (struct sockaddr *)&server_address,
             &c.cnx, &c.h3_ctx, &c.ctrl_ctx, now, sni) != 0) {
         fprintf(stderr, "[client] picowt_prepare_client_cnx failed\n");
-        picoquic_free(c.quic);
+        client_cleanup(&c);
+        return 1;
+    }
+    if (fail_here(fail_after, "prepare")) {
+        client_cleanup(&c);
         return 1;
     }
     picowt_set_transport_parameters(c.cnx);
@@ -302,12 +349,20 @@ int main(int argc, char **argv)
     if (picowt_connect(c.cnx, c.h3_ctx, c.ctrl_ctx, authority, path,
                        client_wt_cb, &c, NULL) != 0) {
         fprintf(stderr, "[client] picowt_connect failed\n");
-        picoquic_free(c.quic);
+        client_cleanup(&c);
+        return 1;
+    }
+    if (fail_here(fail_after, "connect")) {
+        client_cleanup(&c);
         return 1;
     }
     if (picoquic_start_client_cnx(c.cnx) != 0) {
         fprintf(stderr, "[client] picoquic_start_client_cnx failed\n");
-        picoquic_free(c.quic);
+        client_cleanup(&c);
+        return 1;
+    }
+    if (fail_here(fail_after, "start")) {
+        client_cleanup(&c);
         return 1;
     }
 
@@ -318,9 +373,7 @@ int main(int argc, char **argv)
     if (ret == PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP)
         ret = 0;
 
-    if (c.conn) moq_pico_wt_conn_destroy(c.conn);
-    if (c.session) moq_session_destroy(c.session);
-    picoquic_free(c.quic);
+    client_cleanup(&c);
 
     if (c.got_object) {
         printf("[client] done: object received\n");

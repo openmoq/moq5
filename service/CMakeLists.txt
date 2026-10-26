@@ -5,6 +5,7 @@
 add_library(moq-service
     src/endpoint.c
     src/endpoint_uri.c
+    src/media_auth.c
     src/media_receiver.c
     src/media_sender.c
 )
@@ -105,6 +106,14 @@ if(TARGET moq::mpeg2ts)
     set(_MOQ_SERVICE_TS_DEFS MOQ_SERVICE_HAVE_MPEG2TS=1)
     set(_MOQ_SERVICE_TS_LIBS moq::mpeg2ts)
 endif()
+# The media player (<moq/media_player.h>) composes the receiver with the
+# playback engine, so it is built when the engine is.
+set(_MOQ_SERVICE_PLAYER_LIBS "")
+if(TARGET moq::playback)
+    target_sources(moq-service PRIVATE src/media_player.c)
+    target_link_libraries(moq-service PUBLIC moq::playback)
+    set(_MOQ_SERVICE_PLAYER_LIBS moq::playback)
+endif()
 target_compile_definitions(moq-service PRIVATE ${_MOQ_SERVICE_FACADE_DEFS}
                                                ${_MOQ_SERVICE_TS_DEFS})
 target_link_libraries(moq-service PRIVATE ${_MOQ_SERVICE_FACADE_LIBS}
@@ -120,9 +129,16 @@ install(TARGETS moq-service
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
-install(DIRECTORY include/moq
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-    FILES_MATCHING PATTERN "*.h")
+if(TARGET moq::playback)
+    install(DIRECTORY include/moq
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.h")
+else()
+    install(DIRECTORY include/moq
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.h"
+        PATTERN "media_player.h" EXCLUDE)
+endif()
 
 # pkg-config: a standalone libmoq-service.pc so Meson/autotools/VLC-style
 # consumers can `pkg-config --cflags --libs libmoq-service` (or Meson
@@ -193,7 +209,7 @@ endif()
 # `service` component branch in libmoqConfig loads those targets first.
 set(_service_libdir "${CMAKE_INSTALL_LIBDIR}")
 set(_service_incdir "${CMAKE_INSTALL_INCLUDEDIR}")
-set(_service_iface "moq::core;moq::msf;Threads::Threads;${_MOQ_SERVICE_FACADE_LIBS};${_MOQ_SERVICE_TS_LIBS}")
+set(_service_iface "moq::core;moq::msf;Threads::Threads;${_MOQ_SERVICE_FACADE_LIBS};${_MOQ_SERVICE_TS_LIBS};${_MOQ_SERVICE_PLAYER_LIBS}")
 string(REPLACE ";" "$<SEMICOLON>" _service_iface_gen "${_service_iface}")
 
 file(GENERATE
@@ -234,9 +250,23 @@ target_compile_definitions(moq-service PRIVATE MOQ_BUILDING)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(moq-service PRIVATE -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+elseif(MSVC)
+    target_compile_options(moq-service PRIVATE $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:/WX>)
 endif()
 
 if(MOQ_BUILD_TESTS)
+    add_executable(test_media_auth tests/test_media_auth.c src/media_auth.c)
+    target_include_directories(test_media_auth PRIVATE include src)
+    target_link_libraries(test_media_auth PRIVATE moq::core)
+    target_compile_features(test_media_auth PRIVATE c_std_11)
+    target_compile_definitions(test_media_auth PRIVATE MOQ_BUILDING)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_media_auth PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME media_auth COMMAND test_media_auth)
+    set_tests_properties(media_auth PROPERTIES TIMEOUT 10)
+
     # White-box target: the resolution layer is internal (endpoint_internal.h,
     # not installed); tests compile the sources directly so the internal
     # symbols stay un-exported in the shared library (same pattern as
@@ -471,7 +501,10 @@ if(MOQ_BUILD_TESTS)
     # with the bare-endpoint + pump seam so ep_pump_cycle can be driven with a
     # controlled session (NULL pre-establishment, then a live IDLE session). Own
     # object set so the testing define never leaks into the shipping library.
-    add_library(moq-service-endpoint-test-internals OBJECT src/endpoint.c src/endpoint_uri.c)
+    # Direct production-TU fixtures link this endpoint-only support instead
+    # of a second sender/receiver object; they also need the shared auth helper.
+    add_library(moq-service-endpoint-test-internals OBJECT
+        src/endpoint.c src/endpoint_uri.c src/media_auth.c)
     target_include_directories(moq-service-endpoint-test-internals
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -491,6 +524,34 @@ if(MOQ_BUILD_TESTS)
     target_include_directories(test_endpoint_post_contract PRIVATE
         ${PROJECT_SOURCE_DIR}/tests/unit)
     add_test(NAME endpoint_post_contract COMMAND test_endpoint_post_contract)
+
+    if(MOQ_BUILD_PQ_THREADED)
+        add_executable(test_endpoint_pico_terminal tests/test_endpoint_pico_terminal.c)
+        target_link_libraries(test_endpoint_pico_terminal PRIVATE
+            moq-service-endpoint-test-internals)
+        target_include_directories(test_endpoint_pico_terminal PRIVATE
+            ${PROJECT_SOURCE_DIR}/tests/unit)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_endpoint_pico_terminal PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME endpoint_pico_terminal COMMAND test_endpoint_pico_terminal)
+        set_tests_properties(endpoint_pico_terminal PROPERTIES TIMEOUT 30)
+    endif()
+
+    # moq_endpoint_drain succeeds only on a facade observation taken after the
+    # hooks' owed output reached the session (a gated latched-facade stand-in).
+    add_executable(test_endpoint_drain_barrier tests/test_endpoint_drain_barrier.c)
+    target_link_libraries(test_endpoint_drain_barrier PRIVATE
+        moq-service-endpoint-test-internals Threads::Threads)
+    target_include_directories(test_endpoint_drain_barrier PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tests/unit)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_endpoint_drain_barrier PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME endpoint_drain_barrier COMMAND test_endpoint_drain_barrier)
+    set_tests_properties(endpoint_drain_barrier PROPERTIES TIMEOUT 120)
 
     add_executable(test_endpoint_negotiated_publication
         tests/test_endpoint_negotiated_publication.c)
@@ -533,7 +594,7 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(media_receiver_init PROPERTIES TIMEOUT 30)
 
         add_library(moq-service-receiver-test-internals OBJECT
-            src/media_receiver.c src/endpoint.c src/endpoint_uri.c)
+            src/media_receiver.c src/media_auth.c src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-receiver-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -557,6 +618,52 @@ if(MOQ_BUILD_TESTS)
         target_include_directories(test_media_catalog_update PRIVATE
             ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME media_catalog_update COMMAND test_media_catalog_update)
+
+        # The media player over a real publisher, with the receiver on a
+        # bare test endpoint (the receiver test seams).
+        if(TARGET moq::playback AND TARGET moq::sim AND TARGET moq::loc)
+            add_executable(test_media_player
+                tests/test_media_player.c src/media_player.c)
+            # The engine's own seams too, where its test build exists.
+            if(TARGET moq-playback-test-internals)
+                set(_moq_player_engine moq-playback-test-internals)
+            else()
+                set(_moq_player_engine moq::playback)
+            endif()
+            target_link_libraries(test_media_player PRIVATE
+                moq-service-receiver-test-internals ${_moq_player_engine} moq::sim moq::loc)
+            target_compile_definitions(test_media_player PRIVATE MOQ_MEDIA_PLAYER_TESTING=1)
+            target_include_directories(test_media_player PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_media_player PRIVATE -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_player COMMAND test_media_player)
+            set_tests_properties(media_player PROPERTIES TIMEOUT 120)
+        endif()
+        if(TARGET moq::playback)
+            add_executable(test_media_player_abi tests/test_media_player_abi.c)
+            target_link_libraries(test_media_player_abi PRIVATE moq::service)
+            add_test(NAME media_player_abi COMMAND test_media_player_abi)
+            add_executable(test_media_player_abi_short_enums tests/test_media_player_abi.c)
+            target_link_libraries(test_media_player_abi_short_enums PRIVATE moq::service)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_media_player_abi PRIVATE -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+                target_compile_options(test_media_player_abi_short_enums PRIVATE
+                    -fshort-enums -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_player_abi_short_enums COMMAND test_media_player_abi_short_enums)
+            add_test(NAME media_player_symbols COMMAND ${CMAKE_COMMAND}
+                -DNM=${CMAKE_NM} -DREADELF=${CMAKE_READELF}
+                -DELF=$<STREQUAL:${CMAKE_EXECUTABLE_FORMAT},ELF>
+                -DLIBRARY=$<TARGET_FILE:moq-service>
+                -DSHARED=$<BOOL:${BUILD_SHARED_LIBS}>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_player_symbols.cmake)
+            set_tests_properties(media_player_symbols PROPERTIES TIMEOUT 60)
+        endif()
 
         # Publication-race test (MOQ-MEDIA-CP-LOOKUP-RACE): deterministic
         # try-lock phase oracle for the effective-catalog publication vs the
@@ -616,6 +723,16 @@ if(MOQ_BUILD_TESTS)
         # receiver_hook with a simpair client session and inject crafted moqx
         # control + subgroup data bytes. Requires moq-sim.
         if(TARGET moq::sim)
+            add_executable(test_media_receiver_auth tests/test_media_receiver_auth.c)
+            target_link_libraries(test_media_receiver_auth PRIVATE
+                moq-service-receiver-test-internals moq::sim)
+            target_include_directories(test_media_receiver_auth PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            target_compile_options(test_media_receiver_auth PRIVATE
+                $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+            add_test(NAME media_receiver_auth COMMAND test_media_receiver_auth)
+            set_tests_properties(media_receiver_auth PROPERTIES TIMEOUT 30)
+
             # This fixture includes the production receiver conversion, so link
             # endpoint-only support rather than a second receiver object.
             add_executable(test_media_receiver_companion
@@ -724,6 +841,45 @@ if(MOQ_BUILD_TESTS)
             add_test(NAME media_receiver_origin COMMAND test_media_receiver_origin)
             set_tests_properties(media_receiver_origin PROPERTIES TIMEOUT 30)
 
+            # Fill loss on the stream-terminal lane, draft 22.
+            add_executable(test_media_receiver_fill_lane
+                tests/test_media_receiver_fill_lane.c
+                tests/receiver_legacy_ts_caller.c)
+            target_link_libraries(test_media_receiver_fill_lane PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_fill_lane PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_fill_lane PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_fill_lane COMMAND test_media_receiver_fill_lane)
+            set_tests_properties(media_receiver_fill_lane PROPERTIES TIMEOUT 30)
+
+            # Retirement and reorder-window ownership through the real hook.
+            add_executable(test_media_receiver_lane_hook
+                tests/test_media_receiver_lane_hook.c
+                tests/receiver_legacy_ts_caller.c)
+            target_link_libraries(test_media_receiver_lane_hook PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_lane_hook PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(TARGET moq::mpeg2ts)
+                target_link_libraries(test_media_receiver_lane_hook PRIVATE moq::mpeg2ts)
+                target_include_directories(test_media_receiver_lane_hook PRIVATE
+                    ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
+                target_compile_definitions(test_media_receiver_lane_hook PRIVATE
+                    ${_MOQ_SERVICE_TS_DEFS} MOQ_TEST_HAVE_TS=1)
+            endif()
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_lane_hook PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_lane_hook COMMAND test_media_receiver_lane_hook)
+            set_tests_properties(media_receiver_lane_hook PROPERTIES TIMEOUT 30)
+
             add_executable(test_media_receiver_fill_control
                 tests/test_media_receiver_fill_control.c
                 tests/receiver_legacy_ts_caller.c)
@@ -758,6 +914,24 @@ if(MOQ_BUILD_TESTS)
                 endif()
                 add_test(NAME media_receiver_ts_fill COMMAND test_media_receiver_ts_fill)
                 set_tests_properties(media_receiver_ts_fill PROPERTIES TIMEOUT 30)
+
+                # The stream-terminal lane behind an MPEG2TS reorder window.
+                add_executable(test_media_receiver_ts_lane
+                    tests/test_media_receiver_ts_lane.c)
+                target_link_libraries(test_media_receiver_ts_lane PRIVATE
+                    moq-service-endpoint-test-internals moq::msf moq::mpeg2ts)
+                target_include_directories(test_media_receiver_ts_lane PRIVATE
+                    ${PROJECT_SOURCE_DIR}/tests/unit
+                    ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
+                target_compile_definitions(test_media_receiver_ts_lane PRIVATE
+                    ${_MOQ_SERVICE_TS_DEFS})
+                if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                    target_compile_options(test_media_receiver_ts_lane PRIVATE
+                        -Wall -Wextra -Wpedantic
+                        $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+                endif()
+                add_test(NAME media_receiver_ts_lane COMMAND test_media_receiver_ts_lane)
+                set_tests_properties(media_receiver_ts_lane PROPERTIES TIMEOUT 30)
             endif()
 
             add_executable(test_media_catalog_bootstrap
@@ -791,8 +965,14 @@ if(MOQ_BUILD_TESTS)
                 moq-service-receiver-test-internals moq::sim)
             target_include_directories(test_media_receiver_scripted PRIVATE
                 ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_scripted PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
             add_test(NAME media_receiver_scripted
                 COMMAND test_media_receiver_scripted)
+            set_tests_properties(media_receiver_scripted PROPERTIES TIMEOUT 30)
             add_executable(test_media_receiver_malformed
                 tests/test_media_receiver_malformed.c)
             target_link_libraries(test_media_receiver_malformed PRIVATE
@@ -915,7 +1095,7 @@ if(MOQ_BUILD_TESTS)
         # the sender would publish after add/remove, to pin coalescing and the
         # no-op dedup deterministically.
         add_library(moq-service-sender-test-internals OBJECT
-            src/media_sender.c src/endpoint.c src/endpoint_uri.c)
+            src/media_sender.c src/media_auth.c src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-sender-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -947,6 +1127,16 @@ if(MOQ_BUILD_TESTS)
         add_test(NAME media_track_cfg_init COMMAND test_media_track_cfg_init)
 
         if(TARGET moq::sim)
+            add_executable(test_media_sender_auth tests/test_media_sender_auth.c)
+            target_link_libraries(test_media_sender_auth PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_auth PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            target_compile_options(test_media_sender_auth PRIVATE
+                $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+            add_test(NAME media_sender_auth COMMAND test_media_sender_auth)
+            set_tests_properties(media_sender_auth PROPERTIES TIMEOUT 30)
+
             add_executable(test_media_sender_priority
                 tests/test_media_sender_priority.c)
             target_link_libraries(test_media_sender_priority PRIVATE
@@ -956,6 +1146,28 @@ if(MOQ_BUILD_TESTS)
             target_compile_options(test_media_sender_priority PRIVATE
                 $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
             add_test(NAME media_sender_priority COMMAND test_media_sender_priority)
+
+            # What a sender owes a graceful drain after each pump.
+            add_executable(test_media_sender_owed_output
+                tests/test_media_sender_owed_output.c)
+            target_link_libraries(test_media_sender_owed_output PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_owed_output PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            target_compile_options(test_media_sender_owed_output PRIVATE
+                $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+            add_test(NAME media_sender_owed_output COMMAND test_media_sender_owed_output)
+            add_executable(test_media_sender_subgroup_terminal
+                tests/test_media_sender_subgroup_terminal.c)
+            target_link_libraries(test_media_sender_subgroup_terminal PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_subgroup_terminal PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            target_compile_options(test_media_sender_subgroup_terminal PRIVATE
+                $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+            add_test(NAME media_sender_subgroup_terminal
+                COMMAND test_media_sender_subgroup_terminal)
+            set_tests_properties(media_sender_subgroup_terminal PROPERTIES TIMEOUT 30)
         endif()
 
         add_executable(test_service_surfaces tests/test_service_surfaces.c)
@@ -1092,7 +1304,13 @@ if(MOQ_BUILD_TESTS)
             target_link_libraries(test_media_sender_pacing PRIVATE
                 moq-service-sender-test-internals moq::sim)
             target_include_directories(test_media_sender_pacing PRIVATE
-                ${PROJECT_SOURCE_DIR}/tests/unit)
+                ${PROJECT_SOURCE_DIR}/tests/unit
+                ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
+            # The timeline-retry row beside a failed MPEG2TS completion.
+            if(TARGET moq::mpeg2ts)
+                target_compile_definitions(test_media_sender_pacing PRIVATE
+                    MOQ_TEST_HAVE_MPEG2TS)
+            endif()
             if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
                 target_compile_options(test_media_sender_pacing PRIVATE -Wall -Wextra -Wpedantic
                     $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
@@ -1155,7 +1373,8 @@ if(MOQ_BUILD_TESTS)
         # duplicate endpoint.c. Requires moq::msf and moq::sim.
         if(TARGET moq::sim)
             add_library(moq-service-refresh-test-internals OBJECT
-                src/media_sender.c src/media_receiver.c src/endpoint.c src/endpoint_uri.c)
+                src/media_sender.c src/media_receiver.c src/media_auth.c
+                src/endpoint.c src/endpoint_uri.c)
             target_include_directories(moq-service-refresh-test-internals
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1364,6 +1583,11 @@ if(MOQ_BUILD_TESTS)
         target_include_directories(test_media_receiver PRIVATE
             ${PROJECT_SOURCE_DIR}/tests/unit
             ${PROJECT_SOURCE_DIR}/tests/support)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_media_receiver PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
         add_test(NAME media_receiver
             COMMAND test_media_receiver
                 --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
@@ -1445,6 +1669,49 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(media_sender PROPERTIES
             LABELS "network" TIMEOUT 60 RESOURCE_LOCK service_network)
 
+        # moq_endpoint_drain across a real sender's END handoff on the threaded
+        # backend: the sender and endpoint test internals over the threaded
+        # adapter's test-internals build (its stage hook), in place of the
+        # shipped threaded adapter.
+        if(TARGET moq-adapter-picoquic-threaded-test-internals)
+            set(_stage_facade_libs ${_MOQ_SERVICE_FACADE_LIBS})
+            list(REMOVE_ITEM _stage_facade_libs moq::adapter-picoquic-threaded)
+            add_library(moq-service-sender-stage-test-internals OBJECT
+                src/media_sender.c src/media_auth.c src/endpoint.c src/endpoint_uri.c)
+            target_include_directories(moq-service-sender-stage-test-internals
+                PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+                PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+            target_link_libraries(moq-service-sender-stage-test-internals
+                PUBLIC moq::core moq::msf Threads::Threads ${_MOQ_SERVICE_TS_LIBS}
+                       moq-adapter-picoquic-threaded-test-internals
+                       ${_stage_facade_libs})
+            target_compile_definitions(moq-service-sender-stage-test-internals
+                PRIVATE ${_MOQ_SERVICE_TS_DEFS} MOQ_MEDIA_SENDER_TESTING=1
+                        ${_MOQ_SERVICE_FACADE_DEFS})
+            target_compile_features(moq-service-sender-stage-test-internals
+                PUBLIC c_std_11)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(moq-service-sender-stage-test-internals PRIVATE
+                    -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_executable(test_endpoint_drain_end_handoff
+                tests/test_endpoint_drain_end_handoff.c)
+            target_link_libraries(test_endpoint_drain_end_handoff PRIVATE
+                moq-service-sender-stage-test-internals moq::msf Threads::Threads)
+            target_include_directories(test_endpoint_drain_end_handoff PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_endpoint_drain_end_handoff PRIVATE
+                    -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME endpoint_drain_end_handoff
+                COMMAND test_endpoint_drain_end_handoff
+                    --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                    --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            set_tests_properties(endpoint_drain_end_handoff PROPERTIES
+                LABELS "network" TIMEOUT 120 RESOURCE_LOCK service_network)
+        endif()
+
         # pkg-config consumer: a plain C program built with ONLY
         # `pkg-config --cflags --libs libmoq-service` from an install prefix --
         # the Meson/VLC consumption path. Reuses the WT adapter's installer
@@ -1466,8 +1733,10 @@ if(MOQ_BUILD_TESTS)
             include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
             set(_svc_abi_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-abi-context.cmake")
             moq_write_consumer_abi_context("${_svc_abi_context}")
+            include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
+            moq_nested_cxx_env(_svc_pkgconfig_cxx_env)
             add_test(NAME service_pkgconfig_consumer
-                COMMAND bash
+                COMMAND ${CMAKE_COMMAND} -E env ${_svc_pkgconfig_cxx_env} bash
                     "${PROJECT_SOURCE_DIR}/adapters/pico_wt/tests/run_pkgconfig_consumer.sh"
                     "${CMAKE_COMMAND}"
                     "libmoq-service"
@@ -1486,6 +1755,53 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(service_pkgconfig_consumer
                 PROPERTIES TIMEOUT 600)
         endif()
+    endif()
+
+    # The same END handoff over the managed WebTransport facade -- registered
+    # whenever managed WT is built, with or without the raw threaded backend: the
+    # facade's test-internals build (MOQ_PICO_WT_TESTING stage hook) in
+    # place of the shipped moq::adapter-pico-wt-managed, against a managed
+    # WebTransport peer from the same build.
+    if(TARGET moq-adapter-pico-wt-managed-test-internals)
+        set(_stage_wt_facade_libs ${_MOQ_SERVICE_FACADE_LIBS})
+        list(REMOVE_ITEM _stage_wt_facade_libs moq::adapter-pico-wt-managed)
+        add_library(moq-service-sender-stage-wt-test-internals OBJECT
+            src/media_sender.c src/media_auth.c src/endpoint.c src/endpoint_uri.c)
+        target_include_directories(moq-service-sender-stage-wt-test-internals
+            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(moq-service-sender-stage-wt-test-internals
+            PUBLIC moq::core moq::msf Threads::Threads ${_MOQ_SERVICE_TS_LIBS}
+                   moq-adapter-pico-wt-managed-test-internals
+                   ${_stage_wt_facade_libs})
+        target_compile_definitions(moq-service-sender-stage-wt-test-internals
+            PRIVATE ${_MOQ_SERVICE_TS_DEFS} MOQ_MEDIA_SENDER_TESTING=1
+                    ${_MOQ_SERVICE_FACADE_DEFS})
+        target_compile_features(moq-service-sender-stage-wt-test-internals
+            PUBLIC c_std_11)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(moq-service-sender-stage-wt-test-internals PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_executable(test_endpoint_drain_end_handoff_wt
+            tests/test_endpoint_drain_end_handoff.c)
+        target_compile_definitions(test_endpoint_drain_end_handoff_wt PRIVATE
+            END_BACKEND_WT=1)
+        target_link_libraries(test_endpoint_drain_end_handoff_wt PRIVATE
+            moq-service-sender-stage-wt-test-internals moq::msf Threads::Threads)
+        target_include_directories(test_endpoint_drain_end_handoff_wt PRIVATE
+            ${PROJECT_SOURCE_DIR}/tests/unit
+            ${PROJECT_SOURCE_DIR}/adapters/pico_wt/tests)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_endpoint_drain_end_handoff_wt PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME endpoint_drain_end_handoff_wt
+            COMMAND test_endpoint_drain_end_handoff_wt
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(endpoint_drain_end_handoff_wt PROPERTIES
+            LABELS "network" TIMEOUT 120 RESOURCE_LOCK service_network)
     endif()
 
     # Explicit MsQuic backend selection over a real MsQuic loopback: the

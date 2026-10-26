@@ -239,6 +239,11 @@ static void settle(fixture_t *f)
 {
     for (unsigned i = 0; i < 8; i++) { network(f); pump(f); }
 }
+/* A trace hook a row may install before start: SimPair reports every unit
+ * it carries to it. */
+static moq_sim_trace_fn fixture_trace;
+static void *fixture_trace_ctx;
+
 static bool start_configured(fixture_t *f, moq_version_t version, uint64_t budget,
                              bool small_flow_queue)
 {
@@ -254,6 +259,8 @@ static bool start_configured(fixture_t *f, moq_version_t version, uint64_t budge
     moq_simpair_cfg_t pc = MOQ_SIMPAIR_CFG_INIT;
     pc.alloc = moq_alloc_default(); pc.version = version;
     pc.max_actions = 8; /* No more than the track-status table: pressure fills actions. */
+    pc.trace_fn = fixture_trace;
+    pc.trace_ctx = fixture_trace_ctx;
     pc.client_send_request_capacity = pc.server_send_request_capacity = true;
     pc.client_initial_request_capacity = pc.server_initial_request_capacity = 32;
     if (moq_simpair_create(&pc, &f->pair) != MOQ_OK ||

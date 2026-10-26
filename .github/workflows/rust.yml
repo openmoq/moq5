@@ -1,0 +1,216 @@
+name: Rust Binding
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rows:
+    name: Rows (${{ matrix.os }}, shared=${{ matrix.shared }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        shared: ["OFF", "ON"]
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: clang
+      CMAKE_BUILD_PARALLEL_LEVEL: "3"
+      CARGO_TERM_COLOR: never
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install build prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config clang libclang-dev libclang-rt-dev python3
+
+      - name: Install build prerequisites (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja pkg-config llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      # The rows add the docs.rs and cross targets themselves through rustup.
+      - name: Install the Rust toolchains
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.85 --profile minimal
+          rustup default stable
+          cargo --version && rustup run 1.85 cargo --version
+
+      # The service SDK the binding links: no adapters, with the player and
+      # MPEG-TS (both stated, so a tree without them fails to configure),
+      # warnings as errors, the tree's library type (the consumer row that
+      # matches it runs). The cross-build row runs where the tree can build
+      # the other architecture (macOS); Linux runs the refusal row only.
+      - name: Configure the tree with the Rust rows
+        env:
+          SDK_SHARED: ${{ matrix.shared }}
+        run: |
+          cmake -S . -B build/rust -G Ninja \
+            -Werror=dev -Werror=deprecated \
+            -DCMAKE_BUILD_TYPE=Debug -DBUILD_SHARED_LIBS="$SDK_SHARED" \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_SKIP_INSTALL_RPATH=ON \
+            -DMOQ_WARNINGS_AS_ERRORS=ON \
+            -DMOQ_BUILD_TESTS=ON -DMOQ_BUILD_SIM=OFF -DMOQ_BUILD_EXAMPLES=OFF \
+            -DMOQ_BUILD_MSF=ON -DMOQ_BUILD_MEDIA_OBJECT=ON -DMOQ_BUILD_SERVICE=ON \
+            -DMOQ_BUILD_PLAYBACK=ON -DMOQ_BUILD_MPEG2TS=ON \
+            -DMOQ_BUILD_RUST_BINDING=ON -DMOQ_RUST_RELAY_ROWS=OFF \
+            -DMOQ_RUST_PLAYER=ON -DMOQ_RUST_MPEG2TS=ON
+
+      - name: Build
+        run: cmake --build build/rust
+
+      - name: Rust rows
+        run: |
+          ctest --test-dir build/rust -R '^rust_' --output-on-failure --no-tests=error
+
+      - name: Retain row logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-rows-${{ matrix.os }}-${{ matrix.shared }}
+          if-no-files-found: ignore
+          path: |
+            build/rust/Testing/Temporary/LastTest.log
+            build/rust/bindings/rust/work/consumer/*.log
+            build/rust/bindings/rust/work/consumer/*.json
+            build/rust/bindings/rust/work/consumer/*.txt
+            build/rust/bindings/rust/work/package/*.log
+            build/rust/bindings/rust/work/package/*.json
+            build/rust/bindings/rust/work/package/*.txt
+            build/rust/bindings/rust/work/cross-*.log
+            build/rust/bindings/rust/work/*.diagnostics.txt
+            build/rust/bindings/rust/work/*.stderr
+            build/rust/bindings/rust/work/gate-controls/*.out
+            build/rust/bindings/rust/work/gate-controls/*.inv
+            build/rust/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.rs
+            build/rust/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.txt
+
+  relay-rows:
+    name: Relay rows (${{ matrix.os }}, picoquic SDK)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      WTQ_BUILD_NETWORK: "OFF"
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install build prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libnuma-dev pkg-config perl python3 \
+            clang libclang-dev libclang-rt-dev
+          echo "CC=gcc" >> "$GITHUB_ENV"
+          echo "CXX=g++" >> "$GITHUB_ENV"
+
+      - name: Install build prerequisites (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja pkg-config llvm openssl@3
+          {
+            echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib"
+            echo "CC=clang"
+            echo "CXX=clang++"
+          } >> "$GITHUB_ENV"
+
+      - name: Install the Rust toolchains
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.85 --profile minimal
+          rustup default stable
+
+      # The SDK the rows link: the picoquic backends, the player and MPEG-TS,
+      # installed with their pkg-config closure.
+      - name: Build and install the picoquic service SDK
+        run: |
+          bash scripts/setup_picoquic_deps.sh -G Ninja
+          source .deps/picoquic-ci/picoquic_deps.env
+          cmake -S . -B build/rust-pq-sdk -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DMOQ_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/rust-pq-sdk" -DCMAKE_INSTALL_LIBDIR=lib \
+            -DMOQ_BUILD_TESTS=OFF -DMOQ_BUILD_SIM=OFF -DMOQ_BUILD_EXAMPLES=OFF \
+            -DMOQ_BUILD_MSF=ON -DMOQ_BUILD_MEDIA_OBJECT=ON -DMOQ_BUILD_SERVICE=ON \
+            -DMOQ_BUILD_PLAYBACK=ON -DMOQ_BUILD_MPEG2TS=ON \
+            -DMOQ_BUILD_ADAPTER_PICOQUIC=ON -DMOQ_BUILD_PQ_THREADED=ON \
+            -DMOQ_BUILD_ADAPTER_PICO_WT=ON -DMOQ_BUILD_PICO_WT_MANAGED=ON \
+            "-DMOQ_PICOQUIC_SOURCE_DIR=$MOQ_PICOQUIC_SOURCE_DIR" \
+            "-DMOQ_PICOTLS_PREFIX=$MOQ_PICOTLS_PREFIX"
+          cmake --build build/rust-pq-sdk
+          cmake --install build/rust-pq-sdk
+          test -f "$RUNNER_TEMP/rust-pq-sdk/lib/pkgconfig/libmoq-service.pc"
+          test -f "$RUNNER_TEMP/rust-pq-sdk/include/moq/media_player.h"
+          test -f "$RUNNER_TEMP/rust-pq-sdk/include/moq/mpeg2ts.h"
+
+      # The relay, from the same setup scripts the relay job uses, with the
+      # Rust rows pointed at the installed picoquic SDK. The cross-build row
+      # is the rows job's; here only the refusal row runs.
+      - name: Build the relay tree with the Rust rows
+        run: |
+          bash scripts/setup_msquic_deps.sh -G Ninja
+          source .deps/msquic-ci/msquic_deps.env
+          msquic_DIR="$msquic_DIR" bash scripts/setup_wtquic_deps.sh -G Ninja
+          source .deps/wtquic-ci/wtquic_deps.env
+          source .deps/picoquic-ci/picoquic_deps.env
+          cmake -S . -B build/rust-relay -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DMOQ_WARNINGS_AS_ERRORS=ON \
+            -DMOQ_BUILD_TESTS=ON -DMOQ_BUILD_SIM=ON -DMOQ_BUILD_EXAMPLES=OFF \
+            -DMOQ_BUILD_MSF=ON -DMOQ_BUILD_MEDIA_OBJECT=ON -DMOQ_BUILD_SERVICE=ON \
+            -DMOQ_BUILD_ADAPTER_PICOQUIC=ON -DMOQ_BUILD_PQ_THREADED=ON \
+            -DMOQ_BUILD_ADAPTER_PICO_WT=ON -DMOQ_BUILD_PICO_WT_MANAGED=ON \
+            "-DMOQ_PICOQUIC_SOURCE_DIR=$MOQ_PICOQUIC_SOURCE_DIR" \
+            "-DMOQ_PICOTLS_PREFIX=$MOQ_PICOTLS_PREFIX" \
+            -DMOQ_BUILD_RELAY=ON -DMOQ_BUILD_ADAPTER_MSQUIC=ON \
+            -DMOQ_BUILD_MSQUIC_MANAGED=ON -DMOQ_BUILD_ADAPTER_WTQUIC=ON \
+            -DMOQ_BUILD_WTQUIC_MSQUIC_MANAGED=ON \
+            -Dmsquic_DIR="$msquic_DIR" -Dwtquic_DIR="$wtquic_DIR" \
+            -DMOQ_BUILD_RUST_BINDING=ON -DMOQ_RUST_CROSS_BUILD=OFF \
+            "-DMOQ_RUST_SDK_PREFIX=$RUNNER_TEMP/rust-pq-sdk" \
+            -DMOQ_RUST_PLAYER=ON -DMOQ_RUST_MPEG2TS=ON
+          cmake --build build/rust-relay --target moq5-relay
+
+      - name: Rust rows against the picoquic SDK, with the relay rows
+        run: |
+          ctest --test-dir build/rust-relay -R '^rust_' --output-on-failure --no-tests=error
+
+      - name: Retain row logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-relay-rows-${{ matrix.os }}
+          if-no-files-found: ignore
+          path: |
+            build/rust-relay/Testing/Temporary/LastTest.log
+            build/rust-relay/bindings/rust/work/live-work/**/relay.log
+            build/rust-relay/bindings/rust/work/live-work/**/peer.log
+            build/rust-relay/bindings/rust/work/peer-verdict-*.log
+            build/rust-relay/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.rs
+            build/rust-relay/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.txt
+            build/rust-relay/bindings/rust/work/*.diagnostics.txt

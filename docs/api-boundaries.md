@@ -68,9 +68,27 @@ and subgroup bookkeeping. Not included by `<moq/moq.h>` — include directly.
 
 Includes `<moq/session.h>`. Lives in `moq-core` (not a separate library).
 
-The facade never polls the session. The caller remains the single consumer
-of `poll_events` and `poll_actions`, forwarding relevant events to the
-facade via `moq_pub_handle_event`.
+Choose one event-consumption mode for the session:
+
+- `moq_pub_tick` polls events internally and is the session's only event
+  consumer. The caller or transport driver still drains actions. Each tick
+  processes at most the session's event capacity, with bounded staged-work
+  passes before and after dispatch.
+- In manual mode, the caller polls events and forwards them through
+  `moq_pub_handle_event`. `moq_pub_flush` retries owned work without polling
+  events. This mode lets several owners share one session event dispatcher.
+
+On every draft, a manual progress round drains actions, calls flush once, then
+continues bounded FIFO event dispatch even after `MOQ_ERR_WOULD_BLOCK`.
+`WOULD_BLOCK + CONSUMED` means the facade owns this event's work; clean up the
+event once and never replay it. Route `IGNORED` events to other owners while
+their borrowed spans remain valid, before another advancing session call.
+Event dispatch can return credit needed by a blocked answer or reset, so do
+not wait for flush-to-OK before polling again. Retry staged work after credit
+returns and yield when no event, action or application progress is possible.
+Tick callers likewise drain actions and retry in progress rounds. See the
+[manual pump guidance](integration-patterns.md#manual-publisher-pump) and the
+contracts in `moq/publisher.h` for ownership and other error returns.
 
 Subscription accept policies: `REJECT_ALL`, `ACCEPT_ALL`, or `CALLBACK`.
 In CALLBACK mode, the callback receives borrowed subscribe request data

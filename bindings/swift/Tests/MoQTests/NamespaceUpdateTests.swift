@@ -11,6 +11,83 @@ import MoQTransportModel
 @Suite("Namespace updates")
 struct NamespaceUpdateTests {
 
+    @Test("Namespace result accepts exact historical extent, rejects short extent")
+    func historicalResultExtent() {
+        let floor = MemoryLayout<moq_namespace_update_result_event_t>.offset(
+            of: \moq_namespace_update_result_event_t.expires_ms)! + MemoryLayout<UInt64>.size
+        var e = moq_event_t()
+        e.kind = MOQ_EVENT_NAMESPACE_UPDATE_RESULT
+        e.u.namespace_update_result.ann._opaque = 27
+        e.u.namespace_update_result.update_request_id = .max
+        e.u.namespace_update_result.outcome = MOQ_NAMESPACE_UPDATE_OUTCOME_OK
+        e.u.namespace_update_result.local_role = MOQ_REQUEST_ROLE_REQUESTER
+        e.u.namespace_update_result.has_expires = true
+        e.u.namespace_update_result.expires_ms = 0
+        for size in [floor - 1, floor, MemoryLayout<moq_namespace_update_result_event_t>.size] {
+            e.detail_size = UInt32(size)
+            let result = ExtendedEvent.namespaceUpdate(e)
+            if size < floor {
+                #expect(result == nil)
+            } else if case .namespaceUpdateResult(let r) = result {
+                #expect(r.target == .announcement(Announcement(e.u.namespace_update_result.ann)))
+                #expect(r.updateRequestID == .max && r.outcome == .ok && r.localRole == .requester)
+                #expect(r.expiresMs == 0)
+            } else {
+                Issue.record("valid namespace result prefix discarded: \(size)")
+            }
+        }
+    }
+
+    @Test("Borrowed namespace update reads only the supplied historical allocation")
+    func historicalBorrowedRecord() throws {
+        let floor = MemoryLayout<moq_namespace_update_record_t>.offset(
+            of: \moq_namespace_update_record_t.token_count)! + MemoryLayout<Int>.size
+        for (bytes, stamp) in [(floor, floor), (floor, floor - 1),
+                              (MemoryLayout<moq_namespace_update_record_t>.size,
+                               MemoryLayout<moq_namespace_update_record_t>.size)] {
+            let text = UnsafeMutablePointer<UInt8>.allocate(capacity: 3)
+            text.initialize(repeating: 0x61, count: 3)
+            let part = UnsafeMutablePointer<moq_bytes_t>.allocate(capacity: 1)
+            part.initialize(to: moq_bytes_t(data: UnsafePointer(text), len: 3))
+            let token = UnsafeMutablePointer<moq_resolved_token_t>.allocate(capacity: 1)
+            token.initialize(to: moq_resolved_token_t())
+            token.pointee.token_type = 7
+            token.pointee.token_value = moq_bytes_t(data: UnsafePointer(text), len: 3)
+            var r = moq_namespace_update_record_t()
+            r.struct_size = UInt32(stamp)
+            r.flags = UInt32(MOQ_NAMESPACE_UPDATE_PREFIX | MOQ_NAMESPACE_UPDATE_AUTHORIZATION)
+            r.update_request_id = .max
+            r.track_namespace_prefix = moq_namespace_t(parts: UnsafePointer(part), count: 1)
+            r.tokens = UnsafePointer(token)
+            r.token_count = 1
+            // Exactly the old producer's allocation: shortening a current
+            // record's stamp would not detect a full-value overread.
+            let raw = UnsafeMutableRawPointer.allocate(
+                byteCount: bytes, alignment: MemoryLayout<moq_namespace_update_record_t>.alignment)
+            withUnsafeBytes(of: &r) { raw.copyMemory(from: $0.baseAddress!, byteCount: bytes) }
+            var e = moq_event_t()
+            e.kind = MOQ_EVENT_NAMESPACE_UPDATE_REQUEST
+            e.detail_size = UInt32(MemoryLayout<moq_namespace_update_request_event_t>.size)
+            e.u.namespace_update_request.ann._opaque = 27
+            e.u.namespace_update_request.update = UnsafePointer(raw.assumingMemoryBound(to: moq_namespace_update_record_t.self))
+            let decoded = ExtendedEvent.namespaceUpdate(e)
+            raw.deallocate()
+            text.update(repeating: 0xff, count: 3)
+            token.deinitialize(count: 1); token.deallocate()
+            part.deinitialize(count: 1); part.deallocate()
+            text.deinitialize(count: 3); text.deallocate()
+            if stamp < floor {
+                #expect(decoded == nil)
+            } else if case .namespaceUpdateRequest(let request) = decoded {
+                #expect(request.update.updateRequestID == .max)
+                #expect(request.update.prefix == ns("aaa"))
+                #expect(request.update.tokens == [AuthorizationToken(type: 7, value: Data([0x61, 0x61, 0x61]))])
+            } else {
+                Issue.record("valid borrowed update prefix discarded")
+            }
+        }
+    }
+
     private struct PumpError: Error {}
 
     private static let peerBit: [UInt64] = [1 << 40, 1 << 41]
@@ -120,6 +197,7 @@ struct NamespaceUpdateTests {
         #expect(results == [NamespaceUpdateResultInfo(
             target: .announcement(ann), updateRequestID: id, outcome: .ok,
             localRole: .requester, errorCode: 0, reason: "", expiresMs: nil)])
+        #expect(r.update.tokens == [token]) // owned after subsequent polls/acceptance
     }
 
     @Test("SUBSCRIBE_TRACKS options and a refused prefix/FORWARD update")

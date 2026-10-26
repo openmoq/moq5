@@ -1,5 +1,5 @@
 /*
- * picoquic local-stream reset after FIN (patches/picoquic/0002), and the
+ * picoquic local-stream reset after FIN (patches/picoquic/0003), and the
  * provider reset rules the adapters build on.
  *
  * RFC 9000 Section 3.1 lets a sender abandon a stream with RESET_STREAM in

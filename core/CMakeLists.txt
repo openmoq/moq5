@@ -20,6 +20,7 @@ add_library(moq-core
     src/session/session_publish.c
     src/session/session_track_status.c
     src/session/session_track_hist.c
+    src/session/session_cluster.c
     src/session/session_namespace.c
     src/session/session_namespace_sub.c
     src/session/session_namespace_update.c
@@ -42,6 +43,7 @@ add_library(moq-core
     src/facade/publisher.c
     src/facade/subscriber.c
     src/bridge/transport_bridge.c
+    src/bridge/stream_order.c
     src/url.c
 )
 
@@ -79,6 +81,8 @@ endif()
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(moq-core PRIVATE -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+elseif(MSVC)
+    target_compile_options(moq-core PRIVATE $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:/WX>)
 endif()
 
 # Static library for white-box tests and fuzzers that access internal symbols.
@@ -95,6 +99,7 @@ if(MOQ_BUILD_TESTS OR MOQ_BUILD_FUZZ)
         src/session/session_subscribe.c src/session/session_fetch.c
         src/session/session_publish.c src/session/session_track_status.c
         src/session/session_track_hist.c
+        src/session/session_cluster.c
         src/session/session_namespace.c src/session/session_namespace_sub.c
         src/session/session_namespace_update.c
         src/session/session_subscribe_tracks.c
@@ -107,6 +112,7 @@ if(MOQ_BUILD_TESTS OR MOQ_BUILD_FUZZ)
         src/session/session_fill.c src/session/location_d22.c
         src/facade/publisher.c src/facade/subscriber.c
         src/bridge/transport_bridge.c
+        src/bridge/stream_order.c
         src/url.c
     )
     target_include_directories(moq-core-test-internals

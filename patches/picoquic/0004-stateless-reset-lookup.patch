@@ -1,0 +1,991 @@
+Look up a stateless reset without processing the datagram.
+
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
+0003.
+
+RFC 9000 Section 10.3.1 has an endpoint compare a datagram's last 16 bytes
+with the stateless reset tokens registered for the remote address it came
+from. An application that runs several QUIC contexts on one port receives a
+datagram on one context while the token may belong to a connection on
+another. picoquic_detect_stateless_reset(quic, bytes, length, addr_from,
+current_time, &detection) performs only that comparison, against the
+(address, token) pairs the context has registered:
+
+- It processes no packet and sends nothing. A match applies the reset to the
+  connection the token names: the disconnected state is committed before any
+  callback, then the stateless_reset and close callbacks run, each read from
+  the registration at that step. The result is
+  picoquic_reset_detection_none, _reset or _already_disconnected.
+- Datagrams shorter than PICOQUIC_RESET_PACKET_MIN_DETECT_SIZE (21) cannot
+  match. The comparison is constant time on every platform.
+- The registered pair is refreshed whenever the default path's first tuple
+  changes, including the path-0 replacement when a multipath path is
+  abandoned, so the lookup finds the token in use.
+
+Ordinary ingress keeps its convention: picoquic_incoming_stateless_reset
+applies the same reset and returns PICOQUIC_ERROR_AEAD_CHECK.
+Tests (picoquic_ct): stateless_reset_detect, stateless_reset_detect_callback,
+stateless_reset_detect_vn, stateless_reset_detect_secondary,
+stateless_reset_detect_rotated and stateless_reset_detect_abandon. In LibMoQ:
+the threaded_lane_group_reset_* rows.
+
+diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
+index d5ad9bbc..22cdd2f8 100644
+--- a/UnitTest1/unittest1.cpp
++++ b/UnitTest1/unittest1.cpp
+@@ -1360,6 +1360,48 @@ namespace UnitTest1
+             Assert::AreEqual(ret, 0);
+         }
+ 
++        TEST_METHOD(stateless_reset_detect)
++        {
++            int ret = stateless_reset_detect_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
++        TEST_METHOD(stateless_reset_detect_callback)
++        {
++            int ret = stateless_reset_detect_callback_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
++        TEST_METHOD(stateless_reset_detect_vn)
++        {
++            int ret = stateless_reset_detect_vn_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
++        TEST_METHOD(stateless_reset_detect_secondary)
++        {
++            int ret = stateless_reset_detect_secondary_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
++        TEST_METHOD(stateless_reset_detect_rotated)
++        {
++            int ret = stateless_reset_detect_rotated_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
++        TEST_METHOD(stateless_reset_detect_abandon)
++        {
++            int ret = stateless_reset_detect_abandon_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
+         TEST_METHOD(immediate_close)
+         {
+             int ret = immediate_close_test();
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index 7017c855..a4634b28 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -5069,6 +5069,7 @@ const uint8_t* picoquic_decode_path_response_frame(picoquic_cnx_t* cnx, const ui
+                         picoquic_log_app_message(cnx, "Migration to server preferred address successful on path %" PRIu64, path_x->unique_path_id);
+                     }
+                     picoquic_reset_path_mtu(path_x);
++                    picoquic_register_net_secret_for_path(cnx, path_x);
+                 }
+                 if (cnx->are_path_callbacks_enabled && cnx->callback_fn != NULL &&
+                     cnx->callback_fn(cnx, path_x->unique_path_id, NULL, 0, picoquic_callback_path_available,
+diff --git a/picoquic/packet.c b/picoquic/packet.c
+index 17addf71..eb2a4f1b 100644
+--- a/picoquic/packet.c
++++ b/picoquic/packet.c
+@@ -1823,22 +1823,71 @@ int picoquic_incoming_client_handshake(
+ 
+ /*
+ * Processing of stateless reset packet.
++* The connection is disconnected before the application is notified, so that a
++* callback finding the same reset again sees a disconnected connection and the
++* reset is notified once. Each notification uses the callback registered at
++* that time: the reset callback may unregister or replace it.
++* Returns 1 if the connection was reset, 0 if it was already disconnected.
+ */
+-int picoquic_incoming_stateless_reset(
+-    picoquic_cnx_t* cnx)
++static int picoquic_apply_stateless_reset(picoquic_cnx_t* cnx)
+ {
++    if (cnx->cnx_state == picoquic_state_disconnected) {
++        return 0;
++    }
+     /* Stateless reset. The connection should be abandonned */
+     if (cnx->cnx_state <= picoquic_state_ready) {
+         cnx->remote_error = PICOQUIC_ERROR_STATELESS_RESET;
+     }
++    cnx->cnx_state = picoquic_state_disconnected;
+     if (cnx->callback_fn) {
+         (void)(cnx->callback_fn)(cnx, 0, NULL, 0, picoquic_callback_stateless_reset, cnx->callback_ctx, NULL);
+     }
+-    picoquic_connection_disconnect(cnx);
++    if (cnx->callback_fn) {
++        (void)(cnx->callback_fn)(cnx, 0, NULL, 0, picoquic_callback_close, cnx->callback_ctx, NULL);
++    }
++    return 1;
++}
++
++int picoquic_incoming_stateless_reset(
++    picoquic_cnx_t* cnx)
++{
++    (void)picoquic_apply_stateless_reset(cnx);
+ 
+     return PICOQUIC_ERROR_AEAD_CHECK;
+ }
+ 
++int picoquic_detect_stateless_reset(picoquic_quic_t* quic, const uint8_t* bytes, size_t length,
++    const struct sockaddr* addr_from, uint64_t current_time, picoquic_reset_detection_enum* detection)
++{
++    int ret = 0;
++
++    if (quic == NULL || addr_from == NULL || detection == NULL || (bytes == NULL && length > 0) ||
++        (addr_from->sa_family != AF_INET && addr_from->sa_family != AF_INET6)) {
++        ret = PICOQUIC_ERROR_UNEXPECTED_ERROR;
++        if (detection != NULL) {
++            *detection = picoquic_reset_detection_none;
++        }
++    }
++    else {
++        PICOQUIC_THREAD_CHECK(quic);
++        *detection = picoquic_reset_detection_none;
++        if (length >= PICOQUIC_RESET_PACKET_MIN_DETECT_SIZE) {
++            picoquic_cnx_t* cnx = picoquic_cnx_by_secret(quic, bytes + length - PICOQUIC_RESET_SECRET_SIZE, addr_from);
++            if (cnx != NULL) {
++                if (picoquic_apply_stateless_reset(cnx)) {
++                    *detection = picoquic_reset_detection_reset;
++                    picoquic_log_app_message(cnx, "%s", "Stateless reset detected without packet processing");
++                    picoquic_reinsert_by_wake_time(quic, cnx, current_time);
++                }
++                else {
++                    *detection = picoquic_reset_detection_already_disconnected;
++                }
++            }
++        }
++    }
++    return ret;
++}
++
+ /*
+  * Processing of 0-RTT packet
+  */
+diff --git a/picoquic/paths.c b/picoquic/paths.c
+index b42142ee..1f86b361 100644
+--- a/picoquic/paths.c
++++ b/picoquic/paths.c
+@@ -79,6 +79,7 @@ void picoquic_set_tuple_challenge_failed(picoquic_path_t* path_x, picoquic_tuple
+         previous_tuple->next_tuple = tuple;
+     }
+     tuple->next_tuple = NULL;
++    picoquic_register_net_secret_for_path(path_x->cnx, path_x);
+ }
+ 
+ /* picoquic_check_tuple_challenge_expired:
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+index 83a408c8..65148739 100644
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -1402,6 +1402,44 @@ int picoquic_incoming_packet_ex(
+     picoquic_cnx_t** first_cnx,
+     uint64_t current_time);
+ 
++/* Stateless reset detection without packet processing.
++ * An application that runs several Quic contexts behind one socket cannot
++ * always route a stateless reset to the context owning its connection: the
++ * reset carries a random connection ID (RFC 9000 section 10.3). The
++ * application can instead offer the datagram to each context with this call.
++ *
++ * The last 16 bytes of the datagram, whatever its header form, are compared
++ * with the stateless reset token that each connection of the context has
++ * registered for the remote address addr_from: the token of the peer
++ * connection ID used on the connection's default path. Tokens of other
++ * connection IDs are not compared. The datagram is not otherwise parsed or
++ * processed: no connection is created and nothing is queued for sending.
++ * Datagrams shorter than PICOQUIC_RESET_PACKET_MIN_DETECT_SIZE cannot match.
++ *
++ * On a match, the connection is reset as by picoquic_incoming_packet: it
++ * becomes disconnected, and if a callback is registered at each step it
++ * receives picoquic_callback_stateless_reset, then picoquic_callback_close,
++ * before this call returns. A connection already disconnected is not changed
++ * or notified again. Callbacks must not delete the connection or the context.
++ *
++ * Returns 0 and sets *detection, or PICOQUIC_ERROR_UNEXPECTED_ERROR if quic,
++ * addr_from or detection is NULL, if bytes is NULL with a nonzero length, or if
++ * addr_from is neither AF_INET nor AF_INET6. On error nothing changes, and a
++ * non-NULL *detection is set to picoquic_reset_detection_none.
++ * Call it on the thread that owns the context. bytes and addr_from are only
++ * read during the call. current_time is used to reschedule a reset connection.
++ */
++#define PICOQUIC_RESET_PACKET_MIN_DETECT_SIZE 21
++
++typedef enum {
++    picoquic_reset_detection_none = 0, /* no registered token matched */
++    picoquic_reset_detection_reset, /* a token matched; this call reset its connection */
++    picoquic_reset_detection_already_disconnected /* a token matched a connection already disconnected */
++} picoquic_reset_detection_enum;
++
++int picoquic_detect_stateless_reset(picoquic_quic_t* quic, const uint8_t* bytes, size_t length,
++    const struct sockaddr* addr_from, uint64_t current_time, picoquic_reset_detection_enum* detection);
++
+ /* Applications must regularly poll the "next packet" API to obtain the
+  * next packet that will be set over the network. The API for that is
+  * picoquic_prepare_next_packet", which operates on a "quic context".
+diff --git a/picoquic/picoquic_internal.h b/picoquic/picoquic_internal.h
+index 55b6766d..75c4a143 100644
+--- a/picoquic/picoquic_internal.h
++++ b/picoquic/picoquic_internal.h
+@@ -1613,6 +1613,7 @@ int picoquic_register_cnx_id(picoquic_quic_t* quic, picoquic_cnx_t* cnx, picoqui
+ 
+ /* Register or update default address and reset secret */
+ int picoquic_register_net_secret(picoquic_cnx_t* cnx);
++void picoquic_register_net_secret_for_path(picoquic_cnx_t* cnx, picoquic_path_t* path_x);
+ 
+ /* Registration of initial connection ID and peer IP */
+ int picoquic_register_net_icid(picoquic_cnx_t* cnx);
+diff --git a/picoquic/quicctx.c b/picoquic/quicctx.c
+index 6de0f739..3aaf7e1f 100644
+--- a/picoquic/quicctx.c
++++ b/picoquic/quicctx.c
+@@ -363,11 +363,8 @@ static int picoquic_net_secret_compare(const void* key1, const void* key2)
+     int ret = picoquic_compare_addr((struct sockaddr*) & cnx1->registered_secret_addr, (struct sockaddr*) & cnx2->registered_secret_addr);
+ 
+     if (ret == 0) {
+-#ifdef PICOQUIC_USE_CONSTANT_TIME_MEMCMP
++        /* RFC 9000 section 10.3.1: compare without leaking the token's value. */
+         ret = picoquic_constant_time_memcmp(cnx1->registered_reset_secret, cnx2->registered_reset_secret, PICOQUIC_RESET_SECRET_SIZE);
+-#else
+-        ret = memcmp(cnx1->registered_reset_secret, cnx2->registered_reset_secret, PICOQUIC_RESET_SECRET_SIZE);
+-#endif
+     }
+     return ret;
+ }
+@@ -1410,6 +1407,20 @@ int picoquic_register_net_secret(picoquic_cnx_t* cnx)
+     return ret;
+ }
+ 
++/* The default path's first tuple changed: the connection now sends to that
++ * tuple's address with its remote connection ID. Register that pair, so a
++ * stateless reset arriving from that address with that connection ID's
++ * token is recognized (RFC 9000 section 10.3.1). Only a connection that has
++ * registered once, at the ready transition, re-registers here. */
++void picoquic_register_net_secret_for_path(picoquic_cnx_t* cnx, picoquic_path_t* path_x)
++{
++    if (cnx != NULL && cnx->nb_paths > 0 && path_x == cnx->path[0] &&
++        cnx->registered_secret_addr.ss_family != 0 &&
++        path_x->first_tuple != NULL && path_x->first_tuple->p_remote_cnxid != NULL) {
++        (void)picoquic_register_net_secret(cnx);
++    }
++}
++
+ void picoquic_init_transport_parameters(picoquic_tp_t* tp)
+ {
+     memset(tp, 0, sizeof(picoquic_tp_t));
+@@ -1857,6 +1868,7 @@ void picoquic_unchain_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple)
+ 
+ void picoquic_delete_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple, int is_deleting_path)
+ {
++    int was_first = (path_x->first_tuple == tuple);
+     /* TODO: dereference local CID, retire remote CID ??? */
+     /* Dereference the remote CID */
+     if (tuple->p_remote_cnxid != NULL) {
+@@ -1864,6 +1876,10 @@ void picoquic_delete_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple, int
+     }
+     /* Remove from chain to the path */
+     picoquic_unchain_tuple(path_x, tuple);
++    /* The next tuple, if any, is now the one in use */
++    if (was_first && !is_deleting_path) {
++        picoquic_register_net_secret_for_path(path_x->cnx, path_x);
++    }
+     /* And finally free */
+     free(tuple);
+ }
+@@ -1874,6 +1890,7 @@ void picoquic_set_first_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple)
+     picoquic_unchain_tuple(path_x, tuple);
+     path_x->first_tuple = tuple;
+     tuple->next_tuple = old_first;
++    picoquic_register_net_secret_for_path(path_x->cnx, path_x);
+ }
+ 
+ /* Set default interface -- to call just after creating a connection context */
+@@ -2185,6 +2202,8 @@ void picoquic_demote_path(picoquic_cnx_t* cnx, int path_index, uint64_t current_
+                 cnx->path[0] = cnx->path[alt_path0];
+                 cnx->path[alt_path0] = path_x;
+                 path_index = alt_path0;
++                /* The default path is now another path object */
++                picoquic_register_net_secret_for_path(cnx, cnx->path[0]);
+             }
+             else {
+                 can_demote = 0;
+diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
+index c65a0618..21a7fba3 100644
+--- a/picoquic_t/picoquic_t.c
++++ b/picoquic_t/picoquic_t.c
+@@ -313,6 +313,12 @@ static const picoquic_test_def_t test_table[] = {
+     { "stateless_reset_bad", stateless_reset_bad_test },
+     { "stateless_reset_client", stateless_reset_client_test },
+     { "stateless_reset_handshake", stateless_reset_handshake_test },
++    { "stateless_reset_detect", stateless_reset_detect_test },
++    { "stateless_reset_detect_callback", stateless_reset_detect_callback_test },
++    { "stateless_reset_detect_vn", stateless_reset_detect_vn_test },
++    { "stateless_reset_detect_secondary", stateless_reset_detect_secondary_test },
++    { "stateless_reset_detect_rotated", stateless_reset_detect_rotated_test },
++    { "stateless_reset_detect_abandon", stateless_reset_detect_abandon_test },
+     { "immediate_close", immediate_close_test },
+     { "tls_api_very_long_stream", tls_api_very_long_stream_test },
+     { "tls_api_very_long_max", tls_api_very_long_max_test },
+diff --git a/picoquictest/multipath_test.c b/picoquictest/multipath_test.c
+index 9ba2c170..de1aade1 100644
+--- a/picoquictest/multipath_test.c
++++ b/picoquictest/multipath_test.c
+@@ -2704,3 +2704,247 @@ int multipath_cid_retire_test(void)
+  * 
+  * TODO: break that into parts that can be verified!
+  */
++
++/* Stateless reset detection compares only the token of the peer connection ID
++ * on the default path. The token of a connection ID used to probe a second
++ * tuple, unretired, does not match; the default path's token still does. */
++int stateless_reset_detect_secondary_test(void)
++{
++    uint64_t simulated_time = 0;
++    uint64_t loss_mask = 0;
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    picoquic_tuple_t* probe_tuple = NULL;
++    picoquic_reset_detection_enum detection = picoquic_reset_detection_reset;
++    uint8_t bytes[39];
++    int server_saw_probe = 0;
++    int ret = tls_api_init_ctx(&test_ctx, 0, PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN, &simulated_time, NULL, NULL, 0, 0, 0);
++
++    if (ret == 0) {
++        ret = tls_api_connection_loop(test_ctx, &loss_mask, 0, &simulated_time);
++    }
++    if (ret == 0) {
++        ret = wait_client_connection_ready(test_ctx, &simulated_time);
++    }
++    if (ret == 0) {
++        ret = multipath_test_add_links(test_ctx, 0);
++    }
++    if (ret == 0) {
++        ret = picoquic_probe_new_path(test_ctx->cnx_client, (struct sockaddr*)&test_ctx->server_addr,
++            (struct sockaddr*)&test_ctx->client_addr_2, simulated_time);
++    }
++    /* Run until the probe has been sent with the new connection ID and the server
++     * has received it from the second client address. */
++    for (int i = 0; ret == 0 && i < 64 && !server_saw_probe; i++) {
++        int was_active = 0;
++        ret = tls_api_one_sim_round(test_ctx, &simulated_time, 0, &was_active);
++        probe_tuple = test_ctx->cnx_client->path[0]->first_tuple->next_tuple;
++        if (ret == 0 && probe_tuple != NULL && probe_tuple->challenge_repeat_count > 0 && test_ctx->cnx_server != NULL) {
++            for (picoquic_tuple_t* t = test_ctx->cnx_server->path[0]->first_tuple; t != NULL; t = t->next_tuple) {
++                if (picoquic_compare_addr((struct sockaddr*)&t->peer_addr, (struct sockaddr*)&test_ctx->client_addr_2) == 0) {
++                    server_saw_probe = 1;
++                }
++            }
++        }
++    }
++    if (ret == 0 && (!server_saw_probe || probe_tuple == NULL || probe_tuple->p_remote_cnxid == NULL ||
++        probe_tuple->p_remote_cnxid == test_ctx->cnx_client->path[0]->first_tuple->p_remote_cnxid ||
++        probe_tuple->p_remote_cnxid->retire_sent)) {
++        DBG_PRINTF("%s", "The probe was not sent with a distinct, unretired connection ID");
++        ret = -1;
++    }
++    if (ret == 0) {
++        memset(bytes, 0xcc, sizeof(bytes));
++        bytes[0] = 0x41;
++        memcpy(bytes + sizeof(bytes) - PICOQUIC_RESET_SECRET_SIZE, probe_tuple->p_remote_cnxid->reset_secret, PICOQUIC_RESET_SECRET_SIZE);
++        if (picoquic_detect_stateless_reset(test_ctx->qclient, bytes, sizeof(bytes), (struct sockaddr*)&test_ctx->server_addr,
++            simulated_time, &detection) != 0 || detection != picoquic_reset_detection_none ||
++            test_ctx->cnx_client->cnx_state != picoquic_state_ready) {
++            DBG_PRINTF("%s", "The probing connection ID's token matched");
++            ret = -1;
++        }
++    }
++    if (ret == 0) {
++        memcpy(bytes + sizeof(bytes) - PICOQUIC_RESET_SECRET_SIZE,
++            test_ctx->cnx_client->path[0]->first_tuple->p_remote_cnxid->reset_secret, PICOQUIC_RESET_SECRET_SIZE);
++        if (picoquic_detect_stateless_reset(test_ctx->qclient, bytes, sizeof(bytes), (struct sockaddr*)&test_ctx->server_addr,
++            simulated_time, &detection) != 0 || detection != picoquic_reset_detection_reset) {
++            DBG_PRINTF("%s", "The default path's token did not match");
++            ret = -1;
++        }
++    }
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++    }
++    return ret;
++}
++
++/* After the client migrates to a second tuple, the connection ID it used on the
++ * first tuple is rotated away from the default path but not yet retired. Its
++ * token no longer matches; the token of the connection ID now on the default
++ * path does. */
++int stateless_reset_detect_rotated_test(void)
++{
++    uint64_t simulated_time = 0;
++    uint64_t loss_mask = 0;
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    picoquic_tuple_t* old_tuple = NULL;
++    picoquic_reset_detection_enum detection = picoquic_reset_detection_reset;
++    uint8_t bytes[39];
++    uint8_t old_token[PICOQUIC_RESET_SECRET_SIZE];
++    int ret = tls_api_init_ctx(&test_ctx, 0, PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN, &simulated_time, NULL, NULL, 0, 0, 0);
++
++    if (ret == 0) {
++        ret = tls_api_connection_loop(test_ctx, &loss_mask, 0, &simulated_time);
++    }
++    if (ret == 0) {
++        ret = wait_client_connection_ready(test_ctx, &simulated_time);
++    }
++    if (ret == 0) {
++        memcpy(old_token, test_ctx->cnx_client->path[0]->first_tuple->p_remote_cnxid->reset_secret, PICOQUIC_RESET_SECRET_SIZE);
++        ret = multipath_test_add_links(test_ctx, 0);
++    }
++    if (ret == 0) {
++        ret = picoquic_probe_new_path(test_ctx->cnx_client, (struct sockaddr*)&test_ctx->server_addr,
++            (struct sockaddr*)&test_ctx->client_addr_2, simulated_time);
++    }
++    if (ret == 0) {
++        ret = wait_client_migration_done(test_ctx, &simulated_time);
++    }
++    if (ret == 0) {
++        for (picoquic_tuple_t* t = test_ctx->cnx_client->path[0]->first_tuple; t != NULL; t = t->next_tuple) {
++            if (picoquic_compare_addr((struct sockaddr*)&t->local_addr, (struct sockaddr*)&test_ctx->client_addr) == 0) {
++                old_tuple = t;
++            }
++        }
++        if (old_tuple == NULL || old_tuple == test_ctx->cnx_client->path[0]->first_tuple || old_tuple->p_remote_cnxid == NULL ||
++            old_tuple->p_remote_cnxid->retire_sent ||
++            memcmp(old_tuple->p_remote_cnxid->reset_secret, old_token, PICOQUIC_RESET_SECRET_SIZE) != 0 ||
++            memcmp(test_ctx->cnx_client->path[0]->first_tuple->p_remote_cnxid->reset_secret, old_token, PICOQUIC_RESET_SECRET_SIZE) == 0) {
++            DBG_PRINTF("%s", "The first connection ID is not rotated away and unretired after the migration");
++            ret = -1;
++        }
++    }
++    if (ret == 0) {
++        memset(bytes, 0xcc, sizeof(bytes));
++        bytes[0] = 0x41;
++        memcpy(bytes + sizeof(bytes) - PICOQUIC_RESET_SECRET_SIZE, old_token, PICOQUIC_RESET_SECRET_SIZE);
++        if (picoquic_detect_stateless_reset(test_ctx->qclient, bytes, sizeof(bytes), (struct sockaddr*)&test_ctx->server_addr,
++            simulated_time, &detection) != 0 || detection != picoquic_reset_detection_none) {
++            DBG_PRINTF("%s", "Rotated-away token matched");
++            ret = -1;
++        }
++    }
++    if (ret == 0) {
++        memcpy(bytes + sizeof(bytes) - PICOQUIC_RESET_SECRET_SIZE,
++            test_ctx->cnx_client->path[0]->first_tuple->p_remote_cnxid->reset_secret, PICOQUIC_RESET_SECRET_SIZE);
++        if (picoquic_detect_stateless_reset(test_ctx->qclient, bytes, sizeof(bytes), (struct sockaddr*)&test_ctx->server_addr,
++            simulated_time, &detection) != 0 || detection != picoquic_reset_detection_reset) {
++            DBG_PRINTF("%s", "The current default path's token did not match");
++            ret = -1;
++        }
++    }
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++    }
++    return ret;
++}
++
++/* Stateless reset detection after the client abandons a multipath path.
++ * Abandoning path 0 makes another path the default: its token must match and
++ * the abandoned path's must not. Abandoning another path leaves the default
++ * path's registration as it is. Each check uses its own connection, so that
++ * one failure cannot hide another. */
++static int reset_detect_mp_start(picoquic_test_tls_api_ctx_t** p_test_ctx, uint64_t* simulated_time)
++{
++    uint64_t loss_mask = 0;
++    picoquic_connection_id_t initial_cid = { {0x1b, 0x12, 0xd3, 4, 5, 6, 7, 8}, 8 };
++    picoquic_tp_t server_parameters;
++    int ret = tls_api_init_ctx_ex2(p_test_ctx, PICOQUIC_INTERNAL_TEST_VERSION_1,
++        PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN, simulated_time, NULL, NULL, 0, 1, 0, &initial_cid,
++        8, 0, 0, 0);
++
++    if (ret == 0 && *p_test_ctx == NULL) {
++        ret = -1;
++    }
++    if (ret == 0) {
++        multipath_init_params(&server_parameters, 0);
++        picoquic_set_default_tp((*p_test_ctx)->qserver, &server_parameters);
++        (*p_test_ctx)->cnx_client->local_parameters.initial_max_path_id = 3;
++        picoquic_start_client_cnx((*p_test_ctx)->cnx_client);
++        ret = tls_api_connection_loop(*p_test_ctx, &loss_mask, 0, simulated_time);
++    }
++    if (ret == 0 && (!(*p_test_ctx)->cnx_client->is_multipath_enabled || !(*p_test_ctx)->cnx_server->is_multipath_enabled)) {
++        ret = -1;
++    }
++    if (ret == 0) {
++        ret = wait_client_connection_ready(*p_test_ctx, simulated_time);
++    }
++    if (ret == 0) {
++        ret = multipath_test_add_links(*p_test_ctx, 0);
++    }
++    if (ret == 0) {
++        ret = picoquic_probe_new_path((*p_test_ctx)->cnx_client, (struct sockaddr*)&(*p_test_ctx)->server_addr,
++            (struct sockaddr*)&(*p_test_ctx)->client_addr_2, *simulated_time);
++    }
++    if (ret == 0) {
++        ret = wait_multipath_ready(*p_test_ctx, simulated_time);
++    }
++    if (ret != 0) {
++        DBG_PRINTF("%s", "Could not establish two paths");
++    }
++    return ret;
++}
++
++/* check: 0, the abandoned default path's token gives none; 1, the new default
++ * path's token gives reset; 2, abandoning path 1 keeps the default registration. */
++static int reset_detect_mp_case(int check)
++{
++    uint64_t simulated_time = 0;
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    picoquic_reset_detection_enum detection = picoquic_reset_detection_none;
++    uint8_t bytes[39];
++    uint8_t old_token[PICOQUIC_RESET_SECRET_SIZE];
++    uint64_t other_path_id = 0;
++    int ret = reset_detect_mp_start(&test_ctx, &simulated_time);
++
++    if (ret == 0) {
++        memcpy(old_token, test_ctx->cnx_client->path[0]->first_tuple->p_remote_cnxid->reset_secret, PICOQUIC_RESET_SECRET_SIZE);
++        other_path_id = test_ctx->cnx_client->path[1]->unique_path_id;
++        ret = picoquic_abandon_path(test_ctx->cnx_client, (check == 2) ? other_path_id : 0, 0, simulated_time);
++    }
++    if (ret == 0 && check != 2 && test_ctx->cnx_client->path[0]->unique_path_id != other_path_id) {
++        DBG_PRINTF("%s", "Abandoning path 0 did not make the other path the default");
++        ret = -1;
++    }
++    if (ret == 0) {
++        memset(bytes, 0xcc, sizeof(bytes));
++        bytes[0] = 0x41;
++        memcpy(bytes + sizeof(bytes) - PICOQUIC_RESET_SECRET_SIZE,
++            (check == 0) ? old_token : test_ctx->cnx_client->path[0]->first_tuple->p_remote_cnxid->reset_secret,
++            PICOQUIC_RESET_SECRET_SIZE);
++        if (check == 2 && memcmp(test_ctx->cnx_client->path[0]->first_tuple->p_remote_cnxid->reset_secret, old_token,
++            PICOQUIC_RESET_SECRET_SIZE) != 0) {
++            DBG_PRINTF("%s", "Abandoning path 1 changed the default path");
++            ret = -1;
++        }
++        else if (picoquic_detect_stateless_reset(test_ctx->qclient, bytes, sizeof(bytes), (struct sockaddr*)&test_ctx->server_addr,
++            simulated_time, &detection) != 0 ||
++            detection != ((check == 0) ? picoquic_reset_detection_none : picoquic_reset_detection_reset)) {
++            DBG_PRINTF("Check %d: detection %d", check, (int)detection);
++            ret = -1;
++        }
++    }
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++    }
++    return ret;
++}
++
++int stateless_reset_detect_abandon_test(void)
++{
++    int ret_old = reset_detect_mp_case(0);
++    int ret_new = reset_detect_mp_case(1);
++    int ret_other = reset_detect_mp_case(2);
++
++    return (ret_old == 0 && ret_new == 0 && ret_other == 0) ? 0 : -1;
++}
+diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
+index 820b651d..192a2ae9 100644
+--- a/picoquictest/picoquictest.h
++++ b/picoquictest/picoquictest.h
+@@ -114,6 +114,12 @@ int stateless_reset_test(void);
+ int stateless_reset_bad_test(void);
+ int stateless_reset_client_test(void);
+ int stateless_reset_handshake_test(void);
++int stateless_reset_detect_test(void);
++int stateless_reset_detect_callback_test(void);
++int stateless_reset_detect_vn_test(void);
++int stateless_reset_detect_secondary_test(void);
++int stateless_reset_detect_rotated_test(void);
++int stateless_reset_detect_abandon_test(void);
+ int immediate_close_test(void);
+ int sim_link_test(void);
+ int tls_api_very_long_stream_test(void);
+diff --git a/picoquictest/tls_api_test.c b/picoquictest/tls_api_test.c
+index 49945d44..90db7ef4 100644
+--- a/picoquictest/tls_api_test.c
++++ b/picoquictest/tls_api_test.c
+@@ -3683,6 +3683,378 @@ int stateless_reset_handshake_test(void)
+     return ret;
+ }
+ 
++/*
++ * Stateless reset detection without packet processing.
++ * picoquic_detect_stateless_reset compares the last 16 bytes of a datagram with
++ * the token each connection registers for the sender's address, the token of
++ * the peer connection ID on its default path, and resets a matching connection
++ * once. These tests offer crafted datagrams to the client context of an
++ * established connection.
++ */
++typedef struct st_reset_detect_cb_t {
++    int nb_reset;
++    int nb_close;
++    int reenter_on; /* event during which detection is called again, once; 0 for none */
++    int unregister_on_reset;
++    struct st_reset_detect_cb_t* replace_on_reset;
++    int nb_reentry;
++    int reentry_ret;
++    picoquic_reset_detection_enum reentry_detection;
++    const uint8_t* bytes;
++    size_t length;
++    const struct sockaddr* addr_from;
++    uint64_t current_time;
++} reset_detect_cb_t;
++
++static int reset_detect_callback(picoquic_cnx_t* cnx,
++    uint64_t UNUSED(stream_id), uint8_t* UNUSED(bytes), size_t UNUSED(length),
++    picoquic_call_back_event_t fin_or_event, void* callback_ctx, void* UNUSED(v_stream_ctx))
++{
++    reset_detect_cb_t* rd = (reset_detect_cb_t*)callback_ctx;
++
++    if (fin_or_event == picoquic_callback_stateless_reset) {
++        rd->nb_reset++;
++    }
++    else if (fin_or_event == picoquic_callback_close) {
++        rd->nb_close++;
++    }
++    else {
++        return 0;
++    }
++    if (rd->reenter_on == (int)fin_or_event && rd->nb_reentry == 0) {
++        rd->nb_reentry++;
++        rd->reentry_ret = picoquic_detect_stateless_reset(picoquic_get_quic_ctx(cnx), rd->bytes, rd->length,
++            rd->addr_from, rd->current_time, &rd->reentry_detection);
++    }
++    if (fin_or_event == picoquic_callback_stateless_reset) {
++        if (rd->unregister_on_reset) {
++            picoquic_set_callback(cnx, NULL, NULL);
++        }
++        else if (rd->replace_on_reset != NULL) {
++            picoquic_set_callback(cnx, reset_detect_callback, rd->replace_on_reset);
++        }
++    }
++    return 0;
++}
++
++static int reset_detect_start(picoquic_test_tls_api_ctx_t** p_test_ctx, uint64_t* simulated_time)
++{
++    uint64_t loss_mask = 0;
++    int ret = tls_api_init_ctx(p_test_ctx, 0, PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN, simulated_time, NULL, NULL, 0, 0, 0);
++
++    if (ret == 0) {
++        ret = tls_api_connection_loop(*p_test_ctx, &loss_mask, 0, simulated_time);
++    }
++    if (ret == 0) {
++        ret = wait_client_connection_ready(*p_test_ctx, simulated_time);
++    }
++    if (ret == 0 && memcmp((*p_test_ctx)->cnx_client->registered_reset_secret,
++        (*p_test_ctx)->cnx_client->path[0]->first_tuple->p_remote_cnxid->reset_secret, PICOQUIC_RESET_SECRET_SIZE) != 0) {
++        DBG_PRINTF("%s", "Client did not register the token of its default path");
++        ret = -1;
++    }
++    return ret;
++}
++
++static void reset_detect_datagram(uint8_t* bytes, size_t length, uint8_t first_byte, const uint8_t* token)
++{
++    memset(bytes, 0xcc, length);
++    bytes[0] = first_byte;
++    if (length >= PICOQUIC_RESET_SECRET_SIZE) {
++        memcpy(bytes + length - PICOQUIC_RESET_SECRET_SIZE, token, PICOQUIC_RESET_SECRET_SIZE);
++    }
++}
++
++/* Nothing more is prepared for a connection after its reset. */
++static int reset_detect_check_silent(picoquic_test_tls_api_ctx_t* test_ctx, uint64_t simulated_time)
++{
++    uint8_t send_buffer[PICOQUIC_MAX_PACKET_SIZE];
++    size_t send_length = 0;
++    struct sockaddr_storage addr_to;
++    struct sockaddr_storage addr_from;
++    int if_index = 0;
++
++    (void)picoquic_prepare_packet_ex(test_ctx->cnx_client, simulated_time, send_buffer, sizeof(send_buffer),
++        &send_length, &addr_to, &addr_from, &if_index, NULL);
++    return (send_length == 0) ? 0 : -1;
++}
++
++/* Lengths and header forms that must match, then a repeat by the API at a
++ * later time and through incoming_packet, which must not notify or reschedule. */
++static int reset_detect_one_match(size_t length, uint8_t first_byte)
++{
++    uint64_t simulated_time = 0;
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    reset_detect_cb_t rd = { 0 };
++    uint8_t bytes[64];
++    picoquic_reset_detection_enum detection = picoquic_reset_detection_none;
++    picoquic_cnx_t* other_cnx = NULL;
++    int ret = reset_detect_start(&test_ctx, &simulated_time);
++
++    if (ret == 0) {
++        picoquic_set_callback(test_ctx->cnx_client, reset_detect_callback, &rd);
++        reset_detect_datagram(bytes, length, first_byte, test_ctx->cnx_client->path[0]->first_tuple->p_remote_cnxid->reset_secret);
++        ret = picoquic_detect_stateless_reset(test_ctx->qclient, bytes, length, (struct sockaddr*)&test_ctx->server_addr,
++            simulated_time, &detection);
++        if (ret != 0 || detection != picoquic_reset_detection_reset || rd.nb_reset != 1 || rd.nb_close != 1 ||
++            test_ctx->cnx_client->cnx_state != picoquic_state_disconnected) {
++            DBG_PRINTF("Length %zu, first byte 0x%x: ret %d, detection %d, resets %d, closes %d, state %d",
++                length, first_byte, ret, (int)detection, rd.nb_reset, rd.nb_close, (int)test_ctx->cnx_client->cnx_state);
++            ret = -1;
++        }
++    }
++    if (ret == 0 && reset_detect_check_silent(test_ctx, simulated_time) != 0) {
++        DBG_PRINTF("%s", "A packet was prepared after the reset");
++        ret = -1;
++    }
++    if (ret == 0) {
++        /* An unrelated connection, to check that a repeat leaves the wake list as it is */
++        other_cnx = picoquic_create_cnx(test_ctx->qclient, picoquic_null_connection_id, picoquic_null_connection_id,
++            (struct sockaddr*)&test_ctx->server_addr, simulated_time + 1000, 0, PICOQUIC_TEST_SNI, PICOQUIC_TEST_ALPN, 1);
++        if (other_cnx == NULL) {
++            ret = -1;
++        }
++    }
++    if (ret == 0) {
++        uint64_t wake_before = test_ctx->cnx_client->next_wake_time;
++        uint64_t other_wake_before = other_cnx->next_wake_time;
++        picoquic_cnx_t* first_before = picoquic_get_earliest_cnx_to_wake(test_ctx->qclient, UINT64_MAX);
++
++        ret = picoquic_detect_stateless_reset(test_ctx->qclient, bytes, length, (struct sockaddr*)&test_ctx->server_addr,
++            simulated_time + 500000, &detection);
++        if (ret != 0 || detection != picoquic_reset_detection_already_disconnected || rd.nb_reset != 1 || rd.nb_close != 1 ||
++            test_ctx->cnx_client->next_wake_time != wake_before || other_cnx->next_wake_time != other_wake_before ||
++            picoquic_get_earliest_cnx_to_wake(test_ctx->qclient, UINT64_MAX) != first_before) {
++            DBG_PRINTF("Repeat: ret %d, detection %d, resets %d, closes %d", ret, (int)detection, rd.nb_reset, rd.nb_close);
++            ret = -1;
++        }
++    }
++    if (ret == 0) {
++        (void)picoquic_incoming_packet(test_ctx->qclient, bytes, length, (struct sockaddr*)&test_ctx->server_addr,
++            (struct sockaddr*)&test_ctx->client_addr, 0, test_ctx->recv_ecn_client, simulated_time + 600000);
++        if (rd.nb_reset != 1 || rd.nb_close != 1) {
++            DBG_PRINTF("Repeat through incoming_packet: resets %d, closes %d", rd.nb_reset, rd.nb_close);
++            ret = -1;
++        }
++    }
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++    }
++    return ret;
++}
++
++int stateless_reset_detect_test(void)
++{
++    uint64_t simulated_time = 0;
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    reset_detect_cb_t rd = { 0 };
++    uint8_t bytes[64];
++    picoquic_reset_detection_enum detection = picoquic_reset_detection_reset;
++    struct sockaddr_storage unspec = { 0 };
++    struct sockaddr_in other_port;
++    const uint8_t* token = NULL;
++    int ret = reset_detect_start(&test_ctx, &simulated_time);
++
++    if (ret == 0) {
++        picoquic_set_callback(test_ctx->cnx_client, reset_detect_callback, &rd);
++        token = test_ctx->cnx_client->path[0]->first_tuple->p_remote_cnxid->reset_secret;
++        reset_detect_datagram(bytes, 39, 0x41, token);
++        other_port = test_ctx->server_addr;
++        other_port.sin_port += 1;
++
++        /* Invalid arguments: an error, nothing detected, nothing changed */
++        if (picoquic_detect_stateless_reset(NULL, bytes, 39, (struct sockaddr*)&test_ctx->server_addr, simulated_time, &detection)
++            != PICOQUIC_ERROR_UNEXPECTED_ERROR || detection != picoquic_reset_detection_none ||
++            picoquic_detect_stateless_reset(test_ctx->qclient, NULL, 39, (struct sockaddr*)&test_ctx->server_addr, simulated_time, &detection)
++            != PICOQUIC_ERROR_UNEXPECTED_ERROR ||
++            picoquic_detect_stateless_reset(test_ctx->qclient, bytes, 39, NULL, simulated_time, &detection)
++            != PICOQUIC_ERROR_UNEXPECTED_ERROR ||
++            picoquic_detect_stateless_reset(test_ctx->qclient, bytes, 39, (struct sockaddr*)&unspec, simulated_time, &detection)
++            != PICOQUIC_ERROR_UNEXPECTED_ERROR || detection != picoquic_reset_detection_none ||
++            picoquic_detect_stateless_reset(test_ctx->qclient, bytes, 39, (struct sockaddr*)&test_ctx->server_addr, simulated_time, NULL)
++            != PICOQUIC_ERROR_UNEXPECTED_ERROR) {
++            DBG_PRINTF("%s", "Invalid arguments not rejected");
++            ret = -1;
++        }
++    }
++    if (ret == 0) {
++        /* The same token from another address, and a datagram too short to be a reset */
++        if (picoquic_detect_stateless_reset(test_ctx->qclient, bytes, 39, (struct sockaddr*)&other_port, simulated_time, &detection) != 0 ||
++            detection != picoquic_reset_detection_none) {
++            DBG_PRINTF("%s", "Token matched from another address");
++            ret = -1;
++        }
++        reset_detect_datagram(bytes, 20, 0x41, token);
++        if (ret == 0 && (picoquic_detect_stateless_reset(test_ctx->qclient, bytes, 20, (struct sockaddr*)&test_ctx->server_addr,
++            simulated_time, &detection) != 0 || detection != picoquic_reset_detection_none)) {
++            DBG_PRINTF("%s", "A 20-byte datagram matched");
++            ret = -1;
++        }
++        if (ret == 0 && (rd.nb_reset != 0 || rd.nb_close != 0 || test_ctx->cnx_client->cnx_state != picoquic_state_ready)) {
++            DBG_PRINTF("%s", "A non-matching datagram changed the connection");
++            ret = -1;
++        }
++    }
++    if (ret == 0) {
++        /* Once deleted, the connection's token no longer matches */
++        reset_detect_datagram(bytes, 39, 0x41, token);
++        picoquic_delete_cnx(test_ctx->cnx_client);
++        test_ctx->cnx_client = NULL;
++        if (picoquic_detect_stateless_reset(test_ctx->qclient, bytes, 39, (struct sockaddr*)&test_ctx->server_addr,
++            simulated_time, &detection) != 0 || detection != picoquic_reset_detection_none) {
++            DBG_PRINTF("%s", "Token of a deleted connection matched");
++            ret = -1;
++        }
++    }
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++        test_ctx = NULL;
++    }
++    if (ret == 0) {
++        ret = reset_detect_one_match(21, 0x41);
++    }
++    if (ret == 0) {
++        ret = reset_detect_one_match(38, 0x41);
++    }
++    if (ret == 0) {
++        ret = reset_detect_one_match(39, 0x41);
++    }
++    if (ret == 0) {
++        ret = reset_detect_one_match(39, 0xc3);
++    }
++    return ret;
++}
++
++/* Callbacks may detect the same reset again, unregister, or replace the callback;
++ * the reset and close are each notified once, through the callback registered
++ * at that time. */
++static int reset_detect_callback_case(int reenter_on, int unregister, int replace, int absent)
++{
++    uint64_t simulated_time = 0;
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    reset_detect_cb_t rd = { 0 };
++    reset_detect_cb_t rd2 = { 0 };
++    uint8_t bytes[39];
++    picoquic_reset_detection_enum detection = picoquic_reset_detection_none;
++    int ret = reset_detect_start(&test_ctx, &simulated_time);
++
++    if (ret == 0) {
++        reset_detect_datagram(bytes, sizeof(bytes), 0x41, test_ctx->cnx_client->path[0]->first_tuple->p_remote_cnxid->reset_secret);
++        rd.reenter_on = reenter_on;
++        rd.unregister_on_reset = unregister;
++        rd.replace_on_reset = (replace) ? &rd2 : NULL;
++        rd.bytes = bytes;
++        rd.length = sizeof(bytes);
++        rd.addr_from = (struct sockaddr*)&test_ctx->server_addr;
++        rd.current_time = simulated_time;
++        picoquic_set_callback(test_ctx->cnx_client, (absent) ? NULL : reset_detect_callback, (absent) ? NULL : &rd);
++
++        ret = picoquic_detect_stateless_reset(test_ctx->qclient, bytes, sizeof(bytes), (struct sockaddr*)&test_ctx->server_addr,
++            simulated_time, &detection);
++        if (ret != 0 || detection != picoquic_reset_detection_reset ||
++            test_ctx->cnx_client->cnx_state != picoquic_state_disconnected) {
++            ret = -1;
++        }
++        else if (absent) {
++            if (rd.nb_reset != 0 || rd.nb_close != 0) {
++                ret = -1;
++            }
++        }
++        else if (rd.nb_reset != 1 ||
++            rd.nb_close != ((unregister || replace) ? 0 : 1) ||
++            rd2.nb_reset != 0 || rd2.nb_close != ((replace) ? 1 : 0)) {
++            ret = -1;
++        }
++        else if (reenter_on != 0 && (rd.nb_reentry != 1 || rd.reentry_ret != 0 ||
++            rd.reentry_detection != picoquic_reset_detection_already_disconnected)) {
++            ret = -1;
++        }
++        if (ret != 0) {
++            DBG_PRINTF("Case reenter %d unregister %d replace %d absent %d: detection %d, resets %d/%d, closes %d/%d, reentry %d, %d",
++                reenter_on, unregister, replace, absent, (int)detection, rd.nb_reset, rd2.nb_reset, rd.nb_close, rd2.nb_close,
++                rd.nb_reentry, (int)rd.reentry_detection);
++        }
++    }
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++    }
++    return ret;
++}
++
++int stateless_reset_detect_callback_test(void)
++{
++    int ret = reset_detect_callback_case(picoquic_callback_stateless_reset, 0, 0, 0);
++
++    if (ret == 0) {
++        ret = reset_detect_callback_case(picoquic_callback_close, 0, 0, 0);
++    }
++    if (ret == 0) {
++        ret = reset_detect_callback_case(0, 1, 0, 0);
++    }
++    if (ret == 0) {
++        ret = reset_detect_callback_case(0, 0, 1, 0);
++    }
++    if (ret == 0) {
++        ret = reset_detect_callback_case(0, 0, 0, 1);
++    }
++    return ret;
++}
++
++/* A datagram that does not match is not processed: an Initial of an unsupported
++ * version offered to the server context creates no connection and queues no
++ * version negotiation, which ordinary ingress of the same bytes then does. */
++int stateless_reset_detect_vn_test(void)
++{
++    uint64_t simulated_time = 0;
++    picoquic_test_tls_api_ctx_t* test_ctx = NULL;
++    uint8_t bytes[PICOQUIC_ENFORCED_INITIAL_MTU];
++    picoquic_reset_detection_enum detection = picoquic_reset_detection_reset;
++    uint32_t nb_cnx_before = 0;
++    int ret = reset_detect_start(&test_ctx, &simulated_time);
++
++    if (ret == 0) {
++        size_t byte_index = 0;
++
++        memset(bytes, 0x5a, sizeof(bytes));
++        bytes[byte_index++] = 0xc0;
++        picoformat_32(&bytes[byte_index], 0x1a2a3a4a);
++        byte_index += 4;
++        bytes[byte_index++] = 8;
++        byte_index += 8;
++        bytes[byte_index++] = 8;
++        nb_cnx_before = test_ctx->qserver->current_number_connections;
++        if (test_ctx->qserver->pending_stateless_packet != NULL) {
++            ret = -1;
++        }
++    }
++    if (ret == 0) {
++        ret = picoquic_detect_stateless_reset(test_ctx->qserver, bytes, sizeof(bytes), (struct sockaddr*)&test_ctx->client_addr,
++            simulated_time, &detection);
++        if (ret != 0 || detection != picoquic_reset_detection_none ||
++            test_ctx->qserver->pending_stateless_packet != NULL ||
++            test_ctx->qserver->current_number_connections != nb_cnx_before ||
++            test_ctx->cnx_server->cnx_state != picoquic_state_ready) {
++            DBG_PRINTF("%s", "Detection without a match changed the server context");
++            ret = -1;
++        }
++    }
++    if (ret == 0) {
++        (void)picoquic_incoming_packet(test_ctx->qserver, bytes, sizeof(bytes), (struct sockaddr*)&test_ctx->client_addr,
++            (struct sockaddr*)&test_ctx->server_addr, 0, test_ctx->recv_ecn_server, simulated_time);
++        if (test_ctx->qserver->pending_stateless_packet == NULL ||
++            test_ctx->qserver->pending_stateless_packet->next_packet != NULL ||
++            test_ctx->qserver->pending_stateless_packet->ptype != picoquic_packet_version_negotiation ||
++            test_ctx->qserver->current_number_connections != nb_cnx_before) {
++            DBG_PRINTF("%s", "Ordinary ingress did not queue exactly one version negotiation");
++            ret = -1;
++        }
++    }
++    if (test_ctx != NULL) {
++        tls_api_delete_ctx(test_ctx);
++    }
++    return ret;
++}
++
+ /* Immediate close. Test that a server can issue an immediate close,
+  * and that the client eventually closes the connection. 
+  */

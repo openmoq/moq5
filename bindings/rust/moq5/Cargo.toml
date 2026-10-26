@@ -1,0 +1,39 @@
+[package]
+name = "moq5"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Safe Rust API for the libmoq (MOQ5) Media over QUIC service tier"
+repository = "https://github.com/openmoq/moq5"
+readme = "README.md"
+keywords = ["moq", "media-over-quic", "quic", "streaming", "cmaf"]
+categories = ["api-bindings", "multimedia", "network-programming"]
+publish = false
+
+[features]
+# The media player (moq5::player), over moq5-sys's player bindings: it needs
+# an SDK built with the player (MOQ_BUILD_PLAYBACK=ON) and fails the build
+# without one.
+player = ["moq5-sys/player"]
+
+[dependencies]
+moq5-sys = { version = "0.1.0", path = "../moq5-sys" }
+
+[package.metadata.docs.rs]
+# Documented from moq5-sys's cfg(docsrs) snapshot, on the targets that
+# snapshot is verified on (see moq5-sys/Cargo.toml), with the player.
+features = ["player"]
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
+
+[[test]]
+name = "compile_fail"
+path = "tests/compile_fail.rs"
+
+# The player's relay row exists only with the feature: run without it, the
+# row is refused rather than passing with no test.
+[[test]]
+name = "live_player"
+path = "tests/live_player.rs"
+required-features = ["player"]

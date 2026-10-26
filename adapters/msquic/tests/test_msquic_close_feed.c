@@ -54,6 +54,7 @@ static int failures = 0;
 /* --- rig ---------------------------------------------------------------- */
 
 struct rig {
+    fake_msq_count_alloc_t alloc;
     fake_msq_t fake;
     moq_session_t *session;
     moq_msquic_conn_t *conn;
@@ -65,13 +66,14 @@ static int rig_up(struct rig *r, moq_msquic_hook_fn hook, void *hook_user)
     moq_msquic_conn_cfg_t cfg;
 
     memset(r, 0, sizeof(*r));
+    fake_msq_count_alloc_init(&r->alloc);
     fake_msq_init(&r->fake, true);
-    moq_session_cfg_init_sized(&scfg, sizeof(scfg), moq_alloc_default(),
+    moq_session_cfg_init_sized(&scfg, sizeof(scfg), &r->alloc.api,
                                MOQ_PERSPECTIVE_CLIENT);
     if (moq_session_create(&scfg, 0, &r->session) < 0)
         return -1;
     moq_msquic_conn_cfg_init_sized(&cfg, sizeof(cfg));
-    cfg.alloc = moq_alloc_default();
+    cfg.alloc = &r->alloc.api;
     cfg.session = r->session;
     cfg.api = fake_msq_table(&r->fake);
     cfg.hook = hook;
@@ -86,16 +88,30 @@ static int rig_up(struct rig *r, moq_msquic_hook_fn hook, void *hook_user)
 
 static void rig_down(struct rig *r)
 {
-    if (r->conn != NULL)
+    if (r->conn != NULL) {
+        fake_msq_cancel_pending(&r->fake, moq_msquic_conn_callback(), r->conn);
+        CHECK(fake_msq_pending_sends(&r->fake) == 0);
+        CHECK(fake_msq_pending_dgrams(&r->fake) == 0);
+        CHECK(r->fake.send_completions == (unsigned)r->fake.send_count);
+        CHECK(r->fake.dgram_completions == (unsigned)r->fake.dgram_count);
+        fake_msq_mark_connection_closed(&r->fake);
         moq_msquic_conn_destroy(r->conn);
+    }
     if (r->session != NULL)
         moq_session_destroy(r->session);
+    CHECK(atomic_load(&r->alloc.live_bytes) == 0);
 }
 
 static void deliver_conn_event(struct rig *r, QUIC_CONNECTION_EVENT_TYPE t)
 {
     QUIC_CONNECTION_EVENT ev;
 
+    if (t == QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE) {
+        fake_msq_cancel_pending(&r->fake, moq_msquic_conn_callback(), r->conn);
+        CHECK(fake_msq_pending_sends(&r->fake) == 0);
+        CHECK(fake_msq_pending_dgrams(&r->fake) == 0);
+        fake_msq_mark_shutdown_complete(&r->fake);
+    }
     memset(&ev, 0, sizeof(ev));
     ev.Type = t;
     moq_msquic_conn_callback()(fake_msq_conn_handle(&r->fake), r->conn, &ev);

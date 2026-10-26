@@ -31,10 +31,31 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <signal.h>
 
 #include "../../../tests/unit/test_support.h"
 
 moqr_broker_t *moqr_test_metrics_broker(void);
+bool moqr_test_coord_wake_init(void);
+void moqr_test_coord_wake_retire(void);
+void moqr_test_coord_wake_notify(void);
+bool moqr_test_coord_wake_drain(void);
+int moqr_test_coord_wake_wait_until(uint64_t deadline_us);
+uint64_t moqr_test_coord_now_us(void);
+int moqr_test_coord_wake_wr(void);
+bool moqr_test_coord_wake_readable(void);
+void moqr_test_coord_counts(uint64_t out[10]);
+void moqr_test_dump_signal(int sig);
+int moqr_test_signal_metrics_pending(void);
+void moqr_test_coord_set_read(ssize_t (*fn)(int, void *, size_t));
+unsigned moqr_test_coord_last_drain_reads(void);
+unsigned moqr_test_coord_drain_bound(void);
+void *moqr_test_mk_lanes_ctx(moqr_shards_t *shards, uint32_t lanes);
+void moqr_test_lanes_ctx_set_snap(void *vctx, moqr_cli_snapshot_t *snap);
+void moqr_test_publish_row(void *vctx, uint32_t shard,
+                           const moqr_cli_snapshot_stats_t *st,
+                           uint64_t serial);
 void moqr_test_set_coord_midflight(void (*fn)(void *), void *ctx);
 void moqr_test_set_coord_pinned(void (*fn)(void *), void *ctx);
 void moqr_test_set_release_bank_corruption(bool on);
@@ -640,6 +661,247 @@ test_http_only_generation_is_silent_and_retires(void)
 
     moqr_cli_snapshot_destroy(&snap);
     moqr_broker_destroy(b);
+    return failures;
+}
+
+
+/* -- the coordinator's self-pipe ------------------------------------------- *
+ *
+ * A pipe byte means "recheck": the coordinator drains, reads the
+ * authoritative state, then waits. These rows drive that protocol over the
+ * production pipe, publication and signal handler, with the health fallback
+ * out of the picture: readiness is checked without waiting (a pending byte
+ * or none), and a wait is only entered when a byte is already there. */
+
+#define CW_NOTIFIED 0
+#define CW_COALESCED 1
+#define CW_FAILED 2
+
+static uint64_t
+cw_count(int k)
+{
+    uint64_t c[10];
+    moqr_test_coord_counts(c);
+    return c[k];
+}
+
+/* A notification posted before the wait is found by it, without waiting. */
+static int
+test_coord_wake_notify_before_wait(void)
+{
+    int failures = 0;
+    MOQ_TEST_CHECK(moqr_test_coord_wake_init());
+    MOQ_TEST_CHECK(!moqr_test_coord_wake_readable());
+    moqr_test_coord_wake_notify();
+    MOQ_TEST_CHECK(moqr_test_coord_wake_readable());
+    /* No deadline: only the byte can end this wait. */
+    MOQ_TEST_CHECK_EQ_INT(moqr_test_coord_wake_wait_until(UINT64_MAX), 1);
+    MOQ_TEST_CHECK(moqr_test_coord_wake_drain());
+    MOQ_TEST_CHECK(!moqr_test_coord_wake_readable());
+    MOQ_TEST_CHECK_EQ_U64(cw_count(CW_NOTIFIED), 1u);
+    MOQ_TEST_CHECK_EQ_U64(cw_count(CW_FAILED), 0u);
+    /* A deadline already passed ends the wait at once with no byte. */
+    MOQ_TEST_CHECK_EQ_INT(
+        moqr_test_coord_wake_wait_until(moqr_test_coord_now_us()), 0);
+    moqr_test_coord_wake_retire();
+    MOQ_TEST_CHECK_EQ_INT(moqr_test_coord_wake_wr(), -1);
+    /* Retired: a late notification writes nothing and fails nothing. */
+    moqr_test_coord_wake_notify();
+    MOQ_TEST_CHECK_EQ_U64(cw_count(CW_NOTIFIED), 1u);
+    MOQ_TEST_CHECK_EQ_U64(cw_count(CW_FAILED), 0u);
+    return failures;
+}
+
+/* The last row lands after the coordinator found the generation incomplete:
+ * its publication leaves a byte, so the coordinator's next wait ends and the
+ * generation renders. Without that byte (and with no health fallback) the
+ * coordinator would sleep on a complete generation. */
+static int
+test_coord_wake_last_row_after_incomplete_check(void)
+{
+    int failures = 0;
+    moqr_broker_t *b = moqr_test_metrics_broker();
+    MOQ_TEST_CHECK_EQ_INT(moqr_broker_init(b, MOQR_BROKER_BANKS), MOQR_OK);
+    moqr_cli_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    MOQ_TEST_CHECK_EQ_INT(
+        moqr_cli_snapshot_init(&snap, 2u, moq_alloc_default()), MOQR_OK);
+    moqr_obs_labels_t labels[2] = { { 0, "msquic", "moqt-18" },
+                                   { 1, "msquic", "moqt-18" } };
+    void *ctx = moqr_test_mk_lanes_ctx(NULL, 2u);
+    MOQ_TEST_CHECK(ctx != NULL);
+    moqr_test_lanes_ctx_set_snap(ctx, &snap);
+    MOQ_TEST_CHECK(moqr_test_coord_wake_init());
+
+    uint64_t s = 0;
+    bool w = false;
+    MOQ_TEST_CHECK_EQ_INT(
+        moqr_broker_request(b, MOQR_BROKER_DEMAND_SIGNAL, &s, &w), MOQR_OK);
+    moqr_cli_snapshot_stats_t st;
+    memset(&st, 0, sizeof(st));
+    st.core.ingested_total = 7;
+    st.shard_cap = MOQR_CLI_CAP_ABSENT;
+    moqr_test_publish_row(ctx, 0, &st, s);
+
+    static char cap[262144];
+    uint64_t inc = 0, fail = 0;
+    capture_begin();
+    /* Turn 1: drain, then check -- one row of two: incomplete. */
+    MOQ_TEST_CHECK(moqr_test_coord_wake_drain());
+    uint64_t r = moqr_test_coord_try_dump(labels, &snap, 0, &inc, &fail);
+    MOQ_TEST_CHECK_EQ_U64(r, 0u);
+    MOQ_TEST_CHECK(!moqr_test_coord_wake_readable());
+    /* The last row publishes after that check. */
+    moqr_test_publish_row(ctx, 1, &st, s);
+    /* Turn 2 happens only if the publication left a byte. */
+    if (moqr_test_coord_wake_readable()) {
+        MOQ_TEST_CHECK_EQ_INT(moqr_test_coord_wake_wait_until(UINT64_MAX), 1);
+        MOQ_TEST_CHECK(moqr_test_coord_wake_drain());
+        r = moqr_test_coord_try_dump(labels, &snap, r, &inc, &fail);
+    }
+    (void)capture_end(cap, sizeof(cap));
+    MOQ_TEST_CHECK_EQ_U64(r, s);   /* rendered */
+    MOQ_TEST_CHECK(!moqr_broker_busy(b));
+    MOQ_TEST_CHECK_EQ_U64(cw_count(CW_NOTIFIED), 2u);
+
+    moqr_test_coord_wake_retire();
+    free(ctx);
+    moqr_cli_snapshot_destroy(&snap);
+    moqr_broker_destroy(b);
+    return failures;
+}
+
+/* A notification crossing the drain: one posted after the drain finished
+ * stays for the next wait; bytes queued before it are all consumed. */
+static int
+test_coord_wake_drain_rearm_crossing(void)
+{
+    int failures = 0;
+    MOQ_TEST_CHECK(moqr_test_coord_wake_init());
+    for (int i = 0; i < 3; i++) {
+        moqr_test_coord_wake_notify();
+    }
+    MOQ_TEST_CHECK(moqr_test_coord_wake_drain());
+    MOQ_TEST_CHECK(!moqr_test_coord_wake_readable());
+    moqr_test_coord_wake_notify();   /* after the drain, before the wait */
+    MOQ_TEST_CHECK(moqr_test_coord_wake_readable());
+    MOQ_TEST_CHECK_EQ_INT(moqr_test_coord_wake_wait_until(UINT64_MAX), 1);
+    moqr_test_coord_wake_retire();
+    return failures;
+}
+
+/* A full pipe coalesces: further notifications are counted as such, never as
+ * failures, the pipe stays readable, and one drain empties it. */
+static int
+test_coord_wake_full_pipe_coalesces(void)
+{
+    int failures = 0;
+    MOQ_TEST_CHECK(moqr_test_coord_wake_init());
+    for (int i = 0; i < (1 << 20) && cw_count(CW_COALESCED) == 0u; i++) {
+        moqr_test_coord_wake_notify();
+    }
+    MOQ_TEST_CHECK(cw_count(CW_COALESCED) > 0u);
+    MOQ_TEST_CHECK_EQ_U64(cw_count(CW_FAILED), 0u);
+    MOQ_TEST_CHECK(moqr_test_coord_wake_readable());
+    /* A signal handler meeting the full pipe still latches. */
+    const uint64_t coalesced = cw_count(CW_COALESCED);
+    errno = EDOM;
+    moqr_test_dump_signal(SIGUSR1);
+    MOQ_TEST_CHECK_EQ_INT(errno, EDOM);   /* the handler preserves errno */
+    MOQ_TEST_CHECK_EQ_INT(moqr_test_signal_metrics_pending(), 1);
+    MOQ_TEST_CHECK_EQ_U64(cw_count(CW_COALESCED), coalesced + 1u);
+    /* A full pipe holds more than one bounded pass reads: the pass stops at
+     * its bound and leaves the rest readable for the next turn. */
+    MOQ_TEST_CHECK(moqr_test_coord_wake_drain());
+    MOQ_TEST_CHECK_EQ_U64(moqr_test_coord_last_drain_reads(),
+                          moqr_test_coord_drain_bound());
+    MOQ_TEST_CHECK(moqr_test_coord_wake_readable());
+    /* Successive passes empty it; each reads at most the bound. */
+    int passes = 0;
+    while (moqr_test_coord_wake_readable() && passes < 100000) {
+        MOQ_TEST_CHECK(moqr_test_coord_wake_drain());
+        MOQ_TEST_CHECK(moqr_test_coord_last_drain_reads() <=
+                       moqr_test_coord_drain_bound());
+        passes++;
+    }
+    MOQ_TEST_CHECK(passes > 1);
+    MOQ_TEST_CHECK(!moqr_test_coord_wake_readable());
+    /* Empty again: the next notification is a byte, not a coalesce. */
+    moqr_test_coord_wake_notify();
+    MOQ_TEST_CHECK(moqr_test_coord_wake_readable());
+    moqr_test_coord_wake_retire();
+    return failures;
+}
+
+/* Reads standing in for a producer that refills the pipe between reads, and
+ * for a read interrupted by every signal. */
+static unsigned g_shim_reads;
+static ssize_t
+shim_always_data(int fd, void *buf, size_t n)
+{
+    (void)fd;
+    g_shim_reads++;
+    memset(buf, 1, n);
+    return (ssize_t)n;
+}
+static ssize_t
+shim_always_eintr(int fd, void *buf, size_t n)
+{
+    (void)fd; (void)buf; (void)n;
+    g_shim_reads++;
+    errno = EINTR;
+    return -1;
+}
+
+/* One drain pass returns after a bounded number of attempts whatever the
+ * pipe does: a sustained producer and an endless run of interrupted reads
+ * each end the pass at the bound (so the turn reaches its stop and health
+ * checks); an empty pipe ends it at once. */
+static int
+test_coord_wake_drain_is_bounded(void)
+{
+    int failures = 0;
+    MOQ_TEST_CHECK(moqr_test_coord_wake_init());
+    const unsigned bound = moqr_test_coord_drain_bound();
+    MOQ_TEST_CHECK(bound > 0u);
+
+    g_shim_reads = 0;
+    moqr_test_coord_set_read(shim_always_data);
+    MOQ_TEST_CHECK(moqr_test_coord_wake_drain());
+    MOQ_TEST_CHECK_EQ_U64(g_shim_reads, bound);
+    MOQ_TEST_CHECK_EQ_U64(moqr_test_coord_last_drain_reads(), bound);
+
+    g_shim_reads = 0;
+    moqr_test_coord_set_read(shim_always_eintr);
+    MOQ_TEST_CHECK(moqr_test_coord_wake_drain());
+    MOQ_TEST_CHECK_EQ_U64(g_shim_reads, bound);   /* interrupted ones count */
+
+    moqr_test_coord_set_read(NULL);
+    MOQ_TEST_CHECK(moqr_test_coord_wake_drain());   /* empty pipe */
+    MOQ_TEST_CHECK_EQ_U64(moqr_test_coord_last_drain_reads(), 1u);
+    moqr_test_coord_wake_retire();
+    return failures;
+}
+
+/* The dump handler latches its demand before waking the coordinator, and
+ * keeps errno: on an empty pipe the byte is there with the latch already
+ * set. */
+static int
+test_coord_wake_signal_latches_then_wakes(void)
+{
+    int failures = 0;
+    MOQ_TEST_CHECK(moqr_test_coord_wake_init());
+    const uint64_t n0 = cw_count(CW_NOTIFIED);
+    errno = ERANGE;
+    moqr_test_dump_signal(SIGUSR1);
+    MOQ_TEST_CHECK_EQ_INT(errno, ERANGE);
+    MOQ_TEST_CHECK(moqr_test_coord_wake_readable());
+    MOQ_TEST_CHECK_EQ_INT(moqr_test_signal_metrics_pending(), 1);
+    MOQ_TEST_CHECK_EQ_U64(cw_count(CW_NOTIFIED), n0 + 1u);
+    MOQ_TEST_CHECK(moqr_test_coord_wake_drain());
+    moqr_test_dump_signal(SIGUSR2);
+    MOQ_TEST_CHECK(moqr_test_coord_wake_readable());
+    moqr_test_coord_wake_retire();
     return failures;
 }
 
@@ -2944,6 +3206,12 @@ main(void)
     failures += test_dual_readiness_metadata();
     failures += test_serve_early_return_finalizes();
     failures += test_build_capability_is_shared();
+    failures += test_coord_wake_notify_before_wait();
+    failures += test_coord_wake_last_row_after_incomplete_check();
+    failures += test_coord_wake_drain_rearm_crossing();
+    failures += test_coord_wake_full_pipe_coalesces();
+    failures += test_coord_wake_signal_latches_then_wakes();
+    failures += test_coord_wake_drain_is_bounded();
 #else
     failures += coord_body_token_identity(1);
     failures += coord_propagates_release_wake(1);

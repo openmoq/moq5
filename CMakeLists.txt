@@ -29,6 +29,7 @@ option(MOQ_BUILD_TESTS             "Build test suite"               ON)
 option(MOQ_BUILD_SIM               "Build moq-sim"                  ${MOQ_BUILD_TESTS})
 option(MOQ_BUILD_ADAPTER_PICOQUIC  "Build picoquic adapter"         OFF)
 option(MOQ_BUILD_CPP_BINDING       "Build C++ binding"              OFF)
+option(MOQ_BUILD_RUST_BINDING      "Qualify the Rust binding (cargo rows over the staged SDK)" OFF)
 option(MOQ_BUILD_LOC               "Build moq-loc LOC helpers"      ON)
 option(MOQ_BUILD_MSF               "Build moq-msf catalog parser"   OFF)
 option(MOQ_BUILD_CMAF              "Build moq-cmaf segment parser"  ON)
@@ -123,6 +124,12 @@ endif()
 # is built.
 if(MOQ_BUILD_ADAPTER_MVFST OR MOQ_BUILD_ADAPTER_PROXYGEN)
     enable_language(CXX)
+endif()
+
+# MSVC only exposes C11 <stdatomic.h> (used by the threaded service tier)
+# behind this switch (VS 2022 17.5+).
+if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
 endif()
 
 # -- Core (always built) -------------------------------------------
@@ -398,6 +405,11 @@ if(MOQ_BUILD_RELAY_CORE)
         # a static source-layering check: deterministic, no physical surface — the
         # "boundary" it checks is the code layering, not a transport
         set_tests_properties(relay_boundary PROPERTIES LABELS "relay;sansio")
+        # The guard's own self-test: its one exception and its neighbors.
+        add_test(NAME relay_boundary_selftest
+                 COMMAND ${CMAKE_COMMAND} -E env bash
+                         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_check_relay_boundary.sh)
+        set_tests_properties(relay_boundary_selftest PROPERTIES LABELS "relay;sansio")
     endif()
 endif()
 
@@ -426,6 +438,8 @@ install(FILES
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 
 if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
+    # FindPicoquic.cmake injects MoqPicoquicProjectPolicy.cmake into picoquic's
+    # project() when a consumer rebuilds picoquic from source, so both ship.
     install(FILES
         cmake/FindPicoquic.cmake
         cmake/MoqPicoquicProjectPolicy.cmake
@@ -502,9 +516,15 @@ if(MOQ_BUILD_LOC)
     string(APPEND LIBMOQ_PC_LIBS " -lmoq-loc")
 endif()
 string(APPEND LIBMOQ_PC_LIBS " -lmoq-core")
+set(LIBMOQ_PC_CFLAGS "")
 if(MOQ_BUILD_ADAPTER_PICOQUIC)
     moq_picoquic_pkgconfig_libs(_libmoq_picoquic_pc_libs)
     string(APPEND LIBMOQ_PC_LIBS " ${_libmoq_picoquic_pc_libs}")
+    # <moq/picoquic.h> includes PicoQUIC's own headers.
+    moq_picoquic_pkgconfig_cflags(_libmoq_picoquic_pc_cflags)
+    if(_libmoq_picoquic_pc_cflags)
+        set(LIBMOQ_PC_CFLAGS " ${_libmoq_picoquic_pc_cflags}")
+    endif()
 endif()
 string(STRIP "${LIBMOQ_PC_LIBS}" LIBMOQ_PC_LIBS)
 
@@ -542,6 +562,21 @@ if(MOQ_BUILD_TESTS)
             COMMAND bash "${PROJECT_SOURCE_DIR}/scripts/setup_picoquic_deps.sh"
                 --check-patch-consumers)
         set_tests_properties(dependency_patch_consumers PROPERTIES
+            TIMEOUT 30 LABELS "tooling")
+    endif()
+    # The media-player dump checker's alignment rules (synthetic runs only;
+    # the live checks it serves stay opt-in).
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME media_player_dump_alignment
+            COMMAND ${Python3_EXECUTABLE} -I
+                "${PROJECT_SOURCE_DIR}/scripts/check_media_player_dump.py" --self-test)
+        set_tests_properties(media_player_dump_alignment PROPERTIES
+            TIMEOUT 30 LABELS "tooling")
+        add_test(NAME live_media_player_verdict
+            COMMAND ${Python3_EXECUTABLE} -I
+                "${PROJECT_SOURCE_DIR}/scripts/live_media_player_verdict.py" --self-test)
+        set_tests_properties(live_media_player_verdict PROPERTIES
             TIMEOUT 30 LABELS "tooling")
     endif()
 endif()
@@ -630,6 +665,11 @@ endif()
 # -- C++ Binding ----------------------------------------------------
 if(MOQ_BUILD_CPP_BINDING)
     add_subdirectory(bindings/cpp)
+endif()
+
+# -- Rust binding ---------------------------------------------------
+if(MOQ_BUILD_RUST_BINDING)
+    add_subdirectory(bindings/rust)
 endif()
 
 # -- Benchmarks -----------------------------------------------------

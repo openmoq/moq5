@@ -2,13 +2,16 @@ import Foundation
 
 // MARK: - MSF Catalog
 
-/// MSF (Media over QUIC Streaming Format) catalog per draft-ietf-moq-msf-01.
+/// MSF (Media over QUIC Streaming Format) catalog model for draft-ietf-moq-msf-01.
 ///
 /// `version` is kept as an `Int` (the in-memory MSF version, 1). On the wire,
-/// MSF-01 §5.1.1 encodes `version` as a JSON **String**: decoding accepts the
-/// canonical `"1"`, the draft convention `"draft-01"`, and — for legacy
-/// compatibility only — the MSF-00 numeric `1`; encoding always emits the
-/// canonical String `"1"`.
+/// MSF-01 §5.1.1 uses the JSON **String** `"draft-01"` for this draft.
+/// Independent catalogs always encode that spelling, including after decoding
+/// `"draft-01"`, the compatibility String `"1"`, or the legacy MSF-00 numeric `1`.
+/// All three decode to version 1; delta catalogs omit `version` (§5.3).
+///
+/// Encoding uses a keyed container and does not enforce §5.1.7's requirement
+/// that `initDataList` follow `tracks` in serialized JSON.
 public struct MSFCatalog: Sendable, Equatable {
     /// The supported MSF version (the value 1; §5.1.1).
     public static let supportedVersion = 1
@@ -68,7 +71,7 @@ extension MSFCatalog: Encodable {
             try c.encode(delta, forKey: .deltaUpdate)
             return
         }
-        // MSF-01 §5.1.1: version is a JSON String; emit the canonical "1".
+        // MSF-01 §5.1.1: emit the draft-name String "draft-01".
         // Refuse to emit an unsupported version — a §5.1.1-conformant subscriber
         // (this binding included) would reject the wire we'd produce.
         guard version == Self.supportedVersion else {
@@ -76,7 +79,7 @@ extension MSFCatalog: Encodable {
                 codingPath: c.codingPath + [CodingKeys.version],
                 debugDescription: "Unsupported MSF version \(version); only \(Self.supportedVersion) is supported (§5.1.1)"))
         }
-        try c.encode(String(version), forKey: .version)
+        try c.encode("draft-01", forKey: .version)
         try c.encodeIfPresent(generatedAt, forKey: .generatedAt)
         try c.encode(tracks, forKey: .tracks)
         // §5.1.3: only the TRUE state is emitted; false means "absent".
@@ -137,9 +140,8 @@ extension MSFCatalog: Decodable {
             try? c.decodeIfPresent([CMSFContentProtection].self, forKey: .contentProtections)
     }
 
-    /// MSF-01 §5.1.1: `version` is a JSON String. Accept the canonical `"1"` and
-    /// the draft-XX convention for this draft (`"draft-01"`); also accept the
-    /// legacy MSF-00 numeric `1` for back-compat. All map to the in-memory
+    /// MSF-01 §5.1.1: accept the draft-name String `"draft-01"`, the compatibility
+    /// String `"1"`, and the legacy MSF-00 numeric `1`. All map to the in-memory
     /// version 1. Reject anything else — per §5.1.1 a subscriber MUST NOT parse
     /// a catalog version it does not understand.
     private static func decodeVersion(

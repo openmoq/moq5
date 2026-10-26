@@ -6,11 +6,13 @@
 #include <cstddef>
 #include <moq/moq.h>
 #include "test_support.h"
+#include "../support/publish_event_client.h"
 #include <cstring>
 
 int main()
 {
     int failures = 0;
+    MOQ_TEST_CHECK(unchanged_publish_event_client());
 
     /* MOQ_BYTES_LITERAL works from C++. */
     moq_bytes_t lit = MOQ_BYTES_LITERAL("hello");

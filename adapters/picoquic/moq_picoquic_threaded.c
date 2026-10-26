@@ -22,184 +22,42 @@
 #include "../common/moq_alpn.h"
 #include "../common/moq_setup_tokens.h"
 #include "../common/moq_adapter_binding.h"
+#include "../common/moq_posix_compat.h"   /* pthread + clock_gettime (Windows shim) */
 #include "../common/moq_pq_stream_backlog.h"
 #include "picoquic_endpoint.h"   /* moq_pq_send_stats_t + per-conn getter */
+#include "pq_wake_sched.h"
+#ifdef MOQ_PQ_THREADED_TESTING
+#include <picoquic_internal.h>   /* stream iteration, for a test seam only */
+#endif
 
 #include <errno.h>
 #include <time.h>
+#ifdef _WIN32
+#include <ws2tcpip.h>   /* getaddrinfo */
+#else
 #include <netdb.h>
-#include <pthread.h>
+#endif
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
-/* Advertised inbound flow-control credit, per unidirectional stream and
- * connection-wide. Sized to the session's default receive budget so a large
- * inbound MoQ object is not held back by too small a window; see create. */
-#define MOQ_PQ_RECV_FLOW_CONTROL (16u * 1024u * 1024u)
-
-/* Default server connection cap when cfg.max_connections is 0. Mirrors the
- * mvfst managed server default. */
-#define MOQ_PQ_THREADED_DEFAULT_MAX_CONNECTIONS 1024u
-#ifndef MOQ_PQ_THREADED_LOCAL_CLOSE_FLUSH_US
-#define MOQ_PQ_THREADED_LOCAL_CLOSE_FLUSH_US 250000ull
+/* Winsock is reference counted per process. Each successful create pairs one
+ * WSAStartup with one WSACleanup (destroy or the create failure path), so the
+ * facade works in hosts that never initialized Winsock themselves. */
+#ifdef _WIN32
+static int pq_net_startup(void)
+{
+    WSADATA wsa;
+    return WSAStartup(MAKEWORD(2, 2), &wsa) == 0 ? 0 : -1;
+}
+static void pq_net_cleanup(void) { WSACleanup(); }
+#else
+static int pq_net_startup(void) { return 0; }
+static void pq_net_cleanup(void) {}
 #endif
 
-/* One accepted server connection. Heap-owned so the public opaque handle
- * (moq_pq_threaded_conn_t*) stays stable while the internal list grows/compacts.
- * All fields are touched only on the network thread except where noted. */
-struct moq_pq_threaded_conn {
-    struct moq_pq_threaded *parent;    /* owning server (for thread-guard) */
-    picoquic_cnx_t *cnx;
-    moq_session_t  *session;
-    moq_pq_conn_t  *conn;
-    moq_version_t   negotiated;
-    bool            close_requested;   /* conn_close: prune after on_lane_pump */
-    bool            dead_observed;     /* terminal AND an app pump has run
-                                          since (SESSION_CLOSED pollable);
-                                          prune precondition for non-app
-                                          closes */
-    uint64_t        close_error_code;
-    bool            fatal;             /* per-conn service failure: prune */
-#ifdef MOQ_PQ_THREADED_TESTING
-    bool            test_service_fatal; /* seam: next service pass fatals */
-#endif
-};
-
-/* The single lane of a managed facade. picoquic_threaded runs one network
- * thread, so a facade has exactly one lane; it just points back at its
- * owner (the pump/iteration operate on the owner's one connection set). */
-struct moq_pq_threaded_lane {
-    struct moq_pq_threaded *owner;
-    uint32_t index;
-};
-
-struct moq_pq_threaded {
-    moq_alloc_t         alloc;
-
-    /* Copied config */
-    moq_perspective_t   perspective;
-    int                 port;
-    bool                send_request_capacity;
-    uint64_t            initial_request_capacity;
-    uint32_t            max_actions;
-    uint32_t            max_events;
-    uint32_t            max_data_streams;
-    uint32_t            max_subscriptions;
-    uint32_t            send_buffer_size;
-    uint32_t            recv_buffer_size;
-    uint64_t            goaway_timeout_us;
-    uint32_t            keep_alive_interval_ms;  /* 0 = keepalive disabled */
-    uint64_t            send_queue_cap_bytes;    /* 0 = adapter default */
-    bool                insecure_skip_verify;
-    int               (*configure_quic_fn)(picoquic_quic_t *, void *);
-    void               *configure_quic_ctx;
-    int               (*on_lane_pump)(moq_pq_threaded_t *,
-                                       moq_pq_threaded_lane_t *,
-                                       uint64_t, void *);
-    void               *on_lane_pump_ctx;
-    uint64_t          (*app_deadline_us)(void *);   /* optional service deadline */
-    void               *app_deadline_ctx;
-    void              (*on_activity)(moq_pq_threaded_t *, void *);
-    void               *on_activity_ctx;
-
-    /* the facade's single lane (owner set in create) */
-    struct moq_pq_threaded_lane lane;
-    /* True ONLY while on_lane_pump is executing (set around each of the
-     * three call sites, cleared before on_activity / service). The
-     * per-connection API is valid only in this window; the flag is
-     * written and read solely on the network thread, so a plain bool
-     * needs no lock (the accessors read it only after confirming they are
-     * on the network thread). */
-    bool                in_lane_pump;
-
-    /* Version negotiation (owned copies of the cfg ALPN offer list, in
-     * preference order). Empty list = legacy single-ALPN behavior
-     * (MOQ_PQ_ALPN_DEFAULT, eager client session, draft-16). */
-    char              **alpn_list;
-    size_t              alpn_count;
-    size_t              alpn_array_bytes;
-    bool                client_deferred;  /* client session awaits the
-                                           * negotiated-ALPN readback */
-    /* The connection target each session is bound with when its profile
-     * requires a binding: the client's authority and path/query (copied
-     * into target_bytes) or the server's URI policy. */
-    moq_setup_tokens_t  setup_tokens;   /* presented in each SETUP */
-    moq_connection_target_t target;
-    uint8_t            *target_bytes;
-    size_t              target_bytes_len;
-
-    /* Resources (owned) */
-    picoquic_quic_t    *quic;
-    picoquic_packet_loop_param_t loop_param;
-
-    /* Mutex-protected state */
-    pthread_mutex_t     mutex;
-    pthread_cond_t      cond;
-    picoquic_network_thread_ctx_t *thread_ctx;
-    /* Client mode: the single session/conn/cnx (eager or deferred). */
-    moq_session_t      *session;
-    moq_pq_conn_t      *conn;
-    picoquic_cnx_t     *active_cnx;
-    /* Server mode: per-connection records (heap-owned; stable handles).
-     * Grown on accept, compacted on prune -- both on the network thread; read
-     * under mutex by conn_count / the legacy first-conn accessors. */
-    struct moq_pq_threaded_conn **conns;
-    size_t              conn_count;
-    size_t              conn_cap;
-    size_t              max_connections;
-    bool                fatal;
-    uint64_t            fatal_code;
-    uint64_t            terminal_error;  /* picoquic local error captured at a
-                                          * client handshake/transport failure;
-                                          * 0 otherwise. Classified by the
-                                          * service endpoint (TLS vs transport). */
-    bool                stopped;
-    bool                pump_exit;
-    bool                loop_running;   /* packet loop is active; stop waits
-                                          * for the callback to clear it */
-    bool                local_close_started;    /* network thread only */
-    uint64_t            local_close_deadline_us; /* network thread only */
-    /* The application error code the local close carries: 0 for a stop or a
-     * pump exit, the recorded fatal code for a client service fatal. */
-    uint64_t            local_close_code;       /* network thread only */
-    bool                fatal_close;            /* network thread only */
-    bool                tx_drained;     /* network thread: local stream flush
-                                         * done (no queued/ready stream data or
-                                         * unsent FIN). Read by drain_state. */
-    bool                loop_exited;    /* loop acknowledged stop request */
-    bool                loop_came_up;   /* packet loop reached its ready
-                                           callback (latched; a later loop
-                                           exit does not clear it) */
-    bool                setup_reached;  /* client: session hit ESTABLISHED */
-    moq_version_t       negotiated;     /* 0 until the version is known */
-    bool                activity_pending;
-    bool                wake_pending;
-    int                 wake_in_flight;
-    pthread_t           network_thread_id;
-    bool                network_thread_id_set;
-
-    /* Characterization telemetry (env MOQ_PQ_THREADED_STATS=1). Written only on
-     * the network thread; read after the thread is joined at stop. */
-    bool                stats_enabled;
-    uint64_t            st_after_send;      /* after_send loop callbacks */
-    uint64_t            st_after_send_nz;   /* after_send phases that sent >0 pkts */
-    uint64_t            st_after_recv;      /* after_receive loop callbacks */
-    uint64_t            st_wake;            /* wake_up loop callbacks */
-    uint64_t            st_after_send_bytes;/* sum of bytes_sent reported */
-    uint64_t            st_service_all;     /* server_service_all invocations */
-    uint64_t            st_pkts_total;      /* packets sent (path-quality delta) */
-    uint64_t            st_pkts_last;       /* last summed path-quality `sent` */
-    uint64_t            st_pkts_max_burst;  /* max packets in one after_send */
-    picoquic_path_quality_t st_quality_last; /* last live path-quality snapshot */
-    /* Per-connection stats accumulated from conns freed before stop, so a pruned
-     * connection's prepare/queue counts are not lost. Final = acc + live conns. */
-    uint64_t            st_acc_prepare;
-    uint64_t            st_acc_provided;
-    uint64_t            st_acc_would_block;
-    uint64_t            st_acc_high_water;  /* max, not sum */
-};
+#include "pq_threaded_internal.h"
+#include "pq_lane_group.h"
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -221,8 +79,14 @@ static void mark_activity(moq_pq_threaded_t *t)
     t->activity_pending = true;
     pthread_cond_broadcast(&t->cond);
     pthread_mutex_unlock(&t->mutex);
+    if (t->group) {
+        pthread_mutex_lock(&t->group->mutex);
+        t->group->activity_pending = true;
+        pthread_cond_broadcast(&t->group->cond);
+        pthread_mutex_unlock(&t->group->mutex);
+    }
     if (t->on_activity)
-        t->on_activity(t, t->on_activity_ctx);
+        t->on_activity(pq_threaded_pump_self(t), t->on_activity_ctx);
 }
 
 static void build_session_cfg(moq_pq_threaded_t *t,
@@ -231,7 +95,10 @@ static void build_session_cfg(moq_pq_threaded_t *t,
 {
     moq_session_cfg_init_sized(scfg, sizeof(*scfg), &t->alloc, persp);
     scfg->send_request_capacity = t->send_request_capacity;
-    scfg->initial_request_capacity = t->initial_request_capacity;
+    /* The documented default (64), as pico_wt applies it: a granted
+     * capacity of 0 would leave the peer unable to send any request. */
+    scfg->initial_request_capacity =
+        t->initial_request_capacity ? t->initial_request_capacity : 64;
     if (t->max_actions) scfg->max_actions = t->max_actions;
     if (t->max_events) scfg->max_events = t->max_events;
     if (t->max_data_streams) scfg->max_data_streams = t->max_data_streams;
@@ -239,6 +106,7 @@ static void build_session_cfg(moq_pq_threaded_t *t,
     if (t->send_buffer_size) scfg->send_buffer_size = t->send_buffer_size;
     if (t->recv_buffer_size) scfg->recv_buffer_size = t->recv_buffer_size;
     if (t->goaway_timeout_us) scfg->goaway_timeout_us = t->goaway_timeout_us;
+    scfg->streaming_objects = t->streaming_objects;
     scfg->setup_auth_tokens = t->setup_tokens.tokens;
     scfg->setup_auth_token_count = t->setup_tokens.count;
 }
@@ -253,15 +121,16 @@ static void build_session_cfg(moq_pq_threaded_t *t,
  * (which only the network thread mutates). Caller holds t->mutex. */
 static void server_publish_first_locked(moq_pq_threaded_t *t)
 {
-    if (t->conn_count > 0) {
-        t->session    = t->conns[0]->session;
-        t->conn       = t->conns[0]->conn;
-        t->active_cnx = t->conns[0]->cnx;
-    } else {
-        t->session = NULL;
-        t->conn = NULL;
-        t->active_cnx = NULL;
+    for (size_t i = 0; i < t->conn_count; i++) {
+        if (t->conns[i]->retired) continue;   /* terminal, kept for its ack */
+        t->session    = t->conns[i]->session;
+        t->conn       = t->conns[i]->conn;
+        t->active_cnx = t->conns[i]->cnx;
+        return;
     }
+    t->session = NULL;
+    t->conn = NULL;
+    t->active_cnx = NULL;
 }
 
 /* Append a heap-owned record. Caller holds t->mutex (conn_count is read
@@ -312,6 +181,7 @@ static void server_conn_free(moq_pq_threaded_t *t,
     if (c->conn) moq_pq_conn_destroy(c->conn);
     if (c->session) moq_session_destroy(c->session);
     t->alloc.free(c, sizeof(*c), t->alloc.ctx);
+    if (t->group) pq_lane_group_release(t);
 }
 
 /* Keep this record's duplicate cnx pointer in step with the raw adapter's
@@ -329,7 +199,13 @@ static void server_conn_free(moq_pq_threaded_t *t,
 static void server_conn_after_callback(moq_pq_conn_t *conn, void *user_ctx)
 {
     struct moq_pq_threaded_conn *c = (struct moq_pq_threaded_conn *)user_ctx;
-    if (!c || !c->cnx) return;
+    if (!c) return;
+    uint64_t events = moq_pq_conn_event_count(conn);
+    if (events != c->events_seen) {
+        c->events_seen = events;
+        if (c->parent) c->parent->input_seq++;
+    }
+    if (!c->cnx) return;
     if (!moq_pq_conn_cnx_released(conn)) return;
 
     c->cnx = NULL;
@@ -460,13 +336,120 @@ static void server_service_all(moq_pq_threaded_t *t, uint64_t now)
             continue;
         }
 #endif
-        if (c->fatal || c->close_requested) continue;
+        if (c->fatal || c->close_requested || c->retired) continue;
         if (moq_pq_service(c->conn, now) < 0)
             c->fatal = true;
     }
 }
 
 #ifdef MOQ_PQ_THREADED_TESTING
+/* Test seam (never shipped; the test-internals build only): a network-thread
+ * hook run at a pass's drain stages -- 1 after the pump, before the post-pump
+ * service; 2 after the drain state is published, mutex released. */
+void moq_pq_threaded_test_set_stage_hook(
+    moq_pq_threaded_t *t, void (*fn)(moq_pq_threaded_t *, int, void *), void *ctx);
+void moq_pq_threaded_test_set_stage_hook(
+    moq_pq_threaded_t *t, void (*fn)(moq_pq_threaded_t *, int, void *), void *ctx)
+{
+    /* Before the network thread runs passes, or while one is parked in it. */
+    t->test_stage = fn;
+    t->test_stage_ctx = ctx;
+}
+/* Test-only, network thread (inside a stage): the drain inputs the
+ * single-connection pass published from, for the row to assert. */
+typedef struct {
+    size_t connections;           /* live connections the pass covered */
+    bool   ready;                 /* every one ready */
+    bool   session_pending;       /* any session holds pending output */
+    bool   bridge_pending;        /* any bridge holds outbound actions */
+    bool   backlog_empty;         /* no stream backlog anywhere */
+    bool   acked;                 /* every send half acknowledged */
+    bool   gen_unchanged;         /* no wake since the pass began */
+} moq_pq_threaded_test_drain_facts_t;
+void moq_pq_threaded_test_drain_facts(moq_pq_threaded_t *t,
+                                      moq_pq_threaded_test_drain_facts_t *out);
+void moq_pq_threaded_test_drain_facts(moq_pq_threaded_t *t,
+                                      moq_pq_threaded_test_drain_facts_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->ready = out->backlog_empty = out->acked = true;
+    if (t->perspective == MOQ_PERSPECTIVE_SERVER) {
+        for (size_t i = 0; i < t->conn_count; i++) {
+            struct moq_pq_threaded_conn *c = t->conns[i];
+            if (!c->cnx) continue;
+            out->connections++;
+            out->ready &= picoquic_get_cnx_state(c->cnx) == picoquic_state_ready;
+            out->session_pending |=
+                moq_session_has_pending_output(moq_pq_conn_session(c->conn));
+            out->bridge_pending |= moq_pq_conn_outbound_pending(c->conn);
+            out->backlog_empty &= moq_pq_cnx_stream_backlog_empty(c->cnx);
+            out->acked &= moq_pq_cnx_streams_acked(c->cnx) != 0;
+        }
+    } else if (t->active_cnx && t->conn) {
+        out->connections = 1;
+        out->ready = picoquic_get_cnx_state(t->active_cnx) == picoquic_state_ready;
+        out->session_pending =
+            moq_session_has_pending_output(moq_pq_conn_session(t->conn));
+        out->bridge_pending = moq_pq_conn_outbound_pending(t->conn);
+        out->backlog_empty = moq_pq_cnx_stream_backlog_empty(t->active_cnx);
+        out->acked = moq_pq_cnx_streams_acked(t->active_cnx) != 0;
+    }
+    pthread_mutex_lock(&t->mutex);
+    out->gen_unchanged = t->drain_gen == t->test_pass_gen;
+    pthread_mutex_unlock(&t->mutex);
+}
+/* Test-only: the wake generation (every wake advances it), read under the
+ * facade mutex from any thread -- how a test sees a drain loop's kicks. */
+uint64_t moq_pq_threaded_test_drain_gen(moq_pq_threaded_t *t);
+uint64_t moq_pq_threaded_test_drain_gen(moq_pq_threaded_t *t)
+{
+    pthread_mutex_lock(&t->mutex);
+    uint64_t g = t->drain_gen;
+    pthread_mutex_unlock(&t->mutex);
+    return g;
+}
+/* Test-only: the peer-to-local direction of each bidirectional stream picoquic
+ * still holds, by initiator -- open (neither FIN nor RESET received), ended by
+ * a FIN, or ended by a RESET. A stream picoquic has already deleted is in
+ * none of the three. Network thread (or a connection no thread drives). */
+typedef struct {
+    size_t open, fin, reset;
+} moq_pq_threaded_test_bidi_halves_t;
+void moq_pq_threaded_test_cnx_bidi_halves(picoquic_cnx_t *cnx, bool client_initiated,
+                                          moq_pq_threaded_test_bidi_halves_t *out);
+void moq_pq_threaded_test_cnx_bidi_halves(picoquic_cnx_t *cnx, bool client_initiated,
+                                          moq_pq_threaded_test_bidi_halves_t *out)
+{
+    for (picoquic_stream_head_t *st = picoquic_first_stream(cnx); st;
+         st = picoquic_next_stream(st)) {
+        if (!PICOQUIC_IS_BIDIR_STREAM_ID(st->stream_id) ||
+            (bool)PICOQUIC_IS_CLIENT_STREAM_ID(st->stream_id) != client_initiated)
+            continue;
+        if (st->reset_received) out->reset++;
+        else if (st->fin_received) out->fin++;
+        else out->open++;
+    }
+}
+/* The same over every live connection of the facade, for the streams the
+ * peer initiated or those this side initiated. */
+void moq_pq_threaded_test_bidi_halves(moq_pq_threaded_t *t, bool peer_initiated,
+                                      moq_pq_threaded_test_bidi_halves_t *out);
+void moq_pq_threaded_test_bidi_halves(moq_pq_threaded_t *t, bool peer_initiated,
+                                      moq_pq_threaded_test_bidi_halves_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    bool server = t->perspective == MOQ_PERSPECTIVE_SERVER;
+    bool client_initiated = server ? peer_initiated : !peer_initiated;
+    if (!server) {
+        if (t->active_cnx)
+            moq_pq_threaded_test_cnx_bidi_halves(t->active_cnx, client_initiated, out);
+        return;
+    }
+    for (size_t i = 0; i < t->conn_count; i++)
+        if (t->conns[i]->cnx)
+            moq_pq_threaded_test_cnx_bidi_halves(t->conns[i]->cnx, client_initiated, out);
+}
+
 /* Test seam (never shipped; the test-internals build only): model a
  * transport close that surfaces in the NEXT service pass, queuing the real
  * MOQ_EVENT_SESSION_CLOSED. Armed from on_lane_pump, that is the post-pump
@@ -527,8 +510,8 @@ static void client_final_pump(moq_pq_threaded_t *t, picoquic_quic_t *quic)
      * only inside the in_lane_pump window. */
     if (t->on_lane_pump) {
         t->in_lane_pump = true;
-        (void)t->on_lane_pump(t, &t->lane, picoquic_get_quic_time(quic),
-                              t->on_lane_pump_ctx);
+        (void)t->on_lane_pump(pq_threaded_pump_self(t), &t->lane,
+                              picoquic_get_quic_time(quic), t->on_lane_pump_ctx);
         t->in_lane_pump = false;
     }
 }
@@ -537,7 +520,7 @@ static void client_final_pump(moq_pq_threaded_t *t, picoquic_quic_t *quic)
  * bridge-fatal, or cleanly closed by the peer. */
 static bool server_conn_dead(const struct moq_pq_threaded_conn *c)
 {
-    return c->close_requested || c->fatal ||
+    return c->close_requested || c->fatal || c->retired ||
            (c->conn && (moq_pq_conn_is_fatal(c->conn) ||
                         moq_pq_conn_is_closed(c->conn)));
 }
@@ -572,11 +555,49 @@ static bool server_has_unobserved_dead(const moq_pq_threaded_t *t)
  * app itself closed are freed -- never a dead conn the app has not had a
  * pump to see. Compaction is network-thread-only; only conn_count is
  * published under the mutex for the cross-thread count accessor. */
-static void server_prune(moq_pq_threaded_t *t)
+/* Retire a terminal connection's transport and keep its record: the same
+ * ordered CONNECTION_CLOSE and callback unbind a legacy prune performs, then
+ * the session is told its transport closed (a no-op when it already knows),
+ * so its SESSION_CLOSED is queued for the application. The adapter keeps its
+ * bridge, which reports whether that event has been polled. Network thread,
+ * after on_lane_pump returned. */
+static void server_conn_retire(moq_pq_threaded_t *t,
+                               struct moq_pq_threaded_conn *c, uint64_t now)
+{
+    bool already_closed = c->conn && moq_pq_conn_is_closed(c->conn);
+    uint64_t code = c->close_requested
+                        ? c->close_error_code
+                        : (c->conn ? moq_pq_conn_fatal_code(c->conn) : 0);
+    if (!already_closed && c->cnx)
+        picoquic_close(c->cnx, code);
+    if (c->conn) moq_pq_conn_release_transport(c->conn);
+    c->cnx = NULL;
+    if (c->session) (void)moq_session_on_transport_close(c->session, code, now);
+    c->retired = true;
+    (void)t;
+}
+
+static void server_prune(moq_pq_threaded_t *t, uint64_t now)
 {
     size_t w = 0;
+    bool retired_any = false;
     for (size_t r = 0; r < t->conn_count; r++) {
         struct moq_pq_threaded_conn *c = t->conns[r];
+        if (t->retain_terminal) {
+            if (server_conn_dead(c) &&
+                (c->dead_observed || c->close_requested || c->retired)) {
+                if (!c->retired) {
+                    server_conn_retire(t, c, now);
+                    retired_any = true;
+                }
+                if (c->acked) {
+                    server_conn_free(t, c, false, 0);
+                    continue;
+                }
+            }
+            t->conns[w++] = c;
+            continue;
+        }
         if (server_conn_dead(c) && (c->dead_observed || c->close_requested)) {
             /* Close the cnx unless the peer already closed it. An app close
              * carries its requested code; a local/service/bridge fatal carries
@@ -589,7 +610,7 @@ static void server_prune(moq_pq_threaded_t *t)
         } else
             t->conns[w++] = c;
     }
-    if (w != t->conn_count) {
+    if (w != t->conn_count || retired_any) {
         pthread_mutex_lock(&t->mutex);
         t->conn_count = w;
         server_publish_first_locked(t);
@@ -673,17 +694,23 @@ static size_t threaded_alpn_select(picoquic_quic_t *quic,
     return count;
 }
 
+static uint64_t client_transport_error(picoquic_cnx_t *cnx)
+{
+    if (!cnx) return 0;
+    uint64_t local_error = picoquic_get_local_error(cnx);
+    return local_error != 0 ? local_error : picoquic_get_remote_error(cnx);
+}
+
 /* Fail the (not yet sessioned) client connection: latch fatal so wait()
  * returns in bounded time, and return -1 so picoquic closes the cnx. */
 static int client_fail_deferred(moq_pq_threaded_t *t)
 {
-    uint64_t local_err = t->active_cnx
-        ? picoquic_get_local_error(t->active_cnx) : 0;
+    uint64_t transport_error = client_transport_error(t->active_cnx);
     pthread_mutex_lock(&t->mutex);
     if (!t->fatal) {
         t->fatal = true;
         t->fatal_code = 0;   /* transport/handshake-level failure */
-        t->terminal_error = local_err;  /* endpoint classifies (TLS vs transport) */
+        t->terminal_error = transport_error;  /* endpoint classifies (TLS vs transport) */
     }
     pthread_mutex_unlock(&t->mutex);
     mark_activity(t);
@@ -810,16 +837,24 @@ static int server_callback(picoquic_cnx_t *cnx,
          * Returning -1 makes picoquic close the not-yet-bound cnx. */
         if (t->conn_count >= t->max_connections)
             return -1;
+        /* In a group the cap is the group's total, taken here and returned
+         * when the record is freed. */
+        if (t->group && !pq_lane_group_admit(t))
+            return -1;
         /* Accept: create session+adapter for THIS cnx and append a record. A
          * per-connection accept failure rejects only this cnx (-1) -- it does
          * NOT make the whole threaded server fatal. moq_pq_conn_create rebinds
          * the cnx callback to moq_pq_callback(conn), so subsequent events for
          * this cnx route straight to its own connection. */
         struct moq_pq_threaded_conn *c = server_accept(t, cnx, now);
-        if (!c) return -1;
+        if (!c) {
+            if (t->group) pq_lane_group_release(t);
+            return -1;
+        }
         /* An explicit adapter keepalive applies to every connection this
          * facade owns, accepted server connections included. No-op when 0. */
         pq_threaded_arm_keep_alive(t, cnx);
+        t->input_seq++;
         pthread_mutex_lock(&t->mutex);
         if (t->negotiated == 0) t->negotiated = c->negotiated;
         pthread_mutex_unlock(&t->mutex);
@@ -953,7 +988,104 @@ static int local_close_step(moq_pq_threaded_t *t, picoquic_quic_t *quic)
     return 0;
 }
 
-static int loop_callback(picoquic_quic_t *quic,
+static int loop_callback_pump(picoquic_quic_t *quic,
+    picoquic_packet_loop_cb_enum cb_mode,
+    void *callback_ctx, void *callback_arg);
+
+/* The earliest application service deadline this facade's own packet loop must
+ * wake for: the global query and, for the one-lane facade, the per-lane query
+ * (lane 0), whichever is sooner. A group lane folds its per-lane deadline in
+ * the group loop (pq_lane_group.c), so this skips it there to avoid folding it
+ * twice. An instant already woken for (at or before deadline_served) is dropped
+ * per candidate, before the minimum, so a deadline stuck in the past wakes the
+ * lane once rather than spinning, and a served global does not mask a later
+ * lane deadline that is still pending. UINT64_MAX when nothing is set or every
+ * pending instant was already served. */
+static uint64_t facade_app_deadline_us(moq_pq_threaded_t *t)
+{
+    uint64_t d = UINT64_MAX;
+    if (t->app_deadline_us) {
+        uint64_t a = t->app_deadline_us(t->app_deadline_ctx);
+        if (a > t->deadline_served && a < d) d = a;
+    }
+    if (!t->own_loop && t->app_lane_deadline_us) {
+        uint64_t a = t->app_lane_deadline_us(t->app_lane_deadline_ctx,
+                                             t->lane.index);
+        if (a > t->deadline_served && a < d) d = a;
+    }
+    return d;
+}
+
+#ifdef MOQ_PQ_THREADED_TESTING
+/* Test-only: the folded application deadline this facade would wake for, so the
+ * per-candidate served filter and the minimum selection are checked without a
+ * live loop. */
+uint64_t moq_pq_threaded_test_app_deadline(moq_pq_threaded_t *t);
+uint64_t moq_pq_threaded_test_app_deadline(moq_pq_threaded_t *t)
+{
+    return facade_app_deadline_us(t);
+}
+/* Test-only: the clamped wait an absolute deadline yields at a given now. */
+int64_t moq_pq_threaded_test_deadline_until(uint64_t deadline_us, uint64_t now_us);
+int64_t moq_pq_threaded_test_deadline_until(uint64_t deadline_us, uint64_t now_us)
+{
+    return deadline_until_us(deadline_us, now_us);
+}
+/* Test-only: the server connection hook (moq_pq_conn_cfg_t.after_callback of
+ * every accepted connection), for a test that ties a connection's picoquic
+ * callbacks to the facade's input sequence without a handshake. */
+void moq_pq_threaded_test_conn_hook(moq_pq_conn_t *conn, void *user_ctx);
+void moq_pq_threaded_test_conn_hook(moq_pq_conn_t *conn, void *user_ctx)
+{
+    server_conn_after_callback(conn, user_ctx);
+}
+#endif
+
+int moq_pq_threaded_loop_callback(picoquic_quic_t *quic,
+    picoquic_packet_loop_cb_enum cb_mode,
+    void *callback_ctx, void *callback_arg)
+{
+    moq_pq_threaded_t *t = (moq_pq_threaded_t *)callback_ctx;
+
+    if (cb_mode == picoquic_packet_loop_ready) {
+        /* Ask to be polled for the next wake time before every select: the
+         * channel for a wake requested during a pump (pump_busy). */
+        if (callback_arg)
+            ((picoquic_packet_loop_options_t *)callback_arg)->do_time_check = 1;
+    } else if (cb_mode == picoquic_packet_loop_time_check) {
+        packet_loop_time_check_arg_t *tc =
+            (packet_loop_time_check_arg_t *)callback_arg;
+        int64_t ignored = 0;
+        /* The application's own deadline bounds the wait too, so a timer
+         * fires on a loop that has no connection to carry a wake time. */
+        if (tc) {
+            uint64_t ad = facade_app_deadline_us(t);
+            if (ad != UINT64_MAX) {
+                int64_t until = deadline_until_us(ad, tc->current_time);
+                if (until < tc->delta_t) tc->delta_t = until;
+                /* Reached: wake for it this once, then do not offer it again. */
+                if (ad <= tc->current_time) t->deadline_served = ad;
+            }
+        }
+        pthread_mutex_lock(&t->mutex);
+        pq_wake_sched_on_time_check(&t->sched, tc ? &tc->delta_t : &ignored);
+        pthread_mutex_unlock(&t->mutex);
+        return 0;
+    }
+    /* Any other callback means select has returned. A pass that pumps is the
+     * rerun if one was owed, and answers that wake as a wake-up pass would
+     * (see was_wake_up). */
+    pthread_mutex_lock(&t->mutex);
+    pq_wake_sched_on_pass(&t->sched,
+                          cb_mode == picoquic_packet_loop_after_receive ||
+                              cb_mode == picoquic_packet_loop_after_send ||
+                              cb_mode == picoquic_packet_loop_wake_up,
+                          cb_mode == picoquic_packet_loop_wake_up);
+    pthread_mutex_unlock(&t->mutex);
+    return loop_callback_pump(quic, cb_mode, callback_ctx, callback_arg);
+}
+
+static int loop_callback_pump(picoquic_quic_t *quic,
     picoquic_packet_loop_cb_enum cb_mode,
     void *callback_ctx, void *callback_arg)
 {
@@ -1000,16 +1132,23 @@ static int loop_callback(picoquic_quic_t *quic,
      * cycle by the public wake contract, so the pre-session early
      * returns below must mark activity for it -- otherwise a parked
      * wait() sleeps out the handshake deadline instead of waking. */
-    bool was_wake_up = (cb_mode == picoquic_packet_loop_wake_up);
+    bool was_wake_up = (cb_mode == picoquic_packet_loop_wake_up) ||
+                       t->sched.rerun_pass;
     if (was_wake_up) {
         pthread_mutex_lock(&t->mutex);
         t->wake_pending = false;
         pthread_mutex_unlock(&t->mutex);
     }
 
+    /* pass_gen: the wake generation this pass began under; work admitted
+     * before a later wake is not covered by what this pass observes. */
     pthread_mutex_lock(&t->mutex);
     bool close_requested = t->stopped || t->pump_exit;
+    uint64_t pass_gen = t->drain_gen;
     pthread_mutex_unlock(&t->mutex);
+#ifdef MOQ_PQ_THREADED_TESTING
+    t->test_pass_gen = pass_gen;
+#endif
     if (close_requested || t->fatal_close)
         return local_close_step(t, quic);
 
@@ -1019,12 +1158,12 @@ static int loop_callback(picoquic_quic_t *quic,
     if (t->perspective == MOQ_PERSPECTIVE_CLIENT && !t->conn &&
         t->active_cnx &&
         picoquic_get_cnx_state(t->active_cnx) == picoquic_state_disconnected) {
-        uint64_t local_err = picoquic_get_local_error(t->active_cnx);
+        uint64_t transport_error = client_transport_error(t->active_cnx);
         pthread_mutex_lock(&t->mutex);
         if (!t->fatal && !t->pump_exit) {
             t->fatal = true;
             t->fatal_code = 0;
-            t->terminal_error = local_err;
+            t->terminal_error = transport_error;
         }
         pthread_mutex_unlock(&t->mutex);
         client_final_pump(t, quic);
@@ -1037,19 +1176,29 @@ static int loop_callback(picoquic_quic_t *quic,
      * stays up (only endpoint-wide failures terminate the packet loop). --- */
     if (t->perspective == MOQ_PERSPECTIVE_SERVER) {
         uint64_t snow = picoquic_get_quic_time(quic);
-        if (t->conn_count == 0) {
-            /* No accepted connection yet: on_lane_pump not called, but a
-             * requested wake still completes as a no-op pump cycle. */
-            if (was_wake_up)
-                mark_activity(t);
-            return 0;
+        /* A receive that brought no connection input (acknowledgements and
+         * flow-control credit raise no callback) leaves every connection
+         * where the last pass's post-pump service left it, so the service
+         * before the pump has nothing to take in; it is skipped. The pump,
+         * the service after it, the drain publication and the activity
+         * mark run as on every pass. */
+        bool quiet = cb_mode == picoquic_packet_loop_after_receive &&
+                     t->input_seq == t->input_served;
+        /* Input arriving from here on is new to the next receive. */
+        t->input_served = t->input_seq;
+        /* The pass runs, and pumps, with no connection too: an application
+         * may have work of its own (another lane's push, a timer) whatever
+         * its connection count. */
+        if (quiet) {
+            if (t->stats_enabled) t->st_quiet_recv++;
+        } else {
+            server_service_all(t, snow);
         }
-
-        server_service_all(t, snow);
 
         if (t->on_lane_pump) {
             t->in_lane_pump = true;
-            int prc = t->on_lane_pump(t, &t->lane, snow, t->on_lane_pump_ctx);
+            int prc = t->on_lane_pump(pq_threaded_pump_self(t), &t->lane, snow,
+                                      t->on_lane_pump_ctx);
             t->in_lane_pump = false;
             if (prc != 0) {
                 pthread_mutex_lock(&t->mutex);
@@ -1062,6 +1211,9 @@ static int loop_callback(picoquic_quic_t *quic,
         /* Every conn dead before/during that pump was observable by it. */
         server_mark_dead_observed(t);
 
+#ifdef MOQ_PQ_THREADED_TESTING
+        if (t->test_stage) t->test_stage(t, 1, t->test_stage_ctx);
+#endif
         server_service_all(t, snow);
 
         /* Terminal-conn observation window: a conn that turned dead in the
@@ -1077,7 +1229,8 @@ static int loop_callback(picoquic_quic_t *quic,
          * initiated them and prunes after the current pump as before. */
         if (t->on_lane_pump && server_has_unobserved_dead(t)) {
             t->in_lane_pump = true;
-            int prc = t->on_lane_pump(t, &t->lane, snow, t->on_lane_pump_ctx);
+            int prc = t->on_lane_pump(pq_threaded_pump_self(t), &t->lane, snow,
+                                      t->on_lane_pump_ctx);
             t->in_lane_pump = false;
             if (prc != 0) {
                 pthread_mutex_lock(&t->mutex);
@@ -1089,7 +1242,7 @@ static int loop_callback(picoquic_quic_t *quic,
             server_mark_dead_observed(t);
         }
 
-        server_prune(t);   /* safe: after on_lane_pump returned */
+        server_prune(t, snow);   /* safe: after on_lane_pump returned */
 
         /* Per-connection app-wake times (each cnx has its own deadline) and an
          * aggregate drain state for moq_endpoint_drain(). */
@@ -1104,20 +1257,24 @@ static int loop_callback(picoquic_quic_t *quic,
             moq_session_t *sess = moq_pq_conn_session(c->conn);
             if (sess) {
                 uint64_t dl = moq_session_next_deadline_us(sess);
-                if (t->app_deadline_us) {
-                    uint64_t ad = t->app_deadline_us(t->app_deadline_ctx);
-                    if (ad < dl) dl = ad;
-                }
+                uint64_t ad = facade_app_deadline_us(t);
+                if (ad < dl) dl = ad;
                 picoquic_set_app_wake_time(c->cnx,
                                             dl == UINT64_MAX ? 0 : dl);
             }
             if (!(picoquic_get_cnx_state(c->cnx) == picoquic_state_ready &&
-                  moq_pq_cnx_stream_backlog_empty(c->cnx)))
+                  !moq_session_has_pending_output(sess) &&
+                  !moq_pq_conn_outbound_pending(c->conn) &&
+                  moq_pq_cnx_stream_backlog_empty(c->cnx) &&
+                  moq_pq_cnx_streams_acked(c->cnx)))
                 all_drained = false;
         }
         pthread_mutex_lock(&t->mutex);
-        t->tx_drained = all_drained;
+        t->tx_drained = all_drained && t->drain_gen == pass_gen;
         pthread_mutex_unlock(&t->mutex);
+#ifdef MOQ_PQ_THREADED_TESTING
+        if (t->test_stage) t->test_stage(t, 2, t->test_stage_ctx);
+#endif
 
         mark_activity(t);
         return 0;
@@ -1151,12 +1308,12 @@ static int loop_callback(picoquic_quic_t *quic,
             t->setup_reached = true;
         } else if (picoquic_get_cnx_state(t->active_cnx) ==
                    picoquic_state_disconnected) {
-            uint64_t local_err = picoquic_get_local_error(t->active_cnx);
+            uint64_t transport_error = client_transport_error(t->active_cnx);
             pthread_mutex_lock(&t->mutex);
             if (!t->fatal && !t->pump_exit) {
                 t->fatal = true;
                 t->fatal_code = 0;  /* transport/handshake-level failure */
-                t->terminal_error = local_err;  /* endpoint classifies (TLS vs transport) */
+                t->terminal_error = transport_error;  /* endpoint classifies (TLS vs transport) */
             }
             pthread_mutex_unlock(&t->mutex);
             client_final_pump(t, quic);
@@ -1175,7 +1332,8 @@ static int loop_callback(picoquic_quic_t *quic,
 
     if (t->on_lane_pump) {
         t->in_lane_pump = true;
-        int prc = t->on_lane_pump(t, &t->lane, now, t->on_lane_pump_ctx);
+        int prc = t->on_lane_pump(pq_threaded_pump_self(t), &t->lane, now,
+                                  t->on_lane_pump_ctx);
         t->in_lane_pump = false;
         if (prc != 0) {
             pthread_mutex_lock(&t->mutex);
@@ -1186,6 +1344,9 @@ static int loop_callback(picoquic_quic_t *quic,
         }
     }
 
+#ifdef MOQ_PQ_THREADED_TESTING
+    if (t->test_stage) t->test_stage(t, 1, t->test_stage_ctx);
+#endif
     if (moq_pq_service(t->conn, now) < 0) {
         client_service_fatal(t);
         /* The pump earlier in THIS cycle ran before the fatal was latched:
@@ -1200,30 +1361,41 @@ static int loop_callback(picoquic_quic_t *quic,
         moq_session_t *sess = moq_pq_conn_session(t->conn);
         if (sess) {
             uint64_t dl = moq_session_next_deadline_us(sess);
-            if (t->app_deadline_us) {
-                uint64_t ad = t->app_deadline_us(t->app_deadline_ctx);
-                if (ad < dl) dl = ad;
-            }
+            uint64_t ad = facade_app_deadline_us(t);
+            if (ad < dl) dl = ad;
             picoquic_set_app_wake_time(t->active_cnx,
                                         dl == UINT64_MAX ? 0 : dl);
         }
     }
 
-    /* Publish graceful-drain state (network thread) for moq_endpoint_drain():
-     * local stream flush is done once no stream has queued/ready reliable data
-     * or an unsent FIN -- every reliable stream byte + FIN handed to the
-     * transport. Deliberately NOT the packet-ACK backlog, which can stay
-     * non-empty on an idle connection after the bytes are sent. The probe is
-     * network-thread-only and side-effect free. */
+    /* Publish graceful-drain state (network thread) for moq_endpoint_drain().
+     * Drained: the session holds no pending output
+     * (moq_session_has_pending_output: no unpolled action, no retained
+     * FIN/RESET/STOP, response or cancellation -- a pass that stopped at the
+     * bridge's budget leaves some), the bridge holds no outbound action, no
+     * stream has queued/ready
+     * reliable data or an unsent FIN (every byte and FIN handed to picoquic),
+     * and the peer has acknowledged every stream's send half
+     * (moq_pq_cnx_streams_acked: sent bytes, FIN, RESET and reliable prefix --
+     * never a peer FIN, and not the packet backlog, which ACK-only packets keep
+     * non-empty on an idle connection). Published only when no wake arrived
+     * since the pass began, so it never predates work queued before that
+     * wake. Network-thread-only and side-effect free. */
     {
         bool drained =
             t->active_cnx &&
             picoquic_get_cnx_state(t->active_cnx) == picoquic_state_ready &&
-            moq_pq_cnx_stream_backlog_empty(t->active_cnx);
+            !moq_session_has_pending_output(moq_pq_conn_session(t->conn)) &&
+            !moq_pq_conn_outbound_pending(t->conn) &&
+            moq_pq_cnx_stream_backlog_empty(t->active_cnx) &&
+            moq_pq_cnx_streams_acked(t->active_cnx);
         pthread_mutex_lock(&t->mutex);
-        t->tx_drained = drained;
+        t->tx_drained = drained && t->drain_gen == pass_gen;
         pthread_mutex_unlock(&t->mutex);
     }
+#ifdef MOQ_PQ_THREADED_TESTING
+    if (t->test_stage) t->test_stage(t, 2, t->test_stage_ctx);
+#endif
 
     mark_activity(t);
     return 0;
@@ -1289,8 +1461,9 @@ void moq_pq_threaded_cfg_init_sized(moq_pq_threaded_cfg_t *cfg, size_t cfg_size)
 /* create                                                              */
 /* ------------------------------------------------------------------ */
 
-moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
-                                     moq_pq_threaded_t **out)
+static moq_result_t create_facade(const moq_pq_threaded_cfg_t *cfg,
+                                  const pq_lane_opts_t *opts,
+                                  moq_pq_threaded_t **out)
 {
     if (out) *out = NULL;
     if (!cfg || !out) return MOQ_ERR_INVAL;
@@ -1311,9 +1484,9 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
     if (!CFG_HAS(cfg, on_lane_pump) || !cfg->on_lane_pump)
         return MOQ_ERR_INVAL;
 
-    /* picoquic_threaded is single-thread: exactly one lane. Reject any
-     * real multi-lane request rather than faking it behind one domain. */
-    if (CFG_HAS(cfg, lane_count) && cfg->lane_count > 1)
+    /* One lane runs one network thread. A server's lane_count > 1 is the
+     * lane group, dispatched by the public create; a client's is refused. */
+    if (!opts && CFG_HAS(cfg, lane_count) && cfg->lane_count > 1)
         return MOQ_ERR_UNSUPPORTED;
 
     int port = CFG_HAS(cfg, port) ? cfg->port : 0;
@@ -1335,6 +1508,18 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
             return MOQ_ERR_INVAL;
     }
 
+    /* Terminal retention is a server-child contract; a client's single
+     * connection has nothing to acknowledge. */
+    bool retain = CFG_HAS(cfg, retain_terminal_until_ack) &&
+                  cfg->retain_terminal_until_ack;
+    if (retain && persp != MOQ_PERSPECTIVE_SERVER)
+        return MOQ_ERR_INVAL;
+    /* The socket option carries an int: a size it cannot represent is
+     * refused, not silently clamped. */
+    if (CFG_HAS(cfg, socket_buffer_bytes) &&
+        cfg->socket_buffer_bytes > (uint32_t)INT32_MAX)
+        return MOQ_ERR_INVAL;
+
     /* Allocate wrapper. */
     moq_pq_threaded_t *t = (moq_pq_threaded_t *)cfg->alloc->alloc(
         sizeof(moq_pq_threaded_t), cfg->alloc->ctx);
@@ -1344,6 +1529,24 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
     t->alloc = *cfg->alloc;
     t->perspective = persp;
     t->port = port;
+    t->retain_terminal = retain;
+    t->streaming_objects =
+        CFG_HAS(cfg, streaming_objects) && cfg->streaming_objects;
+    if (CFG_HAS(cfg, socket_buffer_bytes))
+        t->socket_buffer_bytes = cfg->socket_buffer_bytes;
+    if (persp == MOQ_PERSPECTIVE_SERVER && CFG_HAS(cfg, bind_address) &&
+        cfg->bind_address) {
+        size_t alen = cfg->bind_address->sa_family == AF_INET
+                          ? sizeof(struct sockaddr_in)
+                      : cfg->bind_address->sa_family == AF_INET6
+                          ? sizeof(struct sockaddr_in6)
+                          : 0;
+        if (alen == 0) {
+            t->alloc.free(t, sizeof(*t), t->alloc.ctx);
+            return MOQ_ERR_INVAL;
+        }
+        memcpy(&t->bind_address, cfg->bind_address, alen);
+    }
     {   /* Characterization telemetry: opt-in, off unless env set to non-"0". */
         const char *se = getenv("MOQ_PQ_THREADED_STATS");
         t->stats_enabled = se && *se && strcmp(se, "0") != 0;
@@ -1390,8 +1593,18 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
         t->app_deadline_us = cfg->app_deadline_us;
         t->app_deadline_ctx = cfg->app_deadline_ctx;
     }
+    /* app_lane_deadline_us + app_lane_deadline_ctx are ONE ABI block: read
+     * only when struct_size covers THROUGH app_lane_deadline_ctx. The one-lane
+     * facade folds it for lane 0, as the header promises. */
+    if (CFG_HAS(cfg, app_lane_deadline_ctx)) {
+        t->app_lane_deadline_us = cfg->app_lane_deadline_us;
+        t->app_lane_deadline_ctx = cfg->app_lane_deadline_ctx;
+    }
     t->lane.owner = t;
-    t->lane.index = 0;
+    t->lane.index = opts ? opts->index : 0;
+    t->group = opts ? opts->group : NULL;
+    t->own_loop = opts != NULL;
+    t->wake_fd = opts ? opts->wake_fd : -1;
     if (CFG_HAS(cfg, on_activity)) {
         t->on_activity = cfg->on_activity;
         t->on_activity_ctx = cfg->on_activity_ctx;
@@ -1403,6 +1616,12 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
         return MOQ_ERR_INTERNAL;
     }
     if (pthread_cond_init(&t->cond, NULL) != 0) {
+        pthread_mutex_destroy(&t->mutex);
+        t->alloc.free(t, sizeof(*t), t->alloc.ctx);
+        return MOQ_ERR_INTERNAL;
+    }
+    if (pq_net_startup() != 0) {
+        pthread_cond_destroy(&t->cond);
         pthread_mutex_destroy(&t->mutex);
         t->alloc.free(t, sizeof(*t), t->alloc.ctx);
         return MOQ_ERR_INTERNAL;
@@ -1439,6 +1658,7 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
         if (moq_alpn_to_version(t->alpn_list[i], strlen(t->alpn_list[i]), &v) &&
             v == MOQ_VERSION_DRAFT_22) {
             free_alpn_list(t);
+            pq_net_cleanup();
             pthread_cond_destroy(&t->cond);
             pthread_mutex_destroy(&t->mutex);
             t->alloc.free(t, sizeof(*t), t->alloc.ctx);
@@ -1467,6 +1687,7 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
                                                    &t->target_bytes_len);
         if (trc != MOQ_OK) {
             free_alpn_list(t);
+            pq_net_cleanup();
             pthread_cond_destroy(&t->cond);
             pthread_mutex_destroy(&t->mutex);
             t->alloc.free(t, sizeof(*t), t->alloc.ctx);
@@ -1486,6 +1707,7 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
         if (src != MOQ_OK) {
             free_alpn_list(t);
             free_target(t);
+            pq_net_cleanup();
             pthread_cond_destroy(&t->cond);
             pthread_mutex_destroy(&t->mutex);
             t->alloc.free(t, sizeof(*t), t->alloc.ctx);
@@ -1510,7 +1732,9 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
          * sourced from the uint32_t cfg field or the 1024 default. */
         t->quic = picoquic_create((uint32_t)t->max_connections, cert, key,
             NULL, default_alpn, server_callback, t,
-            NULL, NULL, NULL, now, NULL, NULL, NULL, 0);
+            opts ? opts->cnx_id_cb : NULL, opts ? opts->cnx_id_ctx : NULL,
+            NULL, now, NULL, NULL,
+            opts ? opts->ticket_key : NULL, opts ? opts->ticket_key_len : 0);
         if (t->quic && t->alpn_count > 1)
             picoquic_set_alpn_select_fn_v2(t->quic, threaded_alpn_select);
     } else {
@@ -1519,6 +1743,10 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
             NULL, NULL, NULL, now, NULL, NULL, NULL, 0);
     }
     if (!t->quic) goto fail_quic;
+    /* The group's connection ID length, before any connection exists. */
+    if (opts && opts->cid_len &&
+        picoquic_set_default_connection_id_length(t->quic, opts->cid_len) != 0)
+        goto fail_configure;
 
     /* Negotiate QUIC DATAGRAM in both directions so the adapter's advertised
      * CAP_DATAGRAM is real rather than silently dropped: this is the max
@@ -1598,6 +1826,30 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
 
     if (t->configure_quic_fn) {
         if (t->configure_quic_fn(t->quic, t->configure_quic_ctx) != 0)
+            goto fail_configure;
+    }
+
+    /* A lane group owns the context invariants the hook must not move out from
+     * under it, so they are re-asserted here, after the hook and before any
+     * connection or thread (opts->cid_len marks a group lane; the one-lane
+     * facade keeps the hook's choices):
+     *   - the routed connection-ID length, which the router reads;
+     *   - stateless-reset sending on, which the group's cross-lane reset
+     *     detection relies on (a lane answers an unknown CID with a reset);
+     *   - early data refused, because every lane shares one ticket key and
+     *     0-RTT across lanes would be replayable. Session resumption (1-RTT)
+     *     still works; only early data is rejected;
+     *   - the advertised receive packet-size ceiling (the max_packet_size
+     *     transport parameter) held at what a lane's receive path accepts: a
+     *     larger value lets a peer send datagrams the group drops as oversize.
+     *     This is the UDP payload bound, not max_datagram_frame_size. */
+    if (opts && opts->cid_len) {
+        if (picoquic_set_default_connection_id_length(t->quic, opts->cid_len) != 0)
+            goto fail_configure;
+        picoquic_set_stateless_reset_sending(t->quic, 1);
+        picoquic_set_accept_0rtt(t->quic, 0);
+        if (picoquic_set_default_tp_value(t->quic, picoquic_tp_max_packet_size,
+                                          PICOQUIC_MAX_PACKET_SIZE) != 0)
             goto fail_configure;
     }
 
@@ -1684,6 +1936,15 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
     memset(&t->loop_param, 0, sizeof(t->loop_param));
     if (persp == MOQ_PERSPECTIVE_SERVER)
         t->loop_param.local_port = (uint16_t)port;
+    if (t->bind_address.ss_family != 0)
+        t->loop_param.local_addr[0] = t->bind_address;
+    t->loop_param.socket_buffer_size = (int)t->socket_buffer_bytes;
+
+    if (opts) {
+        /* A lane of a group: the group starts the loop on its own thread. */
+        *out = t;
+        return MOQ_OK;
+    }
 
     picoquic_network_thread_ctx_t *tctx = NULL;
     for (int attempt = 0; attempt < 3 && !tctx; attempt++) {
@@ -1693,7 +1954,7 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
         int thread_ret = 0;
         picoquic_network_thread_ctx_t *cand =
             picoquic_start_network_thread(t->quic, &t->loop_param,
-                loop_callback, t, &thread_ret);
+                moq_pq_threaded_loop_callback, t, &thread_ret);
         if (!cand) continue;
         /* Wait on OUR ready latch, not thread_ctx->thread_is_ready: the
          * loop clears that flag again when it exits, so a loop that came
@@ -1712,10 +1973,10 @@ moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
              * sockloop). A pre-ready death simply never signals, so the
              * bounded timedwait expires and the thread is torn down. */
             struct timespec deadline;
-            clock_gettime(CLOCK_REALTIME, &deadline);
-            deadline.tv_sec += 2;
+            bool has_deadline = clock_gettime(CLOCK_REALTIME, &deadline) == 0;
+            if (has_deadline) deadline.tv_sec += 2;
             pthread_mutex_lock(&t->mutex);
-            while (!t->loop_came_up) {
+            while (!t->loop_came_up && has_deadline) {
                 if (pthread_cond_timedwait(&t->cond, &t->mutex,
                                            &deadline) != 0)
                     break;   /* timeout or error: give up waiting */
@@ -1754,10 +2015,29 @@ fail_quic:
 fail_cfg_strings:
     free_alpn_list(t);
     free_target(t);
+    pq_net_cleanup();
     pthread_cond_destroy(&t->cond);
     pthread_mutex_destroy(&t->mutex);
     t->alloc.free(t, sizeof(*t), t->alloc.ctx);
     return MOQ_ERR_INTERNAL;
+}
+
+moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
+                                     moq_pq_threaded_t **out)
+{
+    if (out) *out = NULL;
+    if (!cfg || !out) return MOQ_ERR_INVAL;
+    if (CFG_HAS(cfg, lane_count) && cfg->lane_count > 1 &&
+        CFG_HAS(cfg, perspective) && cfg->perspective == MOQ_PERSPECTIVE_SERVER)
+        return pq_lane_group_create(cfg, out);
+    return create_facade(cfg, NULL, out);
+}
+
+moq_result_t moq_pq_threaded_create_lane(const moq_pq_threaded_cfg_t *cfg,
+                                         const pq_lane_opts_t *opts,
+                                         moq_pq_threaded_t **out)
+{
+    return create_facade(cfg, opts, out);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1767,6 +2047,7 @@ fail_cfg_strings:
 moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
 {
     if (!t) return MOQ_ERR_INVAL;
+    if (t->group_ctx) return pq_lane_group_stop(t->group_ctx);
 
     pthread_mutex_lock(&t->mutex);
 
@@ -1803,16 +2084,23 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
          * callback. */
         (void)picoquic_wake_up_network_thread(ctx);
         struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec += 3;
-        pthread_mutex_lock(&t->mutex);
-        while (t->loop_running) {
-            if (pthread_cond_timedwait(&t->cond, &t->mutex,
-                                       &deadline) == ETIMEDOUT)
-                break;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) == 0) {
+            deadline.tv_sec += 3;
+            pthread_mutex_lock(&t->mutex);
+            while (t->loop_running) {
+                if (pthread_cond_timedwait(&t->cond, &t->mutex,
+                                           &deadline) != 0)
+                    break;
+            }
+            pthread_mutex_unlock(&t->mutex);
         }
-        pthread_mutex_unlock(&t->mutex);
+        /* A failed clock/wait only skips the graceful wait, never the join.
+         * All wake borrowers already left through the fence above. */
         picoquic_delete_network_thread(ctx);
+    } else if (t->own_loop) {
+        /* The group's loop observes t->stopped on its next turn, runs the
+         * bounded local close, and exits; the group joins the thread. */
+        pq_lane_group_lane_stop(t);
     }
 
     /* Characterization telemetry: read only network-thread snapshots after
@@ -1854,7 +2142,8 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
             "pkts_per_positive_send_avg=%.2f pkts_per_send_max=%llu "
             "after_recv=%llu wake=%llu service_all=%llu "
             "prepare=%llu provided=%llu q_high_water=%llu q_would_block=%llu "
-            "cwin=%llu rtt_us=%llu pacing_Bps=%llu bytes_sent=%llu\n",
+            "cwin=%llu rtt_us=%llu pacing_Bps=%llu bytes_sent=%llu "
+            "quiet_recv=%llu\n",
             t->perspective == MOQ_PERSPECTIVE_SERVER ? "server" : "client",
             (unsigned long long)t->st_after_send,
             (unsigned long long)t->st_after_send_nz,
@@ -1870,7 +2159,8 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
             (unsigned long long)agg.queue_would_block,
             (unsigned long long)q.cwin, (unsigned long long)q.rtt,
             (unsigned long long)q.pacing_rate,
-            (unsigned long long)q.bytes_sent);
+            (unsigned long long)q.bytes_sent,
+            (unsigned long long)t->st_quiet_recv);
     }
 
     pthread_mutex_lock(&t->mutex);
@@ -1887,6 +2177,18 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
 void moq_pq_threaded_destroy(moq_pq_threaded_t *t)
 {
     if (!t) return;
+    if (t->group_ctx) {
+        pq_lane_group_destroy(t->group_ctx);
+        t->group_ctx = NULL;
+        /* the group facade itself: no context, no connections */
+        free_alpn_list(t);
+        free_target(t);
+        pthread_cond_destroy(&t->cond);
+        pthread_mutex_destroy(&t->mutex);
+        moq_alloc_t alloc = t->alloc;
+        alloc.free(t, sizeof(*t), alloc.ctx);
+        return;
+    }
 
     /* The network thread is already stopped and joined (moq_pq_threaded_stop),
      * so nothing races this teardown. Server connections: destroy each record
@@ -1909,6 +2211,7 @@ void moq_pq_threaded_destroy(moq_pq_threaded_t *t)
     free_alpn_list(t);
     free_target(t);
 
+    pq_net_cleanup();
     pthread_cond_destroy(&t->cond);
     pthread_mutex_destroy(&t->mutex);
     moq_alloc_t alloc = t->alloc;
@@ -1921,7 +2224,7 @@ void moq_pq_threaded_destroy(moq_pq_threaded_t *t)
 
 moq_session_t *moq_pq_threaded_session(moq_pq_threaded_t *t)
 {
-    if (!t) return NULL;
+    if (!t || t->group_ctx) return NULL;   /* a group has no single session */
     pthread_mutex_lock(&t->mutex);
     moq_session_t *s = t->session;
     pthread_mutex_unlock(&t->mutex);
@@ -1930,7 +2233,7 @@ moq_session_t *moq_pq_threaded_session(moq_pq_threaded_t *t)
 
 moq_version_t moq_pq_threaded_negotiated_version(const moq_pq_threaded_t *t)
 {
-    if (!t) return (moq_version_t)0;
+    if (!t || t->group_ctx) return (moq_version_t)0;
     moq_pq_threaded_t *mt = (moq_pq_threaded_t *)t;
     pthread_mutex_lock(&mt->mutex);
     moq_version_t v = t->negotiated;
@@ -1940,7 +2243,7 @@ moq_version_t moq_pq_threaded_negotiated_version(const moq_pq_threaded_t *t)
 
 moq_pq_conn_t *moq_pq_threaded_conn(moq_pq_threaded_t *t)
 {
-    if (!t) return NULL;
+    if (!t || t->group_ctx) return NULL;
     pthread_mutex_lock(&t->mutex);
     moq_pq_conn_t *c = t->conn;
     pthread_mutex_unlock(&t->mutex);
@@ -1982,13 +2285,19 @@ static bool pq_in_pump_window(const moq_pq_threaded_t *t)
 
 uint32_t moq_pq_threaded_lane_count(const moq_pq_threaded_t *t)
 {
-    return t ? 1u : 0u;
+    if (!t) return 0u;
+    return t->group_ctx ? pq_lane_group_count(t->group_ctx) : 1u;
 }
 
 moq_pq_threaded_lane_t *moq_pq_threaded_lane(moq_pq_threaded_t *t,
                                              uint32_t index)
 {
-    if (!t || index != 0) return NULL;
+    if (!t) return NULL;
+    if (t->group_ctx) {
+        moq_pq_threaded_t *lane = pq_lane_group_lane(t->group_ctx, index);
+        return lane ? &lane->lane : NULL;
+    }
+    if (index != 0) return NULL;
     return &t->lane;
 }
 
@@ -2033,9 +2342,38 @@ moq_result_t moq_pq_threaded_conn_close(moq_pq_threaded_conn_t *conn,
     return MOQ_OK;
 }
 
+void moq_picoquic_threaded_conn_set_user(moq_pq_threaded_conn_t *conn,
+                                         void *user)
+{
+    if (conn && pq_in_pump_window(conn->parent)) conn->user = user;
+}
+
+void *moq_picoquic_threaded_conn_user(const moq_pq_threaded_conn_t *conn)
+{
+    return conn && pq_in_pump_window(conn->parent) ? conn->user : NULL;
+}
+
+moq_result_t moq_picoquic_threaded_conn_ack_terminal(moq_pq_threaded_conn_t *conn)
+{
+    if (!conn) return MOQ_ERR_INVAL;
+    moq_pq_threaded_t *t = conn->parent;
+    if (!t || !t->retain_terminal || !pq_in_pump_window(t))
+        return MOQ_ERR_WRONG_STATE;
+    if (conn->acked) return MOQ_OK;
+    /* Terminal, and its SESSION_CLOSED already transferred by a poll. A
+     * connection closed by the application is told it is closed only when
+     * its transport is retired after this pump, so it is acknowledgeable on a
+     * later one. */
+    if (!server_conn_dead(conn) || !moq_pq_conn_terminal_observed(conn->conn))
+        return MOQ_ERR_WRONG_STATE;
+    conn->acked = true;
+    return MOQ_OK;
+}
+
 size_t moq_pq_threaded_conn_count(const moq_pq_threaded_t *t)
 {
     if (!t) return 0;
+    if (t->group_ctx) return pq_lane_group_conn_count(t->group_ctx);
     moq_pq_threaded_t *mt = (moq_pq_threaded_t *)t;
     pthread_mutex_lock(&mt->mutex);
     size_t n = mt->conn_count;
@@ -2050,6 +2388,7 @@ size_t moq_pq_threaded_conn_count(const moq_pq_threaded_t *t)
 int moq_pq_threaded_drain_state(moq_pq_threaded_t *t)
 {
     if (!t) return 0;
+    if (t->group_ctx) return pq_lane_group_drain_state(t->group_ctx);
     pthread_mutex_lock(&t->mutex);
     if (t->network_thread_id_set &&
         pthread_equal(pthread_self(), t->network_thread_id)) {
@@ -2064,6 +2403,7 @@ int moq_pq_threaded_drain_state(moq_pq_threaded_t *t)
 bool moq_pq_threaded_is_fatal(const moq_pq_threaded_t *t)
 {
     if (!t) return false;
+    if (t->group_ctx) return pq_lane_group_is_fatal(t->group_ctx);
     moq_pq_threaded_t *mt = (moq_pq_threaded_t *)t;
     pthread_mutex_lock(&mt->mutex);
     bool f = mt->fatal;
@@ -2074,6 +2414,7 @@ bool moq_pq_threaded_is_fatal(const moq_pq_threaded_t *t)
 uint64_t moq_pq_threaded_fatal_code(const moq_pq_threaded_t *t)
 {
     if (!t) return 0;
+    if (t->group_ctx) return pq_lane_group_fatal_code(t->group_ctx);
     moq_pq_threaded_t *mt = (moq_pq_threaded_t *)t;
     pthread_mutex_lock(&mt->mutex);
     uint64_t c = mt->fatal_code;
@@ -2104,22 +2445,57 @@ moq_result_t moq_pq_threaded_lane_wake(moq_pq_threaded_lane_t *lane)
 moq_result_t moq_pq_threaded_wake(moq_pq_threaded_t *t)
 {
     if (!t) return MOQ_ERR_INVAL;
+    if (t->group_ctx) return pq_lane_group_wake_all(t->group_ctx);
 
     pthread_mutex_lock(&t->mutex);
-    if (t->stopped || t->fatal || t->pump_exit || !t->thread_ctx) {
+    /* Whatever the caller queued before this wake is unobserved until a pass
+     * that begins after it: the cached drain state no longer stands. */
+    t->drain_gen++;
+    t->tx_drained = false;
+    if (t->stopped || t->fatal || t->pump_exit ||
+        (!t->thread_ctx && !t->own_loop)) {
         pthread_mutex_unlock(&t->mutex);
         return MOQ_ERR_CLOSED;
     }
+#ifdef _WIN32
+    /* No Windows constructor can produce a group-owned loop. */
+    if (t->own_loop) {
+        pthread_mutex_unlock(&t->mutex);
+        return MOQ_ERR_UNSUPPORTED;
+    }
+#endif
     if (t->wake_pending) {
+        pthread_mutex_unlock(&t->mutex);
+        return MOQ_OK;
+    }
+    if (pq_wake_sched_on_wake(&t->sched) == PQ_WAKE_RERUN) {
+        /* The network thread is not blocked: the next time check runs a pass
+         * for this wake, without a pipe write (see pq_wake_sched.h). */
         pthread_mutex_unlock(&t->mutex);
         return MOQ_OK;
     }
     t->wake_pending = true;
     t->wake_in_flight++;
     picoquic_network_thread_ctx_t *ctx = t->thread_ctx;
+#ifndef _WIN32
+    int wake_fd = t->wake_fd;
+#endif
     pthread_mutex_unlock(&t->mutex);
 
-    int rc = picoquic_wake_up_network_thread(ctx);
+    int rc;
+#ifndef _WIN32
+    if (t->own_loop) {
+        /* The group's loop drains its pipe every turn; a full pipe already
+         * holds a wake, so EAGAIN is a delivered wake. */
+        uint8_t one = 1;
+        ssize_t n = write(wake_fd, &one, 1);
+        rc = (n == 1 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
+                 ? 0 : -1;
+    } else
+#endif
+    {
+        rc = picoquic_wake_up_network_thread(ctx);
+    }
 
     pthread_mutex_lock(&t->mutex);
     t->wake_in_flight--;
@@ -2163,7 +2539,10 @@ moq_result_t moq_pq_threaded_wait(moq_pq_threaded_t *t,
     struct timespec deadline;
     bool has_deadline = (timeout_us != UINT64_MAX);
     if (has_deadline) {
-        clock_gettime(CLOCK_REALTIME, &deadline);
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            pthread_mutex_unlock(&t->mutex);
+            return MOQ_ERR_INTERNAL;
+        }
         deadline.tv_sec  += (time_t)(timeout_us / 1000000ULL);
         deadline.tv_nsec += (long)((timeout_us % 1000000ULL) * 1000ULL);
         if (deadline.tv_nsec >= 1000000000L) {
@@ -2172,14 +2551,15 @@ moq_result_t moq_pq_threaded_wait(moq_pq_threaded_t *t,
         }
     }
 
+    bool wait_failed = false;
     while (!t->activity_pending && !t->stopped &&
            !t->fatal && !t->pump_exit) {
-        if (has_deadline) {
-            int wrc = pthread_cond_timedwait(&t->cond, &t->mutex,
-                                              &deadline);
-            if (wrc == ETIMEDOUT) break;
-        } else {
-            pthread_cond_wait(&t->cond, &t->mutex);
+        int wrc = has_deadline
+            ? pthread_cond_timedwait(&t->cond, &t->mutex, &deadline)
+            : pthread_cond_wait(&t->cond, &t->mutex);
+        if (wrc != 0) {
+            wait_failed = !has_deadline || wrc != ETIMEDOUT;
+            break;
         }
     }
 
@@ -2189,6 +2569,8 @@ moq_result_t moq_pq_threaded_wait(moq_pq_threaded_t *t,
     } else if (t->activity_pending) {
         t->activity_pending = false;
         result = MOQ_OK;
+    } else if (wait_failed) {
+        result = MOQ_ERR_INTERNAL;
     } else {
         result = MOQ_DONE;
     }

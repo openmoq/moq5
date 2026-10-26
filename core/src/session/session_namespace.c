@@ -62,6 +62,12 @@ void ann_free_entry(moq_session_t *s, size_t slot)
         e->ns_id_buf = NULL;
         e->ns_id_len = 0;
     }
+    if (e->role == MOQ_ANN_ROLE_RECEIVER) {
+        size_t charge = e->cluster.hop_count * sizeof(uint64_t);
+        s->recv_payload_bytes =
+            charge <= s->recv_payload_bytes ? s->recv_payload_bytes - charge : 0;
+    }
+    session_cluster_free(s, &e->cluster);
     ns_update_release(s, &e->update);
     uint32_t next_gen = e->generation + 1;
     uint8_t *recv_buf = e->rs.recv_buf;
@@ -576,8 +582,20 @@ static bool ann_projection_fits(const moq_session_t *s,
     for (size_t i = 0; i < d->token_count; ++i)
         if (!ann_scratch_region(s->event_scratch_cap, &cursor,
                 d->tokens[i].token_value.len, 1)) return false;
-    return !d->token_count || ann_scratch_region(s->event_scratch_cap, &cursor,
-        d->token_count * sizeof(moq_resolved_token_t), _Alignof(moq_resolved_token_t));
+    if (d->token_count && !ann_scratch_region(s->event_scratch_cap, &cursor,
+                                              d->token_count * sizeof(moq_resolved_token_t),
+                                              _Alignof(moq_resolved_token_t)))
+        return false;
+    moq_buf_reader_t path = {d->cluster_hop_path.data, d->cluster_hop_path.len, 0};
+    size_t hops = 0;
+    uint64_t id;
+    while (path.pos < path.len) {
+        if (moq_buf_read_vi64(&path, &id) != MOQ_OK)
+            return false;
+        ++hops;
+    }
+    return !hops || ann_scratch_region(s->event_scratch_cap, &cursor, hops * sizeof(uint64_t),
+                                       _Alignof(uint64_t));
 }
 
 /* -- Incoming PUBLISH_NAMESPACE handler (semantic) ------------------ */
@@ -592,6 +610,24 @@ moq_result_t session_core_on_publish_namespace(moq_session_t *s,
     uint8_t *nid = NULL;
     size_t nid_len = 0;
     size_t scratch_saved = s->event_scratch_len;
+    moq_cluster_metadata_t cluster = {0};
+    if ((s->cluster_negotiated && !d->cluster_hop_path.len) ||
+        (!s->cluster_negotiated && (d->cluster_hop_path.len || d->cluster_has_route_cost))) {
+        result = close_with_error(s, 0x3, "cluster namespace metadata without negotiation or path");
+        goto cleanup_all;
+    }
+    rc = session_cluster_decode(s, d->cluster_hop_path, d->cluster_has_route_cost,
+                                d->cluster_route_cost, &cluster);
+    if (rc < 0) {
+        result = rc;
+        goto cleanup_all;
+    }
+    size_t cluster_bytes = cluster.hop_count * sizeof(uint64_t);
+    if (s->recv_payload_bytes > s->max_recv_buf ||
+        cluster_bytes > s->max_recv_buf - s->recv_payload_bytes) {
+        result = close_with_error(s, 0x1, "namespace path exceeds receive budget");
+        goto cleanup_all;
+    }
 
     bool retained = s->profile->premature_fin_fails_request;
     if (!retained && event_queue_full(s)) {
@@ -695,6 +731,11 @@ moq_result_t session_core_on_publish_namespace(moq_session_t *s,
         goto cleanup_all;
     }
 
+    if (s->cluster_negotiated &&
+        session_cluster_namespace_duplicate(s, &d->track_namespace, false, -1)) {
+        result = close_with_error(s, 0x3, "duplicate namespace advertisement");
+        goto cleanup_all;
+    }
     moq_namespace_t ev_ns;
     if (!event_scratch_copy_namespace(s, &d->track_namespace, &ev_ns)) {
         if (scratch_saved == 0) {
@@ -767,6 +808,12 @@ moq_result_t session_core_on_publish_namespace(moq_session_t *s,
     e.u.namespace_published.tokens = ev_tokens;
     e.u.namespace_published.token_count = d->token_count;
 
+    rc = session_cluster_event(s, &cluster, &e.u.namespace_published.cluster);
+    if (rc < 0) {
+        s->event_scratch_len = scratch_saved;
+        result = rc;
+        goto cleanup_all;
+    }
     rc = push_event(s, &e);
     if (rc < 0) {
         s->event_scratch_len = scratch_saved;
@@ -782,6 +829,8 @@ moq_result_t session_core_on_publish_namespace(moq_session_t *s,
     entry->request_id = d->request_id;
     entry->ns_id_buf = nid;
     entry->ns_id_len = nid_len;
+    entry->cluster = cluster;
+    s->recv_payload_bytes += cluster.hop_count * sizeof(uint64_t);
     if (retained) {
         (void)moq_request_lifetime_init(&entry->rs.lifetime,
             MOQ_REQUEST_FAMILY_ANNOUNCEMENT, false);
@@ -809,6 +858,7 @@ moq_result_t session_core_on_publish_namespace(moq_session_t *s,
     return MOQ_OK;
 
 cleanup_all:
+    session_cluster_free(s, &cluster);
     process_auth_tokens_free_staging(s, d->tokens, d->token_staged,
         d->token_count);
     if (nid) s->alloc.free(nid, nid_len, s->alloc.ctx);
@@ -1072,11 +1122,30 @@ moq_result_t session_core_on_announcement_error(moq_session_t *s,
 
 /* -- Public API: publish_namespace ---------------------------------- */
 
-void moq_publish_namespace_cfg_init(moq_publish_namespace_cfg_t *cfg)
+/* Exact old layout: ARM ILP32 is 20 bytes/alignment 4, whereas the appended
+ * metadata raises the current struct's alignment and starts at offset 24. */
+typedef struct publish_namespace_legacy_cfg {
+    uint32_t struct_size;
+    moq_namespace_t track_namespace;
+    const moq_auth_token_t *auth_tokens;
+    size_t auth_token_count;
+} publish_namespace_legacy_cfg_t;
+_Static_assert(sizeof(publish_namespace_legacy_cfg_t) == MOQ_PUBLISH_NAMESPACE_CFG_LEGACY_SIZE,
+               "namespace initializer preserves the actual historical extent");
+
+void(moq_publish_namespace_cfg_init)(moq_publish_namespace_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_publish_namespace_cfg_t);
+    moq_publish_namespace_cfg_init_sized(cfg, MOQ_PUBLISH_NAMESPACE_CFG_LEGACY_SIZE);
+}
+
+void moq_publish_namespace_cfg_init_sized(moq_publish_namespace_cfg_t *cfg, size_t cfg_size)
+{
+    if (!cfg || cfg_size < sizeof(cfg->struct_size))
+        return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    memset(cfg, 0, n);
+    uint32_t written = (uint32_t)n;
+    memcpy(cfg, &written, sizeof(written));
 }
 
 moq_result_t moq_session_publish_namespace(moq_session_t *s,
@@ -1084,11 +1153,27 @@ moq_result_t moq_session_publish_namespace(moq_session_t *s,
     moq_announcement_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
-#define PNS_CFG_MIN offsetof(moq_publish_namespace_cfg_t, auth_tokens)
-#define PNS_CFG_HAS(f) (cfg->struct_size >= \
-    offsetof(moq_publish_namespace_cfg_t, f) + sizeof(cfg->f))
-    if (cfg->struct_size < PNS_CFG_MIN)
+    uint32_t cfg_size;
+    memcpy(&cfg_size, cfg, sizeof(cfg_size));
+    if (cfg_size < MOQ_PUBLISH_NAMESPACE_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
+    moq_publish_namespace_cfg_t local = {0};
+    local.struct_size = cfg_size;
+#define PNS_CFG_COPY(f) do { \
+    if (cfg_size >= offsetof(moq_publish_namespace_cfg_t, f) + sizeof(local.f)) \
+        memcpy(&local.f, (const uint8_t *)cfg + offsetof(moq_publish_namespace_cfg_t, f), \
+               sizeof(local.f)); \
+} while (0)
+    PNS_CFG_COPY(track_namespace);
+    if (cfg_size >= offsetof(moq_publish_namespace_cfg_t, auth_token_count) + sizeof(size_t)) {
+        PNS_CFG_COPY(auth_tokens);
+        PNS_CFG_COPY(auth_token_count);
+    }
+    PNS_CFG_COPY(cluster);
+#undef PNS_CFG_COPY
+    cfg = &local;
+#define PNS_CFG_HAS(f) (cfg_size >= \
+    offsetof(moq_publish_namespace_cfg_t, f) + sizeof(local.f))
     *out_handle = MOQ_ANNOUNCEMENT_INVALID;
 
     const moq_auth_token_t *auth_tokens = NULL;
@@ -1097,6 +1182,13 @@ moq_result_t moq_session_publish_namespace(moq_session_t *s,
         auth_tokens = cfg->auth_tokens;
         auth_token_count = cfg->auth_token_count;
     }
+    moq_cluster_metadata_t cluster_input = {0};
+    if (PNS_CFG_HAS(cluster))
+        cluster_input = cfg->cluster;
+    if (!s->cluster_negotiated && (cluster_input.hop_count || cluster_input.has_route_cost))
+        return MOQ_ERR_UNSUPPORTED;
+    if (session_cluster_validate(&cluster_input, s->cluster_negotiated) < 0)
+        return MOQ_ERR_INVAL;
     /* The application may not publish under a reserved session-level
      * namespace. */
     if (s->profile->reserved_session_namespaces &&
@@ -1143,14 +1235,25 @@ moq_result_t moq_session_publish_namespace(moq_session_t *s,
         return MOQ_ERR_NOMEM;
     }
 
-    if (ann_is_duplicate_ns(s, nid, nid_len, MOQ_ANN_ROLE_ANNOUNCER)) {
+    if (ann_is_duplicate_ns(s, nid, nid_len, MOQ_ANN_ROLE_ANNOUNCER) ||
+        (s->cluster_negotiated &&
+         session_cluster_namespace_duplicate(s, &cfg->track_namespace, true, -1))) {
         if (nid) s->alloc.free(nid, nid_len, s->alloc.ctx);
         s->profile->abort_request(s, &req_ep);
         return MOQ_ERR_INVAL;
     }
 
+    moq_cluster_metadata_t cluster = {0};
+    moq_result_t crc = session_cluster_copy(s, &cluster_input, &cluster);
+    if (crc < 0) {
+        if (nid)
+            s->alloc.free(nid, nid_len, s->alloc.ctx);
+        s->profile->abort_request(s, &req_ep);
+        return crc;
+    }
     /* Encode PUBLISH_NAMESPACE into send_buf. */
     if (action_queue_full(s)) {
+        session_cluster_free(s, &cluster);
         if (nid) s->alloc.free(nid, nid_len, s->alloc.ctx);
         s->profile->abort_request(s, &req_ep);
         return MOQ_ERR_WOULD_BLOCK;
@@ -1161,14 +1264,25 @@ moq_result_t moq_session_publish_namespace(moq_session_t *s,
                              s->send_cap - s->send_len);
 
         moq_publish_namespace_encode_args_t pn_args = {
+            .cluster = cluster,
             .request_id = req_ep.request_id,
             .track_namespace = cfg->track_namespace,
             .auth_tokens = auth_tokens,
             .auth_token_count = auth_token_count,
         };
         moq_result_t rc2 = s->profile->encode_publish_namespace(s, &w, &pn_args);
+        if (rc2 == MOQ_ERR_BUFFER && s->send_len > 0) {
+            moq_buf_writer_t probe;
+            rc2 = send_probe_begin(s, &probe);
+            if (rc2 == MOQ_OK) {
+                rc2 = s->profile->encode_publish_namespace(s, &probe, &pn_args);
+                rc2 = send_probe_end(s, &probe, rc2);
+            }
+        }
         if (rc2 < 0) {
-            if (nid) s->alloc.free(nid, nid_len, s->alloc.ctx);
+            session_cluster_free(s, &cluster);
+            if (nid)
+                s->alloc.free(nid, nid_len, s->alloc.ctx);
             s->profile->abort_request(s, &req_ep);
             return rc2;
         }
@@ -1194,7 +1308,9 @@ moq_result_t moq_session_publish_namespace(moq_session_t *s,
         }
         moq_result_t arc = push_action(s, &act);
         if (arc < 0) {
-            if (nid) s->alloc.free(nid, nid_len, s->alloc.ctx);
+            session_cluster_free(s, &cluster);
+            if (nid)
+                s->alloc.free(nid, nid_len, s->alloc.ctx);
             s->profile->abort_request(s, &req_ep);
             return arc;
         }
@@ -1209,6 +1325,7 @@ moq_result_t moq_session_publish_namespace(moq_session_t *s,
     entry->request_id = req_ep.request_id;
     entry->ns_id_buf = nid;
     entry->ns_id_len = nid_len;
+    entry->cluster = cluster;
     entry->handle = ann_make_handle(s, (size_t)slot);
     if (s->profile->premature_fin_fails_request)
         (void)moq_request_lifetime_init(&entry->rs.lifetime,
@@ -1566,9 +1683,10 @@ static moq_result_t ann_refuse_update(moq_session_t *s, int slot,
     rc = queue_send_bidi(s, e->rs.ref, buf, len, true);
     if (rc < 0) return rc;
     if (report)
-        (void)ns_update_push_result_event(s, MOQ_REQUEST_FAMILY_ANNOUNCEMENT,
-            e->handle._opaque, a->d.request_id, MOQ_NAMESPACE_UPDATE_OUTCOME_REFUSED,
-            MOQ_REQUEST_ROLE_RESPONDER, a->refuse_code, NULL, 0, false, 0);
+        (void)ns_update_push_result_event(s, MOQ_REQUEST_FAMILY_ANNOUNCEMENT, e->handle._opaque,
+                                          a->d.request_id, MOQ_NAMESPACE_UPDATE_OUTCOME_REFUSED,
+                                          MOQ_REQUEST_ROLE_RESPONDER, a->refuse_code, NULL, 0,
+                                          false, 0, NULL);
     ns_update_admission_commit(s, a);
     (void)moq_request_lifetime_fin_committed(&e->rs.lifetime);
     e->state = MOQ_ANN_DRAINING;
@@ -1586,6 +1704,15 @@ moq_result_t ann_on_namespace_update(moq_session_t *s, int slot,
     moq_result_t rc = ns_update_admit(s, MOQ_REQUEST_FAMILY_ANNOUNCEMENT,
                                       e->rs.ref, env, &a);
     if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+    if (a.d.cluster_hop_path.len) {
+        moq_buf_reader_t path = {a.d.cluster_hop_path.data, a.d.cluster_hop_path.len, 0};
+        uint64_t origin = 0;
+        (void)moq_buf_read_vi64(&path, &origin);
+        if (!e->cluster.hop_count || origin != e->cluster.hop_ids[0]) {
+            ns_update_admission_abort(s, &a);
+            return close_with_error(s, 0x3, "namespace publisher changed without withdrawal");
+        }
+    }
     rc = a.refuse_code
         ? ann_refuse_update(s, slot, &a, true)
         : ns_update_defer(s, MOQ_REQUEST_FAMILY_ANNOUNCEMENT, e->handle._opaque,
@@ -1606,6 +1733,60 @@ moq_result_t ann_refuse_namespace_update(moq_session_t *s, int slot,
     moq_result_t rc = ns_update_admit(s, MOQ_REQUEST_FAMILY_ANNOUNCEMENT,
                                       s->announcements[slot].rs.ref, env, &a);
     if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
+    if (s->cluster_negotiated && !a.refuse_code) {
+        moq_ann_entry_t *e = &s->announcements[slot];
+        moq_cluster_metadata_t update = {0};
+        rc = session_cluster_decode(s, a.d.cluster_hop_path, a.d.cluster_has_route_cost,
+                                    a.d.cluster_route_cost, &update);
+        if (rc < 0) {
+            ns_update_admission_abort(s, &a);
+            return rc;
+        }
+        if (update.hop_count &&
+            (!e->cluster.hop_count || update.hop_ids[0] != e->cluster.hop_ids[0])) {
+            session_cluster_free(s, &update);
+            ns_update_admission_abort(s, &a);
+            return close_with_error(s, 0x3, "namespace publisher changed without withdrawal");
+        }
+        size_t old_bytes = update.hop_count ? e->cluster.hop_count * sizeof(uint64_t) : 0;
+        size_t new_bytes = update.hop_count * sizeof(uint64_t);
+        if (new_bytes > old_bytes &&
+            (s->recv_payload_bytes > s->max_recv_buf ||
+             new_bytes - old_bytes > s->max_recv_buf - s->recv_payload_bytes)) {
+            session_cluster_free(s, &update);
+            ns_update_admission_abort(s, &a);
+            return close_with_error(s, 0x1, "namespace path exceeds receive budget");
+        }
+        if (new_bytes > s->event_scratch_cap) {
+            session_cluster_free(s, &update);
+            ns_update_admission_abort(s, &a);
+            return close_with_error(s, 0x1, "event scratch permanently too small");
+        }
+        uint8_t buf[64];
+        size_t len = 0;
+        if (event_queue_full(s) ||
+            !event_scratch_fits_aligned(s, update.hop_count, sizeof(uint64_t), 0,
+                                        _Alignof(uint64_t)))
+            rc = MOQ_ERR_WOULD_BLOCK;
+        else
+            rc = ns_update_encode_ok(s, a.d.request_id, buf, sizeof(buf), &len);
+        if (rc == MOQ_OK)
+            rc = queue_send_bidi(s, e->rs.ref, buf, len, false);
+        if (rc < 0) {
+            session_cluster_free(s, &update);
+            ns_update_admission_abort(s, &a);
+            return rc;
+        }
+        (void)ns_update_push_result_event(s, MOQ_REQUEST_FAMILY_ANNOUNCEMENT, e->handle._opaque,
+                                          a.d.request_id, MOQ_NAMESPACE_UPDATE_OUTCOME_OK,
+                                          MOQ_REQUEST_ROLE_RESPONDER, 0, NULL, 0, false, 0,
+                                          &update);
+        s->recv_payload_bytes = s->recv_payload_bytes - old_bytes + new_bytes;
+        session_cluster_apply(s, &e->cluster, &update);
+        session_cluster_free(s, &update);
+        ns_update_admission_commit(s, &a);
+        return MOQ_OK;
+    }
     if (!a.refuse_code) a.refuse_code = MOQ_REQUEST_ERROR_NOT_SUPPORTED;
     rc = ann_refuse_update(s, slot, &a, false);
     if (rc < 0 || s->state == MOQ_SESS_CLOSED) ns_update_admission_abort(s, &a);
@@ -1618,14 +1799,16 @@ moq_result_t ann_on_update_response(moq_session_t *s, int slot, bool ok,
 {
     moq_ann_entry_t *e = &s->announcements[slot];
     moq_ns_update_t *u = &e->update;
-    moq_result_t rc = ns_update_push_result_event(s,
-        MOQ_REQUEST_FAMILY_ANNOUNCEMENT, e->handle._opaque, u->out_request_id,
+    moq_result_t rc = ns_update_push_result_event(
+        s, MOQ_REQUEST_FAMILY_ANNOUNCEMENT, e->handle._opaque, u->out_request_id,
         ok ? MOQ_NAMESPACE_UPDATE_OUTCOME_OK : MOQ_NAMESPACE_UPDATE_OUTCOME_ERROR,
-        MOQ_REQUEST_ROLE_REQUESTER,
-        ok ? 0 : s->profile->semantic_request_error(error_code),
-        ok ? NULL : reason, ok ? 0 : reason_len, has_expires, expires_ms);
+        MOQ_REQUEST_ROLE_REQUESTER, ok ? 0 : s->profile->semantic_request_error(error_code),
+        ok ? NULL : reason, ok ? 0 : reason_len, has_expires, expires_ms,
+        ok ? &u->out_cluster : NULL);
     if (rc < 0 || s->state == MOQ_SESS_CLOSED) return rc;
     if (!ok) u->failed = true;
+    else
+        session_cluster_apply(s, &e->cluster, &u->out_cluster);
     ns_update_clear_outstanding(s, u);
     return MOQ_OK;
 }
@@ -1650,6 +1833,9 @@ moq_result_t moq_session_update_namespace(moq_session_t *s,
         e->rs.lifetime.local_fin || e->rs.lifetime.local_reset)
         return MOQ_ERR_WRONG_STATE;
     if (s->goaway_received) return MOQ_ERR_GOAWAY;
+    if (args.cluster.hop_count &&
+        (!e->cluster.hop_count || args.cluster.hop_ids[0] != e->cluster.hop_ids[0]))
+        return MOQ_ERR_INVAL;
     return ns_update_send(s, e->rs.ref, &e->update, &args, out_update_request_id);
 }
 
@@ -1685,6 +1871,12 @@ moq_result_t moq_session_accept_namespace_update(moq_session_t *s,
     if (rc < 0) return rc;
     rc = queue_send_bidi(s, e->rs.ref, buf, len, false);
     if (rc < 0) return rc;
+    if (e->update.owed_cluster.hop_count) {
+        size_t charge = e->cluster.hop_count * sizeof(uint64_t);
+        s->recv_payload_bytes =
+            charge <= s->recv_payload_bytes ? s->recv_payload_bytes - charge : 0;
+    }
+    session_cluster_apply(s, &e->cluster, &e->update.owed_cluster);
     ns_update_clear_owed(s, &e->update);
     return MOQ_OK;
 }
@@ -1727,4 +1919,16 @@ moq_result_t moq_session_namespace_owed_update(moq_session_t *s,
     moq_result_t rc = ann_owed_slot(s, ann, &slot);
     if (rc < 0) return rc;
     return ns_update_owed_query(&s->announcements[slot].update, out, out_size);
+}
+
+moq_result_t moq_session_namespace_cluster(moq_session_t *s, moq_announcement_t ann,
+                                           moq_cluster_metadata_t *out, size_t out_size)
+{
+    if (!s || !out || out_size < sizeof(*out))
+        return MOQ_ERR_INVAL;
+    int slot = ann_resolve_handle(s, ann);
+    if (slot < 0)
+        return MOQ_ERR_STALE_HANDLE;
+    *out = s->announcements[slot].cluster;
+    return MOQ_OK;
 }

@@ -30,7 +30,9 @@ static int failures = 0;
 
 moq_media_receiver_t *moq_media_receiver_test_new_cfg(
     const moq_media_receiver_cfg_t *cfg);
-void moq_media_receiver_test_free(moq_media_receiver_t *r);
+void moq_media_receiver_test_destroy_with_session(moq_media_receiver_t *r,
+                                                  moq_session_t *session,
+                                                  uint64_t now_us);
 void moq_media_receiver_test_pump(moq_media_receiver_t *r,
                                   moq_session_t *session, uint64_t now_us);
 
@@ -280,7 +282,7 @@ int main(void)
     MOQ_TEST_CHECK_EQ_INT(objects, 4);
     MOQ_TEST_CHECK_EQ_U64(st.parse_drops, 0);
 
-    moq_media_receiver_test_free(r);
+    moq_media_receiver_test_destroy_with_session(r, client, now);
     moq_simpair_destroy(sp);
 
     if (failures == 0)

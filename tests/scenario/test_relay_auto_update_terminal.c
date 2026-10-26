@@ -28,9 +28,10 @@
  * watcher's STOP_SENDING (AU_CHILD_STOP) -- while the request lives on.
  * The source later seals that subgroup (a FIN; an upstream reset) and ends
  * normally: the request keeps receiving its other subgroups and a new one
- * that reuses the ended child's session slot, the seal releases only the
- * binding's slot for the child (no FIN or second reset after the session's
- * own, no session error), and the request ends with the ordinary terminal.
+ * that reuses the ended child's session slot. A local reset releases its
+ * binding slot at the seal; a peer STOP retains the key until eviction or
+ * request teardown to prevent reopening (draft-22 section 11.3.2). Neither
+ * sends a FIN or second reset, and the request ends with the ordinary terminal.
  * A stream mid-object refuses the seal's FIN with WRONG_STATE, which is no
  * stale stream: the relay fails closed (AU_MIDOBJ).
  *
@@ -524,12 +525,29 @@ au_case(bool publication, int mode)
                                                       rig.now));
         }
         au_pump(&rig, ws, &wo, sibp, &so, 16);
-        /* Only the binding's slot for the child went: the request, its
-         * session and the stream in the child's old session slot live on,
-         * and nothing more went out for the child. */
-        moq_subgroup_handle_t gone;
-        R_CHECK(&rig, !moqr_bind_debug_sg_handle(rig.bind, ws->rsess, 0, 0,
-                                                 &gone));
+        /* A peer STOP keeps the exact stopped key across source resets:
+         * the source may publish more on that key without renewed downstream
+         * interest. A local reset has no such suppression record. Neither
+         * touches the stream that reused the old session slot. */
+        moq_subgroup_handle_t retained = { 0 };
+        bool has_retained = moqr_bind_debug_sg_handle(rig.bind, ws->rsess, 0, 0,
+                                                       &retained);
+        R_CHECK(&rig, has_retained == (mode == AU_CHILD_STOP));
+        if (has_retained) {
+            R_CHECK(&rig, moq_subgroup_eq(retained, dh));
+            b_conn_t *stopped_cn = conn_by_session(rig.bind, ws->rsess);
+            int stopped_count = 0;
+            if (stopped_cn != NULL) {
+                for (uint32_t i = 0; i < rig.bind->n_sgs; i++) {
+                    const b_sg_t *sg = &stopped_cn->sgs[i];
+                    if (!sg->used || !moq_subgroup_eq(sg->h, dh)) continue;
+                    R_CHECK(&rig, sg->stopped && sg->sub_raw == old_raw &&
+                                   sg->group == 0 && sg->subgroup == 0);
+                    stopped_count++;
+                }
+            }
+            R_CHECK(&rig, stopped_count == 1);
+        }
         R_CHECK(&rig, !wo.closed);
         R_CHECK(&rig, au_dsub_count(rig.bind, ws->rsess) == 1);
         R_CHECK(&rig, au_probe.resets_sent == 1);

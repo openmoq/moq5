@@ -117,7 +117,7 @@ public final class MediaSender: @unchecked Sendable {
         let attachment = self.attachment
         let engine = endpoint.engine
         if engine.post({ attachment.finalizeDetach() }) {
-            engine.removePumpHook(kind: .sender)
+            attachment.hook.remove(from: engine, kind: .sender)
         }
     }
 
@@ -154,10 +154,11 @@ public final class MediaSender: @unchecked Sendable {
         let sender = MediaSender(
             endpoint: endpoint, configuration: configuration, backend: backend)
         let attachment = sender.attachment      /* NOT the sender: no cycle */
-        try endpoint.engine.installPumpHook(
+        let token = try endpoint.engine.installPumpHook(
             kind: .sender,
             run: { /* the sender has no per-pump work */ },
             teardown: { attachment.finalizeDetach() })
+        attachment.hook.set(token)
         return sender
     }
 
@@ -169,7 +170,7 @@ public final class MediaSender: @unchecked Sendable {
         let engine = endpoint.engine
         await engine.postAndWait {
             attachment.finalizeDetach()
-            engine.removePumpHook(kind: .sender)
+            attachment.hook.remove(from: engine, kind: .sender)
         }
     }
 
@@ -396,6 +397,9 @@ public final class MediaSender: @unchecked Sendable {
 /// (no retain cycle through the hook slot).
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 package final class SenderAttachment: @unchecked Sendable {
+
+    /// Which installation of the sender hook is this attachment's.
+    package let hook = PumpHookOwnership()
 
     package let backend: any SenderBackend
     package let state = SenderState()

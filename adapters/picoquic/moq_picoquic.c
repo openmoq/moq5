@@ -23,6 +23,9 @@ struct moq_pq_conn {
     void                       *user_ctx;
     void                      (*after_callback)(moq_pq_conn_t *conn,
                                                  void *user_ctx);
+    /* picoquic callbacks other than prepare_to_send received so far: what a
+     * service pass may have new input from (moq_pq_conn_event_count). */
+    uint64_t                    events;
 
     moq_transport_bridge_t     *bridge;
     moq_transport_endpoint_ops_t endpoint_ops;
@@ -134,6 +137,8 @@ typedef struct pq_rx_stream {
     uint64_t budget;      /* window headroom kept ahead of the app's forward progress */
     uint64_t granted;     /* absolute window last advertised (delivered + expected) */
     uint8_t  kind;        /* pq_rx_kind_t: replay routing */
+    /* Bridge-managed parser bytes, accepted separately from held input. */
+    moq_transport_uni_prefix_t uni_prefix;
     bool     app_fc;      /* picoquic_set_app_flow_control(cnx, id, 1) issued */
     bool     paused;      /* has retained/blocked work; MUST NOT feed the bridge */
     bool     buf_fin;     /* a peer FIN follows the retained bytes */
@@ -148,6 +153,7 @@ typedef struct pq_rx_stream {
     bool     held_input;
     bool     held_fin;
     size_t   held_len;
+    bool     admission_stopped; /* discard until a real receive terminal/release */
     /* This adapter STOPped the receive half and neither its FIN nor a RESET
      * has reached the adapter. From the STOP on picoquic delivers no more
      * bytes and no FIN, only a RESET, so for a peer that ends the stream with
@@ -279,6 +285,18 @@ static int pq_set_stream_ctx(moq_pq_conn_t *c, uint64_t stream_id, void *ctx)
     return picoquic_set_app_stream_ctx(c->cnx, stream_id, ctx) == 0 ? 0 : -1;
 }
 
+/* Positive receive-half terminal, never a claim about the bidi send half.
+ * Core-owned buffered input keeps its existing drain obligation. */
+static void pq_rx_stop_terminal(void *owner, uint64_t stream_id)
+{
+    moq_pq_conn_t *c = (moq_pq_conn_t *)owner;
+    pq_rx_stream_t *st = pq_rx_find(c, stream_id);
+    if (st == NULL || (!st->held_input && !st->admission_stopped)) return;
+    if (st->release_watch && c->cnx != NULL)
+        picoquic_unlink_app_stream_ctx(c->cnx, stream_id);
+    pq_rx_drop(c, stream_id);
+}
+
 /* Asked before a STOP_SENDING (pq_endpoint_ctx_t.rx_terminal_discard). True
  * only for a stream this adapter still holds a refused chunk of whose receive
  * half its own record shows terminal at the transport: the held chunk carried
@@ -294,13 +312,15 @@ static bool pq_rx_terminal_discard(void *owner, uint64_t stream_id)
     pq_rx_stream_t *st = pq_rx_find(c, stream_id);
     if (st == NULL || !st->held_input || !(st->held_fin || st->buf_fin))
         return false;
-    pq_rx_drop(c, stream_id);
+    pq_rx_stop_terminal(c, stream_id);
     return true;
 }
 
 /* Told after an accepted STOP_SENDING (pq_endpoint_ctx_t.rx_stopped): the
  * cancellation discharges a held chunk, so it and anything retained behind it
- * are dropped and no later service pass redelivers them. A stream the session
+ * are dropped and no later service pass redelivers them. Its stopped slot
+ * watches the provider's actual end rather than accepting the stream again.
+ * A stream the session
  * itself stops keeps its state: what the adapter retained still settles the
  * bridge's discarding entry, and when that does not include the FIN the
  * stream is watched for picoquic's release (release_watch). Nonzero when the
@@ -322,8 +342,18 @@ static int pq_rx_stopped(void *owner, uint64_t stream_id)
         st->release_watch = true;
         return 0;
     }
+    memset(&st->uni_prefix, 0, sizeof(st->uni_prefix));
     if (st->held_input) {
-        pq_rx_drop(c, stream_id);
+        if (pq_set_stream_ctx(c, stream_id, c) != 0) return -1;
+        st->release_watch = true;
+        if (st->buf != NULL)
+            c->alloc.free(st->buf, st->buf_cap, c->alloc.ctx);
+        st->buf = NULL;
+        st->buf_len = st->buf_cap = st->held_len = 0;
+        st->held_input = st->held_fin = st->buf_fin = st->fin_blocked = false;
+        st->blocked = 0;
+        st->paused = false;
+        st->admission_stopped = true;
         return 0;
     }
     if (st->buf_fin || st->fin_blocked) return 0;
@@ -425,9 +455,33 @@ static moq_result_t pq_feed_bridge(moq_pq_conn_t *c, pq_rx_stream_t *st,
             c->bridge, st->stream_id, bytes, len, fin, now);
     case PQ_RX_UNI:
     default:
-        return moq_transport_bridge_on_peer_uni_bytes(
-            c->bridge, st->stream_id, bytes, len, fin, now);
+        return moq_transport_bridge_on_peer_uni_prefix_bytes(
+            c->bridge, st->stream_id, &st->uni_prefix, bytes, len, fin, now);
     }
+}
+
+/* REFUSE_CANCEL owns no bytes, FIN or bridge record. Stage only the real
+ * receive-terminal facts for the endpoint; an accepted STOP discards payload
+ * but keeps the receive slot until the provider's actual terminal/release. */
+static int pq_rx_refuse(moq_pq_conn_t *c, pq_rx_stream_t *st,
+                         bool fin, uint64_t now)
+{
+    uint64_t sid = st->stream_id;
+    bool bidi = st->kind == PQ_RX_BIDI;
+    if (st->kind == PQ_RX_CONTROL) goto fatal;
+    st->held_input = true;
+    st->held_fin |= fin;
+    uint64_t code = moq_session_version(c->session) == MOQ_VERSION_DRAFT_16
+        ? MOQ_STREAM_ERROR_CANCELLED : MOQ_STREAM_ERROR_EXCESSIVE_LOAD;
+    if (c->endpoint_ops.stop_sending(&c->endpoint_ctx, sid, code) != MOQ_TRANSPORT_OK)
+        goto fatal;
+    /* Endpoint notifications may retire st; keep only scalar identity here. */
+    if (bidi && c->endpoint_ops.reset_stream(&c->endpoint_ctx, sid, code) != MOQ_TRANSPORT_OK)
+        goto fatal;
+    return 0;
+fatal:
+    moq_transport_bridge_on_transport_error(c->bridge, 0, now);
+    return -1;
 }
 
 /* Advance the peer's receive window to keep at most `budget` bytes ahead of the
@@ -448,7 +502,7 @@ static moq_result_t pq_feed_bridge(moq_pq_conn_t *c, pq_rx_stream_t *st,
  * (granted) is published only on success. */
 static int pq_rx_refresh_credit(moq_pq_conn_t *c, pq_rx_stream_t *st)
 {
-    if (!st->app_fc) return 0;
+    if (!st->app_fc || st->admission_stopped) return 0;
     uint64_t held = (uint64_t)st->buf_len + st->blocked;
     if (held < st->blocked || held >= st->budget)
         return 0;                                   /* no headroom: frozen */
@@ -482,7 +536,15 @@ static int pq_rx_on_data(moq_pq_conn_t *c, uint64_t sid, pq_rx_kind_t kind,
                          const uint8_t *bytes, size_t len, bool fin,
                          uint64_t now)
 {
-    pq_rx_stream_t *st = pq_rx_get(c, sid, kind);
+    pq_rx_stream_t *st = pq_rx_find(c, sid);
+    if (st != NULL && st->admission_stopped) {
+        if (fin) {
+            if (st->release_watch) picoquic_unlink_app_stream_ctx(c->cnx, sid);
+            pq_rx_drop(c, sid);
+        }
+        return 0;
+    }
+    st = pq_rx_get(c, sid, kind);
     if (st == NULL) {                        /* untrackable / TPs unreadable */
         moq_transport_bridge_on_transport_error(c->bridge, 0, now);
         return -1;
@@ -515,6 +577,8 @@ static int pq_rx_on_data(moq_pq_conn_t *c, uint64_t sid, pq_rx_kind_t kind,
     }
 
     moq_result_t rc = pq_feed_bridge(c, st, bytes, len, fin, now);
+    if (rc == MOQ_BRIDGE_INGRESS_REFUSE_CANCEL)
+        return pq_rx_refuse(c, st, fin, now);
     if (rc == MOQ_ERR_WOULD_BLOCK) {
         /* The session buffered this chunk internally and is blocked draining it;
          * a trailing FIN (if any) is retained by the bridge and ends the stream
@@ -607,7 +671,7 @@ static void pq_rx_after_service(moq_pq_conn_t *c, uint64_t now)
     }
     for (size_t i = 0; i < c->rx_count; i++) {
         pq_rx_stream_t *st = &c->rx[i];
-        if (!st->active) continue;
+        if (!st->active || st->admission_stopped) continue;
         if (!st->paused) {
             /* Owed-grant sweep: a grant deferred while the connection was not
              * yet READY (or batched past a quantum) is issued here, on the
@@ -644,6 +708,10 @@ static void pq_rx_after_service(moq_pq_conn_t *c, uint64_t now)
             moq_result_t rc = pq_feed_bridge(c, st, st->buf, hl, hfin, now);
             if (rc == MOQ_ERR_INPUT_NOT_CONSUMED)
                 continue;
+            if (rc == MOQ_BRIDGE_INGRESS_REFUSE_CANCEL) {
+                if (pq_rx_refuse(c, st, hfin, now) != 0) return;
+                continue;
+            }
             st->held_input = false;
             st->held_len = 0;
             st->held_fin = false;
@@ -677,7 +745,16 @@ static void pq_rx_after_service(moq_pq_conn_t *c, uint64_t now)
              * this allocation. */
             st->buf = NULL; st->buf_len = 0; st->buf_cap = 0; st->buf_fin = false;
             moq_result_t rc = pq_feed_bridge(c, st, buf, blen, bfin, now);
+            if (rc == MOQ_ERR_INPUT_NOT_CONSUMED) {
+                st->buf = buf; st->buf_len = blen; st->buf_cap = bcap; st->buf_fin = bfin;
+                st->held_input = true; st->held_len = blen; st->held_fin = bfin;
+                continue;
+            }
             if (buf != NULL) c->alloc.free(buf, bcap, c->alloc.ctx);
+            if (rc == MOQ_BRIDGE_INGRESS_REFUSE_CANCEL) {
+                if (pq_rx_refuse(c, st, bfin, now) != 0) return;
+                continue;
+            }
             if (rc == MOQ_ERR_WOULD_BLOCK) {
                 st->blocked = blen;           /* session took it, still draining */
                 if (bfin) st->fin_blocked = true;  /* fin retained by the bridge */
@@ -741,6 +818,7 @@ bool moq_pq_test_rx_state(moq_pq_conn_t *conn, uint64_t stream_id,
     out->held_input = st->held_input;
     out->held_len = st->held_len;
     out->held_fin = st->held_fin;
+    out->prefix_len = st->uni_prefix.len;
     out->buf_len = st->buf_len;
     out->buf = st->buf;
     out->release_watch = st->release_watch;
@@ -772,6 +850,11 @@ void moq_pq_test_endpoint(moq_pq_conn_t *conn,
 {
     *ops = &conn->endpoint_ops;
     *ctx = &conn->endpoint_ctx;
+}
+
+moq_transport_endpoint_ops_t *moq_pq_test_endpoint_ops(moq_pq_conn_t *conn)
+{
+    return &conn->endpoint_ops;
 }
 
 void moq_pq_test_fail_stream_ctx(int n)
@@ -882,9 +965,12 @@ int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
         return -1;
     }
     c->endpoint_ctx.rx_terminal_discard = pq_rx_terminal_discard;
+    c->endpoint_ctx.rx_stop_terminal = pq_rx_stop_terminal;
     c->endpoint_ctx.rx_stopped = pq_rx_stopped;
     c->endpoint_ctx.rx_rebind = pq_rx_rebind;
     c->endpoint_ctx.rx_owner = c;
+    /* Every ingress/replay site handles bounded refusal before advertising. */
+    c->endpoint_ops.capabilities |= MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT;
 #ifdef MOQ_PICOQUIC_TESTING
     if (g_pq_test_hold_bidi)
         c->endpoint_ops.capabilities |= MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT;
@@ -1013,6 +1099,30 @@ bool moq_pq_conn_cnx_released(const moq_pq_conn_t *conn)
     return !conn || conn->cnx == NULL;
 }
 
+uint64_t moq_pq_conn_event_count(const moq_pq_conn_t *conn)
+{
+    return conn ? conn->events : 0;
+}
+
+bool moq_pq_conn_outbound_pending(const moq_pq_conn_t *conn)
+{
+    return conn && conn->bridge &&
+           moq_transport_bridge_has_outbound_pending(conn->bridge);
+}
+
+bool moq_pq_conn_terminal_observed(const moq_pq_conn_t *conn)
+{
+    bool observed = false;
+    if (!conn || !conn->bridge) return false;
+    (void)moq_transport_bridge_terminal_facts(conn->bridge, &observed);
+    return observed;
+}
+
+void moq_pq_conn_release_transport(moq_pq_conn_t *conn)
+{
+    if (conn && conn->cnx) pq_release_cnx(conn, conn->cnx);
+}
+
 /* -- Inbound: picoquic callback → bridge ---------------------------- */
 
 /* Call before picoquic builds packets; a refusal is fatal. */
@@ -1048,6 +1158,8 @@ int moq_pq_callback(picoquic_cnx_t *cnx,
             c->after_callback(c, c->user_ctx);
         return 0;
     }
+
+    c->events++;
 
     /* Does picoquic hand the cnx back on THIS callback? Decided before the
      * terminal short-circuit below: a bridge that is already terminal (a local

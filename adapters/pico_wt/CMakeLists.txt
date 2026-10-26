@@ -57,6 +57,8 @@ set_target_properties(moq-adapter-pico-wt PROPERTIES
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(moq-adapter-pico-wt PRIVATE
         -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+elseif(MSVC)
+    target_compile_options(moq-adapter-pico-wt PRIVATE $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:/WX>)
 endif()
 
 # -- Build-tree package target ------------------------------------------
@@ -117,6 +119,11 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libmoqPicoWtAdapterTargets-install.cma
 # embedded here using the same helper as libmoq.pc.
 # picohttp-core uses picoquic-log (picoquic_set_qlog).
 moq_picoquic_pkgconfig_libs(LIBMOQ_PICOWT_DEP_LIBS WITH_LOG)
+moq_picoquic_pkgconfig_cflags(_picowt_dep_cflags)
+set(LIBMOQ_PICOWT_DEP_CFLAGS "")
+if(_picowt_dep_cflags)
+    set(LIBMOQ_PICOWT_DEP_CFLAGS " ${_picowt_dep_cflags}")
+endif()
 # Relocatable prefix: the .pc lands at <prefix>/<libdir>/pkgconfig, so the
 # up-path from ${pcfiledir} back to <prefix> is (libdir depth + 1) levels.
 # Computing it from CMAKE_INSTALL_LIBDIR handles lib, lib64, and multiarch
@@ -263,6 +270,7 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
             "${CMAKE_BUILD_TYPE}"
             "${_picowt_openssl_root}"
             "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-work"
+            "${CMAKE_INSTALL_INCLUDEDIR}"
             "${_picowt_abi_context}")
     set_tests_properties(pico_wt_install_consumer PROPERTIES TIMEOUT 600)
 
@@ -314,6 +322,27 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     endif()
     add_test(NAME pico_wt_loopback COMMAND test_pico_wt_loopback)
     set_tests_properties(pico_wt_loopback PROPERTIES TIMEOUT 30)
+
+    if(TARGET moq::adapter-picoquic)
+        add_executable(test_outbound_stream_credit
+            tests/test_outbound_stream_credit.c tests/pico_wt_harness.c)
+        target_include_directories(test_outbound_stream_credit PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(test_outbound_stream_credit PRIVATE
+            moq::adapter-pico-wt moq::adapter-picoquic picoquic-test)
+        target_compile_definitions(test_outbound_stream_credit PRIVATE
+            PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_outbound_stream_credit PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        foreach(cell raw-uni raw-bidi wt-uni wt-bidi raw-reset wt-reset)
+            string(REPLACE "-" "_" suffix "${cell}")
+            add_test(NAME outbound_credit_${suffix}
+                COMMAND test_outbound_stream_credit ${cell})
+            set_tests_properties(outbound_credit_${suffix} PROPERTIES TIMEOUT 60)
+        endforeach()
+    endif()
 
     # The loopback rows that construct an endpoint directly call the
     # adapter's private endpoint constructor, which the shipping library does
@@ -513,6 +542,36 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
     add_test(NAME pico_wt_backpressure COMMAND test_pico_wt_backpressure)
     set_tests_properties(pico_wt_backpressure PROPERTIES TIMEOUT 180)
 
+    # Shared send admission over the real adapter: its queue kept full, the
+    # capability advertised and withdrawn, what the subscriber receives
+    # compared, coalesced and standalone FINs while the budget is spent.
+    # Compiles the adapter sources in, as the backpressure test does, for the
+    # connection's endpoint vtable and queue.
+    add_executable(test_pico_wt_shared_admission
+        tests/test_pico_wt_shared_admission.c
+        tests/pico_wt_harness.c
+        pico_wt_adapter.c
+        pico_wt_endpoint.c
+        ../common/moq_pq_send_queue.c
+    )
+    target_compile_definitions(test_pico_wt_shared_admission PRIVATE
+        MOQ_PICO_WT_TESTING
+        PICOQUIC_SOURCE_DIR="${MOQ_PICOQUIC_SOURCE_DIR}")
+    target_include_directories(test_pico_wt_shared_admission PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    target_link_libraries(test_pico_wt_shared_admission PRIVATE
+        moq::adapter-pico-wt
+        picoquic-test
+    )
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_pico_wt_shared_admission PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME pico_wt_shared_admission COMMAND test_pico_wt_shared_admission)
+    set_tests_properties(pico_wt_shared_admission PROPERTIES TIMEOUT 300)
+
     # Receive-backpressure lifecycle: what happens to a paused stream on FIN,
     # RESET, STOP_SENDING, teardown, and before the connection is READY.
     # Recompiles the adapter sources so the test build can reach the
@@ -686,6 +745,90 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(moq-adapter-pico-wt-managed PRIVATE
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    elseif(MSVC)
+        target_compile_options(moq-adapter-pico-wt-managed PRIVATE $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:/WX>)
+    endif()
+
+    if(MOQ_BUILD_TESTS AND NOT WIN32)
+        # The same typed host model selects the actual WT managed source.
+        # Link attach adapters only, avoiding a second managed facade copy.
+        add_executable(test_pico_wt_windows_model
+            ../picoquic/tests/test_threaded_windows_model.c)
+        target_include_directories(test_pico_wt_windows_model PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../picoquic/tests/support/win32
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_compile_definitions(test_pico_wt_windows_model PRIVATE
+            MOQ_BUILDING MOQ_TEST_WIN32_FAKES MOQ_TEST_WT_MANAGED_MODEL)
+        target_link_libraries(test_pico_wt_windows_model PRIVATE
+            moq::adapter-pico-wt moq::adapter-picoquic Threads::Threads)
+        set_target_properties(test_pico_wt_windows_model PROPERTIES
+            C_STANDARD 11 C_STANDARD_REQUIRED ON)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_windows_model PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        foreach(_win_row IN ITEMS wait public-clock public-shim public-native
+                public-infinite public-controls stop-clock stop-shim
+                stop-native stop-controls)
+            add_test(NAME pico_wt_windows_${_win_row}_model
+                COMMAND test_pico_wt_windows_model ${_win_row})
+            set_tests_properties(pico_wt_windows_${_win_row}_model
+                PROPERTIES TIMEOUT 30)
+        endforeach()
+
+        # Actual managed startup with typed provider-thread replacements.
+        # Real pthreads exercise ownership; no socket is opened. Provider
+        # configuration and cleanup still use the selected implementation.
+        if(EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem" AND
+           EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            add_executable(test_pico_wt_managed_startup
+                tests/test_pico_wt_managed_startup.c)
+            target_compile_definitions(test_pico_wt_managed_startup PRIVATE
+                MOQ_BUILDING)
+            target_link_libraries(test_pico_wt_managed_startup PRIVATE
+                moq::adapter-pico-wt moq::adapter-picoquic Threads::Threads)
+            set_target_properties(test_pico_wt_managed_startup PROPERTIES
+                C_STANDARD 11 C_STANDARD_REQUIRED ON)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_pico_wt_managed_startup PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            foreach(_startup_row IN ITEMS ready ready-exit ready-during-wait
+                    failure retry late-ready clock-failure ready-clock-failure
+                    wait-error race)
+                add_test(NAME pico_wt_managed_startup_${_startup_row}
+                    COMMAND test_pico_wt_managed_startup ${_startup_row}
+                        "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                        "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+                set_tests_properties(pico_wt_managed_startup_${_startup_row}
+                    PROPERTIES TIMEOUT 15 LABELS "pico_wt;managed")
+            endforeach()
+        endif()
+    endif()
+
+    # Test-internals build of the managed facade: the same source with its
+    # MOQ_PICO_WT_TESTING seams (stage hook, drain facts), never installed or
+    # exported. A test that drives the facade through the service tier links
+    # this in place of moq::adapter-pico-wt-managed.
+    if(MOQ_BUILD_TESTS)
+        add_library(moq-adapter-pico-wt-managed-test-internals STATIC
+            pico_wt_managed.c)
+        target_include_directories(moq-adapter-pico-wt-managed-test-internals
+            PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/tests
+                    "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(moq-adapter-pico-wt-managed-test-internals
+            PUBLIC  moq::adapter-pico-wt moq::adapter-picoquic
+            PRIVATE $<BUILD_INTERFACE:${_PICOHTTP}> ${_PICO_CORE}
+                    Threads::Threads)
+        target_compile_definitions(moq-adapter-pico-wt-managed-test-internals
+            PRIVATE MOQ_PICO_WT_TESTING)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(moq-adapter-pico-wt-managed-test-internals PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
     endif()
 
     # -- Build-tree package target --------------------------------------
@@ -815,6 +958,7 @@ endif()\n")
                 "${_picowtm_openssl_root}"
                 "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-managed-work"
                 "${_picowtm_install_staging}"
+                "${CMAKE_INSTALL_INCLUDEDIR}"
                 "${_picowt_abi_context}")
         set_tests_properties(pico_wt_managed_install_consumer
             PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
@@ -942,6 +1086,59 @@ endif()\n")
         endif()
     endif()
 
+    # The managed drain holds while the session retains reliable lifecycle
+    # output: a draft-18 rejection that reaches a client whose event queue is
+    # full. White-box: drives the MOQ_PICO_WT_TESTING stage hook and drain
+    # facts over local loopback.
+    if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR AND
+       EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem" AND
+       EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        add_executable(test_pico_wt_managed_drain_retained
+            tests/test_pico_wt_managed_drain_retained.c
+            pico_wt_managed.c)
+        target_compile_definitions(test_pico_wt_managed_drain_retained PRIVATE
+            MOQ_PICO_WT_TESTING)
+        target_include_directories(test_pico_wt_managed_drain_retained PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pico_wt_managed_drain_retained PRIVATE
+            moq::adapter-pico-wt-managed Threads::Threads)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_managed_drain_retained PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pico_wt_managed_drain_retained
+            COMMAND test_pico_wt_managed_drain_retained
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_drain_retained PROPERTIES
+            TIMEOUT 120 LABELS "network;pico_wt;managed")
+        # Its server-port classification alone, against a held port and a
+        # failing setup.
+        add_test(NAME pico_wt_managed_drain_retained_port_control
+            COMMAND test_pico_wt_managed_drain_retained --port-control
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_drain_retained_port_control
+            PROPERTIES TIMEOUT 60 LABELS "network;pico_wt;managed")
+        # Its own guards, against starts that unexpectedly succeed.
+        add_test(NAME pico_wt_managed_drain_retained_port_guards
+            COMMAND test_pico_wt_managed_drain_retained --port-guards
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_drain_retained_port_guards
+            PROPERTIES TIMEOUT 60 LABELS "network;pico_wt;managed")
+        # Those guards refuse a setup failure in place of an unexpected
+        # start.
+        add_test(NAME pico_wt_managed_drain_retained_port_guards_setup_failure
+            COMMAND test_pico_wt_managed_drain_retained --port-guards-setup-failure
+                "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_drain_retained_port_guards_setup_failure
+            PROPERTIES TIMEOUT 60 LABELS "network;pico_wt;managed")
+    endif()
+
     # Managed client pre-accept stream buffer: chunk order and FIN, the stream
     # and byte limits (WT_BUFFERED_STREAM_REJECTED), peer reset, early
     # datagrams, and a refused CONNECT (WT_SESSION_GONE). White-box: the
@@ -997,6 +1194,11 @@ endif()\n")
             set_tests_properties(pico_wt_managed_client PROPERTIES
                 TIMEOUT 30
                 LABELS "network;pico_wt;managed")
+            # Its wait loop alone, against waits that return at once.
+            add_test(NAME pico_wt_managed_client_early_wake
+                COMMAND test_pico_wt_managed_client --early-wake-control)
+            set_tests_properties(pico_wt_managed_client_early_wake PROPERTIES
+                TIMEOUT 30 LABELS "pico_wt;managed")
         endif()
 
         # Managed server <-> managed client, both in-process, each on

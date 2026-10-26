@@ -186,6 +186,8 @@ static void handle_catalog_object(client_ctx_t *ctx, moq_sub_object_t *obj,
             moq_playback_track_cfg_init(&tcfg);
             tcfg.media_type = MOQ_PLAYBACK_MEDIA_VIDEO;
             tcfg.packaging = MOQ_PLAYBACK_PACKAGING_CMAF;
+            tcfg.transport_version =
+                (uint32_t)moq_session_version(ctx->session);
             tcfg.init_data = (moq_bytes_t){
                 .data = ctx->init_data_buf, .len = ctx->init_data_len };
 
@@ -251,7 +253,7 @@ static void process_playback(client_ctx_t *ctx, uint64_t now)
     }
 
     moq_playback_cmd_t cmd;
-    while (moq_playback_poll_command(ctx->pb, &cmd) == MOQ_OK) {
+    while (moq_playback_poll_command(ctx->pb, &cmd, sizeof(cmd)) == MOQ_OK) {
         switch (cmd.kind) {
         case MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO:
             ctx->playback_configured = true;
@@ -347,7 +349,7 @@ static void process_playback(client_ctx_t *ctx, uint64_t now)
     }
 
     moq_playback_event_t evt;
-    while (moq_playback_poll_event(ctx->pb, &evt) == MOQ_OK) {
+    while (moq_playback_poll_event(ctx->pb, &evt, sizeof(evt)) == MOQ_OK) {
         switch (evt.kind) {
         case MOQ_PLAYBACK_EVENT_OBJECT_DROPPED:
             fprintf(stderr, "  playback dropped: reason=%d g=%llu o=%llu\n",
@@ -534,8 +536,11 @@ int main(int argc, char *argv[])
     fprintf(stderr, "Connecting to %s:%d (need %d frames)...\n",
         host, port, min_frames);
 
-    int rc = picoquic_packet_loop(quic, 0, 0, 0, 0, 0,
-                                   loop_callback, &ctx);
+    /* 0 is normal termination: the packet loop maps the callback's
+     * PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP to 0. Anything else is a loop
+     * failure. */
+    int loop_rc = picoquic_packet_loop(quic, 0, 0, 0, 0, 0,
+                                       loop_callback, &ctx);
 
     if (ctx.pb) moq_playback_destroy(ctx.pb);
     if (ctx.sub) moq_sub_destroy(ctx.sub);
@@ -561,8 +566,11 @@ int main(int argc, char *argv[])
     fprintf(stderr, "  seq errors:      %d\n", ctx.seq_errors);
     fprintf(stderr, "  cadence errors:  %d\n", ctx.cadence_errors);
     fprintf(stderr, "  playback errors: %d\n", ctx.playback_errors);
+    fprintf(stderr, "  packet loop:     %s (%d)\n",
+        loop_rc == 0 ? "ok" : "failed", loop_rc);
 
-    bool pass = ctx.catalog_parsed && ctx.init_decoded && ctx.init_parsed &&
+    bool pass = loop_rc == 0 &&
+                ctx.catalog_parsed && ctx.init_decoded && ctx.init_parsed &&
                 ctx.video_subscribed && ctx.playback_created &&
                 ctx.playback_configured &&
                 ctx.decode_cmds >= ctx.min_frames &&

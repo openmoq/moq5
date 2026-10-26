@@ -2,6 +2,7 @@
 #define MOQR_BIND_RETRIEVAL_H
 
 #include <moq/relay/moqr_bind.h>
+#include "moqr_bind_metadata.h"
 
 /* Owner-thread-only, non-installed interface shared by the local fill writer
  * and the shard owner. No authorization entry point: parent must be the live,
@@ -201,6 +202,10 @@ moqr_result_t moqr_bind_retrieve_source_set(moqr_bind_t *b,
  * final and sends whatever cancellation is owed. */
 typedef struct moqr_retrieve_standalone_query {
     uint64_t remote_cookie;   /* the owner shard's binding cookie here     */
+    bool cluster_selected;
+    moqr_cluster_advertisement_id_t cluster_source_advertisement;
+    uint64_t cluster_requester_hop_id;
+    uint64_t cluster_requester_correlation_id;
     moqr_ns_t ns;             /* borrowed for the open call                */
     moq_bytes_t name;
     uint64_t start_group, start_object;  /* the request as received:    */
@@ -210,11 +215,28 @@ typedef struct moqr_retrieve_standalone_query {
     moqr_group_order_t group_order;
     uint8_t subscriber_priority;
     uint64_t deadline_us;     /* the request's absolute wait deadline      */
+    /* A Joining FETCH: the track, in this shard's core, that the joined
+     * subscription was answered for. The source names the owner's identity
+     * that feeds it, and the owner refuses the request (STALE_HANDLE at open
+     * when nothing here feeds it any more) unless that identity still
+     * answers the name. */
+    bool join;
+    moqr_track_t join_track;
 } moqr_retrieve_standalone_query_t;
 
 typedef struct moqr_retrieve_standalone_plan {
     moqr_fetch_plan_t wire;   /* as moqr_core_fetch_open reports it        */
     moqr_retrieve_location_t start, end; /* ACCEPT: inclusive range        */
+    /* ACCEPT: the Track Properties the answer states, as the owner's reply
+     * pin held them when it admitted the request (moqr_bind_meta_reply): the
+     * set and the draft that stated it, or UNAVAILABLE when they cannot be
+     * stated. meta_bytes stays valid while the handle is open. */
+    moqr_bind_meta_state_t meta_state;
+    moq_version_t meta_wire_version;
+    moq_bytes_t meta_bytes;
+    /* REJECT: the owner had no room for the request (its FETCH pool full),
+     * answered as capacity rather than by error_code. */
+    bool capacity;
 } moqr_retrieve_standalone_plan_t;
 
 typedef struct moqr_retrieve_standalone_ops {

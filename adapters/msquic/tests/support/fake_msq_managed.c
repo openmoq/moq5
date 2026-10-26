@@ -108,6 +108,13 @@ static void QUIC_API g_connection_close(HQUIC h)
     fake_mgd_conn_t *c = g_live != NULL ? conn_of(g_live, h) : NULL;
 
     if (c != NULL) {
+        if (c->fake.shutdown_complete) {
+            FAKE_MGD_REQUIRE(fake_msq_pending_sends(&c->fake) == 0 &&
+                              fake_msq_pending_dgrams(&c->fake) == 0);
+        } else {
+            fake_msq_cancel_pending(&c->fake, c->cb, c->ctx);
+        }
+        fake_msq_mark_connection_closed(&c->fake);
         c->closed = true;
         c->in_use = false;   /* the slot is reusable by a later accept */
         g_live->conn_count--;
@@ -377,6 +384,10 @@ void fake_mgd_deliver_shutdown_complete(fake_mgd_conn_t *c)
     QUIC_CONNECTION_EVENT ev;
 
     FAKE_MGD_REQUIRE(c->cb != NULL);
+    fake_msq_cancel_pending(&c->fake, c->cb, c->ctx);
+    FAKE_MGD_REQUIRE(fake_msq_pending_sends(&c->fake) == 0 &&
+                      fake_msq_pending_dgrams(&c->fake) == 0);
+    fake_msq_mark_shutdown_complete(&c->fake);
     memset(&ev, 0, sizeof(ev));
     ev.Type = QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE;
     (void)c->cb((HQUIC)&c->fake, c->ctx, &ev);

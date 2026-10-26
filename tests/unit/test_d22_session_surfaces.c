@@ -22,7 +22,7 @@
 #include "../../core/src/wire/control_d22_internal.h"
 #include <string.h>
 
-#include "test_raw_pair_support.h"
+#include "test_raw_pair_d22.h"
 
 static moq_bytes_t g_parts[] = { { (const uint8_t *)"live", 4 } };
 

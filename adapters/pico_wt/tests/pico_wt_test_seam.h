@@ -61,6 +61,25 @@ void moq_pico_wt_managed_test_detach_conn(moq_pico_wt_managed_t *m);
 moq_pico_wt_conn_t *moq_pico_wt_managed_test_conn(moq_pico_wt_managed_t *m);
 picoquic_cnx_t *moq_pico_wt_managed_test_cnx(moq_pico_wt_managed_t *m);
 
+/* Drain-state observation. The stage hook runs on the network thread: stage 1
+ * after the pump, before the post-pump service; stage 2 after a pass published
+ * its drain state, with the facade mutex released.
+ * Install it from on_pump (the owner executor): the network thread runs from
+ * create. The facts are the drain inputs, read on the network thread (call
+ * from the hook); gen_unchanged is true while no wake has arrived since the
+ * pass began. */
+typedef struct {
+    bool ready, session_pending, bridge_pending, backlog_empty, acked, gen_unchanged;
+} moq_pwt_test_drain_facts_t;
+void moq_pico_wt_managed_test_set_stage_hook(
+    moq_pico_wt_managed_t *m,
+    void (*fn)(moq_pico_wt_managed_t *, int, void *), void *ctx);
+void moq_pico_wt_managed_test_drain_facts(moq_pico_wt_managed_t *m,
+                                          moq_pwt_test_drain_facts_t *out);
+/* The wake generation (every wake advances it), read under the facade mutex
+ * from any thread. */
+uint64_t moq_pico_wt_managed_test_drain_gen(moq_pico_wt_managed_t *m);
+
 /* A client's CONNECT, deferred until the server's SETTINGS: how often h3zero
  * queued it on the CONNECT stream once they arrived (not proof it reached the
  * wire), and how often it was instead still pending after them (submission
@@ -84,10 +103,9 @@ const moq_connection_target_t *moq_pico_wt_managed_test_target(
  * (receive-admission tests; adapter compiled with MOQ_PICO_WT_TESTING). */
 void moq_pico_wt_test_set_hold_input(moq_pico_wt_conn_t *conn, bool on);
 
-/* Connections created while set also declare
- * MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT, so their bridge keeps held-stream
- * records (age, cancellation). Test builds only; no shipped adapter declares
- * that capability. */
+/* Legacy test-only request to add MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT at
+ * create. Redundant with the production default; false does not disable
+ * bounded admission. Never installed or exported. */
 void moq_pico_wt_test_create_with_hold_bidi(bool on);
 
 /* Receive-lifecycle observers (adapter compiled with MOQ_PICO_WT_TESTING):
@@ -100,6 +118,8 @@ extern void (*pw_test_local_stop_observer)(moq_pico_wt_conn_t *conn,
                                            uint64_t stream_id);
 extern void (*pw_test_grant_observer)(moq_pico_wt_conn_t *conn,
                                       uint64_t stream_id, uint64_t headroom);
+/* One notification at the start of each nonterminal full receive sweep. */
+extern void (*pw_test_sweep_observer)(moq_pico_wt_conn_t *conn);
 
 /* Keepalive seam globals (test-internals build only). */
 extern void (*moq_pico_wt_managed_test_keep_alive)(picoquic_cnx_t *, uint64_t);

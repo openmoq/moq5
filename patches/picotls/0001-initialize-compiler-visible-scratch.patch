@@ -1,6 +1,6 @@
 Initialize compiler-visible scratch before conditional writes.
 
-Applies to picotls f06553b877ada93c860dd1db9002eabf7365292d.
+Applies to picotls 7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1.
 GCC Release builds cannot prove that every live curve word is initialized
 before use, or that the cipher-selection assertion succeeded before its
 output is inspected. Keep assertions and warnings enabled; initialize the

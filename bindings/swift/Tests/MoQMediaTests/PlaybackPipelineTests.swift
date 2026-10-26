@@ -9,7 +9,8 @@ import CMoQSim
 // MARK: - Helpers
 
 private func encodeLOCProps(
-    timestamp: UInt64, keyframe: Bool = false
+    timestamp: UInt64, keyframe: Bool = false,
+    version: moq_version_t = MOQ_VERSION_DRAFT_16
 ) throws -> Buffer? {
     var h = moq_loc_headers_t()
     moq_loc_headers_init(&h)
@@ -22,7 +23,7 @@ private func encodeLOCProps(
         h.video_frame_marking.end_of_frame = true
     }
     var p: OpaquePointer?
-    let rc = moq_loc_encode(moq_alloc_default()!, MOQ_VERSION_DRAFT_16, MOQ_LOC_PROFILE_01, &h, &p)
+    let rc = moq_loc_encode(moq_alloc_default()!, version, MOQ_LOC_PROFILE_01, &h, &p)
     guard rc == MOQ_OK else { throw MoQError.internal }
     guard let ptr = p else { return nil }
     return Buffer(adopting: ptr)
@@ -113,6 +114,31 @@ struct PlaybackRAWTests {
         #expect(pts == 1_000_000)
         #expect(kf == true)
         #expect(p.copyBytes() == Data([0x00, 0x00, 0x01, 0x65]))
+    }
+
+    @Test("Draft-18 track keeps a UNIX-microsecond LOC timestamp")
+    func rawVideoDraft18Timestamp() throws {
+        let pb = try PlaybackPipeline(configuration: .init())
+        let track = try pb.addTrack(PlaybackTrackConfiguration(
+            mediaType: .video, packaging: .raw, codec: "avc1",
+            wireVersion: .draft18))
+
+        let ts: UInt64 = 1_700_000_000_000_000
+        let payload = try Buffer(Data([0x00, 0x00, 0x01, 0x65]))
+        let props = try encodeLOCProps(
+            timestamp: ts, keyframe: true, version: MOQ_VERSION_DRAFT_18)
+        try pb.push(object: makeObj(payload: payload, properties: props),
+                    track: track, now: 0)
+        try pb.tick(now: 0)
+
+        var commands: [PlaybackCommand] = []
+        try pb.drainCommands { commands.append($0) }
+        #expect(commands.count == 2)
+        guard commands.count == 2,
+              case .decodeVideo(_, _, _, let dts, _, _, _, _, _, _) = commands[1] else {
+            Issue.record("Expected decodeVideo"); return
+        }
+        #expect(dts == ts)
     }
 
     @Test("RAW audio emits configure + decode, always keyframe")

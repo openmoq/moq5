@@ -16343,14 +16343,37 @@ static void test_harness(void)
 /* A retired subscription does not retire its FIN-started delivery timers. */
 static void test_failed_update_closing_timer(void)
 {
+    const int setup_before = failures;
     moq_session_t *s = make_session_default();
     MOQ_TEST_CHECK(s != NULL);
     if (!s) return;
+    if (failures != setup_before) goto closing_timer_out;
     moq_stream_ref_t ref = arm_failed_update_completed_subscription(s);
+    bool armed = failures == setup_before && ref._v != 0 && g_fu_sg_count == FU_SUBGROUPS &&
+        g_fu_sg_refs[0]._v != 0 && g_fu_sg_refs[1]._v != 0 &&
+        g_fu_sg_refs[0]._v != g_fu_sg_refs[1]._v;
+    MOQ_TEST_CHECK(armed);
+    if (!armed) goto closing_timer_out;
+    int slot = sg_find_by_stream_ref(s, g_fu_sg_refs[0]);
+    MOQ_TEST_CHECK(slot >= 0 && (size_t)slot < s->sg_cap);
+    if (slot < 0 || (size_t)slot >= s->sg_cap) goto closing_timer_out;
+    const moq_sg_entry_t original = s->subgroups[slot];
+    const moq_subgroup_handle_t subgroup = sg_make_handle(s, (size_t)slot);
+    bool identity_ready = original.state == MOQ_SG_CLOSING &&
+        moq_subgroup_is_valid(subgroup) && moq_subscription_is_valid(original.sub) &&
+        original.pub._opaque == 0 && original.header_len > 0 &&
+        original.group_id == g_fu_sg_group[0] && original.subgroup_id == 0;
+    MOQ_TEST_CHECK(identity_ready);
+    if (!identity_ready) goto closing_timer_out;
     fu_extra_capture(s);
+    if (failures != setup_before) goto closing_timer_out;
     uint8_t msg[192];
     size_t len = enc_update_unknown_alias(msg, sizeof(msg));
-    MOQ_TEST_CHECK(moq_session_on_bidi_stream_bytes(s, ref, msg, len, true, 10) == MOQ_OK);
+    MOQ_TEST_CHECK(len > 0);
+    if (len == 0 || failures != setup_before) goto closing_timer_out;
+    moq_result_t rc = moq_session_on_bidi_stream_bytes(s, ref, msg, len, true, 10);
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) goto closing_timer_out;
     check_sub_terminal_retired(s, ref);
     const terminal_case_t terminal = {
         .want_output = want_failed_update_output,
@@ -16360,27 +16383,52 @@ static void test_failed_update_closing_timer(void)
     failures += fu_extra_check_committed(s, "closing stream terminal");
     MOQ_TEST_CHECK_EQ_U64(s->subgroup_deadline_us, 5000004);
 
-    MOQ_TEST_CHECK(moq_session_on_data_committed(s, g_fu_sg_refs[1], 11) == MOQ_OK);
+    rc = moq_session_on_data_committed(s, g_fu_sg_refs[1], 11);
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) goto closing_timer_out;
     check_no_output(s, &pub_hooks_for_actions);
     MOQ_TEST_CHECK_EQ_U64(s->subgroup_deadline_us, 5000004);
     MOQ_TEST_CHECK(moq_session_tick(s, 5000003) == MOQ_OK);
     check_no_output(s, &pub_hooks_for_actions);
     MOQ_TEST_CHECK(moq_session_tick(s, 5000004) == MOQ_OK);
-    moq_event_t event;
+    moq_event_t event = {0};
     size_t events = 0;
-    while (moq_session_poll_events(s, &event, 1)) {
+    for (;;) {
+        size_t n = 0;
+        rc = moq_session_poll_events_ex(s, &event, 1, sizeof(event), &n);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        if (rc != MOQ_OK || n == 0) break;
         ++events;
+        MOQ_TEST_CHECK(event.kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED);
+        MOQ_TEST_CHECK(event.detail_size == MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE);
+        if (event.kind == MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED &&
+            event.detail_size >= MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE) {
+            const moq_outgoing_subgroup_terminated_event_t *t = &event.u.outgoing_subgroup_terminated;
+            MOQ_TEST_CHECK(moq_subgroup_eq(t->subgroup, subgroup));
+            MOQ_TEST_CHECK(moq_subscription_eq(t->sub, original.sub));
+            MOQ_TEST_CHECK(t->pub._opaque == 0);
+            MOQ_TEST_CHECK_EQ_U64(t->stream_ref._v, g_fu_sg_refs[0]._v);
+            MOQ_TEST_CHECK_EQ_U64(t->group_id, original.group_id);
+            MOQ_TEST_CHECK_EQ_U64(t->subgroup_id, original.subgroup_id);
+            MOQ_TEST_CHECK(t->cause == MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT);
+            MOQ_TEST_CHECK_EQ_U64(t->error_code, MOQ_RESET_DELIVERY_TIMEOUT);
+        }
         moq_event_cleanup(&event);
     }
-    MOQ_TEST_CHECK_EQ_SIZE(events, 0);
-    moq_action_t action;
+    MOQ_TEST_CHECK_EQ_SIZE(events, 1);
+    moq_action_t action = {0};
     size_t actions = 0;
-    while (moq_session_poll_actions(s, &action, 1)) {
+    for (;;) {
+        size_t n = 0;
+        rc = moq_session_poll_actions_ex(s, &action, 1, sizeof(action), &n);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        if (rc != MOQ_OK || n == 0) break;
         ++actions;
         MOQ_TEST_CHECK(action.kind == MOQ_ACTION_RESET_DATA);
         if (action.kind == MOQ_ACTION_RESET_DATA) {
             MOQ_TEST_CHECK_EQ_U64(action.u.reset_data.stream_ref._v, g_fu_sg_refs[0]._v);
             MOQ_TEST_CHECK_EQ_U64(action.u.reset_data.error_code, 0x2);
+            MOQ_TEST_CHECK_EQ_U64(action.u.reset_data.reliable_size, original.header_len);
         }
         moq_action_cleanup(&action);
     }
@@ -16389,6 +16437,7 @@ static void test_failed_update_closing_timer(void)
     MOQ_TEST_CHECK(moq_session_tick(s, 5000005) == MOQ_OK);
     check_no_output(s, &pub_hooks_for_actions);
     check_sub_terminal_retired(s, ref);
+closing_timer_out:
     moq_session_destroy(s);
 }
 

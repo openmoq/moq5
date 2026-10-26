@@ -25,6 +25,7 @@ typedef struct info_view {
     bool     verify_build;
     /* raw listener */
     sv_t     host;
+    sv_t     transport;   /* the configured backend's label */
     int64_t  port;
     size_t   nver;
     sv_t     ver[MOQR_CLI_MAX_VERSIONS];
@@ -113,7 +114,7 @@ write_doc(moqr_json_w_t *w, const info_view_t *v)
     moqr_json_key(w, "kind"); moqr_json_str(w, "raw", 3);
     moqr_json_key(w, "host"); put_sv(w, v->host);
     moqr_json_key(w, "port"); moqr_json_i64(w, v->port);
-    moqr_json_key(w, "transport"); moqr_json_str(w, "msquic", 6);
+    moqr_json_key(w, "transport"); put_sv(w, v->transport);
     moqr_json_key(w, "offered_versions");
     moqr_json_array_begin(w);
     for (size_t i = 0; i < v->nver; i++) {
@@ -268,6 +269,9 @@ view_from_inputs(const moqr_cli_info_inputs_t *in, info_view_t *v)
         return false;
     }
     v->port = cfg->port;
+    v->transport = cfg->transport == MOQR_CLI_TRANSPORT_PICOQUIC
+                       ? (sv_t){ "picoquic", 8 }
+                       : (sv_t){ "msquic", 6 };
     v->nver = cfg->version_count;
     for (size_t i = 0; i < v->nver; i++) {
         if (!SV(cfg->alpn_buf[i], &v->ver[i])) {
@@ -421,6 +425,7 @@ static const info_view_t k_max_view = {
     .dual_listener_build = false,
     .verify_build = false,
     .host = SVC(k_ctl255),
+    .transport = { "picoquic", 8 },   /* the longest backend label */
     .port = INT64_MIN,
     .nver = MOQR_CLI_MAX_VERSIONS,
     .ver = { SVC(k_ctl15), SVC(k_ctl15), SVC(k_ctl15), SVC(k_ctl15) },

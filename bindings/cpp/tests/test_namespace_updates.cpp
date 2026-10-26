@@ -347,9 +347,41 @@ static void test_subscribe_tracks_options(int &failures)
     if (failures == before) std::printf("PASS: cpp_subscribe_tracks_options\n");
 }
 
+static void test_historical_result_extent(int &failures)
+{
+    moq_event_t raw{};
+    raw.kind = MOQ_EVENT_NAMESPACE_UPDATE_RESULT;
+    auto &d = raw.u.namespace_update_result;
+    d.ann._opaque = 27;
+    d.update_request_id = UINT64_MAX;
+    d.outcome = MOQ_NAMESPACE_UPDATE_OUTCOME_OK;
+    d.local_role = MOQ_REQUEST_ROLE_REQUESTER;
+    d.has_expires = true;
+    d.expires_ms = 0;
+    const size_t v0 = offsetof(moq_namespace_update_result_event_t, expires_ms) + sizeof(d.expires_ms);
+    for (size_t size : {v0 - 1, v0, sizeof(d)}) {
+        raw.detail_size = static_cast<uint32_t>(size);
+        const auto value = moq::polled_event(raw).variant_extended();
+        const auto *result = std::get_if<moq::extended_event::namespace_update_result>(&value);
+        if (size < v0) {
+            MOQ_CHECK(std::holds_alternative<moq::event::unknown>(value));
+        } else {
+            MOQ_CHECK(result != nullptr);
+            if (result != nullptr) {
+                MOQ_CHECK(result->ann == moq::announcement(d.ann));
+                MOQ_CHECK(result->update_request_id == UINT64_MAX);
+                MOQ_CHECK(result->outcome == moq::extended_event::namespace_update_outcome::ok);
+                MOQ_CHECK(result->local_role == moq::request_role::requester);
+                MOQ_CHECK(result->expires_ms == 0u);
+            }
+        }
+    }
+}
+
 int main()
 {
     int failures = 0;
+    test_historical_result_extent(failures);
     test_announcement_update(failures);
     test_ns_sub_prefix_refused(failures);
     test_rendezvous_option(failures);

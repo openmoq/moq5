@@ -594,3 +594,82 @@ struct EstablishmentDeadlineTests {
         #expect(backend.snapshot().violations.isEmpty)
     }
 }
+
+@Suite("Pump hook deadlines")
+struct PumpHookDeadlineTests {
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A hook deadline caps the wait; none, or nil, leaves the slice")
+    func deadlineCapsWait() async throws {
+        let backend = ScriptedEndpointBackend()
+        let endpoint = makeEndpoint(backend)
+        let engine = endpoint.engine
+        #expect(await backend.awaitParked(entries: 1))
+        #expect(backend.snapshot().waitTimeouts.last == 60_000_000)
+
+        /* A hook with no deadline leaves the slice. */
+        let quiet = try engine.installPumpHook(kind: .sender, run: {}, teardown: {},
+                                               deadline: { nil })
+        #expect(await backend.awaitParked(entries: 2))
+        #expect(backend.snapshot().waitTimeouts.last == 60_000_000)
+        engine.removePumpHook(kind: .sender, token: quiet)
+
+        /* A deadline 5 s out bounds the wait by those 5 s. */
+        let due = EndpointEngine.monotonicMicroseconds() + 5_000_000
+        let timed = try engine.installPumpHook(kind: .receiver, run: {}, teardown: {},
+                                               deadline: { due })
+        /* Every earlier park used the 60 s slice, so a capped park can only
+         * follow the install, however soon the engine re-parks after it. */
+        #expect(await backend.awaitCondition { s in
+            s.waitTimeouts.contains { $0 <= 5_000_000 && $0 > 4_000_000 }
+        })
+        engine.removePumpHook(kind: .receiver, token: timed)
+        await endpoint.close()
+        #expect(backend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A due deadline waits zero; the earliest of several wins")
+    func dueAndEarliest() async throws {
+        let backend = ScriptedEndpointBackend()
+        let endpoint = makeEndpoint(backend)
+        let engine = endpoint.engine
+        let later = EndpointEngine.monotonicMicroseconds() + 30_000_000
+        let a = try engine.installPumpHook(kind: .receiver, run: {}, teardown: {},
+                                           deadline: { later })
+        let b = try engine.installPumpHook(kind: .sender, run: {}, teardown: {},
+                                           deadline: { 1 })      /* long past */
+        #expect(await backend.awaitCondition { $0.waitTimeouts.contains(0) })
+        engine.removePumpHook(kind: .sender, token: b)
+        engine.removePumpHook(kind: .receiver, token: a)
+        await endpoint.close()
+        #expect(backend.snapshot().violations.isEmpty)
+    }
+}
+
+/// A closed backend parks timed whenever a hook names a deadline, however
+/// far off: the ceiling bounds one park, never whether the park is timed.
+@Suite struct ClosedParkTimeoutTests {
+    @Test func noDeadlineParksUntilNudged() {
+        #expect(EndpointEngine.closedParkTimeout(deadlines: [], now: 100, ceiling: 60) == nil)
+    }
+
+    @Test func nearDeadlineParksUntilIt() {
+        #expect(EndpointEngine.closedParkTimeout(deadlines: [130, 120], now: 100,
+                                                 ceiling: 60) == 20)
+    }
+
+    @Test func deadlineAtTheCeilingStaysTimed() {
+        #expect(EndpointEngine.closedParkTimeout(deadlines: [160], now: 100,
+                                                 ceiling: 60) == 60)
+    }
+
+    @Test func deadlineBeyondTheCeilingStaysTimed() {
+        #expect(EndpointEngine.closedParkTimeout(deadlines: [UInt64.max], now: 100,
+                                                 ceiling: 60) == 60)
+    }
+
+    @Test func overdueDeadlineDoesNotPark() {
+        #expect(EndpointEngine.closedParkTimeout(deadlines: [50], now: 100, ceiling: 60) == 0)
+    }
+}

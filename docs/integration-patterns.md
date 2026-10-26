@@ -379,21 +379,59 @@ moq_playback_track_cfg_t ptc; moq_playback_track_cfg_init(&ptc);
 ptc.media_type = MOQ_PLAYBACK_MEDIA_VIDEO;
 ptc.packaging  = MOQ_PLAYBACK_PACKAGING_CMAF;
 ptc.timescale  = 90000;
+ptc.transport_version = (uint32_t)moq_session_version(session);
 if (moq_playback_add_track(rx->playback, &ptc, &rx->pb_track) != MOQ_OK)
     return 1;
 
-/* Feed objects in on_lane_pump. */
-moq_playback_push_sub_object(rx->playback, rx->pb_track,
-    &sub_object, now);  /* returns MOQ_OK or error */
+/* One pump step. rx->video_track is the media track's subscription, made
+ * once the catalog names the track; rx->pb_track is its playback track.
+ * The queues are bounded and every refusal is
+ * MOQ_ERR_WOULD_BLOCK with nothing taken, so the step drains first and
+ * retries; a held subscriber object stays owned by the caller until the
+ * push accepts it. */
+static int pump_playback(rx_t *rx, uint64_t now)
+{
+    /* Drain both queues. Commands own rcbuf refs (e.g. a DECODE payload);
+     * the queue consumer calls moq_playback_cmd_cleanup(&cmd) after use. */
+    moq_playback_cmd_t cmd;
+    while (moq_playback_poll_command(rx->playback, &cmd, sizeof(cmd)) == MOQ_OK)
+        app_queue_push(&rx->cmd_queue, &cmd);
+    moq_playback_event_t ev;
+    while (moq_playback_poll_event(rx->playback, &ev, sizeof(ev)) == MOQ_OK)
+        app_log_playback_event(&ev);   /* drops, gaps, track end */
 
-/* Tick and drain commands. */
-moq_playback_tick(rx->playback, now);
-moq_playback_cmd_t cmd;
-while (moq_playback_poll_command(rx->playback, &cmd) == MOQ_OK) {
-    app_queue_push(&rx->cmd_queue, &cmd);
-    /* Commands own rcbuf refs (e.g. DECODE payload).
-     * The queue consumer must call moq_playback_cmd_cleanup(&cmd)
-     * after processing each command. */
+    /* Push the held object (if any), then new ones. Only objects of the
+     * media track reach playback: the catalog and any other track are
+     * routed first, and only a media object is ever held for retry. */
+    while (rx->have_held || moq_sub_poll_object(rx->sub, &rx->held) == MOQ_OK) {
+        if (!rx->have_held) {
+            if (rx->held.track == rx->catalog_track)
+                handle_catalog(rx, &rx->held, now);
+            if (rx->held.track != rx->video_track) {
+                moq_sub_object_cleanup(&rx->held);
+                continue;
+            }
+            rx->have_held = true;
+        }
+        moq_result_t rc = moq_playback_push_sub_object(rx->playback,
+                                                       rx->pb_track,
+                                                       &rx->held, now);
+        if (rc == MOQ_ERR_WOULD_BLOCK)
+            break;                      /* keep it; retry next step */
+        moq_sub_object_cleanup(&rx->held);
+        rx->have_held = false;
+        if (rc != MOQ_OK)
+            return -1;                  /* caller error or ended track */
+    }
+
+    /* tick may have released some objects before it returns WOULD_BLOCK;
+     * that progress stands. It also makes room for a refused push when
+     * tracks still waiting for a keyframe fill the buffer. Drain on the
+     * next step and tick again. */
+    moq_result_t trc = moq_playback_tick(rx->playback, now);
+    if (trc != MOQ_OK && trc != MOQ_ERR_WOULD_BLOCK)
+        return -1;
+    return 0;
 }
 ```
 
@@ -401,6 +439,18 @@ while (moq_playback_poll_command(rx->playback, &cmd) == MOQ_OK) {
 
 The publisher receives media from the app thread via a queue,
 encodes it as MoQ objects, and writes them on the network thread.
+This pattern makes `moq_pub_tick` the session's only event consumer. It works
+on every draft: service transport actions, call tick once, then return to the
+driver after a bounded amount of application work. A tick that returns
+`MOQ_ERR_WOULD_BLOCK` still permits event progress on the next round; do not
+spin until it returns OK. For a shared event dispatcher, use the
+[manual mode](#manual-publisher-pump) below instead of tick.
+
+The application-defined `publisher_t` includes a `write_request_t pending_write`
+and a `bool has_pending_write`, initially false. These fields belong to the
+network thread. A blocked write stays there, ahead of later queued objects;
+it does not rely on finding room to push a popped request back into a
+concurrently filled queue.
 
 ### on_lane_pump implementation
 
@@ -453,38 +503,33 @@ int publisher_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
     { moq_result_t trc = moq_pub_tick(px->pub, now);
       if (trc < 0 && trc != MOQ_ERR_WOULD_BLOCK) return 1; }
 
-    /* Drain write requests from app queue.
-     * Each req owns one ref on payload and properties, transferred
-     * from the app thread via the queue. write_object_ex borrows
-     * them for the call and increfs internally for the action
-     * queue. The pump decrefs the queue's ref after write. */
-    write_request_t req;
-    while (app_queue_pop(&px->write_queue, &req)) {
+    /* Application-chosen budget, not a library limit. Keep one owned
+     * request until its write completes; a partial fan-out owns additional
+     * facade refs and must be retried with identical identity and bytes. */
+    for (size_t writes = 0; writes < 32; ++writes) {
+        if (!px->has_pending_write) {
+            if (!app_queue_pop(&px->write_queue, &px->pending_write)) break;
+            px->has_pending_write = true;
+        }
+        const write_request_t *req = &px->pending_write;
         moq_pub_object_cfg_t obj;
         moq_pub_object_cfg_init_sized(&obj, sizeof(obj));
-        obj.group_id   = req.group_id;
-        obj.object_id  = req.object_id;
-        obj.payload    = req.payload;
-        obj.properties = req.properties;
-        obj.end_of_group = req.end_of_group;
+        obj.group_id   = req->group_id;
+        obj.object_id  = req->object_id;
+        obj.payload    = req->payload;
+        obj.properties = req->properties;
+        obj.end_of_group = req->end_of_group;
         moq_result_t wrc = moq_pub_write_object_ex(
             px->pub, px->media_track, &obj, now);
-        if (wrc == MOQ_OK) {
-            /* Written. Release queue's refs. */
-            moq_rcbuf_decref(req.payload);
-            if (req.properties) moq_rcbuf_decref(req.properties);
-        } else if (wrc == MOQ_ERR_WOULD_BLOCK) {
-            /* Action queue full. Requeue for retry on next pump
-             * cycle — do not decref, queue still owns refs. */
-            app_queue_push_front(&px->write_queue, &req);
+        if (wrc == MOQ_ERR_WOULD_BLOCK) {
+            /* Retain this request for the next driver round. A terminal
+             * reset may need event credit, not just action capacity. */
             break;
-            /* Alternative (low-latency drop policy): decref and
-             * discard instead of requeuing. */
-        } else {
-            /* Permanent error. Release refs and drop. */
-            moq_rcbuf_decref(req.payload);
-            if (req.properties) moq_rcbuf_decref(req.properties);
         }
+        moq_rcbuf_decref(req->payload);
+        moq_rcbuf_decref(req->properties);
+        px->has_pending_write = false;
+        if (wrc != MOQ_OK) return 1; /* stop; teardown releases facade refs */
     }
     return 0;
 }
@@ -506,10 +551,58 @@ moq_pq_threaded_wake(t);
 ```
 
 The app thread transfers its owned rcbuf refs to the queue.
-The network thread's `on_lane_pump` owns them from that point and
-decrefs after `write_object_ex` succeeds, or on permanent error.
-On `WOULD_BLOCK`, refs stay with the requeued request.
-Zero-copy through the entire path.
+Once popped, the network thread owns them through `pending_write` and
+decrefs after `write_object_ex` succeeds. On `WOULD_BLOCK`, keep the request's
+identity, bytes and references unchanged. Flush/tick resumes staged request
+work, but the application must retry the write itself. Other errors stop
+this sample's pump; lifecycle cleanup must destroy the publisher and release
+any still-pending or queued application refs. Arrange another driver round
+while work remains after the 32-write budget, giving transport service a turn
+first; wait for input, credit or an application decision when no progress is
+possible.
+
+An application that chooses to drop a partial write must first drive
+`moq_pub_reset_group` to completion, retrying that same reset after
+`MOQ_ERR_WOULD_BLOCK` while continuing normal event/action progress. Keep the
+pending request until that abandonment succeeds; then release its application
+refs and clear it. A clean group close or merely dropping local refs does not
+abandon the facade's operation. The reset affects every active destination of
+that track, and later Objects must obey the track's existing group-history
+rules. Destroying the publisher is the alternative when ending its entire
+lifetime.
+
+### Manual publisher pump
+
+When several owners share the session's events, use one application
+dispatcher and `moq_pub_handle_event`; do not also call `moq_pub_tick`.
+On every draft, one bounded progress round follows this sequence:
+
+1. Service available transport actions. If action draining blocks, continue
+   to the event steps below; a queued reset may need event credit.
+2. Call `moq_pub_flush` once to retry work the publisher already owns.
+   `MOQ_ERR_WOULD_BLOCK` means work remains, not that event polling must wait.
+   Handle other errors according to the public contract.
+3. Poll and dispatch one event at a time, up to an application-chosen event
+   budget. Keep normal FIFO order. On `WOULD_BLOCK + CONSUMED`, the publisher
+   has taken ownership of the necessary state: clean up the event exactly
+   once and continue. Never save or replay that event after flush.
+4. Offer `IGNORED` events to other owners while their borrowed spans are
+   valid, before another advancing call on the session, then clean up once.
+   Route fill request/terminal and outgoing-subgroup terminal events too;
+   these can release credit or reconcile subgroup state needed by other work.
+5. After dispatch returns credit, retry staged work in a bounded pass and
+   service available actions. If no event, action or application progress
+   occurred, yield to the driver rather than spinning for flush-to-OK.
+
+Clean up every polled event exactly once, including on an error exit.
+`CONSUMED` does not promise that an ACK or response reached the peer. An
+initial decision may remain owned after destination allocation fails with
+`NOMEM + CONSUMED`; recover resources and use flush to retry it, rather
+than replaying the event. An intentionally deferred authorizer or fill can
+keep returning WOULD_BLOCK until the application supplies its decision.
+For deferred subscription resolution, the decision's ID becomes stale as
+soon as it is recorded, even if resolution returns WOULD_BLOCK or NOMEM; see
+[deferred authorization](architecture.md#deferred-subscribe-authorization).
 
 ## Session Tuning for Media
 

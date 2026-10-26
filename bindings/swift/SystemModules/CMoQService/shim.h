@@ -1,12 +1,14 @@
 #ifndef MOQ_SERVICE_SHIM_H
 #define MOQ_SERVICE_SHIM_H
 
-/* The installed C service tier (pkg-config: libmoq-service). The service
- * headers pull types.h/session.h/media_object.h/cmaf.h/msf.h transitively;
+/* The installed C service tier (pkg-config: libmoq-service), built with
+ * the playback engine (the media player). The service headers pull
+ * types.h/session.h/media_object.h/cmaf.h/msf.h/playback.h transitively;
  * rcbuf.h is included for the sender's payload buffers. */
 #include <moq/endpoint.h>
 #include <moq/media_receiver.h>
 #include <moq/media_sender.h>
+#include <moq/media_player.h>
 #include <moq/rcbuf.h>
 
 /* Swift does not import these UINT32_C macros. Keep their mapping in C so the

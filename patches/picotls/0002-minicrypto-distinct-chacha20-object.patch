@@ -14,7 +14,7 @@ byte, and every build description that names it is updated: CMake, the
 Visual Studio project and filters, and the Xcode project. The vendored cifra
 file, the symbols, the flags and the behavior are unchanged.
 
-Applies to picotls f06553b877ada93c860dd1db9002eabf7365292d, after 0001.
+Applies to picotls 7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1, after 0001.
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 6c8f942..4e47000 100644

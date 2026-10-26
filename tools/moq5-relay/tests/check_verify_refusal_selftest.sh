@@ -59,8 +59,8 @@ expect "the right status with a capacity report" 2 \
     "  cli runtime: 5816 bytes (snapshot rows, plus the serve context at lanes > 1; included above)" no
 
 # -- a successful report is never a refusal ----------------------------------
-# The capacity report describes a term as applying "at lanes > 1"; scanning the
-# text for that phrase is what made a passing run read as a refusal.
+# A report line that shares the guard's phrase "lanes > 1" is still not a
+# refusal: a matcher that scanned for the phrase would read a passing run as one.
 expect "a successful capacity report" 0 \
     "relay-state allocation-request ceiling: 1616263241 bytes
   cli runtime: 399861 bytes (snapshot rows, plus the serve context at lanes > 1; included above)" no

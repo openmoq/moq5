@@ -1111,7 +1111,7 @@ run_one(uint64_t seed, uint32_t ops, const lc_faults_t *faults, ca_t *ca,
     LC_APPLY(cfg.log_budget.max_groups, lc.f.log_max_groups);
     LC_APPLY(cfg.log_budget.max_bytes, lc.f.log_max_bytes);
     moqr_core_capacity_t cap;
-    moqr_core_capacity_describe(&cfg, &cap);
+    moqr_core_capacity_describe(&cfg, &cap, sizeof(cap));
     if (moqr_core_create(&cfg, &lc.core) != MOQR_OK) {
         printf("FAIL: core create (seed 0x%" PRIx64 ")\n", seed);
         moqr_trace_destroy(lc.trace);

@@ -6,10 +6,13 @@
  * the other in order, data streams offset so both directions stay distinct.
  * Each side takes the profile, request capacity, GOAWAY drain timeout, SETUP
  * tokens and token cache from a side_cfg_t.
+ *
+ * It needs only the public session API, so a test that links the shipping
+ * (possibly shared) libraries can use it; test_raw_pair_d22.h adds raw
+ * draft-22 message injection for white-box tests.
  */
 #include <moq/moq.h>
 #include "test_binding_support.h"
-#include "../../core/src/wire/messages_d22_internal.h"
 #include <string.h>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -174,24 +177,6 @@ RP_UNUSED static void destroy(moq_session_t *c, moq_session_t *sv)
 {
     moq_session_destroy(c);
     moq_session_destroy(sv);
-}
-
-/* A draft-22 control message on a request stream. */
-RP_UNUSED static moq_result_t feed(moq_session_t *s, moq_stream_ref_t ref, const moq_d22_message_t *m,
-                         const moq_d22_param_t *params, size_t n, uint64_t request_type,
-                         bool from_subscriber, uint64_t now)
-{
-    moq_d22_message_context_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.request_type = request_type;
-    ctx.update_from_subscriber = from_subscriber;
-    ctx.max_filter_ranges = 8;
-    uint8_t buf[256];
-    moq_buf_writer_t w;
-    moq_buf_writer_init(&w, buf, sizeof(buf));
-    moq_result_t rc = moq_d22_encode_message(&w, m, params, n, &ctx);
-    if (rc < 0) return rc;
-    return moq_session_on_bidi_stream_bytes(s, ref, buf, moq_buf_writer_offset(&w), false, now);
 }
 
 #endif /* MOQ_TEST_RAW_PAIR_SUPPORT_H */

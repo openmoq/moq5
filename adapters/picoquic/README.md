@@ -4,7 +4,8 @@ Bridges moq-core sessions to real QUIC transport via picoquic.
 
 ## Stream scheduling
 
-PicoQUIC and PicoWT schedule data streams per MOQT 7.2: subscriber priority,
+PicoQUIC and PicoWT schedule data streams per drafts 16/18 §7.2 and draft 22
+§5.1.2: subscriber priority,
 then publisher priority, then group in the request's group order (MOQT 7.1),
 then lowest subgroup ID. Streams of different requests that tie on all of
 these share bandwidth round-robin. Applications choose the priorities: the
@@ -13,28 +14,64 @@ adapters do not infer them from a media codec or track name.
 The adapter ranks queued streams and uses even native priority values for
 round-robin service among equal ranks. Control traffic uses priority zero;
 data ranks start at two, one per distinct key. PicoQUIC's eight-bit priority
-space permits 127 data ranks, so a new prioritized stream waits while 127
-others hold bytes in the queue; the bridge keeps it, in priority order.
-Streams already sending never wait. The queue is bounded like a socket's send
-buffer: a write is refused once the queued bytes reach the cap, and accepted
-whole below it, so the bridge's best-priority write always gets in first.
+space permits 127 data ranks. Additional distinct keys share the least urgent
+native level (254). This preserves a monotone mapping but makes those ranks
+ties at the transport; it does not block admission of a more urgent stream.
+Equal keys consume one rank regardless of stream count.
+The queue's byte budget controls admission: a write is refused once queued
+bytes reach the cap, and accepted whole below it, so the bridge's
+best-priority write gets in first when capacity returns.
+Standalone zero-byte FIN markers each consume one unit of that budget until
+drained or discarded; adding FIN to an existing data chunk needs no extra unit.
+This bounds accepted markers separately from their zero payload size.
 
 The core emits each stream's priority before its first write, so it survives
 subgroup retirement and a blocked transport open/write. A subscriber priority
-update re-ranks all streams of that request, including data already queued.
-A FETCH stream takes the publisher priority of its next object. This is not an
-object-level scheduler. Separate request-stream ranks and per-object datagram
+update re-ranks ordinary streams of that request, including data already queued.
+Draft-22 fills retain their independently resolved child parameters.
+A FETCH stream retains the priority of its held objects until those bytes
+drain from the adapter queue. Objects with the same publisher priority may
+be queued together; a different priority waits at the bridge, so it cannot
+demote or promote earlier objects. The initial FETCH preamble can take the
+first object's priority. No peer acknowledgment is required for this change.
+Draft-22 fills carry their parent identity and current object's group through
+the bridge; crossing a group waits for the earlier class to drain too.
+Within a group, a fill precedes subscription data. Between groups the parent
+order applies, except that a fill with the opposite order yields to
+subscription data.
+
+Overlapping fills can make these pairwise recommendations cyclic. The bridge
+collapses each cyclic component to a shared rank, preserving every precedence
+edge between components. Equal ranks take turns among continuously eligible
+streams; higher priorities or transport blockage can still delay them. This
+is a policy for conflicting recommendations, not a claim to satisfy all edges
+of a cycle. The heap retains full logical ranks; the transport key saturates
+its position at 65535 before native rank compression. Already transmitted
+bytes cannot be reordered.
+
+Each dirty parent snapshot uses linear scratch and quadratic work in its
+admitted streams, without recursion. Same-class writes do not rebuild it;
+data pumps share a limit of 256 attempts per service call before yielding
+remaining work.
+Separate request-stream ranks and per-object datagram
 priority are not implemented. No congestion-latency improvement is implied
 without measurement.
 
 The adapter queue holds 128 KiB by default (PicoQUIC: `send_queue_cap_bytes`).
 The bridge retains the rest, up to 1 MiB in total (at least 128 KiB in the
-bridge), and hands it over in priority order. When a stream's queued bytes
-drain, the adapter reports it (`MOQ_TRANSPORT_CAP_STREAM_DRAINED`), so the
-bridge sets the priority again on the next write.
+bridge), and hands it over in priority order. The cap is one for the whole
+connection, so the adapter refuses a write only when no stream can take
+bytes (`MOQ_TRANSPORT_CAP_SHARED_ADMISSION`): after a refusal the bridge
+offers no more bytes in that hand-off, while FIN-only writes and resets still
+go, and a reset that frees queued bytes reopens it. PicoWT's queue is the
+same. When a stream's queued bytes drain, the adapter reports it
+(`MOQ_TRANSPORT_CAP_STREAM_DRAINED`), so the bridge sets the priority again on
+the next write.
 
-The private bridge callback is optional and size-gated. Other adapters retain
-their existing scheduling behavior when they do not implement it.
+The bridge priority callback is optional and size-gated. Other adapters retain
+their existing scheduling behavior when they do not implement it. Without
+the drained notice, per-write reprioritization remains best effort; the bridge
+does not wait for a callback that the endpoint cannot provide.
 
 ## moq_pq_conn_t (direct adapter)
 
@@ -229,11 +266,20 @@ and `Threads::Threads`.
 
 ## Provider source baseline
 
-The qualified picoquic source is a602e60babea48da7849169d716aaf68684e66d6
+The pinned development picoquic source is
+70b5fd5aafdd2d6c349ff783202ece9d778bcaf2 (release `v2026.10.22.70b5fd5`)
 with the patches `scripts/setup_picoquic_deps.sh` applies, built against
-picotls f06553b877ada93c860dd1db9002eabf7365292d. Other source trees given
+picotls 7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1. Other source trees given
 through `MOQ_PICOQUIC_SOURCE_DIR` are used as they are: no version is
 checked, and no Git metadata is required.
+
+This release advertises and accepts both the legacy RESET_STREAM_AT transport
+parameter (`0x17f7586d2cb571`) and the draft-11 parameter (`0x1d`). That support
+comes from upstream, not a LibMoQ patch. It does not change the MoQ draft offer
+or enable reliable reset when the peer advertises neither parameter. The
+remaining development patches and their removal conditions are documented in
+[`patches/picoquic/README.md`](../../patches/picoquic/README.md); the unmodified
+release does not yet supply all contracts required below.
 
 On that baseline picoquic-core needs nothing from picoquic-log, so libmoq
 links the provider's targets with picoquic's own dependency edges only
@@ -249,7 +295,7 @@ picoquic-log.
 
 The adapter requires picoquic to copy accepted `picoquic_close_ex` reasons
 before returning and retain them through connection deletion callbacks.
-`scripts/setup_picoquic_deps.sh` applies patch 0006 to the pinned provider.
+`scripts/setup_picoquic_deps.sh` applies patch 0005 to the pinned provider.
 External provider packages must carry the equivalent implementation and
 advertise `PICOQUIC_CLOSE_REASON_COPIED=1` in their matching public header.
 The adapter rejects headers without this contract. Rebuild private-header
@@ -257,7 +303,7 @@ consumers and provider binaries together after applying the patch.
 
 ## Provider terminal observation
 
-`scripts/setup_picoquic_deps.sh` also applies patch 0007, which advertises
+`scripts/setup_picoquic_deps.sh` also applies patch 0006, which advertises
 `PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION` 1: the exact STOP_SENDING error
 (`picoquic_get_remote_stop_error`) and an opt-in callback once every byte and
 the FIN of a local unidirectional stream are acknowledged
@@ -272,7 +318,7 @@ apply in the order declared by `patches/picoquic/series`; use
 
 The raw and WebTransport adapters require
 `PICOQUIC_TERMINAL_STREAM_ALREADY_CLOSED=1` in the provider's matching public
-header. Patch 0010 supplies this contract for the pinned source. An external
+header. Patch 0008 supplies this contract for the pinned source. An external
 provider must carry the equivalent implementation, not only define the macro.
 Rebuild the provider and adapters together; an installed provider's headers and
 libraries must describe the same implementation.
@@ -287,5 +333,5 @@ byte is terminal. STOP ends only the receive direction of a bidirectional
 stream, never its independent send direction.
 
 This cancellation contract is required whether or not terminal observation is
-enabled. Omitting patch 0007 is supported for drafts 16 and 18, but does not
+enabled. Omitting patch 0006 is supported for drafts 16 and 18, but does not
 remove the close-reason or terminal-cancellation requirements.

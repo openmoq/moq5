@@ -15,7 +15,7 @@
 #include "../../core/src/session/session_internal.h"
 #include "../../core/src/wire/messages_d22_internal.h"
 #include "../../core/src/wire/control_d22_internal.h"
-#include "test_raw_pair_support.h"
+#include "test_raw_pair_d22.h"
 #include <string.h>
 
 static moq_bytes_t g_parts[] = { { (const uint8_t *)"live", 4 } };

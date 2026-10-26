@@ -9,7 +9,7 @@ This file is the reviewed in-tree architecture reference.
 A relay is a set of single-writer **shards**; each shard owns sessions and
 **tracks**; each track is a **bounded append-and-evict log** of refcounted
 object records; every consumer of any kind — live subscriber, fetch, cache
-retention, cross-shard pump, future cluster leg — is a **cursor** over that
+retention, cross-shard pump, cluster leg — is a **cursor** over that
 log; and the whole relay is a deterministic state machine whose only inputs
 are session events, delivery outcomes, control operations, and time.
 
@@ -44,7 +44,9 @@ Consequences, each load-bearing:
   clamped at create to `max(2, max_subs, max_ns_subs, max_ns_nodes)` — the
   largest single *atomic* reservation (a track's upstream resolution
   ≤ max_subs; one namespace's withdrawal ≤ max_ns_subs; a namespace
-  subscription's matches ≤ max_ns_nodes). A binding close, whose total
+  subscription's matches ≤ max_ns_nodes). Cluster cores also clamp it to
+  at least `max_subs + 2 * max_tracks + max_ns_subs` for route changes.
+  A binding close, whose total
   fan-out could be multiplicative (announced namespaces × watchers), is
   **resumable**: it delivers as much as fits, returns WOULD_BLOCK, and the
   binding drains and retries until done — so a close never strands and a
@@ -62,6 +64,35 @@ Consequences, each load-bearing:
   under-reporting. Admission control refuses past capacity instead of
   degrading.
 
+## Cluster routing
+
+Draft-22 sessions can negotiate the pinned
+[MoQ Cluster draft-01](../../docs/draft-lcurley-moq-cluster-01.txt). The
+[embedding guide](../README.md#cluster-routing) describes configuration.
+The host creates and reconnects peer connections; core and binding remain
+sans-I/O and run on their existing owners.
+
+The core retains bounded alternative routes for a namespace. Selection starts
+with the longest advertised prefix, excludes routes returning to the requester
+or containing its nonzero hop ID, then prefers known paths, lower accumulated
+cost, fewer hops and newer arrival. Local-loop routes are dropped. Link costs
+saturate, and a currently served path advertises zero cost while retaining its
+accumulated cost for later use. Warm reparenting uses a deterministic ordering.
+
+The binding advertises one selected route per recipient, appending its local
+hop exactly once. Same-publisher metadata changes update the advertisement;
+publisher changes withdraw it before replacement. Ordinary publishers enter
+the mesh as path `[0]`; separate unknown publishers retain distinct lifetimes.
+Peer identifiers guide routing while the existing authorization policy
+continues to control namespace discovery and content requests.
+
+Track ingest and upstream FETCH retain the selected source and generation.
+Same-origin failover resumes beyond the previous source's largest group; old
+partial records are abandoned and unsealed subgroups reset before replacement.
+Different/unknown publishers do not share retained content. Shards copy route
+metadata through bounded queues and verify the current source generation before
+applying replies, so delayed old-source data cannot enter a replacement log.
+
 ## Hard rules (CI-enforced where possible)
 
 1. `relay/src/core/` is sans-I/O: no sockets, threads, clocks, globals. Time is an
@@ -69,7 +100,12 @@ Consequences, each load-bearing:
 2. Public libmoq API only. Never `transport_bridge.h` / `wire.h` / `codec.h`
    / `control*.h` / `session_internal.h`, and not the publisher/subscriber
    facades (they own session event polling; the relay needs raw events).
-   Enforced by `scripts/check_relay_boundary.sh` (`relay_boundary` ctest).
+   One exception, by file: `relay/src/core/props_codec.c`, the property codec
+   translation primitive, uses `moq/vi64.h` and `moq/wire.h` (and nothing
+   else forbidden) to re-encode Object and Track Property integers between
+   draft-16 (i) and draft-18/22 (vi64) when a relay forwards across drafts.
+   Enforced by `scripts/check_relay_boundary.sh` (`relay_boundary` ctest),
+   whose exception and its neighbors `relay_boundary_selftest` checks.
 3. Single-writer per shard. Cross-shard = bounded mailboxes + explicit
    `moq_rcbuf_clone` only.
 4. Everything bounded; every bound is a capacity-model term.
@@ -134,15 +170,45 @@ raw MsQuic managed adapter the executable is not built. Tests carry the
 
 ## The production runtime (MsQuic managed lanes)
 
-`moq5-relay serve` runs over the **MsQuic managed** server, gated on
-`moq::adapter-msquic-managed` — there is no picoquic fallback for the
-production executable. `listener.lanes` defaults to 1 and is bounded at 64.
+`moq5-relay serve` runs over the **MsQuic managed** server by default, gated on
+`moq::adapter-msquic-managed`. Where the threaded PicoQUIC server is also built,
+`listener.transport: "picoquic"` serves raw QUIC on it instead; it is never
+chosen implicitly (see below). `listener.lanes` defaults to 1 and is bounded at 64.
 Lane count 1 keeps the direct single-core path; lane count greater than 1
 instantiates `moqr_shards_t` with exactly one shard per lane:
 
 ```
 MsQuic managed lane i  ->  shard i { one moqr_bind_t, one moqr_core_t, one trace }  ->  sessions
 ```
+
+**The PicoQUIC listener** (`listener.transport: "picoquic"`) runs the same
+shard runtime, binding, core, auth, cache, retrieval, admin endpoint and
+metrics; only the facade differs. It is one `moq_pq_threaded_t` -- one
+picoquic context and network thread -- on the listener port, and it runs the
+shard runtime at its one lane (no cross-shard plane at one shard). What it is
+and is not:
+
+- Raw QUIC only, drafts 16, 18 and 22 as configured. A `webtransport` object
+  beside it is refused at load; WebTransport is the wtquic-MsQuic listener's.
+- One lane. `listener.lanes` above 1 is refused at load: several picoquic
+  contexts on one port would be routed by the kernel on each datagram's
+  address, not its connection ID, so a connection whose packets reach another
+  context (a NAT rebinding, a socket joining the port) would be lost. One
+  context validates and follows a client's new path itself (RFC 9000,
+  Section 9). Several lanes need connection-ID routing between contexts.
+- The facade is created with `retain_terminal_until_ack`, so a closed
+  connection and its session stay valid until the binding has detached and
+  the reap pass acknowledges it (`moqr_relay_reap_pass_pq`).
+- Tuning (`relay_pq_configure`, through the facade's `configure_quic`): the
+  configured congestion controller (`listener.picoquic.congestion`, default
+  BBR), 8192 concurrent unidirectional and 1024 bidirectional streams, 64 MiB
+  connection and 16 MiB request/control-stream credit, NEW_TOKEN issuance
+  (cookie mode 2), datagram priority above media streams and below control,
+  a 10 s handshake timeout, and the socket buffer size
+  (`listener.picoquic.socket_buffer_bytes`, default 4 MiB).
+- Lane doorbell statistics are an MsQuic facade's; the PicoQUIC lane row
+  reports them as refused, never as zeros, and the single shard's cross-shard
+  plane as absent.
 
 - **`on_lane_pump` is the only session-access window.** Every `moq_session_*`
   and `moqr_bind_*` call happens inside it, under that lane's lock domain.
@@ -338,7 +404,8 @@ contract row, not just the path text.
 | `moq_msquic_lane_next_conn` / `moq_msquic_managed_conn_session` | lane-local connection iteration + per-conn session, valid only inside `on_lane_pump`; a terminal conn stays visible for the batch delivering `SESSION_CLOSED`, then is reaped; `_conn_close(conn, code)` defers past the pump | `adapters/msquic/include/moq/msquic_managed.h` |
 | `moq_msquic_managed_conn_user` / `_set_user` | per-connection state slot — the relay keys its per-conn binding tag here (never a pointer-keyed map: conn/session pointers can be reused by a successor connection) | `adapters/msquic/include/moq/msquic_managed.h` |
 | `moq_msquic_managed_session` | CLIENT-only convenience — NULL on a SERVER and outside the pump; the relay server must NOT use it, it iterates lane conns instead | `adapters/msquic/include/moq/msquic_managed.h` |
-| Other managed adapters (`moq_pq_threaded_t`, `moq_mvfst_managed_t`) — NOT the production relay transport | historical / non-production: same create/stop/destroy + `on_pump` confinement shape; the executable no longer links picoquic-threaded | `adapters/picoquic/include/moq/picoquic_threaded.h`, `adapters/mvfst/include/moq/mvfst.h` |
+| `moq_pq_threaded_t` — the PicoQUIC relay transport (`listener.transport: "picoquic"`) | one network thread and one lane; the relay runs one facade; `on_lane_pump` confinement, run with or without connections; per-connection slot `moq_picoquic_threaded_conn_user`/`_set_user`; terminal connections retained until `moq_picoquic_threaded_conn_ack_terminal` | `adapters/picoquic/include/moq/picoquic_threaded.h` |
+| `moq_mvfst_managed_t` — NOT a relay transport | same create/stop/destroy + `on_pump` confinement shape | `adapters/mvfst/include/moq/mvfst.h` |
 
 ## Draft-22 behaviour
 
@@ -406,8 +473,8 @@ sessions of different drafts. What is specific to draft-22 sessions:
 - **FETCH ranges** are resolved by the relay against its own Largest
   (`moq_session_set_defer_fetch_ranges`, described under "Status").
 - **Standalone FETCH retrieves what the relay does not hold** (§3.2.3). A
-  draft-22 standalone FETCH is admitted once and answered with FETCH_OK at
-  once. Its range is then covered in the requested group order -- descending
+  standalone FETCH, on every draft, is admitted once and answered with
+  FETCH_OK at once. Its range is then covered in the requested group order -- descending
   orders groups, each group's Objects stay in Object order (§3.2.1) -- from
   the cache, and each run the cache does not hold is retrieved with one
   upstream FETCH for exactly that run, through the same retrieval cursor and
@@ -417,19 +484,24 @@ sessions of different drafts. What is specific to draft-22 sessions:
   is marked End of Timed-Out Range while the response continues; a FILL_TIMEOUT
   of 0 asks nothing upstream. A run with no connection to retrieve it from is marked
   End of Unknown Range at once (Timed-Out once the budget is spent), and an
-  Object still arriving is waited for up to the deadline. Retrieved Objects
+  Object still arriving is waited for up to the deadline. A draft without End
+  of Timed-Out Range (draft-16, draft-18) gets End of Unknown Range instead:
+  never a FIN that would say the Objects do not exist (draft-16 §9.16.3,
+  draft-18 §10.12.3). Retrieved Objects
   are not ingested into the live log. An upstream FETCH that fails resets the
   response with UNKNOWN_OBJECT_STATUS (§3.2.2); a local failure resets it
-  with INTERNAL_ERROR; a request the relay cannot take on (no FETCH slot) is
-  refused with REQUEST_ERROR INTERNAL_ERROR. All of these are request-local:
+  with INTERNAL_ERROR; a request the relay cannot take on (no FETCH slot, or
+  a full FETCH pool) is refused as capacity, with its retry hint. All of these
+  are request-local:
   the session, its subscriptions and its other FETCHes are unaffected, and a
   reset the session cannot take yet is retried until it commits. The
   subscriber's cancellation retires the request at once and cancels its
   upstream FETCH. On a shard that does not own the track the FETCH is routed
   to the owning shard, which admits it against its own log and answers it
   from its cache and upstream across the shard channels (above), so the
-  response is the same whichever shard the subscriber landed on. Draft-16 and
-  draft-18 FETCH are served from the retained log as before.
+  response is the same whichever shard the subscriber landed on. The binding
+  serves every draft's FETCH this way; the core's retained-only
+  `moqr_core_fetch_open` stays available to embedders that choose it.
 
 Tests: `relay_session_binding_fetch`, `relay_session_binding_d22`,
 `relay_shard_fill`,
@@ -606,3 +678,13 @@ stack uses fb303/ServiceData callbacks, not exposition text). Labels are
 bounded by construction — shard, transport, draft version, and per-series
 enum reason/state — never namespace, track, session, or cursor identity;
 per-entity detail lives in the route dump and the trace ring.
+
+Cluster replication reserves one allocation-free withdrawal record per directed
+mailbox in addition to its configured admission slots. A new advertisement
+refused by a full receiver cannot block the withdrawal that frees its capacity.
+The record obeys the same visibility barrier; a reannouncement cannot overtake
+its pending withdrawal. Its create-time storage is included in the cluster
+mailbox capacity term and is absent when clustering is disabled. Mirrors
+retain the original owner-qualified advertisement ID, and a reparented PUSH
+loses ingest authority immediately when the source generation
+changes, even while its wire cancellation is waiting for session credit.

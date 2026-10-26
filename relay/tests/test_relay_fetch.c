@@ -5,7 +5,8 @@
  * before-tail vs tail end_of_track, the fetch terminals (unknown track,
  * INVALID_RANGE, whole-group End), max_fetches exhaustion, the fetch_pin_bytes
  * budget (multi-fetch backpressure + the no-infinite-wait floor), the idempotent
- * re-peek (WOULD_BLOCK hold invariant), and close/binding-close pin release.
+ * re-peek (WOULD_BLOCK hold invariant, a held chunked object across a
+ * chunk-node eviction included), and close/binding-close pin release.
  * Allocator balance zero ends every test.
  */
 
@@ -577,7 +578,7 @@ test_pin_floor(void)
     cfg.log_budget.max_bytes = 64;
     cfg.fetch_pin_bytes = 1;
     moqr_core_capacity_t cap;
-    moqr_core_capacity_describe(&cfg, &cap);
+    moqr_core_capacity_describe(&cfg, &cap, sizeof(cap));
     MOQ_TEST_CHECK(cap.payload_bytes >= 64);   /* floored, not 1 */
 
     moqr_binding_t pub, sub;
@@ -1196,6 +1197,109 @@ test_chunked_fetch_payload_outlives_core(void)
 
     MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
     MOQ_TEST_PASS("chunked_fetch_payload_outlives_core");
+    return failures;
+}
+
+/* A FETCH holding a chunked object across a refused downstream write keeps
+ * it when a later group's chunk reclaims the chunk-node pool from the
+ * object's group: the re-peek serves the held object byte for byte, and the
+ * eviction of the rest of the range surfaces only after it, as TOO_OLD. The
+ * held copy is released once. */
+static int
+test_chunked_fetch_held_node_eviction(void)
+{
+    int failures = 0;
+    ca_t a;
+    ca_init(&a);
+    moqr_core_relay_cfg_t cfg;
+    moqr_core_relay_cfg_init_sized(&cfg, sizeof(cfg), &a.vt);
+    cfg.log_budget.max_groups = 8;
+    cfg.log_budget.max_bytes = 1u << 20;
+    cfg.log_max_chunk_nodes = 4;
+    cfg.linger_us = 1000;
+    moqr_core_t *c = NULL;
+    MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_OK);
+    if (c == NULL) {
+        return failures;
+    }
+    moqr_binding_t pub, sub;
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 1, &pub) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_binding_open(c, 2, &sub) == MOQR_OK);
+    moqr_track_t t;
+    MOQ_TEST_CHECK(mktrack(c, pub, "v", &t) == MOQR_OK);
+
+    /* Group 0's object: three 4-byte chunks, three of the four nodes. */
+    moqr_log_append_desc_t d;
+    moqr_log_append_desc_init(&d);
+    d.group_id = 0;
+    d.subgroup_id = 0;
+    d.object_id = 0;
+    d.publisher_priority = 1;
+    d.status = MOQR_OBJ_NORMAL;
+    d.obj_state = MOQR_OBJ_OPEN;
+    d.declared_len = 12;
+    d.now_us = 1;
+    MOQ_TEST_CHECK(moqr_core_ingest(c, t, &d) == MOQR_OK);
+    static const uint8_t CB[3] = { 0x11u, 0x22u, 0x33u };
+    for (int i = 0; i < 3; i++) {
+        uint8_t body[4];
+        memset(body, CB[i], sizeof(body));
+        moq_rcbuf_t *ch = NULL;
+        MOQ_TEST_CHECK(moq_rcbuf_create(&a.vt, body, sizeof(body), &ch) == 0);
+        MOQ_TEST_CHECK(moqr_core_append_chunk(c, t, 0, 0, 0, ch) == MOQR_OK);
+        moq_rcbuf_decref(ch);
+    }
+    MOQ_TEST_CHECK(moqr_core_complete_record(c, t, 0, 0, 0) == MOQR_OK);
+    /* Object 1, whole (no node): still owed to the range after object 0. */
+    MOQ_TEST_CHECK(ing(c, &a, t, 0, 0, 1) == MOQR_OK);
+
+    moq_bytes_t nsb[1];
+    moqr_fetch_req_t r;
+    fetch_req(&r, "v", nsb, 0, 0, 0, 0);   /* whole group 0 */
+    moqr_fetch_t fh;
+    moqr_fetch_plan_t plan;
+    MOQ_TEST_CHECK(moqr_core_fetch_open(c, sub, &r, FNOW, &fh, &plan) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(plan.admit, MOQR_FETCH_ACCEPT);
+    moqr_fetch_item_t it;
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it) == MOQR_OK);
+    MOQ_TEST_CHECK(it.kind == MOQR_FETCH_ITEM_OBJECT && it.rec.object_id == 0 &&
+                   it.rec.payload != NULL);
+
+    /* Group 1's object: its second chunk needs the node group 0 holds. */
+    d.group_id = 1;
+    d.declared_len = 8;
+    MOQ_TEST_CHECK(moqr_core_ingest(c, t, &d) == MOQR_OK);
+    for (int i = 0; i < 2; i++) {
+        uint8_t body[4];
+        memset(body, 0x44, sizeof(body));
+        moq_rcbuf_t *ch = NULL;
+        MOQ_TEST_CHECK(moq_rcbuf_create(&a.vt, body, sizeof(body), &ch) == 0);
+        MOQ_TEST_CHECK(moqr_core_append_chunk(c, t, 1, 0, 0, ch) == MOQR_OK);
+        moq_rcbuf_decref(ch);
+    }
+    moqr_core_stats_t st;
+    moqr_core_get_stats(c, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_total, 2);   /* group 0's two records */
+
+    static const uint8_t WANT[12] = { 0x11, 0x11, 0x11, 0x11, 0x22, 0x22,
+                                      0x22, 0x22, 0x33, 0x33, 0x33, 0x33 };
+    moqr_fetch_item_t it2;
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it2) == MOQR_OK);
+    MOQ_TEST_CHECK(it2.kind == MOQR_FETCH_ITEM_OBJECT &&
+                   it2.rec.payload == it.rec.payload);
+    if (it2.rec.payload != NULL && moq_rcbuf_len(it2.rec.payload) == 12) {
+        MOQ_TEST_CHECK(memcmp(moq_rcbuf_data(it2.rec.payload), WANT, 12) == 0);
+    } else {
+        MOQ_TEST_CHECK(false);
+    }
+    MOQ_TEST_CHECK(moqr_core_fetch_commit(c, fh) == MOQR_OK);
+    moqr_fetch_item_t it3;
+    MOQ_TEST_CHECK(moqr_core_fetch_peek(c, fh, FNOW, &it3) == MOQR_ERR_TOO_OLD);
+    MOQ_TEST_CHECK(moqr_core_fetch_close(c, fh) == MOQR_OK);
+
+    moqr_core_destroy(c);
+    MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
+    MOQ_TEST_PASS("chunked_fetch_held_node_eviction");
     return failures;
 }
 
@@ -2371,6 +2475,7 @@ main(void)
     failures += test_chunked_complete_fetch();   /* FETCH over a chunked COMPLETE record */
     failures += test_chunked_fetch_oom();        /* coalesce fail-closed under OOM */
     failures += test_chunked_fetch_payload_outlives_core();  /* coalesced payload outlives the core */
+    failures += test_chunked_fetch_held_node_eviction();
     failures += test_exact_replay();
     failures += test_merge_order();
     failures += test_status_skip();

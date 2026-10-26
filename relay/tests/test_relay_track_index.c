@@ -158,13 +158,14 @@ typedef struct r_sub_baseline {
 } r_sub_baseline_t;
 
 _Static_assert(sizeof(r_sub_t) == sizeof(r_sub_baseline_t) +
-                                      2 * sizeof(uint32_t),
-               "track_next/track_prev must cost exactly 8 bytes per sub");
-/* subs_head fits former padding (0 bytes); the reclaim bookkeeping
- * (interest_seq + idle_since_us) costs exactly 16 bytes per track. */
+                                      2 * sizeof(uint32_t) + 2 * sizeof(uint64_t),
+               "track links and per-request cluster identity have bounded cost");
+/* subs_head fits former padding. Reclaim bookkeeping costs two words;
+ * cluster source lifetime, origin, requester identity/correlation and the
+ * aligned group-boundary guard cost six additional words. */
 _Static_assert(sizeof(r_track_t) == sizeof(r_track_baseline_t) +
-                                        2 * sizeof(uint64_t),
-               "r_track_t grows only by the two reclaim words");
+                                        8 * sizeof(uint64_t),
+               "r_track_t adds two reclaim and six cluster ownership words");
 
 /* -- The oracle ------------------------------------------------------------ */
 
@@ -678,7 +679,7 @@ describe_structure(ca_t *a, uint32_t max_subs, uint32_t max_tracks)
     cfg.log_budget.max_groups = 4;
     cfg.log_budget.max_bytes = 1 << 20;
     moqr_core_capacity_t cap;
-    if (moqr_core_capacity_describe(&cfg, &cap) != MOQR_OK) {
+    if (moqr_core_capacity_describe(&cfg, &cap, sizeof(cap)) != MOQ_OK) {
         return UINT64_MAX;
     }
     return cap.structure_bytes;

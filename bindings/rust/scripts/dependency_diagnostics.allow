@@ -1,0 +1,83 @@
+# The upstream warnings the warning gates (consumer/run.sh, package_check.sh)
+# accept: diagnostics of registry dependencies that a `cargo -vv` build shows
+# because cargo caps dependency lints at `warn` under -vv (an ordinary build
+# caps them at `allow`). They stay visible in every build log and in the
+# inventory beside it; a lane that passes with them passes with accepted
+# upstream warnings, not without warnings.
+#
+# An entry names one diagnostic exactly: crate, version, location (the file
+# relative to the crate and the line of rustc's primary span) and lint. There
+# is no crate-wide, lint-wide or location-free entry, and none for an error
+# or for this build's own crates. Anything not named here fails the gate and
+# is reported (scripts/diagnostics.py; scripts/gate_controls.sh exercises
+# each refusal).
+#
+# What qualifies an entry: every crate below is at its newest release that
+# the dependency graph accepts (bindgen 0.73.2, the newest, takes
+# clang-sys 1.9.1, cexpr 0.6.0 and regex; cexpr 0.6.0, the newest, takes
+# nom 7, whose newest release is 7.1.3 and which takes memchr 2.8.3 and
+# minimal-lexical 0.2.1; regex takes regex-automata 0.4.18), so no
+# compatible upstream release removes the warning; and its source was read
+# at the location named and the warning marks no correctness, safety, ABI or
+# portability defect. The reason is stated per group.
+#
+# Where each appears: rustc 1.95 (the macOS rows' cargo) and 1.99 report the
+# same set except the `deprecated` entries, which only 1.99 reports; memchr's
+# dead_code entries appear on aarch64 only (the type is the x86-64/wasm mask).
+#
+# crate version location lint
+
+# `unsafe extern fn(...)` function-pointer types without a written ABI. The
+# default ABI of `extern` is "C", which is libclang's: no ABI change.
+clang-sys 1.9.1 src/link.rs:96 missing_abi
+clang-sys 1.9.1 src/link.rs:128 missing_abi
+# `#[cfg_attr(feature = "cargo-clippy", allow(clippy::...))]`: lint-level
+# attributes behind a feature modern clippy never sets; no code changes.
+clang-sys 1.9.1 src/lib.rs:23 unexpected_cfgs
+clang-sys 1.9.1 src/link.rs:173 unexpected_cfgs
+clang-sys 1.9.1 src/link.rs:174 unexpected_cfgs
+# `use std::path::Path` in the build script, used only by the main that
+# links libclang at build time; the `runtime` feature bindgen enables
+# compiles the other main.
+clang-sys 1.9.1 build.rs:18 unused_imports
+
+# `SensibleMoveMask` and its `get_for_offset`: the movemask of the x86-64
+# and wasm searchers; aarch64 uses its own NEON mask type instead.
+memchr 2.8.3 src/vector.rs:118 dead_code
+memchr 2.8.3 src/vector.rs:126 dead_code
+# `core::u8::MAX` and `core::u32::MAX`: the same values as `u8::MAX` and
+# `u32::MAX`, deprecated in favor of the associated constants.
+memchr 2.8.3 src/arch/all/packedpair/mod.rs:179 deprecated
+memchr 2.8.3 src/memmem/searcher.rs:916 deprecated
+
+# `fn rview(x: &[Limb]) -> ReverseView<Limb>`: the elided lifetime is not
+# written in the return type; the signature means the same either way.
+minimal-lexical 0.2.1 src/bigint.rs:127 mismatched_lifetime_syntaxes
+# `i32::max_value()`: the same value as `i32::MAX`.
+minimal-lexical 0.2.1 src/parse.rs:190 deprecated
+minimal-lexical 0.2.1 src/parse.rs:191 deprecated
+
+# `#[cfg_attr(nightly, warn/allow(rustdoc::missing_doc_code_examples))]` and
+# `#[cfg_attr(feature = "cargo-clippy", allow(...))]`: lint-level attributes
+# behind a cfg nothing sets; no code changes.
+nom 7.1.3 src/internal.rs:49 unexpected_cfgs
+nom 7.1.3 src/internal.rs:96 unexpected_cfgs
+nom 7.1.3 src/internal.rs:340 unexpected_cfgs
+nom 7.1.3 src/internal.rs:357 unexpected_cfgs
+nom 7.1.3 src/internal.rs:374 unexpected_cfgs
+nom 7.1.3 src/internal.rs:392 unexpected_cfgs
+nom 7.1.3 src/internal.rs:409 unexpected_cfgs
+nom 7.1.3 src/internal.rs:430 unexpected_cfgs
+nom 7.1.3 src/lib.rs:375 unexpected_cfgs
+nom 7.1.3 src/lib.rs:379 unexpected_cfgs
+nom 7.1.3 src/lib.rs:391 unexpected_cfgs
+nom 7.1.3 src/lib.rs:418 unexpected_cfgs
+# `pub use self::str::*`: a glob re-export with nothing public behind it in
+# this configuration.
+nom 7.1.3 src/lib.rs:439 unused_imports
+
+# `core::usize::MAX` and `core::i32::MAX`: the same values as `usize::MAX`
+# and `i32::MAX`, deprecated in favor of the associated constants.
+regex-automata 0.4.18 src/nfa/thompson/pikevm.rs:1241 deprecated
+regex-automata 0.4.18 src/nfa/thompson/pikevm.rs:1416 deprecated
+regex-automata 0.4.18 src/util/primitives.rs:151 deprecated

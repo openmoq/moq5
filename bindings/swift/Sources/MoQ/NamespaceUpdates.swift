@@ -285,8 +285,14 @@ extension ExtendedEvent {
             // The frozen v0 record: everything through token_count.
             let v0 = MemoryLayout<moq_namespace_update_record_t>.offset(
                 of: \moq_namespace_update_record_t.token_count)! + MemoryLayout<Int>.size
-            guard let p, Int(p.pointee.struct_size) >= v0 else { return nil }
-            return NamespaceUpdateRecord(p.pointee)
+            guard let p else { return nil }
+            let raw = UnsafeRawPointer(p)
+            guard raw.load(as: UInt32.self) >= UInt32(v0) else { return nil }
+            var value = moq_namespace_update_record_t()
+            withUnsafeMutableBytes(of: &value) {
+                $0.baseAddress!.copyMemory(from: raw, byteCount: v0)
+            }
+            return NamespaceUpdateRecord(value)
         }
         switch e.kind {
         case MOQ_EVENT_NAMESPACE_UPDATE_REQUEST:
@@ -308,7 +314,7 @@ extension ExtendedEvent {
                 target: .trackSubscription(TrackSubscription(e.u.subscribe_tracks_update_request.handle)),
                 update: u))
         case MOQ_EVENT_NAMESPACE_UPDATE_RESULT:
-            guard Int(e.detail_size) >= MemoryLayout<moq_namespace_update_result_event_t>.size
+            guard detailCovers(e.detail_size, \moq_namespace_update_result_event_t.expires_ms)
             else { return nil }
             let d = e.u.namespace_update_result
             return .namespaceUpdateResult(NamespaceUpdateResultInfo(

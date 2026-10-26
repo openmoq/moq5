@@ -100,6 +100,7 @@ app_pump(moq_msquic_managed_t *m, moq_msquic_managed_lane_t *lane,
 }
 
 typedef struct rig {
+    fake_msq_count_alloc_t alloc;
     fake_mgd_t            fake;
     app_ctx_t             app;
     moq_msquic_managed_t *m;
@@ -110,14 +111,15 @@ static bool
 rig_up(rig_t *r, uint32_t facade_conns, uint32_t bind_conns)
 {
     memset(r, 0, sizeof(*r));
+    fake_msq_count_alloc_init(&r->alloc);
     fake_mgd_init(&r->fake);
     moq_msq_test_api_override = fake_mgd_table(&r->fake);
     moq_msq_test_no_doorbell = true;
 
     moqr_core_relay_cfg_t core_cfg;
     moqr_core_relay_cfg_init_sized(&core_cfg, sizeof(core_cfg),
-                                   moq_alloc_default());
-    if (moqr_trace_create(moq_alloc_default(), 256, &r->app.trace) != MOQR_OK) {
+                                   &r->alloc.api);
+    if (moqr_trace_create(&r->alloc.api, 256, &r->app.trace) != MOQR_OK) {
         return false;
     }
     core_cfg.trace = r->app.trace;
@@ -125,7 +127,7 @@ rig_up(rig_t *r, uint32_t facade_conns, uint32_t bind_conns)
         return false;
     }
     moqr_bind_cfg_t bcfg;
-    moqr_bind_cfg_init_sized(&bcfg, sizeof(bcfg), moq_alloc_default());
+    moqr_bind_cfg_init_sized(&bcfg, sizeof(bcfg), &r->alloc.api);
     bcfg.core = r->app.core;
     bcfg.max_conns = bind_conns;
     if (moqr_bind_create(&bcfg, &r->app.bind) != MOQR_OK) {
@@ -134,7 +136,7 @@ rig_up(rig_t *r, uint32_t facade_conns, uint32_t bind_conns)
 
     moq_msquic_managed_cfg_t scfg;
     moq_msquic_managed_cfg_init_sized(&scfg, sizeof(scfg));
-    scfg.alloc = moq_alloc_default();
+    scfg.alloc = &r->alloc.api;
     scfg.perspective = MOQ_PERSPECTIVE_SERVER;
     scfg.host = NULL;               /* no bind address: nothing listens */
     scfg.port = 0;
@@ -168,6 +170,7 @@ rig_down(rig_t *r)
     if (r->app.trace != NULL) {
         moqr_trace_destroy(r->app.trace);
     }
+    T_CHECK(atomic_load(&r->alloc.live_bytes) == 0);
     moq_msq_test_api_override = NULL;
     moq_msq_test_no_doorbell = false;
 }

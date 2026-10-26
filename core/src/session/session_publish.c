@@ -945,7 +945,6 @@ moq_result_t session_core_on_publish(moq_session_t *s,
     e.u.publish_request.token_count = d->token_count;
     e.u.publish_request.track_properties = ev_props;
     e.u.publish_request.dynamic_groups = d->dynamic_groups;
-    e.u.publish_request.publisher_group_order = track_order;
     e.u.publish_request.has_largest = d->has_largest;
     e.u.publish_request.largest_group = d->has_largest ? d->largest_group : 0;
     e.u.publish_request.largest_object = d->has_largest ? d->largest_object : 0;
@@ -1589,6 +1588,14 @@ moq_result_t moq_session_publish(moq_session_t *s,
                              s->send_cap - s->send_len);
 
         moq_result_t rc2 = s->profile->encode_publish(s, &w, &args);
+        if (rc2 == MOQ_ERR_BUFFER && s->send_len > 0) {
+            moq_buf_writer_t probe;
+            rc2 = send_probe_begin(s, &probe);
+            if (rc2 == MOQ_OK) {
+                rc2 = s->profile->encode_publish(s, &probe, &args);
+                rc2 = send_probe_end(s, &probe, rc2);
+            }
+        }
         if (rc2 < 0) {
             track_hist_release(s, phist);
             s->profile->abort_request(s, &req_ep);
@@ -2346,6 +2353,7 @@ static moq_result_t pub_reject_update_control(moq_session_t *s,
         rc = queue_send_control(s, buf + split, total - split);
     }
     if (rc < 0) return rc;
+    session_tag_owner_done(s, pe->handle._opaque);
     s->profile->commit_inbound_request(s, &d->endpoint);
     pub_free_entry(s, d->target_slot);
     return MOQ_OK;
@@ -2599,9 +2607,11 @@ static moq_result_t pub_queue_update_done(moq_session_t *s, size_t slot,
     };
     moq_result_t rc = s->profile->encode_publish_done(s, &dw, &done_args);
     if (rc < 0) return rc;
-    return pe->rs.ref._v != 0
+    rc = pe->rs.ref._v != 0
         ? queue_send_bidi(s, pe->rs.ref, buf, moq_buf_writer_offset(&dw), true)
         : queue_send_control(s, buf, moq_buf_writer_offset(&dw));
+    if (rc == MOQ_OK) session_tag_owner_done(s, pe->handle._opaque);
+    return rc;
 }
 
 /* Whether a subgroup or fill stream of publication `slot` still owes the
@@ -2609,7 +2619,8 @@ static moq_result_t pub_queue_update_done(moq_session_t *s, size_t slot,
 static bool pub_owes_closures(const moq_session_t *s, size_t slot)
 {
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
-        if (s->subgroups[i].state == MOQ_SG_RESET_OWED &&
+        if ((s->subgroups[i].state == MOQ_SG_RESET_OWED ||
+             s->subgroups[i].state == MOQ_SG_TERMINAL_OWED) &&
             moq_publication_is_valid(s->subgroups[i].pub) &&
             moq_publication_eq(s->publishes[slot].handle, s->subgroups[i].pub))
             return true;
@@ -2900,26 +2911,19 @@ moq_result_t session_accept_publication_update_receipt(
     moq_result_t rc = pub_inbound_update_answer_target(s, pub, cfg->update_request_id, &slot);
     if (rc < 0) return rc;
     moq_pub_entry_t *e = &s->publishes[slot];
-    uint32_t n = e->owed_update.count;
     bool req_stream = e->rs.ref._v != 0;
 
-    /* The whole answer is reserved before anything is queued: one REQUEST_OK
-     * per covered update, every byte of them, the subscriber priority's
-     * owner-wide key, and the fill. */
-    size_t ok_actions = n + pub_inbound_update_priority_slots(s, e, &e->owed_update.rec);
+    /* All wire ACKs share one output action; reserve the priority update
+     * and fill separately before committing any part of the answer. */
+    size_t ok_actions = 1 + pub_inbound_update_priority_slots(s, e, &e->owed_update.rec);
     if (action_queue_avail(s) < ok_actions) return MOQ_ERR_WOULD_BLOCK;
     moq_update_plan_t plan;
     rc = pub_inbound_update_prepare(s, (size_t)slot, &e->owed_update.rec, ok_actions,
                                     &plan);
     if (rc < 0) return rc;
-    rc = session_update_accept_fits(s, &e->owed_update, &plan);
+    rc = session_update_queue_accept(s, req_stream, e->rs.ref,
+                                    &e->owed_update, &plan);
     if (rc < 0) return rc;
-
-    for (uint32_t i = 0; i < n; i++) {
-        rc = pub_inbound_update_queue_ok(s, req_stream, e->rs.ref,
-                                 session_owed_update_id(&e->owed_update, i), &plan);
-        if (rc < 0) return rc;   /* unreachable: reserved above */
-    }
     moq_sub_update_t u = e->owed_update.rec;
     session_owed_update_clear(s, &e->owed_update);
     if (receipt) {
@@ -3452,6 +3456,8 @@ moq_result_t moq_session_finish_publish(
 
     for (size_t i = 0; i < s->sg_cap; i++) {
         moq_sg_entry_t *sg = &s->subgroups[i];
+        if (sg->state == MOQ_SG_TERMINAL_OWED && moq_publication_eq(sg->pub, pub))
+            return MOQ_ERR_WOULD_BLOCK;
         if (sg->state == MOQ_SG_FREE || sg->state == MOQ_SG_CLOSING ||
             sg->state == MOQ_SG_RESETTING)
             continue;
@@ -3505,6 +3511,7 @@ moq_result_t moq_session_finish_publish(
     /* Terminal: finish the request bidi (FIN) for stream-correlated profiles. */
     moq_result_t arc = queue_publish_response(s, (size_t)slot, buf, elen, req_stream);
     if (arc < 0) return arc;
+    session_tag_owner_done(s, pe->handle._opaque);
 
     if (need_drain)
         (void)drain_ref_add(s, pe->rs.ref);   /* slot reserved above */
@@ -3636,6 +3643,7 @@ moq_result_t moq_session_open_pub_subgroup(
     probe.publisher_priority = cfg->publisher_priority;
     moq_action_meta_t meta;
     sg_stream_meta(s, &probe, &meta);
+    meta.subgroup_header = true;
 
     moq_data_priority_t key;
     session_subgroup_data_key(&meta, &key);
@@ -3661,7 +3669,8 @@ moq_result_t moq_session_open_pub_subgroup(
     entry->delivery_deadline_us = UINT64_MAX;
     entry->streaming_deadline_us = UINT64_MAX;
     entry->ovr_has_object = entry->ovr_has_subgroup = false;
-    entry->timeout_expired = false;
+    entry->terminal_cause = MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
+    entry->terminal_code = 0;
     /* Saturates at the profile's unknown Stream Count, which every
      * PUBLISH_DONE clamps to anyway. */
     if (s->publishes[pub_slot].subgroup_streams_opened <

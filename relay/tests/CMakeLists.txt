@@ -22,7 +22,8 @@ add_library(moq-relay-core-test-internals STATIC
     ${MOQR_TEST_CORE_DIR}/relay.c
     ${MOQR_TEST_CORE_DIR}/trace.c
     ${MOQR_TEST_CORE_DIR}/types.c
-    ${MOQR_TEST_CORE_DIR}/stats.c)
+    ${MOQR_TEST_CORE_DIR}/stats.c
+    ${MOQR_TEST_CORE_DIR}/props_codec.c)
 target_compile_definitions(moq-relay-core-test-internals PRIVATE
     MOQR_CORE_TESTING MOQ_RELAY_CORE_STATIC)
 target_include_directories(moq-relay-core-test-internals PUBLIC
@@ -43,6 +44,12 @@ target_link_libraries(test_relay_control PRIVATE
     moq-relay-core-test-internals)
 target_compile_definitions(test_relay_control PRIVATE MOQR_CORE_TESTING)
 moqr_test_warnings(test_relay_control)
+
+add_executable(test_relay_props_codec test_relay_props_codec.c)
+target_link_libraries(test_relay_props_codec PRIVATE moq::relay-core)
+target_include_directories(test_relay_props_codec PRIVATE ${MOQR_TEST_CORE_DIR})
+moqr_test_warnings(test_relay_props_codec)
+add_test(NAME relay_props_codec COMMAND test_relay_props_codec)
 
 # White-box core and binding tests compile the production source into their
 # own translation units; no production target exposes these internals.
@@ -183,7 +190,7 @@ if(TARGET moq::sim)
     # The core suite keeps the relay_session_binding test name; the others
     # register as relay_session_binding_<suite>.
     set(MOQR_SESSION_BINDING_SUITES
-        core auth delivery ingress fetch namespace d22 metadata)
+        core auth delivery ingress fetch namespace d22 metadata reset)
     foreach(suite IN LISTS MOQR_SESSION_BINDING_SUITES)
         set(_exe test_relay_session_binding_${suite})
         add_executable(${_exe} ${_exe}.c
@@ -199,6 +206,37 @@ if(TARGET moq::sim)
         endif()
         add_test(NAME ${_test} COMMAND ${_exe})
         set_tests_properties(${_test} PROPERTIES TIMEOUT 120)
+    endforeach()
+    # Object Properties across drafts, by delivery family (same rig).
+    add_executable(test_relay_props_delivery test_relay_props_delivery.c
+        $<TARGET_OBJECTS:moq-relay-session-binding-harness>
+        $<TARGET_OBJECTS:moq-relay-bind-test-internals>)
+    target_compile_definitions(test_relay_props_delivery PRIVATE MOQR_BIND_TESTING)
+    target_link_libraries(test_relay_props_delivery PRIVATE moq::sim moq-relay-policy)
+    moqr_test_warnings(test_relay_props_delivery)
+    add_test(NAME relay_props_delivery COMMAND test_relay_props_delivery)
+    set_tests_properties(relay_props_delivery PROPERTIES TIMEOUT 120 LABELS "relay;sansio")
+    # Wire decoding belongs to a scenario outside the relay source boundary.
+    add_executable(test_relay_session_binding_stop
+        ${PROJECT_SOURCE_DIR}/tests/scenario/test_relay_session_binding_stop.c
+        $<TARGET_OBJECTS:moq-relay-session-binding-harness>
+        $<TARGET_OBJECTS:moq-relay-bind-test-internals>)
+    target_compile_definitions(test_relay_session_binding_stop PRIVATE MOQR_BIND_TESTING)
+    target_link_libraries(test_relay_session_binding_stop PRIVATE moq::sim moq-relay-policy)
+    moqr_test_warnings(test_relay_session_binding_stop)
+    foreach(draft IN ITEMS 16 18 22)
+        foreach(row IN ITEMS seal continuation siblings no-reopen capacity)
+            string(REPLACE "-" "_" _row "${row}")
+            foreach(disposition IN ITEMS stop control)
+                foreach(load IN ITEMS normal pressure)
+                    set(_test relay_subgroup_stop_d${draft}_${_row}_${disposition}_${load})
+                    add_test(NAME ${_test} COMMAND test_relay_session_binding_stop
+                        ${draft} ${row} ${disposition} ${load})
+                    set_tests_properties(${_test} PROPERTIES TIMEOUT 120
+                        LABELS "relay;sansio;subgroup-stop;d${draft}")
+                endforeach()
+            endforeach()
+        endforeach()
     endforeach()
     add_test(NAME relay_metadata_lifetime
         COMMAND test_relay_session_binding_metadata --metadata-lifetime)
@@ -222,13 +260,41 @@ if(TARGET moq::sim)
             absent-source source-error source-reset total-deadline
             cancel-reuse capacity-recovery descending cancel-cached
             coalesce-oom coalesce-control legacy descending-groups
-            evicted-range abort-blocked d18-origin source-lost expired-zero
+            evicted-range abort-blocked d18-origin d16-origin d18-descending-wire
+            d18-descending-wire-d18-origin source-lost expired-zero
             expired-budget)
         string(REPLACE "-" "_" _row "${row}")
         add_test(NAME relay_standalone_fetch_${_row}
             COMMAND test_relay_standalone_fetch ${row})
         set_tests_properties(relay_standalone_fetch_${_row} PROPERTIES
             TIMEOUT 60 LABELS "relay;sansio;d22")
+    endforeach()
+    # A draft-18 origin and subscriber: the relay's own upstream FETCH is a
+    # draft-18 one, descending included.
+    foreach(row IN ITEMS publish-gap descending total-deadline source-error)
+        string(REPLACE "-" "_" _row "${row}")
+        add_test(NAME relay_standalone_fetch_d18x_${_row}
+            COMMAND test_relay_standalone_fetch d18x:${row})
+        set_tests_properties(relay_standalone_fetch_d18x_${_row} PROPERTIES
+            TIMEOUT 60 LABELS "relay;sansio")
+    endforeach()
+    # The same retrieval rows for draft-16 and draft-18 FETCH subscribers.
+    # A draft-18 session does not originate a descending FETCH (its local
+    # policy), so that row runs for draft-16 only.
+    foreach(draft IN ITEMS d16 d18)
+        set(_rows publish-gap pull-gap cached-only absent-source source-error
+            source-reset total-deadline cancel-reuse capacity-recovery
+            cancel-cached abort-blocked)
+        if(draft STREQUAL "d16")
+            list(APPEND _rows descending)
+        endif()
+        foreach(row IN LISTS _rows)
+            string(REPLACE "-" "_" _row "${row}")
+            add_test(NAME relay_standalone_fetch_${draft}_${_row}
+                COMMAND test_relay_standalone_fetch ${draft}:${row})
+            set_tests_properties(relay_standalone_fetch_${draft}_${_row} PROPERTIES
+                TIMEOUT 60 LABELS "relay;sansio")
+        endforeach()
     endforeach()
 
     add_executable(test_relay_unfiltered test_relay_unfiltered.c
@@ -279,12 +345,62 @@ if(TARGET moq::sim)
         moq::relay moq::sim)
     moqr_test_warnings(test_relay_standalone_fetch_shard)
     foreach(row IN ITEMS cross-gap cross-cache cross-cancel cross-absent
-            cross-descending cross-capacity)
+            cross-descending cross-capacity cross-capacity-requester
+            cross-capacity-owner-rows)
         string(REPLACE "-" "_" _row "${row}")
         add_test(NAME relay_standalone_fetch_shard_${_row}
             COMMAND test_relay_standalone_fetch_shard ${row})
         set_tests_properties(relay_standalone_fetch_shard_${_row} PROPERTIES
             TIMEOUT 60 LABELS "relay;sansio;d22")
+    endforeach()
+
+    # Cross-shard standalone FETCH Track Properties, which reach the
+    # binding's private metadata calls: built from the bind and shard test
+    # objects, as the CLI's cross-shard composition tests are.
+    if(TARGET moq-relay-bind-test-internals AND TARGET moq-relay-shard-test-internals)
+        add_executable(test_relay_props_shard test_relay_props_shard.c
+            $<TARGET_OBJECTS:moq-relay-bind-test-internals>
+            $<TARGET_OBJECTS:moq-relay-shard-test-internals>)
+        target_compile_definitions(test_relay_props_shard PRIVATE MOQR_BIND_TESTING)
+        target_link_libraries(test_relay_props_shard PRIVATE moq::relay moq::sim)
+        moqr_test_warnings(test_relay_props_shard)
+        # plainNN-*: property-less controls, a draft-NN fetcher on the owner
+        # shard (local) or the other one (cross).
+        foreach(row IN ITEMS same convert to16 to18 immutable oom parked cancel ceiling
+                plain16-local plain16-cross plain18-local plain18-cross plain22-cross)
+            string(REPLACE "-" "_" _row "${row}")
+            add_test(NAME relay_props_shard_${_row}
+                COMMAND test_relay_props_shard ${row})
+            set_tests_properties(relay_props_shard_${_row} PROPERTIES
+                TIMEOUT 60 LABELS "relay;sansio")
+        endforeach()
+    endif()
+
+    add_executable(test_relay_join_shard test_relay_join_shard.c)
+    target_link_libraries(test_relay_join_shard PRIVATE moq-relay-inspect moq::sim)
+    moqr_test_warnings(test_relay_join_shard)
+    foreach(row IN ITEMS cached hole saved-largest cancel publish-queued
+            replaced-while-queued)
+        string(REPLACE "-" "_" _row "${row}")
+        add_test(NAME relay_join_shard_${_row}
+            COMMAND test_relay_join_shard ${row})
+        set_tests_properties(relay_join_shard_${_row} PROPERTIES
+            TIMEOUT 60 LABELS "relay;sansio")
+    endforeach()
+
+    # Eviction at a remote owner over real sessions, every draft (the same
+    # rig as test_relay_shard_fill, which the source includes).
+    add_executable(test_relay_shard_evict_terminal
+        test_relay_shard_evict_terminal.c)
+    target_link_libraries(test_relay_shard_evict_terminal PRIVATE
+        moq::relay moq::sim)
+    moqr_test_warnings(test_relay_shard_evict_terminal)
+    foreach(row IN ITEMS whole chunks watermark-only nodes refused)
+        string(REPLACE "-" "_" _row "${row}")
+        add_test(NAME relay_shard_evict_terminal_${_row}
+            COMMAND test_relay_shard_evict_terminal ${row})
+        set_tests_properties(relay_shard_evict_terminal_${_row} PROPERTIES
+            TIMEOUT 60 LABELS "relay;sansio")
     endforeach()
 
     add_executable(test_relay_shard_fill test_relay_shard_fill.c)
@@ -293,6 +409,9 @@ if(TARGET moq::sim)
     moqr_test_warnings(test_relay_shard_fill)
     add_test(NAME relay_shard_fill COMMAND test_relay_shard_fill)
     set_tests_properties(relay_shard_fill PROPERTIES TIMEOUT 60)
+    add_test(NAME relay_shard_fill_mixed_draft
+        COMMAND test_relay_shard_fill --mixed-draft)
+    set_tests_properties(relay_shard_fill_mixed_draft PROPERTIES TIMEOUT 60)
 
 endif()
 
@@ -352,6 +471,7 @@ set(MOQR_LIBRARY_TESTS_SANSIO
     relay_session_binding_delivery relay_session_binding_ingress
     relay_session_binding_fetch relay_session_binding_namespace
     relay_session_binding_d22 relay_session_binding_metadata
+    relay_session_binding_reset
     relay_lifecycle relay_ns_propagation
     relay_shard_fill relay_namespace_controls relay_namespace_features
     relay_namespace_d22
@@ -406,4 +526,33 @@ if(Python3_Interpreter_FOUND AND UNIX AND MOQR_SDK_CXX)
         --sim $<TARGET_EXISTS:moq-sim>
         --msquic-dir "${msquic_DIR}")
     set_tests_properties(relay_sdk_package PROPERTIES TIMEOUT 180 LABELS "relay;boundary")
+endif()
+
+# Inspect private counter exhaustion without exporting a production test seam.
+add_executable(test_relay_cluster test_relay_cluster.c
+    ${MOQR_TEST_CORE_DIR}/wire_codes.c
+    ${MOQR_TEST_CORE_DIR}/capacity.c
+    ${MOQR_TEST_CORE_DIR}/log.c
+    ${MOQR_TEST_CORE_DIR}/trace.c
+    ${MOQR_TEST_CORE_DIR}/types.c)
+target_include_directories(test_relay_cluster PRIVATE
+    ${MOQR_TEST_CORE_DIR} ${MOQ_RELAY_INCLUDE_DIR})
+target_link_libraries(test_relay_cluster PRIVATE moq::core)
+moqr_test_warnings(test_relay_cluster)
+add_test(NAME relay_cluster COMMAND test_relay_cluster)
+set_tests_properties(relay_cluster PROPERTIES LABELS "relay;sansio")
+
+if(MOQ_BUILD_RELAY_RUNTIME)
+add_executable(test_relay_cluster_shards test_relay_cluster_shards.c)
+target_link_libraries(test_relay_cluster_shards PRIVATE moq-relay-inspect)
+moqr_test_warnings(test_relay_cluster_shards)
+add_test(NAME relay_cluster_shards COMMAND test_relay_cluster_shards)
+set_tests_properties(relay_cluster_shards PROPERTIES LABELS "relay;sansio")
+if(TARGET moq::sim)
+add_executable(test_relay_cluster_mesh test_relay_cluster_mesh.c)
+target_link_libraries(test_relay_cluster_mesh PRIVATE moq::relay moq::sim)
+moqr_test_warnings(test_relay_cluster_mesh)
+add_test(NAME relay_cluster_mesh COMMAND test_relay_cluster_mesh)
+set_tests_properties(relay_cluster_mesh PROPERTIES LABELS "relay;sansio")
+endif()
 endif()

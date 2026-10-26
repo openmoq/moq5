@@ -51,11 +51,20 @@ package final class EndpointEngine: @unchecked Sendable {
 
     /// An attached service's per-pass work: `run` does the eager service
     /// step (e.g. draining the C track-event queue); `teardown` detaches the
-    /// child from the C endpoint. Both run on the service thread, outside
-    /// the engine lock.
+    /// child from the C endpoint; `deadline`, when given, names the earliest
+    /// ``monotonicMicroseconds()`` at which `run` has time-driven work, and
+    /// the engine's wait for activity ends by then. All run on the service
+    /// thread, outside the engine lock.
     private struct PumpHook {
+        let token: PumpHookToken
         let run: @Sendable () -> Void
         let teardown: @Sendable () -> Void
+        let deadline: (@Sendable () -> UInt64?)?
+    }
+
+    /// Names one installation of a pump hook, so only its owner removes it.
+    package struct PumpHookToken: Sendable, Hashable {
+        fileprivate let value: UInt64
     }
 
     /// One queued unit of service-thread work. All vars are engine-lock
@@ -100,6 +109,7 @@ package final class EndpointEngine: @unchecked Sendable {
     private var retiredNegotiatedWireVersion: WireVersion?
     private var retiredGoawayNewSessionURI: Data?
     private var hookSlots: [PumpHookKind: PumpHook] = [:]
+    private var nextHookToken: UInt64 = 0
 
     /// Defensive ceiling on one C wait; wakes make it irrelevant in practice
     /// and a timeout just loops another pass.
@@ -108,6 +118,13 @@ package final class EndpointEngine: @unchecked Sendable {
     /// stale a cancellation/shutdown check can get (the C sender slices its
     /// BLOCK_TIMEOUT waits at the same 50 ms granularity).
     package static let drainSliceMicroseconds: UInt64 = 50_000
+
+    /// The clock hook deadlines are named on: monotonic microseconds since
+    /// boot (`DispatchTime`'s uptime; on Apple platforms the host-time
+    /// clock CoreMedia's host clock reads).
+    package static func monotonicMicroseconds() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds / 1_000
+    }
 
     package init(backend: any EndpointBackend) {
         self.backend = backend
@@ -157,11 +174,14 @@ package final class EndpointEngine: @unchecked Sendable {
     /// backend's stop/destroy (C: `moq_endpoint_stop` refuses while
     /// attachments live). Throws `.wrongState` when the slot is taken (one
     /// attachment per kind, like C) and `.closed` once shutdown has begun.
+    /// The returned token is what removes it.
+    @discardableResult
     package func installPumpHook(
         kind: PumpHookKind,
         run: @escaping @Sendable () -> Void,
-        teardown: @escaping @Sendable () -> Void
-    ) throws {
+        teardown: @escaping @Sendable () -> Void,
+        deadline: (@Sendable () -> UInt64?)? = nil
+    ) throws -> PumpHookToken {
         cond.lock()
         guard phase == .running else {
             cond.unlock()
@@ -171,18 +191,28 @@ package final class EndpointEngine: @unchecked Sendable {
             cond.unlock()
             throw MoQServiceError.wrongState
         }
-        hookSlots[kind] = PumpHook(run: run, teardown: teardown)
+        nextHookToken += 1
+        let token = PumpHookToken(value: nextHookToken)
+        hookSlots[kind] = PumpHook(token: token, run: run, teardown: teardown,
+                                   deadline: deadline)
         nudgeLocked()
         backend.wake()                  /* .running implies not retired */
         cond.unlock()
+        return token
     }
 
     /// Release `kind`'s slot without running its teardown -- the caller has
     /// already detached its child (e.g. a receiver's own close()).
-    package func removePumpHook(kind: PumpHookKind) {
+    /// Release `kind`'s slot only while it still holds the installation
+    /// `token` names: a later attachment's hook is never removed by an
+    /// earlier owner. Returns whether it removed it.
+    @discardableResult
+    package func removePumpHook(kind: PumpHookKind, token: PumpHookToken) -> Bool {
         cond.lock()
+        defer { cond.unlock() }
+        guard hookSlots[kind]?.token == token else { return false }
         hookSlots[kind] = nil
-        cond.unlock()
+        return true
     }
 
     /// Callers hold the lock. Stable order: receiver before sender.
@@ -313,6 +343,29 @@ package final class EndpointEngine: @unchecked Sendable {
             cond.unlock()
             cont?.resume(throwing: CancellationError())
         }
+    }
+
+    /// The block step's C wait: the slice ceiling, shortened to the
+    /// earliest hook deadline (0 when one is already due).
+    /// How long a park on a closed backend may last: nil when no hook names
+    /// a deadline (only a job or a nudge makes work then), else until the
+    /// earliest deadline, at most `ceiling`. A deadline at or beyond the
+    /// ceiling still parks timed: the park ends at the ceiling, and the next
+    /// pass parks again toward the same deadline.
+    package static func closedParkTimeout(deadlines: [UInt64], now: UInt64,
+                                          ceiling: UInt64) -> UInt64? {
+        guard let due = deadlines.min() else { return nil }
+        return min(ceiling, due > now ? due - now : 0)
+    }
+
+    private static func waitTimeout(for hooks: [PumpHook]) -> UInt64 {
+        var timeout = waitSliceMicroseconds
+        let now = monotonicMicroseconds()
+        for hook in hooks {
+            guard let due = hook.deadline?() else { continue }
+            timeout = min(timeout, due > now ? due - now : 0)
+        }
+        return timeout
     }
 
     // MARK: Latch
@@ -606,14 +659,29 @@ package final class EndpointEngine: @unchecked Sendable {
                     cond.unlock()
                     continue
                 }
+                /* A hook's deadline still bounds the park: its time-driven
+                 * work needs no other wake. */
+                let hooks = orderedHooksLocked()
+                cond.unlock()
+                let until = Self.closedParkTimeout(
+                    deadlines: hooks.compactMap { $0.deadline?() },
+                    now: Self.monotonicMicroseconds(),
+                    ceiling: Self.waitSliceMicroseconds
+                ).map { Date().addingTimeInterval(Double($0) / 1_000_000) }
+                cond.lock()
                 while jobs.isEmpty && !dirty && phase == .running && !latched {
-                    cond.wait()
+                    if let until {
+                        if !cond.wait(until: until) { break }
+                    } else {
+                        cond.wait()
+                    }
                 }
                 cond.unlock()
             } else {
+                let hooks = orderedHooksLocked()
                 cond.unlock()
                 _ = backend.waitForActivity(
-                    timeoutMicroseconds: Self.waitSliceMicroseconds)
+                    timeoutMicroseconds: Self.waitTimeout(for: hooks))
                 /* The result is not consumed here: the next pass reads the
                  * latch mirror and backend state, which the wait return
                  * reflects (interrupted -> step 3, closed -> step 5). */

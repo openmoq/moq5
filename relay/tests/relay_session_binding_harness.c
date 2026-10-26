@@ -80,6 +80,10 @@ uint32_t relay_bind_test_log_max_groups = 0;
 /* 0 = 1 MiB; a small value makes the log refuse an object larger than it. */
 uint64_t relay_bind_test_log_max_bytes = 0;
 
+/* 0 = the log default; a small value makes chunked objects meet the log's
+ * chunk-node pool, so node pressure and local capacity loss are exercised. */
+uint32_t relay_bind_test_log_max_chunk_nodes = 0;
+
 /* Track Properties the origin states when it accepts the relay's SUBSCRIBE
  * through relay_bind_test_peer_drain (empty = none). Borrowed. */
 moq_bytes_t relay_bind_test_accept_track_properties = { NULL, 0 };
@@ -188,6 +192,16 @@ relay_bind_test_rig_connect(rig_t *r, moq_version_t version)
     return cn;
 }
 
+/* The bind pump, with the scan bounds its walks rely on checked on both
+ * sides of it (moqr_bind_debug_scan_bounds_ok). */
+static void
+rig_bind_pump(rig_t *r)
+{
+    R_CHECK(r, moqr_bind_debug_scan_bounds_ok(r->bind));
+    (void)moqr_bind_pump(r->bind, r->now);
+    R_CHECK(r, moqr_bind_debug_scan_bounds_ok(r->bind));
+}
+
 /* One deterministic pump cycle: transport steps, then the production
  * binding does everything else (events -> core -> intents -> deliveries). */
 void
@@ -206,7 +220,7 @@ relay_bind_test_rig_cycle(rig_t *r)
         size_t steps = 0;
         (void)moq_simpair_run_until_quiescent(cn->sp, 64, &steps);
     }
-    (void)moqr_bind_pump(r->bind, r->now);
+    rig_bind_pump(r);
 }
 
 void
@@ -234,7 +248,7 @@ rig_cycle_except(rig_t *r, const conn_t *skip)
         size_t steps = 0;
         (void)moq_simpair_run_until_quiescent(cn->sp, 64, &steps);
     }
-    (void)moqr_bind_pump(r->bind, r->now);
+    rig_bind_pump(r);
 }
 
 /* Advance ONE pair's transport without running the bind pump, so several
@@ -256,7 +270,7 @@ relay_bind_test_rig_step_pair(rig_t *r, conn_t *cn)
 void
 relay_bind_test_rig_bind_pump_once(rig_t *r)
 {
-    (void)moqr_bind_pump(r->bind, r->now);
+    rig_bind_pump(r);
 }
 
 void
@@ -307,6 +321,9 @@ relay_bind_test_rig_create_ex(rig_t *r, ca_t *a, uint32_t bind_dsubs, uint32_t b
                                     : 8;
     cfg.log_budget.max_bytes = relay_bind_test_log_max_bytes != 0 ? relay_bind_test_log_max_bytes
                                                          : 1 << 20;
+    if (relay_bind_test_log_max_chunk_nodes != 0) {
+        cfg.log_max_chunk_nodes = relay_bind_test_log_max_chunk_nodes;
+    }
     cfg.linger_us = relay_bind_test_linger_us != 0 ? relay_bind_test_linger_us : 500;
     cfg.max_intents = core_intents;
     cfg.authorize = relay_bind_test_authorize; /* NULL = allow-all (default)      */
@@ -1966,7 +1983,12 @@ relay_bind_test_jf_down_drain(rig_t *r, jf_down_t *d)
                     if (d->req_fh[k]._opaque == h) extra = k;
                 }
                 if (extra >= 0) {
-                    if (ev->kind == MOQ_EVENT_FETCH_ERROR) d->req_err[extra]++;
+                    if (ev->kind == MOQ_EVENT_FETCH_ERROR) {
+                        d->req_err[extra]++;
+                        d->req_code[extra] = ev->u.fetch_error.error_code;
+                    } else {
+                        d->req_other[extra]++;
+                    }
                 } else if (!d->fh_set || h != d->fh._opaque) {
                     d->foreign++;
                 } else {
@@ -1981,6 +2003,10 @@ relay_bind_test_jf_down_drain(rig_t *r, jf_down_t *d)
                         d->ok_eot = ev->u.fetch_ok.end_of_track;
                         d->ok_eg = ev->u.fetch_ok.end_group;
                         d->ok_eo = ev->u.fetch_ok.end_object;
+                        d->ok_props_len = ev->u.fetch_ok.track_properties.len;
+                        if (d->ok_props_len != 0 && d->ok_props_len <= sizeof(d->ok_props))
+                            memcpy(d->ok_props, ev->u.fetch_ok.track_properties.data,
+                                   d->ok_props_len);
                         break;
                     case MOQ_EVENT_FETCH_OBJECT: {
                         const moq_fetch_object_event_t *fo = &ev->u.fetch_object;
@@ -1996,11 +2022,21 @@ relay_bind_test_jf_down_drain(rig_t *r, jf_down_t *d)
                                     : boot_payload_is(fo->payload, 0xD0, BOOT_DELTA_LEN);
                             d->props_len[k] = fo->properties ? moq_rcbuf_len(fo->properties) : 0;
                             d->props_exact[k] = jf_props_is(fo->properties, fo->object_id);
+                            if (d->props_len[k] != 0 && d->props_len[k] <= sizeof(d->props[k]))
+                                memcpy(d->props[k], moq_rcbuf_data(fo->properties),
+                                       d->props_len[k]);
                         }
                         d->objects++;
                         break;
                     }
-                    case MOQ_EVENT_FETCH_GAP:      d->gaps++; break;
+                    case MOQ_EVENT_FETCH_GAP:
+                        if (d->gaps < 4) {
+                            d->gap_kind[d->gaps] = (uint32_t)ev->u.fetch_gap.range_kind;
+                            d->gap_g[d->gaps] = ev->u.fetch_gap.group_id;
+                            d->gap_o[d->gaps] = ev->u.fetch_gap.object_id;
+                        }
+                        d->gaps++;
+                        break;
                     case MOQ_EVENT_FETCH_COMPLETE: d->complete++; break;
                     case MOQ_EVENT_FETCH_ERROR: {
                         const moq_fetch_error_event_t *fe = &ev->u.fetch_error;
@@ -2101,6 +2137,9 @@ relay_bind_test_jf_join(jf_t *j, jf_down_t *d)
  * catalog subscriptions are being established: the relay keeps the upstream
  * subscription but could not retain its track key (no forwarding source). */
 bool relay_bind_test_jf_setup_usub_key_oom = false;
+/* The origin's draft when nonzero; otherwise every jf connection speaks the
+ * setup's version. */
+moq_version_t relay_bind_test_jf_origin_version = 0;
 
 bool
 relay_bind_test_jf_setup_at(jf_t *j, moq_version_t version, int n_down, bool live_control,
@@ -2117,8 +2156,10 @@ relay_bind_test_jf_setup_at(jf_t *j, moq_version_t version, int n_down, bool liv
     /* Connection slot order is pump order: origin first by default; with
      * origin_last the downstream peers' events are processed before the
      * origin's in every pump. */
+    moq_version_t ov = relay_bind_test_jf_origin_version != 0
+                           ? relay_bind_test_jf_origin_version : version;
     if (!origin_last) {
-        j->o.cn = relay_bind_test_rig_connect(&j->rig, version);
+        j->o.cn = relay_bind_test_rig_connect(&j->rig, ov);
     }
     j->o.largest_group = largest_group;
     j->o.largest_object = largest_object;
@@ -2127,7 +2168,7 @@ relay_bind_test_jf_setup_at(jf_t *j, moq_version_t version, int n_down, bool liv
         j->d[i].cn = relay_bind_test_rig_connect(&j->rig, version);
     }
     if (origin_last) {
-        j->o.cn = relay_bind_test_rig_connect(&j->rig, version);
+        j->o.cn = relay_bind_test_rig_connect(&j->rig, ov);
     }
     if (live_control) {
         j->live.cn = relay_bind_test_rig_connect(&j->rig, version);

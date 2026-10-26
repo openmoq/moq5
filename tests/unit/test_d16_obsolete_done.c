@@ -25,6 +25,7 @@
  *     SUBSCRIBE we served (the peer's), with the same bound and obligations.
  */
 #include <moq/moq.h>
+#include <moq/control.h>
 #include "test_raw_pair_support.h"
 #include "test_support.h"
 #include "../../core/src/session/session_internal.h"

@@ -1094,7 +1094,20 @@ static void test_teardown_while_paused(void)
     CHECK(g_acct.live == 2);         /* table + retention buffer */
 
     /* Deregister clears the connection pointer while bytes are still retained;
-     * a later service must not reach picoquic through it. */
+     * a later service must not reach picoquic through it. h3zero removes the
+     * session's stream prefix before it tells the prefix's function, so the
+     * prefix goes first here too, unbound so that its removal calls nobody;
+     * h3zero's state is then what a real deregister leaves. */
+    h3zero_stream_prefix_t *pfx = h3zero_find_stream_prefix(
+        f.h.client_h3_ctx, f.h.client_ctrl_ctx->stream_id);
+    CHECK(pfx != NULL && pfx->function_ctx == (void *)f.h.client_conn);
+    if (pfx) {
+        pfx->function_call = NULL;
+        h3zero_delete_stream_prefix(f.h.test_ctx->cnx_client, f.h.client_h3_ctx,
+                                    f.h.client_ctrl_ctx->stream_id);
+    }
+    CHECK(h3zero_find_stream_prefix(f.h.client_h3_ctx,
+                                    f.h.client_ctrl_ctx->stream_id) == NULL);
     h3zero_stream_ctx_t sctx;
     memset(&sctx, 0, sizeof(sctx));
     sctx.stream_id = f.sid;

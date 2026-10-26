@@ -52,7 +52,9 @@ set(_moq_native_key "${PROJECT_SOURCE_DIR}/adapters/msquic/tests/test_only_loopb
 if(NOT EXISTS "${_moq_native_cert}" OR NOT EXISTS "${_moq_native_key}")
     message(FATAL_ERROR "Native media relay test credentials are missing")
 endif()
-foreach(_moq_native_row d18_raw d22_raw d22_wt d22_split d22_cmaf)
+foreach(_moq_native_row d18_raw d22_raw d22_wt d22_split d22_cmaf d18_push
+        d22_push d18_complete d22_complete d18_complete_now d22_complete_now
+        d18_complete_slow d22_complete_slow)
     add_test(NAME media_relay_native_${_moq_native_row}
         COMMAND test_media_relay_native
             "${_moq_native_cert}" "${_moq_native_key}" ${_moq_native_row})

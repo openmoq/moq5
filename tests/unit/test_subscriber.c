@@ -364,11 +364,14 @@ static void test_object_queue_full_pending_retry(void) {
 
     /* Poll the first object to free the slot. */
     moq_sub_object_t obj;
+    MOQ_TEST_CHECK(moq_sub_track_has_queued_input(sub, track));
     MOQ_TEST_CHECK(moq_sub_poll_object(sub, &obj) == MOQ_OK);
     MOQ_TEST_CHECK(obj.object_id == 0);
     MOQ_TEST_CHECK(moq_rcbuf_len(obj.payload) == 5);
     MOQ_TEST_CHECK(memcmp(moq_rcbuf_data(obj.payload), "first", 5) == 0);
     moq_sub_object_cleanup(&obj);
+    /* Only the pending object is left: still input. */
+    MOQ_TEST_CHECK(moq_sub_track_has_queued_input(sub, track));
 
     /* Retry tick: pending flushed into queue. */
     rc = moq_sub_tick(sub, moq_simpair_now_us(sp));
@@ -381,6 +384,27 @@ static void test_object_queue_full_pending_retry(void) {
     moq_sub_object_cleanup(&obj);
 
     MOQ_TEST_CHECK(moq_sub_poll_object(sub, &obj) == MOQ_DONE);
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(sub, track));
+
+    /* An explicit unsubscribe keeps what is already queued for the
+     * application: it is input until polled, and after release nothing is. */
+    moq_rcbuf_t *p3 = NULL;
+    moq_rcbuf_create(&alloc, (const uint8_t *)"third", 5, &p3);
+    moq_pub_write_object(pub, ptrack, 0, 2, p3, moq_simpair_now_us(sp));
+    moq_rcbuf_decref(p3);
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+    (void)moq_sub_tick(sub, moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK(moq_sub_track_has_queued_input(sub, track));
+    MOQ_TEST_CHECK(moq_sub_unsubscribe(sub, track, moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_sub_track_has_queued_input(sub, track));
+    MOQ_TEST_CHECK(moq_sub_poll_object(sub, &obj) == MOQ_OK);
+    MOQ_TEST_CHECK(obj.object_id == 2);
+    moq_sub_object_cleanup(&obj);
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(sub, track));
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+    (void)moq_sub_tick(sub, moq_simpair_now_us(sp));
+    (void)moq_sub_release_track(sub, track);
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(sub, track));
 
     moq_sub_destroy(sub);
     moq_pub_destroy(pub);
@@ -2456,7 +2480,6 @@ static void test_streaming_chunk_queue_full_pending_retry(void) {
     tcfg.track_name = MOQ_BYTES_LITERAL("video");
     moq_sub_track_t *track = NULL;
     moq_sub_subscribe(sub, &tcfg, moq_simpair_now_us(sp), &track);
-    (void)track;
 
     moq_simpair_run_until_quiescent(sp, 8, NULL);
     moq_pub_tick(pub, moq_simpair_now_us(sp));
@@ -2474,9 +2497,12 @@ static void test_streaming_chunk_queue_full_pending_retry(void) {
     MOQ_TEST_CHECK(rc == MOQ_ERR_WOULD_BLOCK);
 
     moq_sub_chunk_t ck;
+    MOQ_TEST_CHECK(moq_sub_track_has_queued_input(sub, track));
     MOQ_TEST_CHECK(moq_sub_poll_chunk(sub, &ck) == MOQ_OK);
     MOQ_TEST_CHECK(ck.begin == true);
     moq_sub_chunk_cleanup(&ck);
+    /* Only the pending chunk is left: still input. */
+    MOQ_TEST_CHECK(moq_sub_track_has_queued_input(sub, track));
 
     MOQ_TEST_CHECK(moq_sub_tick(sub, moq_simpair_now_us(sp) + 1) == MOQ_OK);
 
@@ -2484,6 +2510,7 @@ static void test_streaming_chunk_queue_full_pending_retry(void) {
     MOQ_TEST_CHECK(ck.end == true);
     MOQ_TEST_CHECK(ck.chunk != NULL);
     moq_sub_chunk_cleanup(&ck);
+    MOQ_TEST_CHECK(!moq_sub_track_has_queued_input(sub, track));
 
     moq_sub_destroy(sub);
     moq_pub_destroy(pub);

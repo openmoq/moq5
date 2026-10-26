@@ -9,6 +9,7 @@
 #include "profile.h"
 #include "transport_binding_internal.h"
 #include "session_transport.h"
+#include "action_meta.h"
 #include "fill_owner_internal.h"
 #include "fill_input_internal.h"
 #include "publisher_fill_receipt.h"
@@ -87,12 +88,6 @@ _Static_assert(sizeof(moq_fetch_complete_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_object_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_fetch_gap_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_request_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
-/* publisher_group_order must stay inside the old padding. */
-_Static_assert(offsetof(moq_publish_request_event_t, largest_group) ==
-               ((offsetof(moq_publish_request_event_t, has_largest) +
-                 sizeof(bool) + _Alignof(uint64_t) - 1u) &
-                ~(size_t)(_Alignof(uint64_t) - 1u)),
-               "publisher_group_order moved largest_group");
 _Static_assert(sizeof(moq_publish_ok_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_error_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
 _Static_assert(sizeof(moq_publish_finished_event_t) <= MOQ_EVENT_DETAIL_MAX, "");
@@ -117,6 +112,10 @@ typedef struct moq_setup_params {
     bool     has_authority;
     bool        has_implementation;
     moq_bytes_t implementation;   /* borrowed from the decoded setup */
+    bool     has_cluster_hop_id;
+    uint64_t cluster_hop_id;
+    bool     has_cluster_relay_cost;
+    uint64_t cluster_relay_cost;
 } moq_setup_params_t;
 
 /* Forward decl: entries hold a pointer to their reserved registry record
@@ -502,6 +501,8 @@ typedef struct moq_drain_scan {
  * per request (the advertised MAX_REQUEST_UPDATES is one, and this side
  * keeps at most one update of its own in flight). */
 typedef struct moq_ns_update {
+    moq_cluster_metadata_t owed_cluster;
+    moq_cluster_metadata_t out_cluster;
     bool                 owed;
     uint32_t             owed_flags;
     uint64_t             owed_request_id;
@@ -538,6 +539,7 @@ typedef struct moq_ns_update {
 } moq_ns_update_t;
 
 typedef struct moq_ann_entry {
+    moq_cluster_metadata_t cluster;
     moq_ann_state_t    state;
     moq_ann_role_t     role;
     uint32_t           generation;
@@ -1325,11 +1327,13 @@ typedef enum moq_sg_state {
     MOQ_SG_CLOSING   = 2,
     MOQ_SG_RESETTING = 3,
     MOQ_SG_STREAMING = 4,
-    /* Ended by a teardown whose action queue had no room left for the
-     * stream's reset: the reset is owed (owed_reset_code) and issued by
-     * session_retry_owed_stream_actions once capacity returns; the entry takes no more
-     * objects and is not reaped until the reset is queued. */
+    /* A reset retained on its entry until action capacity or the bridge's
+     * pressure escape admits it. A nonzero terminal_cause means its terminal
+     * event already committed; owed_reset_code retains that first code.
+     * The entry takes no more objects and is not reaped before handover. */
     MOQ_SG_RESET_OWED = 5,
+    /* First STOP/expiry recognized; event and RESET_DATA are still owed. */
+    MOQ_SG_TERMINAL_OWED = 6,
 } moq_sg_state_t;
 
 typedef struct moq_sg_entry {
@@ -1361,11 +1365,10 @@ typedef struct moq_sg_entry {
      * UINT64_MAX: none running, or (clock at the first payload byte) not yet
      * started. */
     uint64_t               streaming_deadline_us;
-    /* A queued object on this stream has exceeded its OBJECT_DELIVERY_TIMEOUT;
-     * set and consumed within one expiry pass. */
-    bool                   timeout_expired;
     /* MOQ_SG_RESET_OWED: the error code of the reset still owed. */
     uint64_t               owed_reset_code;
+    moq_outgoing_subgroup_terminal_cause_t terminal_cause;
+    uint64_t               terminal_code;
     /*
      * Intrusive OCCUPANCY list, ascending slot order. A slot is linked iff it
      * is allocated (state != FREE / active). Every sweep that used to scan the
@@ -1738,6 +1741,7 @@ typedef struct moq_goaway_encode_args {
 } moq_goaway_encode_args_t;
 
 typedef struct moq_publish_namespace_encode_args {
+    moq_cluster_metadata_t cluster;
     uint64_t        request_id;
     moq_namespace_t track_namespace;
     const moq_auth_token_t *auth_tokens;
@@ -1760,6 +1764,7 @@ typedef struct moq_subscribe_namespace_encode_args {
 } moq_subscribe_namespace_encode_args_t;
 
 typedef struct moq_namespace_msg_encode_args {
+    moq_cluster_metadata_t cluster;
     bool is_done;    /* false = NAMESPACE (found), true = NAMESPACE_DONE (gone) */
     moq_namespace_t suffix;
 } moq_namespace_msg_encode_args_t;
@@ -1915,6 +1920,11 @@ typedef struct moq_rx_stream {
                                                  stream's first under that
                                                  bit */
     uint64_t               prev_object_id;
+    /* The last Object the stream carried completely: an Object is complete
+     * once the next one's header parses, or once the stream ends with no
+     * payload of it outstanding. What a subgroup terminal reports. */
+    bool                   has_last_complete;
+    uint64_t               last_complete_object_id;
 
     uint8_t                hdr_buf[MOQ_RX_HDR_BUF];
     uint8_t                hdr_len;
@@ -2117,34 +2127,6 @@ void moq_index_remove(moq_index_entry_t *tbl, size_t mask, uint64_t key);
 
 /* -- Session struct ------------------------------------------------ */
 
-/*
- * Scheduling and timing record of a queued action, kept beside the action
- * ring (same index). Only SEND_DATA and SEND_DATAGRAM carry one; every other
- * kind has a zeroed record and is never reordered. The adapter's poll takes
- * the best schedulable action rather than the oldest (design: Priorities,
- * rules 1-4), and an object whose OBJECT_DELIVERY_TIMEOUT has elapsed is
- * dropped instead of being handed to the transport.
- */
-#define MOQ_SCHED_MODE_NONE     0u
-#define MOQ_SCHED_MODE_SUBGROUP 1u   /* subscription-delivered, on a subgroup stream */
-#define MOQ_SCHED_MODE_DATAGRAM 2u   /* subscription-delivered, as a datagram */
-#define MOQ_SCHED_MODE_FILL     3u   /* fill-delivered, on the fill fetch stream */
-#define MOQ_SCHED_MODE_FETCH    4u   /* a FETCH response */
-
-typedef struct moq_action_meta {
-    uint64_t deadline_us;        /* OBJECT_DELIVERY_TIMEOUT expiry; UINT64_MAX = none */
-    uint64_t owner;              /* the request the object answers (handle bits); 0 = none */
-    uint64_t group_id;
-    uint64_t subgroup_id;        /* SUBGROUP */
-    uint64_t object_id;          /* DATAGRAM / FILL */
-    uint8_t  subscriber_priority;
-    uint8_t  publisher_priority;
-    uint8_t  mode;               /* MOQ_SCHED_MODE_* */
-    uint8_t  group_order;        /* the owner's: MOQ_GROUP_ORDER_ASCENDING / DESCENDING */
-    uint8_t  fill_group_order;   /* FILL: the fill's own order */
-    bool     has_location;       /* group_id and the id field are meaningful */
-} moq_action_meta_t;
-
 typedef struct moq_state_location_cell {
     moq_location_filter_cfg_t value;
     size_t next;
@@ -2188,6 +2170,14 @@ struct moq_session {
     bool                defer_fetch_ranges;
     /* The application answers draft-22 namespace updates
      * (moq_session_set_defer_namespace_updates). */
+    bool cluster_enabled;
+    bool cluster_negotiated;
+    bool cluster_has_relay_cost;
+    bool cluster_peer_has_relay_cost;
+    uint64_t cluster_hop_id;
+    uint64_t cluster_relay_cost;
+    uint64_t cluster_peer_hop_id;
+    uint64_t cluster_peer_relay_cost;
     bool                defer_namespace_updates;
     /* The peer's implementation identifier, copied at setup completion. */
     uint8_t            *peer_implementation;
@@ -2209,8 +2199,16 @@ struct moq_session {
     size_t        action_head;
     size_t        action_tail;
     moq_action_meta_t *action_meta;   /* parallel to actions */
-    /* The delivery deadline of the last action polled (UINT64_MAX: none). */
-    uint64_t           last_poll_deadline_us;
+    /* A summary of the queued actions [action_head, action_tail): how many
+     * carry a finite OBJECT_DELIVERY_TIMEOUT expiry, and how many are not
+     * data (the kinds the poll's data scheduling does not reorder). It lets
+     * the expiry check, the queued-deadline query and the reset offer skip a
+     * queue that cannot hold what they look for. An action entering or
+     * leaving the ring, or a queued action whose kind or deadline changes in
+     * place, goes through session_action_enqueued/_dequeued; a ring emptied
+     * wholesale zeroes both. */
+    size_t        action_timed;
+    size_t        action_nondata;
 
     moq_event_t  *events;
     size_t        event_cap;
@@ -2265,6 +2263,10 @@ struct moq_session {
     int32_t          sg_occ_head;
     int32_t          rx_occ_head;
     int32_t          fetch_occ_head;
+    /* A subgroup may be RESET_OWED or TERMINAL_OWED (event + reset). Set
+     * at every debt producer; cleared only by a complete subgroup walk
+     * finding neither, so a clear flag spares the per-action walks. */
+    bool             sg_reset_owed;
 
     moq_ann_entry_t *announcements;
     size_t           ann_cap;
@@ -2436,14 +2438,13 @@ struct moq_session {
     uint64_t            goaway_timeout_us;
     uint64_t            goaway_deadline_us;
     uint64_t            subgroup_deadline_us;
-    /* When a subgroup delivery-timeout reset cannot be enqueued because the
-     * action queue is full (transport backpressure), the raw subgroup
-     * deadline above stays expired so the pending reset is not lost. This
-     * holds a bounded retry time in the future so moq_session_next_deadline_us()
-     * reports a deferred deadline instead of the still-expired one -- timer
-     * drivers then sleep until the backoff elapses rather than busy-spinning a
-     * zero-length wait. UINT64_MAX when no reset is deferred. */
+    /* Recognized terminal debt uses a bounded retry wake while action/event
+     * admission is blocked. Unrecognized subgroup deadlines remain separate.
+     * UINT64_MAX when no unpublished outgoing terminal remains. */
     uint64_t            subgroup_retry_deadline_us;
+    /* First outgoing-terminal recognition owes the bridge a prune pass.
+     * Event consumption and reset handover do not acknowledge this latch. */
+    bool                outgoing_terminal_dirty;
     uint64_t            idle_timeout_us;
     uint64_t            idle_deadline_us;
     /* §9.8: configured terminal wait (effective; cfg 0 -> library default)
@@ -2708,6 +2709,15 @@ moq_result_t push_action(moq_session_t *s, const moq_action_t *a);
  * none) and is stored whichever way the record came. */
 moq_result_t push_action_ex(moq_session_t *s, const moq_action_t *a,
                             const moq_action_meta_t *meta, uint64_t deadline_us);
+void session_tag_owner_done(moq_session_t *s, uint64_t owner);
+/* Keep the queued-action summary (action_timed, action_nondata) as an action
+ * enters the ring or leaves it, called with the action and its scheduling
+ * record as they stand at that moment. A queued action rewritten in place
+ * leaves as it was and enters as it becomes. */
+void session_action_enqueued(moq_session_t *s, const moq_action_t *a,
+                             const moq_action_meta_t *m);
+void session_action_dequeued(moq_session_t *s, const moq_action_t *a,
+                             const moq_action_meta_t *m);
 /* Earliest OBJECT_DELIVERY_TIMEOUT expiry among the queued actions. */
 uint64_t session_queued_data_deadline(const moq_session_t *s);
 /* Drop every queued object whose OBJECT_DELIVERY_TIMEOUT has elapsed at
@@ -2934,6 +2944,26 @@ void session_retry_owed_stops(moq_session_t *s);
 void sg_reset_or_owe(moq_session_t *s, size_t slot, uint64_t code, size_t keep);
 /* The send half: the resets owed by MOQ_SG_RESET_OWED subgroups. */
 void sg_retry_owed_resets(moq_session_t *s);
+/* Recognize queued-object and subgroup expiry, then retry bounded terminal
+ * debts. Does not advance time or invalidate borrows. */
+void session_service_outgoing_terminals(moq_session_t *s);
+bool sg_has_terminal_debt(const moq_session_t *s);
+/* Acknowledge new terminal recognition for bridge queue pruning. Private;
+ * event polling does not clear it, and reset retries do not set it again. */
+bool bridge_session_take_terminal_changes(moq_session_t *s);
+/* Transfer a reset debt directly into a poll slot when the action ring is
+ * full, publishing its event unless already claimed. Never overtakes its header. */
+bool sg_take_terminal_action(moq_session_t *s, moq_action_t *out);
+/* An uncommitted terminal needs event credit; either terminal form must
+ * remain behind its queued subgroup header/barrier. These checks are passive. */
+bool sg_terminal_reset_ready(const moq_session_t *s, const moq_sg_entry_t *sg);
+/* Commit a terminal's event while retaining its reset on the subgroup entry.
+ * Used only after the bridge has admitted the pressure escape. */
+bool sg_claim_terminal_reset(moq_session_t *s, size_t slot);
+/* Revalidate a passive reset offer and claim event/local-reset ownership
+ * before provider calls. False leaves the offer unclaimed. Private bridge SPI. */
+bool bridge_session_claim_data_reset(moq_session_t *s,
+                                      const moq_reset_data_action_t *reset);
 
 /* Index of `ref_v` among the streams stopped without a receive entry, or -1. */
 int rx_stopped_ref_find(const moq_session_t *s, uint64_t ref_v);
@@ -3433,6 +3463,9 @@ moq_result_t session_core_reject_initial_request(moq_session_t *s,
 /* -- Decoded inbound PUBLISH_NAMESPACE (profile → session core) ------- */
 
 typedef struct moq_decoded_publish_namespace {
+    moq_bytes_t cluster_hop_path;
+    bool cluster_has_route_cost;
+    uint64_t cluster_route_cost;
     moq_request_endpoint_t endpoint;
     uint64_t         request_id;
     moq_namespace_t  track_namespace;
@@ -3538,6 +3571,9 @@ static inline uint64_t retry_interval_to_ms(uint64_t wire)
 }
 
 typedef struct moq_decoded_ns_sub_response {
+    moq_bytes_t cluster_hop_path;
+    bool cluster_has_route_cost;
+    uint64_t cluster_route_cost;
     moq_ns_sub_response_kind_t kind;
     size_t consumed;                 /* bytes consumed from input */
 
@@ -4218,6 +4254,21 @@ extern uint64_t session_work_index_rm_search;    /* moq_index_remove search step
 extern uint64_t session_work_index_rm_backshift; /* moq_index_remove backshift steps */
 
 /*
+ * The deadline query's walks and the queued-action inspections of expiry and
+ * the reset offer, outside the advancing preamble: one counter per loop site,
+ * the same rule as above. moq_session_next_deadline_us is observing, so a test
+ * reads them around one query or one bridge service.
+ */
+extern uint64_t session_work_deadline_sg_probes;  /* subgroup slots visited, next-deadline query */
+extern uint64_t session_work_deadline_sub_probes; /* subscription slots visited, next-deadline query */
+extern uint64_t session_work_deadline_pub_probes; /* publication slots visited, next-deadline query */
+extern uint64_t session_work_queued_deadline;     /* queued actions visited, session_queued_data_deadline */
+extern uint64_t session_work_expiry_search;       /* queued actions visited, expiry's search for a due one */
+extern uint64_t session_work_expiry_compact;      /* queued actions visited, expiry's compaction */
+extern uint64_t session_work_reset_offer;         /* queued actions visited, bridge_session_offer_data_reset */
+extern uint64_t session_work_sg_stream_find;      /* subgroup slots visited, sg_find_by_stream_ref */
+
+/*
  * CONTROL loops: bounded by active work, not by capacity and not by occupancy.
  * Counted so the image can claim completeness without describing them.
  */
@@ -4470,6 +4521,9 @@ typedef struct moq_decoded_publish_blocked {
 /* A draft-22 REQUEST_UPDATE of a namespace request (§9.5): the selected
  * parameters its family permits. Spans borrow the message body. */
 typedef struct moq_decoded_namespace_update {
+    moq_bytes_t cluster_hop_path;
+    bool cluster_has_route_cost;
+    uint64_t cluster_route_cost;
     uint64_t        request_id;
     bool            has_prefix;
     moq_namespace_t prefix;
@@ -4479,6 +4533,7 @@ typedef struct moq_decoded_namespace_update {
 } moq_decoded_namespace_update_t;
 
 typedef struct moq_namespace_update_encode_args {
+    moq_cluster_metadata_t cluster;
     uint64_t                request_id;
     moq_request_family_t    family;
     bool                    has_prefix;
@@ -4622,8 +4677,10 @@ void session_owed_update_record(moq_owed_update_t *o, const moq_sub_update_t *cu
 moq_result_t session_update_encode_ok(moq_session_t *s, uint64_t request_id,
                                       const moq_update_plan_t *p,
                                       uint8_t *buf, size_t cap, size_t *out_len);
-moq_result_t session_update_accept_fits(moq_session_t *s, const moq_owed_update_t *o,
-                                        const moq_update_plan_t *p);
+/* Queue the owed run's distinct wire acknowledgments in one output action.
+ * A refusal leaves the action queue, send cursor and owed record unchanged. */
+moq_result_t session_update_queue_accept(moq_session_t *s, bool req_stream,
+    moq_stream_ref_t ref, const moq_owed_update_t *o, const moq_update_plan_t *p);
 moq_result_t session_update_reject_cfg_check(const moq_session_t *s,
                                              const moq_reject_subscription_update_cfg_t *cfg);
 void session_update_reject_args(const moq_owed_update_t *o,
@@ -4979,6 +5036,20 @@ moq_result_t request_stream_failed_by_fin(moq_session_t *s,
  * bidi. The caller reserved the action slot. */
 void request_bidi_reset_local(moq_session_t *s, moq_stream_ref_t stream_ref);
 
+/* Owned cluster metadata helpers; mutations reserve the new path first. */
+bool session_cluster_namespace_duplicate(moq_session_t *s, const moq_namespace_t *ns,
+                                         bool local_sender, int excluded_ns_sub);
+moq_result_t session_cluster_validate(const moq_cluster_metadata_t *m, bool required);
+moq_result_t session_cluster_copy(moq_session_t *s, const moq_cluster_metadata_t *in,
+                                  moq_cluster_metadata_t *out);
+moq_result_t session_cluster_decode(moq_session_t *s, moq_bytes_t path, bool has_cost,
+                                    uint64_t cost, moq_cluster_metadata_t *out);
+void session_cluster_free(moq_session_t *s, moq_cluster_metadata_t *m);
+moq_result_t session_cluster_event(moq_session_t *s, const moq_cluster_metadata_t *in,
+                                   moq_cluster_metadata_t *out);
+void session_cluster_apply(moq_session_t *s, moq_cluster_metadata_t *current,
+                           moq_cluster_metadata_t *update);
+
 /* -- Draft-22 namespace updates (session_namespace_update.c) ---------- */
 
 struct moq_request_envelope;
@@ -5008,11 +5079,13 @@ moq_result_t ns_update_owed_query(const moq_ns_update_t *u,
     moq_namespace_update_record_t *out, size_t out_size);
 moq_result_t ns_update_push_request_event(moq_session_t *s,
     moq_request_family_t family, uint64_t handle_raw, const moq_ns_update_t *u);
-moq_result_t ns_update_push_result_event(moq_session_t *s,
-    moq_request_family_t family, uint64_t handle_raw, uint64_t update_request_id,
-    moq_namespace_update_outcome_t outcome, moq_request_role_t role,
-    uint64_t error_code, const uint8_t *reason, size_t reason_len,
-    bool has_expires, uint64_t expires_ms);
+moq_result_t ns_update_push_result_event(moq_session_t *s, moq_request_family_t family,
+                                         uint64_t handle_raw, uint64_t update_request_id,
+                                         moq_namespace_update_outcome_t outcome,
+                                         moq_request_role_t role, uint64_t error_code,
+                                         const uint8_t *reason, size_t reason_len, bool has_expires,
+                                         uint64_t expires_ms,
+                                         const moq_cluster_metadata_t *cluster);
 /* Decode, admit the Request ID and stage the token transaction of a peer
  * namespace update. A malformed message closes the session. On MOQ_OK the
  * caller ends the admission with ns_update_defer, or with

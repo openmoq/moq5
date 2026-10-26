@@ -8,6 +8,7 @@
 
 #include <moq/relay/capacity.h>
 #include <moq/relay/log.h>
+#include <moq/relay/relay.h>
 #include <moq/relay/trace.h>
 
 #include <moq/rcbuf.h>
@@ -1175,6 +1176,150 @@ test_chunk_abandon(void)
     return failures;
 }
 
+/* The terminal one list carries: none, a FIN (sealed), or a reset and its
+ * cause. */
+typedef struct list_end {
+    bool              sealed;
+    bool              reset;
+    moqr_reset_desc_t cause;
+} list_end_t;
+
+static list_end_t
+list_end(const moqr_log_t *log, uint64_t group, uint32_t list_slot)
+{
+    list_end_t e;
+    memset(&e, 0, sizeof(e));
+    e.sealed = moqr_log_subgroup_sealed(log, group, list_slot, NULL);
+    e.reset = moqr_log_subgroup_reset(log, group, list_slot, &e.cause);
+    return e;
+}
+
+static bool
+same_cause(moqr_reset_desc_t a, moqr_reset_desc_t b)
+{
+    return a.tag == b.tag && a.value == b.value;
+}
+
+/* An upstream eviction watermark closes the retained groups below it
+ * without inventing completion. Nothing more will arrive for them, but
+ * nothing proves their retained objects are whole subgroups, so a list
+ * that had not ended ends with a reset, never a FIN (draft-16 §10.4.3,
+ * draft-18 §11.4.3, draft-22 §11.3.2): complete-but-unsealed and header
+ * End-of-Group lists alike, with the eviction cause.
+ * An OPEN object is abandoned with that cause, and a list whose last
+ * object was abandoned ends with that object's cause. Complete records stay
+ * readable; a list that already ended keeps its terminal; End-of-Group
+ * finality stays unresolved; groups at or above the watermark are
+ * untouched. The count is the lists newly terminalized, and a repeated or
+ * lower watermark changes nothing. */
+static int
+test_watermark_terminals(void)
+{
+    int failures = 0;
+    count_alloc_t ca;
+    ca_init(&ca);
+    moqr_log_t *log = mklog(&ca, 8, 1u << 20, NULL);
+    MOQ_TEST_CHECK(log != NULL);
+    if (log == NULL) {
+        return failures;
+    }
+    moqr_reset_desc_t evicted, upstream = rd_wire(0x7), abandoned = rd_wire(0x9);
+    MOQ_TEST_CHECK(moqr_reset_desc_internal(MOQR_RESET_CODE_EVICTED,
+                                            &evicted) == MOQR_OK);
+
+    /* Group 2, one list per shape (object ids are unique group-wide). */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 0, 0, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);   /* list 0: unsealed */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 0, 1, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 1, 2, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);   /* list 1: sealed */
+    MOQ_TEST_CHECK(moqr_log_seal_subgroup(log, 2, 1) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 2, 3, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);   /* list 2: reset */
+    MOQ_TEST_CHECK(moqr_log_reset_subgroup(log, 2, 2, upstream) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 3, 4, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);   /* list 3: OPEN tail */
+    MOQ_TEST_CHECK(open_rec(log, 2, 3, 5, 16) == MOQR_OK);
+    MOQ_TEST_CHECK(append_chunk_n(log, &ca.vt, 2, 3, 5, 6, 0xC5) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 4, 6, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);   /* list 4: abandoned tail */
+    MOQ_TEST_CHECK(open_rec(log, 2, 4, 7, 16) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_log_abandon_record(log, 2, 4, 7, abandoned) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 5, 8, 8, true, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);   /* list 5: header EOG */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 2, 5, 9, 8, true, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);
+    /* Group 3, at the watermark: an unsealed list that must stay open. */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 3, 0, 0, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);
+    STEP_CHECK(log);
+    moqr_log_stats_t st;
+    moqr_log_get_stats(log, &st);
+    const uint64_t bytes_before = st.retained_bytes;
+    const uint64_t records_before = st.record_count;
+
+    MOQ_TEST_CHECK_EQ_SIZE(moqr_log_note_evicted_below(log, 3), (size_t)4);
+    STEP_CHECK(log);
+
+    list_end_t e = list_end(log, 2, 0);
+    MOQ_TEST_CHECK(e.sealed && e.reset && same_cause(e.cause, evicted));
+    MOQ_TEST_CHECK(!moqr_log_subgroup_is_final(log, 2, 0, 1));
+    e = list_end(log, 2, 1);
+    MOQ_TEST_CHECK(e.sealed && !e.reset);   /* the FIN stands */
+    MOQ_TEST_CHECK(moqr_log_subgroup_is_final(log, 2, 1, 2));
+    e = list_end(log, 2, 2);
+    MOQ_TEST_CHECK(e.sealed && e.reset && same_cause(e.cause, upstream));
+    e = list_end(log, 2, 3);
+    MOQ_TEST_CHECK(e.sealed && e.reset && same_cause(e.cause, evicted));
+    e = list_end(log, 2, 4);
+    MOQ_TEST_CHECK(e.sealed && e.reset && same_cause(e.cause, abandoned));
+    e = list_end(log, 2, 5);
+    MOQ_TEST_CHECK(e.sealed && e.reset && same_cause(e.cause, evicted));
+    MOQ_TEST_CHECK(!moqr_log_group_final(log, 2, NULL));   /* unresolved */
+    e = list_end(log, 3, 0);
+    MOQ_TEST_CHECK(!e.sealed && !e.reset);
+
+    /* The complete records are all still there, byte for byte; only the
+     * OPEN object's partial chunks went, abandoned with the eviction cause. */
+    moqr_record_view_t v;
+    MOQ_TEST_CHECK(moqr_log_read_rec(log, 2, 0, 1, &v) == MOQR_OK);
+    MOQ_TEST_CHECK(v.object_id == 1 && v.obj_state == MOQR_OBJ_COMPLETE &&
+                   v.payload != NULL && moq_rcbuf_len(v.payload) == 8 &&
+                   moq_rcbuf_data(v.payload)[0] == 1);
+    MOQ_TEST_CHECK(moqr_log_read_rec(log, 2, 3, 1, &v) == MOQR_OK);
+    MOQ_TEST_CHECK(v.object_id == 5 && v.obj_state == MOQR_OBJ_ABANDONED &&
+                   v.chunk_count == 0);
+    moqr_log_get_stats(log, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.retained_bytes, bytes_before - 6);
+    MOQ_TEST_CHECK_EQ_U64(st.record_count, records_before);
+    MOQ_TEST_CHECK_EQ_U64(st.group_count, 2);
+
+    /* Below the watermark, what was never received is closed for good. */
+    MOQ_TEST_CHECK_EQ_U64(moqr_log_evicted_floor(log), 3);
+    MOQ_TEST_CHECK(moqr_log_read_rec(log, 1, 0, 0, &v) == MOQR_ERR_TOO_OLD);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 1, 0, 0, 8, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_ERR_TOO_OLD);
+
+    /* Repeated and lower watermarks are no-ops: first terminal wins. */
+    MOQ_TEST_CHECK_EQ_SIZE(moqr_log_note_evicted_below(log, 3), (size_t)0);
+    MOQ_TEST_CHECK_EQ_SIZE(moqr_log_note_evicted_below(log, 2), (size_t)0);
+    MOQ_TEST_CHECK_EQ_U64(moqr_log_evicted_floor(log), 3);
+    e = list_end(log, 2, 2);
+    MOQ_TEST_CHECK(e.reset && same_cause(e.cause, upstream));
+    e = list_end(log, 2, 1);
+    MOQ_TEST_CHECK(e.sealed && !e.reset);
+    e = list_end(log, 3, 0);
+    MOQ_TEST_CHECK(!e.sealed && !e.reset);
+
+    STEP_CHECK(log);
+    moqr_log_destroy(log);
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)(ca.allocs - ca.frees), 0);
+    MOQ_TEST_PASS("watermark_terminals");
+    return failures;
+}
+
 /* Identity + ordering — a duplicate object id is rejected, and no
  * later object can be appended to a subgroup while a record is OPEN. */
 static int
@@ -1266,6 +1411,393 @@ test_chunk_capacity(void)
     MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);   /* every slice decref'd */
     MOQ_TEST_CHECK_EQ_INT((int)(ca.allocs - ca.frees), 0);
     MOQ_TEST_PASS("chunk_capacity");
+    return failures;
+}
+
+/* An object of `n` chunks of `len` bytes, filled fill, fill+1, ..., complete. */
+static moqr_result_t
+chunked_obj(moqr_log_t *log, const moq_alloc_t *a, uint64_t group,
+            uint64_t subgroup, uint64_t object, uint32_t n, size_t len,
+            uint8_t fill)
+{
+    moqr_result_t rc = open_rec(log, group, subgroup, object, (uint64_t)n * len);
+    for (uint32_t i = 0; rc == MOQR_OK && i < n; i++) {
+        rc = append_chunk_n(log, a, group, subgroup, object, len,
+                            (uint8_t)(fill + i));
+    }
+    return rc == MOQR_OK ? moqr_log_complete_record(log, group, subgroup, object)
+                         : rc;
+}
+
+/* Record `rec_idx` of the group's first list holds `n` chunks of `len` bytes,
+ * filled fill, fill+1, ... in order. */
+static bool
+chunks_are(const moqr_log_t *log, uint64_t group, uint32_t rec_idx, uint32_t n,
+           size_t len, uint8_t fill)
+{
+    moqr_record_view_t v;
+    if (moqr_log_read_rec(log, group, 0, rec_idx, &v) != MOQR_OK ||
+        v.chunk_count != n) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const moq_rcbuf_t *cb = NULL;
+        uint64_t cl = 0;
+        if (moqr_log_view_chunk(log, &v, i, &cb, &cl) != MOQR_OK || cb == NULL ||
+            cl != len) {
+            return false;
+        }
+        for (size_t j = 0; j < len; j++) {
+            if (moq_rcbuf_data(cb)[j] != (uint8_t)(fill + i)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static moqr_log_t *
+mklog_nodes(count_alloc_t *ca, uint32_t nodes, uint64_t max_bytes)
+{
+    moqr_log_cfg_t cfg;
+    moqr_log_cfg_init_sized(&cfg, sizeof(cfg), &ca->vt);
+    cfg.budget.max_groups = 8;
+    cfg.budget.max_bytes = max_bytes;
+    cfg.max_chunk_nodes = nodes;
+    moqr_log_t *log = NULL;
+    return moqr_log_create(&cfg, &log) == MOQR_OK ? log : NULL;
+}
+
+/* The chunk-node pool, like the byte budget, sheds the oldest retained group
+ * (never the open record's own) before refusing a chunk: COMPLETE chunked
+ * records keep their nodes until eviction, so a pool held entirely by older
+ * groups must not refuse every later object while the byte budget still has
+ * room. What is evicted is gone whole, and what is admitted is intact. */
+static int
+test_chunk_nodes_evict_oldest_group(void)
+{
+    int failures = 0;
+    count_alloc_t ca;
+    ca_init(&ca);
+    moqr_log_t *log = mklog_nodes(&ca, 4, 1024);
+    MOQ_TEST_CHECK(log != NULL);
+    if (log == NULL) {
+        return failures;
+    }
+
+    /* Group 0: one 40-byte object as 4x10-byte chunks, complete: its record
+     * holds all four nodes. */
+    MOQ_TEST_CHECK(chunked_obj(log, &ca.vt, 0, 0, 0, 4, 10, 0x10) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)log->chunk_used, 4);
+    STEP_CHECK(log);
+
+    /* Group 1's first chunk fits the byte budget: it is admitted by shedding
+     * group 0, not refused. */
+    MOQ_TEST_CHECK(chunked_obj(log, &ca.vt, 1, 0, 0, 2, 10, 0x20) == MOQR_OK);
+    STEP_CHECK(log);
+    moqr_log_stats_t st;
+    moqr_log_get_stats(log, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.group_count, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.oldest_group_id, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_groups_total, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_records_total, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.retained_bytes, 20);
+    MOQ_TEST_CHECK_EQ_INT((int)log->chunk_used, 2);
+    MOQ_TEST_CHECK(chunks_are(log, 1, 0, 2, 10, 0x20));
+    /* The horizon moved past group 0: a late object of it is too old. */
+    MOQ_TEST_CHECK(open_rec(log, 0, 0, 1, 10) == MOQR_ERR_TOO_OLD);
+
+    STEP_CHECK(log);
+    moqr_log_destroy(log);
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)(ca.allocs - ca.frees), 0);
+    MOQ_TEST_PASS("chunk_nodes_evict_oldest_group");
+    return failures;
+}
+
+/* One chunk can need several evictions, oldest first: a group holding no node
+ * (a whole object) goes too when a group behind it holds some. The receiving
+ * record moves as the group array compacts, and is found again each time. */
+static int
+test_chunk_nodes_evict_several(void)
+{
+    int failures = 0;
+    count_alloc_t ca;
+    ca_init(&ca);
+    moqr_log_t *log = mklog_nodes(&ca, 4, 1024);
+    MOQ_TEST_CHECK(log != NULL);
+    if (log == NULL) {
+        return failures;
+    }
+    MOQ_TEST_CHECK(chunked_obj(log, &ca.vt, 0, 0, 0, 2, 10, 0x10) == MOQR_OK);
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 1, 0, 0, 10, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);
+    MOQ_TEST_CHECK(chunked_obj(log, &ca.vt, 2, 0, 0, 2, 10, 0x20) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)log->chunk_used, 4);
+    STEP_CHECK(log);
+
+    MOQ_TEST_CHECK(open_rec(log, 3, 0, 0, 30) == MOQR_OK);
+    /* First chunk: group 0's two nodes come back. */
+    MOQ_TEST_CHECK(append_chunk_n(log, &ca.vt, 3, 0, 0, 10, 0x30) == MOQR_OK);
+    moqr_log_stats_t st;
+    moqr_log_get_stats(log, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_groups_total, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.oldest_group_id, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)log->chunk_used, 3);
+    STEP_CHECK(log);
+    /* Second chunk: the freed node, no eviction. */
+    MOQ_TEST_CHECK(append_chunk_n(log, &ca.vt, 3, 0, 0, 10, 0x31) == MOQR_OK);
+    moqr_log_get_stats(log, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_groups_total, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)log->chunk_used, 4);
+    STEP_CHECK(log);
+    /* Third chunk: group 1 holds no node and goes, then group 2 frees two. */
+    MOQ_TEST_CHECK(append_chunk_n(log, &ca.vt, 3, 0, 0, 10, 0x32) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_log_complete_record(log, 3, 0, 0) == MOQR_OK);
+    moqr_log_get_stats(log, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_groups_total, 3);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_records_total, 3);
+    MOQ_TEST_CHECK_EQ_U64(st.group_count, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.oldest_group_id, 3);
+    MOQ_TEST_CHECK_EQ_U64(st.retained_bytes, 30);
+    MOQ_TEST_CHECK_EQ_INT((int)log->chunk_used, 3);
+    MOQ_TEST_CHECK(chunks_are(log, 3, 0, 3, 10, 0x30));
+
+    STEP_CHECK(log);
+    moqr_log_destroy(log);
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)(ca.allocs - ca.frees), 0);
+    MOQ_TEST_PASS("chunk_nodes_evict_several");
+    return failures;
+}
+
+/* Every node in use belongs to the receiving record's own group: no older
+ * group can give one back, so the chunk is refused at once and nothing older
+ * is evicted for nothing. The record stays OPEN with what it holds, and the
+ * chunk is not taken. */
+static int
+test_chunk_nodes_own_group_only(void)
+{
+    int failures = 0;
+    count_alloc_t ca;
+    ca_init(&ca);
+    moqr_log_t *log = mklog_nodes(&ca, 4, 1024);
+    MOQ_TEST_CHECK(log != NULL);
+    if (log == NULL) {
+        return failures;
+    }
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 0, 0, 0, 10, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);
+    MOQ_TEST_CHECK(open_rec(log, 1, 0, 0, 50) == MOQR_OK);
+    for (int i = 0; i < 4; i++) {
+        MOQ_TEST_CHECK(append_chunk_n(log, &ca.vt, 1, 0, 0, 10,
+                                      (uint8_t)(0x40 + i)) == MOQR_OK);
+    }
+    STEP_CHECK(log);
+    moq_rcbuf_t *b = mkbuf(&ca.vt, 10, 0x44);
+    MOQ_TEST_CHECK(b != NULL);
+    if (b != NULL) {
+        MOQ_TEST_CHECK(moqr_log_append_chunk(log, 1, 0, 0, b) ==
+                       MOQR_ERR_CAPACITY);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(b), 1);
+        moq_rcbuf_decref(b);
+    }
+    moqr_log_stats_t st;
+    moqr_log_get_stats(log, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_groups_total, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.group_count, 2);
+    MOQ_TEST_CHECK_EQ_U64(st.retained_bytes, 50);
+    MOQ_TEST_CHECK_EQ_INT((int)log->chunk_used, 4);
+    moqr_record_view_t v;
+    MOQ_TEST_CHECK(moqr_log_read_rec(log, 1, 0, 0, &v) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(v.obj_state, MOQR_OBJ_OPEN);
+    MOQ_TEST_CHECK_EQ_U64(v.chunk_count, 4);
+
+    STEP_CHECK(log);
+    moqr_log_destroy(log);
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)(ca.allocs - ca.frees), 0);
+    MOQ_TEST_PASS("chunk_nodes_own_group_only");
+    return failures;
+}
+
+/* Every node in use belongs to the receiving record's group or a newer one.
+ * Eviction runs oldest first and never passes the receiving group, so no
+ * group it may evict can give a node back: the chunk is refused at once and
+ * the older group, which holds none, is kept. Nothing is evicted; the
+ * horizon, bytes, records and nodes are as they were; every retained payload
+ * reads back; the record stays OPEN with its chunks; the chunk is not taken. */
+static int
+test_chunk_nodes_newer_group_holds(void)
+{
+    int failures = 0;
+    count_alloc_t ca;
+    ca_init(&ca);
+    moqr_log_t *log = mklog_nodes(&ca, 4, 1024);
+    MOQ_TEST_CHECK(log != NULL);
+    if (log == NULL) {
+        return failures;
+    }
+    /* Group 0: a whole object, no node. Group 1: an OPEN object with two of
+     * its three chunks. Group 2: a complete object of two chunks. */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 0, 0, 0, 10, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);
+    MOQ_TEST_CHECK(open_rec(log, 1, 0, 0, 30) == MOQR_OK);
+    MOQ_TEST_CHECK(append_chunk_n(log, &ca.vt, 1, 0, 0, 10, 0x40) == MOQR_OK);
+    MOQ_TEST_CHECK(append_chunk_n(log, &ca.vt, 1, 0, 0, 10, 0x41) == MOQR_OK);
+    MOQ_TEST_CHECK(chunked_obj(log, &ca.vt, 2, 0, 0, 2, 10, 0x50) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)log->chunk_used, 4);
+    STEP_CHECK(log);
+    moqr_log_stats_t before;
+    moqr_log_get_stats(log, &before);
+
+    /* Group 1's last chunk: the bytes fit, the pool is full. */
+    moq_rcbuf_t *b = mkbuf(&ca.vt, 10, 0x42);
+    MOQ_TEST_CHECK(b != NULL);
+    if (b != NULL) {
+        MOQ_TEST_CHECK(moqr_log_append_chunk(log, 1, 0, 0, b) ==
+                       MOQR_ERR_CAPACITY);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(b), 1);
+        moq_rcbuf_decref(b);
+    }
+    moqr_log_stats_t st;
+    moqr_log_get_stats(log, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_groups_total, before.evicted_groups_total);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_records_total, before.evicted_records_total);
+    MOQ_TEST_CHECK_EQ_U64(st.group_count, 3);
+    MOQ_TEST_CHECK_EQ_U64(st.oldest_group_id, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.retained_bytes, 50);
+    MOQ_TEST_CHECK_EQ_U64(st.record_count, before.record_count);
+    MOQ_TEST_CHECK_EQ_INT((int)log->chunk_used, 4);
+    MOQ_TEST_CHECK(!log->any_evicted);
+    moqr_record_view_t v;
+    memset(&v, 0, sizeof(v));
+    bool g0_read = moqr_log_read_rec(log, 0, 0, 0, &v) == MOQR_OK;
+    MOQ_TEST_CHECK(g0_read);
+    bool g0_intact = g0_read && v.payload != NULL && moq_rcbuf_len(v.payload) == 10;
+    for (size_t i = 0; g0_intact && i < 10; i++) {
+        g0_intact = moq_rcbuf_data(v.payload)[i] == 0x00;
+    }
+    MOQ_TEST_CHECK(g0_intact);
+    MOQ_TEST_CHECK(chunks_are(log, 2, 0, 2, 10, 0x50));
+    memset(&v, 0, sizeof(v));
+    MOQ_TEST_CHECK(moqr_log_read_rec(log, 1, 0, 0, &v) == MOQR_OK);
+    MOQ_TEST_CHECK_EQ_U64(v.obj_state, MOQR_OBJ_OPEN);
+    MOQ_TEST_CHECK(chunks_are(log, 1, 0, 2, 10, 0x40));
+    /* The horizon has not passed group 0: a later object of it is admitted. */
+    MOQ_TEST_CHECK(append_obj(log, &ca.vt, 0, 0, 1, 10, false, MOQR_OBJ_NORMAL,
+                              false) == MOQR_OK);
+
+    STEP_CHECK(log);
+    moqr_log_destroy(log);
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)(ca.allocs - ca.frees), 0);
+    MOQ_TEST_PASS("chunk_nodes_newer_group_holds");
+    return failures;
+}
+
+/* A chunk the record cannot take on other grounds evicts nothing, however
+ * short the pool: a zero-length chunk is a no-op and one past the declared
+ * length is refused before any eviction. */
+static int
+test_chunk_nodes_no_evict_for_nothing(void)
+{
+    int failures = 0;
+    count_alloc_t ca;
+    ca_init(&ca);
+    moqr_log_t *log = mklog_nodes(&ca, 2, 1024);
+    MOQ_TEST_CHECK(log != NULL);
+    if (log == NULL) {
+        return failures;
+    }
+    MOQ_TEST_CHECK(chunked_obj(log, &ca.vt, 0, 0, 0, 2, 10, 0x10) == MOQR_OK);
+    MOQ_TEST_CHECK(open_rec(log, 1, 0, 0, 20) == MOQR_OK);
+    MOQ_TEST_CHECK(append_chunk_n(log, &ca.vt, 1, 0, 0, 0, 0x50) == MOQR_OK);
+    MOQ_TEST_CHECK(append_chunk_n(log, &ca.vt, 1, 0, 0, 30, 0x51) ==
+                   MOQR_ERR_INVAL);
+    moqr_log_stats_t st;
+    moqr_log_get_stats(log, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_groups_total, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.group_count, 2);
+    MOQ_TEST_CHECK_EQ_INT((int)log->chunk_used, 2);
+    STEP_CHECK(log);
+    /* A chunk it can take does reclaim group 0. */
+    MOQ_TEST_CHECK(append_chunk_n(log, &ca.vt, 1, 0, 0, 10, 0x52) == MOQR_OK);
+    moqr_log_get_stats(log, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_groups_total, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)log->chunk_used, 1);
+
+    STEP_CHECK(log);
+    moqr_log_destroy(log);
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)(ca.allocs - ca.frees), 0);
+    MOQ_TEST_PASS("chunk_nodes_no_evict_for_nothing");
+    return failures;
+}
+
+/* A reader's place survives a chunk-node eviction as it survives any other:
+ * a cursor inside the evicted group resumes at the oldest retained record
+ * with the skip reported, and a chunk the reader still holds keeps its bytes
+ * until the reader lets it go. The eviction drops the log's own reference,
+ * once. */
+static int
+test_chunk_nodes_under_cursor(void)
+{
+    int failures = 0;
+    count_alloc_t ca;
+    ca_init(&ca);
+    moqr_log_t *log = mklog_nodes(&ca, 4, 1024);
+    MOQ_TEST_CHECK(log != NULL);
+    if (log == NULL) {
+        return failures;
+    }
+    MOQ_TEST_CHECK(chunked_obj(log, &ca.vt, 0, 0, 0, 2, 10, 0x10) == MOQR_OK);
+    MOQ_TEST_CHECK(chunked_obj(log, &ca.vt, 0, 0, 1, 2, 10, 0x20) == MOQR_OK);
+    moqr_cursor_t cur = MOQR_CURSOR_INVALID;
+    MOQ_TEST_CHECK(moqr_log_cursor_open(log, MOQR_CURSOR_FROM_OLDEST, &cur) ==
+                   MOQR_OK);
+    moqr_record_view_t v;
+    bool skipped = false;
+    MOQ_TEST_CHECK(moqr_log_cursor_next(log, cur, &v, &skipped) == MOQR_OK);
+    MOQ_TEST_CHECK(!skipped && v.group_id == 0 && v.object_id == 0);
+    /* The reader keeps object 0's second chunk, as a queued send would. */
+    const moq_rcbuf_t *cb = NULL;
+    uint64_t cl = 0;
+    MOQ_TEST_CHECK(moqr_log_view_chunk(log, &v, 1, &cb, &cl) == MOQR_OK);
+    moq_rcbuf_t *held =
+        cb != NULL ? moq_rcbuf_incref((moq_rcbuf_t *)(void *)cb) : NULL;
+    MOQ_TEST_CHECK(held != NULL && moq_rcbuf_refcount(held) == 2);
+
+    /* Group 1's object needs a node: group 0 is evicted under the cursor. */
+    MOQ_TEST_CHECK(chunked_obj(log, &ca.vt, 1, 0, 0, 1, 10, 0x30) == MOQR_OK);
+    moqr_log_stats_t st;
+    moqr_log_get_stats(log, &st);
+    MOQ_TEST_CHECK_EQ_U64(st.evicted_groups_total, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.oldest_group_id, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)log->chunk_used, 1);
+    if (held != NULL) {
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(held), 1);
+        bool intact = moq_rcbuf_len(held) == 10;
+        for (size_t i = 0; intact && i < 10; i++) {
+            intact = moq_rcbuf_data(held)[i] == 0x11;
+        }
+        MOQ_TEST_CHECK(intact);
+    }
+    MOQ_TEST_CHECK(moqr_log_cursor_next(log, cur, &v, &skipped) == MOQR_OK);
+    MOQ_TEST_CHECK(skipped);
+    MOQ_TEST_CHECK_EQ_U64(v.group_id, 1);
+    MOQ_TEST_CHECK_EQ_U64(v.object_id, 0);
+    MOQ_TEST_CHECK(moqr_log_cursor_close(log, cur) == MOQR_OK);
+
+    STEP_CHECK(log);
+    moqr_log_destroy(log);
+    /* The reader's reference was the last one. */
+    if (held != NULL) {
+        moq_rcbuf_decref(held);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)ca.live_bytes, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)(ca.allocs - ca.frees), 0);
+    MOQ_TEST_PASS("chunk_nodes_under_cursor");
     return failures;
 }
 
@@ -1754,8 +2286,15 @@ main(void)
     failures += test_capacity_describe_bounds();
     failures += test_chunk_open_append_complete();
     failures += test_chunk_abandon();
+    failures += test_watermark_terminals();
     failures += test_chunk_ordering_and_dup();
     failures += test_chunk_capacity();
+    failures += test_chunk_nodes_evict_oldest_group();
+    failures += test_chunk_nodes_evict_several();
+    failures += test_chunk_nodes_own_group_only();
+    failures += test_chunk_nodes_newer_group_holds();
+    failures += test_chunk_nodes_no_evict_for_nothing();
+    failures += test_chunk_nodes_under_cursor();
     failures += test_chunk_byte_accounting_eviction();
     failures += test_group_final();
     failures += test_full_width_identity();

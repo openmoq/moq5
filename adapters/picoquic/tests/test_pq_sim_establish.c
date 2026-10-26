@@ -17,6 +17,7 @@
 
 #include <moq/moq.h>
 #include <moq/picoquic.h>
+#include "../../../tests/test_cluster_transport_flow.h"
 
 #include <picoquictest_internal.h>
 #include <picoquic_utils.h>
@@ -57,6 +58,12 @@ static int sim_create_session(moq_version_t version, moq_perspective_t persp,
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 16;
     cfg.version = version;
+    if (version == MOQ_VERSION_DRAFT_22) {
+        cfg.cluster_enabled = true;
+        cfg.cluster_hop_id = persp == MOQ_PERSPECTIVE_CLIENT ? 101 : 202;
+        cfg.cluster_has_relay_cost = persp == MOQ_PERSPECTIVE_CLIENT;
+        cfg.cluster_relay_cost = 0;
+    }
     return moq_session_create(&cfg, 0, out) == MOQ_OK ? 0 : -1;
 }
 
@@ -182,11 +189,48 @@ static void sim_pump(pq_sim_t *s, uint64_t ms)
  * Draft-18 is a symmetric handshake over a unidirectional control-channel
  * pair: BOTH endpoints start and send SETUP. Draft-16 starts the client
  * alone; the server is reactive. */
+static uint32_t sim_accept_uri(void *ctx, uint32_t present, moq_bytes_t authority, moq_bytes_t path)
+{
+    (void)ctx;
+    (void)present;
+    (void)authority;
+    (void)path;
+    return MOQ_URI_ACCEPT;
+}
+static int sim_bind_session(moq_session_t *session, picoquic_cnx_t *cnx)
+{
+    if (!moq_session_binding_requirements(session))
+        return 0;
+    const picoquic_tp_t *local = picoquic_get_transport_parameters(cnx, 1);
+    const picoquic_tp_t *remote = picoquic_get_transport_parameters(cnx, 0);
+    moq_transport_binding_t b;
+    moq_transport_binding_init(&b);
+    b.kind = MOQ_BINDING_RAW_QUIC;
+    b.facts_known = MOQ_BINDING_FACTS_ALL;
+    b.facts_supported = MOQ_BINDING_HANDSHAKE_COMPLETE;
+    if (local && local->max_datagram_frame_size)
+        b.facts_supported |= MOQ_BINDING_LOCAL_QUIC_DATAGRAM | MOQ_BINDING_DATAGRAM_RECEIVE;
+    if (remote && remote->max_datagram_frame_size)
+        b.facts_supported |= MOQ_BINDING_PEER_QUIC_DATAGRAM | MOQ_BINDING_DATAGRAM_SEND;
+    if (moq_session_perspective(session) == MOQ_PERSPECTIVE_SERVER)
+        b.accept_uri = sim_accept_uri;
+    else {
+        static const uint8_t host[] = "test.example:443", path[] = "/moq";
+        b.target_present = MOQ_BINDING_TARGET_COMPLETE;
+        b.authority = (moq_bytes_t){host, sizeof(host) - 1};
+        b.path_query = (moq_bytes_t){path, sizeof(path) - 1};
+    }
+    return moq_session_bind_transport(session, &b, sizeof(b)) == MOQ_OK ? 0 : -1;
+}
 static int sim_handshake(pq_sim_t *s)
 {
+    if (sim_bind_session(s->client_session, s->test_ctx->cnx_client) != 0 ||
+        sim_bind_session(s->server_session, s->test_ctx->cnx_server) != 0)
+        return -1;
     if (moq_session_start(s->client_session, s->now) < 0) return -1;
-    if (s->version == MOQ_VERSION_DRAFT_18 &&
-        moq_session_start(s->server_session, s->now) < 0) return -1;
+    if ((s->version == MOQ_VERSION_DRAFT_18 || s->version == MOQ_VERSION_DRAFT_22) &&
+        moq_session_start(s->server_session, s->now) < 0)
+        return -1;
 
     int cd = 0, sd = 0;
     uint64_t tl = s->now + 5000000;
@@ -518,6 +562,28 @@ static void run_version(uint8_t cid_byte, moq_version_t version)
     sim_cleanup(&s);
 }
 
+static int cluster_native_pump(void *ctx)
+{
+    sim_pump((pq_sim_t *)ctx, 200);
+    return 0;
+}
+static void run_cluster(void)
+{
+    scenario = "d22-cluster";
+    pq_sim_t s;
+    CHECK(sim_setup(&s, 0x22, MOQ_VERSION_DRAFT_22, PICOQUIC_MAX_PACKET_SIZE) == 0);
+    if (s.test_ctx && s.client_conn && s.server_conn) {
+        CHECK(sim_handshake(&s) == 0);
+        if (moq_session_state(s.client_session) == MOQ_SESS_ESTABLISHED &&
+            moq_session_state(s.server_session) == MOQ_SESS_ESTABLISHED)
+            failures += cluster_packet_flow(s.client_session, s.server_session, &s,
+                                            cluster_native_pump, &s.now);
+        CHECK(!moq_pq_conn_is_fatal(s.client_conn));
+        CHECK(!moq_pq_conn_is_fatal(s.server_conn));
+    }
+    sim_cleanup(&s);
+}
+
 int main(void)
 {
     /* A. draft-16: harness control. */
@@ -526,6 +592,8 @@ int main(void)
     /* B + C. draft-18: symmetric uni-control establish + request-bidi
      * stream-0 routing + subgroup data delivery. */
     run_version(0x18, MOQ_VERSION_DRAFT_18);
+
+    run_cluster();
 
     /* D. object datagram over real picoquic with QUIC DATAGRAM negotiated:
      * the peer receives it as a datagram. */

@@ -216,12 +216,12 @@ typedef struct {
 
 static void drain_outputs(run_state_t *rs) {
     moq_playback_cmd_t cmd;
-    while (moq_playback_poll_command(rs->pb, &cmd) == MOQ_OK) {
+    while (moq_playback_poll_command(rs->pb, &cmd, sizeof(cmd)) == MOQ_OK) {
         trace_cmd(&rs->trace, &cmd);
         moq_playback_cmd_cleanup(&cmd);
     }
     moq_playback_event_t evt;
-    while (moq_playback_poll_event(rs->pb, &evt) == MOQ_OK)
+    while (moq_playback_poll_event(rs->pb, &evt, sizeof(evt)) == MOQ_OK)
         trace_evt(&rs->trace, &evt);
 }
 
@@ -518,7 +518,7 @@ static int fixed_scenarios(void)
 
         moq_playback_cmd_t cmd;
         bool got_decode = false;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK) {
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK) {
             if (cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO) {
                 FCHECK(cmd.u.decode_video.group_id == 500);
                 FCHECK(cmd.u.decode_video.object_id == 3);
@@ -529,7 +529,7 @@ static int fixed_scenarios(void)
         FCHECK(got_decode);
 
         moq_playback_event_t evt;
-        while (moq_playback_poll_event(pb, &evt) == MOQ_OK)
+        while (moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK)
             FCHECK(evt.kind != MOQ_PLAYBACK_EVENT_GAP_DETECTED);
 
         moq_playback_destroy(pb);
@@ -569,12 +569,13 @@ static int fixed_scenarios(void)
         FCHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
         moq_playback_object_init(&obj);
         obj.track = t; obj.group_id = 1;
+        /* Arriving at 1000000, the later object starts the wait there. */
         obj.object_id = 2; obj.payload = p2; obj.properties = pr2;
-        FCHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
+        FCHECK(moq_playback_push_object(pb, &obj, 1000000) == MOQ_OK);
 
         FCHECK(moq_playback_tick(pb, 1000000) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         moq_playback_object_init(&obj);
@@ -584,14 +585,14 @@ static int fixed_scenarios(void)
         FCHECK(moq_playback_tick(pb, 1100000) == MOQ_OK);
 
         int decode_count = 0;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK) {
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK) {
             if (cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO) decode_count++;
             moq_playback_cmd_cleanup(&cmd);
         }
         FCHECK(decode_count == 2);
 
         moq_playback_event_t evt;
-        while (moq_playback_poll_event(pb, &evt) == MOQ_OK)
+        while (moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK)
             FCHECK(evt.kind != MOQ_PLAYBACK_EVENT_GAP_DETECTED);
 
         moq_rcbuf_decref(p0); moq_rcbuf_decref(p1); moq_rcbuf_decref(p2);
@@ -636,13 +637,13 @@ static int fixed_scenarios(void)
 
         FCHECK(moq_playback_tick(pb, 0) == MOQ_OK);
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK)
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK)
             moq_playback_cmd_cleanup(&cmd);
 
         FCHECK(moq_playback_tick(pb, 200000) == MOQ_OK);
         bool got_gap = false, got_partial = false;
         moq_playback_event_t evt;
-        while (moq_playback_poll_event(pb, &evt) == MOQ_OK) {
+        while (moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK) {
             if (evt.kind == MOQ_PLAYBACK_EVENT_GAP_DETECTED) got_gap = true;
             if (evt.kind == MOQ_PLAYBACK_EVENT_PARTIAL_GROUP_ABANDONED)
                 got_partial = true;
@@ -660,14 +661,14 @@ static int fixed_scenarios(void)
         FCHECK(moq_playback_tick(pb, 300000) == MOQ_OK);
 
         bool got_reset = false, got_decode = false;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK) {
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK) {
             if (cmd.kind == MOQ_PLAYBACK_CMD_RESET) got_reset = true;
             if (cmd.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO) got_decode = true;
             moq_playback_cmd_cleanup(&cmd);
         }
         FCHECK(got_reset);
         FCHECK(got_decode);
-        while (moq_playback_poll_event(pb, &evt) == MOQ_OK) (void)0;
+        while (moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK) (void)0;
 
         moq_rcbuf_decref(p0); moq_rcbuf_decref(p2); moq_rcbuf_decref(pk);
         moq_rcbuf_decref(pr0); moq_rcbuf_decref(pr2); moq_rcbuf_decref(pr_kf);
@@ -710,7 +711,7 @@ static int fixed_scenarios(void)
 
         moq_playback_cmd_t cmd;
         bool got_configure = false, got_cmaf = false;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK) {
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK) {
             if (cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO)
                 got_configure = true;
             if (cmd.kind == MOQ_PLAYBACK_CMD_DECODE_CMAF) {
@@ -725,7 +726,7 @@ static int fixed_scenarios(void)
         FCHECK(got_cmaf);
 
         moq_playback_event_t evt;
-        while (moq_playback_poll_event(pb, &evt) == MOQ_OK) (void)0;
+        while (moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK) (void)0;
 
         moq_playback_destroy(pb);
         FCHECK(sa.balance == 0);
@@ -781,7 +782,7 @@ static int fixed_scenarios(void)
 
         bool got_audio_cfg = false, got_audio_dec = false;
         moq_playback_cmd_t cmd;
-        while (moq_playback_poll_command(pb, &cmd) == MOQ_OK) {
+        while (moq_playback_poll_command(pb, &cmd, sizeof(cmd)) == MOQ_OK) {
             if (cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_AUDIO) got_audio_cfg = true;
             if (cmd.kind == MOQ_PLAYBACK_CMD_DECODE_AUDIO) got_audio_dec = true;
             FCHECK(cmd.kind != MOQ_PLAYBACK_CMD_DECODE_VIDEO);
@@ -791,7 +792,7 @@ static int fixed_scenarios(void)
         FCHECK(got_audio_dec);
 
         moq_playback_event_t evt;
-        while (moq_playback_poll_event(pb, &evt) == MOQ_OK) (void)0;
+        while (moq_playback_poll_event(pb, &evt, sizeof(evt)) == MOQ_OK) (void)0;
 
         moq_playback_destroy(pb);
         FCHECK(sa.balance == 0);

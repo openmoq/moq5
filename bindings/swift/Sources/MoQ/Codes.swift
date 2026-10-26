@@ -183,6 +183,39 @@ public struct NamespaceSubscriptionTerminatedInfo: Sendable, Hashable {
     public let streamErrorCode: UInt64
 }
 
+/// Why a locally opened subgroup was reset asynchronously. Unknown native
+/// causes keep their value; this never means the whole request ended.
+public enum OutgoingSubgroupTerminalCause: Sendable, Hashable {
+    case none
+    case peerStopSending
+    case deliveryTimeout
+    case unknown(UInt32)
+
+    internal init(_ value: UInt32) {
+        switch value {
+        case UInt32(MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE): self = .none
+        case UInt32(MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING): self = .peerStopSending
+        case UInt32(MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT): self = .deliveryTimeout
+        default: self = .unknown(value)
+        }
+    }
+}
+
+/// Copied identity of an outgoing subgroup whose reset was committed locally.
+/// Exactly one owner is present. Handles identify the terminated generation,
+/// not necessarily a live object; no provider completion or peer ACK is implied.
+public struct OutgoingSubgroupTerminatedInfo: Sendable, Hashable {
+    public let subgroup: SubgroupHandle
+    public let subscription: Subscription?
+    public let publication: Publication?
+    public let groupID: UInt64
+    public let subgroupID: UInt64
+    public let stream: StreamRef
+    /// The exact reset code, including zero when zero was the cause's code.
+    public let errorCode: UInt64
+    public let cause: OutgoingSubgroupTerminalCause
+}
+
 // MARK: - Event field coverage
 
 /// An appended event field is read only when the producer's detail covers all

@@ -520,19 +520,42 @@ MOQ_API moq_result_t moq_endpoint_wait(moq_endpoint_t *ep, uint64_t timeout_us);
  * latched endpoint still yields MOQ_ERR_INTERRUPTED from blocking calls. */
 MOQ_API void moq_endpoint_wake(moq_endpoint_t *ep);
 
-/* Block (app thread only) until local reliable stream data has been flushed out
- * of the transport's send queues -- no stream still has queued or ready-to-send
- * bytes or an unsent FIN. Call this after writing the last objects and before
- * moq_endpoint_stop() so the abrupt stop does not truncate bytes still sitting
- * in libmoq/picoquic's stream send queues.
+/* Block (app thread only) until the output this endpoint's attached services
+ * owe has been handed to the session and the transport has flushed it. Call
+ * this after the last writes (and end_track for a finite publication) while
+ * the sender is still attached -- destroying it first discards what it still
+ * has queued -- and before moq_endpoint_stop(), so the abrupt stop does not
+ * truncate it.
  *
- * Scope of the guarantee:
- *   - It DOES mean each still-required reliable stream byte and FIN has been
+ * Scope of the guarantee, in layers:
+ *   - Services: every attached service has handed over the output it owes --
+ *     for a sender its queued END_OF_TRACK markers, objects of tracks with
+ *     demand, catalog generations, resets and other lifecycle work. NOT
+ *     owed: media retained for a track nobody has subscribed to and that
+ *     has no established publication, together with an END_OF_TRACK queued
+ *     behind that media -- both stay owned by the sender, are neither
+ *     delivered nor discarded by this, and go out (media, then END) if a
+ *     subscriber arrives. A graceful completion (moq_media_sender_complete)
+ *     waiting on such media, or on a generated timeline's records kept for
+ *     a timeline nobody has subscribed to, is held with them the same way:
+ *     its terminal catalog is owed once they have gone out. A failed
+ *     completion owes no further end and no terminal catalog; output it had
+ *     already accepted and that is still sendable stays owed. A drain
+ *     success is never proof that a broadcast completed. An accepted
+ *     publication paused at Forward 0
+ *     still owes its terminal: a drain with it held times out (MOQ_DONE)
+ *     rather than reporting success.
+ *   - Local flush: each still-required reliable stream byte and FIN has been
  *     handed to the transport for sending (local stream backlog empty).
- *   - It does NOT mean all packets were acknowledged by the peer (the QUIC
- *     packet/retransmission backlog can remain non-empty on an idle connection
- *     long after the bytes and FIN were sent).
+ *   - Transport acknowledgement, where the backend observes it: on the
+ *     picoquic backends (raw QUIC and WebTransport) the peer has also
+ *     acknowledged every stream's sent bytes, its FIN once sent, and a
+ *     RESET with its reliable prefix -- never a FIN the peer has yet to
+ *     send, and not the packet backlog, which ACK-only packets keep non-empty
+ *     on an idle connection.
  *   - It does NOT mean the peer application has consumed the media.
+ * A success is always observed after the services' output was handed over:
+ * never a transport state that predates it.
  *
  * Direct MsQuic and WTQuic-MsQuic may conservatively wait for acknowledgment
  * of non-superseded output. Accepted send cancellation or lawful peer STOP
@@ -543,8 +566,9 @@ MOQ_API void moq_endpoint_wake(moq_endpoint_t *ep);
  * reliable-stream guarantee.
  *
  * Returns:
- *   MOQ_OK              local stream flush complete: stopping will not truncate
- *                       queued stream data.
+ *   MOQ_OK              the services' owed output was handed over and flushed
+ *                       (and acknowledged, where observed): stopping will not
+ *                       truncate it.
  *   MOQ_DONE            timeout_us elapsed before the flush completed.
  *   MOQ_ERR_INTERRUPTED the interrupt latch is set.
  *   MOQ_ERR_CLOSED      the endpoint went terminal/fatal during the drain.

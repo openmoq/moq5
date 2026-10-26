@@ -95,6 +95,9 @@ public enum ExtendedEvent: Equatable {
     /// An update concluded: the peer's answer to this side's update, or this
     /// side's own refusal of a peer update.
     case namespaceUpdateResult(NamespaceUpdateResultInfo)
+    /// An outgoing subgroup's reset was committed locally. This does not
+    /// imply termination or continued liveness of its subscription/publication.
+    case outgoingSubgroupTerminated(OutgoingSubgroupTerminatedInfo)
     case unknown(UInt32)
 }
 
@@ -284,6 +287,21 @@ extension ExtendedEvent {
                 subgroupID: sf.subgroup_id,
                 endOfGroup: sf.end_of_group
             ))
+
+        case MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED:
+            if cEvent.detail_size < UInt32(MOQ_OUTGOING_SUBGROUP_TERMINATED_EVENT_V0_SIZE) {
+                result = .unknown(kind)
+            } else {
+                let d = cEvent.u.outgoing_subgroup_terminated
+                result = .outgoingSubgroupTerminated(OutgoingSubgroupTerminatedInfo(
+                    subgroup: SubgroupHandle(d.subgroup),
+                    subscription: moq_subscription_is_valid(d.sub) ? Subscription(d.sub) : nil,
+                    publication: moq_publication_is_valid(d.pub) ? Publication(d.pub) : nil,
+                    groupID: d.group_id, subgroupID: d.subgroup_id,
+                    stream: StreamRef(d.stream_ref), errorCode: d.error_code,
+                    cause: OutgoingSubgroupTerminalCause(d.cause)
+                ))
+            }
 
         case MOQ_EVENT_FILL_CREATED:
             let d = cEvent.u.fill_created

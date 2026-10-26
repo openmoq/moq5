@@ -85,7 +85,7 @@ static void rig_open_cap(rig_t *r, const moq_pub_cfg_t *pcfg, moq_version_t vers
     MOQ_TEST_CHECK(moq_pub_create(moq_simpair_server(r->pair), &r->alloc,
                                  pcfg, &r->publisher) == MOQ_OK);
     if (version == MOQ_VERSION_DRAFT_22)
-        r->admission_bytes = r->last_sizes[(r->alloc_calls - 2) % 4];
+        r->admission_bytes = r->last_sizes[(r->alloc_calls - 3) % 4];
     r->ns = MOQ_BYTES_LITERAL("publisher-fill-ownership");
     moq_pub_track_cfg_t tc;
     moq_pub_track_cfg_init_sized(&tc, sizeof(tc));
@@ -1137,7 +1137,8 @@ static void test_creation_allocations(moq_version_t version)
     moq_pub_cfg_t cfg;
     moq_pub_cfg_init_sized(&cfg, sizeof(cfg));
     rig_open_ex(&r, &cfg, version, 0);
-    unsigned allocations = version == MOQ_VERSION_DRAFT_22 ? 4 : 1;
+    /* Publisher, optional fills, admissions, FETCH owners, generic answers. */
+    unsigned allocations = version == MOQ_VERSION_DRAFT_22 ? 5 : 4;
     for (unsigned failure = 1; failure <= allocations; failure++) {
         int64_t balance = r.allocations.balance;
         r.fail_at = r.alloc_calls + failure;
@@ -1152,7 +1153,7 @@ static void test_creation_allocations(moq_version_t version)
     MOQ_TEST_CHECK(moq_pub_create(moq_simpair_server(r.pair), &r.alloc, &cfg, &pub) == MOQ_OK);
     MOQ_TEST_CHECK_EQ_INT(r.alloc_calls - calls, allocations);
     if (version == MOQ_VERSION_DRAFT_22)
-        MOQ_TEST_CHECK_EQ_INT(r.last_sizes[(r.alloc_calls - 2) % 4],
+        MOQ_TEST_CHECK_EQ_INT(r.last_sizes[(r.alloc_calls - 3) % 4],
                              80 * (sizeof(void *) == 8 ? 64 : 56));
     moq_pub_destroy(pub);
     rig_close(&r);

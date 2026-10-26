@@ -373,8 +373,8 @@ Tests: `delivery_timers`, `scheduling_order`, `group_order_default`.
 
 The transport bridge holds data for the endpoint in priority order and checks
 OBJECT_DELIVERY_TIMEOUT again before it hands an object over: an expired
-object's stream is reset with DELIVERY_TIMEOUT, a stream not yet opened is
-never opened, and the session ends the subgroup. The publisher facade then
+object's stream is reset with DELIVERY_TIMEOUT and the session ends the
+subgroup. The publisher facade then
 drops the rest of that group for the subscriber and keeps the subscription,
 as after a STOP_SENDING on one subgroup stream. Tests: `scheduling`,
 `publisher_stream_loss`.
@@ -486,6 +486,36 @@ A request naming a Track Namespace whose first field is "." or ".session"
 is refused with DOES_NOT_EXIST before the application sees it, and the
 application may not publish under one (§2.4.3, §6.5; `request_refusal`).
 
+## MoQ Cluster draft-01
+
+The [pinned cluster draft](draft-lcurley-moq-cluster-01.txt) is supported as an
+opt-in on draft-22 sessions and the reusable relay core, binding and shard
+runtime. The draft references transport draft-21; this implementation maps its
+cluster semantics onto draft-22 request streams. This adds no draft-21 wire
+profile. Draft-16, draft-18 and unnegotiated draft-22 behavior remain unchanged.
+See the [setup guide](../relay/README.md#cluster-routing),
+[API contract](../relay/docs/api.md#cluster-configuration-and-metadata) and
+[design](moq-cluster-01-design.md).
+
+Tests `cluster_wire`, `cluster_session` and `cluster_work` cover negotiation,
+metadata validation, partial updates and bounded receive work. Tests
+`relay_cluster`, `relay_cluster_shards` and `relay_cluster_mesh` cover route
+selection, source identity, backpressure, failover and delayed responses across
+shards. The nine-case mesh delivers exact catalog bytes and three progressing
+media groups through two relays, including sharded and redundant topologies.
+`pq_sim_establish` and the public `pico_wt_loopback` row exercise cluster
+negotiation and catalog/media delivery in native QUIC and WebTransport
+TLS/packet simulations. The private loopback variant excludes that cluster
+flow. These are not live socket mesh evidence.
+
+The [original implementation plan](moq-cluster-01-plan.txt) retains historical
+candidate results; those totals and baseline failures are not qualification
+results or accepted exceptions for the composed tree. Final qualification is
+reported separately against its exact source. Live socket mesh testing and
+the absent `../moq-pub` application remain unverified. Peer discovery, dialing
+and reconnect policy belong to the host; the relay command does not expose
+cluster-peer configuration.
+
 ## Known limitations
 
 Each of these is a stated limit or open decision a user can run into.
@@ -508,10 +538,18 @@ Each of these is a stated limit or open decision a user can run into.
   namespace terminals and sender-local fatal projection are implemented,
   including additive C++/Swift views. Whole-profile qualification is not
   complete; this is not whole-media-service acceptance.
-- **Publisher progress:** Bounded admission and retained-FETCH serialization
-  are implemented, including retained-FETCH rejection while the event queue is
-  full (`publisher_retained_fetch_event_credit`). A tighter bound on snapshot
-  memory is not implemented, and no broader progress guarantee is made.
+- **Publisher progress:** Every draft uses bounded FIFO event pumping with
+  fixed per-parent admission owners and one immutable retained-FETCH snapshot
+  per session FETCH slot. Each snapshot has an object-count and track byte
+  limit; its references survive cache replacement and are released on
+  completion, cancellation or local teardown. Generic refusal/status answers
+  use fixed storage bounded by the session's responder pools and retain FIFO
+  wire order. Manual callers continue dispatching after
+  `WOULD_BLOCK + CONSUMED`; flush never polls and must not be spun to OK before
+  another event is handled. Focused fixtures include
+  `publisher_retained_fetch_event_credit`, `publisher_subgroup_terminal` and
+  `publisher_response_ownership`. Whole-profile and transport qualification
+  remain incomplete; bounded storage is not an unconditional progress promise.
 - **Namespace completion:** A lawful responder FIN on an established
   namespace subscription reports its own completion cause after the remaining
   GONE observations, natively and in the C++/Swift views. Whole-profile
@@ -550,12 +588,14 @@ Each of these is a stated limit or open decision a user can run into.
   because GROUP_ORDER cannot travel on the REQUEST_UPDATE that carries the
   subscriber's choices.
 - **Transport scheduling is per stream.** Datagrams are not scheduled by
-  priority at the transport. A FETCH or fill stream carries objects of
-  several groups, so it is placed by its priorities only, and fill streams
-  take each write's priority as they did before stream keys. A FETCH whose
-  objects carry different publisher priorities takes, while several of them
-  wait at the transport, the priority of the last one handed over, not of
-  the next to go (issue #36). With
+  priority at the transport. With the stream-drained capability, a FETCH
+  retains its held objects' publisher priority until those bytes drain;
+  a different priority waits in the bridge. Draft-22 fills also retain their
+  current group and parent identity. Within a group, fills precede subgroup
+  data; between groups the parent's order applies, except that an
+  opposite-order fill yields to subscription data. Cyclic fill preferences
+  share a rank. No peer acknowledgment is required. Without the drained
+  capability, per-write reprioritization remains best effort. With
   `max_actions` below 4 the bridge keys no stream: the group order is not
   applied at the transport. An adapter that sets priorities without the
   stream-drained notice loses the order whenever its transport still holds a

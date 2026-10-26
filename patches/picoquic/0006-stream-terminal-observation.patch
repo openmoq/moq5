@@ -1,0 +1,254 @@
+Observe exact STOP and opted-in local UNI byte+FIN ACK.
+
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
+0005.
+
+Preserve callback values; append a successful send-commit event. Observation
+is per existing local UNI, opt-in before sending, and retains no payload.
+H3 forwards completion before releasing correlation; free is never success.
+A STOP_SENDING received after the FIN is sent but before every byte and the
+FIN are acknowledged is still delivered, and its signalled latch is set
+before the callback runs. A stream with a requested reset is acknowledged
+only once that reset is sent and acknowledged (and, for a reliable reset,
+its prefix).
+
+A reset accepted by picoquic_reset_stream_at wins over any later ACK: it
+withdraws the stream's opt-in, so the committed callback never follows it.
+The committed callback runs before picoquic_callback_stream_released, while
+the stream's correlation is still live. PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION
+advertises the contract.
+
+Reset after FIN comes from upstream; 0003 retains terminal refusal and
+context preservation, empty non-FIN ACK handling and reliable-prefix
+retirement. This patch preserves reset precedence over a later FIN ACK.
+
+Tests: adapters/picoquic/tests/test_pq_terminal.c in LibMoQ, with separate
+constructed-state and deterministic native packet rows.
+
+diff --git a/picohttp/h3zero_common.c b/picohttp/h3zero_common.c
+index 05443f80..9adc9f04 100644
+--- a/picohttp/h3zero_common.c
++++ b/picohttp/h3zero_common.c
+@@ -2066,6 +2066,22 @@ int h3zero_callback(picoquic_cnx_t* cnx,
+ 				}
+ 			}
+ 			break;
++		case picoquic_callback_stream_send_committed:
++			/* Look up retained correlation; a path callback may have unlinked
++			 * the native application context without releasing the H3 stream. */
++			stream_ctx = h3zero_find_stream(ctx, stream_id);
++			if (stream_ctx != NULL) {
++				if (stream_ctx->path_callback != NULL) {
++					ret = stream_ctx->path_callback(cnx, NULL, 0,
++						picohttp_callback_stream_send_committed, stream_ctx, stream_ctx->path_callback_ctx);
++				}
++				/* The callback is allowed to delete its own stream. */
++				stream_ctx = h3zero_find_stream(ctx, stream_id);
++				if (stream_ctx != NULL) {
++					h3zero_delete_stream(cnx, ctx, stream_ctx);
++				}
++			}
++			break;
+ 		case picoquic_callback_stateless_reset:
+ 		case picoquic_callback_close: /* Received connection close */
+ 		case picoquic_callback_application_close: /* Received application close */
+diff --git a/picohttp/h3zero_common.h b/picohttp/h3zero_common.h
+index 0fcfe31b..aad842c7 100644
+--- a/picohttp/h3zero_common.h
++++ b/picohttp/h3zero_common.h
+@@ -51,7 +51,11 @@ extern "C" {
+         picohttp_callback_stop_sending, /* Peer asking to reset the stream. */
+         picohttp_callback_deregister, /* Context has been deregistered */
+         picohttp_callback_free,
+-        picohttp_callback_drain /* Peer initiated graceful WebTransport drain. */
++        picohttp_callback_drain, /* Peer initiated graceful WebTransport drain. */
++        /* Opted-in local UNI: bytes+FIN acknowledged, before free. The path
++         * callback may delete this stream, but must defer deleting the H3
++         * context or recursively driving packet processing until return. */
++        picohttp_callback_stream_send_committed
+     } picohttp_call_back_event_t;
+ 
+     struct st_h3zero_callback_ctx_t;
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index a4634b28..1874a247 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -96,11 +96,13 @@ int picoquic_is_stream_acked(picoquic_stream_head_t* stream)
+     int is_acked = 0;
+ 
+     if (stream->is_closed) {
+-        if (stream->reset_sent) {
+-            /* A reliable reset also needs its prefix acknowledged. The FIN may
+-             * have closed the stream before the reset was requested, so
+-             * closure alone does not imply that. */
+-            is_acked = stream->reset_acked && picoquic_reliable_prefix_is_acked(stream);
++        if (stream->reset_requested) {
++            /* A requested reset is acknowledged only once it is sent and
++             * acknowledged; a reliable reset also needs its prefix
++             * acknowledged. The FIN may have closed the stream before the
++             * reset was requested, so closure alone does not imply that. */
++            is_acked = stream->reset_sent && stream->reset_acked &&
++                picoquic_reliable_prefix_is_acked(stream);
+         } 
+         else {
+         /* Check whether the ack was already received, including the FIN bit */
+@@ -129,6 +131,19 @@ int picoquic_delete_stream_if_closed(picoquic_cnx_t* cnx, picoquic_stream_head_t
+     if (stream->is_closed && (
+         (!IS_BIDIR_STREAM_ID(stream->stream_id) && !IS_LOCAL_STREAM_ID(stream->stream_id, cnx->client_mode)) ||
+         picoquic_is_stream_acked(stream))) {
++        if (stream->send_commit_enabled && !stream->send_commit_signalled &&
++            stream->fin_sent && !stream->reset_requested &&
++            !stream->stop_sending_received && !stream->is_discarded &&
++            cnx->cnx_state < picoquic_state_disconnecting && cnx->callback_fn != NULL) {
++            /* Latch before calling application code, while correlation is
++             * still live. The callback may close/unlink but cannot free cnx. */
++            stream->send_commit_signalled = 1;
++            if (cnx->callback_fn(cnx, stream->stream_id, NULL, 0,
++                picoquic_callback_stream_send_committed, cnx->callback_ctx,
++                stream->app_stream_ctx) != 0) {
++                picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_INTERNAL_ERROR, 0);
++            }
++        }
+         /* Notify application that the stream is fully retired and any
+          * per-stream app context tied to this stream_id can be freed.
+          * Fired only if the app took ownership (non-NULL ctx). Return
+@@ -1134,11 +1149,13 @@ const uint8_t* picoquic_decode_stop_sending_frame(picoquic_cnx_t* cnx, const uin
+         picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_STREAM_STATE_ERROR,
+             picoquic_frame_type_stop_sending);
+         bytes = NULL;
+-    } else if (!stream->stop_sending_received && !stream->reset_requested && !stream->fin_sent) {
++    } else if (!stream->stop_sending_received && !stream->reset_requested &&
++        (!stream->fin_sent || !picoquic_check_sack_list(&stream->sack_list, 0, stream->sent_offset))) {
+         stream->stop_sending_received = 1;
+         stream->remote_stop_error = error_code;
+ 
+         if (cnx->callback_fn != NULL && !stream->stop_sending_signalled) {
++            stream->stop_sending_signalled = 1;
+             if (!stream->is_discarded) {
+                 if (cnx->callback_fn(cnx, stream->stream_id, NULL, 0, picoquic_callback_stop_sending, cnx->callback_ctx, stream->app_stream_ctx) != 0) {
+                     picoquic_log_app_message(cnx, "Stop sending callback on stream %" PRIu64 " returns error 0x%x",
+@@ -1147,7 +1164,6 @@ const uint8_t* picoquic_decode_stop_sending_frame(picoquic_cnx_t* cnx, const uin
+                         picoquic_frame_type_stop_sending);
+                 }
+             }
+-            stream->stop_sending_signalled = 1;
+         }
+     } else {
+         /* The stream is already finished. Should just ignore the frame */
+diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
+index 4a11b966..aa29f5a0 100644
+--- a/picoquic/picoquic.h
++++ b/picoquic/picoquic.h
+@@ -425,7 +425,8 @@ typedef enum {
+     picoquic_callback_stream_released, /* Stream fully retired: bytes=NULL, len=0,
+                                        * stream_ctx = the app_stream_ctx the app set;
+                                        * picoquic will not call back with this stream_ctx again. */
+-    picoquic_callback_scone_indication /* Received a scone indication of the long term incoming rate */
++    picoquic_callback_scone_indication, /* Received a scone indication of the long term incoming rate */
++    picoquic_callback_stream_send_committed /* Opted-in local UNI: all bytes and FIN acknowledged. */
+ } picoquic_call_back_event_t;
+ 
+ typedef struct st_picoquic_tp_preferred_address_t {
+@@ -1852,6 +1853,30 @@ uint64_t picoquic_get_application_error(picoquic_cnx_t* cnx);
+ /* Returns the remote error for the given stream. */
+ uint64_t picoquic_get_remote_stream_error(picoquic_cnx_t* cnx, uint64_t stream_id);
+ 
++/* Exact STOP and opt-in local UNI byte+FIN acknowledgement contract. */
++#define PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION 1
++
++/* Non-advancing query, normally from the STOP callback. Returns zero only for
++ * a retained stream with a received STOP. Zero is a valid error. Invalid or
++ * absent input returns nonzero without changing *out_error. */
++int picoquic_get_remote_stop_error(picoquic_cnx_t* cnx, uint64_t stream_id,
++    uint64_t* out_error);
++
++/* Enable on an existing local unidirectional stream before transmission and
++ * before requesting FIN. An unsent protocol preamble may already be queued.
++ * No payload is retained by this observation. The committed callback occurs
++ * once, with the current application stream context, before native release.
++ * Reset, received STOP, discard or connection shutdown wins over later ACKs.
++ * Streams without opt-in receive no new callback. Repeated opt-in before
++ * sending is harmless; invalid/terminal requests fail without mutation.
++ *
++ * The callback may query, unlink its application context, reset (which will
++ * refuse this already committed stream), open another stream, or close the
++ * connection. It must defer deleting the connection/QUIC context or recursively
++ * driving packet processing until the callback returns. */
++int picoquic_enable_stream_send_commit(picoquic_cnx_t* cnx, uint64_t stream_id);
++
++
+ uint64_t picoquic_get_data_sent(picoquic_cnx_t * cnx);
+ 
+ uint64_t picoquic_get_data_received(picoquic_cnx_t * cnx);
+diff --git a/picoquic/picoquic_internal.h b/picoquic/picoquic_internal.h
+index 54c474e5..c5a81396 100644
+--- a/picoquic/picoquic_internal.h
++++ b/picoquic/picoquic_internal.h
+@@ -815,6 +815,8 @@ typedef struct st_picoquic_stream_head_t {
+     unsigned int is_not_coalesced : 1; /* do not mix data for this stream with data from other stream in same packet */
+     unsigned int is_close_check_queued : 1; /* The stream is in the connection's close check queue */
+     unsigned int is_direct_callback_active : 1; /* A direct receive callback of this stream is running */
++    unsigned int send_commit_enabled : 1;
++    unsigned int send_commit_signalled : 1;
+ } picoquic_stream_head_t;
+ 
+ #define IS_CLIENT_STREAM_ID(id) (unsigned int)(((id) & 1) == 0)
+diff --git a/picoquic/streams.c b/picoquic/streams.c
+index d1dc8e08..9e687675 100644
+--- a/picoquic/streams.c
++++ b/picoquic/streams.c
+@@ -450,6 +450,43 @@ static int picoquic_queue_reset_stream_frame(picoquic_cnx_t* cnx, picoquic_strea
+     return ret;
+ }
+ 
++int picoquic_get_remote_stop_error(picoquic_cnx_t* cnx, uint64_t stream_id,
++    uint64_t* out_error)
++{
++    picoquic_stream_head_t* stream;
++    if (cnx == NULL || out_error == NULL) {
++        return PICOQUIC_ERROR_INVALID_STREAM_ID;
++    }
++    PICOQUIC_THREAD_CHECK(cnx->quic);
++    stream = picoquic_find_stream(cnx, stream_id);
++    if (stream == NULL || !stream->stop_sending_received) {
++        return PICOQUIC_ERROR_INVALID_STREAM_ID;
++    }
++    *out_error = stream->remote_stop_error;
++    return 0;
++}
++
++int picoquic_enable_stream_send_commit(picoquic_cnx_t* cnx, uint64_t stream_id)
++{
++    picoquic_stream_head_t* stream;
++    if (cnx == NULL) {
++        return PICOQUIC_ERROR_INVALID_STREAM_ID;
++    }
++    PICOQUIC_THREAD_CHECK(cnx->quic);
++    stream = picoquic_find_stream(cnx, stream_id);
++    if (stream == NULL || IS_BIDIR_STREAM_ID(stream_id) ||
++        !IS_LOCAL_STREAM_ID(stream_id, cnx->client_mode)) {
++        return PICOQUIC_ERROR_INVALID_STREAM_ID;
++    }
++    if (stream->sent_offset != 0 || stream->fin_requested ||
++        stream->reset_requested || stream->stop_sending_received ||
++        stream->is_discarded || cnx->cnx_state >= picoquic_state_disconnecting) {
++        return PICOQUIC_ERROR_STREAM_ALREADY_CLOSED;
++    }
++    stream->send_commit_enabled = 1;
++    return 0;
++}
++
+ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+     uint64_t stream_id, uint64_t local_stream_error, uint64_t reliable_size)
+ {
+@@ -487,6 +524,10 @@ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+                 /* Only an accepted reset releases the application context. */
+                 stream->app_stream_ctx = NULL;
+                 stream->reliable_size = reliable_size;
++                /* The reset wins over any later ACK: the committed callback
++                 * never follows it, even when the ACK of every byte and the
++                 * FIN retires the stream before the reset is sent. */
++                stream->send_commit_enabled = 0;
+                 stream->local_error = local_stream_error;
+                 stream->reset_requested = 1;
+ 

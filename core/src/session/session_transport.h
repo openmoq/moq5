@@ -20,6 +20,10 @@
  */
 bool moq_session_uses_uni_control(const moq_session_t *s);
 
+/* Observing: the bound profile's stream error for cancellation at a local
+ * resource limit. Requires a fully initialized session; changes no state. */
+uint64_t moq_session_resource_limit_stream_error(const moq_session_t *s);
+
 /*
  * True when the session still needs the PEER's terminal (FIN/RESET) on this
  * bidi stream after our own send half has closed -- i.e. a peer-origin
@@ -92,6 +96,57 @@ moq_result_t moq_session_register_transport_owner(moq_session_t *s,
                                                   const void *owner);
 void moq_session_unregister_transport_owner(moq_session_t *s,
                                             const void *owner);
+
+/* Receive-entry pressure: private bridge policy, never application API.
+ * All three operations are serialized with the session. They do not advance
+ * time, run a sweep, invalidate borrows, or invoke the transport. The bridge
+ * must settle prior inbound obligations before selecting/cancelling, and
+ * retain its victim ref until rx_entry_active becomes false. A suspended
+ * sweep makes selection/cancellation WOULD_BLOCK; resume it normally first.
+ *
+ * A candidate is an admitted SUBGROUP with exactly one live subscriber-role
+ * subscription/publication binding. FETCH, fill, shared aliases, unbound or
+ * ended bindings and already-STOPPED streams are excluded. Pending delivery,
+ * peer terminal, local teardown or malformed-track work must drain first.
+ * Both priorities are the owner's/current stream's effective values, not
+ * pending update values. Larger numbers are worse; ties choose the lowest
+ * full ref (not admission age). Capacity is not part of the ranking. */
+typedef struct moq_admitted_data_candidate {
+    moq_stream_ref_t stream_ref;
+    uint8_t subscriber_priority;
+    uint8_t publisher_priority;
+} moq_admitted_data_candidate_t;
+
+/* Observing. out is required and zeroed on every failure/no-candidate result.
+ * INVAL: NULL session/out/owner or owner not registered on this session.
+ * CLOSED: session inactive. OK: one eligible candidate in out.
+ * WOULD_BLOCK: sweep suspended, or candidates exist but all owe prior work.
+ * DONE: no candidate exists. None of these outcomes mutates session state. */
+moq_result_t moq_session_worst_admitted_data(moq_session_t *s,
+    const void *owner, moq_admitted_data_candidate_t *out);
+
+/* Non-advancing transaction. INVAL: invalid/unregistered owner (checked first),
+ * absent/ineligible ref, or code other than this profile's pressure code:
+ * D16 CANCELLED (0x1), D18/D22 EXCESSIVE_LOAD (0x9). CLOSED: inactive session.
+ * WOULD_BLOCK: suspended sweep, prior work, or insufficient action/event slots.
+ * Every non-OK result leaves the session unchanged. OK queues exactly one
+ * STOP_DATA with code; a surfaced unfinished object also gets one empty
+ * OBJECT_CHUNK end with terminal STOP and error_code zero. The entry releases
+ * parser resources but retains its binding in STOPPED. Genuine terminal or
+ * positive local transport retirement counts/frees it through existing paths;
+ * owner teardown may instead release the slot into a numeric stopped record.
+ * OK does not claim recovered RX capacity or peer reset.
+ * The bridge must preserve the selected victim on ring pressure and must not
+ * invoke this operation past a retained inbound obligation for that ref. */
+moq_result_t moq_session_cancel_admitted_data(moq_session_t *s,
+    const void *owner, moq_stream_ref_t ref, uint64_t code);
+
+/* Observing exact-ref RX occupancy, including STOPPED entries. False for NULL
+ * session, invalid/unregistered owner, absent ref, or a numeric stopped record.
+ * Independent of binding/session liveness: an occupied entry is still pressure.
+ * This deliberately differs from moq_session_has_transport_stream(). */
+bool moq_session_rx_entry_active(const moq_session_t *s, const void *owner,
+                                 moq_stream_ref_t ref);
 
 /*
  * The registered owner publishes its own next deadline (has == false clears

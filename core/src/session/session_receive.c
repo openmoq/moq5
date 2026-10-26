@@ -2,6 +2,8 @@
 #include "../bridge/transport_bridge_internal.h"
 #include "../base/rcbuf_internal.h"
 
+#include <assert.h>
+
 /* -- Receive data stream pool -------------------------------------- */
 
 static int rx_find_by_ref(moq_session_t *s, moq_stream_ref_t ref)
@@ -404,6 +406,8 @@ static moq_result_t rx_fan_closure(moq_session_t *s, moq_rx_stream_t *rx,
             e.u.subgroup_reset.subgroup_id = rx->subgroup_id;
             e.u.subgroup_reset.error_code = error_code;
             e.u.subgroup_reset.end_of_group = rx->end_of_group;
+            e.u.subgroup_reset.has_last_object = rx->has_last_complete;
+            e.u.subgroup_reset.last_object_id = rx->last_complete_object_id;
         } else {
             e.kind = MOQ_EVENT_SUBGROUP_FINISHED;
             e.detail_size = (uint32_t)sizeof(moq_subgroup_finished_event_t);
@@ -412,6 +416,8 @@ static moq_result_t rx_fan_closure(moq_session_t *s, moq_rx_stream_t *rx,
             e.u.subgroup_finished.group_id = rx->group_id;
             e.u.subgroup_finished.subgroup_id = rx->subgroup_id;
             e.u.subgroup_finished.end_of_group = rx->end_of_group;
+            e.u.subgroup_finished.has_last_object = rx->has_last_complete;
+            e.u.subgroup_finished.last_object_id = rx->last_complete_object_id;
         }
         moq_result_t rc = push_event(s, &e);
         if (rc < 0) return rc;
@@ -931,6 +937,8 @@ static moq_result_t rx_emit_subgroup_reset(moq_session_t *s, int slot,
     e.u.subgroup_reset.subgroup_id = rx->subgroup_id;
     e.u.subgroup_reset.error_code = error_code;
     e.u.subgroup_reset.end_of_group = rx->end_of_group;
+    e.u.subgroup_reset.has_last_object = rx->has_last_complete;
+    e.u.subgroup_reset.last_object_id = rx->last_complete_object_id;
     moq_result_t rc = push_event(s, &e);
     if (rc < 0) {
         rx->reset_error_code = error_code;
@@ -1115,6 +1123,8 @@ static moq_result_t rx_finish_stream(moq_session_t *s, int slot)
         e.u.subgroup_finished.group_id = rx->group_id;
         e.u.subgroup_finished.subgroup_id = rx->subgroup_id;
         e.u.subgroup_finished.end_of_group = rx->end_of_group;
+        e.u.subgroup_finished.has_last_object = rx->has_last_complete;
+        e.u.subgroup_finished.last_object_id = rx->last_complete_object_id;
         moq_result_t rc = push_event(s, &e);
         if (rc < 0) {
             rx->parse_state = MOQ_RX_PENDING_FINISHED;
@@ -1129,26 +1139,20 @@ static moq_result_t rx_finish_stream(moq_session_t *s, int slot)
 
 /* -- Receive helpers ----------------------------------------------- */
 
-static moq_result_t rx_try_stop(moq_session_t *s, int slot)
+/* Queue and commit a local STOP. A refused enqueue changes nothing; callers
+ * that owe an unconditional STOP retain that debt in rx_try_stop below. */
+static moq_result_t rx_commit_stop(moq_session_t *s, int slot, uint64_t code)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
-    if (action_queue_full(s)) {
-        rx->parse_state = MOQ_RX_NEED_STOP;
-        return MOQ_ERR_WOULD_BLOCK;
-    }
     moq_action_t a;
     memset(&a, 0, sizeof(a));
     a.kind = MOQ_ACTION_STOP_DATA;
     a.detail_size = (uint32_t)sizeof(moq_stop_data_action_t);
     a.borrow_epoch = s->borrow_epoch;
     a.u.stop_data.stream_ref = rx->stream_ref;
-    a.u.stop_data.error_code =
-        (rx->binding_ended || rx->stop_cancels) ? 0x1 /* CANCELLED */ : 0;
+    a.u.stop_data.error_code = code;
     moq_result_t rc = push_action(s, &a);
-    if (rc < 0) {
-        rx->parse_state = MOQ_RX_NEED_STOP;
-        return rc;
-    }
+    if (rc < 0) return rc;
     /* The STOP is now queued: if this stream was the late response to a
      * locally-cancelled fetch, release its cancel tombstone. Doing it here (not
      * at FETCH_HEADER decode) means a deferred/retried stop still consumes it. */
@@ -1177,6 +1181,16 @@ static moq_result_t rx_try_stop(moq_session_t *s, int slot)
     rx->parse_state = MOQ_RX_STOPPED;
     if (rx->binding_ended) rx_stopped_to_record(s, slot);
     return MOQ_OK;
+}
+
+static moq_result_t rx_try_stop(moq_session_t *s, int slot)
+{
+    moq_rx_stream_t *rx = &s->rx_streams[slot];
+    uint64_t code = (rx->binding_ended || rx->stop_cancels)
+        ? 0x1 /* CANCELLED */ : 0;
+    moq_result_t rc = rx_commit_stop(s, slot, code);
+    if (rc < 0) rx->parse_state = MOQ_RX_NEED_STOP;
+    return rc;
 }
 
 /* A data stream is bound (at its header) to a subscription or publication. That
@@ -1209,6 +1223,15 @@ static bool rx_binding_alive(moq_session_t *s, const moq_rx_stream_t *rx)
  * event as the poll releases it per event); the stream's own references are
  * released once every subscription has its event. Resumable under
  * WOULD_BLOCK: a served subscription is never served twice. */
+/* The stream's current Object has been carried completely: its last
+ * byte left the parser as an event, or was consumed for a suppressed one.
+ * What a subgroup terminal reports as the stream's last Object. */
+static void rx_note_complete(moq_rx_stream_t *rx)
+{
+    rx->has_last_complete = true;
+    rx->last_complete_object_id = rx->cur_object_id;
+}
+
 static moq_result_t rx_fan_push_chunk(moq_session_t *s, int slot)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
@@ -1358,6 +1381,7 @@ static moq_result_t rx_fan_emit_object(moq_session_t *s, int slot)
         rx->cur_extensions = NULL;
     }
     rx->payload_written = 0;
+    rx_note_complete(rx);
     if (rx->pending_fin && rx->hdr_len == 0 && rx->input_len == 0)
         return rx_finish_stream(s, slot);
     rx->parse_state = MOQ_RX_AWAITING_OBJECT;
@@ -1388,6 +1412,8 @@ static moq_result_t rx_push_pending_chunk(moq_session_t *s, int slot)
             moq_rcbuf_decref(rx->cur_extensions);
             rx->cur_extensions = NULL;
         }
+        if (rx->pending_end && rx->pending_terminal == MOQ_OBJECT_TERMINAL_NORMAL)
+            rx_note_complete(rx);
         return MOQ_OK;
     }
 
@@ -1398,7 +1424,13 @@ static moq_result_t rx_push_pending_chunk(moq_session_t *s, int slot)
         if (rc < 0) return rc;
     }
 
-    if (rx->fan_shared) return rx_fan_push_chunk(s, slot);
+    if (rx->fan_shared) {
+        moq_result_t frc = rx_fan_push_chunk(s, slot);
+        if (frc >= 0 && rx->pending_end &&
+            rx->pending_terminal == MOQ_OBJECT_TERMINAL_NORMAL)
+            rx_note_complete(rx);
+        return frc;
+    }
 
     if (event_queue_full(s))
         return MOQ_ERR_WOULD_BLOCK;
@@ -1443,8 +1475,144 @@ static moq_result_t rx_push_pending_chunk(moq_session_t *s, int slot)
     rx->pending_chunk = NULL;
     if (rx->pending_begin)
         rx->cur_extensions = NULL;
+    if (rx->pending_end && rx->pending_terminal == MOQ_OBJECT_TERMINAL_NORMAL)
+        rx_note_complete(rx);
 
     return MOQ_OK;
+}
+
+/* -- Admission-pressure cancellation -------------------------------- *
+ * One single-binding subgroup only. Prior delivery/terminal work keeps its
+ * first cause, and capacity refusals never create a new STOP obligation. */
+static moq_result_t rx_pressure_eligible(const moq_session_t *s,
+                                         const moq_rx_stream_t *rx,
+                                         uint8_t *subscriber_priority)
+{
+    if (!rx->active || rx->stream_kind != MOQ_STREAM_KIND_SUBGROUP ||
+        rx->fill_bound || rx->fan_shared || moq_fetch_is_valid(rx->fetch) ||
+        rx->binding_ended || rx->parse_state == MOQ_RX_STOPPED ||
+        rx->parse_state == MOQ_RX_AWAITING_HEADER ||
+        rx->parse_state == MOQ_RX_DEFERRED_ALIAS)
+        return MOQ_ERR_INVAL;
+
+    bool has_sub = moq_subscription_is_valid(rx->sub);
+    bool has_pub = moq_publication_is_valid(rx->pub_handle);
+    if (has_sub == has_pub) return MOQ_ERR_INVAL;
+    bool teardown;
+    if (has_sub) {
+        int slot = sub_resolve_handle(s, rx->sub);
+        if (slot < 0 || s->subs[slot].role != MOQ_SUB_ROLE_SUBSCRIBER ||
+            s->subs[slot].state != MOQ_SUB_ESTABLISHED)
+            return MOQ_ERR_INVAL;
+        const moq_sub_entry_t *e = &s->subs[slot];
+        *subscriber_priority = e->subscriber_priority;
+        teardown = e->done_expired || e->mt_failing || e->update_failed ||
+                   e->cancel_pending || e->req_recv_reset ||
+                   e->rs.lifetime.cancelled || e->rs.lifetime.peer_fin_failed;
+    } else {
+        int slot = pub_resolve_handle(s, rx->pub_handle);
+        if (slot < 0 || s->publishes[slot].role != MOQ_PUB_ROLE_SUBSCRIBER ||
+            (s->publishes[slot].state != MOQ_PUB_ESTABLISHED &&
+             s->publishes[slot].state != MOQ_PUB_PENDING_SUBSCRIBER))
+            return MOQ_ERR_INVAL;
+        const moq_pub_entry_t *e = &s->publishes[slot];
+        *subscriber_priority = e->subscriber_priority;
+        teardown = e->done_expired || e->mt_failing || e->update_failed ||
+                   e->handoff_fin_pending || e->rs.lifetime.cancelled ||
+                   e->rs.lifetime.peer_fin_failed;
+    }
+    if (teardown || rx->stop_cancels || rx->pending_fin || rx->reset_owed ||
+        session_alias_failing(s, rx->track_alias))
+        return MOQ_ERR_WOULD_BLOCK;
+    switch (rx->parse_state) {
+    case MOQ_RX_PENDING_FINISHED:
+    case MOQ_RX_PENDING_RESET:
+    case MOQ_RX_NEED_STOP:
+    case MOQ_RX_PENDING_EMIT:
+    case MOQ_RX_PENDING_CHUNK:
+        return MOQ_ERR_WOULD_BLOCK;
+    case MOQ_RX_AWAITING_OBJECT:
+    case MOQ_RX_READING_PAYLOAD:
+    case MOQ_RX_STREAMING_PAYLOAD:
+        return MOQ_OK;
+    default:
+        return MOQ_ERR_INVAL;
+    }
+}
+
+moq_result_t moq_session_worst_admitted_data(moq_session_t *s,
+    const void *owner, moq_admitted_data_candidate_t *out)
+{
+    if (out) memset(out, 0, sizeof(*out));
+    if (!s || !owner || s->transport_owner != owner || !out)
+        return MOQ_ERR_INVAL;
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    if (s->sweep_active) return MOQ_ERR_WOULD_BLOCK;
+    bool found = false, blocked = false;
+    for (int32_t i = s->rx_occ_head; i >= 0; i = s->rx_streams[i].occ_next) {
+        const moq_rx_stream_t *rx = &s->rx_streams[i];
+        uint8_t sub_priority = 0;
+        moq_result_t rc = rx_pressure_eligible(s, rx, &sub_priority);
+        if (rc == MOQ_ERR_WOULD_BLOCK) blocked = true;
+        if (rc != MOQ_OK) continue;
+        uint8_t pub_priority = rx_object_priority(s, rx);
+        if (!found || sub_priority > out->subscriber_priority ||
+            (sub_priority == out->subscriber_priority &&
+             (pub_priority > out->publisher_priority ||
+              (pub_priority == out->publisher_priority &&
+               rx->stream_ref._v < out->stream_ref._v)))) {
+            out->stream_ref = rx->stream_ref;
+            out->subscriber_priority = sub_priority;
+            out->publisher_priority = pub_priority;
+            found = true;
+        }
+    }
+    return found ? MOQ_OK : blocked ? MOQ_ERR_WOULD_BLOCK : MOQ_DONE;
+}
+
+moq_result_t moq_session_cancel_admitted_data(moq_session_t *s,
+    const void *owner, moq_stream_ref_t ref, uint64_t code)
+{
+    if (!s || !owner || s->transport_owner != owner) return MOQ_ERR_INVAL;
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    uint64_t expected_code = s->profile->resource_limit_stream_error;
+    if (code != expected_code) return MOQ_ERR_INVAL;
+    int slot = rx_find_by_ref(s, ref);
+    if (slot < 0) return MOQ_ERR_INVAL;
+    moq_rx_stream_t *rx = &s->rx_streams[slot];
+    uint8_t sub_priority = 0;
+    moq_result_t rc = rx_pressure_eligible(s, rx, &sub_priority);
+    if (rc != MOQ_OK) return rc;
+    if (s->sweep_active) return MOQ_ERR_WOULD_BLOCK;
+    bool close_object = rx->parse_state == MOQ_RX_STREAMING_PAYLOAD &&
+                        !rx->suppress_cur_object;
+    if (action_queue_full(s) || (close_object && event_queue_full(s)))
+        return MOQ_ERR_WOULD_BLOCK;
+
+    /* Both rings are reserved on this serialized drive. Eligibility ruled
+     * out fanout, verdict changes and pending chunks; the empty terminal
+     * allocates nothing and cannot block. STOP never claims a peer code. */
+    if (close_object) {
+        assert(rx->pending_chunk == NULL);
+        rx->pending_begin = false;
+        rx->pending_end = true;
+        rx->pending_terminal = MOQ_OBJECT_TERMINAL_STOP;
+        rx->pending_reset_code = 0;
+        rx->pending_data_len = 0;
+        rx->pending_from_input = false;
+        rc = rx_push_pending_chunk(s, slot);
+        assert(rc == MOQ_OK);
+        if (rc != MOQ_OK) return rc;
+    }
+    return rx_commit_stop(s, slot, code);
+}
+
+bool moq_session_rx_entry_active(const moq_session_t *s, const void *owner,
+                                 moq_stream_ref_t ref)
+{
+    if (!s || !owner || s->transport_owner != owner) return false;
+    int slot = moq_index_find(s->idx_rx_by_ref, s->idx_rx_mask, ref._v);
+    return slot >= 0 && s->rx_streams[slot].active;
 }
 
 static moq_result_t rx_emit_chunk(moq_session_t *s, int slot,
@@ -1573,6 +1741,7 @@ static moq_result_t rx_emit_object(moq_session_t *s, int slot)
             rx->cur_extensions = NULL;
         }
         rx->payload_written = 0;
+        rx_note_complete(rx);
         if (rx->pending_fin && rx->hdr_len == 0 && rx->input_len == 0)
             return rx_finish_stream(s, slot);
         rx->parse_state = MOQ_RX_AWAITING_OBJECT;
@@ -1639,6 +1808,7 @@ static moq_result_t rx_emit_object(moq_session_t *s, int slot)
     rx->payload_rcbuf = NULL;
     rx->payload_buf = NULL;
     rx->payload_written = 0;
+    rx_note_complete(rx);
 
     /* (Received-object history is fed at object ADMISSION in the header-parse
      * loop, before delivery -- see the track_hist_merge there -- so both the

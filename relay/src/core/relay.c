@@ -229,8 +229,21 @@ typedef struct r_trie_node {
     bool      has_announce;
     uint32_t  ann_binding;      /* binding slot                            */
     uint32_t  ann_binding_gen;
+    uint32_t  cluster_route_index; /* exact projected route, including mirrors */
     uint64_t  session_cookie;   /* peer wire announce handle; 0 for mirrors */
 } r_trie_node_t;
+
+typedef struct r_cluster_route {
+    bool used;
+    bool mirrored;
+    bool inherited_warm;
+    bool warm_notified;
+    uint32_t mirror_source_index;
+    moqr_cluster_advertisement_id_t original;
+    uint32_t node, binding, binding_gen, hop_count;
+    uint64_t session_cookie, lifetime, arrival;
+    uint64_t seed_cost, cost, source_peer_hop_id, source_correlation_id;
+} r_cluster_route_t;
 
 typedef struct r_ns_sub {
     bool      used;
@@ -276,6 +289,11 @@ typedef struct r_track {
     uint32_t        src_ann_node;
     uint32_t        src_ann_binding;
     uint32_t        src_ann_binding_gen;
+    uint64_t        cluster_route_lifetime;
+    uint64_t        cluster_origin;
+    uint64_t        cluster_requester_hop, cluster_requester_correlation;
+    bool            cluster_group_floor_set;
+    uint64_t        cluster_group_floor;
     uint64_t        upstream_cookie;
     bool            has_largest;
     uint32_t        fetch_count;      /* live fetch cursors reading it     */
@@ -331,6 +349,7 @@ typedef struct r_sub {
     uint32_t      gen;            /* odd = live                            */
     uint32_t      binding;
     uint32_t      binding_gen;
+    uint64_t      cluster_requester_hop, cluster_requester_correlation;
     uint32_t      sub_next;       /* per-binding sub list (R_SUB_NIL = end) */
     uint32_t      sub_prev;
     uint32_t      track;
@@ -539,6 +558,8 @@ typedef struct r_binding {
                                    * while this is 0: no begun object anywhere on
                                    * the binding => nothing to reset.           */
     uint64_t cookie;
+    bool     cluster_negotiated;
+    uint64_t peer_hop_id, relay_cost, correlation_id;
     bool     metadata_managed;
     bool     out_active;          /* one outstanding delivery              */
     bool     out_chunked;         /* outstanding delivery is a chunked rec */
@@ -592,6 +613,7 @@ typedef struct r_fetch {
     uint32_t gen;                 /* odd = live                            */
     uint32_t binding;
     uint32_t binding_gen;
+    uint64_t cluster_requester_hop, cluster_requester_correlation;
     uint32_t track;
     uint32_t track_gen_slot;      /* track pool gen at open (identity guard) */
     uint64_t cookie;              /* caller correlation                    */
@@ -690,6 +712,13 @@ struct moqr_core {
     r_rtok_t      *rtoks;
     uint32_t       max_rtoks;
 
+    bool cluster_enabled;
+    uint64_t cluster_hop_id, cluster_sequence;
+    uint32_t max_cluster_routes, max_cluster_hops;
+    r_cluster_route_t *cluster_routes;
+    uint64_t *cluster_hops;
+    moqr_cluster_advertisement_id_t cluster_forced;
+
     moqr_intent_t *intents;      /* ring                                   */
     uint32_t       intent_head;
     uint32_t       intent_count;
@@ -734,6 +763,14 @@ struct moqr_core {
     uint64_t   fetch_pin_cap;            /* total pinnable payload bytes;
                                           * floored >= per-track log max_bytes */
     uint64_t   fetch_pin_used;
+
+#ifdef MOQR_CORE_TESTING
+    /* moqr_core_debug_hold_binding_close: the binding closes still to refuse
+     * before any effect, how many were refused, and the cookie of the last. */
+    uint32_t   dbg_close_hold;
+    uint32_t   dbg_close_held;
+    uint64_t   dbg_close_held_cookie;
+#endif
 };
 
 /* -- small helpers ------------------------------------------------------------- */
@@ -1105,6 +1142,24 @@ sub_resolve(moqr_core_t *c, moqr_sub_t h, uint32_t *out_slot)
     return &c->subs[slot];
 }
 
+static uint32_t cluster_failover_node(moqr_core_t *c, moqr_ns_t ns,
+    const r_track_t *track, uint32_t excluded, uint32_t excluded_gen,
+    uint64_t excluded_lifetime);
+static void cluster_reparent_sweep(moqr_core_t *c);
+static uint32_t cluster_track_lookup(moqr_core_t *c, moqr_ns_t ns,
+    moq_bytes_t name, uint32_t requester, uint32_t requester_gen,
+    uint64_t *hash_out);
+static uint32_t cluster_best_at(const moqr_core_t *c, uint32_t node,
+    uint32_t requester, uint32_t requester_gen, uint32_t excluded, uint32_t excluded_gen);
+static uint32_t cluster_select_node(moqr_core_t *c, moqr_ns_t ns,
+    uint32_t requester, uint32_t requester_gen);
+static moqr_result_t cluster_unannounce(moqr_core_t *c, uint32_t bslot,
+    uint32_t bgen, uint32_t node, uint64_t lifetime);
+static bool cluster_track_eligible(const moqr_core_t *c, const r_track_t *t,
+    uint32_t requester, uint32_t requester_gen);
+static void cluster_pin_track(moqr_core_t *c, r_track_t *t);
+static void cluster_warm_flush(moqr_core_t *c);
+
 /* -- intents ---------------------------------------------------------------------- */
 
 static bool
@@ -1155,6 +1210,7 @@ moqr_core_poll_intents(moqr_core_t *c, moqr_intent_t *out, size_t cap)
     if (c == NULL || out == NULL || cap == 0) {
         return 0;
     }
+    cluster_warm_flush(c);
     size_t n = c->intent_count < cap ? c->intent_count : cap;
     for (size_t i = 0; i < n; i++) {
         out[i] = c->intents[(c->intent_head + i) % c->max_intents];
@@ -1208,8 +1264,62 @@ r_rtok_slots(uint32_t max_ns_subs, uint32_t max_ns_nodes)
     return n > UINT32_MAX ? UINT32_MAX : (uint32_t)n;
 }
 
+static moqr_result_t core_create_cluster(const moqr_core_relay_cfg_t *cfg,
+    const moqr_cluster_cfg_t *cluster, moqr_core_t **out);
+
 moqr_result_t
 moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
+{
+    return core_create_cluster(cfg, NULL, out);
+}
+
+void
+moqr_cluster_cfg_init_sized(moqr_cluster_cfg_t *cfg, size_t size)
+{
+    if (cfg == NULL || size < sizeof(uint32_t)) return;
+    moqr_cluster_cfg_t value = {0};
+    moqr_cluster_write(cfg, size, &value, sizeof(value));
+}
+
+moq_result_t
+moqr_cluster_cfg_resolve(const moqr_cluster_cfg_t *cfg, moqr_cluster_info_t *out,
+                          size_t out_size)
+{
+    if (out == NULL || out_size < MOQR_CLUSTER_INFO_V0_SIZE) return MOQ_ERR_INVAL;
+    moqr_cluster_cfg_t input = {0};
+    if (cfg != NULL && !moqr_cluster_read(cfg, MOQR_CLUSTER_CFG_V0_SIZE,
+                                         &input, sizeof(input))) return MOQ_ERR_INVAL;
+    moqr_cluster_info_t value = {0};
+    value.enabled = input.enabled;
+    if (value.enabled) {
+        value.local_hop_id = input.local_hop_id;
+        value.max_routes = input.max_routes ? input.max_routes : 256u;
+        value.max_hops = input.max_hops ? input.max_hops : 32u;
+        if ((uint64_t)value.max_routes * value.max_hops > SIZE_MAX / sizeof(uint64_t))
+            return MOQ_ERR_INVAL;
+#if SIZE_MAX < UINT64_MAX
+        if ((uint64_t)value.max_routes > SIZE_MAX / sizeof(r_cluster_route_t))
+            return MOQ_ERR_INVAL;
+#endif
+    }
+    moqr_cluster_write(out, out_size, &value, sizeof(value));
+    return MOQ_OK;
+}
+
+moq_result_t
+moqr_core_create_cluster(const moqr_core_relay_cfg_t *cfg,
+    const moqr_cluster_cfg_t *cluster, moqr_core_t **out)
+{
+    if (out == NULL) return MOQ_ERR_INVAL;
+    moqr_core_t *created = NULL;
+    moqr_result_t rc = core_create_cluster(cfg, cluster, &created);
+    if (rc == MOQR_OK) *out = created;
+    return moqr_result_public(rc);
+}
+
+static moqr_result_t
+core_create_cluster(const moqr_core_relay_cfg_t *cfg,
+    const moqr_cluster_cfg_t *cluster, moqr_core_t **out)
 {
     if (out == NULL) {
         return MOQR_ERR_INVAL;
@@ -1218,6 +1328,9 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
     if (cfg == NULL || cfg->struct_size < sizeof(uint32_t)) {
         return MOQR_ERR_INVAL;
     }
+    moqr_cluster_info_t cluster_resolved;
+    if (moqr_cluster_cfg_resolve(cluster, &cluster_resolved, sizeof(cluster_resolved)) != MOQ_OK)
+        return MOQR_ERR_INVAL;
     const moq_alloc_t *a = RELAY_CFG_HAS(cfg, alloc) ? cfg->alloc : NULL;
     if (a == NULL || a->alloc == NULL || a->free == NULL) {
         return MOQR_ERR_INVAL;
@@ -1276,6 +1389,15 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
     c->max_fetches = lim.max_fetches;
     c->max_cancels = lim.max_cancels;
     c->fetch_pin_cap = lim.fetch_pin_bytes;
+    c->cluster_enabled = cluster_resolved.enabled;
+    c->cluster_hop_id = cluster_resolved.local_hop_id;
+    c->max_cluster_routes = cluster_resolved.max_routes;
+    c->max_cluster_hops = cluster_resolved.max_hops;
+    if (c->cluster_enabled) {
+        uint64_t atomic = (uint64_t)c->max_subs + 2u * (uint64_t)c->max_tracks + c->max_ns_subs;
+        if (atomic > UINT32_MAX) { moqr_core_destroy(c); return MOQR_ERR_INVAL; }
+        if (c->max_intents < atomic) c->max_intents = (uint32_t)atomic;
+    }
     /* The intent-ring atomicity clamp is folded into
      * moqr_core_limits_resolve (single source with the capacity describes);
      * lim.max_intents above already carries it. */
@@ -1351,6 +1473,10 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
             memset(c->field, 0, (size_t)n_ * sizeof(*c->field));          \
         }                                                                 \
     } while (0)
+    if (c->cluster_enabled) {
+        R_POOL_ALLOC(cluster_routes, c->max_cluster_routes);
+        R_POOL_ALLOC(cluster_hops, (uint64_t)c->max_cluster_routes * c->max_cluster_hops);
+    }
     R_POOL_ALLOC(bindings, c->max_bindings);
     R_POOL_ALLOC(tracks, c->max_tracks);
     R_POOL_ALLOC(subs, c->max_subs);
@@ -1375,7 +1501,8 @@ moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
             memset(c->ready_words, 0, rw);
         }
     }
-    if (c->bindings == NULL || c->tracks == NULL || c->subs == NULL ||
+    if ((c->cluster_enabled && (c->cluster_routes == NULL || c->cluster_hops == NULL)) ||
+        c->bindings == NULL || c->tracks == NULL || c->subs == NULL ||
         c->ready_words == NULL ||
         c->nodes == NULL || c->ns_subs == NULL || c->intents == NULL ||
         c->tsubs == NULL || c->offers == NULL || c->rtoks == NULL ||
@@ -1414,6 +1541,10 @@ moqr_core_destroy(moqr_core_t *c)
         return;
     }
     moq_alloc_t a = c->alloc;
+    r_free(c, c->cluster_routes, (size_t)c->max_cluster_routes * sizeof(*c->cluster_routes));
+    r_free(c, c->cluster_hops, (size_t)c->max_cluster_routes * c->max_cluster_hops * sizeof(uint64_t));
+    c->cluster_routes = NULL;
+    c->cluster_hops = NULL;
     if (c->tracks != NULL) {
         for (uint32_t i = 0; i < c->max_tracks; i++) {
             if ((c->tracks[i].gen & 1u) != 0) {
@@ -1820,6 +1951,12 @@ trie_node_free(moqr_core_t *c, uint32_t n)
         }
         if (mv->src_refs != 0) {
             track_src_rewrite(c, last, n);
+        }
+    }
+    if (c->cluster_enabled && n != last) {
+        for (uint32_t ri = 0; ri < c->max_cluster_routes; ri++) {
+            if (c->cluster_routes[ri].used && c->cluster_routes[ri].node == last)
+                c->cluster_routes[ri].node = n;
         }
     }
     memset(&c->nodes[last], 0, sizeof(c->nodes[last]));
@@ -2268,6 +2405,10 @@ track_replace_retained_generation(moqr_core_t *c, uint32_t slot,
     t->has_largest = false;
     t->largest_group = 0;
     t->largest_object = 0;
+    t->cluster_group_floor_set = false;
+    t->cluster_group_floor = 0;
+    t->cluster_requester_hop = 0;
+    t->cluster_requester_correlation = 0;
     t->linger_deadline_us = 0;
     t->gen = r_gen_renew(t->gen);   /* keep the slot, stale old readers/handles */
     r_bump_route_epoch(c);
@@ -3212,6 +3353,7 @@ moqr_core_binding_open_with_options(moqr_core_t *c, uint64_t session_cookie,
             b->pin_chunks_cap = pin_chunks_cap;
             b->gen = gen;
             b->cookie = session_cookie;
+            b->relay_cost = 1;
             b->metadata_managed = options != NULL &&
                 (options->flags & MOQR_BINDING_TRACK_METADATA_MANAGED) != 0;
             b->subs_head = R_SUB_NIL;   /* empty (memset left it 0) */
@@ -3487,7 +3629,8 @@ trie_longest_announce_excluding(const moqr_core_t *c, moqr_ns_t ns,
  * upstream identity). *retargeted reports which arm ran. */
 static moqr_result_t
 track_source_failover(moqr_core_t *c, uint32_t tslot, uint32_t excl_bslot,
-                      uint32_t excl_bgen, uint64_t now_us, bool *retargeted)
+                      uint32_t excl_bgen, uint64_t excluded_lifetime,
+                      uint64_t now_us, bool *retargeted)
 {
     r_track_t *t = &c->tracks[tslot];
     moq_bytes_t parts[32];
@@ -3500,12 +3643,41 @@ track_source_failover(moqr_core_t *c, uint32_t tslot, uint32_t excl_bslot,
     }
     ns.count = count < 32 ? count : 32;
 
-    uint32_t pub_node =
-        trie_longest_announce_excluding(c, ns, excl_bslot, excl_bgen);
+    uint32_t pub_node = c->cluster_enabled
+        ? cluster_failover_node(c, ns, t, excl_bslot, excl_bgen, excluded_lifetime)
+        : trie_longest_announce_excluding(c, ns, excl_bslot, excl_bgen);
 
     if (pub_node != UINT32_MAX) {
         if (!intent_space(c, 1)) {
             return MOQR_ERR_WOULD_BLOCK;
+        }
+        if (c->cluster_enabled) {
+            t->cluster_group_floor_set = t->has_largest;
+            t->cluster_group_floor = t->largest_group;
+            moqr_reset_desc_t reset;
+            if (moqr_reset_desc_local(MOQR_RESET_CANCELLED, &reset) == MOQR_OK) {
+                /* Every retained group belongs to the released source. Its
+                 * delayed chunks/terminals cannot touch the replacement, so
+                 * finish all old partials and unsealed streams right here. */
+                uint32_t groups = moqr_log_group_count(t->log);
+                for (uint32_t gi = 0; gi < groups; gi++) {
+                    uint64_t group = moqr_log_group_id_at(t->log, gi);
+                    (void)moqr_log_abandon_group_open(t->log, group, reset, NULL);
+                    uint32_t lists = moqr_log_group_list_count(t->log, group);
+                    for (uint32_t li = 0; li < lists; li++) {
+                        moqr_record_view_t rec;
+                        uint64_t subgroup;
+                        if (!moqr_log_subgroup_sealed(t->log, group, li, &subgroup) &&
+                            moqr_log_read_rec(t->log, group, li, 0, &rec) == MOQR_OK)
+                            (void)moqr_log_reset_subgroup(t->log, group, rec.subgroup_id, reset);
+                    }
+                }
+                ready_mark_track(c, tslot);
+            }
+            for (uint32_t fi = 0; fi < c->max_fetches; fi++) {
+                if ((c->fetches[fi].gen & 1u) != 0 && c->fetches[fi].track == tslot &&
+                    c->fetches[fi].track_gen_slot == t->gen) fetch_retire(c, &c->fetches[fi]);
+            }
         }
         t->state = R_TRACK_PENDING;
         t->source_kind = R_TRACK_SOURCE_PULL;
@@ -3516,6 +3688,7 @@ track_source_failover(moqr_core_t *c, uint32_t tslot, uint32_t excl_bslot,
         track_src_set(c, t, pub_node);
         t->src_ann_binding = c->nodes[pub_node].ann_binding;
         t->src_ann_binding_gen = c->nodes[pub_node].ann_binding_gen;
+        cluster_pin_track(c, t);
         moqr_intent_t *up = intent_push(c, MOQR_INTENT_UPSTREAM_SUBSCRIBE);
         t->metadata_managed = t->metadata_managed ||
             c->bindings[t->up_binding].metadata_managed;
@@ -3553,6 +3726,12 @@ track_source_failover(moqr_core_t *c, uint32_t tslot, uint32_t excl_bslot,
         it->pd = core_local_done(MOQR_PD_TRACK_ENDED);
         sub_retire(c, i, now_us);
     }
+    if (c->cluster_enabled) {
+        for (uint32_t fi = 0; fi < c->max_fetches; fi++) {
+            if ((c->fetches[fi].gen & 1u) != 0 && c->fetches[fi].track == tslot &&
+                c->fetches[fi].track_gen_slot == t->gen) fetch_retire(c, &c->fetches[fi]);
+        }
+    }
     return MOQR_OK;
 }
 
@@ -3567,6 +3746,14 @@ moqr_core_binding_close(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us)
     if (b == NULL) {
         return MOQR_ERR_STALE_HANDLE;
     }
+#ifdef MOQR_CORE_TESTING
+    if (c->dbg_close_hold > 0) {
+        c->dbg_close_hold--;
+        c->dbg_close_held++;
+        c->dbg_close_held_cookie = b->cookie;
+        return MOQR_ERR_WOULD_BLOCK;   /* before any effect */
+    }
+#endif
 
     /* Resumable close. The atomic worst case (parked-sub rejects +
      * per-announce NS_GONE fan-out over possibly many announced namespaces)
@@ -3609,7 +3796,7 @@ moqr_core_binding_close(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us)
              * one thing this close may NOT do is strand it silently */
             bool retargeted = false;
             moqr_result_t frc =
-                track_source_failover(c, i, bslot, b->gen, now_us,
+                track_source_failover(c, i, bslot, b->gen, 0, now_us,
                                       &retargeted);
             if (frc == MOQR_ERR_WOULD_BLOCK) {
                 return MOQR_ERR_WOULD_BLOCK;   /* partial; retry */
@@ -3629,6 +3816,16 @@ moqr_core_binding_close(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us)
         if (ls.record_count == 0 && track_sub_count(c, i) == 0 &&
             track_fetch_count(c, i) == 0) {
             track_free_slot(c, i);
+        }
+    }
+
+    if (c->cluster_enabled) {
+        for (uint32_t ri = 0; ri < c->max_cluster_routes; ri++) {
+            r_cluster_route_t *rr = &c->cluster_routes[ri];
+            if (rr->used && rr->binding == bslot && rr->binding_gen == b->gen) {
+                moqr_result_t crc = cluster_unannounce(c, bslot, b->gen, rr->node, rr->lifetime);
+                if (crc != MOQR_OK) return crc;
+            }
         }
     }
 
@@ -3743,11 +3940,19 @@ announce_need(const moqr_core_t *c, moqr_ns_t ns, uint32_t *deep,
     }
 }
 
+#include "cluster_routes.h"
+
 moqr_result_t
 moqr_core_announce_room(const moqr_core_t *c, moqr_ns_t ns)
 {
     if (c == NULL || !ns_view_ok(ns, 0)) {
         return MOQR_ERR_INVAL;
+    }
+    if (c->cluster_enabled) {
+        bool free_route = false;
+        for (uint32_t ri = 0; ri < c->max_cluster_routes; ri++)
+            if (!c->cluster_routes[ri].used) { free_route = true; break; }
+        if (!free_route) return MOQR_ERR_CAPACITY;
     }
     uint32_t deep = 0, missing = 0;
     uint64_t missing_bytes = 0;
@@ -3772,6 +3977,8 @@ moqr_core_announce_ex(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
     if (c == NULL || !ns_view_ok(ns, 0)) {
         return MOQR_ERR_INVAL;
     }
+    if (c->cluster_enabled)
+        return moqr_result_legacy(moqr_core_announce_cluster(c, bh, ns, session_cookie, NULL, false));
     uint32_t bslot = 0;
     r_binding_t *b = binding_resolve(c, bh, &bslot);
     if (b == NULL) {
@@ -3869,6 +4076,8 @@ moqr_core_unannounce(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns)
         return MOQR_ERR_STALE_HANDLE;
     }
     uint32_t node = trie_walk(c, ns);
+    if (c->cluster_enabled)
+        return cluster_unannounce(c, bslot, b->gen, node, 0);
     if (node == UINT32_MAX || !c->nodes[node].has_announce ||
         c->nodes[node].ann_binding != bslot ||
         c->nodes[node].ann_binding_gen != b->gen) {
@@ -4106,6 +4315,13 @@ moqr_core_force_withdraw(moqr_core_t *c, moqr_ns_t ns, uint64_t request_error,
     }
 
     /* Clear the announce (bypass the owner check) + NS_GONE fan-out. */
+    if (c->cluster_enabled) {
+        for (uint32_t ri = 0; ri < c->max_cluster_routes; ri++) {
+            r_cluster_route_t *r = &c->cluster_routes[ri];
+            if (r->used && r->node == node && r->binding == ann_bslot &&
+                r->binding_gen == ann_bgen) r->used = false;
+        }
+    }
     c->nodes[node].has_announce = false;
     r_room_changed(c);
     r_bump_route_epoch(c);
@@ -4121,6 +4337,9 @@ moqr_core_force_withdraw(moqr_core_t *c, moqr_ns_t ns, uint64_t request_error,
         intent_set_ns_from_node(c, it, node);
         it->value = key_rd32(c->ns_subs[si].prefix);
     }
+
+    if (c->cluster_enabled)
+        cluster_project(c, node, cluster_best_at(c, node, UINT32_MAX, 0, UINT32_MAX, 0));
 
     /* Wire-cancel the publisher (unless already pending) + retire its live grant. */
     if (need_cancel) {
@@ -4774,7 +4993,8 @@ moqr_core_next_discovery(moqr_core_t *c, moqr_binding_t bh, moqr_discovery_t *ou
         }
         for (uint32_t k = 0; k < c->max_tracks; k++) {
             const r_track_t *t = &c->tracks[k];
-            if (!track_offerable(t, bslot, b->gen)) {
+            if (!track_offerable(t, bslot, b->gen) ||
+                !cluster_track_eligible(c, t, bslot, b->gen)) {
                 continue;
             }
             const r_offer_t *o = offer_at(c, i, k);
@@ -5129,6 +5349,8 @@ rendezvous_hold(moqr_core_t *c, uint32_t bslot, r_binding_t *b,
     s->gen = gen;
     s->binding = bslot;
     s->binding_gen = b->gen;
+    s->cluster_requester_hop = b->peer_hop_id;
+    s->cluster_requester_correlation = b->correlation_id;
     s->track = tslot;
     s->track_gen_slot = t->gen;
     s->state = R_SUB_PARKED;
@@ -5178,6 +5400,30 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
     if (reserved) c->subs_reserved--;
     moqr_result_t rc = core_subscribe(c, bh, req, out);
     if (reserved && rc != MOQR_OK) c->subs_reserved++;
+    return rc;
+}
+
+moqr_result_t
+moqr_core_internal_subscribe_cluster(moqr_core_t *c, moqr_binding_t bh,
+    const moqr_subscribe_req_t *req, moqr_cluster_advertisement_id_t source,
+    uint64_t requester_hop_id,
+    uint64_t requester_correlation_id, moqr_sub_t *out)
+{
+    if (c == NULL || !c->cluster_enabled || source.serial == 0 || req == NULL ||
+        req->struct_size < offsetof(moqr_subscribe_req_t, forward) ||
+        !ftn_view_ok(req->ns, req->name)) return MOQR_ERR_INVAL;
+    if (cluster_owner_node(c, source, req->ns) == UINT32_MAX)
+        return MOQR_ERR_STALE_HANDLE;
+    r_binding_t *b = binding_resolve(c, bh, NULL);
+    if (b == NULL) return MOQR_ERR_STALE_HANDLE;
+    uint64_t hop = b->peer_hop_id, corr = b->correlation_id;
+    b->peer_hop_id = requester_hop_id;
+    b->correlation_id = requester_correlation_id;
+    c->cluster_forced = source;
+    moqr_result_t rc = moqr_core_subscribe(c, bh, req, out);
+    memset(&c->cluster_forced, 0, sizeof(c->cluster_forced));
+    b->peer_hop_id = hop;
+    b->correlation_id = corr;
     return rc;
 }
 
@@ -5237,12 +5483,19 @@ core_subscribe(moqr_core_t *c, moqr_binding_t bh,
     }
 
     uint64_t hash = 0;
-    uint32_t tslot = track_lookup(c, req->ns, req->name, &hash);
+    uint32_t tslot = (c->cluster_enabled ? cluster_track_lookup(c, req->ns, req->name, bslot, b->gen, &hash) : track_lookup(c, req->ns, req->name, &hash));
     moqr_result_t rc;
+    if (tslot != UINT32_MAX && c->cluster_enabled &&
+        !cluster_track_eligible(c, &c->tracks[tslot], bslot, b->gen) &&
+        track_sub_count(c, tslot) == 0 && track_fetch_count(c, tslot) == 0) {
+        track_free_slot(c, tslot);
+        tslot = UINT32_MAX;
+    }
+
 
     if (tslot == UINT32_MAX) {
         /* New track: needs an announced publisher. */
-        uint32_t pub_node = trie_longest_announce(c, req->ns);
+        uint32_t pub_node = (c->cluster_enabled ? cluster_select_node(c, req->ns, bslot, b->gen) : trie_longest_announce(c, req->ns));
         if (pub_node == UINT32_MAX && req_wait) {
             /* §9.20.6: hold the subscription, without an answer, until a
              * publisher appears or its one deadline passes. */
@@ -5266,7 +5519,7 @@ core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         }
         /* Making room may have compacted the trie; announced nodes are
          * never freed, only moved, so look the publisher up again. */
-        pub_node = trie_longest_announce(c, req->ns);
+        pub_node = (c->cluster_enabled ? cluster_select_node(c, req->ns, bslot, b->gen) : trie_longest_announce(c, req->ns));
         r_track_t *t = &c->tracks[tslot];
         t->state = R_TRACK_PENDING;
         t->source_kind = R_TRACK_SOURCE_PULL;
@@ -5277,6 +5530,9 @@ core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         track_src_set(c, t, pub_node);
         t->src_ann_binding = c->nodes[pub_node].ann_binding;
         t->src_ann_binding_gen = c->nodes[pub_node].ann_binding_gen;
+        cluster_pin_track(c, t);
+        t->cluster_requester_hop = b->peer_hop_id;
+        t->cluster_requester_correlation = b->correlation_id;
 
         t->metadata_managed = c->bindings[t->up_binding].metadata_managed;
         r_sub_t *s = &c->subs[sslot];
@@ -5285,6 +5541,8 @@ core_subscribe(moqr_core_t *c, moqr_binding_t bh,
         s->gen = gen;
         s->binding = bslot;
         s->binding_gen = b->gen;
+    s->cluster_requester_hop = b->peer_hop_id;
+    s->cluster_requester_correlation = b->correlation_id;
         s->track = tslot;
         s->track_gen_slot = t->gen;
         s->state = R_SUB_PARKED;
@@ -5323,6 +5581,13 @@ core_subscribe(moqr_core_t *c, moqr_binding_t bh,
 
     /* Existing track. */
     r_track_t *t = &c->tracks[tslot];
+    if (!cluster_track_eligible(c, t, bslot, b->gen) && t->state != R_TRACK_RENDEZVOUS) {
+        moqr_intent_t *deny = intent_push(c, MOQR_INTENT_REJECT_SUB);
+        deny->binding_cookie = b->cookie;
+        deny->cookie = req->cookie;
+        deny->error_code = R_ERR_DOES_NOT_EXIST;
+        return MOQR_OK;
+    }
     if (t->state == R_TRACK_RENDEZVOUS && !req_wait) {
         /* Others wait for this track's publisher; this request does not. */
         moqr_intent_t *it = intent_push(c, MOQR_INTENT_REJECT_SUB);
@@ -5341,6 +5606,8 @@ core_subscribe(moqr_core_t *c, moqr_binding_t bh,
     s->gen = gen;
     s->binding = bslot;
     s->binding_gen = b->gen;
+    s->cluster_requester_hop = b->peer_hop_id;
+    s->cluster_requester_correlation = b->correlation_id;
     s->track = tslot;
     s->track_gen_slot = t->gen;
     s->forward = req_forward;   /* initial Forward, carried atomically */
@@ -5395,7 +5662,7 @@ core_subscribe(moqr_core_t *c, moqr_binding_t bh,
 
     if (t->state == R_TRACK_WARM) {
         /* Re-establish upstream if a publisher is announced. */
-        uint32_t pub_node = trie_longest_announce(c, req->ns);
+        uint32_t pub_node = (c->cluster_enabled ? cluster_select_node(c, req->ns, bslot, b->gen) : trie_longest_announce(c, req->ns));
         if (pub_node != UINT32_MAX) {
             t->state = R_TRACK_PENDING;
             t->source_kind = R_TRACK_SOURCE_PULL;
@@ -5406,6 +5673,9 @@ core_subscribe(moqr_core_t *c, moqr_binding_t bh,
             track_src_set(c, t, pub_node);
             t->src_ann_binding = c->nodes[pub_node].ann_binding;
             t->src_ann_binding_gen = c->nodes[pub_node].ann_binding_gen;
+        cluster_pin_track(c, t);
+        t->cluster_requester_hop = b->peer_hop_id;
+        t->cluster_requester_correlation = b->correlation_id;
             t->metadata_managed = t->metadata_managed ||
                 c->bindings[t->up_binding].metadata_managed;
             moqr_intent_t *up = intent_push(c,
@@ -5685,6 +5955,17 @@ moqr_core_track_current_generation(const moqr_core_t *c, moqr_track_t th,
     if (t == NULL) return MOQR_ERR_STALE_HANDLE;
     *out_track_gen = t->track_gen;
     return MOQR_OK;
+}
+
+bool
+moqr_core_internal_source_idle(const moqr_core_t *c, moqr_track_t th,
+    uint64_t old_source_gen)
+{
+    if (c == NULL || old_source_gen == UINT64_MAX) return false;
+    const r_track_t *t = track_resolve((moqr_core_t *)(uintptr_t)c, th, NULL);
+    return t != NULL && t->state == R_TRACK_WARM &&
+        t->source_kind == R_TRACK_SOURCE_NONE && !t->has_upstream_binding &&
+        t->track_gen == old_source_gen + 1;
 }
 
 moqr_result_t
@@ -6009,12 +6290,28 @@ static void
 track_set_push_source(moqr_core_t *c, r_track_t *t, moqr_ns_t ns, uint32_t bslot,
                       uint32_t bgen)
 {
+    if (c->cluster_enabled) {
+        uint32_t node = cluster_longest_node(c, ns);
+        for (uint32_t ri = 0; ri < c->max_cluster_routes; ri++) {
+            const r_cluster_route_t *r = &c->cluster_routes[ri];
+            if (r->used && r->node == node && r->binding == bslot && r->binding_gen == bgen) {
+                track_src_set(c, t, node);
+                t->src_ann_binding = bslot;
+                t->src_ann_binding_gen = bgen;
+                t->cluster_route_lifetime = r->lifetime;
+                t->cluster_origin = cluster_path(c, ri)[0];
+                return;
+            }
+        }
+        return;
+    }
     uint32_t node = trie_longest_announce(c, ns);
     if (node != UINT32_MAX && c->nodes[node].ann_binding == bslot &&
         c->nodes[node].ann_binding_gen == bgen) {
         track_src_set(c, t, node);
         t->src_ann_binding = bslot;
         t->src_ann_binding_gen = bgen;
+        cluster_pin_track(c, t);
     } else {
         track_src_set(c, t, UINT32_MAX);
     }
@@ -6107,6 +6404,32 @@ moqr_core_publish_open(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
     }
     uint64_t hash = 0;
     uint32_t tslot = track_lookup(c, ns, name, &hash);
+    if (c->cluster_enabled) {
+        tslot = UINT32_MAX;
+        for (uint32_t ti = 0; ti < c->max_tracks; ti++) {
+            const r_track_t *t = &c->tracks[ti];
+            bool held_eligible = t->state == R_TRACK_RENDEZVOUS;
+            if (held_eligible && (t->gen & 1u) != 0) {
+                uint32_t node = cluster_longest_node(c, ns), own_route = UINT32_MAX;
+                for (uint32_t ri = 0; ri < c->max_cluster_routes; ri++) {
+                    const r_cluster_route_t *r = &c->cluster_routes[ri];
+                    if (r->used && r->node == node && r->binding == bslot && r->binding_gen == b->gen)
+                        own_route = ri;
+                }
+                for (uint32_t si = t->subs_head; si != R_SUB_NIL && held_eligible; si = c->subs[si].track_next) {
+                    const r_sub_t *sub = &c->subs[si];
+                    held_eligible = own_route != UINT32_MAX
+                        ? cluster_eligible(c, own_route, sub->binding, sub->binding_gen, UINT32_MAX, 0)
+                        : (sub->binding != bslot && (b->correlation_id == 0 ||
+                            b->correlation_id != c->bindings[sub->binding].correlation_id));
+                }
+            }
+            if ((t->gen & 1u) != 0 && t->hash == hash &&
+                key_view_eq(&t->key, ns, name) &&
+                ((t->up_binding == bslot && t->up_binding_gen == b->gen) ||
+                 held_eligible)) { tslot = ti; break; }
+        }
+    }
     moqr_result_t rc;
     if (tslot != UINT32_MAX) {
         r_track_t *t = &c->tracks[tslot];
@@ -6254,21 +6577,36 @@ moqr_core_ingest(moqr_core_t *c, moqr_track_t th,
     if (t->state != R_TRACK_ACTIVE) {
         return MOQR_ERR_WRONG_STATE;
     }
+    if (desc->struct_size < offsetof(moqr_log_append_desc_t, declared_len) +
+                            sizeof(desc->declared_len)) return MOQR_ERR_INVAL;
+    if (t->cluster_group_floor_set && desc->group_id <= t->cluster_group_floor) {
+        if (desc->payload != NULL) moq_rcbuf_decref(desc->payload);
+        if (desc->properties != NULL) moq_rcbuf_decref(desc->properties);
+        return MOQR_OK;
+    }
     /* OPEN begins an incrementally-filled record (chunk-through). The Largest
      * Object advances when the first byte of an Object past it arrives
      * (draft-22 3.1.4), so an Object still arriving can be the Largest; what
      * is served up to the Largest waits for it to complete (fetch peek). */
+    /* Groups evicted to make room owe their watermark and terminal progress
+     * even when the record is then refused. */
+    const uint64_t evicted = moqr_log_evicted_groups_total(t->log);
     if (desc->obj_state == MOQR_OBJ_OPEN) {
         moqr_result_t orc = moqr_log_open_record(t->log, desc);
         if (orc == MOQR_OK) {
             track_note_largest(t, desc->group_id, desc->object_id);
             track_location_ingest(c, t, desc);
             ready_mark_track(c, tslot);   /* a live-edge head is selectable */
+        } else if (moqr_log_evicted_groups_total(t->log) != evicted) {
+            ready_mark_track(c, tslot);
         }
         return orc;
     }
     moqr_result_t rc = moqr_log_append(t->log, desc);
     if (rc != MOQR_OK) {
+        if (moqr_log_evicted_groups_total(t->log) != evicted) {
+            ready_mark_track(c, tslot);
+        }
         return rc;
     }
     track_note_largest(t, desc->group_id, desc->object_id);
@@ -6297,10 +6635,16 @@ moqr_core_append_chunk(moqr_core_t *c, moqr_track_t th, uint64_t group_id,
     if (t->state != R_TRACK_ACTIVE) {
         return MOQR_ERR_WRONG_STATE;
     }
+    if (t->cluster_group_floor_set && group_id <= t->cluster_group_floor)
+        return MOQR_OK; /* append_chunk borrows the caller's buffer */
+    const uint64_t evicted = moqr_log_evicted_groups_total(t->log);
     moqr_result_t rc =
         moqr_log_append_chunk(t->log, group_id, subgroup_id, object_id, chunk);
-    if (rc == MOQR_OK) {
-        ready_mark_track(c, tslot);   /* growth resumes a stalled delivery */
+    /* Growth resumes a stalled delivery; the groups evicted to make room owe
+     * their watermark and terminal progress even when the chunk is then
+     * refused. */
+    if (rc == MOQR_OK || moqr_log_evicted_groups_total(t->log) != evicted) {
+        ready_mark_track(c, tslot);
     }
     return rc;
 }
@@ -6320,6 +6664,8 @@ moqr_core_complete_record(moqr_core_t *c, moqr_track_t th, uint64_t group_id,
     if (t->state != R_TRACK_ACTIVE) {
         return MOQR_ERR_WRONG_STATE;
     }
+    if (t->cluster_group_floor_set && group_id <= t->cluster_group_floor)
+        return MOQR_OK;
     moqr_result_t rc =
         moqr_log_complete_record(t->log, group_id, subgroup_id, object_id);
     if (rc != MOQR_OK) {
@@ -6364,6 +6710,8 @@ moqr_core_abandon_record(moqr_core_t *c, moqr_track_t th, uint64_t group_id,
     if (t->state != R_TRACK_ACTIVE && t->state != R_TRACK_WARM) {
         return MOQR_ERR_WRONG_STATE;
     }
+    if (t->cluster_group_floor_set && group_id <= t->cluster_group_floor)
+        return MOQR_OK;
     moqr_result_t rc = moqr_log_abandon_record(t->log, group_id, subgroup_id,
                                                object_id, reset);
     if (rc == MOQR_OK) {
@@ -6387,6 +6735,8 @@ moqr_core_seal_subgroup(moqr_core_t *c, moqr_track_t th, uint64_t group_id,
     if (t == NULL) {
         return MOQR_ERR_STALE_HANDLE;
     }
+    if (t->cluster_group_floor_set && group_id <= t->cluster_group_floor)
+        return MOQR_OK;
     moqr_result_t rc = moqr_log_seal_subgroup(t->log, group_id, subgroup_id);
     if (rc == MOQR_OK) {
         ready_mark_track(c, tslot);   /* the seal notice is deliverable */
@@ -6411,6 +6761,8 @@ moqr_core_reset_subgroup(moqr_core_t *c, moqr_track_t th, uint64_t group_id,
     if (t == NULL) {
         return MOQR_ERR_STALE_HANDLE;
     }
+    if (t->cluster_group_floor_set && group_id <= t->cluster_group_floor)
+        return MOQR_OK;
     moqr_result_t rc =
         moqr_log_reset_subgroup(t->log, group_id, subgroup_id, reset);
     if (rc == MOQR_OK) {
@@ -6531,7 +6883,13 @@ moqr_core_note_track_evicted_below(moqr_core_t *c, moqr_track_t th,
     if (t == NULL) {
         return MOQR_ERR_STALE_HANDLE;
     }
-    (void)moqr_log_note_evicted_below(t->log, oldest_retained);
+    uint64_t floor = moqr_log_evicted_floor(t->log);
+    if (moqr_log_note_evicted_below(t->log, oldest_retained) > 0 ||
+        moqr_log_evicted_floor(t->log) != floor) {
+        /* The reset notices are deliverable, and a subscription waiting on
+         * the closed range may now retire. */
+        ready_mark_track(c, tslot);
+    }
     return MOQR_OK;
 }
 
@@ -6667,6 +7025,17 @@ grant_do_teardown(moqr_core_t *c, uint32_t slot, uint64_t now_us)
          * stale grant and touches NOTHING — never a replacement
          * publisher's route, tracks, or cancellation state. */
         uint32_t node = trie_walk(c, ns);
+        if (c->cluster_enabled && node != UINT32_MAX) {
+            for (uint32_t ri = 0; ri < c->max_cluster_routes; ri++) {
+                const r_cluster_route_t *r = &c->cluster_routes[ri];
+                if (r->used && r->node == node &&
+                    c->bindings[r->binding].cookie == g->binding_cookie &&
+                    r->session_cookie == g->session_cookie) {
+                    cluster_project(c, node, ri);
+                    break;
+                }
+            }
+        }
         if (node == UINT32_MAX || !c->nodes[node].has_announce ||
             c->bindings[c->nodes[node].ann_binding].cookie !=
                 g->binding_cookie ||
@@ -6823,7 +7192,10 @@ rendezvous_sweep(moqr_core_t *c, uint64_t now_us)
             parts[p] = key_part(&t->key, p);
         }
         moqr_ns_t ns = { .parts = parts, .count = count < 32 ? count : 32 };
-        uint32_t pub_node = trie_longest_announce(c, ns);
+        uint32_t pub_node = c->cluster_enabled && t->subs_head != R_SUB_NIL
+            ? cluster_select_node(c, ns, c->subs[t->subs_head].binding,
+                                  c->subs[t->subs_head].binding_gen)
+            : trie_longest_announce(c, ns);
         if (pub_node != UINT32_MAX) {
             if (!intent_space(c, 1)) {
                 continue;   /* next tick; the deadline does not move */
@@ -6834,9 +7206,15 @@ rendezvous_sweep(moqr_core_t *c, uint64_t now_us)
             t->has_upstream_binding = true;
             t->up_binding = c->nodes[pub_node].ann_binding;
             t->up_binding_gen = c->nodes[pub_node].ann_binding_gen;
-            t->src_ann_node = pub_node;
+            track_src_set(c, t, pub_node);
             t->src_ann_binding = c->nodes[pub_node].ann_binding;
             t->src_ann_binding_gen = c->nodes[pub_node].ann_binding_gen;
+        cluster_pin_track(c, t);
+            if (c->cluster_enabled && t->subs_head != R_SUB_NIL) {
+                const r_binding_t *requester = &c->bindings[c->subs[t->subs_head].binding];
+                t->cluster_requester_hop = requester->peer_hop_id;
+                t->cluster_requester_correlation = requester->correlation_id;
+            }
             t->metadata_managed = c->bindings[t->up_binding].metadata_managed;
             for (uint32_t k = t->subs_head; k != R_SUB_NIL;
                  k = c->subs[k].track_next) {
@@ -6877,6 +7255,7 @@ moqr_core_tick(moqr_core_t *c, uint64_t now_us)
         return MOQR_ERR_INVAL;
     }
     grant_tick(c, now_us);
+    cluster_reparent_sweep(c);
     rendezvous_sweep(c, now_us);
     for (uint32_t i = 0; i < c->max_tracks; i++) {
         r_track_t *t = &c->tracks[i];
@@ -7101,10 +7480,13 @@ track_rec_expired(const r_track_t *t, const moqr_record_view_t *v,
 static bool
 sub_best_candidate(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
                    r_cand_t *out, bool *out_range_done,
-                   r_seal_note_t *out_seal, uint64_t now_us)
+                   r_seal_note_t *out_seal, uint64_t now_us,
+                   moqr_core_delivery_eligible_fn eligible, void *ctx,
+                   bool *capacity_blocked)
 {
     uint32_t gn = moqr_log_group_count(log);
     *out_range_done = false;
+    *capacity_blocked = false;
     r_cand_t best = { .have = false };
     bool any_in_range = false;
     bool blocked_open = false;   /* an in-range OPEN head is pending */
@@ -7273,6 +7655,10 @@ sub_best_candidate(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
                 }
                 /* Selectable: OPEN with new chunks, COMPLETE (deliver the
                  * remaining emitted..chunk_count then end), or ABANDONED-begun. */
+                if (eligible != NULL && !eligible(ctx, s->cookie, &v)) {
+                    *capacity_blocked = true;
+                    break;   /* leave this list's head and ledgers untouched */
+                }
                 r_cand_t cand = { .have = true,
                                   .list = pos_slot,
                                   .emitted = emitted,
@@ -7306,7 +7692,7 @@ sub_best_candidate(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log,
      * in-range record remains deliverable — but NOT while an in-range OPEN head
      * is still pending (it must complete or be reset/abandoned first, else a
      * begun downstream object would be left without a terminal). */
-    if (s->has_end && !blocked_open) {
+    if (s->has_end && !blocked_open && !*capacity_blocked) {
         const r_track_t *t = &c->tracks[s->track];
         if (s->excluded != NULL) {
             *out_range_done = t->has_largest &&
@@ -7424,9 +7810,10 @@ sub_eot_complete(moqr_core_t *c, r_sub_t *s, const moqr_log_t *log)
     return true;
 }
 
-moqr_result_t
-moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
-                        moqr_delivery_t *out)
+static moqr_result_t
+core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
+                   moqr_delivery_t *out, moqr_core_delivery_eligible_fn eligible,
+                   void *ctx)
 {
     if (c == NULL || out == NULL) {
         return MOQR_ERR_INVAL;
@@ -7606,10 +7993,11 @@ moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
         }
         r_cand_t cand;
         bool range_done = false;
+        bool capacity_blocked = false;
         r_seal_note_t seal;
         memset(&seal, 0, sizeof(seal));
         if (!sub_best_candidate(c, s, t->log, &cand, &range_done, &seal,
-                                now_us)) {
+                                now_us, eligible, ctx, &capacity_blocked)) {
             if (s->pending_skip) {
                 /* Fresh jump found by the scan's gpos_gc: EVICT_WATERMARK
                  * precedes any SEAL for the same sub. */
@@ -7626,6 +8014,9 @@ moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
                     ntc_kind = MOQR_DELIVERY_NOTICE_SEAL;
                     ntc_seal = seal;
                 }
+            } else if (capacity_blocked) {
+                /* Still owes records; lack of a stream slot is not source
+                 * completion, range completion or subscription retirement. */
             } else if (range_done && !s->range_end_holds && s->forward) {
                 /* Range-completion retirement is a delivery outcome, not stream
                  * maintenance — hold it while paused (Forward=0); resume re-runs
@@ -7884,28 +8275,42 @@ moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
         moqr_log_subgroup_is_final(c->tracks[ws->track].log,
                                    best.view.group_id, best.list,
                                    best.view.object_id);
-    if (b->out_chunked || b->out_abandoned) {
-        /* Store the delivery so a re-peek after a downstream WOULD_BLOCK
-         * replays it verbatim: chunk bytes come from the pinned array via
-         * moqr_core_delivery_chunk (survives record eviction), and an abandoned
-         * head replays so the bind can retry a WOULD_BLOCKed reset. */
-        b->out_view = *out;
-    }
+    /* Held batches replay this view; all record shapes retain their scalar
+     * identity here for intentional-discard tracing at confirmation. */
+    b->out_view = *out;
     return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_next_delivery(moqr_core_t *c, moqr_binding_t bh, uint64_t now_us,
+                        moqr_delivery_t *out)
+{
+    return core_next_delivery(c, bh, now_us, out, NULL, NULL);
+}
+
+moqr_result_t
+moqr_core_internal_next_eligible(moqr_core_t *c, moqr_binding_t bh,
+                                 uint64_t now_us, moqr_delivery_t *out,
+                                 moqr_core_delivery_eligible_fn eligible,
+                                 void *ctx)
+{
+    if (eligible == NULL) return MOQR_ERR_INVAL;
+    return core_next_delivery(c, bh, now_us, out, eligible, ctx);
 }
 
 moqr_result_t
 moqr_core_internal_delivery_flags(const moqr_core_t *c, moqr_binding_t bh,
                                   bool *subgroup_properties, bool *follows_gap,
-                                  moqr_reset_desc_t *gap_reset)
+                                  moqr_reset_desc_t *gap_reset, uint32_t *list)
 {
     if (c == NULL || subgroup_properties == NULL || follows_gap == NULL ||
-        gap_reset == NULL) {
+        gap_reset == NULL || list == NULL) {
         return MOQR_ERR_INVAL;
     }
     *subgroup_properties = false;
     *follows_gap = false;
     *gap_reset = moqr_reset_desc_none();
+    *list = 0;
     r_binding_t *b = binding_resolve((moqr_core_t *)(uintptr_t)c, bh, NULL);
     if (b == NULL) {
         return MOQR_ERR_STALE_HANDLE;
@@ -7916,6 +8321,7 @@ moqr_core_internal_delivery_flags(const moqr_core_t *c, moqr_binding_t bh,
     *subgroup_properties = b->out_subgroup_properties;
     *follows_gap = b->out_follows_gap;
     *gap_reset = b->out_gap_reset;
+    *list = b->out_list;
     return MOQR_OK;
 }
 
@@ -7939,15 +8345,20 @@ moqr_core_delivery_done(moqr_core_t *c, moqr_binding_t bh,
         outcome != MOQR_DELIVERY_STREAM_ERROR &&
         outcome != MOQR_DELIVERY_STALLED &&
         outcome != MOQR_DELIVERY_ABANDONED &&
-        outcome != MOQR_DELIVERY_REFUSED_UNBEGUN) {
+        outcome != MOQR_DELIVERY_REFUSED_UNBEGUN &&
+        outcome != MOQR_DELIVERY_DISCARDED) {
         return MOQR_ERR_INVAL;
     }
     if (b->out_notice != MOQR_DELIVERY_NOTICE_NONE &&
         (outcome == MOQR_DELIVERY_STALLED ||
          outcome == MOQR_DELIVERY_ABANDONED ||
-         outcome == MOQR_DELIVERY_REFUSED_UNBEGUN)) {
+         outcome == MOQR_DELIVERY_REFUSED_UNBEGUN ||
+         outcome == MOQR_DELIVERY_DISCARDED)) {
         return MOQR_ERR_INVAL;   /* a notice has no stall/abandon/pre-begin
                                   * refusal shape */
+    }
+    if (outcome == MOQR_DELIVERY_DISCARDED && b->out_evict_reset) {
+        return MOQR_ERR_INVAL;   /* names a group, not an exact record */
     }
     if (outcome == MOQR_DELIVERY_REFUSED_UNBEGUN && b->out_abandoned) {
         return MOQR_ERR_INVAL;   /* a reset has no pre-begin refusal site */
@@ -8024,6 +8435,7 @@ moqr_core_delivery_done(moqr_core_t *c, moqr_binding_t bh,
         return MOQR_OK;
     }
     switch (outcome) {
+    case MOQR_DELIVERY_DISCARDED:
     case MOQR_DELIVERY_DELIVERED:
         if (pe != NULL) {
             if (gpos_emit(s, pe)[b->out_list] > 0) {
@@ -8037,12 +8449,18 @@ moqr_core_delivery_done(moqr_core_t *c, moqr_binding_t bh,
             /* A record that does not continue the earlier stream opens a new
              * downstream stream, which owes its own terminal: a seal this sub
              * acknowledged belonged to the stream before it. */
-            if (b->out_follows_gap && b->out_list < s->gpos_lists - 1) {
+            if ((b->out_follows_gap || outcome == MOQR_DELIVERY_DISCARDED) &&
+                b->out_list < s->gpos_lists - 1) {
                 gpos_acked(s, pe)[b->out_list / 32u] &= ~(1u << (b->out_list % 32u));
             }
         }
-        c->delivered_total++;
-        r_trace(c, MOQR_TRACE_DELIVERY, 0, bslot, b->out_sub, b->out_group, 0);
+        if (outcome == MOQR_DELIVERY_DELIVERED) {
+            c->delivered_total++;
+            r_trace(c, MOQR_TRACE_DELIVERY, 0, bslot, b->out_sub, b->out_group, 0);
+        } else {
+            r_trace(c, MOQR_TRACE_CURSOR_SKIP, 2, bslot, b->out_sub,
+                    b->out_group, b->out_view.rec.object_id);
+        }
         break;
     case MOQR_DELIVERY_STALLED:
         /* Live edge drained but not COMPLETE: record how many chunks are now
@@ -8100,6 +8518,118 @@ moqr_core_delivery_done(moqr_core_t *c, moqr_binding_t bh,
         break;
     }
     binding_unpin(b);
+    return MOQR_OK;
+}
+
+moqr_result_t
+moqr_core_internal_discard_subgroup(moqr_core_t *c, moqr_binding_t bh,
+                                    moqr_sub_t sh, uint64_t group,
+                                    uint64_t subgroup, uint32_t list,
+                                    uint32_t budget, uint64_t now_us,
+                                    bool *retired, bool *more)
+{
+    if (c == NULL || retired == NULL || more == NULL || budget == 0) {
+        return MOQR_ERR_INVAL;
+    }
+    *retired = false;
+    *more = false;
+    uint32_t bslot = 0, sslot = 0;
+    r_binding_t *b = binding_resolve(c, bh, &bslot);
+    r_sub_t *s = sub_resolve(c, sh, &sslot);
+    if (b == NULL) return MOQR_ERR_STALE_HANDLE;
+    if (s == NULL) {
+        *retired = true;   /* this exact subscription owner is gone */
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    if (s->binding != bslot || s->binding_gen != b->gen || s->gpos_lists == 0 ||
+        list >= s->gpos_lists - 1u) return MOQR_ERR_INVAL;
+    r_track_t *t = &c->tracks[s->track];
+    if ((t->gen & 1u) == 0 || t->gen != s->track_gen_slot) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    moqr_log_t *log = t->log;
+    moqr_record_view_t probe;
+    *retired = moqr_log_read_rec(log, group, MOQR_LOG_LIST_DATAGRAM, 0,
+                                 &probe) == MOQR_ERR_TOO_OLD;
+    /* Validate the captured position while the group is retained. Group
+     * eviction never reuses its ID, so its old list index remains sufficient
+     * to clear just this position's ledger after the log releases the list. */
+    bool retained = false;
+    for (uint32_t gi = 0; gi < log->group_count; gi++) {
+        const moqr_group_t *g = &log->groups[gi];
+        if (g->group_id != group) continue;
+        if (list >= g->sg_count || g->sgs[list].subgroup_id != subgroup) {
+            return MOQR_ERR_INVAL;
+        }
+        retained = true;
+        break;
+    }
+    if (!retained && !*retired) return MOQR_ERR_WRONG_STATE;
+    uint32_t used = 0;
+    bool changed = false;
+    if (b->out_active && b->out_sub == sslot &&
+        b->out_notice == MOQR_DELIVERY_NOTICE_NONE && !b->out_evict_reset &&
+        b->out_group == group && b->out_list == list) {
+        moqr_result_t rc = moqr_core_delivery_done(c, bh,
+                                                   MOQR_DELIVERY_DISCARDED,
+                                                   now_us);
+        if (rc != MOQR_OK) return rc;
+        used++;
+        changed = true;
+    }
+    uint32_t pos = gpos_hash_find(s, group);
+    r_gpos_t *pe = pos == R_GPOS_NIL ? NULL : gpos_at(s, pos);
+    if (pe == NULL && !*retired) pe = gpos_entry(c, s, log, group);
+    if (pe == NULL && !*retired) return MOQR_ERR_CAPACITY;
+    if (pe != NULL) {
+        if (gpos_emit(s, pe)[list] != 0) {
+            sub_begun_sub(c, s);
+            changed = true;
+        }
+        gpos_emit(s, pe)[list] = 0;
+        gpos_gap_set(s, pe, list, false);
+        gpos_renew_set(s, pe, list, false);
+        gpos_owed(s, pe)[list] = 0;
+        if (!*retired) {
+            while (used < budget &&
+                   moqr_log_read_rec(log, group, list, pe->idx[list],
+                                      &probe) == MOQR_OK) {
+                pe->idx[list]++;
+                gpos_acked(s, pe)[list / 32u] &= ~(1u << (list % 32u));
+                r_trace(c, MOQR_TRACE_CURSOR_SKIP, 2, bslot, sslot,
+                        group, probe.object_id);
+                used++;
+                changed = true;
+            }
+            *more = moqr_log_read_rec(log, group, list, pe->idx[list],
+                                       &probe) == MOQR_OK;
+        }
+        /* A held synthetic reset can lose its last begun position here.
+         * Preserve it when any sibling of the evicted group still needs it. */
+        if (b->out_active && b->out_evict_reset && b->out_sub == sslot &&
+            b->out_group == group) {
+            bool begun = false;
+            for (uint32_t li = 0; li < s->gpos_lists; li++) {
+                begun = begun || gpos_emit(s, pe)[li] != 0;
+            }
+            if (!begun) binding_drop_held(b);
+        }
+        if (*retired) {
+            bool begun = false;
+            for (uint32_t li = 0; li < s->gpos_lists; li++) {
+                begun = begun || gpos_emit(s, pe)[li] != 0;
+            }
+            if (!begun) {
+                pe->occupied = false;
+                gpos_body_clear(s, pe);
+                gpos_hash_rebuild(s);
+                s->pending_skip = true;
+            }
+        }
+    }
+    if (changed || *retired) {
+        ready_mark(c, bslot);   /* newly exposed notices still need ack */
+    }
     return MOQR_OK;
 }
 
@@ -8491,7 +9021,16 @@ core_fetch_admit(moqr_core_t *c, moqr_binding_t bh, const moqr_fetch_req_t *req,
         return MOQR_ERR_UNSUPPORTED;
     }
 
-    uint32_t tslot = track_lookup(c, req->ns, req->name, NULL);
+    uint32_t tslot = (c->cluster_enabled ? cluster_track_lookup(c, req->ns, req->name, bslot, b->gen, NULL) : track_lookup(c, req->ns, req->name, NULL));
+    uint32_t cluster_node = UINT32_MAX;
+    if (c->cluster_enabled && tslot == UINT32_MAX) {
+        cluster_node = cluster_select_node(c, req->ns, bslot, b->gen);
+        if (cluster_node == UINT32_MAX) {
+            out_plan->admit = MOQR_FETCH_REJECT;
+            out_plan->error_code = R_ERR_DOES_NOT_EXIST;
+            return MOQR_OK;
+        }
+    }
 
     if (tslot == UINT32_MAX) {
         out_plan->admit = MOQR_FETCH_REJECT;
@@ -8506,6 +9045,12 @@ core_fetch_admit(moqr_core_t *c, moqr_binding_t bh, const moqr_fetch_req_t *req,
         return MOQR_OK;
     }
     r_track_t *t = &c->tracks[tslot];
+    if (!cluster_track_eligible(c, t, bslot, b->gen)) {
+        out_plan->admit = MOQR_FETCH_REJECT;
+        out_plan->error_code = R_ERR_DOES_NOT_EXIST;
+        return MOQR_OK;
+    }
+
     if (retrieval != NULL && track_remote_cookie(c, t) != 0) {
         /* A copy another shard feeds here: that shard holds the track, its
          * Largest Object and its upstream. */
@@ -8632,6 +9177,8 @@ core_fetch_admit(moqr_core_t *c, moqr_binding_t bh, const moqr_fetch_req_t *req,
     f->gen = gen;
     f->binding = bslot;
     f->binding_gen = b->gen;
+    f->cluster_requester_hop = b->peer_hop_id;
+    f->cluster_requester_correlation = b->correlation_id;
     f->track = tslot;
     f->track_gen_slot = t->gen;
     t->fetch_count++;
@@ -8714,6 +9261,31 @@ moqr_core_internal_retrieve_open(moqr_core_t *c, moqr_binding_t bh,
     if (rc == MOQR_OK) {
         plan->wire = wire;
     }
+    return rc;
+}
+
+moqr_result_t
+moqr_core_internal_retrieve_open_cluster(moqr_core_t *c, moqr_binding_t bh,
+    const moqr_fetch_req_t *req, moqr_cluster_advertisement_id_t source,
+    uint64_t requester_hop_id,
+    uint64_t requester_correlation_id, uint64_t now_us,
+    moqr_fetch_t *owner, moqr_core_retrieve_plan_t *plan)
+{
+    if (c == NULL || !c->cluster_enabled || source.serial == 0 || req == NULL ||
+        req->struct_size < offsetof(moqr_fetch_req_t, report_gaps) || !ftn_view_ok(req->ns, req->name))
+        return MOQR_ERR_INVAL;
+    if (cluster_owner_node(c, source, req->ns) == UINT32_MAX)
+        return MOQR_ERR_STALE_HANDLE;
+    r_binding_t *b = binding_resolve(c, bh, NULL);
+    if (b == NULL) return MOQR_ERR_STALE_HANDLE;
+    uint64_t hop = b->peer_hop_id, corr = b->correlation_id;
+    b->peer_hop_id = requester_hop_id;
+    b->correlation_id = requester_correlation_id;
+    c->cluster_forced = source;
+    moqr_result_t rc = moqr_core_internal_retrieve_open(c, bh, req, now_us, owner, plan);
+    memset(&c->cluster_forced, 0, sizeof(c->cluster_forced));
+    b->peer_hop_id = hop;
+    b->correlation_id = corr;
     return rc;
 }
 
@@ -9554,6 +10126,36 @@ moqr_core_source_finish(moqr_core_t *c, moqr_track_t th, uint64_t track_gen,
  * the binding marked until the ring has room), and the source is released
  * now, so no ACTIVE source is left without an owner to retry it. Queues no
  * intent; never WOULD_BLOCK. */
+/* One subscription cannot be served on its binding's draft (Object
+ * Properties its destination cannot represent): it alone ends, with
+ * `status`, by its binding's next delivery scan before anything else is
+ * delivered for it -- the same per-subscription retirement a failed source
+ * gives -- and a full intent ring keeps it marked for a later scan. The
+ * track and every other subscription are untouched. */
+moqr_result_t
+moqr_core_internal_sub_fail(moqr_core_t *c, moqr_sub_t sh, moqr_pd_desc_t status)
+{
+    if (c == NULL || !moqr_pd_desc_valid(status)) {
+        return MOQR_ERR_INVAL;
+    }
+    uint32_t slot = 0;
+    r_sub_t *s = sub_resolve(c, sh, &slot);
+    if (s == NULL) {
+        return MOQR_ERR_STALE_HANDLE;
+    }
+    if (s->state != R_SUB_ACTIVE) {
+        return MOQR_ERR_WRONG_STATE;
+    }
+    s->src_done = true;
+    s->src_abort = true;
+    s->src_done_pd = status;
+    if (s->binding < c->max_bindings &&
+        c->bindings[s->binding].gen == s->binding_gen) {
+        ready_mark(c, s->binding);
+    }
+    return MOQR_OK;
+}
+
 moqr_result_t
 moqr_core_internal_source_abort(moqr_core_t *c, moqr_track_t th,
                                 uint64_t track_gen, moqr_pd_desc_t status)
@@ -9596,6 +10198,33 @@ moqr_core_debug_begun_ledger(const moqr_core_t *c, moqr_sub_t sh,
     *out_binding_begun_subs = b->begun_subs;
     return true;
 }
+
+/* Test-only: the next `attempts` calls of moqr_core_binding_close on this core
+ * (any live binding) return MOQR_ERR_WOULD_BLOCK before any effect, as a close
+ * that cannot yet make progress does; 0 releases the hold. The core's owner
+ * thread only, like every other core call. Never compiled into a production
+ * core. */
+void
+moqr_core_debug_hold_binding_close(moqr_core_t *c, uint32_t attempts)
+{
+    if (c != NULL) {
+        c->dbg_close_hold = attempts;
+    }
+}
+
+/* Test-only: how many closes the hold refused, and the cookie of the binding
+ * the last one named. */
+uint32_t
+moqr_core_debug_binding_close_held(const moqr_core_t *c, uint64_t *out_cookie)
+{
+    if (c == NULL) {
+        return 0;
+    }
+    if (out_cookie != NULL) {
+        *out_cookie = c->dbg_close_held_cookie;
+    }
+    return c->dbg_close_held;
+}
 #endif /* MOQR_CORE_TESTING */
 
 uint32_t
@@ -9628,9 +10257,30 @@ moqr_core_drain_ready(moqr_core_t *c, uint64_t *cookies, uint32_t cap)
     return out;
 }
 
-moqr_result_t
+static moqr_result_t core_cluster_capacity(const moqr_core_relay_cfg_t *cfg,
+    const moqr_cluster_cfg_t *cluster, moqr_core_capacity_t *out);
+
+moq_result_t
 moqr_core_capacity_describe(const moqr_core_relay_cfg_t *cfg,
-                            moqr_core_capacity_t *out)
+    moqr_core_capacity_t *out, size_t out_size)
+{
+    return moqr_core_cluster_capacity_describe(cfg, NULL, out, out_size);
+}
+
+moq_result_t
+moqr_core_cluster_capacity_describe(const moqr_core_relay_cfg_t *cfg,
+    const moqr_cluster_cfg_t *cluster, moqr_core_capacity_t *out, size_t out_size)
+{
+    if (out == NULL || out_size < MOQR_CORE_CAPACITY_V0_SIZE) return MOQ_ERR_INVAL;
+    moqr_core_capacity_t value;
+    moqr_result_t rc = core_cluster_capacity(cfg, cluster, &value);
+    if (rc == MOQR_OK) moqr_cluster_write(out, out_size, &value, sizeof(value));
+    return moqr_result_public(rc);
+}
+
+static moqr_result_t
+core_cluster_capacity(const moqr_core_relay_cfg_t *cfg,
+    const moqr_cluster_cfg_t *cluster, moqr_core_capacity_t *out)
 {
     if (out == NULL) {
         return MOQR_ERR_INVAL;
@@ -9639,6 +10289,9 @@ moqr_core_capacity_describe(const moqr_core_relay_cfg_t *cfg,
     if (cfg == NULL || cfg->struct_size < sizeof(uint32_t)) {
         return MOQR_ERR_INVAL;
     }
+    moqr_cluster_info_t cluster_resolved;
+    if (moqr_cluster_cfg_resolve(cluster, &cluster_resolved, sizeof(cluster_resolved)) != MOQ_OK)
+        return MOQR_ERR_INVAL;
     /* The SAME pure resolution create() consumes — defaults, the
      * cancels/bindings coupling, and the intent-ring atomicity clamp all
      * come from one place. */
@@ -9656,6 +10309,11 @@ moqr_core_capacity_describe(const moqr_core_relay_cfg_t *cfg,
     uint64_t nodes = lim.max_ns_nodes;
     uint64_t ns_subs = lim.max_ns_subs;
     uint64_t intents = lim.max_intents;
+    if (cluster_resolved.enabled) {
+        uint64_t atomic = subs + 2u * tracks + ns_subs;
+        if (atomic > UINT32_MAX) return MOQR_ERR_INVAL;
+        if (intents < atomic) intents = atomic;
+    }
     uint64_t intern = lim.name_intern_bytes;
     uint64_t parked = lim.max_parked;
     uint64_t parked_bytes = lim.parked_bytes;
@@ -9667,6 +10325,13 @@ moqr_core_capacity_describe(const moqr_core_relay_cfg_t *cfg,
 
     uint64_t s = sizeof(moqr_core_t);
     s = moqr_cap_add(s, moqr_cap_mul(bindings, sizeof(r_binding_t)));
+    if (cluster_resolved.enabled) {
+        uint64_t routes = cluster_resolved.max_routes;
+        uint64_t hops = cluster_resolved.max_hops;
+        if (routes * hops > SIZE_MAX / sizeof(uint64_t)) return MOQR_ERR_INVAL;
+        s = moqr_cap_add(s, moqr_cap_mul(routes, sizeof(r_cluster_route_t)));
+        s = moqr_cap_add(s, moqr_cap_mul(moqr_cap_mul(routes, hops), sizeof(uint64_t)));
+    }
     /* Binding-ready bitset: one bit per binding slot, whole words. */
     s = moqr_cap_add(s, moqr_cap_mul(ready_word_count(lim.max_bindings),
                                      sizeof(uint64_t)));
@@ -10646,6 +11311,29 @@ moqr_core_route_dump_json(const moqr_core_t *c, char *buf, size_t cap,
     }
     rd_addf(&w, "]");
 
+    if (c->cluster_enabled) {
+        rd_addf(&w, ",\"cluster_routes\":[");
+        bool route_first = true;
+        for (uint32_t ri = 0; ri < c->max_cluster_routes; ri++) {
+            const r_cluster_route_t *r = &c->cluster_routes[ri];
+            if (!r->used) continue;
+            rd_addf(&w, route_first ? "{\"namespace\":" : ",{\"namespace\":");
+            route_first = false;
+            rd_node_ns(&w, c, r->node, true);
+            rd_addf(&w, ",\"binding\":%llu,\"generation\":%llu,\"arrival\":%llu,\"cost\":%llu,\"advertised_cost\":%llu,\"mirrored\":%s,\"hop_path\":[",
+                (unsigned long long)c->bindings[r->binding].cookie,
+                (unsigned long long)r->lifetime,
+                (unsigned long long)r->arrival,
+                (unsigned long long)r->cost,
+                (unsigned long long)(cluster_route_warm(c, ri) ? 0 : r->cost),
+                r->mirrored ? "true" : "false");
+            for (uint32_t hi = 0; hi < r->hop_count; hi++)
+                rd_addf(&w, hi == 0 ? "%llu" : ",%llu", (unsigned long long)cluster_path(c, ri)[hi]);
+            rd_addf(&w, "]}");
+        }
+        rd_addf(&w, "]");
+    }
+
     rd_addf(&w, ",\"namespace_subscriptions\":[");
     first = true;
     for (uint32_t i = 0; i < c->max_ns_subs; i++) {
@@ -10773,6 +11461,24 @@ moqr_core_route_dump_text(const moqr_core_t *c, char *buf, size_t cap,
     }
     if (!any) {
         rd_addf(&w, "  (none)\n");
+    }
+
+    if (c->cluster_enabled) {
+        rd_addf(&w, "cluster_routes:\n");
+        for (uint32_t ri = 0; ri < c->max_cluster_routes; ri++) {
+            const r_cluster_route_t *r = &c->cluster_routes[ri];
+            if (!r->used) continue;
+            rd_addf(&w, "  ");
+            rd_node_ns(&w, c, r->node, false);
+            rd_addf(&w, " -> binding %llu generation=%llu cost=%llu advertised_cost=%llu path=[",
+                (unsigned long long)c->bindings[r->binding].cookie,
+                (unsigned long long)r->lifetime,
+                (unsigned long long)r->cost,
+                (unsigned long long)(cluster_route_warm(c, ri) ? 0 : r->cost));
+            for (uint32_t hi = 0; hi < r->hop_count; hi++)
+                rd_addf(&w, hi == 0 ? "%llu" : ",%llu", (unsigned long long)cluster_path(c, ri)[hi]);
+            rd_addf(&w, "]\n");
+        }
     }
 
     rd_addf(&w, "namespace_subscriptions:\n");

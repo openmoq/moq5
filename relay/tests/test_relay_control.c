@@ -4554,7 +4554,7 @@ test_capacity_gpos_oracle(void)
         cfg.log_budget.max_bytes = 1u << 20;
         cfg.log_max_subgroups = max_sg;
         moqr_core_capacity_t cap;
-        moqr_core_capacity_describe(&cfg, &cap);
+        moqr_core_capacity_describe(&cfg, &cap, sizeof(cap));
         cap_struct[k] = cap.structure_bytes;
         moqr_core_t *c = NULL;
         MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_OK);
@@ -7316,7 +7316,7 @@ test_location_capacity_reuse(void)
     failures += location_expect(c, b, journal_slots, 0, 0);
     failures += location_idle(c, b);
     moqr_core_capacity_t model;
-    moqr_core_capacity_describe(&cfg, &model);
+    moqr_core_capacity_describe(&cfg, &model, sizeof(model));
     MOQ_TEST_CHECK((uint64_t)a.live <= model.structure_bytes + model.payload_bytes);
     moqr_core_destroy(c);
     MOQ_TEST_CHECK_EQ_INT((int)a.live, 0);
@@ -8252,10 +8252,11 @@ take_rec(moqr_core_t *c, moqr_binding_t b, uint64_t now, uint64_t object_id,
     MOQ_TEST_CHECK_EQ_U64(d.notice, MOQR_DELIVERY_NOTICE_NONE);
     MOQ_TEST_CHECK_EQ_U64(d.rec.object_id, object_id);
     bool props = false;
+    uint32_t list = 0;
     *follows_gap = false;
     *gap_reset = moqr_reset_desc_none();
     MOQ_TEST_CHECK(moqr_core_internal_delivery_flags(c, b, &props, follows_gap,
-                                                     gap_reset) == MOQR_OK);
+                                                     gap_reset, &list) == MOQR_OK);
     MOQ_TEST_CHECK(moqr_core_delivery_done(c, b, MOQR_DELIVERY_DELIVERED, now) ==
                    MOQR_OK);
     return failures;

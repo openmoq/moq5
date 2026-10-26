@@ -160,19 +160,21 @@
  *     stream that finds no mapping free beyond that reserve is held too:
  *     MOQ_ERR_INPUT_NOT_CONSUMED, with the same zero-consumption and
  *     exact-redelivery obligations as above.
- *   - On the same profiles, a NEW peer uni stream whose first chunk carries
- *     a complete data stream type (a subgroup or fetch header) and finds no
+ *   - On the same profiles, a NEW peer uni stream whose type completes as
+ *     a data stream (a subgroup or fetch header) and finds no
  *     mapping free beyond the reserve is held the same way; a NEW peer uni
- *     stream whose first chunk carries a complete padding stream type is
+ *     stream whose type completes as padding is
  *     then refused with MOQ_BRIDGE_INGRESS_REFUSE_CANCEL and never held. A
- *     stream whose first chunk is the control type, an incomplete type or
- *     an unknown type is never held or refused this way: it takes a free
- *     mapping as without this capability, and a full stream map is fatal
- *     for it.
+ *     possible control stream is never cancelled for capacity. Use the
+ *     prefix-state ingress below: incomplete types collect in the adapter's
+ *     existing receive record, without a mapping or hold slot. Classification
+ *     continues while control input is retained, but session delivery does
+ *     not. A completed DATA callback gets bounded map/hold ownership or a
+ *     refusal immediately; invalid types and truncated FIN remain errors.
  *   - On a profile whose control channel is one bidirectional stream (draft
  *     16, where every peer unidirectional stream is data), a NEW peer uni
- *     stream that finds no free stream mapping is held the same way. The
- *     draft-16 control stream is never held.
+ *     stream or non-control request bidi that finds no free stream mapping
+ *     is held the same way. The draft-16 control stream is never held.
  *   - Every held stream (uni or bidi) takes one hold record; there are
  *     max_pending of them. Held streams are offered for redelivery oldest
  *     first, and a new arrival waits behind them.
@@ -241,6 +243,10 @@ typedef enum moq_transport_cap {
     MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT = 1u << 5,
     /* The endpoint calls moq_transport_bridge_on_stream_drained(). */
     MOQ_TRANSPORT_CAP_STREAM_DRAINED = 1u << 6,
+    /* write() and write_payload() refuse only when the connection-wide
+     * budget for the stream bytes the endpoint holds is spent (see "Shared
+     * admission" below). */
+    MOQ_TRANSPORT_CAP_SHARED_ADMISSION = 1u << 7,
 } moq_transport_cap_t;
 
 /* Private ingress outcome of on_peer_uni_bytes / on_peer_uni_rcbuf /
@@ -271,6 +277,30 @@ typedef enum moq_transport_cap {
  *
  * write() and write_payload(): all-or-nothing. Consume all bytes or
  * reject with WOULD_BLOCK. No partial consumption.
+ *
+ * Without MOQ_TRANSPORT_CAP_SHARED_ADMISSION a refused write holds back only
+ * its own stream: the bridge goes on to the next ready stream.
+ *
+ * -- Shared admission (MOQ_TRANSPORT_CAP_SHARED_ADMISSION) --
+ *
+ * The endpoint holds the stream bytes it accepts in one budget for the whole
+ * connection, and write() and write_payload() return WOULD_BLOCK only when
+ * that budget is spent. Such a refusal is not about its stream: no write
+ * adding bytes to any stream can be accepted until the endpoint has capacity
+ * again -- once its transport takes queued bytes, which happens between
+ * bridge services, or once it drops a stream's queued bytes for a reset the
+ * bridge issues. A write of no bytes with FIN may still be accepted while the
+ * budget is spent (the endpoint can mark the FIN on bytes it still holds for
+ * that stream). The results of open_uni, open_bidi, reset_stream,
+ * reset_stream_at, abort_stream, stop_sending and close_transport keep their
+ * own meaning.
+ *
+ * After such a refusal, the bridge offers no further write adding bytes in
+ * that hand-off of queued data, unless a reset it issues there is accepted;
+ * FIN-only writes and resets still go. It offers data again at its next
+ * hand-off. An endpoint that reports its budget through budget_spent() is
+ * asked at the start of each hand-off instead, and a spent budget makes the
+ * whole hand-off one that follows a refusal.
  *
  * -- Reset/stop/close contract --
  *
@@ -369,6 +399,18 @@ typedef struct moq_transport_endpoint_ops {
     moq_transport_result_t (*reset_stream_at)(void *ctx, uint64_t stream_id,
                                               uint64_t error_code,
                                               uint64_t reliable_size);
+    /*
+     * OPTIONAL, read only with MOQ_TRANSPORT_CAP_SHARED_ADMISSION: true when
+     * the connection-wide budget is spent right now, so write() and
+     * write_payload() would refuse every write adding bytes. It must change
+     * no state, and must answer false whenever it cannot tell. The bridge
+     * then begins a hand-off of queued data as it would after such a
+     * refusal, without first making the write that would be refused.
+     * Appended after reset_stream_at; the bridge reads it by byte offset
+     * only when struct_size covers it, so an adapter built against the
+     * smaller struct keeps the old behavior.
+     */
+    bool (*budget_spent)(void *ctx);
 } moq_transport_endpoint_ops_t;
 
 #ifdef __cplusplus
@@ -541,6 +583,36 @@ MOQ_API moq_result_t moq_transport_bridge_on_peer_uni_rcbuf(
     moq_transport_bridge_t *brg, uint64_t stream_id,
     moq_rcbuf_t *data, bool fin, uint64_t now_us);
 
+/* Held-stream adapters keep this parser state in their existing receive
+ * record, zeroed on creation and discarded with that exact stream identity.
+ * The bridge alone reads/writes it. At most eight bytes can precede a complete
+ * vi64 type; the ninth byte completes even a nonminimal encoding. Accepted
+ * prefixes consume no stream-map entry or control reservation. Their storage
+ * follows the adapter's bounded receive population, not cumulative stream IDs.
+ *
+ * Use these entry points for every uni delivery and replay when declaring
+ * HOLD_BIDI_INPUT. Collection accepts the entire incomplete fragment and must
+ * permit later type bytes even while other control input is pending. Once
+ * classified, admission may refuse the entire CURRENT chunk; accepted prefix
+ * bytes stay in this state or move into the bridge mapping and are never
+ * redelivered by the adapter. FIN/RESET and teardown keep their usual meaning.
+ * No borrowed rcbuf reference survives a call merely to collect its prefix.
+ * This is private, lockstep adapter state, not an application API. */
+typedef struct moq_transport_uni_prefix {
+    uint8_t bytes[8];
+    uint8_t len;
+} moq_transport_uni_prefix_t;
+
+MOQ_API moq_result_t moq_transport_bridge_on_peer_uni_prefix_bytes(
+    moq_transport_bridge_t *brg, uint64_t stream_id,
+    moq_transport_uni_prefix_t *prefix, const uint8_t *data, size_t len,
+    bool fin, uint64_t now_us);
+
+MOQ_API moq_result_t moq_transport_bridge_on_peer_uni_prefix_rcbuf(
+    moq_transport_bridge_t *brg, uint64_t stream_id,
+    moq_transport_uni_prefix_t *prefix, moq_rcbuf_t *data, bool fin,
+    uint64_t now_us);
+
 MOQ_API moq_result_t moq_transport_bridge_on_peer_bidi_bytes(
     moq_transport_bridge_t *brg, uint64_t stream_id,
     const uint8_t *data, size_t len, bool fin, uint64_t now_us);
@@ -634,7 +706,11 @@ MOQ_API moq_result_t moq_transport_bridge_on_peer_stop_sending(
 /*
  * The endpoint holds no more bytes of local data stream `stream_id` (its send
  * queue emptied). After the FIN the stream leaves the priority order;
- * otherwise its next write sets its key again. Without
+ * otherwise its next write sets its key again. A queued FETCH object whose
+ * publisher priority differs from the held objects becomes eligible now;
+ * a draft-22 fill also waits when its group changes. Objects in the same
+ * scheduling class may be handed over together. This is local send
+ * queue exhaustion, not peer acknowledgment. Without
  * MOQ_TRANSPORT_CAP_STREAM_DRAINED the bridge keys every write and drops the
  * stream from the order at the FIN. Its peers move up, so it may call
  * set_stream_priority for them before it returns.

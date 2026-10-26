@@ -250,12 +250,12 @@ struct MSFCatalogVersionTests {
         return try JSONDecoder().decode(MSFCatalog.self, from: Data(json.utf8))
     }
 
-    @Test("Accepts canonical String version \"1\"")
+    @Test("Accepts compatibility String version \"1\"")
     func acceptsStringOne() throws {
         #expect(try decode("\"1\"").version == 1)
     }
 
-    @Test("Accepts the draft-01 convention")
+    @Test("Accepts the canonical draft-01 String")
     func acceptsDraft01() throws {
         #expect(try decode("\"draft-01\"").version == 1)
     }
@@ -272,33 +272,47 @@ struct MSFCatalogVersionTests {
         }
     }
 
-    @Test("Encodes the canonical String version \"1\"")
+    @Test("Encodes the literal draft-01 version for default and explicit version 1")
     func encodesCanonicalString() throws {
-        let data = try JSONEncoder().encode(MSFCatalog(version: 1, tracks: []))
-        let json = String(data: data, encoding: .utf8)!
-        #expect(json.contains("\"version\":\"1\""))
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        for catalog in [MSFCatalog(), MSFCatalog(version: 1, tracks: [])] {
+            let json = String(decoding: try encoder.encode(catalog), as: UTF8.self)
+            #expect(json == #"{"tracks":[],"version":"draft-01"}"#)
+        }
     }
 
     @Test("Encoding an unsupported version throws (no wire we'd refuse to parse)")
     func encodingUnsupportedVersionThrows() throws {
-        #expect(throws: (any Error).self) {
-            _ = try JSONEncoder().encode(MSFCatalog(version: 2, tracks: []))
+        for version in [-1, 0, 2] {
+            #expect(throws: EncodingError.self) {
+                _ = try JSONEncoder().encode(MSFCatalog(version: version, tracks: []))
+            }
         }
     }
 
-    @Test("Round-trips a libmoq-style MSF-01 catalog (String version)")
-    func roundTripsStringVersion() throws {
+    @Test("Re-encodes all supported version spellings as literal draft-01",
+          arguments: ["\"draft-01\"", "\"1\"", "1"])
+    func roundTripsStringVersion(_ versionLiteral: String) throws {
         let json = """
-        {"version":"1","generatedAt":1,"tracks":[\
+        {"version":\(versionLiteral),"generatedAt":1,"tracks":[\
         {"name":"video","packaging":"loc","isLive":true,"role":"video","codec":"avc1.42e01e"}]}
         """
         let decoded = try JSONDecoder().decode(MSFCatalog.self, from: Data(json.utf8))
         #expect(decoded.version == 1)
         #expect(decoded.tracks.map(\.name) == ["video"])
 
-        // Re-encode → canonical String "1".
-        let reJson = String(data: try JSONEncoder().encode(decoded), encoding: .utf8)!
-        #expect(reJson.contains("\"version\":\"1\""))
+        // Check literal output before the tolerant decoder can mask its spelling.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(decoded)
+        let reJson = String(decoding: data, as: UTF8.self)
+        #expect(reJson == """
+        {"generatedAt":1,"tracks":[\
+        {"codec":"avc1.42e01e","isLive":true,"name":"video","packaging":"loc","role":"video"}],\
+        "version":"draft-01"}
+        """)
+        #expect(try JSONDecoder().decode(MSFCatalog.self, from: data) == decoded)
     }
 }
 
@@ -546,6 +560,7 @@ struct MSFInitDataListTests {
         #expect(cat.initDataList?[1].id == "init-a")
         #expect(cat.tracks[0].initRef == "init-v")   // references the entry id
 
+        // Value round-trip only; this does not verify §5.1.7's JSON member order.
         let data = try JSONEncoder().encode(cat)
         let back = try JSONDecoder().decode(MSFCatalog.self, from: data)
         #expect(back == cat)
@@ -773,13 +788,13 @@ struct MSFDeltaUpdateTests {
             MSFCatalog.self, from: try JSONEncoder().encode(cat)) == cat)
     }
 
-    @Test("Independent catalog still encodes version + tracks and no deltaUpdate")
+    @Test("Independent catalog encodes draft-01 + tracks and no deltaUpdate")
     func independentUnchanged() throws {
         let cat = MSFCatalog(version: 1, tracks: [
             MSFTrack(name: "v", packaging: "loc", isLive: true)
         ])
         let s = String(decoding: try JSONEncoder().encode(cat), as: UTF8.self)
-        #expect(s.contains("\"version\":\"1\""))
+        #expect(s.contains("\"version\":\"draft-01\""))
         #expect(s.contains("\"tracks\""))
         #expect(!s.contains("deltaUpdate"))
     }
