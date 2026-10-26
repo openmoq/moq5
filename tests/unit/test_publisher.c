@@ -3,6 +3,7 @@
 #include <moq/wire.h>   /* MOQ_QUIC_VARINT_MAX */
 #include "test_session_support.h"
 #include "publisher_track_old_layout.h"
+#include "../../core/src/spi/core_spi.h"
 #include <stddef.h>
 #include <stdio.h>
 #include <moq/control.h>
@@ -1834,6 +1835,18 @@ static void test_reset_group(void) {
     /* No subscriber / no open group: no-op OK. */
     MOQ_TEST_CHECK(moq_pub_reset_group(pub, track, 0,
         moq_simpair_now_us(sp)) == MOQ_OK);
+    bool did_reset = true;
+    MOQ_TEST_CHECK(moq_core_internal_pub_reset_group(NULL, track, 0,
+        moq_simpair_now_us(sp), &did_reset) == MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK(!did_reset);
+    did_reset = true;
+    MOQ_TEST_CHECK(moq_core_internal_pub_reset_group(pub, NULL, 0,
+        moq_simpair_now_us(sp), &did_reset) == MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK(!did_reset);
+    did_reset = true;
+    MOQ_TEST_CHECK(moq_core_internal_pub_reset_group(pub, track, 0,
+        moq_simpair_now_us(sp), &did_reset) == MOQ_OK);
+    MOQ_TEST_CHECK(!did_reset);   /* no subscriber/open subgroup */
 
     /* Subscribe + accept. */
     moq_subscribe_cfg_t scfg;
@@ -1870,6 +1883,15 @@ static void test_reset_group(void) {
 
     /* Abandon the open group: the publisher must emit a RESET_DATA action
      * (RESET_STREAM on the wire), not a clean close. */
+    /* A missing private output is rejected without abandoning the group;
+     * the existing public call below must still perform its reset. */
+    MOQ_TEST_CHECK(moq_core_internal_pub_reset_group(pub, track, 0x10,
+        moq_simpair_now_us(sp), NULL) == MOQ_ERR_INVAL);
+    did_reset = true;
+    MOQ_TEST_CHECK(moq_core_internal_pub_reset_group(pub, track,
+        MOQ_QUIC_VARINT_MAX + 1, moq_simpair_now_us(sp), &did_reset)
+        == MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK(!did_reset);
     MOQ_TEST_CHECK(moq_pub_reset_group(pub, track, 0x10,
         moq_simpair_now_us(sp)) == MOQ_OK);
     bool saw_reset = false;
@@ -1890,9 +1912,55 @@ static void test_reset_group(void) {
     moq_rcbuf_decref(p1);
     moq_simpair_run_until_quiescent(sp, 8, NULL);
 
+    /* Same implementation via the private entry: true for an actual reset,
+     * false on the next call, rather than a cumulative publisher count. */
+    did_reset = false;
+    MOQ_TEST_CHECK(moq_core_internal_pub_reset_group(pub, track, 0x10,
+        moq_simpair_now_us(sp), &did_reset) == MOQ_OK);
+    MOQ_TEST_CHECK(did_reset);
+    did_reset = true;
+    MOQ_TEST_CHECK(moq_core_internal_pub_reset_group(pub, track, 0x10,
+        moq_simpair_now_us(sp), &did_reset) == MOQ_OK);
+    MOQ_TEST_CHECK(!did_reset);
+
     /* A second reset with nothing open is a no-op again. */
     MOQ_TEST_CHECK(moq_pub_reset_group(pub, track, 0,
         moq_simpair_now_us(sp)) == MOQ_OK);
+
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    /* Retire a subgroup through the public session API before the facade
+     * observes it. The facade then encounters STALE_HANDLE: not a new reset. */
+    moq_rcbuf_t *p2 = NULL;
+    moq_rcbuf_create(&alloc, d1, sizeof(d1), &p2);
+    MOQ_TEST_CHECK(moq_pub_write_object(pub, track, 2, 0, p2,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    moq_rcbuf_decref(p2);
+    moq_simpair_run_until_quiescent(sp, 8, NULL);
+    moq_session_t *session = moq_simpair_server(sp);
+    moq_subgroup_handle_t subgroup = MOQ_SUBGROUP_INVALID;
+    size_t open = 0;
+    for (size_t i = 0; i < session->sg_cap; i++) {
+        const moq_sg_entry_t *sg = &session->subgroups[i];
+        if (sg->state != MOQ_SG_OPEN || sg->group_id != 2) continue;
+        subgroup._opaque = moq_handle_pack(MOQ_HANDLE_POOL_SUBGROUP,
+            session->session_tag, sg->generation, (uint32_t)i);
+        open++;
+    }
+    MOQ_TEST_CHECK_EQ_U64(open, 1);
+    MOQ_TEST_CHECK(moq_session_reset_subgroup(session, subgroup, 0x10,
+        moq_simpair_now_us(sp)) == MOQ_OK);
+    did_reset = true;
+    MOQ_TEST_CHECK(moq_core_internal_pub_reset_group(pub, track, 0x10,
+        moq_simpair_now_us(sp), &did_reset) == MOQ_OK);
+    MOQ_TEST_CHECK(!did_reset);
+    size_t resets = 0;
+    { moq_action_t acts[8];
+      size_t na = moq_session_poll_actions(session, acts, 8);
+      for (size_t i = 0; i < na; i++) {
+          if (acts[i].kind == MOQ_ACTION_RESET_DATA) resets++;
+          moq_action_cleanup(&acts[i]);
+      } }
+    MOQ_TEST_CHECK_EQ_U64(resets, 1);   /* only the direct session reset */
 
     moq_pub_remove_track(pub, track, moq_simpair_now_us(sp));
     moq_pub_destroy(pub);

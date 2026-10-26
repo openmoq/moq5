@@ -1436,6 +1436,9 @@ static void expect_conserved(moq_media_sender_t *s, uint64_t written,
  * only the wire shows that the publisher reset the cancelled subscription's
  * open subgroup. */
 static int g_cancel_resets;
+/* These fixture media objects have nonempty payload/properties. A non-FIN
+ * SEND_DATA with header bytes but no payload is their subgroup header. */
+static int g_subgroup_headers;
 
 static void trace_cancel_resets(void *ctx, const moq_sim_trace_record_t *r)
 {
@@ -1443,6 +1446,12 @@ static void trace_cancel_resets(void *ctx, const moq_sim_trace_record_t *r)
     if (r->kind == MOQ_SIM_TRACE_ACTION && r->from == MOQ_PERSPECTIVE_CLIENT &&
         r->action_kind == MOQ_ACTION_RESET_DATA && r->code == 0x1)
         g_cancel_resets++;
+    if (r->kind == MOQ_SIM_TRACE_ACTION && r->from == MOQ_PERSPECTIVE_CLIENT &&
+        r->action_kind == MOQ_ACTION_SEND_DATA && r->bytes.len > 0 &&
+        r->count == 0 &&
+        r->struct_size >= offsetof(moq_sim_trace_record_t, fin) + sizeof(r->fin) &&
+        !r->fin)
+        g_subgroup_headers++;
 }
 
 static moq_simpair_t *make_pair(moq_alloc_t *alloc, uint32_t max_actions,
@@ -1452,6 +1461,7 @@ static moq_simpair_t *make_pair(moq_alloc_t *alloc, uint32_t max_actions,
     cfg.alloc = alloc; cfg.seed = 42; cfg.initial_now_us = 1000;
     cfg.trace_fn = trace_cancel_resets;
     g_cancel_resets = 0;
+    g_subgroup_headers = 0;
     cfg.client_send_request_capacity = true;
     cfg.client_initial_request_capacity = 32;
     cfg.server_send_request_capacity = true;
@@ -1653,10 +1663,11 @@ static bool fix_init_drop_act(fix_t *fix, moq_alloc_t *alloc, uint64_t now,
 /* Same, with an explicit drop policy. */
 static bool fix_init_policy_act(fix_t *fix, moq_alloc_t *alloc, uint64_t now,
                                 uint32_t queue_objects, uint32_t max_actions,
-                                moq_media_send_backpressure_t policy)
+                                moq_media_send_backpressure_t policy,
+                                moq_version_t version)
 {
     return fix_init_q2(fix, alloc, max_actions, false, now, queue_objects,
-                       true, false, NULL, -1, PACING_VERSION, policy);
+                       true, false, NULL, -1, version, policy);
 }
 
 /* The peer subscribes to one media track; returns once SUBSCRIBE_OK arrived
@@ -2256,14 +2267,14 @@ static void test_demand_loss_after_emission(uint64_t version)
     /* That reset (asserted on the wire above) surfaces no SUBGROUP_RESET:
      * the subscriber deleted the subscription state when it cancelled,
      * stopped its streams and discards what still arrives for them. The
-     * service discharges its abandonment once. */
+     * service discharges its local abandonment once, with no new reset. */
     expect_resets(&fix, NULL, 0, "demand-loss-departure");
     moq_media_sender_stats_t st;
     memset(&st, 0, sizeof(st));
     MOQ_TEST_CHECK(moq_media_sender_get_stats(fix.s, &st, sizeof(st)) == MOQ_OK);
     MOQ_TEST_CHECK_EQ_U64(st.groups_dropped, 1);
     MOQ_TEST_CHECK_EQ_U64(st.keyframes_dropped, 0);
-    MOQ_TEST_CHECK_EQ_U64(st.groups_abandoned, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.groups_abandoned, 0);
     MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_reset_attempts(fix.s), 1);
     expect_conserved(fix.s, 5, 3, 0, 2, 0, "demand-loss-final");
 out:
@@ -3657,11 +3668,11 @@ out:
  *
  *  Facade semantics, which decide this row's oracle: once the
  *  subscriber has left, moq_pub_reset_group() finds no active slot with an open
- *  subgroup (publisher.c:2865) and returns MOQ_OK having emitted nothing, and
+ *  subgroup and returns MOQ_OK having emitted nothing, and
  *  the departed peer observes neither the RESET nor the END_OF_TRACK. The
  *  observable is therefore the SERVICE-side transition -- the obligation
- *  discharged and counted exactly once -- not a wire sequence. No seam was
- *  invented to manufacture one.
+ *  discharged once WITHOUT counting another reset -- not a wire sequence.
+ *  No seam was invented to manufacture one.
  * ===================================================================== */
 static void test_terminal_flushes_reset(void)
 {
@@ -3722,7 +3733,7 @@ static void test_terminal_flushes_reset(void)
     drive(&fix, now);
     {
         drop_snap_t st; drop_snap(fix.s, &st);
-        MOQ_TEST_CHECK_EQ_U64(st.abandoned, 1);   /* discharged and counted */
+        MOQ_TEST_CHECK_EQ_U64(st.abandoned, 0);   /* local completion only */
     }
     /* The row started from a declared zero, so the count is exact: that hook
      * made exactly ONE attempt. */
@@ -3731,7 +3742,7 @@ static void test_terminal_flushes_reset(void)
     {   /* Exactly once: no further hook repeats the transition, and no
          * further hook even attempts it. */
         drop_snap_t st; drop_snap(fix.s, &st);
-        MOQ_TEST_CHECK_EQ_U64(st.abandoned, 1);
+        MOQ_TEST_CHECK_EQ_U64(st.abandoned, 0);
         MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_reset_attempts(fix.s), 1);
     }
     /* The departed video peer observes nothing; audio is unaffected. */
@@ -3896,7 +3907,7 @@ out:
  *  session_subscribe.c:545+), so a one-session pair cannot produce two
  *  subscription slots. The accepted publication is the public second slot.
  * ===================================================================== */
-static void test_reset_partial_fanout(void)
+static void test_reset_partial_fanout(bool stale_remaining)
 {
     int before = failures;
     test_alloc_state_t as = {0};
@@ -4017,6 +4028,35 @@ static void test_reset_partial_fanout(void)
             MOQ_TEST_CHECK(!(fix.term[i].track == 0 && fix.term[i].group == 0));
     }
 
+    if (stale_remaining) {
+        /* Retire the remaining subgroup directly through the session before
+         * the next sender hook. This is a test-only driver of the real API,
+         * using the existing layout access to identify the one open g0 slot.
+         * The facade's next reset then sees a stale handle, with NO new reset
+         * effect. The service must remember its first successful slot across
+         * WOULD_BLOCK rather than counting only the last call's effects. */
+        moq_session_t *session = moq_simpair_client(fix.sp);
+        moq_subgroup_handle_t subgroup = MOQ_SUBGROUP_INVALID;
+        size_t open = 0;
+        for (size_t i = 0; i < session->sg_cap; i++) {
+            const moq_sg_entry_t *sg = &session->subgroups[i];
+            if (sg->state != MOQ_SG_OPEN || sg->group_id != 0) continue;
+            subgroup._opaque = moq_handle_pack(MOQ_HANDLE_POOL_SUBGROUP,
+                session->session_tag, sg->generation, (uint32_t)i);
+            open++;
+        }
+        MOQ_TEST_CHECK_EQ_U64(open, 1);
+        uint32_t a0 = moq_media_sender_test_reset_attempts(fix.s);
+        MOQ_TEST_CHECK(moq_session_reset_subgroup(session, subgroup, 0x10, now)
+                       == MOQ_OK);
+        MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(fix.sp, 64, NULL) == MOQ_OK);
+        collect(&fix, now);   /* delivery only: no sender hook */
+        MOQ_TEST_CHECK_EQ_INT(fix.reset_n, 2);
+        MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_reset_attempts(fix.s), a0);
+        drop_snap_t d; drop_snap(fix.s, &d);
+        MOQ_TEST_CHECK_EQ_U64(d.abandoned, 0);   /* still not completed */
+    }
+
     /* Capacity returns: the remaining slot is retired on a later hook, the
      * service abandonment is counted exactly once, and no hook duplicates it. */
     for (int i = 0; i < 40 && fix.reset_n < 2; i++) drive(&fix, now);
@@ -4024,6 +4064,10 @@ static void test_reset_partial_fanout(void)
     {
         drop_snap_t d; drop_snap(fix.s, &d);
         MOQ_TEST_CHECK_EQ_U64(d.abandoned, 1);
+        moq_media_sender_track_stats_t ts = {0};
+        MOQ_TEST_CHECK(moq_media_sender_get_track_stats(fix.s, fix.t[0], &ts,
+                                                       sizeof(ts)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(ts.groups_abandoned, 1);
     }
     {   /* Exactly one RESET per peer slot, matched by exact handle so the two
          * otherwise-identical records cannot authorize each other. */
@@ -4074,7 +4118,8 @@ static void test_reset_partial_fanout(void)
 out:
     fix_free(&fix);
     MOQ_TEST_CHECK(as.balance == 0);
-    report(&fix, "pacing_reset_partial_fanout", before);
+    report(&fix, stale_remaining ? "pacing_reset_partial_fanout_stale_remainder"
+                                 : "pacing_reset_partial_fanout", before);
 }
 
 /* ===================================================================== *
@@ -5025,6 +5070,7 @@ out:
  *  objects were delivered MUST be reset, never closed with a FIN.
  * ===================================================================== */
 static void test_drop_blocked_group(moq_media_send_backpressure_t policy,
+                                    moq_version_t version, bool header_only,
                                     const char *name)
 {
     int before = failures;
@@ -5032,21 +5078,43 @@ static void test_drop_blocked_group(moq_media_send_backpressure_t policy,
     moq_alloc_t alloc = test_allocator(&as);
     fix_t fix;
     uint64_t now = 1000;
-    enum { QCAP = 2, ACTS = 4 };
-    if (!fix_init_policy_act(&fix, &alloc, now, QCAP, ACTS, policy)) {
+    enum { QCAP = 2 };
+    /* Four actions allow g0's header + two object actions + FIN, but no g1
+     * header. Five also open g1, then refuse its two-action object write. */
+    uint32_t acts = header_only ? 5u : 4u;
+    if (!fix_init_policy_act(&fix, &alloc, now, QCAP, acts, policy, version)) {
         failures++; goto out;
     }
     if (!subscribe_track(&fix, 0, "v", now)) { failures++; goto out; }
     set_phase(&fix, PHASE_PACE);
 
     int from = fix.tr.n;
+    int headers_before = g_subgroup_headers;
     MOQ_TEST_CHECK(write_obj(&fix, 0, 0xd0, true, true, 1000) == MOQ_OK);
     MOQ_TEST_CHECK(write_obj(&fix, 0, 0xd1, true, true, 2000) == MOQ_OK);
     drive(&fix, now);
     /* Group 0 went out; group 1 was refused by the session, not dropped. */
     expect_conserved(fix.s, 2, 1, 1, 0, PAYLOAD_LEN, "blkdrop-g1-refused");
     MOQ_TEST_CHECK_EQ_INT(fix.tr.n - from, 1);
+    MOQ_TEST_CHECK_EQ_INT(g_subgroup_headers - headers_before,
+                          header_only ? 2 : 1);
+    MOQ_TEST_CHECK_EQ_INT(fix.reset_n, 0);
     MOQ_TEST_CHECK(!moq_media_sender_is_fatal(fix.s));
+
+    /* Only the first control object has reached the peer. Capture its group
+     * before eviction or any observation of the target group's reset. MSF on
+     * draft-22 seeds groups from an epoch base; this checks relative identity,
+     * not that wall-clock seed. Legacy drafts retain the absolute-zero oracle.
+     * Group numbers below are offsets from this one stable anchor. */
+    if (fix.tr.n - from != 1) goto out;
+    uint64_t group_base = version == MOQ_VERSION_DRAFT_22
+        ? fix.tr.recs[from].group : 0;
+    MOQ_TEST_CHECK(group_base <= MOQ_QUIC_VARINT_MAX - 4u);
+    if (group_base > MOQ_QUIC_VARINT_MAX - 4u) goto out;
+    {
+        const tr_exp_t anchor[1] = { { 0, group_base, 0, 0xd0, 0 } };
+        expect_from(&fix, from, anchor, 1, "blkdrop-base-anchor");
+    }
 
     /* Two newer keyframe groups overflow the bound of two: the oldest group,
      * group 1, is evicted whole and the newest sync point is kept. */
@@ -5095,26 +5163,34 @@ static void test_drop_blocked_group(moq_media_send_backpressure_t policy,
     /* Every delivered object, exactly, in order: group 1 never appears, and
      * the groups after it keep their own ids. */
     {
-        const tr_exp_t exp[4] = { { 0, 0, 0, 0xd0, 0 }, { 0, 2, 0, 0xd2, 2 },
-                                  { 0, 3, 0, 0xd3, 3 }, { 0, 4, 0, 0xd4, 4 } };
+        const tr_exp_t exp[4] = { { 0, group_base, 0, 0xd0, 0 },
+                                  { 0, group_base + 2, 0, 0xd2, 2 },
+                                  { 0, group_base + 3, 0, 0xd3, 3 },
+                                  { 0, group_base + 4, 0, 0xd4, 4 } };
         expect_from(&fix, from, exp, 4, "blkdrop-media");
     }
     /* Complete groups 0, 2 and 3 FIN; group 4 is still open. Group 1 never
      * FINs: its only object was dropped before it was delivered. */
     {
-        const term_exp_t terms[3] = { { 0, 0, 0, true, true },
-                                      { 0, 2, 0, true, true },
-                                      { 0, 3, 0, true, true } };
+        const term_exp_t terms[3] = { { 0, group_base, 0, true, true },
+                                      { 0, group_base + 2, 0, true, true },
+                                      { 0, group_base + 3, 0, true, true } };
         expect_terminals(&fix, terms, 3, "blkdrop-terminals");
     }
-    /* No object of group 1 reached the peer, so draft-18 11.4.3 owes it no
-     * RESET; one is allowed only if its subgroup was opened. A RESET of any
-     * other group would truncate a complete one. */
-    MOQ_TEST_CHECK(fix.reset_n <= 1);
-    for (int i = 0; i < fix.reset_n && i < RESET_MAX; i++)
-        MOQ_TEST_CHECK(fix.reset[i].track == 0 && fix.reset[i].group == 1 &&
-                       fix.reset[i].subgroup == 0);
-    fix.reset_consumed = fix.reset_n;
+    /* An opened header-only subgroup must reset. In this library's unopened
+     * local-operation case there is no stream to reset, so expect none. */
+    {
+        const reset_exp_t rexp[1] = {
+            { 0, group_base + 1, 0, 0x10, true, .sub_opaque = 0, .pub_opaque = 0 } };
+        expect_resets(&fix, rexp, header_only ? 1 : 0, "blkdrop-resets");
+        moq_media_sender_stats_t st = {0};
+        moq_media_sender_track_stats_t ts = {0};
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(fix.s, &st, sizeof(st)) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_media_sender_get_track_stats(fix.s, fix.t[0], &ts,
+                                                       sizeof(ts)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(st.groups_abandoned, header_only ? 1u : 0u);
+        MOQ_TEST_CHECK_EQ_U64(ts.groups_abandoned, header_only ? 1u : 0u);
+    }
 
 out:
     fix_free(&fix);
@@ -5126,6 +5202,7 @@ out:
  * object was delivered, so the evicted tail leaves a subgroup on the wire that
  * draft-18 11.4.3 requires to be reset, not FINed truncated. */
 static void test_drop_blocked_tail(moq_media_send_backpressure_t policy,
+                                   moq_version_t version,
                                    const char *name)
 {
     int before = failures;
@@ -5134,7 +5211,7 @@ static void test_drop_blocked_tail(moq_media_send_backpressure_t policy,
     fix_t fix;
     uint64_t now = 1000;
     enum { QCAP = 2, ACTS = 4 };
-    if (!fix_init_policy_act(&fix, &alloc, now, QCAP, ACTS, policy)) {
+    if (!fix_init_policy_act(&fix, &alloc, now, QCAP, ACTS, policy, version)) {
         failures++; goto out;
     }
     if (!subscribe_track(&fix, 0, "v", now)) { failures++; goto out; }
@@ -5143,6 +5220,19 @@ static void test_drop_blocked_tail(moq_media_send_backpressure_t policy,
     int from = fix.tr.n;
     MOQ_TEST_CHECK(write_obj(&fix, 0, 0xe8, true, true, 1000) == MOQ_OK);
     drive(&fix, now);
+    /* Anchor to the first delivered control BEFORE writing the target group,
+     * never to that group's delivered object or RESET. As above, draft-22's
+     * absolute MSF wall-clock seed is outside this pacing proof. */
+    MOQ_TEST_CHECK_EQ_INT(fix.tr.n - from, 1);
+    if (fix.tr.n - from != 1) goto out;
+    uint64_t group_base = version == MOQ_VERSION_DRAFT_22
+        ? fix.tr.recs[from].group : 0;
+    MOQ_TEST_CHECK(group_base <= MOQ_QUIC_VARINT_MAX - 3u);
+    if (group_base > MOQ_QUIC_VARINT_MAX - 3u) goto out;
+    {
+        const tr_exp_t anchor[1] = { { 0, group_base, 0, 0xe8, 0 } };
+        expect_from(&fix, from, anchor, 1, "blktail-base-anchor");
+    }
     MOQ_TEST_CHECK(write_obj(&fix, 0, 0xe9, true, true, 2000) == MOQ_OK);
     MOQ_TEST_CHECK(write_obj(&fix, 0, 0xea, false, false, 2500) == MOQ_OK);
     drive(&fix, now);
@@ -5182,25 +5272,130 @@ static void test_drop_blocked_tail(moq_media_send_backpressure_t policy,
     MOQ_TEST_CHECK(moq_media_sender_track_has_subscriber(fix.s, fix.t[0]));
     expect_conserved(fix.s, 5, 4, 0, 1, 0, "blktail-drained");
     {
-        const tr_exp_t exp[4] = { { 0, 0, 0, 0xe8, 0 }, { 0, 1, 0, 0xe9, 1 },
-                                  { 0, 2, 0, 0xeb, 3 }, { 0, 3, 0, 0xec, 4 } };
+        const tr_exp_t exp[4] = { { 0, group_base, 0, 0xe8, 0 },
+                                  { 0, group_base + 1, 0, 0xe9, 1 },
+                                  { 0, group_base + 2, 0, 0xeb, 3 },
+                                  { 0, group_base + 3, 0, 0xec, 4 } };
         expect_from(&fix, from, exp, 4, "blktail-media");
     }
     /* Group 1 is reset exactly once and never FINs; complete groups 0 and 2
      * FIN; group 3 is still open. */
     {
         const reset_exp_t rexp[1] = {
-            { 0, 1, 0, 0x10, true, .sub_opaque = 0, .pub_opaque = 0 } };
+            { 0, group_base + 1, 0, 0x10, true, .sub_opaque = 0, .pub_opaque = 0 } };
         expect_resets(&fix, rexp, 1, "blktail-reset");
-        const term_exp_t terms[2] = { { 0, 0, 0, true, true },
-                                      { 0, 2, 0, true, true } };
+        const term_exp_t terms[2] = { { 0, group_base, 0, true, true },
+                                      { 0, group_base + 2, 0, true, true } };
         expect_terminals(&fix, terms, 2, "blktail-terminals");
     }
     {
         drop_snap_t d; drop_snap(fix.s, &d);
         MOQ_TEST_CHECK_EQ_U64(d.abandoned, 1);
+        moq_media_sender_track_stats_t ts = {0};
+        MOQ_TEST_CHECK(moq_media_sender_get_track_stats(fix.s, fix.t[0], &ts,
+                                                       sizeof(ts)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(ts.groups_abandoned, 1);
     }
 
+out:
+    fix_free(&fix);
+    MOQ_TEST_CHECK(as.balance == 0);
+    report(&fix, name, before);
+}
+
+
+/* Direct public removal BEFORE any eviction must release the facade's held
+ * write before END_OF_TRACK. Shapes: unopened, header-only, mid-group tail.
+ * This ownership gap predates PR63; it is not attributed to its contributor. */
+static void test_remove_blocked_write(moq_version_t version, int shape)
+{
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    fix_t fix;
+    const uint64_t now = 1000;
+    char name[80];
+    snprintf(name, sizeof(name), "pacing_remove_blocked_d%u_shape%d",
+             (unsigned)version, shape);
+    if (!fix_init_policy_act(&fix, &alloc, now, 2, shape == 1 ? 5 : 4,
+                             MOQ_MEDIA_SEND_BP_DROP_GROUP, version)) {
+        failures++; goto out;
+    }
+    if (!subscribe_track(&fix, 0, "v", now)) { failures++; goto out; }
+    set_phase(&fix, PHASE_PACE);
+    int from = fix.tr.n;
+    int headers = g_subgroup_headers;
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xf0, true, true, 1000) == MOQ_OK);
+    if (shape == 2) drive(&fix, now);
+    MOQ_TEST_CHECK(write_obj(&fix, 0, 0xf1, true, true, 2000) == MOQ_OK);
+    if (shape == 2)
+        MOQ_TEST_CHECK(write_obj(&fix, 0, 0xf2, false, false, 2500) == MOQ_OK);
+    drive(&fix, now);
+    int sent = shape == 2 ? 2 : 1;
+    expect_conserved(fix.s, (uint64_t)sent + 1, (uint64_t)sent, 1, 0,
+                     PAYLOAD_LEN, "remove-held-before");
+    MOQ_TEST_CHECK_EQ_INT(fix.tr.n - from, sent);
+    MOQ_TEST_CHECK_EQ_INT(g_subgroup_headers - headers, shape == 0 ? 1 : 2);
+    MOQ_TEST_CHECK_EQ_INT(fix.reset_n, 0);
+    MOQ_TEST_CHECK_EQ_INT(fix.done_n, 0);
+    MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_reset_attempts(fix.s), 0);
+    if (failures != before) goto out;   /* a geometry failure is not causal RED */
+    uint64_t base = version == MOQ_VERSION_DRAFT_22 ? fix.tr.recs[from].group : 0;
+    MOQ_TEST_CHECK(base <= MOQ_QUIC_VARINT_MAX - 2u);
+    if (base > MOQ_QUIC_VARINT_MAX - 2u) goto out;
+    {
+        const tr_exp_t media[2] = { {0, base, 0, 0xf0, 0},
+                                    {0, base + 1, 0, 0xf1, 1} };
+        expect_from(&fix, from, media, sent, "remove-held-media-before");
+    }
+    if (failures != before) goto out;
+    MOQ_TEST_CHECK(moq_media_sender_remove_track(fix.s, fix.t[0]) == MOQ_OK);
+    moq_media_track_cfg_t tc;
+    moq_media_track_cfg_init_sized(&tc, sizeof(tc));
+    tc.name = MOQ_BYTES_LITERAL("v");
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+    tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+    tc.codec = MOQ_BYTES_LITERAL("av01");
+    tc.bitrate = 1500000;
+    tc.is_live = true;
+    moq_media_track_t *replacement = NULL;
+    MOQ_TEST_CHECK(moq_media_sender_add_track(fix.s, &tc, &replacement)
+                   == MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK(replacement == NULL);
+    for (int i = 0; i < 24; i++) drive(&fix, now);
+    moq_result_t replace_rc = moq_media_sender_add_track(fix.s, &tc, &replacement);
+    moq_media_sender_stats_t st = {0};
+    MOQ_TEST_CHECK(moq_media_sender_get_stats(fix.s, &st, sizeof(st)) == MOQ_OK);
+    fprintf(stderr, "PR63-REMOVE d%u shape%d done=%d status=%d replacement=%d fatal=%d queued=%llu dropped=%llu resets=%d abandoned=%llu\n",
+            (unsigned)version, shape, fix.done_n, fix.stat_n,
+            replace_rc == MOQ_OK && replacement != NULL,
+            moq_media_sender_is_fatal(fix.s), (unsigned long long)st.objects_queued,
+            (unsigned long long)st.objects_dropped, fix.reset_n,
+            (unsigned long long)st.groups_abandoned);
+    MOQ_TEST_CHECK(replace_rc == MOQ_OK && replacement != NULL);
+    MOQ_TEST_CHECK(!moq_media_sender_is_fatal(fix.s));
+    expect_conserved(fix.s, (uint64_t)sent + 1, (uint64_t)sent, 0, 1, 0,
+                     "remove-held-after");
+    MOQ_TEST_CHECK_EQ_U64(st.groups_abandoned, shape == 0 ? 0u : 1u);
+    {
+        const tr_exp_t media[2] = { {0, base, 0, 0xf0, 0},
+                                    {0, base + 1, 0, 0xf1, 1} };
+        expect_from(&fix, from, media, sent, "remove-held-media-after");
+        const reset_exp_t reset[1] = {
+            {0, base + 1, 0, 0x10, true, .sub_opaque = 0, .pub_opaque = 0} };
+        expect_resets(&fix, reset, shape == 0 ? 0 : 1, "remove-held-reset");
+        const stat_exp_t terminal[1] = { {0, base + 2, 0, MOQ_OBJECT_END_OF_TRACK} };
+        expect_status(&fix, terminal, 1, "remove-held-terminal");
+        const term_exp_t fins[2] = { {0, base, 0, true, true},
+                                     {0, base + 2, 0, false, false} };
+        expect_terminals(&fix, fins, 2, "remove-held-fin");
+        const done_exp_t done[1] = { {fix.sub[0]._opaque, MOQ_PUB_DONE_TRACK_ENDED} };
+        expect_done(&fix, done, 1, "remove-held-done");
+    }
+    if (shape != 0 && fix.reset_n == 1 && fix.stat_n == 1 && fix.done_n == 1) {
+        MOQ_TEST_CHECK(fix.reset[0].seq < fix.stat[0].seq);
+        MOQ_TEST_CHECK(fix.reset[0].seq < fix.done_seq[0]);
+    }
 out:
     fix_free(&fix);
     MOQ_TEST_CHECK(as.balance == 0);
@@ -5242,7 +5437,8 @@ int main(void)
     test_terminal_flushes_reset();
     test_reset_attempt_once_per_hook(1);
     test_reset_attempt_once_per_hook(2);
-    test_reset_partial_fanout();
+    test_reset_partial_fanout(false);
+    test_reset_partial_fanout(true);
     /* Every mode, unbounded and across bounded action rings: each ring size
      * refuses a different write first. */
     static const uint32_t rings[] = { 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
@@ -5258,13 +5454,38 @@ int main(void)
         for (int e = 0; e < 2; e++) test_failed_ts_timeline(rings[r], e != 0);
 #endif
     test_drop_blocked_group(MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME,
+                            PACING_VERSION, false,
                             "pacing_drop_blocked_group_to_keyframe");
     test_drop_blocked_group(MOQ_MEDIA_SEND_BP_DROP_GROUP,
+                            PACING_VERSION, false,
                             "pacing_drop_blocked_group_drop_group");
     test_drop_blocked_tail(MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME,
+                           PACING_VERSION,
                            "pacing_drop_blocked_tail_to_keyframe");
     test_drop_blocked_tail(MOQ_MEDIA_SEND_BP_DROP_GROUP,
+                           PACING_VERSION,
                            "pacing_drop_blocked_tail_drop_group");
+    static const moq_version_t blocked_versions[] = {
+        MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_22 };
+    static const moq_media_send_backpressure_t policies[] = {
+        MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME, MOQ_MEDIA_SEND_BP_DROP_GROUP };
+    for (size_t v = 0; v < sizeof(blocked_versions) / sizeof(blocked_versions[0]); v++)
+        for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); p++) {
+            char name[96];
+            snprintf(name, sizeof(name), "pacing_drop_header_only_d%u_policy%u",
+                     (unsigned)blocked_versions[v], (unsigned)policies[p]);
+            test_drop_blocked_group(policies[p], blocked_versions[v], true, name);
+            if (blocked_versions[v] == PACING_VERSION) continue;
+            snprintf(name, sizeof(name), "pacing_drop_unopened_d%u_policy%u",
+                     (unsigned)blocked_versions[v], (unsigned)policies[p]);
+            test_drop_blocked_group(policies[p], blocked_versions[v], false, name);
+            snprintf(name, sizeof(name), "pacing_drop_tail_d%u_policy%u",
+                     (unsigned)blocked_versions[v], (unsigned)policies[p]);
+            test_drop_blocked_tail(policies[p], blocked_versions[v], name);
+        }
+    for (size_t v = 0; v < sizeof(blocked_versions) / sizeof(blocked_versions[0]); v++)
+        for (int shape = 0; shape < 3; shape++)
+            test_remove_blocked_write(blocked_versions[v], shape);
     if (failures) {
         fprintf(stderr, "FAILURES: %d\n", failures);
         return 1;

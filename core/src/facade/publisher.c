@@ -2,6 +2,7 @@
 #include "fill_identity_internal.h"
 #include "migration_internal.h"
 #include "../session/publisher_fill_receipt.h"
+#include "../spi/core_spi.h"
 #include <moq/rcbuf.h>
 #include <moq/wire.h>
 #include "../internal/validate.h"
@@ -5339,10 +5340,12 @@ moq_result_t moq_pub_declare_groups_complete_through(moq_publisher_t *pub,
     return track_run_completions(pub, track, now_us);
 }
 
-moq_result_t moq_pub_reset_group(moq_publisher_t *pub,
-                                   moq_pub_track_t *track,
-                                   uint64_t error_code, uint64_t now_us)
+static moq_result_t pub_reset_group(moq_publisher_t *pub,
+                                     moq_pub_track_t *track,
+                                     uint64_t error_code, uint64_t now_us,
+                                     bool *out_did_reset)
 {
+    *out_did_reset = false;
     if (!pub || !track) return MOQ_ERR_INVAL;
     if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
@@ -5360,6 +5363,7 @@ moq_result_t moq_pub_reset_group(moq_publisher_t *pub,
             sl->sg, error_code, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc < 0 && rc != MOQ_ERR_STALE_HANDLE) return rc;
+        if (rc == MOQ_OK) *out_did_reset = true;
         sl->sg_open = false;
         sl->streaming = false;   /* any in-flight streaming object is gone */
         sl->needs_reset = false;
@@ -5376,6 +5380,24 @@ moq_result_t moq_pub_reset_group(moq_publisher_t *pub,
     track_op_release(track);
     track->streaming_active = false;
     return MOQ_OK;
+}
+
+moq_result_t moq_pub_reset_group(moq_publisher_t *pub,
+                                   moq_pub_track_t *track,
+                                   uint64_t error_code, uint64_t now_us)
+{
+    bool did_reset;
+    return pub_reset_group(pub, track, error_code, now_us, &did_reset);
+}
+
+moq_result_t moq_core_internal_pub_reset_group(moq_publisher_t *pub,
+                                                moq_pub_track_t *track,
+                                                uint64_t error_code,
+                                                uint64_t now_us,
+                                                bool *out_did_reset)
+{
+    if (!out_did_reset) return MOQ_ERR_INVAL;
+    return pub_reset_group(pub, track, error_code, now_us, out_did_reset);
 }
 
 /* NEW_GROUP_REQUEST on a track that advertises DYNAMIC_GROUPS: surfaced when

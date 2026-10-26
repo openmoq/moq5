@@ -1017,11 +1017,13 @@ typedef struct moq_media_sender_stats {
                                      discarded: several objects of one group
                                      count once, two groups twice */
     uint64_t keyframes_dropped;
-    uint64_t groups_abandoned;    /* open wire subgroups actually driven through
-                                     the RESET lifecycle. A partially emitted
-                                     group can contribute to BOTH this and
-                                     groups_dropped -- they are two different
-                                     facts about it */
+    uint64_t groups_abandoned;    /* completed service group abandonments that
+                                     queued at least one subgroup reset. Counts
+                                     once across all destinations and retries;
+                                     releasing only a local pending write does
+                                     not count. Session acceptance, not transport
+                                     transmission or peer acknowledgement.
+                                     A group may also count in groups_dropped. */
     uint64_t backpressure_stalls; /* BLOCK_TIMEOUT waits entered */
     moq_result_t last_error;      /* the most recent failure the sender
                                      recorded (0 = none): a non-OK write() or

@@ -3,7 +3,7 @@
 // scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: f6a97c2e6d65 (native headers modified in the worktree)
+// libmoq commit: 61305e9c5d80
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -11602,7 +11602,7 @@ pub struct moq_media_sender_stats {
     #[doc = " distinct (track, group) values from which\nat least ONE queued media object was\ndiscarded: several objects of one group\ncount once, two groups twice"]
     pub groups_dropped: u64,
     pub keyframes_dropped: u64,
-    #[doc = " open wire subgroups actually driven through\nthe RESET lifecycle. A partially emitted\ngroup can contribute to BOTH this and\ngroups_dropped -- they are two different\nfacts about it"]
+    #[doc = " completed service group abandonments that\nqueued at least one subgroup reset. Counts\nonce across all destinations and retries;\nreleasing only a local pending write does\nnot count. Session acceptance, not transport\ntransmission or peer acknowledgement.\nA group may also count in groups_dropped."]
     pub groups_abandoned: u64,
     #[doc = " BLOCK_TIMEOUT waits entered"]
     pub backpressure_stalls: u64,

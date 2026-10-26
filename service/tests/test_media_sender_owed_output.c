@@ -13,8 +13,8 @@
  *     its queued terminal stays owed (no completion is reported while it is
  *     held), and at Forward 1 it is handed over;
  *   - an object of a subscribed track is owed until the pump sends it;
- *   - a reset owed for a group abandoned after its subscriber left is owed
- *     until it is sent;
+ *   - abandonment after a subscriber left is owed until the facade releases
+ *     its local state, without counting another wire reset;
  *   - a post-ready catalog change is owed until it is republished;
  *   - a removed track is owed until it is torn down, including when its
  *     teardown is refused and retried after the republish committed;
@@ -389,9 +389,10 @@ done:
 
 /* A group emitted to a subscriber who then leaves, continued while nobody
  * subscribes under drop_without_demand: the dropped continuation abandons
- * the open subgroup. The pump that drops it arms and normally sends its
- * reset at once; refused, the reset stays owed until a later pump sends it,
- * and the group is counted abandoned exactly once. */
+ * the held group. The pump that drops it arms and normally completes the
+ * abandonment at once; refused, it stays owed until a later pump completes it.
+ * The departed slot was already retired, so that completion has no reset
+ * effect and must not increment groups_abandoned. */
 static void run_abandoned_group_reset(moq_version_t version)
 {
     int before = failures;
@@ -416,7 +417,8 @@ static void run_abandoned_group_reset(moq_version_t version)
     for (int i = 0; i < 4; i++) drive(&f);
     MOQ_TEST_CHECK(!owed(&f));
     MOQ_TEST_CHECK_EQ_INT(moq_media_sender_get_stats(f.sender, &st, sizeof st), MOQ_OK);
-    MOQ_TEST_CHECK_EQ_U64(st.groups_abandoned, 1);
+    MOQ_TEST_CHECK_EQ_U64(st.groups_abandoned, 0);   /* local completion only */
+    MOQ_TEST_CHECK_EQ_U64(f.resets[0], 0);
     MOQ_TEST_CHECK(!moq_media_sender_is_fatal(f.sender));
 done:
     teardown(&f);

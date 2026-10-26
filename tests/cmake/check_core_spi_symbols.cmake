@@ -1,13 +1,13 @@
 # check_core_spi_symbols.cmake — pin the core's private same-build SPI exports.
 #
 # moq_core_internal_* symbols (core/src/spi/core_spi.h) are exported from the
-# shared libmoq-core only so a relay library built with the same core can call
+# shared libmoq-core only so relay/service libraries built with that core can call
 # them. They are a private same-build ABI: the header is NOT installed and this
 # is NOT a stable third-party/application ABI.
 #
 # This check pins the EXACT set: the library must export every listed symbol
 # and NO OTHER moq_core_internal_* symbol. A missing symbol is a visibility
-# breakage (the shared relay would fail to link); an extra one is an unreviewed
+# breakage (a same-build library would fail to link); an extra one is an unreviewed
 # addition to the private SPI. Adding or removing one is a deliberate change
 # that must update BASE_SYMBOLS below.
 #
@@ -51,6 +51,7 @@ endif()
 
 # The complete private SPI surface (core/src/spi/core_spi.h MOQ_API symbols).
 set(BASE_SYMBOLS
+    moq_core_internal_pub_reset_group
     moq_core_internal_track_max_cache_duration
     moq_core_internal_track_properties_validate
 )
@@ -131,7 +132,7 @@ if(missing OR extra)
     if(missing)
         string(REPLACE ";" "\n    " missing_str "${missing}")
         string(APPEND msg
-            "\n  MISSING (must be MOQ_API for the same-build relay):\n    ${missing_str}")
+            "\n  MISSING (must be MOQ_API for the same-build relay/service):\n    ${missing_str}")
     endif()
     if(extra)
         string(REPLACE ";" "\n    " extra_str "${extra}")

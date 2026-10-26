@@ -311,8 +311,10 @@ struct moq_media_track {
     uint64_t              emit_group;        /* group currently open on wire */
     bool                  emit_open;         /* a subgroup is open on the wire */
     uint64_t              emit_obj;          /* next object id in emit_group */
-    bool                  pending_reset;     /* a drop abandoned emit_group;
-                                                the drain must reset it */
+    bool                  pending_reset;     /* a drop abandoned a held group;
+                                                reset/release owed by the drain */
+    bool                  reset_had_effect;  /* some slot reset successfully;
+                                                retained across partial retries */
     bool                  write_blocked;     /* the facade holds a write of
                                                 blocked_group refused with
                                                 WOULD_BLOCK, pending retry */
@@ -1925,13 +1927,14 @@ static void sender_emit_mt_for(moq_media_sender_t *s, moq_media_track_t *tl,
 }
 
 /* THE pending-reset state transition. An armed `pending_reset` is lifecycle
- * work OWED by the track: the abandoned open subgroup must be RESET on the wire
- * before anything can turn it into a clean FIN.
+ * work OWED by the track: any abandoned open subgroup must be RESET on the wire
+ * before anything can turn it into a clean FIN. An unopened pending write needs
+ * only local release; the facade reports the actual reset effects.
  *
  *   MOQ_OK        -- and only then -- clears the obligation, clears emit_open,
- *                    and counts the abandonment exactly once.
- *   WOULD_BLOCK   -- shared capacity: EVERY field, the obligation and the code
- *                    are preserved exactly for retry, and nothing is counted.
+ *                    and counts it once if any retry actually reset a slot.
+ *   WOULD_BLOCK   -- shared capacity: the obligation and any actual reset
+ *                    effects are preserved for retry; nothing is counted yet.
  *   any other <0  -- fatal; the obligation is NOT cleared and no successful
  *                    abandonment is counted.
  *
@@ -1950,8 +1953,11 @@ static moq_result_t sender_flush_reset(moq_media_sender_t *s,
         return MOQ_ERR_WOULD_BLOCK;                  /* retryable, untouched */
     }
 #endif
-    moq_result_t rrc = moq_pub_reset_group(s->pub, t->pub_track, 0x10, now_us);
-    if (rrc == MOQ_ERR_WOULD_BLOCK) return rrc;      /* retryable, untouched */
+    bool did_reset = false;
+    moq_result_t rrc = moq_core_internal_pub_reset_group(
+        s->pub, t->pub_track, 0x10, now_us, &did_reset);
+    t->reset_had_effect |= did_reset;
+    if (rrc == MOQ_ERR_WOULD_BLOCK) return rrc;      /* obligation retained */
     if (rrc < 0) {
         sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
         return rrc;                                   /* obligation retained */
@@ -1959,8 +1965,11 @@ static moq_result_t sender_flush_reset(moq_media_sender_t *s,
     t->pending_reset = false;
     t->emit_open = false;
     t->write_blocked = false;
-    s->stats.groups_abandoned++;
-    t->tstats.groups_abandoned++;
+    if (t->reset_had_effect) {
+        s->stats.groups_abandoned++;
+        t->tstats.groups_abandoned++;
+    }
+    t->reset_had_effect = false;
     return MOQ_OK;
 }
 
@@ -2612,6 +2621,10 @@ static bool sender_retire_track(moq_media_sender_t *s, moq_media_track_t *t,
     moq_media_auth_operation_clear(&t->publish_auth, &s->alloc);
     pthread_mutex_lock(&s->mu);
     bool failed = t->auth_failed;
+    /* Direct removal can precede eviction: the facade still owns a blocked
+     * WRITE_OBJECT even when no subgroup opened. Abandon it retryably before
+     * END_OF_TRACK, which cannot overtake that retained operation. */
+    if (t->pub_track && t->write_blocked) t->pending_reset = true;
     moq_result_t rc = t->pending_reset ? sender_flush_reset(s, t, now_us) : MOQ_OK;
     pthread_mutex_unlock(&s->mu);
     if (rc != MOQ_OK) return false;

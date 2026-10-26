@@ -13,6 +13,7 @@
  */
 
 #include <moq/export.h>
+#include <moq/publisher.h>
 #include <moq/session.h>
 
 #include <stdbool.h>
@@ -47,6 +48,18 @@ MOQ_API bool moq_core_internal_track_max_cache_duration(moq_version_t version,
 MOQ_API moq_result_t moq_core_internal_track_properties_validate(
     moq_version_t version, const uint8_t *props, size_t len,
     bool dynamic_groups, moq_group_order_t group_order);
+
+/* moq_pub_reset_group() with an observation of this call's actual effects.
+ * out_did_reset is required and is initialized to false before validation.
+ * True means at least one moq_session_reset_subgroup() returned MOQ_OK during
+ * THIS call, including partial progress before WOULD_BLOCK or another error.
+ * Stale handles and releasing only a local pending operation do not count.
+ * A caller counting one completed abandonment must retain this fact across
+ * retries and count only when the whole operation returns MOQ_OK. All other
+ * behavior, ownership and serialization requirements match the public entry. */
+MOQ_API moq_result_t moq_core_internal_pub_reset_group(
+    moq_publisher_t *pub, moq_pub_track_t *track,
+    uint64_t error_code, uint64_t now_us, bool *out_did_reset);
 
 #ifdef __cplusplus
 }
