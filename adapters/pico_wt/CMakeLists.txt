@@ -776,6 +776,36 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
             set_tests_properties(pico_wt_windows_${_win_row}_model
                 PROPERTIES TIMEOUT 30)
         endforeach()
+
+        # Actual managed startup with typed provider-thread replacements.
+        # Real pthreads exercise ownership; no socket is opened. Provider
+        # configuration and cleanup still use the selected implementation.
+        if(EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem" AND
+           EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            add_executable(test_pico_wt_managed_startup
+                tests/test_pico_wt_managed_startup.c)
+            target_compile_definitions(test_pico_wt_managed_startup PRIVATE
+                MOQ_BUILDING)
+            target_link_libraries(test_pico_wt_managed_startup PRIVATE
+                moq::adapter-pico-wt moq::adapter-picoquic Threads::Threads)
+            set_target_properties(test_pico_wt_managed_startup PROPERTIES
+                C_STANDARD 11 C_STANDARD_REQUIRED ON)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_pico_wt_managed_startup PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            foreach(_startup_row IN ITEMS ready ready-exit ready-during-wait
+                    failure retry late-ready clock-failure ready-clock-failure
+                    wait-error race)
+                add_test(NAME pico_wt_managed_startup_${_startup_row}
+                    COMMAND test_pico_wt_managed_startup ${_startup_row}
+                        "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                        "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+                set_tests_properties(pico_wt_managed_startup_${_startup_row}
+                    PROPERTIES TIMEOUT 15 LABELS "pico_wt;managed")
+            endforeach()
+        endif()
     endif()
 
     # Test-internals build of the managed facade: the same source with its

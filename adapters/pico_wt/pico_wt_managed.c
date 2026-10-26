@@ -49,11 +49,9 @@ static int wt_net_startup(void)
     return WSAStartup(MAKEWORD(2, 2), &wsa) == 0 ? 0 : -1;
 }
 static void wt_net_cleanup(void) { WSACleanup(); }
-static void wt_sleep_ms(unsigned ms) { Sleep(ms); }
 #else
 static int wt_net_startup(void) { return 0; }
 static void wt_net_cleanup(void) {}
-static void wt_sleep_ms(unsigned ms) { usleep(ms * 1000u); }
 #endif
 
 /* Advertised inbound flow-control credit, per unidirectional stream and
@@ -209,6 +207,7 @@ struct moq_pico_wt_managed {
     uint64_t           close_flush_deadline_us;    /* network thread only */
     bool               stopped;
     bool               loop_came_up;   /* loop reached ready (latched) */
+    bool               startup_retiring; /* mutex: rejected until joined */
     bool               pump_exit;
     bool               loop_running;   /* packet loop is active; stop waits
                                          * for the callback to clear it */
@@ -1174,8 +1173,15 @@ static int loop_callback(picoquic_quic_t *quic,
 {
     moq_pico_wt_managed_t *m = (moq_pico_wt_managed_t *)callback_ctx;
 
+    pthread_mutex_lock(&m->mutex);
+    if (m->startup_retiring) {
+        pthread_mutex_unlock(&m->mutex);
+        /* The creator rejected this attempt before READY. Keep rejecting
+         * subsequent callbacks too: the provider may call port_update even
+         * after READY requests termination. No packet work may begin. */
+        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+    }
     if (cb_mode == picoquic_packet_loop_ready) {
-        pthread_mutex_lock(&m->mutex);
         m->network_thread_id = pthread_self();
         m->network_thread_id_set = true;
         m->loop_came_up = true;
@@ -1187,6 +1193,7 @@ static int loop_callback(picoquic_quic_t *quic,
                 ->do_time_check = 1;
         return 0;
     }
+    pthread_mutex_unlock(&m->mutex);
 
     if (cb_mode == picoquic_packet_loop_wake_up) {
         pthread_mutex_lock(&m->mutex);
@@ -1739,22 +1746,32 @@ moq_result_t moq_pico_wt_managed_create(
     for (int attempt = 0; attempt < 3 && !tctx; attempt++) {
         pthread_mutex_lock(&m->mutex);
         m->loop_came_up = false;
+        m->startup_retiring = false;
         pthread_mutex_unlock(&m->mutex);
         int thread_ret = 0;
         picoquic_network_thread_ctx_t *cand =
             picoquic_start_network_thread(m->quic, &m->loop_param,
                 loop_callback, m, &thread_ret);
         if (!cand) continue;
-        /* Wait on OUR ready latch (a loop that came up and exited again
-         * clears thread_is_ready -- see moq_picoquic_threaded.c). */
-        bool came_up = false;
-        for (int waited_ms = 0; waited_ms < 2000; waited_ms++) {
-            pthread_mutex_lock(&m->mutex);
-            came_up = m->loop_came_up;
-            pthread_mutex_unlock(&m->mutex);
-            if (came_up || cand->return_code != 0) break;
-            wt_sleep_ms(1);
+        /* Only the facade latch is synchronized with the ready callback.
+         * The provider writes return_code without our mutex, and clears
+         * thread_is_ready again on exit. A loop that reached readiness and
+         * exited promptly is still a successful start; a pre-ready failure
+         * instead reaches the deadline before its candidate is joined. */
+        struct timespec deadline;
+        bool has_deadline = clock_gettime(CLOCK_REALTIME, &deadline) == 0;
+        if (has_deadline) deadline.tv_sec += 2;
+        pthread_mutex_lock(&m->mutex);
+        while (!m->loop_came_up && has_deadline) {
+            if (pthread_cond_timedwait(&m->cond, &m->mutex, &deadline) != 0)
+                break;
         }
+        bool came_up = m->loop_came_up;
+        /* Commit retirement before unlocking. A late READY must not start
+         * work or publish session/adapter ownership while we join. The
+         * decision remains set until deletion finishes, before any retry. */
+        m->startup_retiring = !came_up;
+        pthread_mutex_unlock(&m->mutex);
         if (came_up)
             tctx = cand;
         else
