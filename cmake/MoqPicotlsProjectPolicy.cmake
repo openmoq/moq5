@@ -16,8 +16,9 @@ unset(_moq_ptls_caller_entry)
 
 # LibMoQ's chosen invariant policy for the picotls it links, the same one
 # scripts/setup_picoquic_deps.sh applies to a prebuilt picotls: picotls's
-# assertions stay enabled in every configuration and its warnings are errors.
-# It applies to this directory (picotls) only.
+# assertions stay enabled in every configuration. Non-MSVC warnings remain
+# errors; MSVC dependency warnings are permitted. The policy applies to this
+# directory (picotls) only; owned-library /WX is a separate PRIVATE option.
 include("${CMAKE_CURRENT_LIST_DIR}/MoqPicotlsBuildPolicy.cmake")
 
 # picoquic's FindPTLS needs PTLS_INCLUDE_DIR in its fetched mbedTLS

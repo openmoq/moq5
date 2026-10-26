@@ -2730,12 +2730,17 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     if (th_cap > SIZE_MAX / sizeof(moq_track_hist_t)) return MOQ_ERR_INVAL;
 
 #define ALIGN_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
-/* Fundamental alignment for arena sub-regions. MSVC's C mode has no C11
- * max_align_t (only <cstddef> does), so spell out the strictest scalar there. */
+    /* MSVC's C headers lack max_align_t. Name the fallback type outside
+     * _Alignof, where MSVC diagnoses an inline type definition. */
 #if defined(_MSC_VER) && !defined(__clang__)
-#define MOQ_MAX_ALIGN _Alignof(union { long long ll; long double ld; void *p; })
+    typedef union {
+        long long ll;
+        long double ld;
+        void *p;
+    } moq_max_align_t;
+    const size_t scratch_align = _Alignof(moq_max_align_t);
 #else
-#define MOQ_MAX_ALIGN _Alignof(max_align_t)
+    const size_t scratch_align = _Alignof(max_align_t);
 #endif
 
     const size_t act_align    = _Alignof(moq_action_t);
@@ -2896,10 +2901,10 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     size_t off_pub_req_recv = off_track_sub_recv + track_sub_recv_bytes;
     size_t pub_req_recv_bytes = pub_cap * pub_req_recv_cap;
     size_t off_scratch = ALIGN_UP(off_pub_req_recv + pub_req_recv_bytes,
-                                    MOQ_MAX_ALIGN);
+                                    scratch_align);
     /* Event borrow arena: same budget as the transient scratch. */
     size_t off_evscratch = ALIGN_UP(off_scratch + scratch_cap,
-                                    MOQ_MAX_ALIGN);
+                                    scratch_align);
     size_t prof_align  = profile->state_align > 0 ? profile->state_align : 1;
     size_t off_profile = ALIGN_UP(off_evscratch + scratch_cap, prof_align);
     /* No-owner admission carriers. Allocated in the session arena at

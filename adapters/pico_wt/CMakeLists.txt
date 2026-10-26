@@ -57,6 +57,8 @@ set_target_properties(moq-adapter-pico-wt PROPERTIES
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(moq-adapter-pico-wt PRIVATE
         -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+elseif(MSVC)
+    target_compile_options(moq-adapter-pico-wt PRIVATE $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:/WX>)
 endif()
 
 # -- Build-tree package target ------------------------------------------
@@ -743,6 +745,37 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(moq-adapter-pico-wt-managed PRIVATE
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    elseif(MSVC)
+        target_compile_options(moq-adapter-pico-wt-managed PRIVATE $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:/WX>)
+    endif()
+
+    if(MOQ_BUILD_TESTS AND NOT WIN32)
+        # The same typed host model selects the actual WT managed source.
+        # Link attach adapters only, avoiding a second managed facade copy.
+        add_executable(test_pico_wt_windows_model
+            ../picoquic/tests/test_threaded_windows_model.c)
+        target_include_directories(test_pico_wt_windows_model PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../picoquic/tests/support/win32
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_compile_definitions(test_pico_wt_windows_model PRIVATE
+            MOQ_BUILDING MOQ_TEST_WIN32_FAKES MOQ_TEST_WT_MANAGED_MODEL)
+        target_link_libraries(test_pico_wt_windows_model PRIVATE
+            moq::adapter-pico-wt moq::adapter-picoquic Threads::Threads)
+        set_target_properties(test_pico_wt_windows_model PROPERTIES
+            C_STANDARD 11 C_STANDARD_REQUIRED ON)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_windows_model PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        foreach(_win_row IN ITEMS wait public-clock public-shim public-native
+                public-infinite public-controls stop-clock stop-shim
+                stop-native stop-controls)
+            add_test(NAME pico_wt_windows_${_win_row}_model
+                COMMAND test_pico_wt_windows_model ${_win_row})
+            set_tests_properties(pico_wt_windows_${_win_row}_model
+                PROPERTIES TIMEOUT 30)
+        endforeach()
     endif()
 
     # Test-internals build of the managed facade: the same source with its

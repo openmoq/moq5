@@ -1658,6 +1658,7 @@ static moq_result_t create_facade(const moq_pq_threaded_cfg_t *cfg,
         if (moq_alpn_to_version(t->alpn_list[i], strlen(t->alpn_list[i]), &v) &&
             v == MOQ_VERSION_DRAFT_22) {
             free_alpn_list(t);
+            pq_net_cleanup();
             pthread_cond_destroy(&t->cond);
             pthread_mutex_destroy(&t->mutex);
             t->alloc.free(t, sizeof(*t), t->alloc.ctx);
@@ -1686,6 +1687,7 @@ static moq_result_t create_facade(const moq_pq_threaded_cfg_t *cfg,
                                                    &t->target_bytes_len);
         if (trc != MOQ_OK) {
             free_alpn_list(t);
+            pq_net_cleanup();
             pthread_cond_destroy(&t->cond);
             pthread_mutex_destroy(&t->mutex);
             t->alloc.free(t, sizeof(*t), t->alloc.ctx);
@@ -1705,6 +1707,7 @@ static moq_result_t create_facade(const moq_pq_threaded_cfg_t *cfg,
         if (src != MOQ_OK) {
             free_alpn_list(t);
             free_target(t);
+            pq_net_cleanup();
             pthread_cond_destroy(&t->cond);
             pthread_mutex_destroy(&t->mutex);
             t->alloc.free(t, sizeof(*t), t->alloc.ctx);
@@ -1970,10 +1973,10 @@ static moq_result_t create_facade(const moq_pq_threaded_cfg_t *cfg,
              * sockloop). A pre-ready death simply never signals, so the
              * bounded timedwait expires and the thread is torn down. */
             struct timespec deadline;
-            clock_gettime(CLOCK_REALTIME, &deadline);
-            deadline.tv_sec += 2;
+            bool has_deadline = clock_gettime(CLOCK_REALTIME, &deadline) == 0;
+            if (has_deadline) deadline.tv_sec += 2;
             pthread_mutex_lock(&t->mutex);
-            while (!t->loop_came_up) {
+            while (!t->loop_came_up && has_deadline) {
                 if (pthread_cond_timedwait(&t->cond, &t->mutex,
                                            &deadline) != 0)
                     break;   /* timeout or error: give up waiting */
@@ -2081,15 +2084,18 @@ moq_result_t moq_pq_threaded_stop(moq_pq_threaded_t *t)
          * callback. */
         (void)picoquic_wake_up_network_thread(ctx);
         struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec += 3;
-        pthread_mutex_lock(&t->mutex);
-        while (t->loop_running) {
-            if (pthread_cond_timedwait(&t->cond, &t->mutex,
-                                       &deadline) == ETIMEDOUT)
-                break;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) == 0) {
+            deadline.tv_sec += 3;
+            pthread_mutex_lock(&t->mutex);
+            while (t->loop_running) {
+                if (pthread_cond_timedwait(&t->cond, &t->mutex,
+                                           &deadline) != 0)
+                    break;
+            }
+            pthread_mutex_unlock(&t->mutex);
         }
-        pthread_mutex_unlock(&t->mutex);
+        /* A failed clock/wait only skips the graceful wait, never the join.
+         * All wake borrowers already left through the fence above. */
         picoquic_delete_network_thread(ctx);
     } else if (t->own_loop) {
         /* The group's loop observes t->stopped on its next turn, runs the
@@ -2451,6 +2457,13 @@ moq_result_t moq_pq_threaded_wake(moq_pq_threaded_t *t)
         pthread_mutex_unlock(&t->mutex);
         return MOQ_ERR_CLOSED;
     }
+#ifdef _WIN32
+    /* No Windows constructor can produce a group-owned loop. */
+    if (t->own_loop) {
+        pthread_mutex_unlock(&t->mutex);
+        return MOQ_ERR_UNSUPPORTED;
+    }
+#endif
     if (t->wake_pending) {
         pthread_mutex_unlock(&t->mutex);
         return MOQ_OK;
@@ -2464,10 +2477,13 @@ moq_result_t moq_pq_threaded_wake(moq_pq_threaded_t *t)
     t->wake_pending = true;
     t->wake_in_flight++;
     picoquic_network_thread_ctx_t *ctx = t->thread_ctx;
+#ifndef _WIN32
     int wake_fd = t->wake_fd;
+#endif
     pthread_mutex_unlock(&t->mutex);
 
     int rc;
+#ifndef _WIN32
     if (t->own_loop) {
         /* The group's loop drains its pipe every turn; a full pipe already
          * holds a wake, so EAGAIN is a delivered wake. */
@@ -2475,7 +2491,9 @@ moq_result_t moq_pq_threaded_wake(moq_pq_threaded_t *t)
         ssize_t n = write(wake_fd, &one, 1);
         rc = (n == 1 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)))
                  ? 0 : -1;
-    } else {
+    } else
+#endif
+    {
         rc = picoquic_wake_up_network_thread(ctx);
     }
 
@@ -2521,7 +2539,10 @@ moq_result_t moq_pq_threaded_wait(moq_pq_threaded_t *t,
     struct timespec deadline;
     bool has_deadline = (timeout_us != UINT64_MAX);
     if (has_deadline) {
-        clock_gettime(CLOCK_REALTIME, &deadline);
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            pthread_mutex_unlock(&t->mutex);
+            return MOQ_ERR_INTERNAL;
+        }
         deadline.tv_sec  += (time_t)(timeout_us / 1000000ULL);
         deadline.tv_nsec += (long)((timeout_us % 1000000ULL) * 1000ULL);
         if (deadline.tv_nsec >= 1000000000L) {
@@ -2530,14 +2551,15 @@ moq_result_t moq_pq_threaded_wait(moq_pq_threaded_t *t,
         }
     }
 
+    bool wait_failed = false;
     while (!t->activity_pending && !t->stopped &&
            !t->fatal && !t->pump_exit) {
-        if (has_deadline) {
-            int wrc = pthread_cond_timedwait(&t->cond, &t->mutex,
-                                              &deadline);
-            if (wrc == ETIMEDOUT) break;
-        } else {
-            pthread_cond_wait(&t->cond, &t->mutex);
+        int wrc = has_deadline
+            ? pthread_cond_timedwait(&t->cond, &t->mutex, &deadline)
+            : pthread_cond_wait(&t->cond, &t->mutex);
+        if (wrc != 0) {
+            wait_failed = !has_deadline || wrc != ETIMEDOUT;
+            break;
         }
     }
 
@@ -2547,6 +2569,8 @@ moq_result_t moq_pq_threaded_wait(moq_pq_threaded_t *t,
     } else if (t->activity_pending) {
         t->activity_pending = false;
         result = MOQ_OK;
+    } else if (wait_failed) {
+        result = MOQ_ERR_INTERNAL;
     } else {
         result = MOQ_DONE;
     }

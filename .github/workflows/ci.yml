@@ -36,6 +36,7 @@ jobs:
           cmake -S . -B build/msvc -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DMOQ_BUILD_TESTS=OFF -DMOQ_BUILD_MSF=ON `
+            -DMOQ_WARNINGS_AS_ERRORS=ON `
             -DMOQ_BUILD_SERVICE=ON -DMOQ_BUILD_ADAPTER_PICOQUIC=ON `
             -DMOQ_BUILD_PQ_THREADED=ON -DMOQ_BUILD_ADAPTER_PICO_WT=ON `
             -DMOQ_BUILD_PICO_WT_MANAGED=ON `

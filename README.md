@@ -221,6 +221,12 @@ multi-config generators such as Visual Studio's yet). Consumers of the
 installed package can use any generator; they only need `OPENSSL_ROOT_DIR`
 in addition to the usual `MOQ_PICOQUIC_SOURCE_DIR` / `MOQ_PICOTLS_PREFIX`.
 
+The raw picoquic managed facade supports clients and single-lane servers on
+Windows (`lane_count` 0 or 1). Windows server lane groups are unsupported:
+a valid count 2..`MOQ_PQ_THREADED_MAX_LANES` returns `MOQ_ERR_UNSUPPORTED`,
+with NULL output and no allocation, Winsock startup, sockets or threads.
+The POSIX group backend remains available on supported `SO_REUSEPORT` platforms.
+
 ## Packaging
 
 Install with `cmake --install`, then consume via

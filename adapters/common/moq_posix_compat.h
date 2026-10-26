@@ -74,21 +74,43 @@ static __inline int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m)
 }
 
 /* pthread_cond_timedwait takes an absolute CLOCK_REALTIME deadline (no
- * condattr clock is ever set); convert it to a relative millisecond wait. */
+ * condattr clock is ever set). A native timeout ends only one relative wait;
+ * the absolute deadline still governs after a capped wait or clock rollback. */
 static __inline int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m,
                                            const struct timespec *abstime)
 {
-    struct timespec now;
-    timespec_get(&now, TIME_UTC);
-    int64_t ms = ((int64_t)abstime->tv_sec - (int64_t)now.tv_sec) * 1000 +
-                 ((int64_t)abstime->tv_nsec - (int64_t)now.tv_nsec) / 1000000;
-    if (ms < 0)
-        ms = 0;
-    if (ms >= (int64_t)INFINITE)
-        ms = (int64_t)INFINITE - 1;
-    if (SleepConditionVariableSRW(c, m, (DWORD)ms, 0))
-        return 0;
-    return GetLastError() == ERROR_TIMEOUT ? ETIMEDOUT : EINVAL;
+    if (!abstime || abstime->tv_nsec < 0 || abstime->tv_nsec >= 1000000000L)
+        return EINVAL;
+    int timed_out = 0;
+    for (;;) {
+        struct timespec now;
+        if (timespec_get(&now, TIME_UTC) != TIME_UTC ||
+            now.tv_nsec < 0 || now.tv_nsec >= 1000000000L)
+            return EINVAL;
+        DWORD ms = 0;
+        if (abstime->tv_sec < now.tv_sec ||
+            (abstime->tv_sec == now.tv_sec && abstime->tv_nsec <= now.tv_nsec)) {
+            if (timed_out) return ETIMEDOUT;
+            /* Even an already expired valid wait releases and reacquires
+             * the mutex. A signalled/spurious wake may still return success. */
+        } else {
+            /* Compare first, then subtract unsigned: even the full signed
+             * time_t range cannot overflow. Borrow before rounding up. */
+            uint64_t sec = (uint64_t)abstime->tv_sec - (uint64_t)now.tv_sec;
+            long ns = abstime->tv_nsec - now.tv_nsec;
+            if (ns < 0) { sec--; ns += 1000000000L; }
+            const uint64_t max_ms = (uint64_t)INFINITE - 1;
+            uint64_t remaining = max_ms;
+            if (sec <= max_ms / 1000) {
+                remaining = sec * 1000 + ((uint64_t)ns + 999999) / 1000000;
+                if (remaining > max_ms) remaining = max_ms;
+            }
+            ms = (DWORD)remaining;
+        }
+        if (SleepConditionVariableSRW(c, m, ms, 0)) return 0;
+        if (GetLastError() != ERROR_TIMEOUT) return EINVAL;
+        timed_out = 1;
+    }
 }
 
 static __inline pthread_t pthread_self(void) { return GetCurrentThreadId(); }

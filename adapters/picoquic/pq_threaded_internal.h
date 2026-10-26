@@ -13,7 +13,7 @@
 #include "picoquic_endpoint.h"
 #include "pq_wake_sched.h"
 
-#include <pthread.h>
+#include "../common/moq_posix_compat.h"
 #include <stdbool.h>
 #include <stdint.h>
 

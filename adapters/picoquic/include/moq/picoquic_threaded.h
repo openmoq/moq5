@@ -247,6 +247,9 @@ typedef struct moq_pq_threaded_cfg {
      * typedef): lane_count contexts and threads on the listener port.
      * A client's value > 1, or a server's beyond the maximum, fails
      * create() with MOQ_ERR_UNSUPPORTED or MOQ_ERR_INVAL.
+     * Windows does not implement server lane groups: a valid server count
+     * 2..MAX returns MOQ_ERR_UNSUPPORTED, with NULL output and no acquired
+     * resources. Clients and servers with 0/1 retain their one-lane behavior.
      *
      * At more than one lane: on_lane_pump and on_activity run on each
      * lane's thread, concurrently, with the shared context (key by
@@ -434,6 +437,9 @@ void moq_pq_threaded_cfg_init_sized(moq_pq_threaded_cfg_t *cfg, size_t cfg_size)
  * On failure, no thread is running; _stop / _destroy are not needed.
  * Returns MOQ_ERR_NOMEM on allocation failure, MOQ_ERR_INVAL on bad
  * config, MOQ_ERR_INTERNAL on picoquic/thread setup failure.
+ * Server lane groups require a supported platform (including SO_REUSEPORT).
+ * On Windows, valid server lane_count 2..MAX returns MOQ_ERR_UNSUPPORTED
+ * before allocation, Winsock startup, sockets or threads; *out is NULL.
  */
 moq_result_t moq_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
                                      moq_pq_threaded_t **out);

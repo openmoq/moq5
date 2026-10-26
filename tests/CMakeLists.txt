@@ -22,6 +22,21 @@ add_test(NAME cmake_consumer_abi_bundle
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ConsumerAbiBundleTest.cmake")
 set_tests_properties(cmake_consumer_abi_bundle PROPERTIES TIMEOUT 60)
 
+# Configure-only models execute the production policy/configuration source.
+# The Windows branch is modeled on the host; it is not native qualification.
+add_test(NAME cmake_windows_owned_policy
+    COMMAND ${CMAKE_COMMAND} "-DMOQ_SOURCE=${PROJECT_SOURCE_DIR}"
+        "-DMOQ_WORK=${CMAKE_CURRENT_BINARY_DIR}/windows-owned-policy"
+        "-DMOQ_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsOwnedPolicyTest.cmake")
+add_test(NAME cmake_picoquic_component_selection
+    COMMAND ${CMAKE_COMMAND} "-DMOQ_SOURCE=${PROJECT_SOURCE_DIR}"
+        "-DMOQ_WORK=${CMAKE_CURRENT_BINARY_DIR}/picoquic-component-selection"
+        "-DMOQ_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PicoquicComponentSelectionTest.cmake")
+set_tests_properties(cmake_windows_owned_policy cmake_picoquic_component_selection
+    PROPERTIES TIMEOUT 120)
+
 # Installed package modules reach siblings through ${CMAKE_CURRENT_LIST_DIR}
 # only at a downstream configure, so check the installed set itself.
 include(GNUInstallDirs)

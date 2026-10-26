@@ -1821,15 +1821,18 @@ moq_result_t moq_pico_wt_managed_stop(moq_pico_wt_managed_t *m)
     if (ctx) {
         (void)picoquic_wake_up_network_thread(ctx);
         struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec += 3;
-        pthread_mutex_lock(&m->mutex);
-        while (m->loop_running) {
-            if (pthread_cond_timedwait(&m->cond, &m->mutex,
-                                       &deadline) == ETIMEDOUT)
-                break;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) == 0) {
+            deadline.tv_sec += 3;
+            pthread_mutex_lock(&m->mutex);
+            while (m->loop_running) {
+                if (pthread_cond_timedwait(&m->cond, &m->mutex,
+                                           &deadline) != 0)
+                    break;
+            }
+            pthread_mutex_unlock(&m->mutex);
         }
-        pthread_mutex_unlock(&m->mutex);
+        /* Clock/wait errors skip only the graceful wait. Wake borrowers
+         * have left through the fence above; the provider still must join. */
         picoquic_delete_network_thread(ctx);
     }
 
@@ -2028,7 +2031,10 @@ moq_result_t moq_pico_wt_managed_wait(moq_pico_wt_managed_t *m,
     struct timespec deadline;
     bool has_deadline = (timeout_us != UINT64_MAX);
     if (has_deadline) {
-        clock_gettime(CLOCK_REALTIME, &deadline);
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            pthread_mutex_unlock(&m->mutex);
+            return MOQ_ERR_INTERNAL;
+        }
         deadline.tv_sec  += (time_t)(timeout_us / 1000000ULL);
         deadline.tv_nsec += (long)((timeout_us % 1000000ULL) * 1000ULL);
         if (deadline.tv_nsec >= 1000000000L) {
@@ -2037,14 +2043,15 @@ moq_result_t moq_pico_wt_managed_wait(moq_pico_wt_managed_t *m,
         }
     }
 
+    bool wait_failed = false;
     while (!m->activity_pending && !m->stopped &&
            !m->fatal && !m->closed && !m->pump_exit) {
-        if (has_deadline) {
-            if (pthread_cond_timedwait(&m->cond, &m->mutex,
-                                       &deadline) == ETIMEDOUT)
-                break;
-        } else {
-            pthread_cond_wait(&m->cond, &m->mutex);
+        int wrc = has_deadline
+            ? pthread_cond_timedwait(&m->cond, &m->mutex, &deadline)
+            : pthread_cond_wait(&m->cond, &m->mutex);
+        if (wrc != 0) {
+            wait_failed = !has_deadline || wrc != ETIMEDOUT;
+            break;
         }
     }
 
@@ -2054,6 +2061,8 @@ moq_result_t moq_pico_wt_managed_wait(moq_pico_wt_managed_t *m,
     } else if (m->activity_pending) {
         m->activity_pending = false;
         result = MOQ_OK;
+    } else if (wait_failed) {
+        result = MOQ_ERR_INTERNAL;
     } else {
         result = MOQ_DONE;
     }
