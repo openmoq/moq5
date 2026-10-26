@@ -128,11 +128,16 @@ MOQ_API void moq_media_receiver_cfg_init_flow_control(
  * metadata) is OWNED by the track handle and stays valid until the receiver is
  * destroyed -- it does NOT borrow from the current effective catalog, so a
  * catalog update that replaces the catalog does not invalidate a handle's desc.
- * A handle's metadata is immutable for its lifetime with ONE exception: a §11.3
- * live->VOD conversion updates the surviving handle's is_live/track_duration in
- * place and fires MOQ_MEDIA_TRACK_UPDATED (per MSF-01 §5.3 every OTHER attribute
- * of a declared Namespace|Name tuple stays fixed). A handle removed from the
- * catalog stays allocated (and its desc readable) until the receiver is
+ * Every description pointer the receiver hands out is an IMMUTABLE SNAPSHOT
+ * with receiver lifetime: it is never written after it is published. The ONE
+ * sanctioned metadata change -- a §11.3 live->VOD conversion (or a non-live
+ * tuple acquiring a previously absent duration) -- publishes a NEW snapshot on
+ * the SAME handle (per MSF-01 §5.3 every OTHER attribute of a declared
+ * Namespace|Name tuple stays fixed): MOQ_MEDIA_TRACK_UPDATED carries it and
+ * moq_media_track_desc_get() returns it from then on, while a pointer taken
+ * earlier (e.g. from TRACK_ADDED) keeps reading the earlier snapshot,
+ * unchanged, until the receiver is destroyed. A handle removed from the
+ * catalog stays allocated (and every snapshot readable) until the receiver is
  * destroyed; it just transitions to a terminal state.
  *
  * Because handles (and the content-protection snapshots that keep previously
@@ -261,9 +266,22 @@ typedef enum moq_media_track_event_kind {
                                     This is the ONLY sanctioned mutation of a
                                     declared tuple (§5.2.7); all other metadata
                                     changes remain immutable-tuple violations
-                                    (§5.3) and are dropped. The handle's desc is
-                                    updated in place before this fires. */
-    MOQ_MEDIA_TRACK_REMOVED,     /* tuple dropped by a later catalog generation */
+                                    (§5.3) and are dropped. The event's desc is
+                                    the NEW snapshot, complete before the event
+                                    is queued; earlier snapshots stay as they
+                                    were. */
+    MOQ_MEDIA_TRACK_REMOVED,     /* tuple dropped by a later catalog generation.
+                                    An ordinary generation withdraws the track:
+                                    its queued objects are purged (counted in
+                                    objects_dropped). A terminating catalog
+                                    (isComplete with no tracks, MSF §5.1.3)
+                                    only ends the broadcast: objects already
+                                    queued for the track stay pollable, on this
+                                    handle and in order. Either way no further
+                                    objects are accepted for the track; this is
+                                    not an end-of-stream signal, and objects of
+                                    the track still in flight when the catalog
+                                    is adopted are not delivered. */
     MOQ_MEDIA_TRACK_ENDED,       /* peer end-of-track / rejection */
     MOQ_MEDIA_CATALOG_READY,     /* first (independent) catalog enumerated; fires
                                     exactly once per connection (later generations
@@ -318,8 +336,14 @@ typedef struct moq_media_track_event {
                                             catalog stays valid but inert: all
                                             three refuse it with
                                             MOQ_ERR_WRONG_STATE. */
-    const moq_media_track_desc_t *desc;  /* handle-owned (see lifetime note
-                                            above); NULL for CATALOG_READY */
+    const moq_media_track_desc_t *desc;  /* an immutable handle-owned snapshot
+                                            (receiver lifetime; lifetime note
+                                            above). For a QUEUED event, the one
+                                            current when it was queued. The one
+                                            exception is PARSE_DROP, which is
+                                            synthesized at poll time and carries
+                                            the snapshot current then. NULL for
+                                            CATALOG_READY */
     uint32_t config_generation;          /* reserved for dynamic config;
                                             always 0 today */
     /* Permanently reserved, never read: the v0 struct ended in four
@@ -352,16 +376,13 @@ typedef struct moq_media_track_event {
                                             parse-drop event for this track */
 } moq_media_track_event_t;
 
-/* The description for a track handle (handle-owned; same lifetime as the
- * TRACK_ADDED event's desc). NULL for a NULL track.
- *
- * Borrowed access is lock-free. Immutable fields (spans, arrays, structured
- * info, catalog passthroughs) may be read through this pointer for the
- * handle's lifetime. The mutable fields -- is_live, has_track_duration,
- * track_duration_ms -- are rewritten in place by the service thread on a
- * live-to-VOD conversion (MSF §11.3) and MUST NOT be read through this
- * pointer concurrently with service: that is a data race. Read them with
- * moq_media_receiver_track_desc_copy() instead. */
+/* The CURRENT description snapshot for a track handle (handle-owned, receiver
+ * lifetime, immutable once returned). After a conversion this is the new
+ * snapshot, which a caller may observe before consuming the TRACK_UPDATED
+ * that announces it; the snapshot a caller took earlier stays valid and
+ * unchanged. NULL for a NULL track. Borrowed access is lock-free.
+ * moq_media_receiver_track_desc_copy() copies the same current snapshot into
+ * caller storage, with receiver membership checked. */
 MOQ_API const moq_media_track_desc_t *moq_media_track_desc_get(
     const moq_media_track_t *track);
 
@@ -371,10 +392,12 @@ MOQ_API const moq_media_track_desc_t *moq_media_track_desc_get(
 #define MOQ_MEDIA_TRACK_DESC_V0_SIZE \
     (offsetof(moq_media_track_desc_t, is_live) + sizeof(bool))
 
-/* Copy a track's CURRENT description into `out` under the receiver mutex --
- * the same mutex the live-to-VOD writer holds -- so the mutable triple is
- * read coherently. This is a snapshot of the present state, not the image
- * the TRACK_ADDED/UPDATED event carried.
+/* Copy a track's CURRENT description snapshot into `out`, read under the
+ * receiver mutex -- the same mutex that publishes a new snapshot on a
+ * live-to-VOD conversion -- so the copy is one whole snapshot, never a mix of
+ * two. It is the present one, which after a conversion is newer than the one
+ * an earlier TRACK_ADDED event carried; that earlier snapshot itself stays
+ * valid and unchanged.
  *
  * `track` must be a handle of `r`: membership is checked against the
  * receiver's own handle table without dereferencing an unowned pointer.
@@ -490,8 +513,10 @@ MOQ_API moq_result_t moq_media_receiver_subscribe_track(
  * not torn down, so a later moq_media_receiver_subscribe_track resumes it
  * cheaply -- repeated enable/disable never accumulates state. The catalog track
  * and the track's TRACK_ADDED handle remain valid -- only delivery stops.
- * Atomic like subscribe_track: MOQ_OK / MOQ_ERR_INVAL / MOQ_ERR_CLOSED; a no-op
- * (and MOQ_OK) for an already-unsubscribed track. */
+ * Atomic like subscribe_track: MOQ_OK / MOQ_ERR_INVAL / MOQ_ERR_CLOSED, and
+ * MOQ_ERR_WRONG_STATE for a track REMOVED from the catalog (an ended track is a
+ * no-op OK: its delivery already stopped); a no-op (and MOQ_OK) for an
+ * already-unsubscribed track. */
 MOQ_API moq_result_t moq_media_receiver_unsubscribe_track(
     moq_media_receiver_t *r, moq_media_track_t *track);
 
@@ -521,9 +546,9 @@ MOQ_API moq_result_t moq_media_receiver_track_state(
     moq_media_track_state_t *out);
 
 /* -- Objects (§6.3) ---------------------------------------------------- *
- * The validated parsed shape (moq_media_parsed_object_t fields) plus
- * exactly two additions: the TRACK_ADDED handle and the config
- * generation. poll_object returning MOQ_OK TRANSFERS EXCLUSIVE OWNERSHIP
+ * The validated parsed shape (moq_media_parsed_object_t fields) plus the
+ * track and wire metadata: the TRACK_ADDED handle, the config generation,
+ * and the object's wire identity. Objects surface in arrival order. poll_object returning MOQ_OK TRANSFERS EXCLUSIVE OWNERSHIP
  * of the object's backing buffers to the caller: the payload/fragment
  * spans stay valid until moq_media_object_cleanup(&obj), which releases
  * them on the calling thread (legal because the handoff is a shard
@@ -583,6 +608,32 @@ typedef struct moq_media_object {
     moq_rcbuf_t          *payload_ref;
     moq_rcbuf_t          *properties_ref;
     moq_cmaf_sample_t    *samples_owned;
+
+    /* Appended after the v0 prefix: the object's wire identity, as the session
+     * delivered it. All three ids are full width and zero is a valid value.
+     * The identity is available only when the returned prefix covers the
+     * complete record, that is when the stamped struct_size reaches the end of
+     * has_subgroup. A shorter stamp, whether the caller's buffer was smaller or
+     * the library older, leaves the earlier fields as they are and says nothing
+     * about any id: it never means an id is absent. Nothing here is owned.
+     *
+     *   group_id / object_id   the object's location in its track;
+     *   has_subgroup           the wire carried a subgroup: true for an object
+     *                          from a subgroup stream (subgroup_id is the
+     *                          SUBGROUP_HEADER's value, resolved to the first
+     *                          object's id or zero per its mode), false for a
+     *                          datagram, which has no subgroup on the wire.
+     *                          subgroup_id is then zero, and only this flag
+     *                          says so: zero is also a real subgroup id;
+     *   publisher_priority     the effective priority the session delivered:
+     *                          the header or datagram byte when present, else
+     *                          the session's default for an inherited priority.
+     *                          It is not a claim that a byte was on the wire. */
+    uint64_t              group_id;
+    uint64_t              subgroup_id;
+    uint64_t              object_id;
+    uint8_t               publisher_priority;
+    bool                  has_subgroup;
 } moq_media_object_t;
 
 /* Release the buffers a successful poll transferred. Safe on a zeroed
@@ -632,7 +683,17 @@ typedef struct moq_media_sap_record {
  * *out filled, MOQ_DONE when none queued, MOQ_ERR_CLOSED when empty AND
  * terminal, MOQ_ERR_INVAL for NULL args or out_size below the v0 base. A
  * malformed timeline payload is counted in stats.parse_drops and is never
- * fatal. The bounded record queue drops oldest under sustained non-polling. */
+ * fatal.
+ *
+ * The record queue is bounded, and never silently lossy: a record once
+ * admitted is retained until polled. When the queue is full, the remaining
+ * records of the independent object are DEFERRED -- not admitted, not marked
+ * as surfaced -- and each is counted in stats.sap_record_deferrals. Because
+ * the dedup cursor advances only for admitted records, the next MSF §8.3
+ * independent object (which carries the accumulated history) delivers the
+ * deferred tail once the application has drained capacity. If no later
+ * independent object arrives, the deferral counter is the public witness of
+ * what the application has not seen. */
 MOQ_API moq_result_t moq_media_receiver_poll_sap(moq_media_receiver_t *r,
                                                  moq_media_sap_record_t *out,
                                                  size_t out_size);
@@ -665,8 +726,15 @@ typedef struct moq_media_timeline_record {
  * min(out_size, current), stamps the bytes written. Returns MOQ_OK with *out
  * filled, MOQ_DONE when none queued, MOQ_ERR_CLOSED when empty AND terminal,
  * MOQ_ERR_INVAL for NULL args or out_size below the v0 base. A malformed timeline
- * payload is counted in stats.parse_drops and is never fatal. The bounded record
- * queue drops oldest under sustained non-polling. */
+ * payload is counted in stats.parse_drops and is never fatal.
+ *
+ * The record queue is bounded, and never silently lossy, exactly as poll_sap:
+ * admitted records are retained until polled; when the queue is full the
+ * remaining records of the independent object are deferred and each counted
+ * in stats.media_timeline_record_deferrals, the dedup cursor stays at the last
+ * admitted record, and the next MSF §7.3 independent object delivers the
+ * deferred tail once capacity has been drained. With no later independent
+ * object, the deferral counter is the public witness. */
 MOQ_API moq_result_t moq_media_receiver_poll_media_timeline(
     moq_media_receiver_t *r,
     moq_media_timeline_record_t *out,
@@ -705,6 +773,17 @@ typedef struct moq_media_receiver_stats {
      * completion beyond the per-track TRACK_REMOVED events a terminating
      * (empty-tracks) catalog emits. */
     bool     catalog_complete;
+    /* Appended (third generation): valid SAP / media-timeline records that
+     * could not be admitted because the bounded record queue was full. These
+     * are DEFERRAL attempts, not permanent losses: the dedup cursor stays at
+     * the last admitted record, so a later independent object delivers the
+     * deferred tail once the application drains capacity -- and a repeated
+     * attempt while the application is still behind counts again. What the
+     * counters guarantee is that bounded-queue pressure is public and
+     * countable, never silent; with no later independent object they are the
+     * witness of what the application has not seen. */
+    uint64_t sap_record_deferrals;
+    uint64_t media_timeline_record_deferrals;
 } moq_media_receiver_stats_t;
 
 /* Snapshot stats into *out. Pass `out_size = sizeof(*out)`; same size contract as
@@ -713,9 +792,12 @@ typedef struct moq_media_receiver_stats {
  *
  * ABI generations (the v0 prefix is frozen at `paused`):
  *   - a v0 caller (out_size through `paused`) gets the fields up to `paused`;
+ *   - a caller sized through `catalog_drops` gets that field but not
+ *     `catalog_complete` nor the deferral counters; one sized through
+ *     `catalog_complete` gets it but not the deferral counters;
  *   - a caller built against newer headers and passing
- *     sizeof(moq_media_receiver_stats_t) gets the appended `catalog_drops` and
- *     `catalog_complete` too;
+ *     sizeof(moq_media_receiver_stats_t) gets everything appended, through
+ *     `sap_record_deferrals` and `media_timeline_record_deferrals`;
  *   - any in-between out_size is clamped by prefix (you get a field only if the
  *     full field fits in out_size). */
 MOQ_API moq_result_t moq_media_receiver_get_stats(

@@ -21,11 +21,12 @@
 #   9  build type
 #  10  openssl root   (may be empty)
 #  11  work dir       (created fresh; removed on success)
+#  12  install libdir (CMAKE_INSTALL_LIBDIR: lib, lib64, lib/<arch>, …)
 set -euo pipefail
 
 CMAKE="$1"; CONSUMER_SRC="$2"; LIBMOQ_BUILD="$3"; PICOQUIC_SRC="$4"
 PICOTLS_PREFIX="$5"; CC="$6"; CFLAGS="$7"; LDFLAGS="$8"; BUILD_TYPE="$9"
-OPENSSL_ROOT="${10}"; WORK="${11}"
+OPENSSL_ROOT="${10}"; WORK="${11}"; LIBDIR="${12}"
 
 P="$WORK/prefix"
 PQB="$WORK/pq-build"
@@ -90,7 +91,10 @@ echo "== 3. configure consumer against install prefix (installed picoquic) =="
 "$CMAKE" --build "$CONB"
 
 echo "== 4. run consumer =="
-"$CONB/moq_pico_wt_adapter_consumer_test"
+# The runner supplies the runtime search path a consumer of a private prefix
+# owns and proves every LibMoQ/PicoQUIC image came from the installed libdir.
+bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../../picoquic/tests/run_installed_consumer.sh" \
+    "$P/$LIBDIR" "$CONB/moq_pico_wt_adapter_consumer_test"
 
 echo "== install-tree consumer OK =="
 rm -rf "$WORK"

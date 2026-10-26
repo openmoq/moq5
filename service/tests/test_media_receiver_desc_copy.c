@@ -2,11 +2,12 @@
  * Contract test for moq_media_receiver_track_desc_copy() and the description
  * writer/reader locking it depends on.
  *
- * A1 -- WRITER LOCK. The live->VOD conversion (MSF-01 sec. 11.3) writes three
- *   mutable scalars of a handle-owned description in place on the network
- *   thread. A phase observer brackets those writes (VOD_WRITER_PRE/POST) and
- *   probes r->mu with an exact tri-state try-lock: the mutex must be HELD at
- *   both boundaries. Single-threaded; no timing race is sampled.
+ * A1 -- WRITER LOCK. The live->VOD conversion (MSF-01 sec. 11.3) publishes a
+ *   new immutable description snapshot on the SAME handle on the network
+ *   thread; the earlier snapshot is never rewritten. A phase observer brackets
+ *   the publication (VOD_WRITER_PRE/POST) and probes r->mu with an exact
+ *   tri-state try-lock: the mutex must be HELD at both boundaries.
+ *   Single-threaded; no timing race is sampled.
  *
  * A2 -- READER LOCK. The copy operation brackets its ownership walk and copy
  *   with DESC_READER_PRE/POST; r->mu must be HELD at both, once per call,
@@ -179,7 +180,7 @@ static bool has_failed(const oracle_t *o, const char *name)
     return false;
 }
 
-/* -- A1: the live->VOD writer holds r->mu across the three writes ---------- */
+/* -- A1: the live->VOD writer holds r->mu across the publication ---------- */
 typedef struct { int seen[8]; int held[8]; int invalid[8]; } probe_t;
 static void phase_hook(const moq_media_receiver_t *r, int phase, void *ctx)
 {
@@ -208,18 +209,31 @@ static void test_a1_vod_writer_lock_gap(void)
     const moq_media_track_desc_t *desc = moq_media_track_desc_get(video);
     OROW(&o, "fixture.live_desc", desc != NULL && desc->is_live && !desc->has_track_duration);
     /* The REAL catalog path: an independent VOD catalog drives receiver_reconcile,
-     * which writes the three scalars in place and then queues TRACK_UPDATED. */
+     * which publishes a new immutable description snapshot on the SAME handle
+     * and then queues TRACK_UPDATED. The earlier snapshot is never rewritten. */
     ingest(r, 1, 0, VOD_CAT);
     drain_all(r, &inv);
     { ev_t want[1] = { { MOQ_MEDIA_TRACK_UPDATED, video } };
       OROW(&o, "fixture.vod_inventory", inventory_matches(&inv, want, 1)); }
-    OROW(&o, "fixture.same_handle_mutated", desc == moq_media_track_desc_get(video) &&
-         desc && !desc->is_live && desc->has_track_duration && desc->track_duration_ms == FX_DURATION);
+    OROW(&o, "fixture.same_handle", inv.n == 1 && inv.ev[0].track == video);
+    OROW(&o, "fixture.old_snapshot_unchanged",
+         desc && desc->is_live && !desc->has_track_duration);
+    const moq_media_track_desc_t *cur = moq_media_track_desc_get(video);
+    OROW(&o, "fixture.new_snapshot_current",
+         cur && cur != desc && !cur->is_live && cur->has_track_duration &&
+         cur->track_duration_ms == FX_DURATION);
+    {
+        moq_media_track_desc_t c;
+        memset(&c, 0, sizeof(c));
+        OROW(&o, "fixture.copy_current",
+             moq_media_receiver_track_desc_copy(r, video, &c, sizeof(c)) == MOQ_OK &&
+             !c.is_live && c.has_track_duration && c.track_duration_ms == FX_DURATION);
+    }
     /* The observer fired exactly once at each boundary of the writer. */
     OROW(&o, "observer.pre_once", p.seen[PH_VOD_WRITER_PRE] == 1);
     OROW(&o, "observer.post_once", p.seen[PH_VOD_WRITER_POST] == 1);
     OROW(&o, "observer.probe_valid", p.invalid[PH_VOD_WRITER_PRE] + p.invalid[PH_VOD_WRITER_POST] == 0);
-    /* The contract holds r->mu across the three writes, so both boundaries
+    /* The contract holds r->mu across the publication, so both boundaries
      * observe HELD. Each is independent, so a lock moved inward fails exactly
      * its phase. */
     OROW(&o, "mu_held_at_writer_pre", p.held[PH_VOD_WRITER_PRE] == 1);
@@ -386,7 +400,8 @@ static bool claimed(oracle_t *o, const char *phase, moq_result_t rc,
 /* Every field the LOC fixture represents, checked on a FULL-size copy:
  * immutable spans byte-exact against the declared literals AND borrowed from
  * the handle (identity), scalars against the literals, everything the fixture
- * leaves absent reported absent. `live` selects the mutable triple.
+ * leaves absent reported absent. `live` selects which snapshot's
+ * is_live/trackDuration values are expected (before or after the conversion).
  * `production` selects the derived info values: a description built by a
  * session carries VIDEO/RAW (A4); on the no-session seam the sized helper
  * refuses version 0 and the fallback leaves info zeroed, so there the copy is
@@ -485,7 +500,12 @@ static void run_desc_copy_oracle(oracle_t *o, desc_copy_fn copy)
     { ev_t want[1] = { { MOQ_MEDIA_TRACK_UPDATED, video } };
       OROW(o, "vod.inventory_exact", inventory_matches(&inv, want, 1));
       if (!inventory_matches(&inv, want, 1)) dump_inventory("vod", &inv); }
-    OROW(o, "vod.same_borrowed_desc", moq_media_track_desc_get(video) == borrowed);
+    /* The conversion published a NEW current snapshot; the one borrowed
+     * earlier stays valid and unchanged, so a lock-free reader of it can never
+     * see a mix of the two. */
+    OROW(o, "vod.new_current_snapshot", moq_media_track_desc_get(video) != NULL &&
+                                        moq_media_track_desc_get(video) != borrowed);
+    OROW(o, "vod.old_snapshot_unchanged", borrowed->is_live && !borrowed->has_track_duration);
     poison(&out, sizeof(out));
     if (CLAIMED(o, "vod", copy(r, video, &out, sizeof(out)), &out, sizeof(out)))
         check_fixture_fields(o, "vod", &out, borrowed, false, false);

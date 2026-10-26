@@ -1,0 +1,317 @@
+# LibMoQ package provider guard.
+#
+# ONE implementation, injected verbatim into BOTH the build-tree and the
+# install-tree libmoqConfig.cmake, so the two trees cannot drift and a defect
+# cannot be fixed in one while surviving in the other.
+#
+# The provider facts recorded above (_LIBMOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND,
+# _LIBMOQ_PICOQUIC_WITH_OPENSSL, _LIBMOQ_PICOQUIC_WITH_MBEDTLS) come from the
+# normalized provider record that built this artifact. They are what a consumer
+# needs so a nested Picoquic resolution cannot revert an mbedTLS artifact to
+# picoquic's OpenSSL defaults.
+
+# SUFFICIENT SIGNATURES, not atom membership. A signature is a set of atoms
+# that must ALL be present; a provider is proven when some signature is fully
+# present. Membership in a list of atoms would be an OR, and an incidental
+# dependency on one generic crypto library would then "prove" a provider.
+#
+# Derived from the picoquic exports this project actually supports, measured on
+# both real trees rather than assumed:
+#
+#   OpenSSL  picoquic-core -> libssl, libcrypto, picotls-core,
+#                             picotls-openssl, picotls-minicrypto
+#   mbedTLS  picoquic-core -> mbedtls, mbedx509, mbedcrypto, picotls-core,
+#                             picotls-minicrypto
+#
+# So `picotls-openssl` is provider-specific and sufficient on its own, while
+# the mbedTLS build exposes only GENERIC mbedTLS libraries -- its sufficient
+# signature is therefore the COMPLETE tuple. `picotls-mbedtls` exists upstream
+# in picotls but is NOT linked by the supported picoquic topology, so it is
+# deliberately not treated as a signature here: a signature this project cannot
+# demonstrate is not evidence.
+#
+# Atoms are compared EXACTLY -- never as substrings -- so a prefixed or
+# suffixed decoy is a different atom.
+set(_LIBMOQ_PROVIDER_SIGS_openssl "picotls-openssl")
+set(_LIBMOQ_PROVIDER_SIGS_mbedtls "mbedtls+mbedx509+mbedcrypto")
+
+# Reduce one link-closure entry to its canonical atom name, or "" when it is
+# not an identity we can name. Handles namespaced target names, `-l` flags, and
+# library paths (basename, `lib` prefix and a known suffix removed).
+function(_libmoq_atom_of entry out)
+    set(_e "${entry}")
+    # Unwrap the generator expressions a link interface legitimately carries;
+    # $<LINK_ONLY:...> and $<BUILD_INTERFACE:...> are real dependencies.
+    while(_e MATCHES "^\\$<(LINK_ONLY|BUILD_INTERFACE|INSTALL_INTERFACE):(.*)>$")
+        set(_e "${CMAKE_MATCH_2}")
+    endwhile()
+    if(_e MATCHES "\\$<")
+        set(${out} "" PARENT_SCOPE)   # unevaluable at configure time
+        return()
+    endif()
+    if(_e MATCHES "^-l(.+)$")
+        set(_e "${CMAKE_MATCH_1}")
+    endif()
+    if(_e MATCHES "/")
+        get_filename_component(_e "${_e}" NAME)
+        string(REGEX REPLACE "^lib" "" _e "${_e}")
+        string(REGEX REPLACE "\\.(a|so|dylib|lib)(\\.[0-9.]+)?$" "" _e "${_e}")
+    endif()
+    # A namespaced target contributes its own name.
+    if(_e MATCHES "^[A-Za-z0-9_]+::(.+)$")
+        set(_e "${CMAKE_MATCH_1}")
+    endif()
+    set(${out} "${_e}" PARENT_SCOPE)
+endfunction()
+
+# Structural evidence: walk the target's dependency closure, following aliases
+# and transitive interface/link dependencies, and report which providers the
+# closure actually proves. A direct-link-only check or a single assumed target
+# spelling would miss evidence one level down, which is why this is a walk.
+function(_libmoq_provider_evidence root out_openssl out_mbedtls)
+    set(_seen "")
+    set(_queue "${root}")
+    set(_atoms "")
+    while(_queue)
+        list(POP_FRONT _queue _cur)
+        if(_cur STREQUAL "")
+            continue()
+        endif()
+        if(_cur IN_LIST _seen)
+            continue()
+        endif()
+        list(APPEND _seen "${_cur}")
+
+        _libmoq_atom_of("${_cur}" _atom)
+        if(_atom AND NOT _atom IN_LIST _atoms)
+            list(APPEND _atoms "${_atom}")
+        endif()
+
+        if(NOT TARGET "${_cur}")
+            continue()
+        endif()
+        # Follow the alias to the target that carries the properties.
+        get_target_property(_aliased "${_cur}" ALIASED_TARGET)
+        if(_aliased)
+            list(APPEND _queue "${_aliased}")
+            continue()
+        endif()
+        get_target_property(_ill "${_cur}" INTERFACE_LINK_LIBRARIES)
+        if(_ill)
+            list(APPEND _queue ${_ill})
+        endif()
+        get_target_property(_type "${_cur}" TYPE)
+        get_target_property(_imported "${_cur}" IMPORTED)
+        if(NOT _type STREQUAL "INTERFACE_LIBRARY" AND NOT _imported)
+            get_target_property(_ll "${_cur}" LINK_LIBRARIES)
+            if(_ll)
+                list(APPEND _queue ${_ll})
+            endif()
+        endif()
+    endwhile()
+    _libmoq_signature_present("${_atoms}" "${_LIBMOQ_PROVIDER_SIGS_openssl}" _o)
+    _libmoq_signature_present("${_atoms}" "${_LIBMOQ_PROVIDER_SIGS_mbedtls}" _m)
+    set(${out_openssl} ${_o} PARENT_SCOPE)
+    set(${out_mbedtls} ${_m} PARENT_SCOPE)
+endfunction()
+
+# TRUE when the collected atoms contain EVERY atom of at least one signature.
+function(_libmoq_signature_present atoms sigs out)
+    foreach(_sig IN LISTS sigs)
+        string(REPLACE "+" ";" _need "${_sig}")
+        set(_all TRUE)
+        foreach(_atom IN LISTS _need)
+            if(NOT _atom IN_LIST atoms)
+                set(_all FALSE)
+            endif()
+        endforeach()
+        if(_all)
+            set(${out} TRUE PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    set(${out} FALSE PARENT_SCOPE)
+endfunction()
+
+# Refuse a Picoquic target whose actual dependency closure proves it lacks the
+# provider this artifact was built with. A both-provider closure is valid when
+# the selected verifier is present; a closure that proves nothing fails closed
+# under its own record, because "no evidence" is not "compatible".
+function(_libmoq_guard_picoquic_target)
+    set(_sel "${_LIBMOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND}")
+    if(NOT _sel)
+        return()
+    endif()
+    if(NOT TARGET picoquic::picoquic-core AND NOT TARGET picoquic-core)
+        return()
+    endif()
+    if(TARGET picoquic::picoquic-core)
+        set(_root picoquic::picoquic-core)
+    else()
+        set(_root picoquic-core)
+    endif()
+    _libmoq_provider_evidence("${_root}" _ev_openssl _ev_mbedtls)
+
+    if(_sel STREQUAL "openssl")
+        set(_have ${_ev_openssl})
+        set(_other ${_ev_mbedtls})
+        set(_other_name "mbedtls")
+    else()
+        set(_have ${_ev_mbedtls})
+        set(_other ${_ev_openssl})
+        set(_other_name "openssl")
+    endif()
+
+    if(_have)
+        return()
+    endif()
+    if(_other)
+        message(FATAL_ERROR
+            "LIBMOQ_PICOQUIC_PROVIDER_MISMATCH selected=${_sel} observed=${_other_name}\n"
+            "The picoquic target already defined in this project proves the "
+            "${_other_name} provider, but this LibMoQ artifact was built "
+            "against ${_sel}. Rebuild picoquic with the ${_sel} provider, or "
+            "consume a LibMoQ artifact built for ${_other_name}.")
+    endif()
+    message(FATAL_ERROR
+        "LIBMOQ_PICOQUIC_PROVIDER_EVIDENCE selected=${_sel} observed=unknown\n"
+        "The picoquic target already defined in this project carries no "
+        "dependency evidence of any TLS provider, so its compatibility with "
+        "this ${_sel}-built LibMoQ artifact cannot be established. Define the "
+        "picoquic target through its own package, or remove it and let LibMoQ "
+        "resolve it.")
+endfunction()
+
+# ONE strict CMake-boolean parser. Consumers legitimately write TRUE/FALSE,
+# 1/0 or yes/no; comparing those lexically against the recorded ON/OFF would
+# call a structurally compatible project a conflict. An unknown token is not
+# guessed at -- it gets its own actionable record.
+function(_libmoq_canon_bool value out_ok out_val)
+    string(TOUPPER "${value}" _v)
+    if(_v STREQUAL "ON" OR _v STREQUAL "TRUE" OR _v STREQUAL "YES"
+       OR _v STREQUAL "Y" OR _v STREQUAL "1")
+        set(${out_ok} TRUE PARENT_SCOPE)
+        set(${out_val} ON PARENT_SCOPE)
+    elseif(_v STREQUAL "OFF" OR _v STREQUAL "FALSE" OR _v STREQUAL "NO"
+           OR _v STREQUAL "N" OR _v STREQUAL "0" OR _v STREQUAL "")
+        set(${out_ok} TRUE PARENT_SCOPE)
+        set(${out_val} OFF PARENT_SCOPE)
+    else()
+        set(${out_ok} FALSE PARENT_SCOPE)
+        set(${out_val} "" PARENT_SCOPE)
+    endif()
+endfunction()
+
+# Hand the recorded provider facts to a nested Picoquic resolution, so it
+# cannot fall back to picoquic's own defaults. A consumer that has explicitly
+# stated the opposite provider is a contradiction between two authorities: it
+# is refused under its own record rather than silently overwritten.
+macro(_libmoq_apply_picoquic_provider_facts)
+    set(_libmoq_pf_restore "")
+    foreach(_libmoq_pf_pair "WITH_OPENSSL;${_LIBMOQ_PICOQUIC_WITH_OPENSSL}"
+                            "WITH_MBEDTLS;${_LIBMOQ_PICOQUIC_WITH_MBEDTLS}")
+        list(GET _libmoq_pf_pair 0 _libmoq_pf_var)
+        list(GET _libmoq_pf_pair 1 _libmoq_pf_want)
+        if(NOT "${_libmoq_pf_want}" STREQUAL "")
+            if(DEFINED ${_libmoq_pf_var})
+                # Compare CANONICAL booleans, not spellings: an explicit value
+                # that means the same thing is compatible and is left exactly
+                # as the consumer wrote it.
+                _libmoq_canon_bool("${${_libmoq_pf_var}}" _libmoq_pf_ok _libmoq_pf_got)
+                if(NOT _libmoq_pf_ok)
+                    message(FATAL_ERROR
+                        "LIBMOQ_PICOQUIC_PROVIDER_EVIDENCE selected=${_LIBMOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND} observed=unparsable\n"
+                        "This project sets ${_libmoq_pf_var}=${${_libmoq_pf_var}}, "
+                        "which is not a CMake boolean. LibMoQ will not guess "
+                        "what an unrecognized provider statement means; use one "
+                        "of ON/TRUE/YES/Y/1 or OFF/FALSE/NO/N/0.")
+                endif()
+                _libmoq_canon_bool("${_libmoq_pf_want}" _libmoq_pf_wok _libmoq_pf_wval)
+                if(NOT "${_libmoq_pf_got}" STREQUAL "${_libmoq_pf_wval}")
+                    message(FATAL_ERROR
+                        "LIBMOQ_PICOQUIC_PROVIDER_EVIDENCE selected=${_LIBMOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND} observed=conflict\n"
+                        "This project sets ${_libmoq_pf_var}=${${_libmoq_pf_var}}, "
+                        "but this LibMoQ artifact was built against picoquic with "
+                        "${_libmoq_pf_var}=${_libmoq_pf_want}. LibMoQ will not "
+                        "overwrite an explicit provider statement; make them agree.")
+                endif()
+            endif()
+            if(NOT DEFINED ${_libmoq_pf_var})
+                list(APPEND _libmoq_pf_restore "${_libmoq_pf_var}")
+                set(${_libmoq_pf_var} "${_libmoq_pf_want}")
+            endif()
+        endif()
+    endforeach()
+
+    # The resolved picotls artifacts are supplied the same way, but they are
+    # not provider ASSERTIONS: a consumer pointing at its own picotls has made
+    # a location choice, not a contradictory provider claim, so an existing
+    # value is left alone rather than refused.
+    foreach(_libmoq_pf_pair "MOQ_PICOTLS_PREFIX;${_LIBMOQ_PICOTLS_PREFIX}"
+                            "PTLS_INCLUDE_DIR;${_LIBMOQ_PTLS_INCLUDE_DIR}"
+                            "PTLS_CORE_LIBRARY;${_LIBMOQ_PTLS_CORE_LIBRARY}"
+                            "PTLS_MINICRYPTO_LIBRARY;${_LIBMOQ_PTLS_MINICRYPTO_LIBRARY}"
+                            "MBEDTLS_INCLUDE_DIR;${_LIBMOQ_MBEDTLS_INCLUDE_DIR}"
+                            "MBEDTLS_LIBRARY;${_LIBMOQ_MBEDTLS_LIBRARY}"
+                            "MBEDTLS_CRYPTO;${_LIBMOQ_MBEDTLS_CRYPTO}"
+                            "MBEDTLS_X509;${_LIBMOQ_MBEDTLS_X509}"
+                            "MOQ_PICOQUIC_MBEDTLS_INCLUDE_DIR;${_LIBMOQ_PICOQUIC_MBEDTLS_INCLUDE_DIR}")
+        list(GET _libmoq_pf_pair 0 _libmoq_pf_var)
+        list(GET _libmoq_pf_pair 1 _libmoq_pf_want)
+        if(NOT "${_libmoq_pf_want}" STREQUAL ""
+           AND NOT DEFINED ${_libmoq_pf_var})
+            list(APPEND _libmoq_pf_restore "${_libmoq_pf_var}")
+            set(${_libmoq_pf_var} "${_libmoq_pf_want}")
+        endif()
+    endforeach()
+endmacro()
+
+# Consumer scope is restored after dependency resolution: the facts exist to
+# steer THIS resolution, not to become the project's own settings.
+macro(_libmoq_restore_picoquic_provider_facts)
+    # Only variables this project actually DEFINED are removed. A blanket
+    # unset() would also drop a value the consumer had set itself -- and where
+    # the consumer set it as a cache entry, unset() would silently expose the
+    # cache again and hide the damage.
+    foreach(_libmoq_pf_var IN LISTS _libmoq_pf_restore)
+        unset(${_libmoq_pf_var})
+    endforeach()
+    set(_libmoq_pf_restore "")
+endmacro()
+
+# THE Picoquic resolution path. Every component route goes through this, so a
+# route cannot acquire a picoquic target without the provider facts being
+# applied and the resulting target being checked. Component-specific
+# requirements (OpenSSL, HTTP) stay with their own component around this call.
+macro(_libmoq_resolve_picoquic)
+    _libmoq_apply_picoquic_provider_facts()
+
+    # NOT find_dependency(): that helper RETURNS from the enclosing package
+    # config when a dependency is not found, which would skip the restore below
+    # and leave this project's temporary provider facts and location hints
+    # defined in the CONSUMER's scope. The same not-found semantics are
+    # reproduced here, but only after cleanup has run.
+    set(_libmoq_pq_args "")
+    if(${CMAKE_FIND_PACKAGE_NAME}_FIND_QUIETLY)
+        list(APPEND _libmoq_pq_args QUIET)
+    endif()
+    find_package(Picoquic ${_libmoq_pq_args})
+
+    # Cleanup FIRST, on every path.
+    _libmoq_restore_picoquic_provider_facts()
+
+    if(NOT Picoquic_FOUND)
+        # Exactly what find_dependency() would have reported, so a QUIET or
+        # REQUIRED consumer still sees standard package semantics: the
+        # component is not found, the reason is specific, and no adapter target
+        # is included.
+        # ONE string argument: several would be joined with ';' and the
+        # message would read back as a list.
+        set(${CMAKE_FIND_PACKAGE_NAME}_NOT_FOUND_MESSAGE
+            "libmoq could not find its required dependency Picoquic. Install picoquic to a prefix in CMAKE_PREFIX_PATH, or pass -DMOQ_PICOQUIC_SOURCE_DIR=/path/to/picoquic (picotls must be adjacent or set -DMOQ_PICOTLS_PREFIX).")
+        set(${CMAKE_FIND_PACKAGE_NAME}_FOUND FALSE)
+        return()
+    endif()
+
+    _libmoq_guard_picoquic_target()
+endmacro()

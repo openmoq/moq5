@@ -199,7 +199,23 @@ MOQ_API void moq_media_parsed_object_init(moq_media_parsed_object_t *out);
  * left at 0. (It is therefore never dropped with MOQ_MEDIA_DROP_MISSING_TIMESTAMP
  * at this layer; a consumer that requires a presentation time enforces that
  * itself via has_capture_time -- e.g. the playback pipeline drops such objects.)
- * When the timestamp is present it drives decode/presentation time as usual.
+ *
+ * When the timestamp IS present, a RAW/LOC object's whole timing comes from
+ * that ONE scalar: it is COPIED into capture_time_us, decode_time_us and
+ * presentation_time_us -- reinterpreted in each output, not unit-converted --
+ * and composition_offset_us is 0. Two consequences a consumer should know:
+ *
+ *   - has_capture_time=true does not mean the publisher supplied a capture
+ *     instant. The LOC field is DEFINED as an epoch capture timestamp
+ *     (LOC-01 2.3.1.1), but a sender given no capture time copies its media
+ *     presentation scalar into it (moq_media_send_object_t, media_sender.h),
+ *     and which source domain produced the value cannot be identified here.
+ *   - a publisher's own media-timeline values do not arrive alongside an
+ *     application-supplied capture instant; the single wire value produced all
+ *     three fields.
+ *
+ * This is RAW/LOC behaviour only. A CMAF object's timing is derived from the
+ * fragment (base media decode time and the sample table), not from this field.
  */
 MOQ_API moq_result_t moq_media_object_parse(
     const moq_media_track_info_t *track,

@@ -45,6 +45,7 @@
  * that drives picoquic (the callback thread).
  */
 
+#include <moq/export.h>
 #include <moq/session.h>
 #include <picoquic.h>
 
@@ -96,7 +97,7 @@ typedef struct moq_pq_conn_cfg {
  * passing sizeof(*cfg) from your compilation unit; that clears the full struct
  * you allocated and stamps the matching size.
  */
-void moq_pq_conn_cfg_init(moq_pq_conn_cfg_t *cfg);
+MOQ_PQ_API void moq_pq_conn_cfg_init(moq_pq_conn_cfg_t *cfg);
 
 /*
  * Size-aware initializer. Clears min(cfg_size, sizeof(*cfg)) bytes and stamps
@@ -108,7 +109,8 @@ void moq_pq_conn_cfg_init(moq_pq_conn_cfg_t *cfg);
  *     moq_pq_conn_cfg_init_sized(&cfg, sizeof(cfg));
  *     cfg.user_ctx = ...;
  */
-void moq_pq_conn_cfg_init_sized(moq_pq_conn_cfg_t *cfg, size_t cfg_size);
+MOQ_PQ_API void moq_pq_conn_cfg_init_sized(moq_pq_conn_cfg_t *cfg,
+                                           size_t cfg_size);
 
 /*
  * Create an adapter connection binding a moq_session to a picoquic
@@ -130,15 +132,15 @@ void moq_pq_conn_cfg_init_sized(moq_pq_conn_cfg_t *cfg, size_t cfg_size);
  * moq_pq_threaded helper enables this by default; raw attach callers do not get
  * it for free.
  */
-int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
-                         moq_pq_conn_t **out);
+MOQ_PQ_API int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
+                                  moq_pq_conn_t **out);
 
-void moq_pq_conn_destroy(moq_pq_conn_t *conn);
+MOQ_PQ_API void moq_pq_conn_destroy(moq_pq_conn_t *conn);
 
 /*
  * Get the underlying moq_session for direct facade/API use.
  */
-moq_session_t *moq_pq_conn_session(moq_pq_conn_t *conn);
+MOQ_PQ_API moq_session_t *moq_pq_conn_session(moq_pq_conn_t *conn);
 
 /*
  * Opaque application context stored on the adapter connection.
@@ -152,8 +154,8 @@ moq_session_t *moq_pq_conn_session(moq_pq_conn_t *conn);
  * via moq_pq_conn_set_user_ctx(). The adapter never reads or
  * modifies user_ctx itself.
  */
-void *moq_pq_conn_user_ctx(const moq_pq_conn_t *conn);
-void  moq_pq_conn_set_user_ctx(moq_pq_conn_t *conn, void *user_ctx);
+MOQ_PQ_API void *moq_pq_conn_user_ctx(const moq_pq_conn_t *conn);
+MOQ_PQ_API void  moq_pq_conn_set_user_ctx(moq_pq_conn_t *conn, void *user_ctx);
 
 /*
  * Query whether the adapter has entered a terminal fatal state.
@@ -167,8 +169,8 @@ void  moq_pq_conn_set_user_ctx(moq_pq_conn_t *conn, void *user_ctx);
  * connection and log the error. It is not a recovery mechanism:
  * once fatal, the adapter and its session are done.
  */
-bool     moq_pq_conn_is_fatal(const moq_pq_conn_t *conn);
-uint64_t moq_pq_conn_fatal_code(const moq_pq_conn_t *conn);
+MOQ_PQ_API bool     moq_pq_conn_is_fatal(const moq_pq_conn_t *conn);
+MOQ_PQ_API uint64_t moq_pq_conn_fatal_code(const moq_pq_conn_t *conn);
 
 /*
  * Query whether the adapter reached terminal non-fatal close.
@@ -182,8 +184,8 @@ uint64_t moq_pq_conn_fatal_code(const moq_pq_conn_t *conn);
  * processing occurs. This is distinct from is_fatal(), which
  * indicates an adapter or bridge internal failure.
  */
-bool     moq_pq_conn_is_closed(const moq_pq_conn_t *conn);
-uint64_t moq_pq_conn_close_code(const moq_pq_conn_t *conn);
+MOQ_PQ_API bool     moq_pq_conn_is_closed(const moq_pq_conn_t *conn);
+MOQ_PQ_API uint64_t moq_pq_conn_close_code(const moq_pq_conn_t *conn);
 
 /*
  * Pump session actions and retry pending inbound work.
@@ -203,7 +205,7 @@ uint64_t moq_pq_conn_close_code(const moq_pq_conn_t *conn);
  * Datagrams that hit WOULD_BLOCK are silently dropped (lossy).
  * Returns 0 on success, negative on fatal error.
  */
-int moq_pq_service(moq_pq_conn_t *conn, uint64_t now_us);
+MOQ_PQ_API int moq_pq_service(moq_pq_conn_t *conn, uint64_t now_us);
 
 /*
  * Picoquic stream data callback. Install this as the connection's
@@ -212,12 +214,12 @@ int moq_pq_service(moq_pq_conn_t *conn, uint64_t now_us);
  * Usage:
  *   picoquic_set_callback(cnx, moq_pq_callback, adapter_conn);
  */
-int moq_pq_callback(picoquic_cnx_t *cnx,
-                      uint64_t stream_id,
-                      uint8_t *bytes, size_t length,
-                      picoquic_call_back_event_t event,
-                      void *callback_ctx,
-                      void *stream_ctx);
+MOQ_PQ_API int moq_pq_callback(picoquic_cnx_t *cnx,
+                               uint64_t stream_id,
+                               uint8_t *bytes, size_t length,
+                               picoquic_call_back_event_t event,
+                               void *callback_ctx,
+                               void *stream_ctx);
 
 #ifdef __cplusplus
 }

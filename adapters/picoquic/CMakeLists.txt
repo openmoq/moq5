@@ -17,6 +17,13 @@ add_library(moq-adapter-picoquic
     ../common/moq_pq_send_queue.c)
 add_library(moq::adapter-picoquic ALIAS moq-adapter-picoquic)
 
+# Only the MOQ_PQ_API declarations -- <moq/picoquic.h>, <moq/picoquic_verify.h>
+# and the private SPI in picoquic_spi.h -- are exported; every other symbol is
+# internal. MOQ_PQ_BUILDING (not the core's MOQ_BUILDING) marks this library
+# as their producer, so the core's MOQ_API functions it calls stay imports.
+set_target_properties(moq-adapter-picoquic PROPERTIES C_VISIBILITY_PRESET hidden)
+target_compile_definitions(moq-adapter-picoquic PRIVATE MOQ_PQ_BUILDING)
+
 target_include_directories(moq-adapter-picoquic
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -28,22 +35,146 @@ target_include_directories(moq-adapter-picoquic
 # picoquic crypto backend. OpenSSL remains the default for source compatibility;
 # mbedTLS is selected explicitly, or automatically when picoquic is configured
 # with WITH_OPENSSL=OFF and WITH_MBEDTLS=ON.
+# ONE normalized provider record, published as cache-internal so every consumer
+# directory sees the same values regardless of processing order. The selected
+# verifier and the two upstream capability facts are distinct: picoquic can be
+# built with both providers enabled while LibMoQ selects one verifier.
+#
+# ABSENCE OF EVIDENCE IS NOT `OFF`. A source-tree picoquic defines WITH_OPENSSL
+# and WITH_MBEDTLS in this scope; an INSTALLED or already-defined picoquic
+# target does not, and mapping that silence to OFF would publish a provider
+# matrix that is demonstrably false -- an installed package whose config runs
+# find_dependency(OpenSSL) would be recorded as OpenSSL-incapable. So an
+# unavailable fact fails closed and the caller supplies it explicitly.
+#
+# What this record IS: the upstream capability facts as stated by the build
+# that produced the picoquic in use. What it is NOT: a proof that the picoquic
+# artifact actually linked those providers. Verifying the artifact would mean
+# inspecting the imported target's dependency closure, which is
+# package-compatibility work and is deliberately out of scope here; the record
+# therefore carries its own provenance rather than implying more than it knows.
+set(_moq_provider_facts_origin "")
+set(_moq_provider_missing "")
+if(NOT DEFINED WITH_OPENSSL)
+    list(APPEND _moq_provider_missing WITH_OPENSSL)
+endif()
+if(NOT DEFINED WITH_MBEDTLS)
+    list(APPEND _moq_provider_missing WITH_MBEDTLS)
+endif()
+
+if(_moq_provider_missing)
+    string(REPLACE ";" " and " _moq_missing_text "${_moq_provider_missing}")
+    message(FATAL_ERROR
+        "LIBMOQ_PICOQUIC_PROVIDER_FACTS_UNKNOWN: ${_moq_missing_text} "
+        "not available in this configuration, so the upstream provider "
+        "capability is UNKNOWN -- not OFF. This happens with an installed or "
+        "already-defined picoquic target, whose build settings are not in "
+        "caller scope. LibMoQ records the provider its artifact was built "
+        "against, so it cannot invent one. Re-run with both facts stated "
+        "explicitly, matching the picoquic actually in use, e.g. "
+        "-DWITH_OPENSSL=ON -DWITH_MBEDTLS=OFF. "
+        "missing=${_moq_missing_text}")
+endif()
+
+# Normalize only RECOGNIZED boolean spellings. An unknown spelling is rejected
+# rather than falling through to a default, so a typo cannot become truthy.
+foreach(_moq_pair "WITH_OPENSSL;_MOQ_PARENT_WITH_OPENSSL"
+                  "WITH_MBEDTLS;_MOQ_PARENT_WITH_MBEDTLS")
+    list(GET _moq_pair 0 _moq_in)
+    list(GET _moq_pair 1 _moq_out)
+    set(_moq_raw "${${_moq_in}}")
+    string(TOUPPER "${_moq_raw}" _moq_up)
+    if(_moq_up STREQUAL "ON" OR _moq_up STREQUAL "TRUE" OR
+       _moq_up STREQUAL "YES" OR _moq_up STREQUAL "Y" OR _moq_up STREQUAL "1")
+        set(${_moq_out} ON)
+    elseif(_moq_up STREQUAL "OFF" OR _moq_up STREQUAL "FALSE" OR
+           _moq_up STREQUAL "NO" OR _moq_up STREQUAL "N" OR
+           _moq_up STREQUAL "0" OR _moq_up STREQUAL "")
+        set(${_moq_out} OFF)
+    else()
+        message(FATAL_ERROR
+            "LIBMOQ_PICOQUIC_PROVIDER_FACTS_UNKNOWN: ${_moq_in} is "
+            "'${_moq_raw}', which is not a recognized CMake boolean. It must "
+            "not be guessed in either direction. field=${_moq_in}")
+    endif()
+endforeach()
+set(_moq_provider_facts_origin "explicit")
+
+# The ONE publication step: the private locals are transient inputs here and
+# are read nowhere else. Every consumer reads the published record below.
+set(MOQ_PARENT_WITH_OPENSSL "${_MOQ_PARENT_WITH_OPENSSL}" CACHE INTERNAL
+    "normalized parent picoquic WITH_OPENSSL")
+set(MOQ_PARENT_WITH_MBEDTLS "${_MOQ_PARENT_WITH_MBEDTLS}" CACHE INTERNAL
+    "normalized parent picoquic WITH_MBEDTLS")
+# The record's own provenance, so an explicitly stated fact stays
+# distinguishable from anything a future revision might infer.
+set(MOQ_PARENT_PROVIDER_FACTS_ORIGIN "${_moq_provider_facts_origin}"
+    CACHE INTERNAL "how the provider capability facts were established")
+
+
+# The resolved picotls artifacts, canonicalized to absolute existing files.
+# A target name or a nonexistent path is NOT an artifact identity: it would
+# compare equal to itself while proving nothing.
+set(MOQ_PARENT_PTLS_CORE "" CACHE INTERNAL "canonical picotls core artifact")
+set(MOQ_PARENT_PTLS_MINICRYPTO "" CACHE INTERNAL
+    "canonical picotls minicrypto artifact")
+foreach(_moq_ptls_pair "PTLS_CORE_LIBRARY;MOQ_PARENT_PTLS_CORE"
+                       "PTLS_MINICRYPTO_LIBRARY;MOQ_PARENT_PTLS_MINICRYPTO")
+    list(GET _moq_ptls_pair 0 _moq_src)
+    list(GET _moq_ptls_pair 1 _moq_dst)
+    set(_moq_val "${${_moq_src}}")
+    if(_moq_val AND IS_ABSOLUTE "${_moq_val}" AND EXISTS "${_moq_val}")
+        get_filename_component(_moq_real "${_moq_val}" REALPATH)
+        set(${_moq_dst} "${_moq_real}" CACHE INTERNAL
+            "canonical picotls artifact")
+    elseif(_moq_val AND TARGET "${_moq_val}")
+        # Resolve the target's actual artifact rather than serializing its name.
+        set(${_moq_dst} "$<TARGET_FILE:${_moq_val}>" CACHE INTERNAL
+            "canonical picotls artifact")
+    endif()
+endforeach()
+
+# Only NOW is the backend selected. AUTO reads the NORMALIZED record, never the
+# raw variables: reading them directly converts an UNAVAILABLE fact to false
+# before the record can reject it, so a single missing fact would surface as a
+# capability failure instead of an unknown-fact one.
 set(_moq_pq_verify_backend "${MOQ_PICOQUIC_VERIFY_BACKEND}")
 string(TOLOWER "${_moq_pq_verify_backend}" _moq_pq_verify_backend)
 if(_moq_pq_verify_backend STREQUAL "auto")
-    if(DEFINED WITH_OPENSSL AND NOT WITH_OPENSSL)
-        if(WITH_MBEDTLS)
+    if(NOT MOQ_PARENT_WITH_OPENSSL)
+        if(MOQ_PARENT_WITH_MBEDTLS)
             set(_moq_pq_verify_backend "mbedtls")
         else()
             message(FATAL_ERROR
+                "LIBMOQ_PICOQUIC_PROVIDER_CAPABILITY_MISMATCH: "
                 "moq-adapter-picoquic cannot install a production TLS verifier "
                 "when picoquic is built with WITH_OPENSSL=OFF and "
                 "WITH_MBEDTLS=OFF. Enable mbedTLS or set "
-                "MOQ_PICOQUIC_VERIFY_BACKEND to a supported backend.")
+                "MOQ_PICOQUIC_VERIFY_BACKEND to a supported backend. "
+                "selected=auto WITH_OPENSSL=${MOQ_PARENT_WITH_OPENSSL} "
+                "WITH_MBEDTLS=${MOQ_PARENT_WITH_MBEDTLS}")
         endif()
     else()
         set(_moq_pq_verify_backend "openssl")
     endif()
+endif()
+
+# The selected verifier must be one the recorded capability actually offers.
+# The facts are KNOWN here -- absence was rejected during ingestion -- so
+# this is a capability mismatch and carries its own token.
+if(_moq_pq_verify_backend STREQUAL "openssl" AND
+   NOT MOQ_PARENT_WITH_OPENSSL)
+    message(FATAL_ERROR
+        "LIBMOQ_PICOQUIC_PROVIDER_CAPABILITY_MISMATCH: the OpenSSL verifier is "
+        "selected while the recorded upstream capability says OpenSSL is not "
+        "built. selected=openssl WITH_OPENSSL=${MOQ_PARENT_WITH_OPENSSL}")
+endif()
+if(_moq_pq_verify_backend STREQUAL "mbedtls" AND
+   NOT MOQ_PARENT_WITH_MBEDTLS)
+    message(FATAL_ERROR
+        "LIBMOQ_PICOQUIC_PROVIDER_CAPABILITY_MISMATCH: the mbedTLS verifier is "
+        "selected while the recorded upstream capability says mbedTLS is not "
+        "built. selected=mbedtls WITH_MBEDTLS=${MOQ_PARENT_WITH_MBEDTLS}")
 endif()
 
 set(_adapter_tls_link "")
@@ -52,6 +183,8 @@ set(MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL OFF CACHE INTERNAL
     "adapter-picoquic install-tree dependency on OpenSSL")
 set(MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND "${_moq_pq_verify_backend}" CACHE INTERNAL
     "adapter-picoquic configured verifier backend")
+
+
 
 if(_moq_pq_verify_backend STREQUAL "openssl")
     # The OpenSSL verifier branch needs picotls' OpenSSL header
@@ -103,10 +236,27 @@ elseif(_moq_pq_verify_backend STREQUAL "mbedtls")
             "picoquic source tree configured with -DWITH_OPENSSL=OFF "
             "-DWITH_MBEDTLS=ON, or set MOQ_PICOQUIC_VERIFY_BACKEND=openssl.")
     endif()
-    if(DEFINED WITH_MBEDTLS AND NOT WITH_MBEDTLS)
+    if(NOT MOQ_PARENT_WITH_MBEDTLS)
         message(FATAL_ERROR
             "MOQ_PICOQUIC_VERIFY_BACKEND=mbedtls requires picoquic built with "
             "-DWITH_MBEDTLS=ON.")
+    endif()
+    # picoquic's ptls_mbedtls.h includes <picotls.h>, so the verifier source
+    # needs picotls' own headers as well as picoquic_mbedtls'. The OpenSSL arm
+    # resolves its equivalent explicitly (MOQ_PTLS_OPENSSL_INCLUDE_DIR); this
+    # arm previously relied on picotls arriving transitively, which does not
+    # happen in a prebuilt-picotls configuration -- FindPicoquic normalizes
+    # PTLS_INCLUDE_DIR precisely because picoquic does not reliably export or
+    # install picotls headers. PRIVATE, so nothing about picotls enters this
+    # adapter's public interface, install target or pkg-config metadata.
+    if(NOT PTLS_INCLUDE_DIR OR NOT EXISTS "${PTLS_INCLUDE_DIR}/picotls.h")
+        message(FATAL_ERROR
+            "moq-adapter-picoquic selected the mbedTLS certificate verifier, "
+            "but picotls' own headers (<picotls.h>) were not located. "
+            "picoquic's ptls_mbedtls.h includes them. Pass "
+            "-DMOQ_PICOTLS_PREFIX=<picotls-build-or-prefix> (the tree "
+            "containing include/picotls.h), or build against source picoquic "
+            "so FindPicoquic sets PTLS_INCLUDE_DIR.")
     endif()
     target_include_directories(moq-adapter-picoquic
         SYSTEM PRIVATE
@@ -128,9 +278,12 @@ elseif(TARGET picoquic-log)
     set(_PQ_LOG "picoquic-log")
 endif()
 
+# picoquic-core and picoquic-log are mutually dependent archives; the adapter
+# carries their whole closure (cmake/MoqPicoquicLink.cmake).
+moq_picoquic_build_link_closure(_PQ_CLOSURE_BUILD ${_PQ} ${_PQ_LOG})
 target_link_libraries(moq-adapter-picoquic
     PUBLIC moq::core ${_adapter_tls_link}
-    PUBLIC $<BUILD_INTERFACE:${_PQ}>)
+    PUBLIC ${_PQ_CLOSURE_BUILD})
 
 set_property(TARGET moq-adapter-picoquic APPEND PROPERTY
     INTERFACE_LINK_LIBRARIES "$<INSTALL_INTERFACE:${_PQ}>")
@@ -167,7 +320,8 @@ install(FILES moq_picoquic.h
 # consumption (absolute paths) and one for install-tree (relocatable).
 
 # Build-tree targets (absolute paths — valid on this machine)
-set(_adapter_pq_link "moq::core;${_adapter_tls_link};${_PQ}")
+moq_picoquic_link_closure(_PQ_CLOSURE ${_PQ} ${_PQ_LOG})
+set(_adapter_pq_link "moq::core;${_adapter_tls_link};${_PQ_CLOSURE}")
 file(GENERATE
     OUTPUT "${PROJECT_BINARY_DIR}/libmoqAdapterTargets.cmake"
     CONTENT "\
@@ -294,6 +448,64 @@ add_library(test_adapter_compile OBJECT test_compile.c)
 target_link_libraries(test_adapter_compile PRIVATE moq::adapter-picoquic)
 
 if(MOQ_BUILD_TESTS)
+    # Test-only parent provenance manifest. CMakeCache.txt is NOT a total
+    # authority -- PTLS_* may be ordinary CMake-scope values that never reach
+    # the cache -- so the parent writes what it actually selected and resolved,
+    # and the drivers compare against that.
+    #
+    # It belongs to the ADAPTER's test scope, not to the raw threaded facade:
+    # every consumer driver that checks the provider contract needs it,
+    # including the pico-WT consumers in a build with the threaded facade OFF.
+    set(_MOQ_PROVENANCE_MANIFEST "${PROJECT_BINARY_DIR}/moq-parent-provenance.txt")
+    # Generated exactly once, here, and published for the other consumer drivers:
+    # two file(GENERATE) commands writing one path is a configure error.
+    set(MOQ_PARENT_PROVENANCE_MANIFEST "${_MOQ_PROVENANCE_MANIFEST}" CACHE INTERNAL
+        "test-only parent provenance manifest")
+    # The CONTENT is a multi-line string literal: its lines are manifest
+    # records, not CMake statements, so they stay at column zero. Indenting
+    # them would prefix every key with whitespace and break the drivers' parse.
+    file(GENERATE OUTPUT "${_MOQ_PROVENANCE_MANIFEST}" CONTENT
+"VERIFIER=${MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND}
+WITH_OPENSSL=${MOQ_PARENT_WITH_OPENSSL}
+WITH_MBEDTLS=${MOQ_PARENT_WITH_MBEDTLS}
+PTLS_CORE_LIBRARY=${MOQ_PARENT_PTLS_CORE}
+PTLS_MINICRYPTO_LIBRARY=${MOQ_PARENT_PTLS_MINICRYPTO}
+")
+
+    # Permanent gate for the consumer drivers' provenance contract, run under
+    # BOTH /bin/bash (3.2 on macOS, where an empty array under `set -u` is an
+    # unbound variable) and the PATH bash. It sits with the manifest it
+    # validates and in the same scope: every consumer driver that checks the
+    # provider contract needs the gate, including the pico-WT consumers in a
+    # build with the threaded facade OFF.
+    add_test(NAME consumer_driver_selftest
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/selftest_consumer_drivers.sh")
+
+    # The shared adapter's dynamic exports are exactly its installed public API
+    # plus the private SPI the threaded adapter links (picoquic_spi.h).
+    if(BUILD_SHARED_LIBS)
+        add_test(NAME adapter_picoquic_symbol_policy
+            COMMAND ${CMAKE_COMMAND}
+                -DDYLIB=$<TARGET_FILE:moq-adapter-picoquic>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_adapter_symbols.cmake)
+    endif()
+
+    # One expected-provider macro for every adapter test that has a
+    # provider-dependent expectation, taken from the CONFIGURED backend. A
+    # runtime capability answer must never select which assertions run: those
+    # answers are themselves under test.
+    if(MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND STREQUAL "openssl")
+        set(_MOQ_PQ_TEST_PROVIDER_DEF MOQ_TEST_VERIFY_BACKEND_OPENSSL=1)
+    elseif(MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND STREQUAL "mbedtls")
+        set(_MOQ_PQ_TEST_PROVIDER_DEF MOQ_TEST_VERIFY_BACKEND_MBEDTLS=1)
+    else()
+        message(FATAL_ERROR
+            "moq-adapter-picoquic tests: the configured certificate-verifier "
+            "backend is '${MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND}', which is "
+            "neither 'openssl' nor 'mbedtls'. Provider-dependent rows have no "
+            "defined expectation for that value.")
+    endif()
+
     # Compile and run the real verifier source against both public picoquic API
     # generations. The legacy row intentionally has no _ex declaration; the
     # modern row makes setter refusal and ownership observable.
@@ -322,6 +534,107 @@ if(MOQ_BUILD_TESTS)
         add_test(NAME picoquic_verify_api_${_verify_api}
                  COMMAND test_picoquic_verify_api_${_verify_api})
     endforeach()
+
+    # The delegated certificate-trust wrapper's own contract. The real verifier
+    # source is compiled against the picoquic setter/context recorder in
+    # tests/support/verify_callback while picotls and the selected crypto
+    # provider stay REAL, so the installed verifier and disposer are directly
+    # observable and preservation is proven by identity. The provider is the
+    # CONFIGURED one; a runtime capability answer never selects a target.
+    # The wrapper test inspects OpenSSL key lifetime, so it must compile
+    # against the headers matching the library it links. FindOpenSSL can
+    # resolve OPENSSL_INCLUDE_DIR to an unrelated framework's older headers
+    # while OPENSSL_SSL_LIBRARY points at a different installation; derive the
+    # include directory from the library actually linked.
+    set(_MOQ_VCB_OPENSSL_INCLUDE "")
+    if(OPENSSL_SSL_LIBRARY)
+        get_filename_component(_vcb_ossl_libdir "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
+        get_filename_component(_vcb_ossl_root "${_vcb_ossl_libdir}" DIRECTORY)
+        if(EXISTS "${_vcb_ossl_root}/include/openssl/crypto.h")
+            set(_MOQ_VCB_OPENSSL_INCLUDE "${_vcb_ossl_root}/include")
+        endif()
+    endif()
+
+    if(MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND STREQUAL "openssl")
+        foreach(_verify_cb_api IN ITEMS legacy modern)
+            add_executable(test_picoquic_verify_callback_${_verify_cb_api}
+                tests/test_verify_callback.c
+                moq_picoquic_verify.c)
+            target_include_directories(
+                test_picoquic_verify_callback_${_verify_cb_api}
+                BEFORE PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/verify_callback
+                    ${CMAKE_CURRENT_SOURCE_DIR}/include
+                    ${PROJECT_SOURCE_DIR}/core/include
+                    ${_MOQ_VCB_OPENSSL_INCLUDE}
+                    ${MOQ_PTLS_OPENSSL_INCLUDE_DIR})
+            # The candidate verifier's own allocation and disposal are
+            # counted directly by renaming the two allocator calls the verifier
+            # source uses. Test targets only; no shipped object sees these.
+            target_compile_definitions(
+                test_picoquic_verify_callback_${_verify_cb_api} PRIVATE
+                    MOQ_PICOQUIC_VERIFY_OPENSSL
+                    MOQ_PICOQUIC_VERIFY_TESTING=1
+                    calloc=moq_test_verify_calloc
+                    free=moq_test_verify_free
+                    MOQ_TEST_CA_PEM="${PROJECT_SOURCE_DIR}/adapters/msquic/tests/test_only_loopback_cert.pem")
+            if(_verify_cb_api STREQUAL "modern")
+                target_compile_definitions(
+                    test_picoquic_verify_callback_${_verify_cb_api} PRIVATE
+                        MOQ_TEST_PICOQUIC_MODERN_API
+                        picoquic_set_verify_certificate_callback_ex=moq_test_set_verify_certificate_callback_ex)
+            else()
+                target_compile_definitions(
+                    test_picoquic_verify_callback_${_verify_cb_api} PRIVATE
+                        picoquic_set_verify_certificate_callback=moq_test_set_verify_certificate_callback)
+            endif()
+            target_link_libraries(test_picoquic_verify_callback_${_verify_cb_api}
+                PRIVATE ${_adapter_tls_link} ${_PQ})
+            set_target_properties(test_picoquic_verify_callback_${_verify_cb_api}
+                PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(
+                    test_picoquic_verify_callback_${_verify_cb_api}
+                    PRIVATE -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME picoquic_verify_callback_${_verify_cb_api}
+                     COMMAND test_picoquic_verify_callback_${_verify_cb_api})
+        endforeach()
+    elseif(MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND STREQUAL "mbedtls")
+        add_executable(test_picoquic_verify_callback_mbedtls
+            tests/test_verify_callback.c
+            moq_picoquic_verify.c)
+        target_include_directories(test_picoquic_verify_callback_mbedtls
+            BEFORE PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/support/verify_callback
+                ${CMAKE_CURRENT_SOURCE_DIR}/include
+                ${PROJECT_SOURCE_DIR}/core/include)
+        target_include_directories(test_picoquic_verify_callback_mbedtls
+            SYSTEM PRIVATE
+                ${MOQ_PICOQUIC_MBEDTLS_INCLUDE_DIR} ${PTLS_INCLUDE_DIR})
+        # The same allocation recorder as the OpenSSL targets, so the
+        # unsupported row can OBSERVE that no helper-owned allocation happened
+        # rather than infer it from the setter count.
+        target_compile_definitions(test_picoquic_verify_callback_mbedtls PRIVATE
+            MOQ_PICOQUIC_VERIFY_MBEDTLS
+            MOQ_PICOQUIC_VERIFY_TESTING=1
+            calloc=moq_test_verify_calloc
+            free=moq_test_verify_free
+            MOQ_TEST_CA_PEM="${PROJECT_SOURCE_DIR}/adapters/msquic/tests/test_only_loopback_cert.pem"
+            picoquic_set_verify_certificate_callback=moq_test_set_verify_certificate_callback)
+        target_link_libraries(test_picoquic_verify_callback_mbedtls
+            PRIVATE ${_adapter_tls_link} ${_PQ})
+        set_target_properties(test_picoquic_verify_callback_mbedtls
+            PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_picoquic_verify_callback_mbedtls
+                PRIVATE -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME picoquic_verify_callback_mbedtls
+                 COMMAND test_picoquic_verify_callback_mbedtls)
+    endif()
 
     # Backpressure test provides its own picoquic function stubs so it
     # can exercise moq_pq_callback/moq_pq_service without a real QUIC
@@ -406,10 +719,11 @@ if(MOQ_BUILD_TESTS)
     endif()
 endif()
 
-
 if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     add_executable(test_threaded_compile tests/test_threaded_compile.c)
     target_link_libraries(test_threaded_compile PRIVATE moq::adapter-picoquic-threaded)
+    target_compile_definitions(test_threaded_compile PRIVATE
+        ${_MOQ_PQ_TEST_PROVIDER_DEF})
     if(MOQ_PICOQUIC_SOURCE_DIR AND EXISTS "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem")
         target_compile_definitions(test_threaded_compile PRIVATE
             MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
@@ -551,6 +865,7 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
         "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic"
         ${PTLS_INCLUDE_DIR})
     target_compile_definitions(test_threaded_tls_policy PRIVATE
+        ${_MOQ_PQ_TEST_PROVIDER_DEF}
         MOQ_TEST_CERT_PATH="${_pq_tls_cert}"
         MOQ_TEST_KEY_PATH="${_pq_tls_key}")
     add_test(NAME threaded_tls_policy COMMAND test_threaded_tls_policy)
@@ -564,6 +879,7 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     target_link_libraries(test_threaded_tls_handshake PRIVATE
         moq-adapter-picoquic-threaded-test-internals)
     target_compile_definitions(test_threaded_tls_handshake PRIVATE
+        ${_MOQ_PQ_TEST_PROVIDER_DEF}
         MOQ_TEST_CERT_PATH="${_pq_tls_cert}"
         MOQ_TEST_KEY_PATH="${_pq_tls_key}"
         MOQ_TEST_CA_PATH="${_pq_tls_ca}")
@@ -592,15 +908,18 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
                  -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                  -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
-                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' && \
+                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}'${MOQ_NESTED_SANITIZER_SHELL_ARGS} && \
              '${CMAKE_COMMAND}' --build '${_threaded_consumer_bld}' && \
              '${_threaded_consumer_bld}/moq_adapter_threaded_consumer_test'")
+    set_tests_properties(adapter_threaded_consumer PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
 
     # Install-tree consumer: installs picoquic + libmoq to a temp prefix
     # and consumes raw managed + the verifier helper against THAT prefix
     # both via find_package(adapter-picoquic-threaded) and via
     # `pkg-config libmoq`. Source includes only <moq/picoquic_threaded.h>
     # + <moq/picoquic_verify.h>; no source-tree include paths.
+
     if(MOQ_PICOQUIC_SOURCE_DIR)
         set(_threaded_openssl_root "")
         if(OPENSSL_SSL_LIBRARY)
@@ -622,10 +941,18 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
                 "${CMAKE_BUILD_TYPE}"
                 "${_threaded_openssl_root}"
                 "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-threaded-work"
-                "${CMAKE_INSTALL_LIBDIR}")
+                "${CMAKE_INSTALL_LIBDIR}"
+                "${MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND}"
+                "${MOQ_PARENT_WITH_OPENSSL}"
+                "${MOQ_PARENT_WITH_MBEDTLS}"
+                "${CMAKE_PREFIX_PATH}"
+                "${MOQ_PARENT_PTLS_CORE}"
+                "${MOQ_PARENT_PTLS_MINICRYPTO}"
+                "${MOQ_PARENT_PROVENANCE_MANIFEST}")
         set_tests_properties(adapter_threaded_install_consumer
-            PROPERTIES TIMEOUT 600)
-    endif()
+            PROPERTIES TIMEOUT 600
+            FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
+        endif()
 endif()
 
 if(MOQ_BUILD_TESTS)
@@ -640,7 +967,80 @@ if(MOQ_BUILD_TESTS)
                  -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
                  -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
                  -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
-                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' && \
+                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}'${MOQ_NESTED_SANITIZER_SHELL_ARGS} && \
              '${CMAKE_COMMAND}' --build '${_adapter_consumer_bld}' && \
              '${_adapter_consumer_bld}/moq_adapter_consumer_test'")
+    set_tests_properties(adapter_consumer PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
+
+    # The adapter surfaces with CMP0156 left unset, as any consumer below
+    # CMake 3.29 has it, from the generated build tree and from an installed
+    # prefix: every surface must link and run with no warning from any step.
+    set(_oldpolicy_threaded OFF)
+    if(TARGET moq-adapter-picoquic-threaded)
+        set(_oldpolicy_threaded ON)
+    endif()
+    add_test(NAME adapter_oldpolicy_consumer
+        COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_oldpolicy_consumer.sh"
+            "${CMAKE_COMMAND}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-oldpolicy"
+            "${CMAKE_CURRENT_BINARY_DIR}/consumer-oldpolicy-work"
+            "${PROJECT_BINARY_DIR}"
+            "${MOQ_PICOQUIC_SOURCE_DIR}"
+            "${MOQ_PICOTLS_PREFIX}"
+            "${CMAKE_C_COMPILER}"
+            "${_oldpolicy_threaded}"
+            "$<BOOL:$<TARGET_EXISTS:moq-adapter-pico-wt-managed>>"
+            "$<BOOL:$<TARGET_EXISTS:moq-adapter-pico-wt>>"
+            "${CMAKE_PREFIX_PATH}"
+            "${picoquic_DIR}"
+            "${CMAKE_INSTALL_LIBDIR}"
+            ${MOQ_NESTED_SANITIZER_DRIVER_ARGS})
+    set_tests_properties(adapter_oldpolicy_consumer PROPERTIES
+        TIMEOUT 300
+        FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
+
+    # Source-tree picoquic with a PREBUILT picotls compiles and links against
+    # MOQ_PICOTLS_PREFIX's headers and archives, and nothing a sibling search
+    # could find beside the project or the build tree. PICOQUIC_FETCH_PTLS=ON
+    # builds picotls from a source checkout instead, a different authority this
+    # prebuilt-prefix gate does not apply to.
+    if(MOQ_PICOQUIC_SOURCE_DIR AND MOQ_PICOTLS_PREFIX AND NOT PICOQUIC_FETCH_PTLS)
+        add_test(NAME ptls_prefix_authority
+            COMMAND ${CMAKE_COMMAND}
+                -DCMAKE_EXE=${CMAKE_COMMAND}
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/ptls-prefix-authority
+                -DMODULES=${PROJECT_SOURCE_DIR}/cmake
+                -DPICOQUIC_SRC=${MOQ_PICOQUIC_SOURCE_DIR}
+                -DPICOTLS_PREFIX=${MOQ_PICOTLS_PREFIX}
+                -P ${PROJECT_SOURCE_DIR}/tests/test_ptls_prefix_authority.cmake)
+        set_tests_properties(ptls_prefix_authority PROPERTIES
+            TIMEOUT 600
+            FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
+    endif()
+
+    # PICOQUIC_FETCH_PTLS=ON with a local picotls checkout (the iOS xcframework
+    # shape): the checkout is the authority. Registered wherever a checkout is
+    # known -- the fetch mode's own override, or the source tree beside a
+    # prebuilt prefix -- and run with downloads disabled.
+    set(_ptls_checkout "")
+    if(PICOQUIC_FETCH_PTLS AND FETCHCONTENT_SOURCE_DIR_PICOTLS)
+        set(_ptls_checkout "${FETCHCONTENT_SOURCE_DIR_PICOTLS}")
+    elseif(MOQ_PICOTLS_PREFIX AND EXISTS "${MOQ_PICOTLS_PREFIX}/../CMakeLists.txt"
+           AND EXISTS "${MOQ_PICOTLS_PREFIX}/../include/picotls.h")
+        get_filename_component(_ptls_checkout "${MOQ_PICOTLS_PREFIX}/.." ABSOLUTE)
+    endif()
+    if(MOQ_PICOQUIC_SOURCE_DIR AND _ptls_checkout)
+        add_test(NAME ptls_fetch_local_source
+            COMMAND ${CMAKE_COMMAND}
+                -DCMAKE_EXE=${CMAKE_COMMAND}
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/ptls-fetch-local-source
+                -DMODULES=${PROJECT_SOURCE_DIR}/cmake
+                -DPICOQUIC_SRC=${MOQ_PICOQUIC_SOURCE_DIR}
+                -DPICOTLS_SOURCE=${_ptls_checkout}
+                -P ${PROJECT_SOURCE_DIR}/tests/test_ptls_fetch_local_source.cmake)
+        set_tests_properties(ptls_fetch_local_source PROPERTIES
+            TIMEOUT 600
+            FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
+    endif()
 endif()

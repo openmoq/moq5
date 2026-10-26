@@ -71,10 +71,8 @@ typedef enum { RUN_OK = 1, RUN_RETRY = 0, RUN_HARD = -1 } run_status_t;
 /* Guards delivery of a large object over a WT subgroup stream: a small
  * control object followed by a 256 KiB object on the same subgroup, both
  * verified intact. A large object spans many packets and several RTTs, so
- * the test must wait by real elapsed time (see wait_realtime) — the
- * iteration-count loop used elsewhere assumes each wait() consumes its
- * full interval and under-budgets an active transfer. The control object
- * also proves the small path and ordering ahead of the big one. */
+ * the test relies on wait_for_object's wall-clock budget. The control
+ * object also proves the small path and ordering ahead of the big one. */
 #define BIGOBJ_SMALL          "ctrl"
 #define BIGOBJ_SMALL_LEN      4u
 #define BIGOBJ_BIG_SIZE       (256u * 1024u)
@@ -451,37 +449,32 @@ static moq_pico_wt_managed_t *make_client(int port, client_app_t *app)
     return make_client_ex(port, app, 0);
 }
 
-/* Wait up to budget for the client's object. */
-static void wait_for_object(moq_pico_wt_managed_t *cli, client_app_t *app,
-                            int timeout_sec)
+/* Milliseconds elapsed on the monotonic clock since *t0. */
+static int64_t ms_since(const struct timespec *t0)
 {
-    uint64_t waited = 0, budget = (uint64_t)timeout_sec * 1000;
-    while (!atomic_load(&app->got_object) && waited < budget) {
-        if (moq_pico_wt_managed_wait(cli, 200000) == MOQ_ERR_CLOSED)
-            break;
-        waited += 200;
-    }
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (int64_t)(t1.tv_sec - t0->tv_sec) * 1000 +
+           (t1.tv_nsec - t0->tv_nsec) / 1000000;
 }
 
 /*
- * Wait bounded by real wall-clock. Unlike wait_for_object (which counts
- * iterations assuming each wait() blocks its full timeout), a sustained
- * large-object transfer makes wait() return early many times, so an
- * iteration count under-budgets it and gives up mid-transfer. A transfer
- * that genuinely never completes still terminates at the deadline because
- * wait() blocks ~200ms per idle call.
+ * Wait up to timeout_sec of wall-clock time for the client's object. The
+ * budget cannot be an iteration count: wait() returns MOQ_OK after every
+ * pump cycle, so handshake, setup and transfer traffic -- or any wake --
+ * make it return long before its 200ms timeout, and a count of calls gives
+ * up after a few milliseconds. A wait that genuinely never completes still
+ * ends at the deadline because an idle wait() blocks ~200ms per call.
  */
-static void wait_realtime(moq_pico_wt_managed_t *cli, client_app_t *app,
-                          int timeout_sec)
+static void wait_for_object(moq_pico_wt_managed_t *cli, client_app_t *app,
+                            int timeout_sec)
 {
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     while (!atomic_load(&app->got_object)) {
         if (moq_pico_wt_managed_wait(cli, 200000) == MOQ_ERR_CLOSED)
             break;
-        struct timespec t1;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        if ((t1.tv_sec - t0.tv_sec) >= timeout_sec)
+        if (ms_since(&t0) >= (int64_t)timeout_sec * 1000)
             break;
     }
 }
@@ -728,10 +721,9 @@ static run_status_t run_announce_done(const char *cert, const char *key,
 
 /* Large-object regression: the server publishes a small control object and
  * a 256 KiB object on one subgroup stream; the client must receive BOTH in
- * full (exact length + pattern). The transfer spans many packets/RTTs, so
- * it waits by real elapsed time (wait_realtime): the iteration-count wait
- * under-counts an active transfer (wait() returns early) and would give up
- * mid-transfer, falsely reporting non-delivery. */
+ * full (exact length + pattern). The transfer spans many packets/RTTs;
+ * wait_for_object bounds it by wall-clock time, so an active transfer
+ * (wait() returning early) is not cut off mid-transfer. */
 static run_status_t run_bigobj(const char *cert, const char *key,
                                int port, int timeout_sec, int small_window)
 {
@@ -769,7 +761,7 @@ static run_status_t run_bigobj(const char *cert, const char *key,
     else
         CHECK(g_observed_uni_window >= (1u << 20));   /* large-object credit */
 
-    wait_realtime(cli, &capp, timeout_sec);
+    wait_for_object(cli, &capp, timeout_sec);
 
     int got = atomic_load(&capp.got_object);
     int small_ok = atomic_load(&capp.small_ok);
@@ -857,7 +849,7 @@ static run_status_t run_bigobj_drain(const char *cert, const char *key,
     /* drain_state==1 means the publisher's local stream backlog is flushed (all
      * reliable bytes + FIN handed to the transport); let the receiver's loop
      * surface the object event, then verify it arrived in full. */
-    if (drained) wait_realtime(cli, &capp, 2);
+    if (drained) wait_for_object(cli, &capp, 2);
 
     int got = atomic_load(&capp.got_object);
     int small_ok = atomic_load(&capp.small_ok);
@@ -1373,11 +1365,15 @@ static run_status_t run_close(const char *cert, const char *key,
         return RUN_RETRY;
     }
 
-    /* (a) Client: the drain → clean close makes wait() terminal. */
+    /* (a) Client: the drain → clean close makes wait() terminal. The 5s
+     * budget is wall-clock for the same reason as wait_for_object: wait()
+     * can return MOQ_OK many times within the 100ms drain. */
     moq_result_t wr = MOQ_DONE;
-    for (uint64_t waited = 0; waited < 5000; waited += 200) {
+    struct timespec close_t0;
+    clock_gettime(CLOCK_MONOTONIC, &close_t0);
+    for (;;) {
         wr = moq_pico_wt_managed_wait(cli, 200000);
-        if (wr == MOQ_ERR_CLOSED) break;
+        if (wr == MOQ_ERR_CLOSED || ms_since(&close_t0) >= 5000) break;
     }
     int is_closed = moq_pico_wt_managed_is_closed(cli);
     int is_fatal  = moq_pico_wt_managed_is_fatal(cli);

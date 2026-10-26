@@ -38,6 +38,11 @@
 #   NP_STRICT       require every declared role file to exist
 # =====================================================================
 
+# Script mode starts from CMake's oldest policy defaults; run with the
+# project's floor so if(IN_LIST) and variable references behave as they do
+# in the build itself.
+cmake_minimum_required(VERSION 3.20)
+
 set(_np_problems 0)
 
 function(_np_fail msg)

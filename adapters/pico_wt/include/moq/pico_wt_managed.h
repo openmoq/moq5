@@ -21,7 +21,24 @@
  *                loop termination.
  *   on_activity: runs on the network thread after each pump cycle.
  *                Signal-only — must NOT call mutation APIs. May be NULL.
+ *                It is NOT called for a pre-session wake acknowledgement
+ *                (below): no pump ran, so there is nothing to report.
  *   Neither callback may call moq_pico_wt_managed_stop.
+ *
+ * Pre-session wake acknowledgement:
+ *   An explicit wake() accepted before the WT session exists cannot run
+ *   on_pump (there is no session to pump). It is still acknowledged: when
+ *   the network thread handles the coalesced wake state it publishes one
+ *   level-retained activity acknowledgement, signalled promptly, and
+ *   retained until a wait() consumes it. Both states are LEVELS, not
+ *   counts: wake() calls made while a wake is already pending share that
+ *   one packet-loop wake, and acknowledgements published before a waiter
+ *   consumes the level collapse into one MOQ_OK. No level is lost; once
+ *   the level has been consumed a new accepted wake produces a new
+ *   acknowledgement. Neither on_pump nor on_activity runs for it.
+ *   Ordinary pre-session loop work (Initial sends, time checks) does not
+ *   produce this acknowledgement; it belongs specifically to an accepted
+ *   explicit wake.
  *
  * Client mode:
  *   _create builds the QUIC context, prepares the WT client connection,
@@ -284,16 +301,26 @@ MOQ_API int moq_pico_wt_managed_local_port(
 
 /* -- Cross-thread signaling --------------------------------------- */
 
-/* Wake the network thread so it runs on_pump. Safe from any thread;
- * coalesced. MOQ_OK on success, MOQ_ERR_CLOSED once terminal
- * (stopped, fatal, clean-closed, or pump-exit). */
+/* Wake the network thread. Once the WT session exists it runs on_pump;
+ * before that it acknowledges the wake to a waiter without a pump (see
+ * "Pre-session wake acknowledgement" above). Safe from any thread;
+ * coalesced -- calls made while a wake is already pending share that one
+ * packet-loop wake, so an accepted call does not necessarily yield a
+ * distinct later MOQ_OK. MOQ_OK on success (accepted or coalesced),
+ * MOQ_ERR_CLOSED once terminal (stopped, fatal, clean-closed, or
+ * pump-exit). */
 MOQ_API moq_result_t moq_pico_wt_managed_wake(moq_pico_wt_managed_t *m);
 
 /*
- * Block until activity or timeout. MOQ_OK if on_pump ran, MOQ_DONE on
- * timeout, MOQ_ERR_CLOSED once terminal (stopped, fatal, clean-closed,
- * or pump-exit). timeout_us==0 is a non-blocking check; UINT64_MAX
- * waits indefinitely.
+ * Block until activity or timeout. MOQ_OK after a normal pump cycle, OR
+ * after the network thread acknowledged the coalesced wake state while no
+ * WT session existed (no pump ran in that case). Activity is a retained
+ * LEVEL: publications before a waiter consumes it collapse into one
+ * MOQ_OK, the wait that returns MOQ_OK consumes it, and a nonblocking wait
+ * then returns MOQ_DONE until the next pump cycle or acknowledged wake.
+ * MOQ_DONE on timeout, MOQ_ERR_CLOSED once terminal (stopped, fatal,
+ * clean-closed, or pump-exit). timeout_us==0 is a non-blocking check;
+ * UINT64_MAX waits indefinitely.
  */
 MOQ_API moq_result_t moq_pico_wt_managed_wait(moq_pico_wt_managed_t *m,
                                               uint64_t timeout_us);

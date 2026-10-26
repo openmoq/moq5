@@ -1144,7 +1144,12 @@ int main(void)
      * OTHER MSF-01 receivers (PlayA), whose parsers are stricter than our
      * own lenient parse -- so assert the exact wire shape, not a libmoq
      * parse round-trip: base version String "1" (§5.1.1) and the §5.1.6
-     * deltaUpdate array with no root version. */
+     * deltaUpdate array with no root version.
+     *
+     * The added track carries no initialization record: a record is a ROOT
+     * field (§5.1.7), a delta has no root, and an init-bearing add therefore
+     * belongs in an independent generation -- which is where
+     * test_media_sender_raw_init_catalog measures it. */
     {
         moq_media_sender_t *s = moq_media_sender_test_new();
         (void)add_trk(s, "v", false);
@@ -1153,8 +1158,7 @@ int main(void)
         moq_media_sender_test_mark_published(s);   /* baseline = {v} */
 
         /* Post-ready add shaped like a real LOC video track (the E2E case D
-         * shape): init data (inlined base64 into the delta add), width/
-         * height/framerate. */
+         * shape): width/height/framerate. */
         {
             moq_media_track_cfg_t tc;
             moq_media_track_cfg_init(&tc);
@@ -1164,8 +1168,6 @@ int main(void)
             tc.codec = (moq_bytes_t){ (const uint8_t *)"av01", 4 };
             tc.bitrate = 1500000;
             tc.is_live = true;
-            static const uint8_t init_data[] = { 0x01, 0x42, 0xe0, 0x1e };
-            tc.init_data = (moq_bytes_t){ init_data, sizeof(init_data) };
             tc.width = 320; tc.height = 240;
             tc.framerate_millis = 30000;
             moq_media_track_t *late = NULL;
@@ -1194,8 +1196,8 @@ int main(void)
 
         /* Object 1 -- the delta. §5.1.6 shape: a deltaUpdate ARRAY of
          * {op, tracks} operations, and NO root version/tracks fields (a
-         * delta MUST NOT carry them). The added track must be the full
-         * self-contained shape (inline initData base64, no initRef). */
+         * delta MUST NOT carry them). The added track is self-contained: it
+         * declares no initialization record, so it references none. */
         {
             char tmp[1024];
             size_t n = moq_rcbuf_len(objs[1]);
@@ -1205,7 +1207,7 @@ int main(void)
                                    27) == 0);
             MOQ_TEST_CHECK(strstr(tmp, "\"version\"") == NULL);
             MOQ_TEST_CHECK(strstr(tmp, "\"name\":\"late\"") != NULL);
-            MOQ_TEST_CHECK(strstr(tmp, "\"initData\":\"AULgHg==\"") != NULL);
+            MOQ_TEST_CHECK(strstr(tmp, "initData") == NULL);
             MOQ_TEST_CHECK(strstr(tmp, "initRef") == NULL);
         }
 

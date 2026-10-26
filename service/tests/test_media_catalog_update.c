@@ -746,19 +746,45 @@ int main(void)
         moq_media_receiver_stats_t sd;
         memset(&sd, 0, sizeof(sd));
         sd.catalog_complete = false;                 /* sentinel: must stay false */
+        sd.sap_record_deferrals = 0xD1D1;            /* sentinels: past the prefix, must survive */
+        sd.media_timeline_record_deferrals = 0xD2D2;
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_media_receiver_get_stats(r, &sd, dropsz), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(sd.struct_size, (uint64_t)dropsz);
         MOQ_TEST_CHECK(sd.catalog_drops >= 1);
         MOQ_TEST_CHECK(sd.catalog_complete == false);   /* clamped out, untouched */
 
-        /* full size: catalog_complete surfaced (true after termination). */
+        /* through catalog_complete: it is surfaced, the deferral counters are
+         * NOT written (sentinels survive). */
+        const size_t completesz =
+            offsetof(moq_media_receiver_stats_t, catalog_complete) + sizeof(bool);
+        moq_media_receiver_stats_t sc;
+        memset(&sc, 0, sizeof(sc));
+        sc.sap_record_deferrals = 0xA5A5;            /* sentinels: must survive */
+        sc.media_timeline_record_deferrals = 0x5A5A;
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_media_receiver_get_stats(r, &sc, completesz), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(sc.struct_size, (uint64_t)completesz);
+        MOQ_TEST_CHECK(sc.catalog_complete == true);
+        MOQ_TEST_CHECK_EQ_U64(sc.sap_record_deferrals, 0xA5A5);
+        MOQ_TEST_CHECK_EQ_U64(sc.media_timeline_record_deferrals, 0x5A5A);
+        /* the catalog_drops prefix likewise never reaches the deferral counters. */
+        MOQ_TEST_CHECK_EQ_U64(sd.sap_record_deferrals, 0xD1D1);
+        MOQ_TEST_CHECK_EQ_U64(sd.media_timeline_record_deferrals, 0xD2D2);
+
+        /* full size: catalog_complete surfaced (true after termination), and
+         * the deferral counters written (zero here: no timeline overflowed). */
         moq_media_receiver_stats_t sf;
         memset(&sf, 0, sizeof(sf));
+        sf.sap_record_deferrals = 0xA5A5;
+        sf.media_timeline_record_deferrals = 0x5A5A;
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_media_receiver_get_stats(r, &sf, sizeof(sf)), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(sf.struct_size, (uint64_t)sizeof(sf));
         MOQ_TEST_CHECK(sf.catalog_complete == true);
         MOQ_TEST_CHECK(sf.catalog_drops >= 1);
+        MOQ_TEST_CHECK_EQ_U64(sf.sap_record_deferrals, 0);
+        MOQ_TEST_CHECK_EQ_U64(sf.media_timeline_record_deferrals, 0);
 
         /* below the v0 base -> INVAL. */
         MOQ_TEST_CHECK_EQ_INT(

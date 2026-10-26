@@ -245,6 +245,12 @@ static void drain_track_events(moq_media_receiver_t *r, ackrec_t *a,
         else if (te.kind == MOQ_MEDIA_CATALOG_READY) {
             if (ready) *ready = true;
         } else if (te.kind == MOQ_MEDIA_TRACK_UPDATE_OK) {
+            /* The queue entry filled directly by the update-ack callback
+             * carries the track's description snapshot captured at enqueue:
+             * non-NULL and, with no conversion in this fixture, the handle's
+             * current one. */
+            MOQ_TEST_CHECK(te.track != NULL && te.desc != NULL);
+            MOQ_TEST_CHECK(te.desc == moq_media_track_desc_get(te.track));
             if (a->n < 8) {
                 a->haslg[a->n] = te.has_largest;
                 a->lg[a->n] = te.largest_group;

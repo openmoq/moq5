@@ -1,0 +1,25 @@
+Initialize the cipher-suite result in the select_cipher test.
+
+test_select_cipher declares `selected` uninitialized. select_cipher writes it
+only on success, and ok() records a failed check and continues, so if an
+expected-success call failed, the following check would read an indeterminate
+pointer; GCC 12 reports this as "'selected' may be used uninitialized" in a
+-Werror Release build of the test programs. Starting from NULL gives that
+failure path a defined value that matches no expected suite; passing cases are
+unchanged. Test code only.
+
+Applies to picotls 7c32032f91449d695b24b82955f20d04d47e6cff.
+
+diff --git a/t/picotls.c b/t/picotls.c
+index ac44ac6..25d1dd6 100644
+--- a/t/picotls.c
++++ b/t/picotls.c
+@@ -60,7 +60,7 @@ static void test_select_cipher(void)
+ {
+ #define C(x) ((x) >> 8) & 0xff, (x) & 0xff
+
+-    ptls_cipher_suite_t *selected;
++    ptls_cipher_suite_t *selected = NULL;
+
+     {
+         ptls_cipher_suite_t *candidates[] = {&ptls_minicrypto_chacha20poly1305sha256, &ptls_minicrypto_aes128gcmsha256, NULL};

@@ -89,6 +89,8 @@ _Static_assert(offsetof(moq_media_track_event_t, parse_drop_class) ==
     (offsetof(moq_media_receiver_stats_t, catalog_drops) + sizeof(uint64_t))
 #define MEDIA_RECEIVER_STATS_CATALOG_COMPLETE_SIZE \
     (offsetof(moq_media_receiver_stats_t, catalog_complete) + sizeof(bool))
+#define MEDIA_RECEIVER_STATS_DEFERRALS_SIZE \
+    (offsetof(moq_media_receiver_stats_t, media_timeline_record_deferrals) + sizeof(uint64_t))
 #define MEDIA_SAP_RECORD_V0_SIZE \
     (offsetof(moq_media_sap_record_t, ept_ms) + sizeof(uint64_t))
 #define MEDIA_TIMELINE_RECORD_V0_SIZE \
@@ -97,7 +99,22 @@ _Static_assert(offsetof(moq_media_track_event_t, parse_drop_class) ==
 /* -- Internal types --------------------------------------------------- */
 
 struct moq_media_track {
+    /* Generation 1 of the description: built once, never written again. */
     moq_media_track_desc_t desc;
+    /* Generation 2, the ONE sanctioned metadata change (§11.3 live->VOD, or a
+     * non-live tuple acquiring a previously absent duration): built privately
+     * in full, then published. It borrows the same immutable handle-owned
+     * backing (spans, arrays, init_buf), which is freed exactly once. Never
+     * written once published. */
+    moq_media_track_desc_t desc_vod;
+    bool                   has_vod_gen;
+    /* The current snapshot: &desc until generation 2 is published, then
+     * &desc_vod. Release-stored by the reconciler after generation 2 is
+     * complete; acquire-loaded by the public getter and by every event
+     * enqueue, so a reader that observes the new pointer observes every
+     * field written before its publication. Initialized before the handle is
+     * exposed. */
+    _Atomic(const moq_media_track_desc_t *) desc_cur;
     moq_rcbuf_t           *init_buf;   /* owned; desc.init/init_data borrow */
 
     /* Handle-owned desc backing (so a handle outlives the effective catalog it
@@ -218,6 +235,10 @@ struct moq_media_track {
 typedef struct receiver_event {
     moq_media_track_event_kind_t kind;
     moq_media_track_t           *track;
+    /* The description snapshot current when this event was ENQUEUED. An
+     * event never derives its description at poll time: a TRACK_ADDED queued
+     * before a conversion keeps generation 1 however late it is polled. */
+    const moq_media_track_desc_t *desc;
     /* per-event copies of the UPDATE_OK scalars, filled at PUSH time
      * (deriving them at poll from track state would corrupt multiple
      * queued acknowledgments). Zero for every other kind. */
@@ -322,12 +343,13 @@ struct moq_media_receiver {
     uint64_t         obj_sizes_total;    /* queued payload bytes */
     uint32_t         obj_head, obj_tail;
 
-    /* Bounded SAP-record queue (CMSF §3.6.1). Plain value records (no refs);
-     * drops oldest when the app under-polls. */
+    /* Bounded SAP-record queue (CMSF §3.6.1). Plain value records (no refs).
+     * Admits nothing while full: what was admitted is retained until polled,
+     * the rest of the object is deferred and counted (sap_record_deferrals). */
     moq_media_sap_record_t *saps;
     uint32_t         sap_cap, sap_head, sap_tail;
-    /* Bounded media-timeline record queue (MSF §7.1.1). Same shape as the SAP
-     * queue: plain values, drop-oldest under-poll. */
+    /* Bounded media-timeline record queue (MSF §7.1.1). Same shape and the
+     * same admission rule as the SAP queue (media_timeline_record_deferrals). */
     moq_media_timeline_record_t *mts;
     uint32_t         mt_cap, mt_head, mt_tail;
     bool             fatal;
@@ -362,9 +384,19 @@ static size_t obj_entry_bytes(const moq_media_object_t *o)
 
 /* -- Event queue (r->mu) ----------------------------------------------- */
 
+/* The handle's current description snapshot (acquire). */
+static const moq_media_track_desc_t *track_current(const moq_media_track_t *t)
+{
+    return atomic_load_explicit(&t->desc_cur, memory_order_acquire);
+}
+
 static bool rq_push(moq_media_receiver_t *r, moq_media_track_event_kind_t kind,
                     moq_media_track_t *track)
 {
+    /* Capture the snapshot BEFORE taking the queue lock, from the publishing
+     * order's point of view: a caller that has release-published generation 2
+     * enqueues an event that refers to it; every earlier event kept its own. */
+    const moq_media_track_desc_t *snap = track ? track_current(track) : NULL;
     pthread_mutex_lock(&r->mu);
     if (r->ev_tail - r->ev_head >= r->ev_cap) {
         /* Losing a discovery event is unrecoverable miswiring (§6.3):
@@ -378,6 +410,7 @@ static bool rq_push(moq_media_receiver_t *r, moq_media_track_event_kind_t kind,
     memset(e, 0, sizeof(*e));
     e->kind = kind;
     e->track = track;
+    e->desc = snap;
     r->ev_tail++;
     pthread_mutex_unlock(&r->mu);
     return true;
@@ -454,9 +487,9 @@ enum {
     MOQ_MR_WRITER_POST = 1,
     MOQ_MR_READER_PRE  = 2,
     MOQ_MR_READER_POST = 3,
-    /* Live->VOD descriptor writer (receiver_reconcile): PRE before the first
-     * mutable-scalar write, POST after the last, before the intended unlock.
-     * Observation only: it neither locks nor changes the write. */
+    /* Live->VOD descriptor publication (receiver_reconcile): PRE before the
+     * new snapshot is stored as current, POST after, before the intended
+     * unlock. Observation only: it neither locks nor changes the store. */
     MOQ_MR_VOD_WRITER_PRE  = 4,
     MOQ_MR_VOD_WRITER_POST = 5,
     /* Description copy reader (moq_media_receiver_track_desc_copy): PRE after
@@ -479,7 +512,41 @@ void moq_media_receiver_test_set_pub_phase_hook(
 #define PUB_PHASE_HOOK(r, ph) \
     do { if (g_pub_phase_hook) g_pub_phase_hook((r), (ph), g_pub_phase_hook_ctx); } \
     while (0)
+
+/* Descriptor-update observer for the one sanctioned mutation of a surviving
+ * tuple (the §11.3 live->VOD conversion). One callback at four points that
+ * bracket the update: PRE (before the first field of the new metadata is
+ * applied), MID (after is_live has been applied but before trackDuration --
+ * the instant at which a reader of the handle's description could observe
+ * fields from two generations), POST (after every field is applied, before
+ * TRACK_UPDATED is enqueued), and PUBLISHED (after the event is enqueued). The
+ * hook observes only; it supplies no synchronization. Never compiled into the
+ * shipping library. */
+enum {
+    MOQ_MR_DESC_PRE       = 0,
+    MOQ_MR_DESC_MID       = 1,
+    MOQ_MR_DESC_POST      = 2,
+    MOQ_MR_DESC_PUBLISHED = 3
+};
+static void (*g_desc_update_hook)(const moq_media_receiver_t *r,
+                                  const moq_media_track_t *t, int phase,
+                                  void *ctx);
+static void *g_desc_update_hook_ctx;
+void moq_media_receiver_test_set_desc_update_hook(
+    void (*fn)(const moq_media_receiver_t *, const moq_media_track_t *, int, void *),
+    void *ctx);
+void moq_media_receiver_test_set_desc_update_hook(
+    void (*fn)(const moq_media_receiver_t *, const moq_media_track_t *, int, void *),
+    void *ctx)
+{
+    g_desc_update_hook = fn;
+    g_desc_update_hook_ctx = ctx;
+}
+#define DESC_UPDATE_HOOK(r, t, ph) \
+    do { if (g_desc_update_hook) g_desc_update_hook((r), (t), (ph), g_desc_update_hook_ctx); } \
+    while (0)
 #else
+#define DESC_UPDATE_HOOK(r, t, ph) ((void)0)
 #define RECONCILE_RACE_HOOK() ((void)0)
 #define PUB_PHASE_HOOK(r, ph) ((void)0)
 #endif
@@ -805,6 +872,7 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
     memset(t, 0, sizeof(*t));
     moq_media_track_desc_t *d = &t->desc;
     d->struct_size = (uint32_t)sizeof(*d);
+    atomic_init(&t->desc_cur, &t->desc);   /* generation 1 is current until published otherwise */
 
     /* One owned buffer for all string spans + the depends/cp-ref bytes + the
      * tuple-key namespace. */
@@ -1164,28 +1232,50 @@ static moq_result_t receiver_reconcile(moq_media_receiver_t *r,
             live->recon_seen = true;
             /* live->VOD conversion (§11.3): the immutable check already proved
              * any change is the sanctioned is_live true->false / trackDuration
-             * absent->present. If is_live or duration actually changed, update
-             * the handle's desc IN PLACE (scalars; no allocation) and emit
-             * TRACK_UPDATED so the app learns the new VOD metadata. The desc
-             * writes precede the rq_push, so an app that polls the event sees
-             * them. */
-            if (mt->is_live != live->desc.is_live ||
-                mt->has_track_duration != live->desc.has_track_duration ||
-                mt->track_duration_ms != live->desc.track_duration_ms) {
-                /* The three writes are the only in-place mutation of a
-                 * published description; they are serialized against
-                 * moq_media_receiver_track_desc_copy() by r->mu so a copy
-                 * never observes a torn triple. rq_push takes r->mu itself,
-                 * so the event is queued after the unlock. */
+             * absent->present. If a field actually changed, PUBLISH a new
+             * immutable description generation on the handle (built in full
+             * in private storage, then release-stored as current) and emit
+             * TRACK_UPDATED carrying it. Visibility is the immutable
+             * publication: the event refers to a complete snapshot, the getter
+             * returns it from the store on, and every earlier pointer keeps
+             * reading its own generation. */
+            const moq_media_track_desc_t *cur = track_current(live);
+            if (mt->is_live != cur->is_live ||
+                mt->has_track_duration != cur->has_track_duration ||
+                mt->track_duration_ms != cur->track_duration_ms) {
+                /* classify_track_change admits exactly one such change per
+                 * tuple (live->VOD with a duration, or a non-live tuple
+                 * acquiring a duration once); a second is refused before this
+                 * point. A published generation is never rewritten: were a
+                 * second change ever to reach here it is not applied. */
+                if (live->has_vod_gen) continue;
+                DESC_UPDATE_HOOK(r, live, MOQ_MR_DESC_PRE);
+                /* Generation 2 is built in private storage: a copy of the
+                 * current snapshot (sharing its immutable backing) with the
+                 * three sanctioned fields set. Nothing public can observe it
+                 * until the release-store below. */
+                live->desc_vod = *cur;
+                live->desc_vod.is_live = mt->is_live;
+                DESC_UPDATE_HOOK(r, live, MOQ_MR_DESC_MID);
+                live->desc_vod.has_track_duration = mt->has_track_duration;
+                live->desc_vod.track_duration_ms = mt->track_duration_ms;
+                DESC_UPDATE_HOOK(r, live, MOQ_MR_DESC_POST);
+                live->has_vod_gen = true;
+                /* Published under r->mu, the mutex
+                 * moq_media_receiver_track_desc_copy() reads under, so a copy
+                 * takes one whole snapshot: the one before or the one after,
+                 * never a mix. The lock-free getter needs only the release. */
                 pthread_mutex_lock(&r->mu);
                 PUB_PHASE_HOOK(r, MOQ_MR_VOD_WRITER_PRE);
-                live->desc.is_live = mt->is_live;
-                live->desc.has_track_duration = mt->has_track_duration;
-                live->desc.track_duration_ms = mt->track_duration_ms;
+                atomic_store_explicit(&live->desc_cur, &live->desc_vod,
+                                      memory_order_release);
                 PUB_PHASE_HOOK(r, MOQ_MR_VOD_WRITER_POST);
                 pthread_mutex_unlock(&r->mu);
+                /* The event captures the pointer just published, so the
+                 * notification already refers to a complete snapshot. */
                 if (!rq_push(r, MOQ_MEDIA_TRACK_UPDATED, live))
                     return MOQ_OK;   /* overflow already terminalized */
+                DESC_UPDATE_HOOK(r, live, MOQ_MR_DESC_PUBLISHED);
             }
             continue;   /* survivor */
         }
@@ -1216,14 +1306,20 @@ static moq_result_t receiver_reconcile(moq_media_receiver_t *r,
             return MOQ_OK;   /* overflow already terminalized */
     }
 
-    /* Removed tuples: live, non-removed, not seen this pass. */
+    /* Removed tuples: live, non-removed, not seen this pass. An ordinary
+     * catalog generation that drops a tuple withdraws it, so its queued
+     * objects are purged. The terminating catalog (MSF §5.1.3 / §11.3:
+     * isComplete with no tracks) only ends the broadcast: objects already
+     * accepted into the queue stay pollable on the removed handle. */
+    const bool terminating = cand->is_complete && cand->track_count == 0;
     for (size_t i = 0; i < r->track_count; i++) {
         moq_media_track_t *t = r->tracks[i];
         if (t->removed || t->recon_seen) continue;
         pthread_mutex_lock(&r->mu);
         t->removed = true;
         t->desired_subscribed = false;
-        obj_compact_locked(r, keep_not_track, t);   /* purge its queued objects */
+        if (!terminating)
+            obj_compact_locked(r, keep_not_track, t);   /* purge its queued objects */
         pthread_mutex_unlock(&r->mu);
         if (t->sub_track) {
             (void)moq_sub_unsubscribe(r->sub, t->sub_track, now_us);
@@ -1674,6 +1770,7 @@ static void receiver_on_update_ok(void *ctx, moq_sub_track_t *track,
     memset(e, 0, sizeof(*e));
     e->kind = MOQ_MEDIA_TRACK_UPDATE_OK;
     e->track = t;
+    e->desc = t ? track_current(t) : NULL;
     e->has_largest = result->has_largest;
     e->largest_group = result->largest_group;
     e->largest_object = result->largest_object;
@@ -1884,6 +1981,13 @@ static void receiver_on_media_object(moq_media_receiver_t *r,
     o->sample_count = parsed.sample_count;
     o->samples = owned;
     o->samples_owned = owned;
+    /* The wire identity, as the facade delivered it: a datagram has no
+     * subgroup on the wire, so its subgroup_id is zero and has_subgroup false. */
+    o->group_id = so->group_id;
+    o->subgroup_id = so->datagram ? 0 : so->subgroup_id;
+    o->object_id = so->object_id;
+    o->publisher_priority = so->publisher_priority;
+    o->has_subgroup = !so->datagram;
     /* Steal the facade object's refs (no moq_sub_object_cleanup). */
     o->payload_ref = so->payload;
     o->properties_ref = so->properties;
@@ -2013,16 +2117,18 @@ static bool sap_record(sap_cur_t *c, uint64_t *g, uint64_t *o,
     return true;
 }
 
-/* Append one record to the bounded SAP queue (r->mu held). Drops the oldest
- * record when the app under-polls -- harmless because the next §8.3 independent
- * object re-sends the accessible history (and the receiver's per-track dedup
- * keeps that from looping). */
-static void sap_queue_push(moq_media_receiver_t *r, moq_media_track_t *track,
+/* Admit one record to the bounded SAP queue (r->mu held). A full queue admits
+ * nothing and leaves the queue unchanged: an admitted record is retained until
+ * polled, never evicted for a later one. The caller then defers the rest of
+ * the independent object and leaves the dedup cursor at the last admitted
+ * record, so the next §8.3 independent object -- which carries the accumulated
+ * history -- delivers the deferred tail once the app has drained capacity. */
+static bool sap_queue_push(moq_media_receiver_t *r, moq_media_track_t *track,
                            uint64_t group, uint64_t object,
                            moq_sap_type_t sap_type, uint64_t ept_ms)
 {
     if (r->sap_tail - r->sap_head >= r->sap_cap)
-        r->sap_head++;   /* drop oldest */
+        return false;    /* full: defer, retain what was admitted */
     moq_media_sap_record_t *rec = &r->saps[r->sap_tail % r->sap_cap];
     memset(rec, 0, sizeof(*rec));
     rec->struct_size = (uint32_t)sizeof(*rec);
@@ -2032,6 +2138,7 @@ static void sap_queue_push(moq_media_receiver_t *r, moq_media_track_t *track,
     rec->sap_type = sap_type;
     rec->ept_ms = ept_ms;
     r->sap_tail++;
+    return true;
 }
 
 /* Parse a SAP timeline object and enqueue its NEW records. Takes over / releases
@@ -2114,16 +2221,28 @@ static void receiver_on_sap_object(moq_media_receiver_t *r,
         for (size_t i = 0; i < tmp_n; i++) {
             uint64_t g = tmp[i].group, o = tmp[i].object;
             /* Dedup the §8.3 independent re-sends: surface a media Location only
-             * once, in (group, object) order. */
+             * once, in (group, object) order. The cursor advances ONLY for a
+             * record actually admitted to the app-visible queue. */
             bool newer = !track->sap_has_last ||
                 g > track->sap_last_group ||
                 (g == track->sap_last_group && o > track->sap_last_object);
-            if (newer) {
-                sap_queue_push(r, track, g, o, tmp[i].sap_type, tmp[i].ept_ms);
-                track->sap_has_last = true;
-                track->sap_last_group = g;
-                track->sap_last_object = o;
+            if (!newer) continue;
+            if (!sap_queue_push(r, track, g, o, tmp[i].sap_type, tmp[i].ept_ms)) {
+                /* Full: this record and every later new record of the object
+                 * are deferred -- counted, not surfaced, not marked surfaced --
+                 * for the next independent object to deliver. */
+                for (size_t k = i; k < tmp_n; k++) {
+                    bool later = !track->sap_has_last ||
+                        tmp[k].group > track->sap_last_group ||
+                        (tmp[k].group == track->sap_last_group &&
+                         tmp[k].object > track->sap_last_object);
+                    if (later) r->stats.sap_record_deferrals++;
+                }
+                break;
             }
+            track->sap_has_last = true;
+            track->sap_last_group = g;
+            track->sap_last_object = o;
         }
     }
     pthread_mutex_unlock(&r->mu);
@@ -2133,16 +2252,16 @@ static void receiver_on_sap_object(moq_media_receiver_t *r,
     moq_sub_object_cleanup(so);
 }
 
-/* Append one media-timeline record to the bounded queue (r->mu held). Drops the
- * oldest when the app sustainedly under-polls; because the per-track dedup cursor
- * has already advanced past a surfaced Location, a dropped record is NOT
- * re-surfaced by a later §7.3 independent re-send (same trade-off as the SAP
- * queue: bound memory over guaranteeing delivery to a stalled consumer). */
-static void mt_queue_push(moq_media_receiver_t *r, moq_media_track_t *track,
+/* Admit one media-timeline record to the bounded queue (r->mu held). A full
+ * queue admits nothing and leaves the queue unchanged, exactly as the SAP
+ * queue: the caller defers the rest of the independent object and leaves the
+ * dedup cursor at the last admitted record, so the next §7.3 independent
+ * object delivers the deferred tail once the app has drained capacity. */
+static bool mt_queue_push(moq_media_receiver_t *r, moq_media_track_t *track,
                           const moq_msf_media_timeline_record_t *src)
 {
     if (r->mt_tail - r->mt_head >= r->mt_cap)
-        r->mt_head++;   /* drop oldest */
+        return false;    /* full: defer, retain what was admitted */
     moq_media_timeline_record_t *rec = &r->mts[r->mt_tail % r->mt_cap];
     memset(rec, 0, sizeof(*rec));
     rec->struct_size = (uint32_t)sizeof(*rec);
@@ -2152,6 +2271,7 @@ static void mt_queue_push(moq_media_receiver_t *r, moq_media_track_t *track,
     rec->object = src->object;
     rec->wallclock_ms = src->wallclock_ms;
     r->mt_tail++;
+    return true;
 }
 
 /* Parse an MSF §7.1.1 explicit media-timeline object and enqueue its NEW records
@@ -2223,16 +2343,27 @@ static void receiver_on_media_timeline_object(moq_media_receiver_t *r,
     for (size_t i = 0; i < n; i++) {
         uint64_t g = tmp[i].group, o = tmp[i].object;
         /* Dedup the §7.3 independent re-sends by media Location (not by the
-         * timeline object's own location): surface each Location once, in order. */
+         * timeline object's own location): surface each Location once, in
+         * order. The cursor advances ONLY for an admitted record. */
         bool newer = !track->mt_has_last ||
             g > track->mt_last_group ||
             (g == track->mt_last_group && o > track->mt_last_object);
-        if (newer) {
-            mt_queue_push(r, track, &tmp[i]);
-            track->mt_has_last = true;
-            track->mt_last_group = g;
-            track->mt_last_object = o;
+        if (!newer) continue;
+        if (!mt_queue_push(r, track, &tmp[i])) {
+            /* Full: defer this record and every later new record of the
+             * object, each counted, for the next independent object. */
+            for (size_t k = i; k < n; k++) {
+                bool later = !track->mt_has_last ||
+                    tmp[k].group > track->mt_last_group ||
+                    (tmp[k].group == track->mt_last_group &&
+                     tmp[k].object > track->mt_last_object);
+                if (later) r->stats.media_timeline_record_deferrals++;
+            }
+            break;
         }
+        track->mt_has_last = true;
+        track->mt_last_group = g;
+        track->mt_last_object = o;
     }
     pthread_mutex_unlock(&r->mu);
     if (heap_tmp) r->alloc.free(heap_tmp, cap * sizeof(*heap_tmp), r->alloc.ctx);
@@ -2920,13 +3051,16 @@ static moq_result_t receiver_prepare(const moq_media_receiver_cfg_t *cfg,
     return receiver_derive_sizes(cfg, sz);
 }
 
-static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
-                                 const moq_media_receiver_cfg_t *cfg,
-                                 const receiver_sizes_t *szp,
-                                 moq_media_receiver_t **out)
+/* Construction on an explicit allocator: every allocation the receiver makes
+ * -- itself, its rings, its tracks and their descriptions -- goes through
+ * `alloc`, with the sizes receiver_prepare derived and checked. */
+static moq_result_t receiver_new_with_alloc(moq_endpoint_t *ep, bool owns,
+                                            const moq_media_receiver_cfg_t *cfg,
+                                            const receiver_sizes_t *szp,
+                                            const moq_alloc_t *alloc,
+                                            moq_media_receiver_t **out)
 {
     const receiver_sizes_t sz = *szp;
-    const moq_alloc_t *alloc = RECEIVER_CTOR_ALLOC();
     moq_media_receiver_t *r = (moq_media_receiver_t *)alloc->alloc(
         sizeof(*r), alloc->ctx);
     if (!r) return MOQ_ERR_NOMEM;
@@ -3025,6 +3159,14 @@ static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
 
     *out = r;
     return MOQ_OK;
+}
+
+static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
+                                 const moq_media_receiver_cfg_t *cfg,
+                                 const receiver_sizes_t *szp,
+                                 moq_media_receiver_t **out)
+{
+    return receiver_new_with_alloc(ep, owns, cfg, szp, RECEIVER_CTOR_ALLOC(), out);
 }
 
 moq_result_t moq_media_receiver_attach(moq_endpoint_t *ep,
@@ -3161,7 +3303,7 @@ moq_result_t moq_media_receiver_poll_track(moq_media_receiver_t *r,
         full.struct_size = (uint32_t)n;
         full.kind = e.kind;
         full.track = e.track;
-        full.desc = e.track ? &e.track->desc : NULL;
+        full.desc = e.desc;   /* the snapshot captured when the event was enqueued */
         full.config_generation = 0;
         /* the UPDATE_OK scalars come from the QUEUE ENTRY's per-event
          * copies, never from current track state. Zero for other kinds. */
@@ -3201,7 +3343,9 @@ moq_result_t moq_media_receiver_poll_track(moq_media_receiver_t *r,
             full.struct_size = (uint32_t)n;
             full.kind = MOQ_MEDIA_TRACK_PARSE_DROP;
             full.track = t;
-            full.desc = &t->desc;
+            /* Synthesized at poll time from the coalesced record, so it
+             * carries the snapshot current at this same instant. */
+            full.desc = track_current(t);
             full.config_generation = 0;
             full.parse_drop_class = cls;
             full.parse_drops_total = total;
@@ -3221,7 +3365,7 @@ moq_result_t moq_media_receiver_poll_track(moq_media_receiver_t *r,
 const moq_media_track_desc_t *moq_media_track_desc_get(
     const moq_media_track_t *track)
 {
-    return track ? &track->desc : NULL;
+    return track ? track_current(track) : NULL;
 }
 
 moq_result_t moq_media_receiver_track_desc_copy(
@@ -3234,8 +3378,9 @@ moq_result_t moq_media_receiver_track_desc_copy(
 
     /* Ownership is a pointer comparison against the receiver's handle table
      * (appended under r->mu, retained until receiver_free), so an unowned
-     * pointer is never dereferenced. The copy runs under the same mutex the
-     * live->VOD writer holds, so the mutable triple is read whole. */
+     * pointer is never dereferenced. The copy reads the CURRENT snapshot under
+     * the same mutex a live->VOD conversion publishes under, so it is one whole
+     * immutable snapshot. */
     pthread_mutex_t *mu = (pthread_mutex_t *)&r->mu;
     pthread_mutex_lock(mu);
     PUB_PHASE_HOOK(r, MOQ_MR_DESC_READER_PRE);
@@ -3244,7 +3389,7 @@ moq_result_t moq_media_receiver_track_desc_copy(
         if (r->tracks[i] == track) { owned = true; break; }
     }
     if (owned) {
-        memcpy(out, &track->desc, n);
+        memcpy(out, track_current(track), n);
         out->struct_size = (uint32_t)n;
     }
     PUB_PHASE_HOOK(r, MOQ_MR_DESC_READER_POST);
@@ -3769,7 +3914,7 @@ void moq_media_receiver_test_push_media_timeline(moq_media_receiver_t *r,
     src.media_time_ms = media_time_ms;
     src.wallclock_ms = wallclock_ms;
     pthread_mutex_lock(&r->mu);
-    mt_queue_push(r, NULL, &src);
+    (void)mt_queue_push(r, NULL, &src);
     pthread_mutex_unlock(&r->mu);
 }
 
@@ -3811,6 +3956,21 @@ moq_result_t moq_media_receiver_test_construct(
 void moq_media_receiver_test_set_fatal(moq_media_receiver_t *r, uint64_t code)
 {
     receiver_set_fatal(r, code);
+}
+
+/* The same, on a caller-supplied allocator: every allocation the receiver
+ * makes -- itself, its rings, its tracks and their descriptions -- goes
+ * through `alloc`, so a counting allocator can prove balance across a whole
+ * scripted run. Production never has a choice here (moq_alloc_default). */
+moq_media_receiver_t *moq_media_receiver_test_new_cfg_alloc(
+    const moq_media_receiver_cfg_t *cfg, const moq_alloc_t *alloc)
+{
+    if (!alloc) return NULL;
+    receiver_sizes_t sz;
+    if (receiver_prepare(cfg, &sz) < 0) return NULL;
+    moq_media_receiver_t *r = NULL;
+    if (receiver_new_with_alloc(NULL, false, cfg, &sz, alloc, &r) != MOQ_OK) return NULL;
+    return r;
 }
 
 /* Drive the real endpoint pump hook with a caller-controlled session. The hook
@@ -3893,4 +4053,93 @@ void moq_media_receiver_test_track_attrib(moq_media_receiver_t *r,
     pthread_mutex_unlock(&r->mu);
 }
 
+/* Host-harness preconditions and intake, for a receiver that has no session.
+ * Each sets or drives exactly what production sets or drives elsewhere:
+ * the transport draft the pump reads from the live session
+ * (receiver_hook), the desire a subscribe records, and the object intake
+ * the facade feeds. Nothing here writes to the object ring. */
+moq_media_track_t *moq_media_receiver_test_track_at(moq_media_receiver_t *r, size_t index)
+{
+    return index < r->track_count ? r->tracks[index] : NULL;
+}
+
+void moq_media_receiver_test_set_transport_version(moq_media_receiver_t *r,
+                                                   moq_version_t v)
+{
+    pthread_mutex_lock(&r->mu);
+    r->transport_version = v;
+    pthread_mutex_unlock(&r->mu);
+}
+
+void moq_media_receiver_test_mark_desired(moq_media_receiver_t *r,
+                                          moq_media_track_t *track)
+{
+    pthread_mutex_lock(&r->mu);
+    track->desired_subscribed = true;
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* One facade object through the REAL intake (parse, admission, queueing,
+ * stats, cleanup on drop), routed by the track's kind exactly as the pump
+ * hook routes it: a SAP timeline to the SAP intake, a media timeline to the
+ * timeline intake, anything else to the media intake. The intake takes over
+ * the refs. */
+void moq_media_receiver_test_push_object_ex(moq_media_receiver_t *r,
+                                            moq_media_track_t *track,
+                                            uint64_t group, uint64_t subgroup, uint64_t object,
+                                            uint8_t publisher_priority,
+                                            moq_object_status_t status,
+                                            bool end_of_group, bool datagram,
+                                            const uint8_t *payload, size_t len,
+                                            const uint8_t *properties, size_t plen);
+
+void moq_media_receiver_test_push_object(moq_media_receiver_t *r,
+                                         moq_media_track_t *track,
+                                         uint64_t group, uint64_t object,
+                                         moq_object_status_t status,
+                                         bool end_of_group, bool datagram,
+                                         const uint8_t *payload, size_t len,
+                                         const uint8_t *properties, size_t plen)
+{
+    moq_media_receiver_test_push_object_ex(r, track, group, 0, object, 0, status, end_of_group,
+                                           datagram, payload, len, properties, plen);
+}
+
+/* The same intake with the whole wire identity the facade would deliver:
+ * subgroup and publisher priority as well as group and object. */
+void moq_media_receiver_test_push_object_ex(moq_media_receiver_t *r,
+                                            moq_media_track_t *track,
+                                            uint64_t group, uint64_t subgroup, uint64_t object,
+                                            uint8_t publisher_priority,
+                                            moq_object_status_t status,
+                                            bool end_of_group, bool datagram,
+                                            const uint8_t *payload, size_t len,
+                                            const uint8_t *properties, size_t plen)
+{
+    moq_sub_object_t so;
+    memset(&so, 0, sizeof so);
+    so.group_id = group;
+    so.subgroup_id = subgroup;
+    so.object_id = object;
+    so.publisher_priority = publisher_priority;
+    so.status = status;
+    so.end_of_group = end_of_group;
+    so.datagram = datagram;
+    /* A terminal-status object carries no payload (the parser refuses one),
+     * so only a NORMAL object gets its bytes. */
+    if (status == MOQ_OBJECT_NORMAL && payload &&
+        moq_rcbuf_create(&r->alloc, payload, len, &so.payload) != MOQ_OK)
+        return;
+    if (properties && plen &&
+        moq_rcbuf_create(&r->alloc, properties, plen, &so.properties) != MOQ_OK) {
+        moq_sub_object_cleanup(&so);
+        return;
+    }
+    if (track->is_sap_timeline)
+        receiver_on_sap_object(r, track, &so, 0);
+    else if (track->is_media_timeline)
+        receiver_on_media_timeline_object(r, track, &so, 0);
+    else
+        receiver_on_media_object(r, track, &so, 0);
+}
 #endif /* MOQ_MEDIA_RECEIVER_TESTING */

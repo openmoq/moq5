@@ -2,24 +2,20 @@
 # WebTransport via the attach-mode adapter. Build-tree only; not
 # installed. No public API; helpers are static in each source.
 
-# Resolve the picoquic core target for the direct picoquic_create /
-# picoquic_packet_loop calls (the adapter brings picohttp-core, but the
-# examples call core packet-loop APIs themselves).
-if(TARGET picoquic::picoquic-core)
-    set(_PICO_CORE picoquic::picoquic-core)
-elseif(TARGET picoquic-core)
-    set(_PICO_CORE picoquic-core)
-else()
-    message(FATAL_ERROR "picoquic-core target not found for pico_wt examples")
-endif()
-
+# These examples call picoquic core APIs (picoquic_create, packet loop)
+# directly, and they get picoquic-core -- headers and archive -- through the
+# adapter's PUBLIC picohttp-core edge, since upstream picohttp-core itself
+# links picoquic-core PUBLIC (picoquic/CMakeLists.txt: target_link_libraries
+# (picohttp-core ... PUBLIC picoquic-core picoquic-log)). Naming picoquic-core
+# again here adds a SECOND link-line occurrence at a different position, which
+# the linker reports as a duplicate library; the closure is already complete
+# without it. Build-tree only, so the adapter's BUILD_INTERFACE edge is the
+# one that applies.
 add_executable(moq_pico_wt_server server.c)
-target_link_libraries(moq_pico_wt_server
-    PRIVATE moq::adapter-pico-wt ${_PICO_CORE})
+target_link_libraries(moq_pico_wt_server PRIVATE moq::adapter-pico-wt)
 
 add_executable(moq_pico_wt_client client.c)
-target_link_libraries(moq_pico_wt_client
-    PRIVATE moq::adapter-pico-wt ${_PICO_CORE})
+target_link_libraries(moq_pico_wt_client PRIVATE moq::adapter-pico-wt)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     target_compile_options(moq_pico_wt_server PRIVATE

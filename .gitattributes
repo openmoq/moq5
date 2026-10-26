@@ -1,3 +1,6 @@
 fuzz/corpus/relay_admin_http/* binary
 # Unified diff context prefixes a space to upstream tab indentation.
 patches/picoquic/*.patch whitespace=-space-before-tab
+patches/picotls/*.patch whitespace=-space-before-tab
+# The Gradle Windows wrapper keeps CRLF in checkouts; the repository stores LF.
+bindings/kotlin/gradlew.bat text eol=crlf

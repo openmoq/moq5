@@ -209,20 +209,57 @@ int main(void)
     srand((unsigned)getpid());
     int base = 15600 + (rand() % 300);
 
-    /* -- Case 1: default OpenSSL-lane client -- the GENUINE system-trust
-     *    verifier is installed once (real installer, seam left NULL), present
-     *    before the configure hook, no null verifier. Kept as the real-verifier
-     *    control, separate from the counted-disposal cases below. */
+    /* -- Case 1: a verified client with NO explicit CA, using the REAL
+     *    installer (seam left NULL). The outcome is provider-dependent and the
+     *    provider is the CONFIGURED one, never a runtime probe:
+     *
+     *      implicit system store    -> the genuine default verifier is
+     *                                  installed once and is present before
+     *                                  the configure hook;
+     *      no implicit system store -> there is nothing to install, so the
+     *                                  create FAILS CLOSED rather than
+     *                                  proceeding unverified. This is the
+     *                                  documented contract for such a
+     *                                  provider (moq/picoquic_verify.h), not a
+     *                                  weaker expectation. */
     {
         reset_seam();
         hook_ctx_t h; memset(&h, 0, sizeof(h));
         moq_pq_threaded_cfg_t c; client_cfg(&c, base + 0, &h, 0);
         moq_pq_threaded_t *t = NULL;
-        CHECK(moq_pq_threaded_create(&c, &t) == MOQ_OK);
+        moq_result_t rc = moq_pq_threaded_create(&c, &t);
+#if defined(MOQ_TEST_VERIFY_BACKEND_MBEDTLS)
+        CHECK(rc != MOQ_OK);
+        CHECK(t == NULL);
+        /* fail-closed means no verifier was installed and none was nulled */
+        CHECK(moq_pq_threaded_test_null_verifier_calls == 0);
+        /* and the configure hook never ran: the refusal precedes it */
+        CHECK(h.hook_calls == 0);
+#else
+        CHECK(rc == MOQ_OK);
         CHECK(moq_pq_threaded_test_cert_install_calls == 1);
         CHECK(moq_pq_threaded_test_null_verifier_calls == 0);
         CHECK(h.hook_calls == 1);
         CHECK(h.verify_at_entry != NULL);   /* default present before hook */
+#endif
+        if (t) { moq_pq_threaded_stop(t); moq_pq_threaded_destroy(t); }
+    }
+
+    /* -- Case 1b: the same client WITH an explicit CA. Every provider must
+     *    install a real verifier here, so the provider split above cannot be
+     *    an excuse for skipping verification anywhere. */
+    {
+        reset_seam();
+        hook_ctx_t h; memset(&h, 0, sizeof(h));
+        moq_pq_threaded_cfg_t c; client_cfg(&c, base + 6, &h, 0);
+        c.ca_file = MOQ_TEST_CERT_PATH;
+        moq_pq_threaded_t *t = NULL;
+        CHECK(moq_pq_threaded_create(&c, &t) == MOQ_OK);
+        CHECK(moq_pq_threaded_test_cert_install_calls == 1);
+        CHECK(moq_pq_threaded_test_null_verifier_calls == 0);
+        CHECK(h.hook_calls == 1);
+        CHECK(h.verify_at_entry != NULL);
+        CHECK(last_ca_file == NULL);   /* real installer, seam not invoked */
         if (t) { moq_pq_threaded_stop(t); moq_pq_threaded_destroy(t); }
     }
 

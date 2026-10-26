@@ -1,0 +1,22 @@
+Link picotls into picohttp-core once.
+
+picohttp-core listed ${PTLS_LIBRARIES} as a PRIVATE link dependency while also
+linking picoquic-core PUBLIC, and picoquic-core already carries
+${PTLS_LIBRARIES} PUBLIC. Every picohttp-core link therefore named each picotls
+archive twice, which Apple's linker reports as "ignoring duplicate libraries"
+when building libpicohttp-core as a shared library. picohttp-core still gets
+picotls from picoquic-core's public interface, so the private entry is dropped.
+
+Applies to picoquic 55b473e207e436d06ea9a2895cc1fc555d42c81c.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -539,7 +539,6 @@
+     add_library(picoquic::picohttp-core ALIAS picohttp-core)
+     target_link_libraries(picohttp-core
+         PRIVATE
+-            ${PTLS_LIBRARIES}
+             ${OPENSSL_LIBRARIES}
+             ${MBEDTLS_LIBRARIES}
+         PUBLIC

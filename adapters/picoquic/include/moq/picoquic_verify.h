@@ -55,6 +55,7 @@
  */
 
 #include <moq/export.h>
+#include <moq/types.h>   /* moq_bytes_t, for the delegated-trust callback */
 
 #ifdef __cplusplus
 extern "C" {
@@ -92,15 +93,70 @@ typedef struct st_picoquic_quic_t picoquic_quic_t;
  * helper and any previously installed verifier remains unchanged. Older
  * picoquic revisions expose a void setter that unconditionally takes ownership.
  */
-MOQ_API int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic,
-                                           const char *ca_file);
+MOQ_PQ_API int moq_picoquic_set_cert_verifier(picoquic_quic_t *quic,
+                                              const char *ca_file);
+
+/* -- delegated certificate trust ------------------------------------------- *
+ *
+ * The provider-stable shape. OpenSSL builds implement it; mbedTLS builds
+ * report no support and refuse to install, so a consumer asks at runtime
+ * rather than compiling provider-conditionally.
+ *
+ * This is the adapter's one spelling of delegated trust: any other consumer
+ * of the same idea uses these names rather than a parallel vocabulary.
+ *
+ * REJECT is zero so a default-initialised or unrecognised verdict fails
+ * closed. */
+typedef enum moq_picoquic_cert_verdict {
+    MOQ_PICOQUIC_CERT_REJECT = 0,
+    MOQ_PICOQUIC_CERT_TRUST  = 1
+} moq_picoquic_cert_verdict_t;
+
+/* The trust decision, over BORROWED spans valid for the call only.
+ * `certificates` is leaf-first DER.
+ *
+ * The callback is responsible for the trust policy. Whoever implements it is
+ * also responsible for the reference-identity check: this adapter does not
+ * perform it on the callback's behalf, so an implementation MUST perform it
+ * itself before consulting any platform trust bridge. Nothing here names a
+ * key type or key exchange; a platform that needs one derives it from the
+ * protocol (TLS 1.3 for QUIC), not from the chain. */
+typedef moq_picoquic_cert_verdict_t (*moq_picoquic_cert_verify_fn)(
+    void *ctx,
+    moq_bytes_t server_name,
+    const moq_bytes_t *certificates,
+    size_t certificate_count);
+
+/* 1 when this adapter build can install a delegated trust callback, else 0.
+ *
+ * Declared and DEFINED in every provider build: a consumer must be able to ask
+ * without provider-conditional compilation of its own. The OpenSSL build
+ * reports support; the mbedTLS build reports 0 rather than accepting a
+ * callback it would ignore. */
+MOQ_PQ_API int moq_picoquic_cert_verify_callback_supported(void);
+
+/* Install a delegated trust callback on a client context.
+ *
+ * `ctx` is opaque to this adapter and MAY be NULL: a stateless callback needs
+ * no context, and one is never required. When non-NULL it stays caller-owned
+ * until the QUIC context is destroyed. The callback
+ * runs synchronously on picoquic's network thread and must not re-enter
+ * picoquic or LibMoQ. Returns 0 on success and -1 for invalid arguments,
+ * allocation or setup failure, a setter rejection, or an unsupported provider.
+ * Transactional under the same ownership rules as
+ * moq_picoquic_set_cert_verifier(): on failure nothing is installed and any
+ * previously installed verifier is unchanged. */
+MOQ_PQ_API int moq_picoquic_set_cert_verify_callback(
+    picoquic_quic_t *quic,
+    moq_picoquic_cert_verify_fn verify,
+    void *ctx);
 
 /* Preflight a CA bundle path without a QUIC context: returns 1 if `ca_file`
  * loads as a trust store (or, for backends with an implicit system store, is
  * NULL/empty), 0 if it cannot be loaded. Lets the service endpoint report a
  * bad CA file as a configuration error (MOQ_ERR_INVAL) up front, rather than
  * as a generic connect failure. */
-MOQ_API int moq_picoquic_ca_file_loadable(const char *ca_file);
+MOQ_PQ_API int moq_picoquic_ca_file_loadable(const char *ca_file);
 
 #ifdef __cplusplus
 }

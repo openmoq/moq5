@@ -249,12 +249,23 @@ static int managed_client_h3_callback(picoquic_cnx_t *cnx,
                            m->h3_ctx, v_stream_ctx);
 }
 
-static void mark_activity(moq_pico_wt_managed_t *m)
+/* Publish the level-retained activity bit a blocked wait() returns on. ONE
+ * place owns the mutex/condition bookkeeping for that bit; every path that
+ * makes wait() return MOQ_OK goes through here. Network thread only. */
+static void publish_activity(moq_pico_wt_managed_t *m)
 {
     pthread_mutex_lock(&m->mutex);
     m->activity_pending = true;
     pthread_cond_broadcast(&m->cond);
     pthread_mutex_unlock(&m->mutex);
+}
+
+/* A completed pump cycle: the activity bit, then the owner's post-pump
+ * signal. The pre-session wake acknowledgement deliberately does NOT come
+ * through here -- no pump ran, so on_activity has nothing to report. */
+static void mark_activity(moq_pico_wt_managed_t *m)
+{
+    publish_activity(m);
     if (m->on_activity)
         m->on_activity(m, m->on_activity_ctx);
 }
@@ -579,9 +590,20 @@ static int loop_callback(picoquic_quic_t *quic,
     }
 
     if (cb_mode == picoquic_packet_loop_wake_up) {
+        /* An accepted explicit wake has reached this thread: consume the
+         * coalesced pending flag so the next wake() is accepted again. While
+         * no WT session exists there is no pump to run for it, but the owner
+         * that issued the wake is waiting to learn that the thread took it --
+         * a queued command of theirs is behind that wait. Acknowledge it
+         * here, on this thread, BEFORE the pre-session return below, as the
+         * level-retained activity bit only: no pump ran, so on_pump and
+         * on_activity are not called. Once a session exists the normal cycle
+         * below publishes activity after the pump exactly as before. */
         pthread_mutex_lock(&m->mutex);
         m->wake_pending = false;
         pthread_mutex_unlock(&m->mutex);
+        if (!m->conn)
+            publish_activity(m);
     } else if (cb_mode == picoquic_packet_loop_time_check) {
         packet_loop_time_check_arg_t *tc =
             (packet_loop_time_check_arg_t *)callback_arg;
@@ -751,6 +773,42 @@ static int loop_callback(picoquic_quic_t *quic,
 
     mark_activity(m);
     return 0;
+}
+
+/* Dispose of the managed CLIENT's owned h3zero context.
+ *
+ * picowt_prepare_client_cnx() installs h3zero_callback with the h3 context as
+ * the connection's callback context; the managed facade then replaces that
+ * pair with its own wrapper and `m`, for the whole life of the network
+ * thread. h3zero's deletion contract still assumes the ORIGINAL pair: when a
+ * registered stream prefix (the WT control stream) carries a callback,
+ * h3zero_delete_all_stream_prefixes() reads the connection's callback context
+ * and casts it to h3zero_callback_ctx_t to find the stream. With `m` still
+ * installed that read is of the wrong object. So, once the network thread can
+ * no longer run, the original pair is restored first, then the context is
+ * deleted, then the owned pointers are cleared exactly once. ONE helper for
+ * destroy and for the failed-create path; a server facade owns no h3 context
+ * and this is a no-op for it.
+ *
+ * Caller guarantees the network thread is quiesced (never started, or stopped
+ * and joined): restoring the callback while it could still run would hand a
+ * live connection to the unwrapped callback. */
+static void dispose_client_h3(moq_pico_wt_managed_t *m)
+{
+    if (!m->h3_ctx)
+        return;
+    if (m->cnx)
+        picoquic_set_callback(m->cnx, h3zero_callback, m->h3_ctx);
+    h3zero_callback_delete_context(m->cnx, m->h3_ctx);
+    /* The context is gone. picoquic_free() will still delete the connection
+     * and dispatch its final callback; the wrapper used to answer that with
+     * "no context" (m->h3_ctx is NULL), and the bare h3zero callback would
+     * dereference the freed context instead. Detach the callback so the
+     * connection's own deletion has nothing to call. */
+    if (m->cnx)
+        picoquic_set_callback(m->cnx, NULL, NULL);
+    m->h3_ctx = NULL;
+    m->ctrl_ctx = NULL;
 }
 
 /* -- cfg_init ------------------------------------------------------- */
@@ -1047,13 +1105,10 @@ moq_result_t moq_pico_wt_managed_create(
 
 fail_configure:
     /* A client cnx whose setup got past picowt_prepare_client_cnx owns an
-     * h3zero context (and its per-stream contexts); delete it before the cnx is
-     * freed, so a failed connect does not leak it. NULL for the server path. */
-    if (m->h3_ctx) {
-        h3zero_callback_delete_context(m->cnx, m->h3_ctx);
-        m->h3_ctx = NULL;
-        m->ctrl_ctx = NULL;
-    }
+     * h3zero context (and its per-stream contexts); dispose of it before the
+     * cnx is freed, so a failed connect does not leak it. No network thread
+     * is running on this path. NULL for the server path. */
+    dispose_client_h3(m);
     picoquic_free(m->quic);
     m->quic = NULL;
 fail_quic:
@@ -1107,16 +1162,12 @@ void moq_pico_wt_managed_destroy(moq_pico_wt_managed_t *m)
     if (m->session) moq_session_destroy(m->session);
     /* The managed client owns the h3zero context returned by
      * picowt_prepare_client_cnx. conn_destroy only detaches/deregisters it
-     * (attach mode does not own it), so the managed path deletes it here --
-     * after the conn is torn down and before picoquic_free() frees the cnx it
-     * references. This empties the per-stream h3zero context tree that ASan
-     * flagged as leaked. The server path leaves m->h3_ctx NULL (picoquic owns
-     * the server-side h3 contexts), so this is client-only. */
-    if (m->h3_ctx) {
-        h3zero_callback_delete_context(m->cnx, m->h3_ctx);
-        m->h3_ctx = NULL;
-        m->ctrl_ctx = NULL;
-    }
+     * (attach mode does not own it), so the managed path disposes of it here
+     * -- after the conn is torn down and before picoquic_free() frees the cnx
+     * it references, and after stop() has joined the network thread. The
+     * server path leaves m->h3_ctx NULL (picoquic owns the server-side h3
+     * contexts), so this is client-only. */
+    dispose_client_h3(m);
     if (m->quic) picoquic_free(m->quic);
     pthread_cond_destroy(&m->cond);
     pthread_mutex_destroy(&m->mutex);

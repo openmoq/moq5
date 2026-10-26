@@ -96,10 +96,35 @@ typedef void (*moq_endpoint_hook_fn)(moq_endpoint_t *ep,
  *                      already cached during its pump: it MUST NOT re-enter the
  *                      endpoint, the session, the adapter, or the publisher/
  *                      receiver facade. NULL = the hook has no time-based
- *                      deadline. */
+ *                      deadline.
+ *   send_drain_status — optional; the attachment's own view of the output it has
+ *                      ALREADY ACCEPTED from its application:
+ *                        IDLE    nothing owed,
+ *                        PENDING output accepted but not yet handed to the core,
+ *                        FAILED  the attachment terminalized with accepted
+ *                                output that can never be handed over.
+ *                      FAILED is distinct because an attachment can go terminal
+ *                      while its endpoint stays established and transport-idle;
+ *                      reporting IDLE there would let drain claim a flush that
+ *                      never happened. Otherwise the same discipline as
+ *                      next_deadline_us, and for the same reason: it is queried
+ *                      OUTSIDE the pump's exclusive window (by
+ *                      moq_endpoint_drain), so it MUST be a pure, non-blocking
+ *                      read of a value the hook cached during its own pump. It
+ *                      MUST NOT re-enter the endpoint, the session, the adapter,
+ *                      or the publisher/receiver facade, and it must not consult
+ *                      demand or any other network-thread state directly -- the
+ *                      hook folds those into the cached answer. NULL = IDLE. */
+typedef enum moq_endpoint_send_drain_status {
+    MOQ_EP_SEND_DRAIN_IDLE    = 0,
+    MOQ_EP_SEND_DRAIN_PENDING = 1,
+    MOQ_EP_SEND_DRAIN_FAILED  = 2
+} moq_endpoint_send_drain_status_t;
+
 typedef struct moq_endpoint_hook_ops {
     moq_endpoint_hook_fn pump;
     uint64_t (*next_deadline_us)(void *ctx);
+    moq_endpoint_send_drain_status_t (*send_drain_status)(void *ctx);
 } moq_endpoint_hook_ops_t;
 
 moq_result_t moq_endpoint_attach_hook(moq_endpoint_t *ep,
@@ -115,6 +140,17 @@ moq_result_t moq_endpoint_attach_hook(moq_endpoint_t *ep,
  * takes ep->mu then each hook's own lock (the ep->mu -> s->mu order), and calls
  * only the pure cached hook reads above. */
 uint64_t moq_endpoint_app_deadline_us(void *ctx);
+
+/* The aggregate of every attached hook's send_drain_status (the pure cached
+ * reads above): FAILED wins over PENDING, which wins over IDLE. Takes ep->mu,
+ * calls each hook callback, releases ep->mu; observes the same ep->mu ->
+ * hook-lock order as the deadline aggregate and never holds ep->mu across a
+ * backend/facade call or a wait. Used by moq_endpoint_drain() to include
+ * service-tier output that has been accepted but not yet handed to the
+ * transport, and to refuse success when an attachment terminalized holding
+ * accepted output. */
+moq_endpoint_send_drain_status_t
+moq_endpoint_hooks_send_drain_status(moq_endpoint_t *ep);
 void moq_endpoint_detach_hook(moq_endpoint_t *ep,
                               moq_endpoint_hook_kind_t kind, void *ctx);
 

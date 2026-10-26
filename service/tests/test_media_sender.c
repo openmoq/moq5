@@ -3034,10 +3034,13 @@ int main(int argc, char **argv)
     }
 
     /* == init_data survives add_track -> published catalog ============== *
-     * A RAW/LOC track's init_data must be encoded into the catalog the sender
-     * publishes (any packaging). The server captures the catalog payload; we
-     * parse it and confirm the "video" track's initData decodes to the bytes
-     * passed to add_track. */
+     * A RAW/LOC track's init_data must reach the catalog the sender publishes
+     * through the MSF-01 indirection: the root Initialization Data List
+     * (§5.1.7) with the track pointing at it by initRef (§5.2.13). MSF-01
+     * defines no per-track initData field, so the track carries none. The
+     * server captures the catalog payload; we parse it, resolve the "video"
+     * track's reference, and confirm it decodes to the bytes passed to
+     * add_track. */
     {
         int port = 0;
         memset(&g_srv, 0, sizeof(g_srv));
@@ -3093,10 +3096,14 @@ int main(int argc, char **argv)
                 moq_msf_catalog_find_role(&catalog, "video");
             MOQ_TEST_CHECK(vt != NULL);
             if (vt) {
-                MOQ_TEST_CHECK(vt->has_init_data && vt->init_data.len > 0);
+                MOQ_TEST_CHECK(!vt->has_init_data);
+                MOQ_TEST_CHECK(vt->has_init_ref && vt->init_ref.len > 0);
+                const moq_msf_init_data_entry_t *e =
+                    moq_msf_catalog_find_init_data(&catalog, vt->init_ref);
+                MOQ_TEST_CHECK(e != NULL && e->data.len > 0);
                 moq_rcbuf_t *decoded = NULL;
-                MOQ_TEST_CHECK_EQ_INT((int)moq_msf_decode_init_data(
-                    al, vt->init_data, &decoded), (int)MOQ_OK);
+                if (e) MOQ_TEST_CHECK_EQ_INT((int)moq_msf_decode_init_data(
+                    al, e->data, &decoded), (int)MOQ_OK);
                 if (decoded) {
                     MOQ_TEST_CHECK_EQ_U64(moq_rcbuf_len(decoded),
                                           sizeof(extradata));
@@ -5350,7 +5357,23 @@ int main(int argc, char **argv)
             MOQ_TEST_CHECK(moq_media_sender_is_closed(s));
             moq_media_sender_destroy(s);
         } else {
+            /* The failure beat create(). WHICH refusal it is depends on the
+             * configured certificate-verifier backend, and the provider is
+             * the CONFIGURED one:
+             *
+             *   implicit system store    -> the attach gate reports the
+             *                               terminal connection, MOQ_ERR_CLOSED;
+             *   no implicit system store -> this config has no CA to verify
+             *                               against, so the endpoint's CA
+             *                               preflight rejects it up front as a
+             *                               configuration error, MOQ_ERR_INVAL.
+             *
+             * Either way no sender exists and nothing unverified was created. */
+#if defined(MOQ_TEST_VERIFY_BACKEND_MBEDTLS)
+            MOQ_TEST_CHECK_EQ_INT((int)crc, (int)MOQ_ERR_INVAL);
+#else
             MOQ_TEST_CHECK_EQ_INT((int)crc, (int)MOQ_ERR_CLOSED);
+#endif
             MOQ_TEST_CHECK(s == NULL);
             printf("note: connect failure preempted create(); "
                    "hook path not exercised this run\n");

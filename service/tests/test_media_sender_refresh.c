@@ -32,6 +32,7 @@ void     moq_media_sender_test_pump(moq_media_sender_t *s,
                                     moq_session_t *session, uint64_t now_us);
 void     moq_media_sender_test_free(moq_media_sender_t *s);
 uint64_t moq_media_sender_test_catalog_group(const moq_media_sender_t *s);
+bool     moq_media_sender_test_catalog_dirty(const moq_media_sender_t *s);
 uint64_t moq_media_sender_test_refresh_interval(const moq_media_sender_t *s);
 unsigned moq_media_sender_test_retained_installs(const moq_media_sender_t *s);
 void     moq_media_sender_test_block_republish_before(moq_media_sender_t *s,
@@ -670,6 +671,9 @@ static void test_refresh_mutation_precedence(moq_version_t ver)
     moq_media_sender_t *s = ready_publish_sender(sp, &cb, t0, false, 1000000ull);
     MOQ_TEST_CHECK(moq_media_sender_is_ready(s));
     MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(s), 0);
+    /* The pumps that reached ready also staged the initial catalog, which
+     * consumes the pre-ready add's mutation: the catalog is clean here. */
+    MOQ_TEST_CHECK(!moq_media_sender_test_catalog_dirty(s));
 
     /* Add a real second (video) track post-ready -- a genuine catalog change. */
     moq_media_track_cfg_t tc; moq_media_track_cfg_init(&tc);
@@ -680,6 +684,8 @@ static void test_refresh_mutation_precedence(moq_version_t ver)
     tc.bitrate = 800000; tc.is_live = true;
     moq_media_track_t *a = NULL;
     MOQ_TEST_CHECK(moq_media_sender_add_track(s, &tc, &a) == MOQ_OK);
+    /* ...and the accepted post-ready add is what dirties it. */
+    MOQ_TEST_CHECK(moq_media_sender_test_catalog_dirty(s));
 
     /* Register + commit the mutation generation at tm, WELL before the refresh
      * deadline (t0 + 1s). Pump generously, accepting the new track's PUBLISH. */
@@ -703,6 +709,7 @@ static void test_refresh_mutation_precedence(moq_version_t ver)
     /* Exactly one generation from the mutation (a real add, not a refresh --
      * the deadline has not been reached). */
     MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(s), 1);
+    MOQ_TEST_CHECK(!moq_media_sender_test_catalog_dirty(s));
 
     /* At the ORIGINAL refresh deadline: the mutation reset the cadence, so the
      * refresh is NOT yet due -> group stays 1 (no redundant refresh). */

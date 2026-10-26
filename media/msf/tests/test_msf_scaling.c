@@ -9,13 +9,22 @@
  * per-op linear scan did O(n) per op, i.e. O(n^2) overall. With N unique adds
  * the indexed path stays well under a linear bound that a quadratic
  * implementation blows straight through -- the RED mutant (revert an apply
- * lookup to a linear scan over eff[0..n)) drives the counter past it. */
+ * lookup to a linear scan over eff[0..n)) drives the counter past it.
+ *
+ * Because this target compiles msf.c itself, it also hosts the direct boundary
+ * rows of the parser's internal overflow-safe array sizer, which the shipped
+ * library does not export. */
 #include <moq/msf.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 extern size_t moq_msf_test_identity_compares;   /* msf.c, under MOQ_MSF_TESTING */
+/* msf.c's internal overflow-safe array sizer (not exported by the library). */
+extern bool moq_msf_checked_array_bytes(size_t count, size_t elem,
+                                        size_t *out_bytes);
 
 static int failures = 0;
 #define CHECK(e) do { if (!(e)) { \
@@ -111,6 +120,34 @@ int main(void)
             CHECK(vcmp < (size_t)(16 * N));
         }
         free(inames); free(ids);
+    }
+
+    /* -- The internal checked array sizer, at its boundaries --------------
+     * A real JSON input cannot reach a SIZE_MAX-overflowing array on a 64-bit
+     * host (the JSON DOM itself would need that many elements), so the helper
+     * every array allocation goes through is exercised directly. */
+    {
+        const size_t elem = sizeof(moq_msf_track_t);
+        size_t bytes = 12345;
+
+        /* Just over the representable limit -> overflow rejected. */
+        CHECK(!moq_msf_checked_array_bytes(SIZE_MAX / elem + 1, elem, &bytes));
+
+        /* Exactly the limit -> representable, computes the product. */
+        size_t boundary = SIZE_MAX / elem;
+        bytes = 0;
+        CHECK(moq_msf_checked_array_bytes(boundary, elem, &bytes));
+        CHECK(bytes == boundary * elem);
+
+        /* Small, normal counts compute as expected. */
+        bytes = 0;
+        CHECK(moq_msf_checked_array_bytes(4, elem, &bytes));
+        CHECK(bytes == 4 * elem);
+
+        /* elem == 0 never overflows (and yields 0 bytes). */
+        bytes = 1;
+        CHECK(moq_msf_checked_array_bytes(SIZE_MAX, 0, &bytes));
+        CHECK(bytes == 0);
     }
 
     free(at); free(names); free(ops);

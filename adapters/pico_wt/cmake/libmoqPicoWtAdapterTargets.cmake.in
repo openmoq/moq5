@@ -7,11 +7,39 @@ get_filename_component(_PICOWT_PREFIX "${_PICOWT_PREFIX}" PATH)
 get_filename_component(_PICOWT_PREFIX "${_PICOWT_PREFIX}" PATH)
 
 if(NOT TARGET moq::adapter-pico-wt)
+  # picohttp-core brings picoquic-core and picoquic-log, which are mutually
+  # dependent archives with only log -> core declared. The interface lists the
+  # pair after it; a single-pass linker (GNU ld) also gets both archives again
+  # as a group of file paths, which CMake keeps in place. Evaluated at consumer
+  # configure time (CMAKE_SYSTEM_NAME is the consumer's platform).
+  set(_libmoq_picowt_link "moq::core;picoquic::picohttp-core")
+  if(TARGET picoquic::picoquic-log)
+    list(APPEND _libmoq_picowt_link picoquic::picoquic-core picoquic::picoquic-log)
+    get_target_property(_libmoq_picowt_core_type picoquic::picoquic-core TYPE)
+    get_target_property(_libmoq_picowt_log_type picoquic::picoquic-log TYPE)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+       AND _libmoq_picowt_core_type STREQUAL "STATIC_LIBRARY"
+       AND _libmoq_picowt_log_type STREQUAL "STATIC_LIBRARY")
+      # "$" is kept apart from "<TARGET_FILE:" so the generator expression
+      # reaches the consumer's link interface instead of being evaluated when
+      # this file itself is generated.
+      set(_libmoq_d "$")
+      list(APPEND _libmoq_picowt_link
+        "-Wl,--start-group"
+        "${_libmoq_d}<TARGET_FILE:picoquic::picoquic-core>"
+        "${_libmoq_d}<TARGET_FILE:picoquic::picoquic-log>"
+        "-Wl,--end-group")
+      unset(_libmoq_d)
+    endif()
+    unset(_libmoq_picowt_core_type)
+    unset(_libmoq_picowt_log_type)
+  endif()
   add_library(moq::adapter-pico-wt @_picowt_lib_type@ IMPORTED)
   set_target_properties(moq::adapter-pico-wt PROPERTIES
     IMPORTED_LOCATION "${_PICOWT_PREFIX}/@_picowt_libdir@/@_picowt_lib_name@"
     INTERFACE_INCLUDE_DIRECTORIES "${_PICOWT_PREFIX}/@_picowt_incdir@"
-    INTERFACE_LINK_LIBRARIES "moq::core;picoquic::picohttp-core")
+    INTERFACE_LINK_LIBRARIES "${_libmoq_picowt_link}")
+  unset(_libmoq_picowt_link)
 endif()
 
 unset(_PICOWT_PREFIX)

@@ -315,6 +315,14 @@ MOQ_API moq_result_t moq_endpoint_wait(moq_endpoint_t *ep, uint64_t timeout_us);
  * before the cycle collapse into one) and LEVEL-retained (a wake that lands
  * before the next wait is not lost; the wait returns immediately).
  *
+ * Before the transport session is established the facade cannot pump: a
+ * wake accepted then still returns an endpoint waiter -- the network thread
+ * acknowledges the coalesced wake state as the same retained activity level
+ * (wakes before it is handled, and acknowledgements before a wait consumes
+ * them, collapse into one) -- while the session-dependent work stays
+ * retained for the first live or terminal cycle. Attached hooks run only
+ * when the facade can pump.
+ *
  * Callable from any thread. Non-allocating and infallible by contract:
  * unlike moq_endpoint_post() it queues no task, so it cannot fail -- use it
  * to schedule reconciliation of state the caller has already recorded
@@ -324,26 +332,57 @@ MOQ_API moq_result_t moq_endpoint_wait(moq_endpoint_t *ep, uint64_t timeout_us);
  * latched endpoint still yields MOQ_ERR_INTERRUPTED from blocking calls. */
 MOQ_API void moq_endpoint_wake(moq_endpoint_t *ep);
 
-/* Block (app thread only) until local reliable stream data has been flushed out
- * of the transport's send queues -- no stream still has queued or ready-to-send
- * bytes or an unsent FIN. Call this after writing the last objects and before
- * moq_endpoint_stop() so the abrupt stop does not truncate bytes still sitting
- * in libmoq/picoquic's stream send queues.
+/* Block (app thread only) until send work already accepted by an attached
+ * service has reached the core AND local reliable stream data has been flushed
+ * out of the transport's send queues -- no stream still has queued or
+ * ready-to-send bytes or an unsent FIN. Call this after writing the last
+ * objects and before moq_endpoint_stop() so the abrupt stop does not truncate
+ * bytes still sitting in an attached service's queue or in libmoq/picoquic's
+ * stream send queues.
  *
  * Scope of the guarantee:
- *   - It DOES mean every reliable stream byte and FIN has been handed to the
- *     transport for sending (local stream backlog empty).
+ *   - It DOES mean output an attached service (media sender) had already
+ *     ACCEPTED from its application -- queued objects, an END_OF_TRACK marker,
+ *     a catalog mutation or a completion -- has been handed to the core, and
+ *     every reliable stream byte and FIN has been handed to the transport for
+ *     sending (local stream backlog empty).
+ *   - Peer acceptance is NOT itself an obligation. Once no accepted local
+ *     output remains, drain does not additionally wait for the peer to accept a
+ *     namespace advertisement or a PUBLISH request: that is peer acceptance,
+ *     not a local flush, and on its own it never holds drain pending.
+ *   - But a PROTOCOL GATE can keep accepted output from reaching the core, and
+ *     drain honestly reports that. An object or terminal marker a service has
+ *     already accepted from the application still sits in that service's queue
+ *     while readiness or track demand has not opened for it -- there is nowhere
+ *     legal to send it yet. That output IS an outstanding obligation, so drain
+ *     stays pending and MAY time out (MOQ_DONE) for as long as the gate holds.
+ *     Waiting for such a gate to open is the caller's decision, not this call's.
  *   - It does NOT mean all packets were acknowledged by the peer (the QUIC
  *     packet/retransmission backlog can remain non-empty on an idle connection
  *     long after the bytes and FIN were sent).
  *   - It does NOT mean the peer application has consumed the media.
  *
+ * Caller obligations:
+ *   - Quiesce concurrent send-side mutations. No API can promise a stable drain
+ *     against a writer that keeps accepting new work while it runs.
+ *   - Let any moq_endpoint_post() task that can create send work RUN first.
+ *     Posted tasks are a separately observable asynchronous executor; drain
+ *     does not account for work still sitting in the post queue.
+ *
  * Returns:
- *   MOQ_OK              local stream flush complete: stopping will not truncate
- *                       queued stream data.
+ *   MOQ_OK              BOTH are flushed: every piece of output an attached
+ *                       service had accepted from the application has reached
+ *                       the core, and the reliable transport backlog this API
+ *                       covers is empty. Stopping will not truncate queued
+ *                       stream data.
  *   MOQ_DONE            timeout_us elapsed before the flush completed.
  *   MOQ_ERR_INTERRUPTED the interrupt latch is set.
- *   MOQ_ERR_CLOSED      the endpoint went terminal/fatal during the drain.
+ *   MOQ_ERR_CLOSED      the endpoint, or an attached send producer holding
+ *                       output already accepted from the application,
+ *                       terminalized before the flush completed. The accepted
+ *                       output did NOT reach the transport, and no retry will
+ *                       make it -- the endpoint itself may still read as
+ *                       established and transport-idle.
  *   MOQ_ERR_WRONG_STATE called from the endpoint's managed execution
  *                       context (a hook).
  *   MOQ_ERR_UNSUPPORTED the active backend cannot prove a local stream flush (it
@@ -405,9 +444,73 @@ typedef struct moq_endpoint_terminal {
 /* Classify the endpoint's terminal reason. Fills `*out` (sized-copy by
  * `out_size`, stamping out->struct_size with bytes written). Returns MOQ_OK, or
  * MOQ_ERR_INVAL for NULL args or an out_size below MOQ_ENDPOINT_TERMINAL_V0_SIZE.
- * On a non-terminal endpoint the reason is MOQ_ENDPOINT_TERMINAL_NONE. */
+ * On a non-terminal endpoint the reason is MOQ_ENDPOINT_TERMINAL_NONE.
+ *
+ * The classification is STABILIZED: a backend publishes its terminal facts
+ * through separately locked accessors, so a single reading of them can compose
+ * a combination the backend never held. This call therefore takes complete
+ * terminal samples until two consecutive samples agree, which is sound because
+ * a backend's terminal transition is finite and eventually stable. Like every
+ * accessor here it returns an OBSERVATION: it may become stale immediately
+ * after the final sample. */
 MOQ_API moq_result_t moq_endpoint_get_terminal(const moq_endpoint_t *ep,
                                                moq_endpoint_terminal_t *out,
+                                               size_t out_size);
+
+/* ONE coherent observation of the endpoint: state, negotiated version, and the
+ * terminal classification, taken together.
+ *
+ * The three legacy accessors below are each individually correct but are read
+ * under DIFFERENT locks -- moq_endpoint_state() releases ep->mu before
+ * consulting the facade, moq_endpoint_get_terminal() takes no ep->mu at all,
+ * and moq_endpoint_negotiated_version() takes its own -- so a caller composing
+ * them samples several instants and can report a pair the endpoint never held
+ * (for example CONNECTING with a nonzero version, or ESTABLISHED with 0).
+ * This accessor exists so a consumer that needs a coherent tuple does not have
+ * to.
+ *
+ * Guarantees, and it takes BOTH mechanisms -- neither alone proves the whole
+ * record coherent:
+ *   - the TERMINAL half is stabilized exactly as moq_endpoint_get_terminal()
+ *     describes: complete samples are repeated until two consecutive agree, so
+ *     a backend that latches a new terminal between the reads of one sample
+ *     cannot produce a combination it never held;
+ *   - the ENDPOINT-LOCAL half (`state`, `negotiated_version`) is captured under
+ *     the endpoint's own mutex together with a private observation generation,
+ *     which is re-checked after the terminal is classified; if any observable
+ *     local change crossed that classification the read is retried. So the two
+ *     can never straddle first establishment, and a terminal reason is never
+ *     paired with a local tuple from the other side of a change the call itself
+ *     observed;
+ *   - a non-NONE `terminal_reason` implies `state == MOQ_ENDPOINT_CLOSED` in
+ *     the SAME snapshot;
+ *   - `CLOSED` with `MOQ_ENDPOINT_TERMINAL_NONE` is valid and means the service
+ *     cannot classify the cause (a local stop before any terminal condition, or
+ *     a backend with no clean-close concept);
+ *   - `negotiated_version == 0` means absent; once nonzero it is retained
+ *     unchanged through draining and close, including unknown future values;
+ *   - MOQ_ENDPOINT_RECONNECTING is representable although v0 never enters it.
+ *
+ * A snapshot may become stale the instant after it is taken -- it is an
+ * observation, not a lock. What it may never be is internally impossible. */
+typedef struct moq_endpoint_snapshot {
+    uint32_t                       struct_size;
+    moq_endpoint_state_t           state;
+    moq_version_t                  negotiated_version; /* 0 = absent */
+    moq_endpoint_terminal_reason_t terminal_reason;
+    uint64_t                       terminal_detail_code;
+} moq_endpoint_snapshot_t;
+
+/* v0 layout size: the whole struct as first published (all fields are v0). */
+#define MOQ_ENDPOINT_SNAPSHOT_V0_SIZE \
+    (offsetof(moq_endpoint_snapshot_t, terminal_detail_code) + sizeof(uint64_t))
+
+/* Fills `*out` (sized-copy by `out_size`, stamping out->struct_size with the
+ * bytes written). Returns MOQ_OK, or MOQ_ERR_INVAL for NULL args or an
+ * out_size below MOQ_ENDPOINT_SNAPSHOT_V0_SIZE -- in which case NO caller byte
+ * is written. An oversized caller tail is left untouched. */
+MOQ_API moq_result_t moq_endpoint_get_snapshot(const moq_endpoint_t *ep,
+                                               moq_endpoint_snapshot_t *out,
                                                size_t out_size);
 
 /* Returns 0 (no moq_version_t value) until the endpoint reaches ESTABLISHED;

@@ -42,19 +42,25 @@ int main(void)
      * app_deadline_us would read cfg->app_deadline_ctx past the allocation. */
     size_t prefix = offsetof(moq_pico_wt_managed_cfg_t, app_deadline_us) +
                     sizeof(((moq_pico_wt_managed_cfg_t *)0)->app_deadline_us);
+    /* The fields are written in a FULL local config, then exactly the prefix is
+     * copied into an allocation of exactly that size: nothing here reaches past
+     * the allocation, and create() is handed a block that ends at
+     * app_deadline_us. */
+    moq_pico_wt_managed_cfg_t full;
+    memset(&full, 0, sizeof(full));
+    full.struct_size = (uint32_t)prefix;
+    full.alloc = moq_alloc_default();
+    full.perspective = MOQ_PERSPECTIVE_CLIENT;
+    full.port = 443;
+    full.host = "127.0.0.1";
+    full.insecure_skip_verify = true;      /* IP host -> "localhost" SNI, past the SNI gate */
+    full.on_pump = pump_cb;
+    full.app_deadline_us = deadline_cb;     /* a real callback, within the prefix */
+    /* app_deadline_ctx is beyond the prefix -- it is never copied. */
     unsigned char *raw = (unsigned char *)malloc(prefix);
     if (!raw) return 4;
-    memset(raw, 0, prefix);
-    moq_pico_wt_managed_cfg_t *cfg = (moq_pico_wt_managed_cfg_t *)raw;
-    cfg->struct_size = (uint32_t)prefix;
-    cfg->alloc = moq_alloc_default();
-    cfg->perspective = MOQ_PERSPECTIVE_CLIENT;
-    cfg->port = 443;
-    cfg->host = "127.0.0.1";
-    cfg->insecure_skip_verify = true;      /* IP host -> "localhost" SNI, past the SNI gate */
-    cfg->on_pump = pump_cb;
-    cfg->app_deadline_us = deadline_cb;     /* a real callback, within the prefix */
-    /* app_deadline_ctx is beyond the allocation -- intentionally not set. */
+    memcpy(raw, &full, prefix);
+    const moq_pico_wt_managed_cfg_t *cfg = (const moq_pico_wt_managed_cfg_t *)(const void *)raw;
 
     /* This config passes every earlier validation and reaches the app_deadline
      * config-import in create(). A correct whole-block gate never touches

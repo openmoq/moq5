@@ -1,0 +1,133 @@
+#!/bin/sh
+# MoQ5 Android/Kotlin bindings -- the canonical Gradle entry point.
+#
+# WHY THIS EXISTS, stated honestly: `./gradlew` cannot verify its own jar. The
+# wrapper script's first act is to execute gradle-wrapper.jar, so any check the
+# build performs on that jar runs in a JVM the jar itself already started. A
+# swapped jar with a plausible size therefore passes an in-build inspection.
+#
+# The same ordering argument applies to the DECLARATION. An earlier revision
+# verified only the three wrapper pins here and left every other pin to the
+# in-build checker -- so a renamed, duplicated or malformed pin was not rejected
+# until Gradle had already launched, evaluated settings.gradle.kts and resolved
+# the Android plugin. This launcher now runs the FULL declaration contract
+# first, through tools/lib-declaration.sh, which is the same authority the
+# in-build checker uses; a second parser here would be free to drift from it.
+#
+# Order, all before Gradle exists:
+#   1. every required pin: exact key, exactly one, non-empty, correct grammar;
+#   2. project-owned property files and the wrapper property keys, same rules;
+#   3. gradlew present and executable;
+#   4. the SHA-256 of the checked-in gradle-wrapper.jar;
+#   5. distributionUrl / distributionSha256Sum against the pins.
+#
+# Only then does it exec the ordinary wrapper, ANCHORED to the project
+# directory, so the advertised entry point behaves identically however it is
+# invoked. `./gradlew` remains checked in and usable, but it is NOT
+# self-verifying and is not the gate entry point.
+#
+# Any argument is passed through: tools/gradlew-verified check
+
+set -eu
+
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/.." && pwd)
+. "$here/lib-declaration.sh"
+
+props="$root/gradle/toolchain.properties"
+wprops="$root/gradle/wrapper/gradle-wrapper.properties"
+wjar="$root/gradle/wrapper/gradle-wrapper.jar"
+
+die() { decl_fail "$1" "$2"; exit 1; }
+
+# --- 1-3. the declaration contract, before anything is launched ------------
+if ! decl_preflight "$root" >/dev/null; then
+    printf 'FAIL[preflight]: the declaration is invalid; Gradle was not launched\n' >&2
+    exit 1
+fi
+
+# --- 4. the wrapper jar's own provenance -----------------------------------
+[ -f "$wjar" ] || die wrapper.jar "missing $wjar"
+want_jar_sha=$(props_value "$props" gradle.wrapper.jar.sha256)
+got_jar_sha=$(decl_sha256 "$wjar") || {
+    case $? in
+        2) die wrapper.jarSha256 "no sha256sum or shasum available to verify $wjar" ;;
+        *) die wrapper.jarSha256 "could not compute a SHA-256 for $wjar" ;;
+    esac
+}
+[ "$got_jar_sha" = "$want_jar_sha" ] \
+    || die wrapper.jarSha256 "gradle-wrapper.jar hashes $got_jar_sha, declared $want_jar_sha"
+
+# --- 5. the distribution the wrapper will fetch ----------------------------
+want_dist_url=$(props_value "$props" gradle.distribution.url)
+got_dist_url=$(props_value "$wprops" distributionUrl)
+[ "$got_dist_url" = "$want_dist_url" ] \
+    || die wrapper.distributionUrl "wrapper points at '$got_dist_url', declared '$want_dist_url'"
+
+want_dist_sha=$(props_value "$props" gradle.distribution.sha256)
+got_dist_sha=$(props_value "$wprops" distributionSha256Sum)
+[ "$got_dist_sha" = "$want_dist_sha" ] \
+    || die wrapper.distributionSha256 "wrapper declares '$got_dist_sha', declared '$want_dist_sha'"
+
+printf 'PASS[preflight.declaration]: every required pin is exactly-once and well formed\n'
+printf 'PASS[wrapper.jarSha256]: %s\n' "$got_jar_sha"
+printf 'PASS[wrapper.distribution]: %s\n' "$got_dist_url"
+
+# An opaque per-invocation token. Time alone collides between two launchers
+# started in the same second, so the pid and a random component are included.
+_moq5_mint_token() {
+    _t=$(date -u +%Y%m%dT%H%M%SZ) || return 1
+    _r=$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || _r=""
+    [ -n "$_r" ] || _r=$$
+    printf '%s-%s-%s' "$_t" "$$" "$_r"
+}
+
+# Anchor to the project directory: the canonical entry point must not operate on
+# whatever directory the caller happened to be in.
+cd "$root"
+
+# THIS INVOCATION's output is teed to a file that belongs to THIS INVOCATION.
+#
+# A forked test JVM writes its -Xcheck:jni diagnostics to its own stderr: they
+# reach Gradle's console but never the JUnit XML, an `onOutput` listener, or
+# -XX:+LogVMOutput. Teeing here is what gives an in-build gate something to read,
+# and because the tee streams, the forks' output is already in the file when the
+# post-test gate runs.
+#
+# A FIXED path was not enough. With one, a launcher that failed before Gradle
+# scheduled any test still truncated and rewrote the log, while stale JUnit XML
+# from an earlier run remained -- and the gate called that combination a clean
+# run. A later direct `./gradlew` invocation could likewise consume the previous
+# invocation's clean log, and two concurrent launchers shared one file
+# (chats/libmoq/1226 F1).
+#
+# So every invocation mints an opaque token, writes into a directory named by it,
+# and stamps the token as the log's first line. The gate requires the launcher's
+# token, the log's token and the token the JNI producer stamped into its own
+# result boundary to be the same string. There is no fallback path: a Gradle run
+# with no launcher identity has no log to read and fails closed.
+_token=$(_moq5_mint_token) || { echo "gradlew-verified: cannot mint a run token" >&2; exit 2; }
+_run_dir="$root/build/jni-runs/$_token"
+_run_log="$_run_dir/gradle-run.log"
+_status="$_run_dir/status"
+mkdir -p "$_run_dir" || { echo "gradlew-verified: cannot create $_run_dir" >&2; exit 2; }
+printf 'moq5-run-token: %s\n' "$_token" > "$_run_log"
+printf 'PASS[run.identity]: this invocation is %s\n' "$_token"
+
+# The run scratch is this invocation's alone and is removed on exit. The exit
+# status is captured BEFORE the cleanup so a failed gate is never hidden by it.
+# shellcheck disable=SC2329  # invoked from the traps below
+_cleanup() { rm -rf -- "$_run_dir"; }
+trap '_cleanup' EXIT
+trap '_cleanup; exit 130' HUP INT TERM
+
+MOQ5_RUN_TOKEN=$_token
+MOQ5_RUN_LOG=$_run_log
+export MOQ5_RUN_TOKEN MOQ5_RUN_LOG
+
+# The status is written by the subshell and read after the pipeline, so a
+# non-zero Gradle exit survives the tee rather than being replaced by tee's own.
+{ "$root/gradlew" "$@" 2>&1; echo $? > "$_status"; } | tee -a "$_run_log"
+_rc=$(cat "$_status" 2>/dev/null) || _rc=1
+[ -n "$_rc" ] || _rc=1
+exit "$_rc"

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug builds only: applies the debug Network Security Config below, so a
+  debug build trusts a locally created CA that the developer has installed as
+  a user CA on a dedicated emulator (see the sample's README). Release builds
+  merge no such attribute and carry no such file.
+
+  The attribute exists from API 24. Below it the platform has no Network
+  Security Config at all, and the live path is refused there anyway: its audio
+  clock needs AudioRecord.getTimestamp, which is API 24.
+-->
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <application
+        android:networkSecurityConfig="@xml/network_security_config"
+        tools:targetApi="24" />
+
+</manifest>

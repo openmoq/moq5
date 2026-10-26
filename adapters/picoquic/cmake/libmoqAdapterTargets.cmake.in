@@ -7,16 +7,31 @@ get_filename_component(_ADAPTER_PREFIX "${_ADAPTER_PREFIX}" PATH)
 if(NOT TARGET moq::adapter-picoquic)
   # picoquic-core and picoquic-log are mutually dependent static archives
   # (core -> picoquic_set_qlog in log; log -> picoquic_frame_name etc. in
-  # core). A single-pass linker (GNU ld) must scan them as a group for both
-  # directions to resolve. CMake auto-repeats archives only for real targets
-  # in a build graph, not these imported ones, so libmoq's exported interface
-  # encodes the group explicitly. macOS ld64 and other multi-pass linkers take
-  # the plain list. Evaluated at consumer configure time (CMAKE_SYSTEM_NAME is
-  # the consumer's platform).
+  # core), and only log -> core is declared. The interface lists the pair; a
+  # single-pass linker (GNU ld) also gets both archives again as a group of
+  # file paths, which CMake keeps in place where a group of targets would be
+  # reordered and emptied. macOS ld64 and other multi-pass linkers take the
+  # plain pair. Evaluated at consumer configure time (CMAKE_SYSTEM_NAME is the
+  # consumer's platform); see cmake/MoqPicoquicLink.cmake in the source tree.
   set(_libmoq_pq_link "@_adapter_pq_target@@_adapter_pq_log@")
   if(@_adapter_pq_grouped@ AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(_libmoq_pq_link
-      "-Wl,--start-group;@_adapter_pq_target@@_adapter_pq_log@;-Wl,--end-group")
+    get_target_property(_libmoq_pq_core_type picoquic::picoquic-core TYPE)
+    get_target_property(_libmoq_pq_log_type picoquic::picoquic-log TYPE)
+    if(_libmoq_pq_core_type STREQUAL "STATIC_LIBRARY"
+       AND _libmoq_pq_log_type STREQUAL "STATIC_LIBRARY")
+      # "$" is kept apart from "<TARGET_FILE:" so the generator expression
+      # reaches the consumer's link interface instead of being evaluated when
+      # this file itself is generated.
+      set(_libmoq_d "$")
+      list(APPEND _libmoq_pq_link
+        "-Wl,--start-group"
+        "${_libmoq_d}<TARGET_FILE:picoquic::picoquic-core>"
+        "${_libmoq_d}<TARGET_FILE:picoquic::picoquic-log>"
+        "-Wl,--end-group")
+      unset(_libmoq_d)
+    endif()
+    unset(_libmoq_pq_core_type)
+    unset(_libmoq_pq_log_type)
   endif()
   add_library(moq::adapter-picoquic @_adapter_lib_type@ IMPORTED)
   set_target_properties(moq::adapter-picoquic PROPERTIES

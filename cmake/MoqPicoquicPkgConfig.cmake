@@ -16,8 +16,10 @@ function(moq_picoquic_pkgconfig_libs out_var)
     endif()
 
     set(_has_openssl OFF)
-    if((DEFINED WITH_OPENSSL AND WITH_OPENSSL) OR
-       MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL)
+    # The normalized provider record, not the raw variable: after ingestion it
+    # is the single authority, and an unavailable fact has already been
+    # rejected rather than silently read as false here.
+    if(MOQ_PARENT_WITH_OPENSSL OR MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL)
         set(_has_openssl ON)
     endif()
     if(_has_openssl)
@@ -25,7 +27,7 @@ function(moq_picoquic_pkgconfig_libs out_var)
     endif()
     string(APPEND _libs " -lpicotls-core -lpicotls-minicrypto")
 
-    if(DEFINED WITH_MBEDTLS AND WITH_MBEDTLS)
+    if(MOQ_PARENT_WITH_MBEDTLS)
         set(_mbed_dirs "")
         foreach(_mbed_var MBEDTLS_LIBRARY MBEDTLS_X509 MBEDTLS_CRYPTO)
             if(DEFINED ${_mbed_var} AND NOT "${${_mbed_var}}" STREQUAL "")

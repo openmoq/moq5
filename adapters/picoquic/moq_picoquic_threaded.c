@@ -21,7 +21,7 @@
 
 #include "../common/moq_alpn.h"
 #include "../common/moq_pq_stream_backlog.h"
-#include "picoquic_endpoint.h"   /* moq_pq_send_stats_t + per-conn getter */
+#include "picoquic_spi.h"   /* moq_pq_send_stats_t + the private adapter SPI */
 
 #include <errno.h>
 #include <time.h>

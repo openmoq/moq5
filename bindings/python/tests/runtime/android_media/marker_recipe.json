@@ -1,0 +1,22 @@
+{
+ "schema": "moq5-android-media-recipe-v1",
+ "source": {"filter": "testsrc", "width": 320, "height": 240, "rate": 24, "frames": 60},
+ "encoder": ["-c:v", "libx264", "-profile:v", "baseline", "-level:v", "3.0", "-pix_fmt", "yuv420p", "-bf", "0",
+             "-g", "24", "-keyint_min", "24", "-sc_threshold", "0", "-threads", "1",
+             "-bsf:v", "h264_metadata=aud=insert", "-bitexact", "-f", "h264"],
+ "expected_idr": [0, 24, 48],
+ "pts_us_step": 41666,
+ "marker": {
+  "cell": 40,
+  "bit_cells": [0, 1, 2, 3, 4, 5],
+  "rows": [
+   {"name": "data", "y": 20, "sync": {"6": "white", "7": "black"}},
+   {"name": "complement", "y": 80, "sync": {"6": "black", "7": "white"}}
+  ],
+  "bit_order": "cell k carries bit k (value 2^k) of the frame number; the complement row carries its inverse",
+  "threshold": 128,
+  "margin": 64
+ },
+ "verify_scales": ["64x36", "96x54", "160x90", "64x48"],
+ "verify_scalers": ["bilinear", "area", "bicubic", "neighbor"]
+}

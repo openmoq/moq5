@@ -45,6 +45,7 @@
  */
 
 #include "endpoint_internal.h"
+#include "endpoint_trust.h"
 
 #include "../../adapters/common/moq_alpn.h"
 
@@ -377,7 +378,16 @@ typedef struct ep_backend_vtable {
     moq_result_t  (*stop)(void *facade);
     void          (*destroy)(void *facade);
     /* Classify the facade's terminal reason + native detail code. NULL is
-     * treated as "generic" (NONE/PROTOCOL/TRANSPORT/CLEAN only). */
+     * treated as "generic" (NONE/PROTOCOL/TRANSPORT/CLEAN only).
+     *
+     * CONTRACT: this is OBSERVATION-ONLY and SAFE TO REPEAT. The central
+     * classifier calls it several times in a row -- it composes separately
+     * locked facade accessors, so one reading can straddle a backend's latch --
+     * and requires the answer to be EVENTUALLY STABLE: once the facade's
+     * terminal transition has settled, every later call must return the same
+     * (reason, detail). An implementation must therefore not mutate facade
+     * state, must not consume anything, and must not depend on being called
+     * exactly once. */
     void          (*terminal)(void *facade,
                               moq_endpoint_terminal_reason_t *reason,
                               uint64_t *detail);
@@ -400,6 +410,11 @@ struct moq_endpoint {
     char *ca_file; size_t ca_file_len; /* NULL = backend default roots if available */
     bool  insecure;
     uint64_t handshake_timeout_us;     /* 0 = backend default; picoquic only */
+    /* The library-owned trust delegate, valid for the endpoint's lifetime.
+     * NULL selects the ordinary path-verifier route. Not reachable from any
+     * installed header: an application cannot supply one. */
+    moq_endpoint_trust_fn trust_fn;
+    void                 *trust_ctx;
 
     /* The version offer as transport tokens, preference order. The ALPN
      * entries point at the static strings in moq_alpn.h (no ownership);
@@ -411,6 +426,23 @@ struct moq_endpoint {
     /* Selected backend: an opaque managed-facade handle + its vtable. Set by
      * the backend create-fn in connect(); NULL until then / after destroy. */
     void                      *facade;
+    /* Advances under ep->mu whenever the OBSERVABLE tuple
+     * (stopped, pump_state, negotiated) changes value. Private: it is never
+     * exposed, never part of the ABI, and never exported. */
+    uint64_t observe_gen;
+#if defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
+    void (*test_interpose)(void *);
+    void  *test_interpose_ctx;
+    int    test_interpose_at;
+    unsigned test_interpose_fires;
+    /* Connect-time observers, taken from the one-shot arming slot when this
+     * endpoint is allocated (moq_endpoint_test_arm_next_connect). */
+    void (*test_after_facade_create)(void *);
+    void (*test_first_established)(void *, moq_endpoint_state_t,
+                                   moq_version_t, moq_version_t, bool);
+    void  *test_connect_ctx;
+    bool   test_established_seen;
+#endif
     const ep_backend_vtable_t *vt;
 
     /* Internal pump hooks (one slot per kind; see endpoint_internal.h).
@@ -514,7 +546,6 @@ static void ep_drain_posted(moq_endpoint_t *ep, moq_session_t *session,
     defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) || \
     defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
-static moq_version_t ep_facade_negotiated_version(const moq_endpoint_t *ep);
 /*
  * One pump cycle, on the facade's managed execution context: drain accepted post()
  * tasks FIFO (calling moq_session_* is legal here), then refresh the cached
@@ -546,11 +577,42 @@ static void ep_pump_cycle(moq_endpoint_t *ep, moq_session_t *session,
         }
     }
     pthread_mutex_lock(&ep->mu);
+    /* A same-value refresh is not an observable change, so it must not advance
+     * the observation generation -- otherwise an ordinary idle pump would make
+     * every concurrent snapshot retry forever. */
+    if (ep->pump_state != st)
+        ep->observe_gen++;
     ep->pump_state = st;
     if (st == MOQ_ENDPOINT_CLOSED)
         atomic_store(&ep->closed, true);   /* mirror for ep->mu-free readers */
-    if (st == MOQ_ENDPOINT_ESTABLISHED && ep->negotiated == 0)
-        ep->negotiated = ep_facade_negotiated_version(ep);
+    if (st == MOQ_ENDPOINT_ESTABLISHED && ep->negotiated == 0) {
+        /* The version comes from the ESTABLISHED session itself: the wire
+         * profile it was created with, fixed for its lifetime. The facade
+         * handle is not consulted -- a managed facade can pump its first
+         * ESTABLISHED cycle before connect() has published it, and a version
+         * read through it there would be 0 beside an ESTABLISHED state.
+         *
+         * This advance is DEFENSIVE and redundant: the version latches in the
+         * same critical section as the ESTABLISHED transition, whose own
+         * advance already covers it. It is kept because the generation's rule
+         * is "advance on any observable tuple change", and a rule with an
+         * exception is a rule waiting to be got wrong. */
+        moq_version_t nv = moq_session_version(session);
+        if (nv != ep->negotiated)
+            ep->observe_gen++;
+        ep->negotiated = nv;
+    }
+#if defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
+    /* The first settled ESTABLISHED cycle, reported as copied values while
+     * ep->mu is held: the observer must not call back into the endpoint. */
+    if (st == MOQ_ENDPOINT_ESTABLISHED && !ep->test_established_seen) {
+        ep->test_established_seen = true;
+        if (ep->test_first_established)
+            ep->test_first_established(ep->test_connect_ctx, st, ep->negotiated,
+                                       moq_session_version(session),
+                                       ep->facade != NULL);
+    }
+#endif
     /* Attached-service hooks run under mu (detach is race-free); the hook
      * contract in endpoint_internal.h forbids re-entering public endpoint
      * APIs from inside. */
@@ -700,12 +762,33 @@ static int ep_wtquic_msquic_pump(moq_wtquic_msquic_managed_t *m,
  * against ep->ca_file, or the backend default roots when available. The
  * facades' built-in default accepts the peer cert, which is NOT
  * production-safe -- making the safe path the default is this tier's job. */
+/* Translate the service verdict at the ONE boundary where the tiers meet.
+ * Only ACCEPT maps to TRUST; REJECT and any unrecognised value fail closed. */
+static moq_picoquic_cert_verdict_t ep_trust_bridge(
+    void *ctx, moq_bytes_t server_name,
+    const moq_bytes_t *certificates, size_t certificate_count)
+{
+    moq_endpoint_t *ep = (moq_endpoint_t *)ctx;
+    if (ep == NULL || ep->trust_fn == NULL) return MOQ_PICOQUIC_CERT_REJECT;
+    moq_endpoint_trust_verdict_t v =
+        ep->trust_fn(ep->trust_ctx, server_name, certificates,
+                     certificate_count);
+    return (v == MOQ_ENDPOINT_TRUST_ACCEPT) ? MOQ_PICOQUIC_CERT_TRUST
+                                            : MOQ_PICOQUIC_CERT_REJECT;
+}
+
 static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
 {
     moq_endpoint_t *ep = (moq_endpoint_t *)ctx;
     if (ep->handshake_timeout_us > 0)
         picoquic_set_default_handshake_timeout(quic, ep->handshake_timeout_us);
     if (ep->insecure) return 0;
+    /* A delegate selects the callback setter and NEVER falls back to the path
+     * setter: falling back would silently verify against a policy the caller
+     * did not ask for. Its incompatibility with ca_file/insecure was already
+     * rejected before this endpoint existed. */
+    if (ep->trust_fn != NULL)
+        return moq_picoquic_set_cert_verify_callback(quic, ep_trust_bridge, ep);
     return moq_picoquic_set_cert_verifier(quic, ep->ca_file);
 }
 #endif
@@ -715,11 +798,9 @@ static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
  * generic form (mvfst/proxygen) knows only PROTOCOL vs generic transport; the
  * picoquic form additionally reads picoquic's captured local error to tell a
  * TLS/certificate failure apart from a plain transport failure. */
-#if defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
+/* The generic classification the backend vtable documents for a NULL `terminal`
+ * slot. Compiled unconditionally: it is the fallback arm of the single-source
+ * classifier below, which every build has. */
 static void ep_classify_generic(bool is_fatal, uint64_t fatal_code,
                                 bool clean_closed,
                                 moq_endpoint_terminal_reason_t *reason,
@@ -735,7 +816,6 @@ static void ep_classify_generic(bool is_fatal, uint64_t fatal_code,
         *reason = MOQ_ENDPOINT_TERMINAL_NONE; *detail = 0;
     }
 }
-#endif
 
 #if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
     defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
@@ -1042,21 +1122,6 @@ void moq_endpoint_wake(moq_endpoint_t *ep)
     ep_facade_wake(ep);
 }
 
-#if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
-    defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) || \
-    defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
-static moq_version_t ep_facade_negotiated_version(const moq_endpoint_t *ep)
-{
-    if (ep->vt && ep->facade) return ep->vt->negotiated_version(ep->facade);
-    return (moq_version_t)0;
-}
-#endif /* any facade (or the bare-endpoint test seam) */
-
 static bool ep_facade_is_fatal(const moq_endpoint_t *ep)
 {
     return (ep->vt && ep->facade) ? ep->vt->is_fatal(ep->facade) : false;
@@ -1188,6 +1253,12 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
     moq_pq_threaded_t *fac = NULL;
     moq_result_t crc = moq_pq_threaded_create(&fc, &fac);
     if (crc < 0) return crc;
+#if defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
+    /* The facade's network thread is already running; ep->facade and ep->vt
+     * are not yet published. */
+    if (ep->test_after_facade_create)
+        ep->test_after_facade_create(ep->test_connect_ctx);
+#endif
     ep->facade = fac;
     ep->vt = &PQ_VT;
     return MOQ_OK;
@@ -1222,6 +1293,12 @@ static moq_result_t ep_create_wt(moq_endpoint_t *ep,
     moq_pico_wt_managed_t *fac = NULL;
     moq_result_t crc = moq_pico_wt_managed_create(&fc, &fac);
     if (crc < 0) return crc;
+#if defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
+    /* As for the raw-QUIC facade: its network thread is running and the
+     * facade is not yet published. */
+    if (ep->test_after_facade_create)
+        ep->test_after_facade_create(ep->test_connect_ctx);
+#endif
     ep->facade = fac;
     ep->vt = &WT_VT;
     return MOQ_OK;
@@ -1603,15 +1680,137 @@ void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg)
     moq_endpoint_cfg_init_sized(cfg, MOQ_ENDPOINT_CFG_V0_SIZE);
 }
 
-moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
-                                  moq_endpoint_t **out)
+/*
+ * The ONE connect implementation. `moq_endpoint_connect()` is this with
+ * `fn == NULL`, so there is no second lifecycle to drift and the public path
+ * stays observably identical at every accepted `struct_size`.
+ */
+#if defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
+/* The one-shot connect arming slot, test builds only. An endpoint does not
+ * exist until connect() allocates it, so observers for its create window are
+ * armed here and moved onto the next endpoint allocated; the slot is empty
+ * again as soon as that happens. */
+static pthread_mutex_t ep_test_slot_mu = PTHREAD_MUTEX_INITIALIZER;
+static bool   ep_test_slot_armed;
+static void (*ep_test_slot_after_create)(void *);
+static void (*ep_test_slot_first_established)(void *, moq_endpoint_state_t,
+                                              moq_version_t, moq_version_t, bool);
+static void  *ep_test_slot_ctx;
+
+#if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || \
+    defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_MVFST_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
+/* Moves an armed slot onto a freshly allocated endpoint. Only a build with a
+ * managed facade allocates one: without a facade, connect() returns
+ * MOQ_ERR_UNSUPPORTED first and leaves any arming in the slot. */
+static void ep_test_take_connect_hooks(moq_endpoint_t *ep)
+{
+    pthread_mutex_lock(&ep_test_slot_mu);
+    if (ep_test_slot_armed) {
+        ep->test_after_facade_create = ep_test_slot_after_create;
+        ep->test_first_established = ep_test_slot_first_established;
+        ep->test_connect_ctx = ep_test_slot_ctx;
+        ep_test_slot_armed = false;
+        ep_test_slot_after_create = NULL;
+        ep_test_slot_first_established = NULL;
+        ep_test_slot_ctx = NULL;
+    }
+    pthread_mutex_unlock(&ep_test_slot_mu);
+}
+#endif /* any managed facade */
+
+/* Arm observers for the NEXT endpoint connect() allocates. after_create runs on
+ * the connecting thread once a picoquic-threaded or pico_wt managed facade
+ * exists and before the endpoint publishes it; first_established runs on the network thread, under
+ * ep->mu, at the first pump cycle that settles ESTABLISHED. Refused while a
+ * previous arming is still unconsumed. */
+moq_result_t moq_endpoint_test_arm_next_connect(
+    void (*after_create)(void *),
+    void (*first_established)(void *, moq_endpoint_state_t, moq_version_t,
+                              moq_version_t, bool),
+    void *ctx)
+{
+    pthread_mutex_lock(&ep_test_slot_mu);
+    if (ep_test_slot_armed) {
+        pthread_mutex_unlock(&ep_test_slot_mu);
+        return MOQ_ERR_WRONG_STATE;
+    }
+    ep_test_slot_armed = true;
+    ep_test_slot_after_create = after_create;
+    ep_test_slot_first_established = first_established;
+    ep_test_slot_ctx = ctx;
+    pthread_mutex_unlock(&ep_test_slot_mu);
+    return MOQ_OK;
+}
+
+/* Whether an arming is still waiting for an endpoint. */
+bool moq_endpoint_test_connect_armed(void)
+{
+    pthread_mutex_lock(&ep_test_slot_mu);
+    bool armed = ep_test_slot_armed;
+    pthread_mutex_unlock(&ep_test_slot_mu);
+    return armed;
+}
+
+/* Clear an unconsumed arming, for a fixture's failure path. */
+void moq_endpoint_test_disarm_next_connect(void)
+{
+    pthread_mutex_lock(&ep_test_slot_mu);
+    ep_test_slot_armed = false;
+    ep_test_slot_after_create = NULL;
+    ep_test_slot_first_established = NULL;
+    ep_test_slot_ctx = NULL;
+    pthread_mutex_unlock(&ep_test_slot_mu);
+}
+#endif
+
+moq_result_t moq_endpoint_connect_with_trust(const moq_endpoint_cfg_t *cfg,
+                                             moq_endpoint_trust_fn fn,
+                                             void *ctx,
+                                             moq_endpoint_t **out)
 {
     if (!cfg || !out) return MOQ_ERR_INVAL;
     *out = NULL;
 
+    /* The frozen v0 floor is validated BEFORE any config field other than
+     * struct_size is read. A caller that supplies a shorter object must be
+     * refused, not read out of bounds: the trust fields below live inside the
+     * v0 prefix, so a short object does not contain them. */
+    if (cfg->struct_size < MOQ_ENDPOINT_CFG_V0_SIZE) return MOQ_ERR_INVAL;
+
+    /* Conflict checks come first, before allocation and any TLS activity: a
+     * delegate together with insecure_skip_verify or an explicit CA file is two
+     * trust sources for one connection, and neither silently wins. */
+    if (fn != NULL) {
+        if (cfg->insecure_skip_verify) return MOQ_ERR_INVAL;
+        if (cfg->ca_file.len > 0)      return MOQ_ERR_INVAL;
+    }
+
     moq_endpoint_resolved_t r;
     moq_result_t rc = moq_endpoint_resolve_cfg(cfg, &r);
     if (rc < 0) return rc;
+
+    /* Resolution is a prerequisite to the delegate decision, because only the
+     * SELECTED backend can honour one. Every non-picoquic create path ignores
+     * the delegate entirely, so accepting it there would silently verify with
+     * that backend's own TLS policy -- the delegate would be requested and not
+     * applied. That is refused here, before allocation, facade creation and
+     * either verifier setter. */
+    if (fn != NULL) {
+        if (r.backend != MOQ_TRANSPORT_BACKEND_PICOQUIC)
+            return MOQ_ERR_UNSUPPORTED;
+#if defined(MOQ_SERVICE_HAVE_PQ_THREADED) || defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
+        /* ... and the picoquic provider must actually be able to apply it. */
+        if (!moq_picoquic_cert_verify_callback_supported())
+            return MOQ_ERR_UNSUPPORTED;
+#else
+        return MOQ_ERR_UNSUPPORTED;   /* no picoquic facade in this build */
+#endif
+    }
 
 
 #if !defined(MOQ_SERVICE_HAVE_PQ_THREADED) && \
@@ -1621,6 +1820,9 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     !defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) && \
     !defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) && \
     !defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
+    /* No facade exists to carry a delegate, so `ctx` is never stored in this
+     * configuration; the delegate itself was already refused above. */
+    (void)ctx;
     return MOQ_ERR_UNSUPPORTED;   /* no managed facade in this build */
 #else
     if (r.protocol == MOQ_TRANSPORT_PROTOCOL_RAW_QUIC) {
@@ -1652,6 +1854,9 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     atomic_init(&ep->closed, false);
     pthread_mutex_init(&ep->mu, NULL);
     ep->pump_state = MOQ_ENDPOINT_CONNECTING;
+#if defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
+    ep_test_take_connect_hooks(ep);
+#endif
 
     ep->host = ep_strdup_bytes(alloc, r.url.host, &ep->host_len);
     ep->sni  = ep_strdup_bytes(alloc, r.sni, &ep->sni_len);
@@ -1725,6 +1930,12 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     }
 #endif
 
+    /* The delegate is stored before any create runs, so the configure hook the
+     * facade invokes already sees it. It stays valid for the endpoint's
+     * lifetime; `ctx` is caller-owned and is not copied. */
+    ep->trust_fn = fn;
+    ep->trust_ctx = ctx;
+
     /* Select the backend for the resolved (protocol, backend) and let its
      * create-fn build the facade. The resolver already rejected any backend
      * with no compiled-in row, so a miss here is unreachable. */
@@ -1746,6 +1957,14 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     *out = ep;
     return MOQ_OK;
 #endif /* any facade available */
+}
+
+/* The public entry: exactly the implementation above with no delegate, so its
+ * observable behaviour is unchanged for every accepted `struct_size`. */
+moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
+                                  moq_endpoint_t **out)
+{
+    return moq_endpoint_connect_with_trust(cfg, NULL, NULL, out);
 }
 
 /* -- Lifecycle ---------------------------------------------------------- */
@@ -1795,6 +2014,27 @@ uint64_t moq_endpoint_app_deadline_us(void *ctx)
     }
     pthread_mutex_unlock(&ep->mu);
     return d;
+}
+
+/* Aggregate attached-service drain status. Same lock discipline as
+ * moq_endpoint_app_deadline_us: ep->mu, then each hook's own lock inside its
+ * pure cached read, and ep->mu is never held across a backend/facade call or a
+ * wait. FAILED wins over PENDING, which wins over IDLE. */
+moq_endpoint_send_drain_status_t
+moq_endpoint_hooks_send_drain_status(moq_endpoint_t *ep)
+{
+    if (!ep) return MOQ_EP_SEND_DRAIN_IDLE;
+    moq_endpoint_send_drain_status_t agg = MOQ_EP_SEND_DRAIN_IDLE;
+    pthread_mutex_lock(&ep->mu);
+    for (int k = 0; k < MOQ_ENDPOINT_HOOK_KIND_COUNT; k++) {
+        if (!ep->hook_ops[k].pump || !ep->hook_ops[k].send_drain_status)
+            continue;
+        moq_endpoint_send_drain_status_t st =
+            ep->hook_ops[k].send_drain_status(ep->hook_ctx[k]);
+        if (st > agg) agg = st;          /* FAILED > PENDING > IDLE */
+    }
+    pthread_mutex_unlock(&ep->mu);
+    return agg;
 }
 
 bool moq_endpoint_interrupted_internal(const moq_endpoint_t *ep)
@@ -1857,6 +2097,8 @@ moq_result_t moq_endpoint_stop(moq_endpoint_t *ep)
     if (rc == MOQ_ERR_WRONG_STATE) return rc;         /* called from on_pump */
 
     pthread_mutex_lock(&ep->mu);
+    if (!ep->stopped)
+        ep->observe_gen++;
     ep->stopped = true;
     atomic_store(&ep->closed, true);   /* mirror for ep->mu-free readers */
     pthread_mutex_unlock(&ep->mu);
@@ -1880,6 +2122,8 @@ void moq_endpoint_destroy(moq_endpoint_t *ep)
         assert(!"moq_endpoint_destroy called before moq_endpoint_stop");
         (void)ep_facade_stop(ep);
         pthread_mutex_lock(&ep->mu);
+        if (!ep->stopped)
+            ep->observe_gen++;
         ep->stopped = true;
         atomic_store(&ep->closed, true);   /* mirror for ep->mu-free readers */
         pthread_mutex_unlock(&ep->mu);
@@ -1930,9 +2174,11 @@ moq_result_t moq_endpoint_drain(moq_endpoint_t *ep, uint64_t timeout_us)
      * probe. */
     if (atomic_load(&ep->interrupted)) return MOQ_ERR_INTERRUPTED;
 
-    /* App-thread only, and only backends that can actually prove drain. The
-     * managed context drives the flush, so calling this from a hook would
-     * deadlock the very progress it waits on. */
+    /* PREFLIGHT, once, before the loop: one backend drain_state call purely to
+     * classify capability and thread. App-thread only, and only backends that
+     * can actually prove drain -- the managed context drives the flush, so
+     * calling this from a hook would deadlock the very progress it waits on.
+     * The value is not used as a flush answer here; the loop below re-asks. */
     int ds = ep_facade_drain_state(ep);
     if (ds == EP_DRAIN_UNSUPPORTED)  return MOQ_ERR_UNSUPPORTED;
     if (ds == EP_DRAIN_WRONG_THREAD) return MOQ_ERR_WRONG_STATE;
@@ -1947,9 +2193,59 @@ moq_result_t moq_endpoint_drain(moq_endpoint_t *ep, uint64_t timeout_us)
          * stale) backlog snapshot now reads empty. */
         if (moq_endpoint_is_closed(ep)) return MOQ_ERR_CLOSED;
 
+        /* (1) Attached-service output first WITHIN THIS ITERATION: while any
+         * hook still owes work, this iteration does not go on to take a
+         * transport progress snapshot. (The one preflight call above already
+         * happened, for capability/thread only -- so it is not true that the
+         * transport is never consulted before the hooks, and the hook query is
+         * not literally the first backend call.) An attached hook can hold
+         * work its application already handed it that has not reached the core
+         * yet; a transport snapshot taken then describes an idle wire that
+         * says nothing about the flush the caller asked for. The backend's own
+         * cycle runs the hook and then services the session, so once no hook
+         * reports pending, the work has entered the core and the transport
+         * probe becomes the meaningful question. This query alone never proves
+         * transport handoff -- that remains the backend's answer.
+         *
+         * Order per progress iteration: attachment status, then the transport
+         * progress snapshot, then the final attachment recheck below. */
+        moq_endpoint_send_drain_status_t hst =
+            moq_endpoint_hooks_send_drain_status(ep);
+        /* An attachment that terminalized holding accepted output can never
+         * hand it over, and its endpoint may still be established and
+         * transport-idle. Reporting success there would promise a flush that
+         * never happened. */
+        if (hst == MOQ_EP_SEND_DRAIN_FAILED) return MOQ_ERR_CLOSED;
+        if (hst == MOQ_EP_SEND_DRAIN_PENDING) {
+            uint64_t hel = ep_mono_now_us() - start;
+            if (hel >= timeout_us) return MOQ_DONE;
+            uint64_t hrem = timeout_us - hel;
+            uint64_t hslice = hrem < EP_DRAIN_POLL_SLICE_US
+                            ? hrem : EP_DRAIN_POLL_SLICE_US;
+            ep_facade_wake(ep);
+            moq_result_t hwr = moq_endpoint_wait(ep, hslice);
+            if (hwr == MOQ_ERR_INTERRUPTED) return MOQ_ERR_INTERRUPTED;
+            continue;
+        }
+
+        /* (2) the backend's own local-transport answer. */
         ds = ep_facade_drain_state(ep);
         if (ds == EP_DRAIN_WRONG_THREAD) return MOQ_ERR_WRONG_STATE;
-        if (ds == EP_DRAIN_DONE) return MOQ_OK;
+        if (ds == EP_DRAIN_DONE) {
+            /* (3) Final recheck. Steps (1) and (2) read two separate
+             * snapshots, and the managed context runs between them: it can
+             * accept new hook work, or terminalize while holding work, after
+             * step (1) answered IDLE. Re-reading the aggregate here re-tests
+             * the hook answer against the same instant the transport was
+             * observed idle, so success is not returned on a stale snapshot.
+             * This is a defensive recheck of THAT window only -- it is not a
+             * synchronization guarantee about an application still writing
+             * concurrently, which the caller is required to have quiesced. */
+            moq_endpoint_send_drain_status_t fst =
+                moq_endpoint_hooks_send_drain_status(ep);
+            if (fst == MOQ_EP_SEND_DRAIN_FAILED) return MOQ_ERR_CLOSED;
+            if (fst == MOQ_EP_SEND_DRAIN_IDLE) return MOQ_OK;
+        }
 
         uint64_t elapsed = ep_mono_now_us() - start;
         if (elapsed >= timeout_us) return MOQ_DONE;
@@ -1968,6 +2264,39 @@ moq_result_t moq_endpoint_drain(moq_endpoint_t *ep, uint64_t timeout_us)
 }
 
 /* -- State -------------------------------------------------------------- */
+
+/* A per-endpoint, one-shot interposition point, test builds only.
+ *
+ * It lets a test drive a real transition at an exact position INSIDE an
+ * observation accessor, which is what makes a composed implementation tear
+ * behaviourally rather than being judged by its shape. Caller-owned function
+ * pointer, stored on the endpoint (never a global), fired at most once, and
+ * absent from every shipped build. */
+#if defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
+static void ep_test_fire_interpose(const moq_endpoint_t *ep, int at)
+{
+    moq_endpoint_t *mep = (moq_endpoint_t *)ep;
+    /* Take and clear the one-shot UNDER ep->mu, so arming and firing cannot
+     * race. The callback is then invoked with the mutex RELEASED: it drives
+     * real endpoint work and may take ep->mu itself, and caller code must
+     * never run under this lock. */
+    pthread_mutex_lock(&mep->mu);
+    void (*fn)(void *) = NULL;
+    void *ctx = NULL;
+    if (mep->test_interpose && mep->test_interpose_at == at) {
+        fn = mep->test_interpose;
+        ctx = mep->test_interpose_ctx;
+        mep->test_interpose = NULL;
+        mep->test_interpose_ctx = NULL;
+        mep->test_interpose_fires++;
+    }
+    pthread_mutex_unlock(&mep->mu);
+    if (fn) fn(ctx);
+}
+#define EP_TEST_INTERPOSE(ep, at) ep_test_fire_interpose((ep), (at))
+#else
+#define EP_TEST_INTERPOSE(ep, at) ((void)0)
+#endif
 
 moq_endpoint_state_t moq_endpoint_state(const moq_endpoint_t *ep)
 {
@@ -2001,6 +2330,70 @@ uint64_t moq_endpoint_fatal_code(const moq_endpoint_t *ep)
     return ep_facade_fatal_code(ep);
 }
 
+/* The SINGLE source of terminal classification.
+ *
+ * Both moq_endpoint_get_terminal() and moq_endpoint_get_snapshot() answer from
+ * here, so the legacy accessor and the snapshot cannot disagree. It honours the
+ * vtable contract that a NULL `terminal` slot receives GENERIC classification
+ * from the facade's fatal/code/clean inputs -- previously the slot was simply
+ * skipped and every such backend reported NONE forever.
+ *
+ * Never called with ep->mu held: a facade terminal function may take a
+ * facade-internal lock, and the endpoint must not impose a lock order on it. */
+static void ep_terminal_sample(const moq_endpoint_t *ep,
+                               moq_endpoint_terminal_reason_t *reason,
+                               uint64_t *detail)
+{
+    *reason = MOQ_ENDPOINT_TERMINAL_NONE;
+    *detail = 0;
+    if (!ep->vt || !ep->facade)
+        return;                     /* no facade: nothing to classify */
+    if (ep->vt->terminal) {
+        ep->vt->terminal(ep->facade, reason, detail);
+        return;
+    }
+    ep_classify_generic(ep_facade_is_fatal(ep), ep_facade_fatal_code(ep),
+                        ep_facade_clean_closed(ep), reason, detail);
+}
+
+/* A STABLE terminal classification.
+ *
+ * One sample is not an observation. Every shipped vt->terminal composes
+ * separately-locked facade accessors -- msquic_managed.c latches term_fatal,
+ * term_closed and both codes together under m->mu (:438-444) while each public
+ * accessor takes that mutex on its own (:2874+), and pico_wt is the same shape
+ * -- so a backend may latch a whole new terminal BETWEEN the reads of one
+ * sample. A sample that straddles the latch can report a combination the
+ * facade never held: fatal read before, clean read after, classified CLEAN.
+ *
+ * The endpoint's own observation generation cannot see that: nothing
+ * endpoint-local moved.
+ *
+ * So samples are repeated until two CONSECUTIVE complete samples agree on both
+ * reason and detail. That terminates because facade terminal state is
+ * finite and latching -- it is a one-way transition per backend -- so a sample
+ * that straddles it differs from the next settled sample, and once settled
+ * every sample agrees. A transition after the final sample merely makes the
+ * answer stale at the next instant, which the contract allows.
+ *
+ * Never called with ep->mu held: a facade terminal function may take a
+ * facade-internal lock, and the endpoint must not impose a lock order on it. */
+static void ep_terminal_classify(const moq_endpoint_t *ep,
+                                 moq_endpoint_terminal_reason_t *reason,
+                                 uint64_t *detail)
+{
+    ep_terminal_sample(ep, reason, detail);
+    for (;;) {
+        moq_endpoint_terminal_reason_t r2;
+        uint64_t d2;
+        ep_terminal_sample(ep, &r2, &d2);
+        if (r2 == *reason && d2 == *detail)
+            return;                 /* two consecutive samples agree */
+        *reason = r2;
+        *detail = d2;
+    }
+}
+
 moq_result_t moq_endpoint_get_terminal(const moq_endpoint_t *ep,
                                        moq_endpoint_terminal_t *out,
                                        size_t out_size)
@@ -2008,27 +2401,99 @@ moq_result_t moq_endpoint_get_terminal(const moq_endpoint_t *ep,
     if (!ep || !out || out_size < MOQ_ENDPOINT_TERMINAL_V0_SIZE)
         return MOQ_ERR_INVAL;
     size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
-    memset(out, 0, n);
 
     moq_endpoint_terminal_t t;
     memset(&t, 0, sizeof(t));
-    t.reason = MOQ_ENDPOINT_TERMINAL_NONE;
-    t.detail_code = 0;
-    if (ep->vt && ep->facade && ep->vt->terminal)
-        ep->vt->terminal(ep->facade, &t.reason, &t.detail_code);
+    ep_terminal_classify(ep, &t.reason, &t.detail_code);
 
     t.struct_size = (uint32_t)n;
     memcpy(out, &t, n);
     return MOQ_OK;
 }
 
+/* One coherent observation. See the contract in endpoint.h.
+ *
+ * The mechanism is a private OBSERVATION GENERATION, and it exists because
+ * monotonicity is not enough. Sampling the terminal first and then reading the
+ * local pair admits this ordering:
+ *
+ *   1. the terminal classifies as NONE while the endpoint is CONNECTING/0;
+ *   2. the facade goes terminal;
+ *   3. first establishment commits ESTABLISHED/version under ep->mu;
+ *   4. the reader pairs that new local tuple with the stale NONE.
+ *
+ * The endpoint was already terminal when it established, so no observer could
+ * have seen ESTABLISHED/version/NONE. A NONE sampled early HIDES a terminal
+ * that happened afterwards, which is exactly the case monotonicity cannot
+ * cover.
+ *
+ * So the read is optimistic and validated:
+ *
+ *   capture (generation, stopped, pump_state, negotiated) under ep->mu;
+ *   classify the terminal OUTSIDE ep->mu -- a facade terminal function may take
+ *     a facade-internal lock, and the endpoint must not impose a lock order;
+ *   re-read the generation under ep->mu;
+ *   retry if it moved.
+ *
+ * A generation that did not move means no observable tuple mutation crossed
+ * the terminal sample, so the pair and the reason describe the SAME instant.
+ *
+ * Retry terminates because the generation advances only on a real change of
+ * the observable tuple, and those changes are finite: `negotiated` latches
+ * once, `stopped` latches once, and `pump_state` follows a converging
+ * lifecycle. A same-value pump refresh deliberately does not advance it, so an
+ * idle endpoint being pumped cannot starve a reader. (The one non-monotone
+ * write -- a lane whose reaped child makes the facade report a NULL session --
+ * is a single transition per reap, not a cycle.)
+ *
+ * A classified terminal still forces CLOSED: the facade is authoritative about
+ * being terminal, and the cached pump_state may not have caught up. */
+moq_result_t moq_endpoint_get_snapshot(const moq_endpoint_t *ep,
+                                       moq_endpoint_snapshot_t *out,
+                                       size_t out_size)
+{
+    if (!ep || !out || out_size < MOQ_ENDPOINT_SNAPSHOT_V0_SIZE)
+        return MOQ_ERR_INVAL;      /* no caller byte is written */
+    size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
+
+    moq_endpoint_snapshot_t s;
+    memset(&s, 0, sizeof(s));      /* every written byte is deterministic */
+
+    moq_endpoint_t *mep = (moq_endpoint_t *)ep;
+    for (;;) {
+        uint64_t gen;
+        pthread_mutex_lock(&mep->mu);
+        gen = ep->observe_gen;
+        s.state = ep->stopped ? MOQ_ENDPOINT_CLOSED : ep->pump_state;
+        s.negotiated_version = ep->negotiated;
+        pthread_mutex_unlock(&mep->mu);
+
+        ep_terminal_classify(ep, &s.terminal_reason, &s.terminal_detail_code);
+
+        pthread_mutex_lock(&mep->mu);
+        uint64_t gen2 = ep->observe_gen;
+        pthread_mutex_unlock(&mep->mu);
+        if (gen == gen2)
+            break;                 /* nothing crossed the terminal sample */
+    }
+
+    if (s.terminal_reason != MOQ_ENDPOINT_TERMINAL_NONE)
+        s.state = MOQ_ENDPOINT_CLOSED;
+
+    s.struct_size = (uint32_t)n;
+    memcpy(out, &s, n);            /* an oversized caller tail is untouched */
+    return MOQ_OK;
+}
+
 moq_version_t moq_endpoint_negotiated_version(const moq_endpoint_t *ep)
 {
     if (!ep) return (moq_version_t)0;
+    EP_TEST_INTERPOSE(ep, 1);      /* before the version is read */
     moq_endpoint_t *mep = (moq_endpoint_t *)ep;
     pthread_mutex_lock(&mep->mu);
     moq_version_t v = ep->negotiated;
     pthread_mutex_unlock(&mep->mu);
+    EP_TEST_INTERPOSE(ep, 2);      /* after the version is read */
     return v;
 }
 
@@ -2105,9 +2570,9 @@ moq_result_t moq_endpoint_post_retryable(moq_endpoint_t *ep,
  *    WOULD_BLOCK. ep_drain_posted touches only the queue + the task fn (never
  *    vt/facade), so it is safe on a bare endpoint even with a live session. */
 
-moq_endpoint_t *moq_endpoint_test_make_bare(void)
+moq_endpoint_t *moq_endpoint_test_make_bare_alloc(const moq_alloc_t *alloc)
 {
-    const moq_alloc_t *alloc = moq_alloc_default();
+    if (!alloc) alloc = moq_alloc_default();
     moq_endpoint_t *ep = (moq_endpoint_t *)alloc->alloc(sizeof(*ep), alloc->ctx);
     if (!ep) return NULL;
     memset(ep, 0, sizeof(*ep));
@@ -2117,6 +2582,11 @@ moq_endpoint_t *moq_endpoint_test_make_bare(void)
     atomic_init(&ep->closed, false);
     ep->pump_state = MOQ_ENDPOINT_CONNECTING;
     return ep;
+}
+
+moq_endpoint_t *moq_endpoint_test_make_bare(void)
+{
+    return moq_endpoint_test_make_bare_alloc(moq_alloc_default());
 }
 
 void moq_endpoint_test_free_bare(moq_endpoint_t *ep)
@@ -2172,5 +2642,358 @@ int moq_endpoint_test_attachments(moq_endpoint_t *ep)
     int n = ep->attachments;
     pthread_mutex_unlock(&ep->mu);
     return n;
+}
+
+/* -- Scripted facade probe (attached-service drain tests) --------------- *
+ * A facade answers moq_endpoint_drain()'s transport question via
+ * vt->drain_state. Every in-tree drain test reaches that view through a real
+ * socket, which cannot express "the transport is idle while an attached
+ * service still owes work" deterministically. This seam installs a facade that
+ * REPORTS a caller-chosen drain state and COUNTS the drain-state / wake / wait
+ * calls it receives.
+ *
+ * It exposes state; it does not decide outcomes. It performs no drain, queues
+ * nothing, and does not alter moq_endpoint_drain()'s logic -- swapping the
+ * reported value cannot make a pending service obligation complete. It does
+ * NOT service wakes spontaneously: wake() only records. A test may install an
+ * optional managed-context stand-in, and then EXACTLY ONE recorded wake is
+ * serviced per wait(), from the wait path only -- i.e. never before the
+ * product has asked the facade for progress. Its storage is CALLER-OWNED and
+ * it allocates nothing, so an endpoint carrying it has no hidden allocation of
+ * its own. It refuses to install over an existing facade rather than
+ * overwriting (and leaking) one. Compiled only under the service testing gate;
+ * never part of a shipped endpoint. */
+struct ep_test_probe {
+    int      report;
+    unsigned drain_calls;
+    unsigned wakes;
+    unsigned waits;
+    /* Optional managed-context stand-in. A real backend answers a wake by
+     * running its next cycle; this probe answers one RECORDED wake by calling
+     * the caller-supplied service function ONCE, from the wait path only --
+     * i.e. only after the product has asked the facade for progress. It never
+     * pre-pumps (wake() itself only records), never services more than one
+     * recorded wake per wait, and cannot influence what a hook reports. */
+    void   (*service)(void *ctx);
+    void    *service_ctx;
+    /* Optional one-shot fired from the drain_state probe: models the managed
+     * context accepting new send work while the transport snapshot is being
+     * taken. Used only to exercise the final recheck. */
+    void   (*on_probe_once)(void *ctx);
+    void    *on_probe_ctx;
+    unsigned on_probe_at;   /* fire when drain_calls reaches this ordinal */
+    /* One-shot fired from INSIDE the facade's terminal classification: it
+     * models a real transition landing partway through an observation. */
+    /* ONE one-shot slot with a position selector, rather than a slot per
+     * position: only one is ever armed at a time, and the probe's storage is
+     * caller-owned and size-checked by every consumer. */
+    void   (*on_terminal_once)(void *ctx);
+    void    *on_terminal_ctx;
+    unsigned char terminal_hook_at;   /* EP_PROBE_HOOK_* */
+    unsigned char hook_fires;
+    unsigned char samples;
+    unsigned serviced;      /* wakes answered so far */
+    unsigned service_calls; /* service invocations (== serviced) */
+    /* Scripted observation state. Zero-initialised by install, so a probe that
+     * never sets these behaves exactly as before: version 0, not fatal, not
+     * cleanly closed. It lets a test drive a REAL first-establishment or
+     * terminal transition through ep_pump_cycle() without a socket -- the
+     * endpoint's own commit path still decides what is latched. */
+    moq_version_t negotiated;
+    bool          fatal;
+    uint64_t      fatal_code_v;
+    bool          clean;
+};
+
+static moq_result_t ep_probe_wait(void *f, uint64_t t)
+{
+    (void)t;
+    struct ep_test_probe *p = (struct ep_test_probe *)f;
+    p->waits++;
+    /* Answer at most ONE recorded-but-unserviced wake per wait. With no
+     * service function installed this is the original behaviour: a timeout
+     * during which nothing is serviced. */
+    if (p->service && p->serviced < p->wakes) {
+        p->serviced++;
+        p->service_calls++;
+        p->service(p->service_ctx);
+        return MOQ_OK;                     /* woken: the caller re-checks */
+    }
+    return MOQ_DONE;                       /* timeout: nothing is serviced */
+}
+static void ep_probe_wake(void *f)
+{
+    ((struct ep_test_probe *)f)->wakes++;   /* recorded, deliberately unserviced */
+}
+/* Where a probe one-shot fires within one terminal classification sample. */
+#define EP_PROBE_HOOK_BEFORE 0   /* before the sample's reads */
+#define EP_PROBE_HOOK_MID    1   /* between the composed reads */
+#define EP_PROBE_HOOK_AFTER  2   /* after the result is computed */
+
+static void ep_probe_fire_hook(struct ep_test_probe *p, unsigned char at);
+
+static bool ep_probe_is_fatal(void *f)
+{
+    struct ep_test_probe *p = (struct ep_test_probe *)f;
+    ep_probe_fire_hook(p, EP_PROBE_HOOK_BEFORE);
+    return p->fatal;
+}
+static uint64_t ep_probe_fatal_code(void *f)
+{
+    return ((struct ep_test_probe *)f)->fatal_code_v;
+}
+static bool ep_probe_clean_closed(void *f)
+{
+    return ((struct ep_test_probe *)f)->clean;
+}
+static moq_version_t ep_probe_ver(void *f)
+{
+    return ((struct ep_test_probe *)f)->negotiated;
+}
+/* The probe scripts the facade's INPUTS -- fatal, its code, cleanly-closed --
+ * and the product's own classifier turns them into a reason. It does not choose
+ * the reason: a test cannot ask for an output the classifier would not produce
+ * from those inputs. */
+static void ep_probe_fire_hook(struct ep_test_probe *p, unsigned char at)
+{
+    if (!p->on_terminal_once || p->terminal_hook_at != at) return;
+    void (*fn)(void *) = p->on_terminal_once;
+    void *c = p->on_terminal_ctx;
+    p->on_terminal_once = NULL;          /* one-shot */
+    p->on_terminal_ctx = NULL;
+    if (p->hook_fires < 255) p->hook_fires++;
+    fn(c);
+}
+
+static void ep_probe_terminal(void *f, moq_endpoint_terminal_reason_t *r,
+                              uint64_t *d)
+{
+    struct ep_test_probe *p = (struct ep_test_probe *)f;
+    ep_probe_fire_hook(p, EP_PROBE_HOOK_BEFORE);
+    if (p->samples < 255) p->samples++;
+    /* Composed reads with EXPLICIT ordering, modelling the real shims: every
+     * shipped vt->terminal reads fatal, its code and clean-closed through
+     * separately-locked facade accessors, so the backend may latch a new
+     * terminal between them. (Argument evaluation order is unspecified in C,
+     * so the reads are sequenced here deliberately.) */
+    bool     fatal = p->fatal;
+    uint64_t code  = p->fatal_code_v;
+    ep_probe_fire_hook(p, EP_PROBE_HOOK_MID);
+    bool clean = p->clean;
+    ep_classify_generic(fatal, code, clean, r, d);
+    /* Fired AFTER this classification is computed and BEFORE it is returned.
+     * That is the only point at which a test can make the world move on while
+     * an already-sampled terminal answer is still in flight -- the boundary a
+     * terminal-first getter has to survive. The hook cannot choose the answer:
+     * `*r`/`*d` are already set and are not touched again. */
+    ep_probe_fire_hook(p, EP_PROBE_HOOK_AFTER);
+}
+static moq_result_t  ep_probe_stop(void *f) { (void)f; return MOQ_OK; }
+static void     ep_probe_destroy(void *f) { (void)f; }   /* caller-owned */
+static int      ep_probe_drain_state(void *f)
+{
+    struct ep_test_probe *p = (struct ep_test_probe *)f;
+    p->drain_calls++;
+    if (p->on_probe_once && p->drain_calls >= p->on_probe_at) {
+        void (*fn)(void *) = p->on_probe_once;
+        void *c = p->on_probe_ctx;
+        p->on_probe_once = NULL;            /* one-shot */
+        p->on_probe_ctx = NULL;
+        fn(c);
+    }
+    return p->report;
+}
+
+/* Designated: a future vtable reorder cannot silently rebind these. */
+static const ep_backend_vtable_t EP_TEST_PROBE_VT = {
+    .wait = ep_probe_wait,
+    .wake = ep_probe_wake,
+    .negotiated_version = ep_probe_ver,
+    .is_fatal = ep_probe_is_fatal,
+    .fatal_code = ep_probe_fatal_code,
+    .clean_closed = ep_probe_clean_closed,
+    .drain_state = ep_probe_drain_state,
+    .stop = ep_probe_stop,
+    .destroy = ep_probe_destroy,
+    .terminal = ep_probe_terminal,
+};
+
+/* A SECOND designated vtable, identical to the probe's except that its
+ * `terminal` slot is NULL. The vtable field documents NULL as "treated as
+ * generic (NONE/PROTOCOL/TRANSPORT/CLEAN only)", so this is the shape that
+ * tests whether moq_endpoint_get_terminal() honours that. Same caller-owned
+ * storage; it allocates nothing. */
+static const ep_backend_vtable_t EP_TEST_PROBE_NULL_TERMINAL_VT = {
+    .wait = ep_probe_wait,
+    .wake = ep_probe_wake,
+    .negotiated_version = ep_probe_ver,
+    .is_fatal = ep_probe_is_fatal,
+    .fatal_code = ep_probe_fatal_code,
+    .clean_closed = ep_probe_clean_closed,
+    .drain_state = ep_probe_drain_state,
+    .stop = ep_probe_stop,
+    .destroy = ep_probe_destroy,
+    .terminal = NULL,
+};
+
+size_t moq_endpoint_test_probe_size(void) { return sizeof(struct ep_test_probe); }
+
+moq_result_t moq_endpoint_test_install_probe(moq_endpoint_t *ep, void *storage,
+                                             size_t size, int report)
+{
+    if (!ep || !storage || size < sizeof(struct ep_test_probe))
+        return MOQ_ERR_INVAL;
+    if (ep->vt || ep->facade) return MOQ_ERR_WRONG_STATE;   /* never overwrite */
+    struct ep_test_probe *p = (struct ep_test_probe *)storage;
+    memset(p, 0, sizeof(*p));
+    p->report = report;
+    ep->vt = &EP_TEST_PROBE_VT;
+    ep->facade = p;
+    return MOQ_OK;
+}
+
+/* Install the same probe behind the NULL-terminal vtable. */
+moq_result_t moq_endpoint_test_install_probe_null_terminal(moq_endpoint_t *ep,
+                                                           void *storage,
+                                                           size_t size)
+{
+    if (!ep || !storage || size < sizeof(struct ep_test_probe))
+        return MOQ_ERR_INVAL;
+    if (ep->vt || ep->facade) return MOQ_ERR_WRONG_STATE;   /* never overwrite */
+    struct ep_test_probe *p = (struct ep_test_probe *)storage;
+    memset(p, 0, sizeof(*p));
+    ep->vt = &EP_TEST_PROBE_NULL_TERMINAL_VT;
+    ep->facade = p;
+    return MOQ_OK;
+}
+
+unsigned moq_endpoint_test_probe_drain_calls(const void *probe)
+{
+    return probe ? ((const struct ep_test_probe *)probe)->drain_calls : 0u;
+}
+
+unsigned moq_endpoint_test_probe_wakes(const void *probe)
+{
+    return probe ? ((const struct ep_test_probe *)probe)->wakes : 0u;
+}
+
+unsigned moq_endpoint_test_probe_waits(const void *probe)
+{
+    return probe ? ((const struct ep_test_probe *)probe)->waits : 0u;
+}
+
+unsigned moq_endpoint_test_probe_services(const void *probe)
+{
+    return probe ? ((const struct ep_test_probe *)probe)->service_calls : 0u;
+}
+
+/* The version the facade reports at first establishment. The endpoint latches
+ * it itself, under its own mutex, exactly as a real backend's would be. */
+/* Arm the single one-shot at position `at` (0 before the sample, 1 between its
+ * composed reads, 2 after its result is computed). */
+void moq_endpoint_test_probe_arm_hook(void *probe, int at, void (*fn)(void *),
+                                      void *ctx)
+{
+    if (!probe) return;
+    struct ep_test_probe *p = (struct ep_test_probe *)probe;
+    p->on_terminal_once = fn;
+    p->on_terminal_ctx = ctx;
+    p->terminal_hook_at = (unsigned char)at;
+}
+
+/* READ-ONLY inventory of the probe's terminal inputs. It adds no storage: the
+ * fields already exist. A test uses it to observe what the facade holds after
+ * an interposed transition, instead of setting the state again -- which would
+ * observe nothing. */
+void moq_endpoint_test_probe_get_terminal(const void *probe, bool *fatal,
+                                          uint64_t *fatal_code, bool *clean)
+{
+    const struct ep_test_probe *p = (const struct ep_test_probe *)probe;
+    if (!p) return;
+    if (fatal)      *fatal = p->fatal;
+    if (fatal_code) *fatal_code = p->fatal_code_v;
+    if (clean)      *clean = p->clean;
+}
+
+unsigned moq_endpoint_test_probe_hook_fires(const void *probe)
+{
+    return probe ? ((const struct ep_test_probe *)probe)->hook_fires : 0u;
+}
+
+unsigned moq_endpoint_test_probe_terminal_samples(const void *probe)
+{
+    return probe ? ((const struct ep_test_probe *)probe)->samples : 0u;
+}
+
+/* Arm the per-endpoint one-shot interposition at point `at`: 1 = before the
+ * negotiated version is read, 2 = after it. Taken and cleared under ep->mu;
+ * the callback runs with the mutex RELEASED (see ep_test_fire_interpose). */
+void moq_endpoint_test_arm_interpose(moq_endpoint_t *ep, int at,
+                                     void (*fn)(void *), void *ctx)
+{
+    if (!ep) return;
+    pthread_mutex_lock(&ep->mu);
+    ep->test_interpose = fn;
+    ep->test_interpose_ctx = ctx;
+    ep->test_interpose_at = at;
+    pthread_mutex_unlock(&ep->mu);
+}
+
+unsigned moq_endpoint_test_interpose_fires(const moq_endpoint_t *ep)
+{
+    if (!ep) return 0u;
+    moq_endpoint_t *mep = (moq_endpoint_t *)ep;
+    pthread_mutex_lock(&mep->mu);
+    unsigned n = ep->test_interpose_fires;
+    pthread_mutex_unlock(&mep->mu);
+    return n;
+}
+
+void moq_endpoint_test_probe_set_negotiated(void *probe, moq_version_t v)
+{
+    if (!probe) return;
+    ((struct ep_test_probe *)probe)->negotiated = v;
+}
+
+/* The facade's terminal INPUTS. The endpoint's own classifier decides the
+ * reported reason from them; this seam cannot select an output. */
+void moq_endpoint_test_probe_set_terminal(void *probe, bool fatal,
+                                          uint64_t fatal_code, bool clean)
+{
+    if (!probe) return;
+    struct ep_test_probe *p = (struct ep_test_probe *)probe;
+    p->fatal = fatal;
+    p->fatal_code_v = fatal_code;
+    p->clean = clean;
+}
+
+void moq_endpoint_test_probe_set_service(void *probe, void (*fn)(void *),
+                                         void *ctx)
+{
+    if (!probe) return;
+    struct ep_test_probe *p = (struct ep_test_probe *)probe;
+    p->service = fn;
+    p->service_ctx = ctx;
+}
+
+/* Fire `fn` ONCE, from inside the drain_state probe whose ordinal (counting
+ * this probe's lifetime drain_state calls) is `at_call`. moq_endpoint_drain()
+ * takes one entry probe before its loop, so `at_call` selects which probe the
+ * injection lands in. */
+void moq_endpoint_test_probe_arm_on_probe_once(void *probe, void (*fn)(void *),
+                                               void *ctx, unsigned at_call)
+{
+    if (!probe) return;
+    struct ep_test_probe *p = (struct ep_test_probe *)probe;
+    p->on_probe_once = fn;
+    p->on_probe_ctx = ctx;
+    p->on_probe_at = at_call;
+}
+
+void moq_endpoint_test_remove_probe(moq_endpoint_t *ep)
+{
+    if (!ep) return;
+    ep->vt = NULL;
+    ep->facade = NULL;   /* storage is the caller's; nothing to free */
 }
 #endif /* MOQ_MEDIA_SENDER_TESTING || MOQ_MEDIA_RECEIVER_TESTING */

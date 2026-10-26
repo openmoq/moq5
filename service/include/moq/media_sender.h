@@ -117,6 +117,13 @@ typedef struct moq_media_sender_cfg {
     moq_media_send_backpressure_t backpressure; /* REQUIRED: UNSET fails;
                                            presets set it */
     uint64_t block_timeout_us;         /* BLOCK_TIMEOUT only; preset default */
+    /* Object bounds. One physical ring serves both phases and is sized
+     * max(effective bounds) + 1; a bound whose ring cannot be represented
+     * (the +1 outside uint32_t -- i.e. UINT32_MAX -- or the ring's byte size
+     * outside this target's size_t) is a MALFORMED configuration: create()
+     * and attach() refuse it with MOQ_ERR_INVAL before connecting or
+     * allocating anything. A representable ring the allocator cannot
+     * provide is exhaustion: MOQ_ERR_NOMEM. */
     uint32_t queue_max_objects;        /* send-queue depth; 0 = default */
     uint32_t queue_max_bytes;          /* send-queue byte budget; 0 = default */
     uint32_t pre_ready_max_objects;    /* pre-ready depth; 0 = default */
@@ -377,16 +384,19 @@ typedef struct moq_media_track_cfg {
 
 MOQ_API void moq_media_track_cfg_init(moq_media_track_cfg_t *cfg);
 
-/* Add a track. Legal both before and after readiness: a post-ready add
- * registers the track and triggers an independent catalog republish (a new
- * catalog group at object 0; the network pump coalesces concurrent add/remove
- * mutations into one new generation). The handle is stable for the sender's
- * life. All pre-ready validation still applies (duplicate name, SAP-timeline
+/* Add a track. Legal both before and after readiness, and the local catalog
+ * work it records does NOT wait for the peer: the track is registered and an
+ * independent catalog republish is triggered (a new catalog group at object 0;
+ * the network pump coalesces concurrent add/remove mutations into one new
+ * generation). An add the initial catalog already carries costs nothing -- the
+ * republish resolves to the same catalog and dedups without a generation.
+ * The handle is stable for the sender's
+ * life. All validation still applies (duplicate name, SAP-timeline
  * name collision, content-protection ref resolution, protected-CMAF init); a
  * failed add leaves the sender unchanged and does not dirty the catalog.
  * Returns MOQ_ERR_CLOSED if terminal, MOQ_ERR_INVAL for malformed cfg,
  * MOQ_ERR_NOMEM on exhaustion. Returns MOQ_ERR_WOULD_BLOCK (retryable) for a
- * post-ready add whose name (or a generated "<name>.sap" / "<name>.timeline") is
+ * add whose name (or a generated "<name>.sap" / "<name>.timeline") is
  * still in use by a just-removed track whose teardown has not completed -- retry
  * later. Any
  * successful replacement publication is ordered after the removal generation,
@@ -407,9 +417,11 @@ MOQ_API moq_result_t moq_media_sender_add_track(
     moq_media_sender_t *s, const moq_media_track_cfg_t *cfg,
     moq_media_track_t **out);
 
-/* Remove a previously added media track from the catalog (post-ready: triggers
- * an independent catalog republish without the track; pre-ready: it is simply
- * kept out of the initial catalog). The track is dropped from future catalog
+/* Remove a previously added media track from the catalog. This triggers an
+ * independent catalog republish without the track and does NOT wait for the
+ * peer; a removal of a track the initial catalog never carried resolves to the
+ * same catalog and dedups without a generation. The track is dropped from
+ * future catalog
  * builds, its queued objects are discarded, future moq_media_sender_write() on
  * it returns MOQ_ERR_WRONG_STATE, and its underlying MOQT track is ended. A
  * media track's generated SAP-timeline and media-timeline siblings are removed
@@ -444,15 +456,39 @@ typedef struct moq_media_send_object {
     bool starts_group;           /* opens a new group (closing any open one) */
     bool ends_group;             /* closes the group after this object */
     uint64_t decode_time_us;     /* advisory in v0 (order conveys decode seq) */
-    /* RAW/LOC timing. The LOC Capture Timestamp (LOC-01 2.3.1.1, wall-clock
-     * microseconds since the Unix epoch) is taken from capture_time_us when
-     * has_capture_time is true (emitted verbatim, no clamp/scale); otherwise it
-     * falls back to presentation_time_us. presentation_time_us also drives the
-     * generated SAP/media timelines. These fields are RAW/LOC-only -- for CMAF
-     * the object's timing and properties live in the passed-through `properties`
-     * block and these are ignored. For a RAW/LOC track the emitted timestamp
-     * (capture_time_us, or presentation_time_us when has_capture_time is false)
-     * MUST fit the QUIC varint / LOC encoding range (<= MOQ_QUIC_VARINT_MAX);
+    /* RAW/LOC timing. A RAW/LOC object's LOC property block carries exactly ONE
+     * timestamp scalar, so that OBJECT cannot preserve both a capture instant
+     * and a media-timeline position. Two layers:
+     *
+     *   - the protocol field is the LOC Capture Timestamp (LOC-01 2.3.1.1,
+     *     defined as wall-clock microseconds since the Unix epoch);
+     *   - this implementation's compatibility fallback copies the media scalar
+     *     presentation_time_us into that field when has_capture_time is false,
+     *     so unless the caller's presentation values are themselves
+     *     epoch-relative the field then holds something that is not a capture
+     *     instant.
+     *
+     * The value is taken from capture_time_us when has_capture_time is true
+     * (emitted verbatim, no clamp/scale); otherwise from presentation_time_us.
+     * presentation_time_us separately drives the generated SAP/media-timeline
+     * tracks, which this choice does not affect.
+     *
+     * What that single scalar means at the receiver (moq_media_object_parse,
+     * media_object.h):
+     *
+     *   - has_capture_time=false here does NOT arrive as an untimed object. The
+     *     peer observes a capture timestamp equal to this presentation_time_us
+     *     and cannot identify which source domain produced the scalar.
+     *   - has_capture_time=true sends that epoch value, and the parser copies
+     *     the same scalar into its decode and presentation outputs as well, so
+     *     the presentation_time_us submitted here does not reach the peer as a
+     *     media-timeline position on this object.
+     *
+     * These fields are RAW/LOC-only -- for CMAF the object's timing and
+     * properties live in the passed-through `properties` block and these are
+     * ignored. For a RAW/LOC track the emitted timestamp (capture_time_us, or
+     * presentation_time_us when has_capture_time is false) MUST fit the QUIC
+     * varint / LOC encoding range (<= MOQ_QUIC_VARINT_MAX);
      * moq_media_sender_write() rejects an out-of-range value with MOQ_ERR_INVAL
      * (synchronously, without taking payload ownership). */
     uint64_t presentation_time_us;
@@ -517,6 +553,42 @@ MOQ_API moq_result_t moq_media_sender_end_track(
  * live-written to active subscribers and retained (for a Joining FETCH) so a
  * later joiner still learns the broadcast completed. The namespace/endpoint stay up (this is
  * not destroy()): call moq_media_sender_destroy() when finished.
+ *
+ * ASYNCHRONOUS. This call RECORDS the completion and wakes the endpoint; it
+ * emits nothing itself. MOQ_OK means the request was accepted (or was already
+ * in effect), NOT that Track Ended or the terminal catalog has been produced --
+ * both are done by later network-pump passes, and each step can legitimately be
+ * deferred by transport backpressure.
+ *
+ * Completion REMOVES every track, and a removed track's still-queued media
+ * and lifecycle work is discarded; the discarded MEDIA objects are counted in
+ * objects_dropped, and discarded lifecycle markers are not. A drain AFTER
+ * complete() flushes the completion work -- Track Ended and the terminal
+ * catalog -- but cannot bring back a media tail that had not drained before
+ * complete() was called.
+ *
+ * To preserve accepted finite output and know the completion reached the
+ * core:
+ *
+ *     1. quiesce your own sender mutations (no further write / add_track /
+ *        remove_track), and call end_track() for any track you intend to end
+ *        explicitly -- completion ends every remaining track itself;
+ *     2. moq_endpoint_drain(endpoint, timeout) and require MOQ_OK, so the
+ *        accepted media and track terminals have reached the core BEFORE
+ *        completion removes the tracks;
+ *     3. moq_media_sender_complete(sender);
+ *     4. moq_endpoint_drain(endpoint, timeout) and require MOQ_OK -- the
+ *        accepted completion work has reached the core and the reliable
+ *        transport backlog is flushed (see moq/endpoint.h);
+ *     5. then moq_media_sender_destroy() and moq_endpoint_stop() as usual.
+ *
+ * Destroying the sender or stopping the endpoint without step 4 may discard
+ * completion work that was accepted but not yet emitted. A drain can remain
+ * pending, and so not succeed within its timeout, while protocol or demand
+ * gates hold queued work. A drain that does succeed is not proof that a peer
+ * received or rendered anything, and does not undo objects a drop policy
+ * already discarded; this sequence preserves what was accepted and not yet
+ * dropped, not every write under an arbitrary drop policy.
  *
  * Legal only after readiness; pre-ready returns MOQ_ERR_WRONG_STATE. IDEMPOTENT:
  * a second call returns MOQ_OK and does nothing. After completion, add_track,

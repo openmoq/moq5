@@ -98,6 +98,17 @@ static void expect_reject(const hs_result_t *r)
     CHECK(is_terminal_rejection(r));
 }
 
+/* A provider with no implicit system store has nothing to verify a CA-less
+ * client against, so the create is refused before any handshake. That is the
+ * same fail-closed outcome as a terminal rejection, reached earlier and more
+ * strongly: the client never reaches the wire. */
+static void expect_refused_before_create(const hs_result_t *r)
+{
+    CHECK(!r->created);
+    CHECK(!r->established);
+    CHECK(!is_terminal_rejection(r));
+}
+
 static void expect_accept(const hs_result_t *r)
 {
     CHECK(r->created);
@@ -194,11 +205,26 @@ int main(void)
     CHECK(moq_pq_threaded_create(&srv, &server) == MOQ_OK);
 
     if (server) {
-        /* 1. Default client: system trust does not contain the test CA, so the
-         *    server cert is rejected -- a terminal, cert-level failure. */
+        /* 1. Default client with NO explicit CA. The outcome is
+         *    provider-dependent, and the provider is the CONFIGURED one:
+         *
+         *      implicit system store    -> the client is created and the
+         *                                  server cert is rejected at the
+         *                                  handshake, a terminal cert-level
+         *                                  failure;
+         *      no implicit system store -> there is nothing to verify
+         *                                  against, so the create is refused
+         *                                  outright.
+         *
+         *    Either way the client never establishes an unverified session,
+         *    which is the property this row exists to pin. */
         hs_result_t def = run_client(port, /*insecure=*/0, /*custom_ca=*/0,
                                      "test.example.com");
+#if defined(MOQ_TEST_VERIFY_BACKEND_MBEDTLS)
+        expect_refused_before_create(&def);
+#else
         expect_reject(&def);
+#endif
 
         /* 2. Insecure client: null verifier accepts any cert. */
         hs_result_t ins = run_client(port, /*insecure=*/1, /*custom_ca=*/0, NULL);

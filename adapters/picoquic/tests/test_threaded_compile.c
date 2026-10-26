@@ -14,12 +14,14 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stddef.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int failures = 0;
 
@@ -172,12 +174,62 @@ static void *wake_stress_thread(void *arg)
 #define SMOKE_PAYLOAD "threaded-smoke"
 #define SMOKE_PAYLOAD_LEN 14
 
+#ifdef MOQ_TEST_THREADED_TRACE
+/* Diagnostic state written ONLY from on_lane_pump, where the network thread
+ * already owns protocol progress. The test thread never dereferences a
+ * moq_session_t: sans-I/O session APIs are not documented thread-safe, and a
+ * server session can be reaped underneath a returned pointer.
+ *
+ * Bounded by construction; overflow is a NAMED failure, never a silent drop. */
+#define TRACE_STATES_MAX 16
+typedef struct {
+    volatile int      saw_session;      /* the pump observed a live session */
+    volatile int      states[TRACE_STATES_MAX];
+    volatile int      state_n;
+    volatile int      state_overflow;
+    volatile int      last_state;      /* -1 until the first observation, so
+                                        * state 0 is recorded like any other */
+} trace_side_t;
+
+static void trace_note_state(trace_side_t *ts, int st)
+{
+    /* network thread only: the pump is the single writer */
+    if (st == __atomic_load_n(&ts->last_state, __ATOMIC_ACQUIRE)) return;
+    __atomic_store_n(&ts->last_state, st, __ATOMIC_RELEASE);
+    int n = __atomic_load_n(&ts->state_n, __ATOMIC_ACQUIRE);
+    if (n < TRACE_STATES_MAX) {
+        __atomic_store_n(&ts->states[n], st, __ATOMIC_RELEASE);
+        __atomic_store_n(&ts->state_n, n + 1, __ATOMIC_RELEASE);
+    } else {
+        __atomic_store_n(&ts->state_overflow, 1, __ATOMIC_RELEASE);
+    }
+}
+#endif
+
 typedef struct {
     moq_publisher_t  *pub;
     moq_pub_track_t  *track;
+#ifdef MOQ_TEST_THREADED_TRACE
+    trace_side_t      tr;
+    volatile int      track_added;      /* LOCAL: moq_pub_add_track accepted */
+    volatile int      namespace_accepted; /* PEER: moq_pub_namespace_accepted */
+    volatile int      has_subscriber;   /* PEER: a subscriber is bound */
+    volatile int      write_attempted;
+    /* No trace-only accepted bit: `obj_written` below is the functional latch
+     * set by the same `wrc == MOQ_OK`, and one return may not be represented
+     * by two mutable facts. It IS the local-write-accepted observation. */
+#endif
     volatile int      obj_written;
     volatile int      do_finish;       /* test triggers finish_subscribers(0x2) */
     volatile int      finished;        /* latched once finish succeeds */
+    /* Controlled perturbations, set before the server starts: stall the first
+     * pump that sees a session (a descheduled network thread), or never
+     * publish (a peer that makes no progress). */
+    uint64_t          stall_first_pump_us;
+    volatile int      stalled;         /* latched by the network thread */
+    int               withhold;
+    volatile int      withheld;        /* the withhold branch ran with a
+                                        * session (network thread) */
 } smoke_srv_t;
 
 static int smoke_srv_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
@@ -186,7 +238,23 @@ static int smoke_srv_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
     (void)lane;
     smoke_srv_t *s = (smoke_srv_t *)ctx;
     moq_session_t *sess = moq_pq_threaded_session(t);
+#ifdef MOQ_TEST_THREADED_TRACE
+    if (sess != NULL) {
+        __atomic_store_n(&s->tr.saw_session, 1, __ATOMIC_RELEASE);
+        trace_note_state(&s->tr, (int)moq_session_state(sess));
+    }
+#endif
     if (!sess) return 0;
+
+    if (s->stall_first_pump_us != 0 &&
+        !__atomic_load_n(&s->stalled, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&s->stalled, 1, __ATOMIC_RELEASE);
+        usleep((useconds_t)s->stall_first_pump_us);
+    }
+    if (s->withhold) {
+        __atomic_store_n(&s->withheld, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
 
     if (!s->pub) {
         moq_pub_cfg_t pc; moq_pub_cfg_init_sized(&pc, sizeof(pc));
@@ -199,7 +267,19 @@ static int smoke_srv_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
         tc.track_name = MOQ_BYTES_LITERAL("data");
         if (moq_pub_add_track(s->pub, &tc, now, &s->track) != MOQ_OK)
             return 1;
+#ifdef MOQ_TEST_THREADED_TRACE
+        __atomic_store_n(&s->track_added, 1, __ATOMIC_RELEASE);
+#endif
     }
+
+#ifdef MOQ_TEST_THREADED_TRACE
+    if (s->pub != NULL && s->track != NULL) {
+        if (moq_pub_namespace_accepted(s->pub, s->track))
+            __atomic_store_n(&s->namespace_accepted, 1, __ATOMIC_RELEASE);
+        if (moq_pub_has_subscriber(s->pub, s->track))
+            __atomic_store_n(&s->has_subscriber, 1, __ATOMIC_RELEASE);
+    }
+#endif
 
     /* Live-write the smoke object once the subscriber has joined (a plain
      * SUBSCRIBE does not replay retained objects, so deliver it live). */
@@ -210,6 +290,9 @@ static int smoke_srv_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                 (const uint8_t *)SMOKE_PAYLOAD, SMOKE_PAYLOAD_LEN,
                 &payload) != MOQ_OK)
             return 1;
+#ifdef MOQ_TEST_THREADED_TRACE
+        __atomic_store_n(&s->write_attempted, 1, __ATOMIC_RELEASE);
+#endif
         moq_result_t wrc = moq_pub_write_object(s->pub, s->track, 0, 0,
                                                 payload, now);
         moq_rcbuf_decref(payload);
@@ -240,12 +323,17 @@ static int smoke_srv_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
 typedef struct {
     moq_subscriber_t *sub;
     moq_sub_track_t  *track;
+#ifdef MOQ_TEST_THREADED_TRACE
+    trace_side_t      tr;
+    volatile int      sub_issued;       /* subscribe call accepted */
+#endif
     volatile int      subscribed;
     volatile int      received;
     volatile int      payload_ok;
     volatile int      done;            /* on_subscribe_done count */
     volatile uint64_t done_status;     /* status from on_subscribe_done */
     volatile int      session_closed;  /* on_closed fired (session torn down) */
+    volatile int      established;     /* the pump saw MOQ_SESS_ESTABLISHED */
 } smoke_cli_t;
 
 static void smoke_on_subscribed(void *ctx, moq_sub_track_t *track)
@@ -277,7 +365,16 @@ static int smoke_cli_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
     (void)lane;
     smoke_cli_t *c = (smoke_cli_t *)ctx;
     moq_session_t *sess = moq_pq_threaded_session(t);
+#ifdef MOQ_TEST_THREADED_TRACE
+    if (sess != NULL) {
+        __atomic_store_n(&c->tr.saw_session, 1, __ATOMIC_RELEASE);
+        trace_note_state(&c->tr, (int)moq_session_state(sess));
+    }
+#endif
     if (!sess) return 0;
+
+    if (moq_session_state(sess) == MOQ_SESS_ESTABLISHED)
+        __atomic_store_n(&c->established, 1, __ATOMIC_RELEASE);
 
     if (!c->sub &&
         moq_session_state(sess) == MOQ_SESS_ESTABLISHED) {
@@ -297,6 +394,9 @@ static int smoke_cli_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
         tc.track_name = MOQ_BYTES_LITERAL("data");
         if (moq_sub_subscribe(c->sub, &tc, now, &c->track) != MOQ_OK)
             return 1;
+#ifdef MOQ_TEST_THREADED_TRACE
+        __atomic_store_n(&c->sub_issued, 1, __ATOMIC_RELEASE);
+#endif
     }
 
     if (!c->sub) return 0;
@@ -316,6 +416,160 @@ static int smoke_cli_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
         moq_sub_object_cleanup(&obj);
     }
     return 0;
+}
+
+/* -- Facade smoke driver -------------------------------------------- */
+
+static int64_t smoke_ms_since(const struct timespec *t0)
+{
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (int64_t)(t1.tv_sec - t0->tv_sec) * 1000 +
+           (t1.tv_nsec - t0->tv_nsec) / 1000000;
+}
+
+typedef enum {
+    SMOKE_REACHED,      /* the goal held */
+    SMOKE_CLOSED,       /* the client's wait returned MOQ_ERR_CLOSED */
+    SMOKE_UNEXPECTED,   /* the wait returned outside OK / DONE / ERR_CLOSED */
+    SMOKE_CEILING       /* the wall-clock ceiling passed first */
+} smoke_end_t;
+
+static const char *smoke_end_name(smoke_end_t e)
+{
+    switch (e) {
+    case SMOKE_REACHED:    return "reached";
+    case SMOKE_CLOSED:     return "closed";
+    case SMOKE_UNEXPECTED: return "unexpected-wait-result";
+    case SMOKE_CEILING:    return "wall-clock-ceiling";
+    }
+    return "?";
+}
+
+/* Per side and per result class. The public wake contract distinguishes
+ * MOQ_OK, MOQ_ERR_CLOSED and MOQ_ERR_INTERNAL, and the wait contract MOQ_OK,
+ * MOQ_DONE and MOQ_ERR_CLOSED; `other` keeps an unexpected class visible
+ * instead of folding it into a coarser bucket. */
+typedef struct {
+    smoke_end_t  end;
+    int64_t      elapsed_ms;
+    int          wake_rounds;           /* rounds that woke both peers */
+    int          srv_wake_ok, srv_wake_closed, srv_wake_internal,
+                 srv_wake_other;
+    int          cli_wake_ok, cli_wake_closed, cli_wake_internal,
+                 cli_wake_other;
+    int          waits;
+    int          wait_ok, wait_done, wait_closed, wait_other;
+    moq_result_t last_wait;
+} smoke_drive_t;
+
+static void smoke_count_wake(moq_result_t rc, int *ok, int *closed,
+                             int *internal, int *other)
+{
+    if (rc == MOQ_OK) (*ok)++;
+    else if (rc == MOQ_ERR_CLOSED) (*closed)++;
+    else if (rc == MOQ_ERR_INTERNAL) (*internal)++;
+    else (*other)++;
+}
+
+/*
+ * Drive a server/client pair until goal(ctx) holds, the client's wait reports
+ * a terminal or unexpected result, or ceiling_ms of wall-clock time passes.
+ *
+ * The bound is time, not a count of waits: moq_pq_threaded_wait() returns
+ * MOQ_OK after every pump cycle, and packet-loop activity alone runs the
+ * pumps, so a run of waits can pass in a few milliseconds while the peer is
+ * still working. Both peers are woken once to start, and again only when a
+ * wait interval passes idle (MOQ_DONE), so the loop does not feed its own
+ * wait with wakes. That removes the self-generated busy loop; continuous
+ * network activity can still return MOQ_OK back to back, which the ceiling
+ * bounds rather than prevents.
+ */
+static void smoke_drive(moq_pq_threaded_t *srv, moq_pq_threaded_t *cli,
+                        int (*goal)(void *), void *ctx, int64_t ceiling_ms,
+                        smoke_drive_t *d)
+{
+    memset(d, 0, sizeof(*d));
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int wake = 1;
+    for (;;) {
+        if (wake) {
+            wake = 0;
+            d->wake_rounds++;
+            smoke_count_wake(moq_pq_threaded_wake(srv), &d->srv_wake_ok,
+                             &d->srv_wake_closed, &d->srv_wake_internal,
+                             &d->srv_wake_other);
+            smoke_count_wake(moq_pq_threaded_wake(cli), &d->cli_wake_ok,
+                             &d->cli_wake_closed, &d->cli_wake_internal,
+                             &d->cli_wake_other);
+        }
+        moq_result_t w = moq_pq_threaded_wait(cli, 25000);
+        d->waits++;
+        d->last_wait = w;
+        if (w == MOQ_OK) d->wait_ok++;
+        else if (w == MOQ_DONE) { d->wait_done++; wake = 1; }
+        else if (w == MOQ_ERR_CLOSED) d->wait_closed++;
+        else d->wait_other++;
+
+        /* A terminal or unexpected wait result is reported as such even if
+         * the goal also holds after that same wait. */
+        if (w == MOQ_ERR_CLOSED) { d->end = SMOKE_CLOSED; break; }
+        if (w != MOQ_OK && w != MOQ_DONE) { d->end = SMOKE_UNEXPECTED; break; }
+        if (goal(ctx)) { d->end = SMOKE_REACHED; break; }
+        if (smoke_ms_since(&t0) >= ceiling_ms) { d->end = SMOKE_CEILING; break; }
+    }
+    d->elapsed_ms = smoke_ms_since(&t0);
+}
+
+/* Accounting that follows from smoke_drive's control flow on every run: each
+ * wait is in exactly one class, each wake round tried both peers once, and a
+ * round follows the first wait and every MOQ_DONE except a final one. No
+ * unexpected wait or wake class is accepted. */
+static void smoke_drive_check(const smoke_drive_t *d)
+{
+    CHECK(d->wait_ok + d->wait_done + d->wait_closed + d->wait_other ==
+          d->waits);
+    CHECK(d->wake_rounds ==
+          1 + d->wait_done - (d->last_wait == MOQ_DONE ? 1 : 0));
+    CHECK(d->srv_wake_ok + d->srv_wake_closed + d->srv_wake_internal +
+          d->srv_wake_other == d->wake_rounds);
+    CHECK(d->cli_wake_ok + d->cli_wake_closed + d->cli_wake_internal +
+          d->cli_wake_other == d->wake_rounds);
+    CHECK(d->wait_other == 0);
+    CHECK(d->srv_wake_other == 0);
+    CHECK(d->cli_wake_other == 0);
+}
+
+static void smoke_drive_report(const char *arm, const smoke_drive_t *d)
+{
+    fprintf(stderr,
+        "smoke %s: end=%s elapsed_ms=%lld waits=%d (ok=%d done=%d "
+        "closed=%d unexpected=%d last=%d) wake_rounds=%d\n",
+        arm, smoke_end_name(d->end), (long long)d->elapsed_ms, d->waits,
+        d->wait_ok, d->wait_done, d->wait_closed, d->wait_other,
+        (int)d->last_wait, d->wake_rounds);
+}
+
+static int smoke_goal_received(void *ctx)
+{
+    return __atomic_load_n(&((smoke_cli_t *)ctx)->received, __ATOMIC_ACQUIRE);
+}
+
+static int smoke_goal_done_or_closed(void *ctx)
+{
+    smoke_cli_t *c = (smoke_cli_t *)ctx;
+    return __atomic_load_n(&c->done, __ATOMIC_ACQUIRE) ||
+           __atomic_load_n(&c->session_closed, __ATOMIC_ACQUIRE);
+}
+
+/* Process CPU time (all threads), in milliseconds. */
+static int64_t smoke_cpu_ms(void)
+{
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return -1;
+    return (int64_t)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000 +
+           (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000;
 }
 
 /* -- Multi-connection server test (raw session on both sides) -------- *
@@ -584,6 +838,55 @@ static void make_server_cfg_real(moq_pq_threaded_cfg_t *cfg,
     cfg->port = 14600 + (rand() % 400);
     cfg->on_lane_pump = dummy_pump;
     cfg->insecure_skip_verify = true;
+}
+
+/* A facade smoke pair on `port`, configured as facade_smoke_object's. Returns
+ * false with nothing left running if either side fails to start. */
+static bool smoke_pair_start(int port, smoke_srv_t *ss, smoke_cli_t *cs,
+                             moq_pq_threaded_t **srv, moq_pq_threaded_t **cli)
+{
+    *srv = NULL;
+    *cli = NULL;
+    moq_pq_threaded_cfg_t sc;
+    make_server_cfg_real(&sc, moq_alloc_default());
+    sc.port = port;
+    sc.send_request_capacity = true;
+    sc.initial_request_capacity = 64;
+    sc.on_lane_pump = smoke_srv_pump;
+    sc.on_lane_pump_ctx = ss;
+    if (moq_pq_threaded_create(&sc, srv) != MOQ_OK)
+        return false;
+
+    moq_pq_threaded_cfg_t cc;
+    moq_pq_threaded_cfg_init_sized(&cc, sizeof(cc));
+    cc.alloc = moq_alloc_default();
+    cc.perspective = MOQ_PERSPECTIVE_CLIENT;
+    cc.host = "localhost";
+    cc.port = port;
+    cc.insecure_skip_verify = true;
+    cc.send_request_capacity = true;
+    cc.initial_request_capacity = 64;
+    cc.on_lane_pump = smoke_cli_pump;
+    cc.on_lane_pump_ctx = cs;
+    if (moq_pq_threaded_create(&cc, cli) != MOQ_OK) {
+        moq_pq_threaded_stop(*srv);
+        moq_pub_destroy(ss->pub);
+        moq_pq_threaded_destroy(*srv);
+        *srv = NULL;
+        return false;
+    }
+    return true;
+}
+
+static void smoke_pair_stop(smoke_srv_t *ss, smoke_cli_t *cs,
+                            moq_pq_threaded_t *srv, moq_pq_threaded_t *cli)
+{
+    moq_pq_threaded_stop(cli);
+    moq_sub_destroy(cs->sub);
+    moq_pq_threaded_destroy(cli);
+    moq_pq_threaded_stop(srv);
+    moq_pub_destroy(ss->pub);
+    moq_pq_threaded_destroy(srv);
 }
 #endif
 
@@ -1801,7 +2104,8 @@ int main(void)
             a_cfg.insecure_skip_verify = false;       /* verify the cert */
             a_cfg.configure_quic = configure_quic_verify;
             moq_pq_threaded_t *a = NULL;
-            if (moq_pq_threaded_create(&a_cfg, &a) == MOQ_OK && a) {
+            int a_created = (moq_pq_threaded_create(&a_cfg, &a) == MOQ_OK && a);
+            if (a_created) {
                 for (int tries = 0; tries < 120; tries++) {
                     moq_pq_threaded_wait(a, 50000);
                     moq_session_t *s = moq_pq_threaded_session(a);
@@ -1851,10 +2155,22 @@ int main(void)
             /* Only assert once the control proves the server served here
              * (rules out a dead/unbound/busy-port false positive). */
             if (b_reachable) {
+                /* Client A must never establish an unverified session. HOW it
+                 * fails is provider-dependent, and the provider is the
+                 * CONFIGURED one: with an implicit system store the client is
+                 * created and then fails the handshake terminally; without one
+                 * there is nothing to verify against and the create is refused
+                 * outright, which is the same fail-closed property reached
+                 * earlier. */
                 CHECK(!a_established);                 /* never established */
+#if defined(MOQ_TEST_VERIFY_BACKEND_MBEDTLS)
+                CHECK(!a_created);                     /* refused before the wire */
+#else
+                CHECK(a_created);
                 CHECK(a_fatal);                        /* failed closed: fatal */
                 CHECK(a_fatal_code == 0);              /* transport-level */
                 CHECK(a_wait == MOQ_ERR_CLOSED);       /* terminal via wait() */
+#endif
                 proven = 1;
             }
         }
@@ -1866,7 +2182,11 @@ int main(void)
     {
         int server_port = 14600 + (rand() % 400);
 
-        smoke_srv_t srv_state = { NULL, NULL, 0 };
+        smoke_srv_t srv_state;
+        memset(&srv_state, 0, sizeof(srv_state));
+#ifdef MOQ_TEST_THREADED_TRACE
+    srv_state.tr.last_state = -1;
+#endif
         moq_pq_threaded_cfg_t srv_cfg;
         make_server_cfg_real(&srv_cfg, moq_alloc_default());
         srv_cfg.port = server_port;
@@ -1880,6 +2200,9 @@ int main(void)
 
         if (src == MOQ_OK) {
             smoke_cli_t cli_state = {0};
+#ifdef MOQ_TEST_THREADED_TRACE
+            cli_state.tr.last_state = -1;
+#endif
             moq_pq_threaded_cfg_t cli_cfg;
             moq_pq_threaded_cfg_init_sized(&cli_cfg, sizeof(cli_cfg));
             cli_cfg.alloc = moq_alloc_default();
@@ -1896,15 +2219,145 @@ int main(void)
             CHECK(crc == MOQ_OK);
 
             if (crc == MOQ_OK) {
-                /* Drive both sides until client receives the object. */
-                for (int tries = 0; tries < 400; tries++) {
-                    moq_pq_threaded_wake(srv);
-                    moq_pq_threaded_wake(cli);
-                    moq_pq_threaded_wait(cli, 25000);
-                    if (__atomic_load_n(&cli_state.received,
-                            __ATOMIC_ACQUIRE))
-                        break;
+                /* Drive both sides until the client receives the object, for
+                 * up to 10 s of wall-clock time. */
+                smoke_drive_t d;
+                smoke_drive(srv, cli, smoke_goal_received, &cli_state, 10000,
+                            &d);
+                smoke_drive_check(&d);
+                if (d.end != SMOKE_REACHED)
+                    smoke_drive_report("object", &d);
+                CHECK(d.end == SMOKE_REACHED);
+
+#ifdef MOQ_TEST_THREADED_TRACE
+                /* Name the FIRST missing causal edge, from state the NETWORK
+                 * thread recorded in its own pump. Nothing here dereferences a
+                 * moq_session_t from this thread. Observation only: no bound,
+                 * timing, or assertion is changed. */
+                {
+                    int c_sess = __atomic_load_n(&cli_state.tr.saw_session,
+                                                 __ATOMIC_ACQUIRE);
+                    int s_sess = __atomic_load_n(&srv_state.tr.saw_session,
+                                                 __ATOMIC_ACQUIRE);
+                    int track_added = __atomic_load_n(&srv_state.track_added,
+                                                      __ATOMIC_ACQUIRE);
+                    int ns_acc = __atomic_load_n(&srv_state.namespace_accepted,
+                                                 __ATOMIC_ACQUIRE);
+                    int sub_iss = __atomic_load_n(&cli_state.sub_issued,
+                                                  __ATOMIC_ACQUIRE);
+                    int subscribed = __atomic_load_n(&cli_state.subscribed,
+                                                     __ATOMIC_ACQUIRE);
+                    int has_sub = __atomic_load_n(&srv_state.has_subscriber,
+                                                  __ATOMIC_ACQUIRE);
+                    int w_try = __atomic_load_n(&srv_state.write_attempted,
+                                                __ATOMIC_ACQUIRE);
+                    /* The functional latch IS the local-write-accepted edge. */
+                    int w_ok = __atomic_load_n(&srv_state.obj_written,
+                                               __ATOMIC_ACQUIRE);
+                    int received = __atomic_load_n(&cli_state.received,
+                                                   __ATOMIC_ACQUIRE);
+                    int payload_ok = __atomic_load_n(&cli_state.payload_ok,
+                                                     __ATOMIC_ACQUIRE);
+                    /* Causally ordered. `local-write-accepted` is the LAST
+                     * server-side edge the facade exposes: there is no
+                     * wire-send observation, so none is invented.
+                     *
+                     * `namespace-accepted` is deliberately NOT a gate here.
+                     * Measured: fully successful runs on both providers report
+                     * it false (subscription and delivery complete without it
+                     * in this SUBSCRIBE-driven flow), so gating on it would
+                     * mislabel a passing run. It is recorded as an edge below
+                     * and judged by nothing. */
+                    const char *first_missing =
+                        (!c_sess)     ? "client-session"        :
+                        (!s_sess)     ? "server-session"        :
+                        (!track_added)? "track-added"           :
+                        (!sub_iss)    ? "subscription-issued"   :
+                        (!subscribed) ? "subscribed"            :
+                        (!has_sub)    ? "server-sees-subscriber":
+                        (!w_try)      ? "write-attempted"       :
+                        (!w_ok)       ? "local-write-accepted"  :
+                        (!received)   ? "object-received"       :
+                        (!payload_ok) ? "payload-matched"       : "none";
+
+                    CHECK(!__atomic_load_n(&cli_state.tr.state_overflow,
+                                           __ATOMIC_ACQUIRE));
+                    CHECK(!__atomic_load_n(&srv_state.tr.state_overflow,
+                                           __ATOMIC_ACQUIRE));
+
+                    fprintf(stderr,
+                        "TRACE smoke port=%d src=%d crc=%d end=%s "
+                        "elapsed_ms=%lld waits=%d last_wait=%d "
+                        "first_missing=%s\n",
+                        server_port, (int)src, (int)crc,
+                        smoke_end_name(d.end), (long long)d.elapsed_ms,
+                        d.waits, (int)d.last_wait, first_missing);
+                    /* The drive runs BEFORE either side reaches a terminal
+                     * state, so the contract is exact rather than merely
+                     * accounted for: every wake round's wake on either side
+                     * returns MOQ_OK. A sum-only check would accept a
+                     * MOQ_ERR_CLOSED or MOQ_ERR_INTERNAL wake whenever a later
+                     * round still delivered the object.
+                     *
+                     * Pinned per side and per class; smoke_drive_check pins
+                     * the sums -- so a count-preserving misclassification
+                     * fails the class oracle while the totals still agree. */
+                    CHECK(d.srv_wake_ok == d.wake_rounds);
+                    CHECK(d.srv_wake_closed == 0);
+                    CHECK(d.srv_wake_internal == 0);
+                    CHECK(d.srv_wake_other == 0);
+                    CHECK(d.cli_wake_ok == d.wake_rounds);
+                    CHECK(d.cli_wake_closed == 0);
+                    CHECK(d.cli_wake_internal == 0);
+                    CHECK(d.cli_wake_other == 0);
+                    fprintf(stderr,
+                        "TRACE   wakes rounds=%d srv ok=%d closed=%d "
+                        "internal=%d other=%d | cli ok=%d closed=%d "
+                        "internal=%d other=%d | waits ok=%d done=%d "
+                        "closed=%d unexpected=%d\n",
+                        d.wake_rounds,
+                        d.srv_wake_ok, d.srv_wake_closed, d.srv_wake_internal,
+                        d.srv_wake_other,
+                        d.cli_wake_ok, d.cli_wake_closed, d.cli_wake_internal,
+                        d.cli_wake_other,
+                        d.wait_ok, d.wait_done, d.wait_closed, d.wait_other);
+                    fprintf(stderr,
+                        "TRACE   edges track_added=%d ns_accepted=%d "
+                        "sub_issued=%d subscribed=%d has_subscriber=%d "
+                        "write_attempted=%d local_write_accepted=%d "
+                        "received=%d payload_ok=%d\n",
+                        track_added, ns_acc, sub_iss, subscribed, has_sub,
+                        w_try, w_ok, received, payload_ok);
+                    /* Thread-safe facade observations backing any "no fatal or
+                     * terminal code" statement. These are facade accessors, not
+                     * sans-I/O session reads. */
+                    fprintf(stderr,
+                        "TRACE   terminal cli fatal=%d code=%llu term=%llu "
+                        "| srv fatal=%d code=%llu term=%llu\n",
+                        (int)moq_pq_threaded_is_fatal(cli),
+                        (unsigned long long)moq_pq_threaded_fatal_code(cli),
+                        (unsigned long long)moq_pq_threaded_terminal_error(cli),
+                        (int)moq_pq_threaded_is_fatal(srv),
+                        (unsigned long long)moq_pq_threaded_fatal_code(srv),
+                        (unsigned long long)moq_pq_threaded_terminal_error(srv));
+                    for (int side = 0; side < 2; side++) {
+                        const trace_side_t *ts = side ? &srv_state.tr
+                                                      : &cli_state.tr;
+                        int n = __atomic_load_n(&ts->state_n, __ATOMIC_ACQUIRE);
+                        fprintf(stderr, "TRACE   %s saw_session=%d states=[",
+                                side ? "srv" : "cli",
+                                __atomic_load_n(&ts->saw_session,
+                                                __ATOMIC_ACQUIRE));
+                        for (int i = 0; i < n; i++)
+                            fprintf(stderr, "%s%d", i ? "," : "",
+                                    __atomic_load_n(&ts->states[i],
+                                                    __ATOMIC_ACQUIRE));
+                        fprintf(stderr, "] overflow=%d\n",
+                                __atomic_load_n(&ts->state_overflow,
+                                                __ATOMIC_ACQUIRE));
+                    }
                 }
+#endif
 
                 CHECK(__atomic_load_n(&srv_state.obj_written,
                     __ATOMIC_ACQUIRE));
@@ -1917,15 +2370,13 @@ int main(void)
                  * verify it fires on_subscribe_done with the status WITHOUT
                  * closing the session. */
                 __atomic_store_n(&srv_state.do_finish, 1, __ATOMIC_RELEASE);
-                for (int tries = 0; tries < 400; tries++) {
-                    moq_pq_threaded_wake(srv);
-                    moq_pq_threaded_wake(cli);
-                    moq_pq_threaded_wait(cli, 25000);
-                    if (__atomic_load_n(&cli_state.done, __ATOMIC_ACQUIRE) ||
-                        __atomic_load_n(&cli_state.session_closed,
-                            __ATOMIC_ACQUIRE))
-                        break;
-                }
+                smoke_drive_t fd;
+                smoke_drive(srv, cli, smoke_goal_done_or_closed, &cli_state,
+                            10000, &fd);
+                smoke_drive_check(&fd);
+                if (fd.end != SMOKE_REACHED)
+                    smoke_drive_report("finish", &fd);
+                CHECK(fd.end == SMOKE_REACHED);
                 CHECK(__atomic_load_n(&srv_state.finished, __ATOMIC_ACQUIRE));
                 CHECK(__atomic_load_n(&cli_state.done, __ATOMIC_ACQUIRE) == 1);
                 CHECK(__atomic_load_n(&cli_state.done_status,
@@ -1943,6 +2394,85 @@ int main(void)
             moq_pq_threaded_destroy(srv);
         }
         PASS("facade_smoke_object");
+    }
+
+    /* -- Facade smoke: the server's network thread stalls once ---------- */
+    /* One 20 ms stall in the first server pump that sees a session -- a
+     * descheduled network thread under load. The client keeps cycling
+     * meanwhile, so a budget counted in waits runs out during the stall; the
+     * wall-clock ceiling has to carry the object across it. */
+    {
+        smoke_srv_t ss;
+        memset(&ss, 0, sizeof(ss));
+        ss.stall_first_pump_us = 20000;
+        smoke_cli_t cs;
+        memset(&cs, 0, sizeof(cs));
+#ifdef MOQ_TEST_THREADED_TRACE
+        ss.tr.last_state = -1;
+        cs.tr.last_state = -1;
+#endif
+        moq_pq_threaded_t *srv = NULL, *cli = NULL;
+        bool started = smoke_pair_start(14600 + (rand() % 400), &ss, &cs,
+                                        &srv, &cli);
+        CHECK(started);
+        if (started) {
+            int64_t cpu0 = smoke_cpu_ms();
+            smoke_drive_t d;
+            smoke_drive(srv, cli, smoke_goal_received, &cs, 10000, &d);
+            int64_t cpu1 = smoke_cpu_ms();
+            smoke_drive_check(&d);
+            smoke_drive_report("server-stall", &d);
+            fprintf(stderr, "smoke server-stall: process_cpu_ms=%lld\n",
+                    (long long)(cpu1 - cpu0));
+            CHECK(__atomic_load_n(&ss.stalled, __ATOMIC_ACQUIRE));
+            CHECK(d.end == SMOKE_REACHED);
+            CHECK(__atomic_load_n(&ss.obj_written, __ATOMIC_ACQUIRE));
+            CHECK(__atomic_load_n(&cs.received, __ATOMIC_ACQUIRE));
+            CHECK(__atomic_load_n(&cs.payload_ok, __ATOMIC_ACQUIRE));
+            smoke_pair_stop(&ss, &cs, srv, cli);
+        }
+        PASS("facade_smoke_server_stall");
+    }
+
+    /* -- Facade smoke: a peer that never publishes ----------------------- */
+    /* The server never publishes, so the goal cannot be reached: the drive
+     * must end at its wall-clock ceiling, named as such, and not before it.
+     * The same ceiling bounds facade_smoke_object at 10 s; 300 ms keeps this
+     * arm short. */
+    {
+        smoke_srv_t ss;
+        memset(&ss, 0, sizeof(ss));
+        ss.withhold = 1;
+        smoke_cli_t cs;
+        memset(&cs, 0, sizeof(cs));
+#ifdef MOQ_TEST_THREADED_TRACE
+        ss.tr.last_state = -1;
+        cs.tr.last_state = -1;
+#endif
+        moq_pq_threaded_t *srv = NULL, *cli = NULL;
+        bool started = smoke_pair_start(14600 + (rand() % 400), &ss, &cs,
+                                        &srv, &cli);
+        CHECK(started);
+        if (started) {
+            int64_t cpu0 = smoke_cpu_ms();
+            smoke_drive_t d;
+            smoke_drive(srv, cli, smoke_goal_received, &cs, 300, &d);
+            int64_t cpu1 = smoke_cpu_ms();
+            smoke_drive_check(&d);
+            smoke_drive_report("no-progress", &d);
+            fprintf(stderr, "smoke no-progress: process_cpu_ms=%lld\n",
+                    (long long)(cpu1 - cpu0));
+            CHECK(d.end == SMOKE_CEILING);
+            CHECK(d.elapsed_ms >= 300);
+            /* Not vacuous: the client reached an established session and the
+             * server withheld with a live session of its own. */
+            CHECK(__atomic_load_n(&cs.established, __ATOMIC_ACQUIRE));
+            CHECK(__atomic_load_n(&ss.withheld, __ATOMIC_ACQUIRE));
+            CHECK(!__atomic_load_n(&ss.obj_written, __ATOMIC_ACQUIRE));
+            CHECK(!__atomic_load_n(&cs.received, __ATOMIC_ACQUIRE));
+            smoke_pair_stop(&ss, &cs, srv, cli);
+        }
+        PASS("facade_smoke_no_progress_ceiling");
     }
 
 #else

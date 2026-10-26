@@ -98,6 +98,62 @@ include(GNUInstallDirs)
 
 if(MOQ_BUILD_TESTS)
     enable_testing()
+    # A test that configures and builds an independent consumer project fails
+    # on any warning that nested build prints, not only on its exit status.
+    # These patterns mirror the classifier in tests/moq_subprocess_warnings.cmake:
+    # CMake warning banners, compiler/linker `warning:` lines (including the
+    # `ld:` forms), MSVC's form, and -Werror-promoted warnings by their [-W...]
+    # tag. The promoted pattern must stay LAST: its unmatched `[` stops CMake
+    # from splitting the list at any later `;`, which would silently fuse the
+    # following pattern into it.
+    set(MOQ_NESTED_BUILD_WARNING_REGEX
+        "CMake Warning"
+        "CMake Deprecation Warning"
+        "(^|[ \t\n])warning:"
+        "warning C[0-9]+:"
+        "error:[^\n]*\\[-W")
+
+    # A test-owned nested consumer that links this build's static archives must
+    # link the sanitizer runtimes those archives were instrumented for. Only the
+    # sanitizer options are taken from the parent's compile and link flags, so
+    # an ordinary parent passes nothing and a nested build never inherits
+    # unrelated parent flags. These values reach test consumers only; nothing
+    # installed or exported carries them.
+    function(_moq_sanitizer_options out flags)
+        separate_arguments(_moq_so_tokens UNIX_COMMAND "${flags}")
+        set(_moq_so_keep "")
+        foreach(_moq_so_t IN LISTS _moq_so_tokens)
+            if(_moq_so_t MATCHES "^-f(no-)?sanitize")
+                list(APPEND _moq_so_keep "${_moq_so_t}")
+            endif()
+        endforeach()
+        string(JOIN " " _moq_so_joined ${_moq_so_keep})
+        set(${out} "${_moq_so_joined}" PARENT_SCOPE)
+    endfunction()
+    _moq_sanitizer_options(MOQ_NESTED_SANITIZER_C_FLAGS "${CMAKE_C_FLAGS}")
+    _moq_sanitizer_options(MOQ_NESTED_SANITIZER_LINK_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
+    # The same options as `-D` arguments for a nested configure run through a
+    # shell command line; empty when the parent uses no sanitizer.
+    set(MOQ_NESTED_SANITIZER_SHELL_ARGS "")
+    if(MOQ_NESTED_SANITIZER_C_FLAGS)
+        string(APPEND MOQ_NESTED_SANITIZER_SHELL_ARGS
+            " -DCMAKE_C_FLAGS='${MOQ_NESTED_SANITIZER_C_FLAGS}'")
+    endif()
+    if(MOQ_NESTED_SANITIZER_LINK_FLAGS)
+        string(APPEND MOQ_NESTED_SANITIZER_SHELL_ARGS
+            " -DCMAKE_EXE_LINKER_FLAGS='${MOQ_NESTED_SANITIZER_LINK_FLAGS}'")
+    endif()
+    # ... and as named arguments for a nested driver script: one element per
+    # option that is present, none for an ordinary parent.
+    set(MOQ_NESTED_SANITIZER_DRIVER_ARGS "")
+    if(MOQ_NESTED_SANITIZER_C_FLAGS)
+        list(APPEND MOQ_NESTED_SANITIZER_DRIVER_ARGS
+            "--sanitizer-c-flags=${MOQ_NESTED_SANITIZER_C_FLAGS}")
+    endif()
+    if(MOQ_NESTED_SANITIZER_LINK_FLAGS)
+        list(APPEND MOQ_NESTED_SANITIZER_DRIVER_ARGS
+            "--sanitizer-link-flags=${MOQ_NESTED_SANITIZER_LINK_FLAGS}")
+    endif()
 endif()
 
 # The project is C by default. The mvfst and proxygen adapters are C++ (folly/
@@ -179,6 +235,7 @@ if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
     list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
     find_package(Picoquic REQUIRED)
     include(MoqPicoquicPkgConfig)
+    include(MoqPicoquicLink)
 endif()
 
 if(MOQ_BUILD_ADAPTER_PICOQUIC)
@@ -353,6 +410,11 @@ install(EXPORT libmoqTargets
     NAMESPACE moq::
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 
+# ONE provider-guard implementation, injected verbatim into BOTH generated
+# configs so the two trees cannot drift.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/libmoq_provider_guard.cmake.in"
+     MOQ_PROVIDER_GUARD)
+
 configure_package_config_file(
     cmake/libmoqConfig.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/cmake-install/libmoqConfig.cmake
@@ -374,30 +436,35 @@ if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 endif()
 
-# Stage the upstream picoquic static archives into the prefix libdir. The
+# Install the picoquic libraries LibMoQ's own package links against. The
 # generated pkg-config files reference them with -L${libdir} (-lpicoquic-core
-# / -lpicoquic-log in libmoq.pc, plus -lpicohttp-core in the pico WT .pc), but
-# picoquic ships no install rules -- so without this a clean
-# `pkg-config --libs libmoq` link fails with "library 'picoquic-core' not
-# found". In source-tree mode they are add_subdirectory targets we can stage;
-# imported/system picoquic provides its own library location (out of scope).
+# / -lpicoquic-log in libmoq.pc, plus -lpicohttp-core in the pico WT .pc).
+# picoquic has install rules of its own, but in source-tree mode it is added
+# EXCLUDE_FROM_ALL (cmake/FindPicoquic.cmake), which keeps them -- and the
+# upstream headers and package exports they carry -- out of this install. So
+# LibMoQ installs just these targets itself, as targets: a shared library is
+# installed with CMake's install-time handling (its build-tree runtime path is
+# dropped), which a plain file copy would not do. Imported/system picoquic
+# provides its own library location (out of scope).
 if(MOQ_PICOQUIC_SOURCE_DIR)
-    set(_moq_pq_install_archives "")
+    set(_moq_pq_install_targets "")
     foreach(_moq_pq_target picoquic-core picoquic-log)
         if(TARGET ${_moq_pq_target})
-            list(APPEND _moq_pq_install_archives ${_moq_pq_target})
+            list(APPEND _moq_pq_install_targets ${_moq_pq_target})
         endif()
     endforeach()
     # picohttp-core (picoquic HTTP/3) is only built and referenced when a
     # WebTransport adapter is enabled.
     if((MOQ_BUILD_ADAPTER_PICO_WT OR MOQ_BUILD_PICO_WT_MANAGED)
        AND TARGET picohttp-core)
-        list(APPEND _moq_pq_install_archives picohttp-core)
+        list(APPEND _moq_pq_install_targets picohttp-core)
     endif()
-    foreach(_moq_pq_target IN LISTS _moq_pq_install_archives)
-        install(FILES $<TARGET_FILE:${_moq_pq_target}>
-            DESTINATION ${CMAKE_INSTALL_LIBDIR})
-    endforeach()
+    if(_moq_pq_install_targets)
+        install(TARGETS ${_moq_pq_install_targets}
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
 endif()
 
 install(FILES LICENSE.txt
@@ -566,12 +633,34 @@ export(EXPORT libmoqTargets
 set(_build_tree_config "include(CMakeFindDependencyMacro)\n")
 string(APPEND _build_tree_config
     "set(_LIBMOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL ${MOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL})\n"
+    # The provider record this artifact was actually built with. Exactly one
+    # active assignment per key, identical in shape to the install tree's.
+    "set(_LIBMOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND ${MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND})\n"
+    "set(_LIBMOQ_PICOQUIC_WITH_OPENSSL ${MOQ_PARENT_WITH_OPENSSL})\n"
+    "set(_LIBMOQ_PICOQUIC_WITH_MBEDTLS ${MOQ_PARENT_WITH_MBEDTLS})\n"
+    # The picotls artifacts this artifact's picoquic was ACTUALLY resolved
+    # against. BUILD TREE ONLY: a build-tree config is already non-relocatable
+    # (it bakes this source directory), so consuming it in place may use the
+    # locations this build resolved. The INSTALL tree deliberately records
+    # none of these -- see cmake/libmoqConfig.cmake.in.
+    "set(_LIBMOQ_PICOTLS_PREFIX \"${MOQ_PICOTLS_PREFIX}\")\n"
+    "set(_LIBMOQ_PTLS_INCLUDE_DIR \"${PTLS_INCLUDE_DIR}\")\n"
+    "set(_LIBMOQ_PTLS_CORE_LIBRARY \"${MOQ_PARENT_PTLS_CORE}\")\n"
+    "set(_LIBMOQ_PTLS_MINICRYPTO_LIBRARY \"${MOQ_PARENT_PTLS_MINICRYPTO}\")\n"
+    # ... and, for an mbedTLS artifact, the mbedTLS installation it was
+    # resolved against.
+    "set(_LIBMOQ_MBEDTLS_INCLUDE_DIR \"${MBEDTLS_INCLUDE_DIR}\")\n"
+    "set(_LIBMOQ_MBEDTLS_LIBRARY \"${MBEDTLS_LIBRARY}\")\n"
+    "set(_LIBMOQ_MBEDTLS_CRYPTO \"${MBEDTLS_CRYPTO}\")\n"
+    "set(_LIBMOQ_MBEDTLS_X509 \"${MBEDTLS_X509}\")\n"
+    "set(_LIBMOQ_PICOQUIC_MBEDTLS_INCLUDE_DIR \"${MOQ_PICOQUIC_MBEDTLS_INCLUDE_DIR}\")\n"
+    "${MOQ_PROVIDER_GUARD}\n"
     "macro(_libmoq_find_adapter_picoquic_deps)\n"
     "  list(APPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/cmake\")\n"
     "  if(_LIBMOQ_ADAPTER_PICOQUIC_NEEDS_OPENSSL)\n"
     "    find_dependency(OpenSSL)\n"
     "  endif()\n"
-    "  find_dependency(Picoquic)\n"
+    "  _libmoq_resolve_picoquic()\n"
     "endmacro()\n")
 string(APPEND _build_tree_config
     "include(\"\${CMAKE_CURRENT_LIST_DIR}/libmoqTargets.cmake\")\n")

@@ -352,8 +352,30 @@ static int poll_counts(moq_media_receiver_t *r, moq_media_track_t *v,
 static bool ts_is(moq_media_receiver_t *r, moq_media_track_t *t,
                   moq_media_track_state_t want)
 {
-    moq_media_track_state_t got;
-    return moq_media_receiver_track_state(r, t, &got) == MOQ_OK && got == want;
+    moq_media_track_state_t got = (moq_media_track_state_t)-1;
+    moq_result_t rc = moq_media_receiver_track_state(r, t, &got);
+    if (rc == MOQ_OK && got == want)
+        return true;
+    /* The state is a point-in-time answer; name what was observed so a
+     * mismatch is diagnosable rather than a bare boolean. */
+    fprintf(stderr, "track state: rc=%d got=%d want=%d\n",
+            (int)rc, (int)got, (int)want);
+    return false;
+}
+
+/* The two inactive answers for a track whose only subscription was withdrawn
+ * before this point: DISCOVERED when no request was ever issued for it, and
+ * PAUSED_APP when one was issued and then disabled. */
+static bool ts_inactive(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    moq_media_track_state_t got = (moq_media_track_state_t)-1;
+    moq_result_t rc = moq_media_receiver_track_state(r, t, &got);
+    if (rc == MOQ_OK && (got == MOQ_MEDIA_TRACK_STATE_DISCOVERED ||
+                         got == MOQ_MEDIA_TRACK_STATE_PAUSED_APP))
+        return true;
+    fprintf(stderr, "track state: rc=%d got=%d want=DISCOVERED|PAUSED_APP\n",
+            (int)rc, (int)got);
+    return false;
 }
 
 int main(int argc, char **argv)
@@ -423,9 +445,16 @@ int main(int argc, char **argv)
         poll_counts(r, v, a, 6, 120, &nv, &na);
         MOQ_TEST_CHECK(nv > 0);
         MOQ_TEST_CHECK_EQ_INT(na, 0);
-        /* Delivering now: ACTIVE; the unsubscribed audio is still DISCOVERED. */
+        /* Delivering now: video is ACTIVE and no audio arrived (na == 0 above).
+         * Audio was subscribed and at once unsubscribed while the network
+         * thread was live, so whether its request was issued in between is a
+         * scheduling fact this row cannot observe: never issued reads
+         * DISCOVERED, issued-then-disabled reads PAUSED_APP. Either is an
+         * inactive answer. The exact DISCOVERED contract (never subscribed) is
+         * pinned before any subscription above; the exact PAUSED_APP contract
+         * (established, then disabled) by the video unsubscribe row below. */
         MOQ_TEST_CHECK(ts_is(r, v, MOQ_MEDIA_TRACK_STATE_ACTIVE));
-        MOQ_TEST_CHECK(ts_is(r, a, MOQ_MEDIA_TRACK_STATE_DISCOVERED));
+        MOQ_TEST_CHECK(ts_inactive(r, a));
 
         moq_media_receiver_destroy(r);
         moq_pq_threaded_stop(srv);

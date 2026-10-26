@@ -1,0 +1,35 @@
+Initialize the point-addition scratch array in micro-ecc.
+
+XYcZ_add and XYcZ_addC declare t5 uninitialized and first write it with
+uECC_vli_modSub, which sets every word in [0, num_words); uECC_vli_mult then
+reads only that range. At -O3, GCC 12 inlines the square/multiply wrappers and
+cannot relate the two loop bounds, so it reports "t5 may be used
+uninitialized" when t5 reaches uECC_vli_mult through its const arguments, and
+a -Werror Release build of picotls-minicrypto fails. Zero-initializing t5 in
+the two functions gives the array a defined value before that first write; the
+arithmetic is unchanged.
+
+Applies to picotls 7c32032f91449d695b24b82955f20d04d47e6cff.
+
+diff --git a/deps/micro-ecc/uECC.c b/deps/micro-ecc/uECC.c
+index a3224dd..ca23e1d 100644
+--- a/deps/micro-ecc/uECC.c
++++ b/deps/micro-ecc/uECC.c
+@@ -796,7 +796,7 @@ static void XYcZ_add(uECC_word_t * X1,
+                      uECC_word_t * Y2,
+                      uECC_Curve curve) {
+     /* t1 = X1, t2 = Y1, t3 = X2, t4 = Y2 */
+-    uECC_word_t t5[uECC_MAX_WORDS];
++    uECC_word_t t5[uECC_MAX_WORDS] = {0};
+     wordcount_t num_words = curve->num_words;
+
+     uECC_vli_modSub(t5, X2, X1, curve->p, num_words); /* t5 = x2 - x1 */
+@@ -827,7 +827,7 @@ static void XYcZ_addC(uECC_word_t * X1,
+                       uECC_word_t * Y2,
+                       uECC_Curve curve) {
+     /* t1 = X1, t2 = Y1, t3 = X2, t4 = Y2 */
+-    uECC_word_t t5[uECC_MAX_WORDS];
++    uECC_word_t t5[uECC_MAX_WORDS] = {0};
+     uECC_word_t t6[uECC_MAX_WORDS];
+     uECC_word_t t7[uECC_MAX_WORDS];
+     wordcount_t num_words = curve->num_words;

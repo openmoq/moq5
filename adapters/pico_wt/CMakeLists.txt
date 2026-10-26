@@ -42,8 +42,19 @@ target_include_directories(moq-adapter-pico-wt
 # BUILD_INTERFACE: the install-tree link interface is hand-written in
 # the generated targets file (referencing picoquic::picohttp-core), so
 # the build-tree target name must never leak into an export.
+#
+# picohttp-core brings picoquic-core and picoquic-log, but those two are
+# mutually dependent archives with only log -> core declared: the adapter
+# carries their whole closure too (cmake/MoqPicoquicLink.cmake), so a one-pass
+# linker still finds log after every core object it pulls.
+set(_PICOWT_PQ_LOG "")
+if(TARGET picoquic::picoquic-log)
+    set(_PICOWT_PQ_LOG picoquic::picoquic-log)
+endif()
+moq_picoquic_build_link_closure(_PICOWT_PQ_CLOSURE_BUILD
+    picoquic::picoquic-core ${_PICOWT_PQ_LOG})
 target_link_libraries(moq-adapter-pico-wt
-    PUBLIC moq::core $<BUILD_INTERFACE:${_PICOHTTP}>
+    PUBLIC moq::core $<BUILD_INTERFACE:${_PICOHTTP}> ${_PICOWT_PQ_CLOSURE_BUILD}
 )
 
 # Export public symbols past C_VISIBILITY_PRESET hidden (MOQ_API).
@@ -64,7 +75,8 @@ endif()
 # adapter-pico-wt)` works against ${PROJECT_BINARY_DIR}, mirroring the
 # picoquic adapter. The install-tree counterpart is generated in the
 # install section below.
-set(_picowt_link "moq::core;${_PICOHTTP}")
+moq_picoquic_link_closure(_PICOWT_PQ_CLOSURE picoquic::picoquic-core ${_PICOWT_PQ_LOG})
+set(_picowt_link "moq::core;${_PICOHTTP};${_PICOWT_PQ_CLOSURE}")
 file(GENERATE
     OUTPUT "${PROJECT_BINARY_DIR}/libmoqPicoWtAdapterTargets.cmake"
     CONTENT "\
@@ -208,7 +220,8 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
                  -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
              '${CMAKE_COMMAND}' --build '${_picowt_consumer_bld}' && \
              '${_picowt_consumer_bld}/moq_pico_wt_adapter_consumer_test'")
-    set_tests_properties(pico_wt_adapter_consumer PROPERTIES TIMEOUT 180)
+    set_tests_properties(pico_wt_adapter_consumer PROPERTIES TIMEOUT 180
+        FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
 endif()
 
 # Install-tree consumer test: installs a BUILD_HTTP picoquic and libmoq
@@ -235,8 +248,10 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
             "${CMAKE_EXE_LINKER_FLAGS}"
             "${CMAKE_BUILD_TYPE}"
             "${_picowt_openssl_root}"
-            "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-work")
-    set_tests_properties(pico_wt_install_consumer PROPERTIES TIMEOUT 600)
+            "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-work"
+            "${CMAKE_INSTALL_LIBDIR}")
+    set_tests_properties(pico_wt_install_consumer PROPERTIES TIMEOUT 600
+        FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
 
     # pkg-config consumer (attach): a plain C program built with only
     # `pkg-config --cflags --libs libmoq-pico-wt` from the install prefix.
@@ -257,8 +272,16 @@ if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
                 "${CMAKE_BUILD_TYPE}"
                 "${_picowt_openssl_root}"
                 "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-consumer-work"
-                "${CMAKE_INSTALL_LIBDIR}")
-        set_tests_properties(pico_wt_pkgconfig_consumer PROPERTIES TIMEOUT 600)
+                "${CMAKE_INSTALL_LIBDIR}"
+                "${MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND}"
+                "${MOQ_PARENT_WITH_OPENSSL}"
+                "${MOQ_PARENT_WITH_MBEDTLS}"
+                "${CMAKE_PREFIX_PATH}"
+                "${MOQ_PARENT_PTLS_CORE}"
+                "${MOQ_PARENT_PTLS_MINICRYPTO}"
+                "${MOQ_PARENT_PROVENANCE_MANIFEST}")
+        set_tests_properties(pico_wt_pkgconfig_consumer PROPERTIES TIMEOUT 600
+            FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
     endif()
 endif()
 
@@ -565,7 +588,8 @@ endif()\n")
                      -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
                  '${CMAKE_COMMAND}' --build '${_picowtm_consumer_bld}' && \
                  '${_picowtm_consumer_bld}/moq_pico_wt_managed_consumer_test'")
-        set_tests_properties(pico_wt_managed_consumer PROPERTIES TIMEOUT 180)
+        set_tests_properties(pico_wt_managed_consumer PROPERTIES TIMEOUT 180
+            FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
 
         # Install-tree managed consumer: installs a BUILD_HTTP picoquic +
         # libmoq to a temp prefix and builds the managed consumer against
@@ -590,9 +614,11 @@ endif()\n")
                 "${CMAKE_EXE_LINKER_FLAGS}"
                 "${CMAKE_BUILD_TYPE}"
                 "${_picowtm_openssl_root}"
-                "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-managed-work")
+                "${CMAKE_CURRENT_BINARY_DIR}/install-consumer-managed-work"
+                "${CMAKE_INSTALL_LIBDIR}")
         set_tests_properties(pico_wt_managed_install_consumer
-            PROPERTIES TIMEOUT 600)
+            PROPERTIES TIMEOUT 600
+            FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
 
         # pkg-config consumer (managed): a plain C program built with only
         # `pkg-config --cflags --libs libmoq-pico-wt-managed` — exercises
@@ -614,9 +640,17 @@ endif()\n")
                     "${CMAKE_BUILD_TYPE}"
                     "${_picowtm_openssl_root}"
                     "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-managed-consumer-work"
-                    "${CMAKE_INSTALL_LIBDIR}")
+                    "${CMAKE_INSTALL_LIBDIR}"
+                    "${MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND}"
+                    "${MOQ_PARENT_WITH_OPENSSL}"
+                    "${MOQ_PARENT_WITH_MBEDTLS}"
+                    "${CMAKE_PREFIX_PATH}"
+                    "${MOQ_PARENT_PTLS_CORE}"
+                    "${MOQ_PARENT_PTLS_MINICRYPTO}"
+                    "${MOQ_PARENT_PROVENANCE_MANIFEST}")
             set_tests_properties(pico_wt_managed_pkgconfig_consumer
-                PROPERTIES TIMEOUT 600)
+                PROPERTIES TIMEOUT 600
+                FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
         endif()
 
         # Verifier cross-link consumer (CMake): a WT managed consumer that
@@ -646,7 +680,8 @@ endif()\n")
                  '${CMAKE_COMMAND}' --build '${_picowtmv_consumer_bld}' && \
                  '${_picowtmv_consumer_bld}/moq_pico_wt_managed_verify_consumer_test'")
         set_tests_properties(pico_wt_managed_verify_consumer
-            PROPERTIES TIMEOUT 180)
+            PROPERTIES TIMEOUT 180
+            FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
 
         # Verifier cross-link consumer (pkg-config): the Meson/autotools
         # path — `pkg-config --cflags --libs libmoq-pico-wt-managed libmoq`
@@ -668,10 +703,39 @@ endif()\n")
                     "${CMAKE_BUILD_TYPE}"
                     "${_picowtm_openssl_root}"
                     "${CMAKE_CURRENT_BINARY_DIR}/pkgconfig-managed-verify-consumer-work"
-                    "${CMAKE_INSTALL_LIBDIR}")
+                    "${CMAKE_INSTALL_LIBDIR}"
+                    "${MOQ_ADAPTER_PICOQUIC_VERIFY_BACKEND}"
+                    "${MOQ_PARENT_WITH_OPENSSL}"
+                    "${MOQ_PARENT_WITH_MBEDTLS}"
+                    "${CMAKE_PREFIX_PATH}"
+                    "${MOQ_PARENT_PTLS_CORE}"
+                    "${MOQ_PARENT_PTLS_MINICRYPTO}"
+                    "${MOQ_PARENT_PROVENANCE_MANIFEST}")
             set_tests_properties(pico_wt_managed_verify_pkgconfig_consumer
-                PROPERTIES TIMEOUT 600)
+                PROPERTIES TIMEOUT 600
+                FAIL_REGULAR_EXPRESSION "${MOQ_NESTED_BUILD_WARNING_REGEX}")
         endif()
+    endif()
+
+    # Pre-session wake acknowledgement: a managed client aimed at a locally
+    # bound UDP socket that never answers, so it stays connecting for the
+    # test's short lifetime. No server, no certs, no example driver.
+    # Loopback UDP only, so it carries the same "network" label as the
+    # other loopback managed rows.
+    if(MOQ_BUILD_TESTS AND MOQ_PICOQUIC_SOURCE_DIR)
+        add_executable(test_pico_wt_managed_presession_wake
+            tests/test_pico_wt_managed_presession_wake.c)
+        target_link_libraries(test_pico_wt_managed_presession_wake
+            PRIVATE moq::adapter-pico-wt-managed)
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pico_wt_managed_presession_wake PRIVATE
+                -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pico_wt_managed_presession_wake
+            COMMAND test_pico_wt_managed_presession_wake)
+        set_tests_properties(pico_wt_managed_presession_wake PROPERTIES
+            TIMEOUT 30
+            LABELS "network;pico_wt;managed")
     endif()
 
     # Managed client test: drives the facade against the example

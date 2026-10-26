@@ -1,0 +1,20 @@
+# Gradle local state. Nothing here is an artifact of the toolchain contract:
+# the wrapper (gradlew, gradlew.bat, gradle/wrapper/*) IS checked in and is a
+# permanent Phase 0.1 deliverable.
+.gradle/
+build/
+local.properties
+
+# Phase 0.2 NDK cross-build output (artifacts, never checked in).
+.native/
+
+# JVM fatal-error and replay dumps. A forked test worker writes these into the
+# module directory when it dies, so an adversarial mutant that crashes a JVM can
+# leave hundreds of KiB behind. They are diagnostics, never inputs, and the
+# shippable-inventory gate additionally FAILS if any survives a run.
+hs_err_pid*.log
+replay_pid*.log
+
+# Repository-local Gradle user home. Wrapper distributions, lock files and
+# partial downloads land here; all of it is regenerated local state.
+.gradle-user-home/

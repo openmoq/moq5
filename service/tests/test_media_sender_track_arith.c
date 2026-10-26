@@ -512,15 +512,20 @@ static void test_c1_defaults_exact_requests(void)
         ROW(what, "size.registry", g_ledger.requested[a.requests + 2] == 4 * sizeof(void *));
     }
     ROW(what, "registered_one", moq_media_sender_test_track_count(s) == 1);
-    ROW(what, "pre_ready_not_dirty", !moq_media_sender_test_catalog_dirty(s));
-    /* post-ready: a second add dirties the catalog (no endpoint: no wake). */
+    /* Recorded whether or not the peer has accepted yet: readiness is peer
+     * acceptance, and a mutation the initial catalog already carries dedups in
+     * the republish without a generation. */
+    ROW(what, "pre_ready_dirty", moq_media_sender_test_catalog_dirty(s));
+    /* post-ready: a second add is accepted and registered (no endpoint: no
+     * wake). The flag is already set above and nothing here stages a catalog,
+     * so it cannot discriminate this add; the clean-to-dirty transition is
+     * pinned against a real session by refresh_mutation_precedence. */
     moq_media_sender_test_set_ready(s);
     static const uint8_t NAME2[] = "audio2";
     moq_media_track_cfg_t tc2; track_cfg(&tc2);
     tc2.name = (moq_bytes_t){ NAME2, 6 };
     moq_media_track_t *t2 = NULL;
     ROW(what, "post_ready.add_ok", moq_media_sender_add_track(s, &tc2, &t2) == MOQ_OK && t2 != NULL);
-    ROW(what, "post_ready.dirty", moq_media_sender_test_catalog_dirty(s));
     ROW(what, "post_ready.registered_two", moq_media_sender_test_track_count(s) == 2);
     finish(what, s);
 }
