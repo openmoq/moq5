@@ -100,7 +100,7 @@ void session_cluster_apply(moq_session_t *s, moq_cluster_metadata_t *current,
 moq_result_t moq_session_cluster_info(const moq_session_t *s, moq_cluster_info_t *out,
                                       size_t out_size)
 {
-    if (!s || !out || out_size < sizeof(uint32_t))
+    if (!s || !out || out_size < MOQ_CLUSTER_INFO_V0_SIZE)
         return MOQ_ERR_INVAL;
     moq_cluster_info_t v = {.struct_size = sizeof(v),
                             .enabled = s->cluster_enabled,

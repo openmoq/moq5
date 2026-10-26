@@ -53,6 +53,46 @@ cluster_eligible(const moqr_core_t *c, uint32_t ri, uint32_t requester,
         excluded, excluded_gen, cluster_path(c, ri), c->cluster_routes[ri].hop_count);
 }
 
+static moqr_cluster_advertisement_id_t
+cluster_advertisement(const moqr_core_t *c, const r_cluster_route_t *r)
+{
+    if (r->mirrored) return r->original;
+    return (moqr_cluster_advertisement_id_t){
+        {r_pack(c, MOQR_HANDLE_POOL_BINDING, r->binding_gen, r->binding)},
+        r->lifetime};
+}
+
+static bool
+cluster_forced_match(const moqr_core_t *c, const r_cluster_route_t *r)
+{
+    return c->cluster_forced.serial == 0 || (!r->mirrored &&
+        moqr_cluster_advertisement_id_eq(cluster_advertisement(c, r), c->cluster_forced));
+}
+
+/* Resolve only an original local owner. A public snapshot is not an
+ * authorization token, and a mirror must never satisfy forced dispatch. */
+static uint32_t
+cluster_owner_node(const moqr_core_t *c, moqr_cluster_advertisement_id_t id,
+                   moqr_ns_t ns)
+{
+    uint32_t bs;
+    const r_binding_t *b = binding_resolve((moqr_core_t *)(uintptr_t)c, id.source, &bs);
+    if (b == NULL || id.serial == 0) return UINT32_MAX;
+    for (uint32_t i = 0; i < c->max_cluster_routes; i++) {
+        const r_cluster_route_t *r = &c->cluster_routes[i];
+        if (!r->used || r->mirrored || r->binding != bs ||
+            r->binding_gen != b->gen || r->lifetime != id.serial) continue;
+        uint32_t node = 0;
+        if (r->node == node) return node;
+        for (size_t p = 0; p < ns.count; p++) {
+            node = trie_find_child(c, node, ns.parts[p]);
+            if (node == UINT32_MAX) break;
+            if (node == r->node) return node;
+        }
+    }
+    return UINT32_MAX;
+}
+
 static uint32_t
 cluster_best_at(const moqr_core_t *c, uint32_t node, uint32_t requester,
     uint32_t requester_gen, uint32_t excluded, uint32_t excluded_gen)
@@ -62,9 +102,7 @@ cluster_best_at(const moqr_core_t *c, uint32_t node, uint32_t requester,
         const r_cluster_route_t *r = &c->cluster_routes[i];
         if (r->node != node || !cluster_eligible(c, i, requester, requester_gen,
                                                 excluded, excluded_gen)) continue;
-        if (c->cluster_forced_lifetime != 0 &&
-            !((r->mirrored ? r->external_lifetime : r->lifetime) == c->cluster_forced_lifetime &&
-              (r->mirrored ? r->external_binding_cookie : c->bindings[r->binding].cookie) == c->cluster_forced_binding)) continue;
+        if (!cluster_forced_match(c, r)) continue;
         if (best == UINT32_MAX) { best = i; continue; }
         const r_cluster_route_t *p = &c->cluster_routes[best];
         bool known = cluster_known(c, i), pk = cluster_known(c, best);
@@ -95,6 +133,8 @@ cluster_project(moqr_core_t *c, uint32_t node, uint32_t ri)
 static uint32_t
 cluster_longest_node(const moqr_core_t *c, moqr_ns_t ns)
 {
+    if (c->cluster_forced.serial != 0)
+        return cluster_owner_node(c, c->cluster_forced, ns);
     uint32_t node = 0, best = c->nodes[0].has_announce ? 0 : UINT32_MAX;
     for (size_t i = 0; i < ns.count; i++) {
         node = trie_find_child(c, node, ns.parts[i]);
@@ -133,36 +173,54 @@ cluster_route_warm(const moqr_core_t *c, uint32_t ri)
     return false;
 }
 
-void
-moqr_core_cluster_info(const moqr_core_t *c, moqr_cluster_info_t *out)
+moq_result_t
+moqr_core_cluster_info(const moqr_core_t *c, moqr_cluster_info_t *out, size_t out_size)
 {
-    if (out == NULL) return;
-    memset(out, 0, sizeof(*out));
-    if (c == NULL) return;
-    out->enabled = c->cluster_enabled;
-    out->local_hop_id = c->cluster_hop_id;
-    out->max_routes = c->max_cluster_routes;
-    out->max_hops = c->max_cluster_hops;
+    if (c == NULL || out == NULL || out_size < MOQR_CLUSTER_INFO_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    moqr_cluster_info_t value = {0};
+    value.enabled = c->cluster_enabled;
+    value.local_hop_id = c->cluster_hop_id;
+    value.max_routes = c->max_cluster_routes;
+    value.max_hops = c->max_cluster_hops;
     for (uint32_t i = 0; i < c->max_cluster_routes; i++)
-        if (c->cluster_routes[i].used) out->routes_used++;
+        if (c->cluster_routes[i].used) value.routes_used++;
+    moqr_cluster_write(out, out_size, &value, sizeof(value));
+    return MOQ_OK;
 }
 
-moqr_result_t
-moqr_core_binding_set_cluster(moqr_core_t *c, moqr_binding_t bh, bool negotiated,
-    uint64_t peer_hop_id, uint64_t effective_relay_cost, uint64_t correlation_id)
+void
+moqr_cluster_peer_cfg_init_sized(moqr_cluster_peer_cfg_t *cfg, size_t size)
 {
-    if (c == NULL || !c->cluster_enabled) return MOQR_ERR_WRONG_STATE;
+    if (cfg == NULL || size < sizeof(uint32_t)) return;
+    moqr_cluster_peer_cfg_t value = {0};
+    if (size >= offsetof(moqr_cluster_peer_cfg_t, effective_relay_cost) + sizeof(uint64_t))
+        value.effective_relay_cost = 1;
+    moqr_cluster_write(cfg, size, &value, sizeof(value));
+}
+
+moq_result_t
+moqr_core_binding_set_cluster(moqr_core_t *c, moqr_binding_t bh,
+    const moqr_cluster_peer_cfg_t *cfg)
+{
+    moqr_cluster_peer_cfg_t value = {0};
+    value.effective_relay_cost = 1;
+    if (cfg != NULL && !moqr_cluster_read(cfg, MOQR_CLUSTER_PEER_CFG_V0_SIZE,
+                                         &value, sizeof(value))) return MOQ_ERR_INVAL;
+    if (!value.negotiated && value.peer_hop_id != 0) return MOQ_ERR_INVAL;
+    if (c == NULL) return MOQ_ERR_INVAL;
+    if (!c->cluster_enabled) return MOQ_ERR_WRONG_STATE;
     uint32_t bs;
     r_binding_t *b = binding_resolve(c, bh, &bs);
-    if (b == NULL) return MOQR_ERR_STALE_HANDLE;
+    if (b == NULL) return MOQ_ERR_STALE_HANDLE;
     for (uint32_t i = 0; i < c->max_cluster_routes; i++)
         if (c->cluster_routes[i].used && c->cluster_routes[i].binding == bs &&
-            c->cluster_routes[i].binding_gen == b->gen) return MOQR_ERR_WRONG_STATE;
-    b->cluster_negotiated = negotiated;
-    b->peer_hop_id = negotiated ? peer_hop_id : 0;
-    b->relay_cost = effective_relay_cost;
-    b->correlation_id = correlation_id;
-    return MOQR_OK;
+            c->cluster_routes[i].binding_gen == b->gen) return MOQ_ERR_WRONG_STATE;
+    b->cluster_negotiated = value.negotiated;
+    b->peer_hop_id = value.peer_hop_id;
+    b->relay_cost = value.effective_relay_cost;
+    b->correlation_id = value.correlation_id;
+    return MOQ_OK;
 }
 
 static void
@@ -170,12 +228,9 @@ cluster_fill(const moqr_core_t *c, uint32_t ri, moqr_cluster_route_t *out)
 {
     const r_cluster_route_t *r = &c->cluster_routes[ri];
     memset(out, 0, sizeof(*out));
-    out->source_binding_cookie = c->bindings[r->binding].cookie;
-    out->source_session_cookie = r->session_cookie;
+    out->struct_size = sizeof(*out);
+    out->advertisement = cluster_advertisement(c, r);
     out->origin_id = cluster_path(c, ri)[0];
-    out->route_generation = r->lifetime;
-    out->original_source_binding_cookie = r->mirrored ? r->external_binding_cookie : out->source_binding_cookie;
-    out->original_route_generation = r->mirrored ? r->external_lifetime : r->lifetime;
     out->accumulated_cost = r->cost;
     uint32_t n = r->node;
     while (n != 0) { out->prefix_count++; n = c->nodes[n].parent; }
@@ -186,24 +241,26 @@ cluster_fill(const moqr_core_t *c, uint32_t ri, moqr_cluster_route_t *out)
     out->metadata.route_cost = out->warm ? 0 : r->cost;
 }
 
-moqr_result_t
+moq_result_t
 moqr_core_cluster_route(const moqr_core_t *c, moqr_binding_t requester,
-    moqr_ns_t ns, moqr_cluster_route_t *out)
+    moqr_ns_t ns, moqr_cluster_route_t *out, size_t out_size)
 {
-    if (c == NULL || out == NULL || !ns_view_ok(ns, 0)) return MOQR_ERR_INVAL;
-    if (!c->cluster_enabled) return MOQR_ERR_WRONG_STATE;
+    if (c == NULL || out == NULL || out_size < MOQR_CLUSTER_ROUTE_V0_SIZE || !ns_view_ok(ns, 0)) return MOQ_ERR_INVAL;
+    if (!c->cluster_enabled) return MOQ_ERR_WRONG_STATE;
     uint32_t bs = UINT32_MAX, bg = 0;
     if (moqr_binding_is_valid(requester)) {
         r_binding_t *b = binding_resolve((moqr_core_t *)(uintptr_t)c, requester, &bs);
-        if (b == NULL) return MOQR_ERR_STALE_HANDLE;
+        if (b == NULL) return MOQ_ERR_STALE_HANDLE;
         bg = b->gen;
     }
     uint32_t node = cluster_longest_node(c, ns);
-    if (node == UINT32_MAX) return MOQR_DONE;
+    if (node == UINT32_MAX) return MOQ_DONE;
     uint32_t ri = cluster_best_at(c, node, bs, bg, UINT32_MAX, 0);
-    if (ri == UINT32_MAX) return MOQR_DONE;
-    cluster_fill(c, ri, out);
-    return MOQR_OK;
+    if (ri == UINT32_MAX) return MOQ_DONE;
+    moqr_cluster_route_t value;
+    cluster_fill(c, ri, &value);
+    moqr_cluster_write(out, out_size, &value, sizeof(value));
+    return MOQ_OK;
 }
 
 static uint32_t
@@ -346,8 +403,8 @@ cluster_revalidate_requests(moqr_core_t *c, uint32_t ri,
     return terminals;
 }
 
-moqr_result_t
-moqr_core_announce_cluster(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
+static moqr_result_t
+cluster_announce(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
     uint64_t session_cookie, const moq_cluster_metadata_t *metadata, bool update)
 {
     if (c == NULL || !ns_view_ok(ns, 0)) return MOQR_ERR_INVAL;
@@ -381,6 +438,8 @@ moqr_core_announce_cluster(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
         return update ? cluster_unannounce(c, bs, b->gen, node, 0) : MOQR_OK;
     }
     if (ri == UINT32_MAX && free_slot == UINT32_MAX) return MOQR_ERR_CAPACITY;
+    if (c->cluster_sequence > UINT64_MAX - (update ? 1u : 2u))
+        return MOQR_INTERNAL_LIMIT;
     /* Reserve fanout before creating nodes or replacing any route bytes. */
     uint32_t need = 0;
     for (uint32_t i = 0; i < c->max_ns_subs; i++) {
@@ -438,6 +497,13 @@ moqr_core_announce_cluster(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
     return MOQR_OK;
 }
 
+moq_result_t
+moqr_core_announce_cluster(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
+    uint64_t session_cookie, const moq_cluster_metadata_t *metadata, bool update)
+{
+    return moqr_result_public(cluster_announce(c, bh, ns, session_cookie, metadata, update));
+}
+
 static void
 cluster_pin_track(moqr_core_t *c, r_track_t *t)
 {
@@ -454,10 +520,27 @@ cluster_pin_track(moqr_core_t *c, r_track_t *t)
 }
 
 static bool
+cluster_direct_push(const moqr_core_t *c, const r_track_t *t,
+    uint32_t requester, uint32_t requester_gen)
+{
+    if (c->cluster_forced.serial != 0 || t->source_kind != R_TRACK_SOURCE_PUSH ||
+        t->state != R_TRACK_ACTIVE || t->cluster_route_lifetime != 0 ||
+        !t->has_upstream_binding || t->up_binding >= c->max_bindings ||
+        c->bindings[t->up_binding].gen != t->up_binding_gen) return false;
+    if (requester == UINT32_MAX) return true;
+    if (requester >= c->max_bindings || c->bindings[requester].gen != requester_gen ||
+        (requester == t->up_binding && requester_gen == t->up_binding_gen)) return false;
+    const r_binding_t *a = &c->bindings[requester], *b = &c->bindings[t->up_binding];
+    return !(a->peer_hop_id != 0 && a->peer_hop_id == b->peer_hop_id) &&
+           !(a->correlation_id != 0 && a->correlation_id == b->correlation_id);
+}
+
+static bool
 cluster_track_eligible(const moqr_core_t *c, const r_track_t *t,
     uint32_t requester, uint32_t requester_gen)
 {
     if (!c->cluster_enabled) return true;
+    if (cluster_direct_push(c, t, requester, requester_gen)) return true;
     moq_bytes_t parts[32];
     uint32_t count = key_part_count(&t->key);
     for (uint32_t i = 0; i < count; i++) parts[i] = key_part(&t->key, i);
@@ -467,9 +550,7 @@ cluster_track_eligible(const moqr_core_t *c, const r_track_t *t,
         const r_cluster_route_t *r = &c->cluster_routes[i];
         if (r->used && r->lifetime == t->cluster_route_lifetime && r->node == node &&
             cluster_eligible(c, i, requester, requester_gen, UINT32_MAX, 0)) {
-            if (c->cluster_forced_lifetime == 0 ||
-                ((r->mirrored ? r->external_lifetime : r->lifetime) == c->cluster_forced_lifetime &&
-                 (r->mirrored ? r->external_binding_cookie : c->bindings[r->binding].cookie) == c->cluster_forced_binding)) return true;
+            if (cluster_forced_match(c, r)) return true;
         }
     }
     return false;
@@ -487,8 +568,8 @@ cluster_order(moqr_ns_t ns, uint64_t id)
     return h;
 }
 
-bool
-moqr_cluster_should_reparent(moqr_ns_t ns, uint64_t local, uint64_t peer)
+static bool
+cluster_should_reparent(moqr_ns_t ns, uint64_t local, uint64_t peer)
 {
     if (local == peer || !ns_view_ok(ns, 0)) return false;
     uint64_t a = cluster_order(ns, local), b = cluster_order(ns, peer);
@@ -512,7 +593,7 @@ cluster_warm_flush(moqr_core_t *c)
 }
 
 moqr_result_t
-moqr_core_cluster_export(const moqr_core_t *c, uint32_t index,
+moqr_core_internal_cluster_export(const moqr_core_t *c, uint32_t index,
     moqr_cluster_export_t *out)
 {
     if (c == NULL || out == NULL || !c->cluster_enabled) return MOQR_ERR_INVAL;
@@ -532,13 +613,14 @@ moqr_core_cluster_export(const moqr_core_t *c, uint32_t index,
     }
     out->ns.parts = out->ns_parts;
     out->ns.count = out->route.prefix_count;
+    out->source_session_cookie = r->session_cookie;
     out->source_peer_hop_id = r->source_peer_hop_id;
     out->source_correlation_id = r->source_correlation_id;
     return MOQR_OK;
 }
 
 moqr_result_t
-moqr_core_cluster_import(moqr_core_t *c, moqr_binding_t bh,
+moqr_core_internal_cluster_import(moqr_core_t *c, moqr_binding_t bh,
     const moqr_cluster_export_t *record, bool withdraw)
 {
     if (c == NULL || record == NULL || !c->cluster_enabled) return MOQR_ERR_INVAL;
@@ -553,18 +635,23 @@ moqr_core_cluster_import(moqr_core_t *c, moqr_binding_t bh,
         if (r->mirrored && r->binding == bs && r->binding_gen == b->gen &&
             r->mirror_source_index == record->source_index) ri = i;
     }
-    if (withdraw || record->route.route_generation == 0) {
+    if (withdraw || record->route.advertisement.serial == 0) {
         return ri == UINT32_MAX ? MOQR_OK : cluster_unannounce(c, bs, b->gen,
             c->cluster_routes[ri].node, c->cluster_routes[ri].lifetime);
     }
-    if (ri != UINT32_MAX &&
-        (c->cluster_routes[ri].external_lifetime != record->route.route_generation ||
-         c->cluster_routes[ri].external_binding_cookie != record->route.source_binding_cookie))
+    if (!moqr_binding_is_valid(record->route.advertisement.source) ||
+        moq_handle_pool_tag(record->route.advertisement.source._opaque) != MOQR_HANDLE_POOL_BINDING ||
+        moq_handle_session_tag(record->route.advertisement.source._opaque) != b->cookie - MOQR_SHARD_COOKIE_BASE + 1u)
+        return MOQR_ERR_INVAL;
+    if (ri != UINT32_MAX && !moqr_cluster_advertisement_id_eq(
+            c->cluster_routes[ri].original, record->route.advertisement))
         return MOQR_ERR_WRONG_STATE; /* withdraw old lifetime before replacement */
     if (!ns_view_ok(record->ns, 0) || record->route.metadata.hop_count == 0 ||
         record->route.metadata.hop_ids == NULL) return MOQR_ERR_INVAL;
     if (record->route.metadata.hop_count > c->max_cluster_hops) return MOQR_ERR_CAPACITY;
     if (ri == UINT32_MAX && free_slot == UINT32_MAX) return MOQR_ERR_CAPACITY;
+    if (c->cluster_sequence > UINT64_MAX - (ri != UINT32_MAX ? 1u : 2u))
+        return MOQR_INTERNAL_LIMIT;
     uint32_t node = trie_walk(c, record->ns);
     /* A source index keeps its namespace for its advertisement lifetime. A
      * replacement is explicitly withdrawn first by the shard mailbox. */
@@ -589,8 +676,7 @@ moqr_core_cluster_import(moqr_core_t *c, moqr_binding_t bh,
     }
     if (ri == UINT32_MAX) ri = free_slot;
     r_cluster_route_t *r = &c->cluster_routes[ri];
-    bool same = r->used && r->external_lifetime == record->route.route_generation &&
-                r->external_binding_cookie == record->route.source_binding_cookie;
+    bool same = r->used && moqr_cluster_advertisement_id_eq(r->original, record->route.advertisement);
     uint64_t lifetime = same ? r->lifetime : ++c->cluster_sequence;
     memmove(cluster_path(c, ri), record->route.metadata.hop_ids,
         record->route.metadata.hop_count * sizeof(uint64_t));
@@ -605,9 +691,8 @@ moqr_core_cluster_import(moqr_core_t *c, moqr_binding_t bh,
     r->hop_count = (uint32_t)record->route.metadata.hop_count;
     r->mirror_source_index = record->source_index;
     r->lifetime = lifetime;
-    r->external_lifetime = record->route.route_generation;
-    r->external_binding_cookie = record->route.source_binding_cookie;
-    r->session_cookie = record->route.source_session_cookie;
+    r->original = record->route.advertisement;
+    r->session_cookie = record->source_session_cookie;
     r->source_peer_hop_id = record->source_peer_hop_id;
     r->source_correlation_id = record->source_correlation_id;
     r->cost = record->route.accumulated_cost;
@@ -621,8 +706,8 @@ moqr_core_cluster_import(moqr_core_t *c, moqr_binding_t bh,
 }
 
 moqr_result_t
-moqr_core_cluster_upstream_route(const moqr_core_t *c, moqr_track_t th,
-    uint64_t track_gen, moqr_cluster_route_t *out, uint64_t *requester_hop_id,
+moqr_core_internal_cluster_upstream_route(const moqr_core_t *c, moqr_track_t th,
+    uint64_t track_gen, moqr_cluster_advertisement_id_t *out, uint64_t *requester_hop_id,
     uint64_t *requester_correlation_id)
 {
     if (c == NULL || out == NULL || requester_hop_id == NULL ||
@@ -632,11 +717,7 @@ moqr_core_cluster_upstream_route(const moqr_core_t *c, moqr_track_t th,
     for (uint32_t i = 0; i < c->max_cluster_routes; i++) {
         const r_cluster_route_t *r = &c->cluster_routes[i];
         if (r->used && r->lifetime == t->cluster_route_lifetime) {
-            cluster_fill(c, i, out);
-            if (r->mirrored) {
-                out->source_binding_cookie = r->external_binding_cookie;
-                out->route_generation = r->external_lifetime;
-            }
+            *out = cluster_advertisement(c, r);
             if (t->subs_head != R_SUB_NIL) {
                 const r_sub_t *requester = &c->subs[t->subs_head];
                 *requester_hop_id = requester->cluster_requester_hop;
@@ -720,7 +801,7 @@ cluster_reparent_sweep(moqr_core_t *c)
         if (r->cost >= c->cluster_routes[current].cost) continue;
         const uint64_t *ids = cluster_path(c, target);
         if (r->seed_cost == 0 && r->hop_count >= 2 &&
-            !moqr_cluster_should_reparent(ns, c->cluster_hop_id, ids[r->hop_count - 1])) continue;
+            !cluster_should_reparent(ns, c->cluster_hop_id, ids[r->hop_count - 1])) continue;
         if (!intent_space(c, 2)) continue;
         moqr_intent_t *old = intent_push(c, MOQR_INTENT_UPSTREAM_UNSUBSCRIBE);
         old->binding_cookie = c->bindings[t->up_binding].cookie;
@@ -738,6 +819,11 @@ cluster_track_lookup(moqr_core_t *c, moqr_ns_t ns, moq_bytes_t name,
 {
     uint64_t hash = key_view_hash(ns, name);
     if (hash_out != NULL) *hash_out = hash;
+    for (uint32_t ti = 0; ti < c->max_tracks; ti++) {
+        const r_track_t *t = &c->tracks[ti];
+        if ((t->gen & 1u) != 0 && t->hash == hash && key_view_eq(&t->key, ns, name) &&
+            cluster_direct_push(c, t, requester, requester_gen)) return ti;
+    }
     uint32_t node = cluster_longest_node(c, ns);
     uint32_t ri = node != UINT32_MAX ? cluster_best_at(c, node, requester,
         requester_gen, UINT32_MAX, 0) : UINT32_MAX;

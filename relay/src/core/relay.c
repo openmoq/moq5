@@ -239,7 +239,7 @@ typedef struct r_cluster_route {
     bool inherited_warm;
     bool warm_notified;
     uint32_t mirror_source_index;
-    uint64_t external_lifetime, external_binding_cookie;
+    moqr_cluster_advertisement_id_t original;
     uint32_t node, binding, binding_gen, hop_count;
     uint64_t session_cookie, lifetime, arrival;
     uint64_t seed_cost, cost, source_peer_hop_id, source_correlation_id;
@@ -717,7 +717,7 @@ struct moqr_core {
     uint32_t max_cluster_routes, max_cluster_hops;
     r_cluster_route_t *cluster_routes;
     uint64_t *cluster_hops;
-    uint64_t cluster_forced_binding, cluster_forced_lifetime;
+    moqr_cluster_advertisement_id_t cluster_forced;
 
     moqr_intent_t *intents;      /* ring                                   */
     uint32_t       intent_head;
@@ -1264,50 +1264,61 @@ r_rtok_slots(uint32_t max_ns_subs, uint32_t max_ns_nodes)
     return n > UINT32_MAX ? UINT32_MAX : (uint32_t)n;
 }
 
+static moqr_result_t core_create_cluster(const moqr_core_relay_cfg_t *cfg,
+    const moqr_cluster_cfg_t *cluster, moqr_core_t **out);
+
 moqr_result_t
 moqr_core_create(const moqr_core_relay_cfg_t *cfg, moqr_core_t **out)
 {
-    return moqr_core_create_cluster(cfg, NULL, out);
+    return core_create_cluster(cfg, NULL, out);
 }
-
-#define CLUSTER_CFG_HAS(cfg, field) ((cfg) != NULL && \
-    offsetof(moqr_cluster_cfg_t, field) + sizeof((cfg)->field) <= (cfg)->struct_size)
 
 void
 moqr_cluster_cfg_init_sized(moqr_cluster_cfg_t *cfg, size_t size)
 {
     if (cfg == NULL || size < sizeof(uint32_t)) return;
-    size_t n = size < sizeof(*cfg) ? size : sizeof(*cfg);
-    memset(cfg, 0, n);
-    cfg->struct_size = (uint32_t)n;
+    moqr_cluster_cfg_t value = {0};
+    moqr_cluster_write(cfg, size, &value, sizeof(value));
 }
 
-moqr_result_t
-moqr_cluster_cfg_resolve(const moqr_cluster_cfg_t *cfg, moqr_cluster_info_t *out)
+moq_result_t
+moqr_cluster_cfg_resolve(const moqr_cluster_cfg_t *cfg, moqr_cluster_info_t *out,
+                          size_t out_size)
 {
-    if (out == NULL) return MOQR_ERR_INVAL;
-    memset(out, 0, sizeof(*out));
-    if (cfg != NULL && cfg->struct_size < sizeof(uint32_t)) return MOQR_ERR_INVAL;
-    out->enabled = CLUSTER_CFG_HAS(cfg, enabled) && cfg->enabled;
-    if (!out->enabled) return MOQR_OK;
-    out->local_hop_id = CLUSTER_CFG_HAS(cfg, local_hop_id) ? cfg->local_hop_id : 0;
-    out->max_routes = CLUSTER_CFG_HAS(cfg, max_routes) && cfg->max_routes ? cfg->max_routes : 256u;
-    out->max_hops = CLUSTER_CFG_HAS(cfg, max_hops) && cfg->max_hops ? cfg->max_hops : 32u;
-    if ((uint64_t)out->max_routes * out->max_hops > SIZE_MAX / sizeof(uint64_t)) {
-        memset(out, 0, sizeof(*out));
-        return MOQR_ERR_INVAL;
-    }
+    if (out == NULL || out_size < MOQR_CLUSTER_INFO_V0_SIZE) return MOQ_ERR_INVAL;
+    moqr_cluster_cfg_t input = {0};
+    if (cfg != NULL && !moqr_cluster_read(cfg, MOQR_CLUSTER_CFG_V0_SIZE,
+                                         &input, sizeof(input))) return MOQ_ERR_INVAL;
+    moqr_cluster_info_t value = {0};
+    value.enabled = input.enabled;
+    if (value.enabled) {
+        value.local_hop_id = input.local_hop_id;
+        value.max_routes = input.max_routes ? input.max_routes : 256u;
+        value.max_hops = input.max_hops ? input.max_hops : 32u;
+        if ((uint64_t)value.max_routes * value.max_hops > SIZE_MAX / sizeof(uint64_t))
+            return MOQ_ERR_INVAL;
 #if SIZE_MAX < UINT64_MAX
-    if ((uint64_t)out->max_routes > SIZE_MAX / sizeof(r_cluster_route_t)) {
-        memset(out, 0, sizeof(*out));
-        return MOQR_ERR_INVAL;
-    }
+        if ((uint64_t)value.max_routes > SIZE_MAX / sizeof(r_cluster_route_t))
+            return MOQ_ERR_INVAL;
 #endif
-    return MOQR_OK;
+    }
+    moqr_cluster_write(out, out_size, &value, sizeof(value));
+    return MOQ_OK;
 }
 
-moqr_result_t
+moq_result_t
 moqr_core_create_cluster(const moqr_core_relay_cfg_t *cfg,
+    const moqr_cluster_cfg_t *cluster, moqr_core_t **out)
+{
+    if (out == NULL) return MOQ_ERR_INVAL;
+    moqr_core_t *created = NULL;
+    moqr_result_t rc = core_create_cluster(cfg, cluster, &created);
+    if (rc == MOQR_OK) *out = created;
+    return moqr_result_public(rc);
+}
+
+static moqr_result_t
+core_create_cluster(const moqr_core_relay_cfg_t *cfg,
     const moqr_cluster_cfg_t *cluster, moqr_core_t **out)
 {
     if (out == NULL) {
@@ -1318,7 +1329,7 @@ moqr_core_create_cluster(const moqr_core_relay_cfg_t *cfg,
         return MOQR_ERR_INVAL;
     }
     moqr_cluster_info_t cluster_resolved;
-    if (moqr_cluster_cfg_resolve(cluster, &cluster_resolved) != MOQR_OK)
+    if (moqr_cluster_cfg_resolve(cluster, &cluster_resolved, sizeof(cluster_resolved)) != MOQ_OK)
         return MOQR_ERR_INVAL;
     const moq_alloc_t *a = RELAY_CFG_HAS(cfg, alloc) ? cfg->alloc : NULL;
     if (a == NULL || a->alloc == NULL || a->free == NULL) {
@@ -3967,7 +3978,7 @@ moqr_core_announce_ex(moqr_core_t *c, moqr_binding_t bh, moqr_ns_t ns,
         return MOQR_ERR_INVAL;
     }
     if (c->cluster_enabled)
-        return moqr_core_announce_cluster(c, bh, ns, session_cookie, NULL, false);
+        return moqr_result_legacy(moqr_core_announce_cluster(c, bh, ns, session_cookie, NULL, false));
     uint32_t bslot = 0;
     r_binding_t *b = binding_resolve(c, bh, &bslot);
     if (b == NULL) {
@@ -5393,23 +5404,24 @@ moqr_core_subscribe(moqr_core_t *c, moqr_binding_t bh,
 }
 
 moqr_result_t
-moqr_core_subscribe_cluster(moqr_core_t *c, moqr_binding_t bh,
-    const moqr_subscribe_req_t *req, uint64_t source_binding_cookie,
-    uint64_t source_route_generation, uint64_t requester_hop_id,
+moqr_core_internal_subscribe_cluster(moqr_core_t *c, moqr_binding_t bh,
+    const moqr_subscribe_req_t *req, moqr_cluster_advertisement_id_t source,
+    uint64_t requester_hop_id,
     uint64_t requester_correlation_id, moqr_sub_t *out)
 {
-    if (c == NULL || !c->cluster_enabled || source_route_generation == 0)
-        return MOQR_ERR_INVAL;
+    if (c == NULL || !c->cluster_enabled || source.serial == 0 || req == NULL ||
+        req->struct_size < offsetof(moqr_subscribe_req_t, forward) ||
+        !ftn_view_ok(req->ns, req->name)) return MOQR_ERR_INVAL;
+    if (cluster_owner_node(c, source, req->ns) == UINT32_MAX)
+        return MOQR_ERR_STALE_HANDLE;
     r_binding_t *b = binding_resolve(c, bh, NULL);
     if (b == NULL) return MOQR_ERR_STALE_HANDLE;
     uint64_t hop = b->peer_hop_id, corr = b->correlation_id;
     b->peer_hop_id = requester_hop_id;
     b->correlation_id = requester_correlation_id;
-    c->cluster_forced_binding = source_binding_cookie;
-    c->cluster_forced_lifetime = source_route_generation;
+    c->cluster_forced = source;
     moqr_result_t rc = moqr_core_subscribe(c, bh, req, out);
-    c->cluster_forced_binding = 0;
-    c->cluster_forced_lifetime = 0;
+    memset(&c->cluster_forced, 0, sizeof(c->cluster_forced));
     b->peer_hop_id = hop;
     b->correlation_id = corr;
     return rc;
@@ -9009,8 +9021,9 @@ core_fetch_admit(moqr_core_t *c, moqr_binding_t bh, const moqr_fetch_req_t *req,
         return MOQR_ERR_UNSUPPORTED;
     }
 
+    uint32_t tslot = (c->cluster_enabled ? cluster_track_lookup(c, req->ns, req->name, bslot, b->gen, NULL) : track_lookup(c, req->ns, req->name, NULL));
     uint32_t cluster_node = UINT32_MAX;
-    if (c->cluster_enabled) {
+    if (c->cluster_enabled && tslot == UINT32_MAX) {
         cluster_node = cluster_select_node(c, req->ns, bslot, b->gen);
         if (cluster_node == UINT32_MAX) {
             out_plan->admit = MOQR_FETCH_REJECT;
@@ -9018,8 +9031,6 @@ core_fetch_admit(moqr_core_t *c, moqr_binding_t bh, const moqr_fetch_req_t *req,
             return MOQR_OK;
         }
     }
-
-    uint32_t tslot = (c->cluster_enabled ? cluster_track_lookup(c, req->ns, req->name, bslot, b->gen, NULL) : track_lookup(c, req->ns, req->name, NULL));
 
     if (tslot == UINT32_MAX) {
         out_plan->admit = MOQR_FETCH_REJECT;
@@ -9255,23 +9266,24 @@ moqr_core_internal_retrieve_open(moqr_core_t *c, moqr_binding_t bh,
 
 moqr_result_t
 moqr_core_internal_retrieve_open_cluster(moqr_core_t *c, moqr_binding_t bh,
-    const moqr_fetch_req_t *req, uint64_t source_binding_cookie,
-    uint64_t source_route_generation, uint64_t requester_hop_id,
+    const moqr_fetch_req_t *req, moqr_cluster_advertisement_id_t source,
+    uint64_t requester_hop_id,
     uint64_t requester_correlation_id, uint64_t now_us,
     moqr_fetch_t *owner, moqr_core_retrieve_plan_t *plan)
 {
-    if (c == NULL || !c->cluster_enabled || source_route_generation == 0)
+    if (c == NULL || !c->cluster_enabled || source.serial == 0 || req == NULL ||
+        req->struct_size < offsetof(moqr_fetch_req_t, report_gaps) || !ftn_view_ok(req->ns, req->name))
         return MOQR_ERR_INVAL;
+    if (cluster_owner_node(c, source, req->ns) == UINT32_MAX)
+        return MOQR_ERR_STALE_HANDLE;
     r_binding_t *b = binding_resolve(c, bh, NULL);
     if (b == NULL) return MOQR_ERR_STALE_HANDLE;
     uint64_t hop = b->peer_hop_id, corr = b->correlation_id;
     b->peer_hop_id = requester_hop_id;
     b->correlation_id = requester_correlation_id;
-    c->cluster_forced_binding = source_binding_cookie;
-    c->cluster_forced_lifetime = source_route_generation;
+    c->cluster_forced = source;
     moqr_result_t rc = moqr_core_internal_retrieve_open(c, bh, req, now_us, owner, plan);
-    c->cluster_forced_binding = 0;
-    c->cluster_forced_lifetime = 0;
+    memset(&c->cluster_forced, 0, sizeof(c->cluster_forced));
     b->peer_hop_id = hop;
     b->correlation_id = corr;
     return rc;
@@ -10245,15 +10257,29 @@ moqr_core_drain_ready(moqr_core_t *c, uint64_t *cookies, uint32_t cap)
     return out;
 }
 
-moqr_result_t
+static moqr_result_t core_cluster_capacity(const moqr_core_relay_cfg_t *cfg,
+    const moqr_cluster_cfg_t *cluster, moqr_core_capacity_t *out);
+
+moq_result_t
 moqr_core_capacity_describe(const moqr_core_relay_cfg_t *cfg,
-                            moqr_core_capacity_t *out)
+    moqr_core_capacity_t *out, size_t out_size)
 {
-    return moqr_core_cluster_capacity_describe(cfg, NULL, out);
+    return moqr_core_cluster_capacity_describe(cfg, NULL, out, out_size);
 }
 
-moqr_result_t
+moq_result_t
 moqr_core_cluster_capacity_describe(const moqr_core_relay_cfg_t *cfg,
+    const moqr_cluster_cfg_t *cluster, moqr_core_capacity_t *out, size_t out_size)
+{
+    if (out == NULL || out_size < MOQR_CORE_CAPACITY_V0_SIZE) return MOQ_ERR_INVAL;
+    moqr_core_capacity_t value;
+    moqr_result_t rc = core_cluster_capacity(cfg, cluster, &value);
+    if (rc == MOQR_OK) moqr_cluster_write(out, out_size, &value, sizeof(value));
+    return moqr_result_public(rc);
+}
+
+static moqr_result_t
+core_cluster_capacity(const moqr_core_relay_cfg_t *cfg,
     const moqr_cluster_cfg_t *cluster, moqr_core_capacity_t *out)
 {
     if (out == NULL) {
@@ -10264,7 +10290,7 @@ moqr_core_cluster_capacity_describe(const moqr_core_relay_cfg_t *cfg,
         return MOQR_ERR_INVAL;
     }
     moqr_cluster_info_t cluster_resolved;
-    if (moqr_cluster_cfg_resolve(cluster, &cluster_resolved) != MOQR_OK)
+    if (moqr_cluster_cfg_resolve(cluster, &cluster_resolved, sizeof(cluster_resolved)) != MOQ_OK)
         return MOQR_ERR_INVAL;
     /* The SAME pure resolution create() consumes — defaults, the
      * cancels/bindings coupling, and the intent-ring atomicity clamp all

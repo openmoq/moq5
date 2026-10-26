@@ -83,6 +83,48 @@ recipient; its metadata borrows core storage until the next mutating core call.
 Its cost is already accumulated. A direct forwarding host appends the local
 hop once; the session binding performs that step for attached sessions.
 
+The new cluster functions and the four core/binding capacity-description
+functions return `moq_result_t`. Structured query/planner outputs take explicit sizes: require the
+named `*_V0_SIZE`, write and stamp `min(out_size, library_size)` only on
+`MOQ_OK`, and leave the output untouched on `MOQ_DONE` or error. The unreleased
+`moqr_core_capacity_t` and `moqr_bind_capacity_t` are sized in place; rebuild
+relay callers against these headers. Existing ordinary relay operations keep
+their `MOQR_*` result contract. Do not cast one result vocabulary to the other:
+`MOQ_ERR_WOULD_BLOCK` is -8, `MOQ_ERR_STALE_HANDLE` is -6, and the new
+`MOQ_ERR_CAPACITY` is -17 (configured admission policy, not automatic retry).
+`MOQ_ERR_LIMIT` means non-recyclable identity exhaustion. Validation, intent
+credit, capacity and identity-limit refusals change no route/owner/queued
+intent. NOMEM may follow reclamation of already-reclaimable cache storage;
+it never partially commits metadata or takes live ownership.
+
+Initialize resolved peer input with `moqr_cluster_peer_cfg_init`: cost defaults
+to one, explicit zero means free, and an unnegotiated peer must have Hop ID
+zero. `moqr_core_binding_set_cluster(core, binding, &peer)` copies the sized
+input before routes exist; NULL selects defaults. The binding's host-policy
+input uses `moqr_bind_cluster_peer_cfg_init` and `has_relay_cost` to distinguish
+an override from negotiation. `moqr_bind_conn_open_cluster(bind, session,
+version, &peer)` has one size source (`peer.struct_size`); NULL equals ordinary
+attachment policy. Neither operation takes session ownership on refusal.
+
+A route query's `advertisement` is a comparison snapshot: the **original full
+binding handle** plus a nonzero, never-reused advertisement serial. All mirrors
+inside one live shard runtime retain that ID. Same-ad cost/path-suffix/warm
+updates retain it; withdrawal/reannounce changes it, as does binding reuse.
+It is comparable only inside that runtime (or one standalone-core lifetime),
+not across independent/recreated runtimes. Nonzero publisher Hop ID can
+establish content continuity across different advertisements; anonymous
+continuity requires the complete advertisement ID. Equality is not proof of
+live ownership or authorization. Serial exhaustion refuses admission/update
+with LIMIT and leaves withdrawal/query/cleanup usable; binding generations
+retire rather than wrap. No global ID allocator or public pool index is used.
+
+Replication, original-owner forced dispatch and warm tie-breaking are private
+same-build mechanisms, not application exports. Forced dispatch checks the
+owner shard, full live binding, exact local non-mirrored advertisement and
+recipient exclusions. Stale selections fail instead of choosing a replacement.
+A live direct PUBLISH remains eligible for its exact track without a namespace
+advertisement; it grants no namespace or sibling-track permission.
+
 ## Ownership
 
 | Resource | Contract |

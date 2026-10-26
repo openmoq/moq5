@@ -1727,7 +1727,8 @@ public:
                 update_record_view(d.update)};
         }
         case MOQ_EVENT_NAMESPACE_UPDATE_RESULT: {
-            if (e.detail_size < sizeof(moq_namespace_update_result_event_t))
+            if (e.detail_size < offsetof(moq_namespace_update_result_event_t, expires_ms) +
+                                sizeof(e.u.namespace_update_result.expires_ms))
                 return event::unknown{e.kind};
             const auto &d = e.u.namespace_update_result;
             return extended_event::namespace_update_result{

@@ -24,11 +24,11 @@ on draft-22 sessions. Enable it explicitly when constructing the relay core:
 moqr_core_relay_cfg_t core_cfg;
 moqr_core_relay_cfg_init_sized(&core_cfg, sizeof(core_cfg), moq_alloc_default());
 moqr_cluster_cfg_t cluster;
-moqr_cluster_cfg_init_sized(&cluster, sizeof(cluster));
+moqr_cluster_cfg_init(&cluster);
 cluster.enabled = true;
 cluster.local_hop_id = 1234; /* one identity across this relay's sessions */
 moqr_core_t *core = NULL;
-moqr_result_t result = moqr_core_create_cluster(&core_cfg, &cluster, &core);
+moq_result_t result = moqr_core_create_cluster(&core_cfg, &cluster, &core);
 ```
 
 For the shard runtime, set `cluster_enabled`, `cluster_hop_id`, and optional

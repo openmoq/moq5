@@ -678,3 +678,13 @@ stack uses fb303/ServiceData callbacks, not exposition text). Labels are
 bounded by construction — shard, transport, draft version, and per-series
 enum reason/state — never namespace, track, session, or cursor identity;
 per-entity detail lives in the route dump and the trace ring.
+
+Cluster replication reserves one allocation-free withdrawal record per directed
+mailbox in addition to its configured admission slots. A new advertisement
+refused by a full receiver cannot block the withdrawal that frees its capacity.
+The record obeys the same visibility barrier; a reannouncement cannot overtake
+its pending withdrawal. Its create-time storage is included in the cluster
+mailbox capacity term and is absent when clustering is disabled. Mirrors
+retain the original owner-qualified advertisement ID, and a reparented PUSH
+loses ingest authority immediately when the source generation
+changes, even while its wire cancellation is waiting for session credit.

@@ -1357,7 +1357,7 @@ test_ns_memory_ceiling(void)
     cfg.log_max_subgroups = cfg.log_max_objects_per_group = 1;
     cfg.log_max_cursors = cfg.log_max_chunk_nodes = 1;
     moqr_core_capacity_t cap;
-    MOQ_TEST_CHECK(moqr_core_capacity_describe(&cfg, &cap) == MOQR_OK);
+    MOQ_TEST_CHECK(moqr_core_capacity_describe(&cfg, &cap, sizeof(cap)) == MOQ_OK);
     moqr_core_t *c = NULL;
     MOQ_TEST_CHECK(moqr_core_create(&cfg, &c) == MOQR_OK);
     moqr_binding_t pb;

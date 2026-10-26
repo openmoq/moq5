@@ -354,7 +354,7 @@ MOQR_CORE_API moqr_result_t moqr_core_binding_open_with_options(
 MOQR_CORE_API moqr_result_t moqr_core_binding_close(moqr_core_t *core, moqr_binding_t b,
                                       uint64_t now_us);
 
-/* Separate size-aware configuration: relay cfg is embedded in frozen ABIs. */
+/* Cluster configuration is separate from the embedded relay templates. */
 typedef struct moqr_cluster_cfg {
     uint32_t struct_size;
     bool enabled;
@@ -362,83 +362,93 @@ typedef struct moqr_cluster_cfg {
     uint32_t max_routes; /* 0 = 256 */
     uint32_t max_hops;   /* 0 = 32 received hops; no truncation */
 } moqr_cluster_cfg_t;
+#define MOQR_CLUSTER_CFG_V0_SIZE 24u
 MOQR_CORE_API void moqr_cluster_cfg_init_sized(moqr_cluster_cfg_t *cfg, size_t size);
-MOQR_CORE_API moqr_result_t moqr_core_create_cluster(
+#define moqr_cluster_cfg_init(p) moqr_cluster_cfg_init_sized((p), sizeof(*(p)))
+MOQR_CORE_API moq_result_t moqr_core_create_cluster(
     const moqr_core_relay_cfg_t *cfg, const moqr_cluster_cfg_t *cluster,
     moqr_core_t **out);
 
-/* Cluster records are separate from frozen intent/limits/statistics layouts. */
 typedef struct moqr_cluster_info {
+    uint32_t struct_size;
     bool enabled;
+    uint8_t _reserved[3];
     uint64_t local_hop_id;
-    uint32_t max_routes;
-    uint32_t max_hops;
-    uint32_t routes_used;
+    uint32_t max_routes, max_hops, routes_used;
+    uint32_t _reserved2;
 } moqr_cluster_info_t;
-/* Pure prefix-safe defaults and representability validation. NULL disables. */
-MOQR_CORE_API moqr_result_t moqr_cluster_cfg_resolve(
-    const moqr_cluster_cfg_t *cfg, moqr_cluster_info_t *out);
+#define MOQR_CLUSTER_INFO_V0_SIZE 32u
+/* Pure defaults/validation. NULL cfg disables; routes_used is zero. */
+MOQR_CORE_API moq_result_t moqr_cluster_cfg_resolve(
+    const moqr_cluster_cfg_t *cfg, moqr_cluster_info_t *out, size_t out_size);
 
+/* Comparison-only identity of one historical advertisement, scoped to one
+ * live shard runtime (or standalone core). Mirrors preserve the original
+ * full binding handle and serial. Updates keep it; withdrawal/reannounce
+ * changes it. Neither equality nor a nonzero ID proves liveness, publisher
+ * equivalence, authorization, or permission to force a route. All-zero is
+ * invalid; copy library-issued IDs rather than minting them. No comparison
+ * across independent/recreated runtimes; discard IDs at runtime destruction. */
+typedef struct moqr_cluster_advertisement_id {
+    moqr_binding_t source;
+    uint64_t serial;
+} moqr_cluster_advertisement_id_t;
+static inline bool moqr_cluster_advertisement_id_eq(
+    moqr_cluster_advertisement_id_t a, moqr_cluster_advertisement_id_t b)
+{
+    return a.source._opaque == b.source._opaque && a.serial == b.serial;
+}
 
 typedef struct moqr_cluster_route {
-    uint64_t source_binding_cookie;
-    uint64_t source_session_cookie;
-    uint64_t original_source_binding_cookie; /* actual owner across shards */
-    uint64_t original_route_generation;
-    uint64_t origin_id;
-    uint64_t route_generation; /* stable advertisement lifetime, not update */
-    uint64_t accumulated_cost;
+    uint32_t struct_size;
     uint32_t prefix_count;
+    moqr_cluster_advertisement_id_t advertisement;
+    uint64_t origin_id, accumulated_cost;
     bool warm;
-    moq_cluster_metadata_t metadata; /* received path; advertised cost */
+    uint8_t _reserved[7];
+    moq_cluster_metadata_t metadata;
 } moqr_cluster_route_t;
+#define MOQR_CLUSTER_ROUTE_V0_SIZE \
+    (offsetof(moqr_cluster_route_t, metadata) + sizeof(moq_cluster_metadata_t))
+/* Sized queries require V0, write/stamp min(out_size, current) on OK, and
+ * leave output untouched on DONE/error. Metadata borrows until core mutation. */
+MOQR_CORE_API moq_result_t moqr_core_cluster_info(const moqr_core_t *core,
+    moqr_cluster_info_t *out, size_t out_size);
 
-MOQR_CORE_API void moqr_core_cluster_info(const moqr_core_t *core,
-                                         moqr_cluster_info_t *out);
-/* Configure before advertising on the binding. Cost is already resolved by
- * the host (absent peer RELAY_COST = 1). correlation_id is local-only; zero
- * disables correlation. Changing a binding with live routes is refused. */
-MOQR_CORE_API moqr_result_t moqr_core_binding_set_cluster(moqr_core_t *core,
-    moqr_binding_t binding, bool negotiated, uint64_t peer_hop_id,
-    uint64_t effective_relay_cost, uint64_t correlation_id);
-/* Initial NULL metadata bridges a legacy publisher as [0]. Partial updates
- * retain omitted fields and preserve the first hop. Copies all supplied hops.
- * Old announce APIs bridge automatically when clustering is enabled. */
-MOQR_CORE_API moqr_result_t moqr_core_announce_cluster(moqr_core_t *core,
+typedef struct moqr_cluster_peer_cfg {
+    uint32_t struct_size;
+    bool negotiated;
+    uint8_t _reserved[3];
+    uint64_t peer_hop_id;
+    uint64_t effective_relay_cost;
+    uint64_t correlation_id;
+} moqr_cluster_peer_cfg_t;
+#define MOQR_CLUSTER_PEER_CFG_V0_SIZE 32u
+MOQR_CORE_API void moqr_cluster_peer_cfg_init_sized(
+    moqr_cluster_peer_cfg_t *cfg, size_t cfg_size);
+#define moqr_cluster_peer_cfg_init(p) \
+    moqr_cluster_peer_cfg_init_sized((p), sizeof(*(p)))
+/* Configure before live routes. NULL selects unnegotiated/hop 0/cost 1/no
+ * correlation. Otherwise cost is already resolved (explicit zero is free).
+ * An unnegotiated peer must have hop 0. Correlation is local-only and must
+ * only join connections known to be one endpoint. Refusal changes no state. */
+MOQR_CORE_API moq_result_t moqr_core_binding_set_cluster(moqr_core_t *core,
+    moqr_binding_t binding, const moqr_cluster_peer_cfg_t *cfg);
+/* Initial NULL metadata bridges legacy input as [0]. Updates retain omitted
+ * members and preserve the first hop and advertisement identity. Inputs are
+ * copied on acceptance. WOULD_BLOCK is a no-effect drain/retry; CAPACITY is
+ * admission policy refusal; LIMIT means identity space cannot be recycled.
+ * NOMEM can follow reclamation of otherwise reclaimable cache/index state,
+ * but never partially accepts an advertisement or replaces live ownership. */
+MOQR_CORE_API moq_result_t moqr_core_announce_cluster(moqr_core_t *core,
     moqr_binding_t binding, moqr_ns_t ns, uint64_t session_cookie,
     const moq_cluster_metadata_t *metadata, bool update);
-/* Pure recipient-specific selection. INVALID requester means local selection.
- * DONE means no eligible route in the longest advertised prefix tier. Metadata
- * borrows core storage until the next mutating core call. The caller appends
- * local_hop_id exactly once for forwarding; returned cost is already charged
- * and discounted to explicit zero only for the currently served warm path. */
-MOQR_CORE_API moqr_result_t moqr_core_cluster_route(const moqr_core_t *core,
-    moqr_binding_t requester, moqr_ns_t ns, moqr_cluster_route_t *out);
-/* Pool-slot snapshot for cross-shard replication. DONE still writes
- * source_index and a zero route_generation, identifying an empty slot. */
-typedef struct moqr_cluster_export {
-    uint32_t source_index;
-    uint64_t revision; /* receive order, including unchanged metadata updates */
-    moqr_ns_t ns;
-    moq_bytes_t ns_parts[32];
-    moqr_cluster_route_t route;
-    uint64_t source_peer_hop_id;
-    uint64_t source_correlation_id;
-} moqr_cluster_export_t;
-MOQR_CORE_API moqr_result_t moqr_core_cluster_export(const moqr_core_t *core,
-    uint32_t source_index, moqr_cluster_export_t *out);
-MOQR_CORE_API moqr_result_t moqr_core_cluster_import(moqr_core_t *core,
-    moqr_binding_t mirror_binding, const moqr_cluster_export_t *record,
-    bool withdraw);
-
-MOQR_CORE_API moqr_result_t moqr_core_cluster_upstream_route(
-    const moqr_core_t *core, moqr_track_t track, uint64_t track_gen,
-    moqr_cluster_route_t *out, uint64_t *requester_hop_id,
-    uint64_t *requester_correlation_id);
-
-/* Pure deterministic warm-parent ordering: equal IDs never reparent. */
-MOQR_CORE_API bool moqr_cluster_should_reparent(moqr_ns_t ns,
-    uint64_t local_hop_id, uint64_t peer_hop_id);
+/* Recipient-specific selection. INVALID requester means local selection.
+ * DONE: no eligible route in the longest prefix tier. The caller appends its
+ * local hop once; returned cost is charged/discounted for the selected path. */
+MOQR_CORE_API moq_result_t moqr_core_cluster_route(const moqr_core_t *core,
+    moqr_binding_t requester, moqr_ns_t ns, moqr_cluster_route_t *out,
+    size_t out_size);
 
 /* -- Authorization (control-plane) ------------------------------------------- *
  * Run the configured auth hook (allow-all if none) for `req`, emit an
@@ -973,15 +983,6 @@ MOQR_CORE_API void moqr_subscribe_req_init_sized(moqr_subscribe_req_t *req,
 MOQR_CORE_API moqr_result_t moqr_core_subscribe(moqr_core_t *core, moqr_binding_t b,
                                   const moqr_subscribe_req_t *req,
                                   moqr_sub_t *out);
-/* Cross-shard demand admits only this original source generation; requester
- * peer identity remains local selection state and is never forwarded. */
-MOQR_CORE_API moqr_result_t moqr_core_subscribe_cluster(moqr_core_t *core,
-    moqr_binding_t binding, const moqr_subscribe_req_t *req,
-    uint64_t source_binding_cookie, uint64_t source_route_generation,
-    uint64_t requester_hop_id, uint64_t requester_correlation_id,
-    moqr_sub_t *out);
-
-
 MOQR_CORE_API moqr_result_t moqr_core_unsubscribe(moqr_core_t *core, moqr_sub_t sub,
                                     uint64_t now_us);
 
@@ -1728,17 +1729,19 @@ MOQR_CORE_API uint32_t moqr_core_drain_ready(moqr_core_t *core, uint64_t *cookie
  * A relay process prints this at startup — retained memory is a function
  * of configuration, computed before anything runs. */
 typedef struct moqr_core_capacity {
+    uint32_t struct_size, _reserved;
     uint64_t structure_bytes;   /* pools, rings, per-track structures     */
     uint64_t payload_bytes;     /* max_tracks x per-log payload budget    */
     uint64_t total_bytes;
 } moqr_core_capacity_t;
+#define MOQR_CORE_CAPACITY_V0_SIZE 32u
 
-MOQR_CORE_API moqr_result_t moqr_core_capacity_describe(const moqr_core_relay_cfg_t *cfg,
-                                          moqr_core_capacity_t *out);
+MOQR_CORE_API moq_result_t moqr_core_capacity_describe(const moqr_core_relay_cfg_t *cfg,
+                                          moqr_core_capacity_t *out, size_t out_size);
 
-MOQR_CORE_API moqr_result_t moqr_core_cluster_capacity_describe(
+MOQR_CORE_API moq_result_t moqr_core_cluster_capacity_describe(
     const moqr_core_relay_cfg_t *cfg, const moqr_cluster_cfg_t *cluster,
-    moqr_core_capacity_t *out);
+    moqr_core_capacity_t *out, size_t out_size);
 
 /* Resolved pool limits of a live core, so consumers (the session binding)
  * can size their own tables to make under-provisioning impossible. */

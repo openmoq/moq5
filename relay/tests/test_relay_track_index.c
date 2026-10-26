@@ -679,7 +679,7 @@ describe_structure(ca_t *a, uint32_t max_subs, uint32_t max_tracks)
     cfg.log_budget.max_groups = 4;
     cfg.log_budget.max_bytes = 1 << 20;
     moqr_core_capacity_t cap;
-    if (moqr_core_capacity_describe(&cfg, &cap) != MOQR_OK) {
+    if (moqr_core_capacity_describe(&cfg, &cap, sizeof(cap)) != MOQ_OK) {
         return UINT64_MAX;
     }
     return cap.structure_bytes;

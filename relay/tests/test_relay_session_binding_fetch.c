@@ -3087,7 +3087,7 @@ jf_cfg_abi(void)
         JF_CAP_OF(cfg, cap);
         MOQ_TEST_CHECK_EQ_U64(cap, MOQR_BIND_DEF_FETCH_FORWARD_BYTES);
         moqr_bind_capacity_t cp;
-        MOQ_TEST_CHECK(moqr_bind_capacity_describe(cfg, &lim, &cp) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_bind_capacity_describe(cfg, &lim, &cp, sizeof(cp)) == MOQ_OK);
         moqr_bind_limits_t bl;
         MOQ_TEST_CHECK(moqr_bind_cfg_resolve(cfg, &lim, &bl) == MOQR_OK);
         MOQ_TEST_CHECK_EQ_U64(cp.total_bytes - cp.structure_bytes - cp.announce_bytes,
@@ -3133,7 +3133,7 @@ jf_cfg_abi(void)
         JF_CAP_OF(&cfg, cap);
         MOQ_TEST_CHECK_EQ_U64(cap, 65536);
         moqr_bind_capacity_t cp;
-        MOQ_TEST_CHECK(moqr_bind_capacity_describe(&cfg, &lim, &cp) == MOQR_OK);
+        MOQ_TEST_CHECK(moqr_bind_capacity_describe(&cfg, &lim, &cp, sizeof(cp)) == MOQ_OK);
         moqr_bind_limits_t bl;
         MOQ_TEST_CHECK(moqr_bind_cfg_resolve(&cfg, &lim, &bl) == MOQR_OK);
         MOQ_TEST_CHECK_EQ_U64(cp.total_bytes - cp.structure_bytes - cp.announce_bytes,
@@ -3146,8 +3146,10 @@ jf_cfg_abi(void)
         moqr_bind_t *b = (moqr_bind_t *)(void *)&cfg;   /* must be reset to NULL */
         MOQ_TEST_CHECK(moqr_bind_create(&cfg, &b) == MOQR_ERR_INVAL);
         MOQ_TEST_CHECK(b == NULL);
-        MOQ_TEST_CHECK(moqr_bind_capacity_describe(&cfg, &lim, &cp) == MOQR_ERR_INVAL);
-        MOQ_TEST_CHECK(cp.total_bytes == 0 && cp.structure_bytes == 0);
+        memset(&cp, 0xa5, sizeof(cp));
+        MOQ_TEST_CHECK(moqr_bind_capacity_describe(&cfg, &lim, &cp, sizeof(cp)) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(cp.total_bytes == UINT64_C(0xa5a5a5a5a5a5a5a5) &&
+                       cp.structure_bytes == UINT64_C(0xa5a5a5a5a5a5a5a5));
         MOQ_TEST_CHECK(moqr_bind_cfg_resolve(&cfg, &lim, &bl) == MOQR_ERR_INVAL);
         MOQ_TEST_CHECK(bl.max_conns == 0 && bl.n_fetches == 0);
     }

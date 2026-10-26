@@ -528,20 +528,31 @@ if(Python3_Interpreter_FOUND AND UNIX AND MOQR_SDK_CXX)
     set_tests_properties(relay_sdk_package PROPERTIES TIMEOUT 180 LABELS "relay;boundary")
 endif()
 
-add_executable(test_relay_cluster test_relay_cluster.c)
-target_link_libraries(test_relay_cluster PRIVATE moq::relay-core)
+# Inspect private counter exhaustion without exporting a production test seam.
+add_executable(test_relay_cluster test_relay_cluster.c
+    ${MOQR_TEST_CORE_DIR}/wire_codes.c
+    ${MOQR_TEST_CORE_DIR}/capacity.c
+    ${MOQR_TEST_CORE_DIR}/log.c
+    ${MOQR_TEST_CORE_DIR}/trace.c
+    ${MOQR_TEST_CORE_DIR}/types.c)
+target_include_directories(test_relay_cluster PRIVATE
+    ${MOQR_TEST_CORE_DIR} ${MOQ_RELAY_INCLUDE_DIR})
+target_link_libraries(test_relay_cluster PRIVATE moq::core)
 moqr_test_warnings(test_relay_cluster)
 add_test(NAME relay_cluster COMMAND test_relay_cluster)
+set_tests_properties(relay_cluster PROPERTIES LABELS "relay;sansio")
 
 if(MOQ_BUILD_RELAY_RUNTIME)
 add_executable(test_relay_cluster_shards test_relay_cluster_shards.c)
 target_link_libraries(test_relay_cluster_shards PRIVATE moq-relay-inspect)
 moqr_test_warnings(test_relay_cluster_shards)
 add_test(NAME relay_cluster_shards COMMAND test_relay_cluster_shards)
+set_tests_properties(relay_cluster_shards PROPERTIES LABELS "relay;sansio")
 if(TARGET moq::sim)
 add_executable(test_relay_cluster_mesh test_relay_cluster_mesh.c)
 target_link_libraries(test_relay_cluster_mesh PRIVATE moq::relay moq::sim)
 moqr_test_warnings(test_relay_cluster_mesh)
 add_test(NAME relay_cluster_mesh COMMAND test_relay_cluster_mesh)
+set_tests_properties(relay_cluster_mesh PROPERTIES LABELS "relay;sansio")
 endif()
 endif()

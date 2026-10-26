@@ -2016,6 +2016,8 @@ static void test_data_committed(int &failures)
 
 static_assert(static_cast<int>(moq::errc::limit) == MOQ_ERR_LIMIT);
 static_assert(MOQ_ERR_LIMIT == -16);
+static_assert(static_cast<int>(moq::errc::capacity) == MOQ_ERR_CAPACITY);
+static_assert(MOQ_ERR_CAPACITY == -17);
 static_assert(static_cast<uint32_t>(moq::fetch_ranges::timed_out) ==
               MOQ_FETCH_RANGE_TIMED_OUT);
 static_assert(static_cast<uint64_t>(moq::request_errors::conflicting_filters) ==

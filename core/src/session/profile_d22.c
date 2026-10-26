@@ -240,16 +240,14 @@ static moq_result_t d22_handle_setup(moq_session_t *s,
     peer.max_auth_token_cache_size = opts.max_auth_token_cache_size;
     peer.has_implementation = opts.has_implementation;
     peer.implementation = opts.implementation;
+    peer.has_cluster_hop_id = opts.has_hop_id;
+    peer.cluster_hop_id = opts.hop_id;
+    peer.has_cluster_relay_cost = opts.has_relay_cost;
+    peer.cluster_relay_cost = opts.relay_cost;
     p->peer_max_filter_ranges = opts.has_max_filter_ranges ? opts.max_filter_ranges : 0;
     p->peer_max_request_updates = opts.has_max_request_updates ? opts.max_request_updates : 0;
-    rc = session_setup_complete_peer(s, &workspace, &peer, &p->setup_received, p->setup_sent);
-    if (rc == MOQ_OK && p->setup_received && s->state != MOQ_SESS_CLOSED) {
-        s->cluster_negotiated = s->cluster_enabled && opts.has_hop_id;
-        s->cluster_peer_hop_id = opts.has_hop_id ? opts.hop_id : 0;
-        s->cluster_peer_has_relay_cost = opts.has_relay_cost;
-        s->cluster_peer_relay_cost = opts.has_relay_cost ? opts.relay_cost : 1;
-    }
-    return rc;
+    return session_setup_complete_peer(s, &workspace, &peer,
+                                        &p->setup_received, p->setup_sent);
 }
 
 /* GOAWAY on the control stream (§9.2): New Session URI and Timeout, no

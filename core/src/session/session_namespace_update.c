@@ -451,8 +451,22 @@ moq_result_t ns_update_cfg_read(const moq_session_t *s,
     const moq_namespace_update_cfg_t *cfg, moq_request_family_t family,
     moq_namespace_update_encode_args_t *out)
 {
-    if (!cfg || cfg->struct_size < MOQ_NAMESPACE_UPDATE_CFG_V0_SIZE)
+    if (!cfg) return MOQ_ERR_INVAL;
+    /* The original ILP32 config is only four-byte aligned; the cluster
+     * tail raises this type's alignment on ARM. Do not dereference the
+     * caller as the enlarged type, even to read its size stamp. */
+    uint32_t size = 0;
+    memcpy(&size, cfg, sizeof(size));
+    if (size < MOQ_NAMESPACE_UPDATE_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
+    moq_namespace_update_cfg_t local;
+    memset(&local, 0, sizeof(local));
+    memcpy(&local, cfg, MOQ_NAMESPACE_UPDATE_CFG_V0_SIZE);
+    if (size >= offsetof(moq_namespace_update_cfg_t, cluster) + sizeof(local.cluster))
+        memcpy(&local.cluster,
+               (const uint8_t *)(const void *)cfg + offsetof(moq_namespace_update_cfg_t, cluster),
+               sizeof(local.cluster));
+    cfg = &local;
     uint32_t legal = family == MOQ_REQUEST_FAMILY_NS_SUB
                          ? MOQ_NAMESPACE_UPDATE_PREFIX
                    : family == MOQ_REQUEST_FAMILY_SUBSCRIBE_TRACKS
@@ -616,10 +630,11 @@ void (moq_namespace_update_cfg_init)(moq_namespace_update_cfg_t *cfg)
 void moq_namespace_update_cfg_init_sized(moq_namespace_update_cfg_t *cfg,
                                          size_t cfg_size)
 {
-    if (!cfg || cfg_size < sizeof(cfg->struct_size)) return;
+    if (!cfg || cfg_size < sizeof(uint32_t)) return;
     size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
     memset(cfg, 0, n);
-    cfg->struct_size = (uint32_t)n;
+    uint32_t stamp = (uint32_t)n;
+    memcpy(cfg, &stamp, sizeof(stamp));
 }
 
 moq_result_t moq_session_set_defer_namespace_updates(moq_session_t *s, bool defer)

@@ -77,6 +77,8 @@ EXEMPT='api-boundary-exempt|MOQ_D16_|moq_d16_|fuzz_|MOQ_EVENT_|moq_publish_ok|mo
 # case-sensitive grep so they don't false-positive on public API
 # identifiers (e.g. moq_publish_ok_event_t, moq_request_error_t).
 FORBIDDEN_WIRE_MSG='SUBSCRIBE_NAMESPACE|PUBLISH_NAMESPACE|PUBLISH_NAMESPACE_CANCEL|REQUEST_OK([^_]|$)|REQUEST_ERROR([^_]|$)|REQUEST_UPDATE([^_]|$)|PUBLISH_OK([^_]|$)|PUBLISH_DONE([^_]|$)|FETCH_OK([^_]|$)|FETCH_CANCEL([^_]|$)|NAMESPACE_DONE([^_]|$)|(^|[^a-z_])UNSUBSCRIBE([^_D]|$)|OBJECT_DATAGRAM'
+# These two definitions describe public config sizes, not wire messages.
+PUBLIC_CFG_SIZES='^[0-9]+:[[:space:]]*#define[[:space:]]+MOQ_PUBLISH_NAMESPACE_CFG_(V0|LEGACY)_SIZE[[:space:]]+\\$'
 
 violations=0
 
@@ -98,6 +100,7 @@ check_file() {
     # Case-sensitive check for wire message names in prose.
     local wire_hits
     wire_hits=$(grep -nE "$FORBIDDEN_WIRE_MSG" "$path" 2>/dev/null \
+        | grep -vE "$PUBLIC_CFG_SIZES" \
         | grep -vE "$EXEMPT" || true)
     if [ -n "$wire_hits" ]; then
         echo "WIRE-MSG VIOLATION in $file:"

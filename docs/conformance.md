@@ -488,18 +488,18 @@ metadata validation, partial updates and bounded receive work. Tests
 selection, source identity, backpressure, failover and delayed responses across
 shards. The nine-case mesh delivers exact catalog bytes and three progressing
 media groups through two relays, including sharded and redundant topologies.
-`pq_sim_establish`, `pico_wt_loopback` and `pico_wt_loopback_private` separately
-verify cluster negotiation and catalog/media delivery in native QUIC and
-WebTransport TLS/packet simulations. These are not live socket mesh evidence.
+`pq_sim_establish` and the public `pico_wt_loopback` row exercise cluster
+negotiation and catalog/media delivery in native QUIC and WebTransport
+TLS/packet simulations. The private loopback variant excludes that cluster
+flow. These are not live socket mesh evidence.
 
-The recorded implementation run passed 575/575 Debug tests and 3/3 adapter
-tests. ASan/UBSan/LeakSanitizer passed 569/575, including all six cluster tests.
-The six failures reproduce on the unchanged baseline: a bounds error in the
-MPEG-TS fixture, four relay-bootstrap leak fixtures and one finite-tail leak
-fixture. Commands and results are in [the validation record](moq-cluster-01-plan.txt).
-Live socket mesh testing and the absent `../moq-pub` application remain
-unverified. Peer discovery, dialing and reconnect policy belong to the host;
-the relay command does not expose cluster-peer configuration.
+The [original implementation plan](moq-cluster-01-plan.txt) retains historical
+candidate results; those totals and baseline failures are not qualification
+results or accepted exceptions for the composed tree. Final qualification is
+reported separately against its exact source. Live socket mesh testing and
+the absent `../moq-pub` application remain unverified. Peer discovery, dialing
+and reconnect policy belong to the host; the relay command does not expose
+cluster-peer configuration.
 
 ## Known limitations
 

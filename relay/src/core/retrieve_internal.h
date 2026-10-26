@@ -2,6 +2,7 @@
 #define MOQR_RETRIEVE_INTERNAL_H
 
 #include <moq/relay/relay.h>
+#include "cluster_internal.h"
 
 /*
  * Same-build internal interface between relay-core and the relay runtime.
@@ -65,7 +66,7 @@ MOQR_CORE_API moqr_result_t moqr_core_internal_retrieve_open(
  * across a shard mailbox. Never admits cached data from another publisher. */
 MOQR_CORE_API moqr_result_t moqr_core_internal_retrieve_open_cluster(
     moqr_core_t *core, moqr_binding_t binding, const moqr_fetch_req_t *req,
-    uint64_t source_binding_cookie, uint64_t source_route_generation,
+    moqr_cluster_advertisement_id_t source,
     uint64_t requester_hop_id, uint64_t requester_correlation_id,
     uint64_t now_us, moqr_fetch_t *owner, moqr_core_retrieve_plan_t *plan);
 

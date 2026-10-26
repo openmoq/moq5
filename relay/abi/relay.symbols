@@ -3,6 +3,7 @@ moqr_bind_capacity_describe
 moqr_bind_cfg_init_sized
 moqr_bind_cfg_resolve
 moqr_bind_cluster_capacity_describe
+moqr_bind_cluster_peer_cfg_init_sized
 moqr_bind_conn_close
 moqr_bind_conn_is_open
 moqr_bind_conn_open

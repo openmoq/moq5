@@ -1,4 +1,7 @@
 MoQ Cluster draft-01 implementation plan
+Historical original-PR plan and receipts. The results below predate the
+current-main composition and API/adoption repairs; they are not current
+qualification results or accepted baseline exceptions.
 Spec: docs/moq-cluster-01-design.md
 Approved scope: full draft-22 session and reusable relay support.
 Execution: parallel protocol and route-engine tasks; root owns integration.

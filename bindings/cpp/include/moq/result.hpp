@@ -26,6 +26,7 @@ enum class errc : int {
     unsupported     = MOQ_ERR_UNSUPPORTED,
     input_not_consumed = MOQ_ERR_INPUT_NOT_CONSUMED,
     limit           = MOQ_ERR_LIMIT,
+    capacity        = MOQ_ERR_CAPACITY,
     internal        = MOQ_ERR_INTERNAL,
 };
 

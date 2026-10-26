@@ -93,10 +93,12 @@ typedef struct moqr_bind_limits {
  * the difference being exactly those three terms. These private limits do
  * not change the embedded config layout or the Joining FETCH byte budget. */
 typedef struct moqr_bind_capacity {
+    uint32_t struct_size, _reserved;
     uint64_t structure_bytes;
     uint64_t announce_bytes;
     uint64_t total_bytes;
 } moqr_bind_capacity_t;
+#define MOQR_BIND_CAPACITY_V0_SIZE 32u
 
 typedef struct moqr_bind_cfg {
     uint32_t           struct_size;
@@ -164,16 +166,19 @@ MOQR_API moqr_result_t moqr_bind_cfg_resolve(const moqr_bind_cfg_t *cfg,
                                     const moqr_core_limits_t *core_limits,
                                     moqr_bind_limits_t *out);
 
-MOQR_API moqr_result_t moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
+/* Sized outputs: require V0, copy/stamp min(out_size, current) on MOQ_OK;
+ * leave all output bytes unchanged on error. Admission CAPACITY differs from
+ * transient WOULD_BLOCK and allocation NOMEM. */
+MOQR_API moq_result_t moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
                                           const moqr_core_limits_t *core_limits,
-                                          moqr_bind_capacity_t *out);
+                                          moqr_bind_capacity_t *out, size_t out_size);
 
 /* Capacity planning before a core exists: pass the immutable resolved
  * cluster configuration from moqr_cluster_cfg_resolve. The ordinary describe
  * function uses cfg->core when supplied, otherwise describes legacy mode. */
-MOQR_API moqr_result_t moqr_bind_cluster_capacity_describe(
+MOQR_API moq_result_t moqr_bind_cluster_capacity_describe(
     const moqr_bind_cfg_t *cfg, const moqr_core_limits_t *core_limits,
-    const moqr_cluster_info_t *cluster, moqr_bind_capacity_t *out);
+    const moqr_cluster_info_t *cluster, moqr_bind_capacity_t *out, size_t out_size);
 
 MOQR_API moqr_result_t moqr_bind_create(const moqr_bind_cfg_t *cfg,
                                moqr_bind_t **out);
@@ -214,13 +219,22 @@ MOQR_API moqr_result_t moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *sessio
 typedef struct moqr_bind_cluster_peer_cfg {
     uint32_t struct_size;
     bool has_relay_cost;
+    uint8_t _reserved[3];
     uint64_t relay_cost;
     uint64_t correlation_id;
 } moqr_bind_cluster_peer_cfg_t;
+#define MOQR_BIND_CLUSTER_PEER_CFG_V0_SIZE 24u
+MOQR_API void moqr_bind_cluster_peer_cfg_init_sized(
+    moqr_bind_cluster_peer_cfg_t *cfg, size_t cfg_size);
+#define moqr_bind_cluster_peer_cfg_init(p) \
+    moqr_bind_cluster_peer_cfg_init_sized((p), sizeof(*(p)))
+/* NULL uses ordinary attachment policy. Reads the named cfg V0 prefix;
+ * ignores unknown tail and relay_cost when has_relay_cost is false.
+ * Copies policy; session stays caller-owned. Refusal takes no ownership. */
 
-MOQR_API moqr_result_t moqr_bind_conn_open_cluster(moqr_bind_t *b,
+MOQR_API moq_result_t moqr_bind_conn_open_cluster(moqr_bind_t *b,
     moq_session_t *session, moq_version_t version,
-    const moqr_bind_cluster_peer_cfg_t *cfg, size_t cfg_size);
+    const moqr_bind_cluster_peer_cfg_t *cfg);
 
 /* This connection's negotiated draft, or MOQ_VERSION_DRAFT_16 if unattached. */
 MOQR_API moq_version_t moqr_bind_conn_version(const moqr_bind_t *b,

@@ -106,7 +106,7 @@ static bool node_create(node_t *n, uint64_t id, bool sharded, bool deny)
     if (deny)
         c.authorize = deny_namespace;
     moqr_cluster_cfg_t cl = {.struct_size = sizeof(cl), .enabled = true, .local_hop_id = id};
-    NEED(moqr_core_create_cluster(&c, &cl, &n->core) == MOQR_OK);
+    NEED(moqr_core_create_cluster(&c, &cl, &n->core) == MOQ_OK);
     moqr_bind_cfg_t b;
     moqr_bind_cfg_init_sized(&b, sizeof(b), &n->alloc.api);
     b.core = n->core;
@@ -229,8 +229,7 @@ static bool run_mesh(mesh_t *m)
     if (m->free_peer) {
         moqr_bind_cluster_peer_cfg_t policy = {
             .struct_size = sizeof(policy), .has_relay_cost = true, .relay_cost = 0};
-        NEED(moqr_bind_conn_open_cluster(m->b.bind, moq_simpair_server(m->peer),
-                                         MOQ_VERSION_DRAFT_22, &policy, sizeof(policy)) == MOQR_OK);
+        NEED(moqr_bind_conn_open_cluster(m->b.bind, moq_simpair_server(m->peer), MOQ_VERSION_DRAFT_22, &policy) == MOQ_OK);
     } else {
         NEED(moqr_bind_conn_open(m->b.bind, moq_simpair_server(m->peer), MOQ_VERSION_DRAFT_22) ==
              MOQR_OK);
@@ -265,13 +264,12 @@ static bool run_mesh(mesh_t *m)
     moqr_cluster_route_t route;
     if (m->deny_discovery) {
         NEED(m->found == 0);
-        NEED(moqr_core_cluster_route(m->b.core, MOQR_BINDING_INVALID, (moqr_ns_t){&ns, 1},
-                                     &route) == MOQR_DONE);
+        NEED(moqr_core_cluster_route(m->b.core, MOQR_BINDING_INVALID, (moqr_ns_t){&ns, 1}, &route, sizeof(route)) == MOQ_DONE);
         return true;
     }
     NEED(m->found == 1);
-    NEED(moqr_core_cluster_route(m->b.core, MOQR_BINDING_INVALID, (moqr_ns_t){&ns, 1}, &route) ==
-         MOQR_OK);
+    NEED(moqr_core_cluster_route(m->b.core, MOQR_BINDING_INVALID, (moqr_ns_t){&ns, 1}, &route, sizeof(route)) ==
+         MOQ_OK);
     NEED(route.metadata.hop_count == 2);
     NEED(route.metadata.hop_ids[0] == (m->cluster_publisher ? 19u : 0u));
     NEED(route.metadata.hop_ids[1] == 31);
@@ -288,8 +286,7 @@ static bool run_mesh(mesh_t *m)
             NEED(moq_session_update_namespace(m->publisher, ann, &update, m->now, NULL) == MOQ_OK);
             NEED(drive(m, 24));
             m->b.alloc.fail = false;
-            NEED(moqr_core_cluster_route(m->b.core, MOQR_BINDING_INVALID, (moqr_ns_t){&ns, 1},
-                                         &route) == MOQR_OK);
+            NEED(moqr_core_cluster_route(m->b.core, MOQR_BINDING_INVALID, (moqr_ns_t){&ns, 1}, &route, sizeof(route)) == MOQ_OK);
             NEED(route.accumulated_cost == costs[i] + (m->free_peer ? 1u : 2u));
         }
     }
@@ -314,8 +311,8 @@ static bool run_mesh(mesh_t *m)
     NEED(m->got_video == 3);
     NEED(moq_session_publish_namespace_done(m->publisher, ann, m->now) == MOQ_OK);
     NEED(drive(m, 24));
-    NEED(moqr_core_cluster_route(m->b.core, MOQR_BINDING_INVALID, (moqr_ns_t){&ns, 1}, &route) ==
-         MOQR_DONE);
+    NEED(moqr_core_cluster_route(m->b.core, MOQR_BINDING_INVALID, (moqr_ns_t){&ns, 1}, &route, sizeof(route)) ==
+         MOQ_DONE);
     return true;
 }
 static void cleanup(mesh_t *m)

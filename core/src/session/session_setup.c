@@ -191,6 +191,13 @@ moq_result_t session_setup_complete_peer(moq_session_t *s,
     s->peer_setup.has_authority = peer->has_authority;
     s->peer_setup.has_max_auth_token_cache_size = peer->has_max_auth_token_cache_size;
     s->peer_setup.max_auth_token_cache_size = peer->max_auth_token_cache_size;
+    /* Commit negotiation only after every retryable setup preparation, but
+     * before establishing and replaying request streams. A request may have
+     * arrived ahead of this control stream and already require HOP_PATH. */
+    s->cluster_negotiated = s->cluster_enabled && peer->has_cluster_hop_id;
+    s->cluster_peer_hop_id = peer->has_cluster_hop_id ? peer->cluster_hop_id : 0;
+    s->cluster_peer_has_relay_cost = peer->has_cluster_relay_cost;
+    s->cluster_peer_relay_cost = peer->has_cluster_relay_cost ? peer->cluster_relay_cost : 1;
     *setup_received = true;
     bool established_now = false;
     if (setup_sent && s->state != MOQ_SESS_ESTABLISHED) {

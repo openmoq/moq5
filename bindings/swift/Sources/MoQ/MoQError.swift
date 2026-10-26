@@ -18,6 +18,8 @@ public enum MoQError: Error, Sendable, Hashable {
     public static let unsupported = MoQError.unknown(MOQ_ERR_UNSUPPORTED)
     /// A permanent implementation limit, not retryable backpressure.
     public static let limit = MoQError.unknown(MOQ_ERR_LIMIT)
+    /// Configured admission policy refused the operation; not transient queue pressure.
+    public static let capacity = MoQError.unknown(MOQ_ERR_CAPACITY)
     case `internal`
     case unknown(Int32)
 }

@@ -112,6 +112,10 @@ typedef struct moq_setup_params {
     bool     has_authority;
     bool        has_implementation;
     moq_bytes_t implementation;   /* borrowed from the decoded setup */
+    bool     has_cluster_hop_id;
+    uint64_t cluster_hop_id;
+    bool     has_cluster_relay_cost;
+    uint64_t cluster_relay_cost;
 } moq_setup_params_t;
 
 /* Forward decl: entries hold a pointer to their reserved registry record

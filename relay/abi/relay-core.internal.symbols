@@ -1,3 +1,6 @@
+moqr_core_internal_cluster_export
+moqr_core_internal_cluster_import
+moqr_core_internal_cluster_upstream_route
 moqr_core_internal_delivery_flags
 moqr_core_internal_discard_subgroup
 moqr_core_internal_duplicate
@@ -18,3 +21,4 @@ moqr_core_internal_source_idle
 moqr_core_internal_sub_fail
 moqr_core_internal_sub_release_reserve
 moqr_core_internal_sub_reserve
+moqr_core_internal_subscribe_cluster

@@ -1916,7 +1916,7 @@ moqr_cli_describe_capacity(const moqr_cli_config_t *cfg,
         moqr_core_relay_cfg_t core = cfg->core;
         core.alloc = alloc;
         moqr_core_capacity_t cap;
-        if (moqr_core_capacity_describe(&core, &cap) != MOQR_OK) {
+        if (moqr_core_capacity_describe(&core, &cap, sizeof(cap)) != MOQ_OK) {
             return MOQR_ERR_INVAL;
         }
         moqr_core_limits_t clim;
@@ -1926,7 +1926,7 @@ moqr_cli_describe_capacity(const moqr_cli_config_t *cfg,
         moqr_bind_cfg_t bind_tmpl;
         moqr_bind_cfg_init_sized(&bind_tmpl, sizeof(bind_tmpl), alloc);
         moqr_bind_capacity_t bc;
-        if (moqr_bind_capacity_describe(&bind_tmpl, &clim, &bc) != MOQR_OK) {
+        if (moqr_bind_capacity_describe(&bind_tmpl, &clim, &bc, sizeof(bc)) != MOQ_OK) {
             return MOQR_ERR_INVAL;
         }
         moqr_bind_limits_t blim;

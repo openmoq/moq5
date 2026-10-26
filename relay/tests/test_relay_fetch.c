@@ -578,7 +578,7 @@ test_pin_floor(void)
     cfg.log_budget.max_bytes = 64;
     cfg.fetch_pin_bytes = 1;
     moqr_core_capacity_t cap;
-    moqr_core_capacity_describe(&cfg, &cap);
+    moqr_core_capacity_describe(&cfg, &cap, sizeof(cap));
     MOQ_TEST_CHECK(cap.payload_bytes >= 64);   /* floored, not 1 */
 
     moqr_binding_t pub, sub;

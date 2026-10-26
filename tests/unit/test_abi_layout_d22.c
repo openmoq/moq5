@@ -77,6 +77,30 @@ _Static_assert(sizeof(void *) == 8 || sizeof(void *) == 4, "pointer width");
 _Static_assert(sizeof(void *) == 4 || ABI_U64_ALIGN == 8,
                "64-bit pointers come with 8-aligned uint64_t");
 
+/* Do not round the old extent up to the NEW uint64 alignment. */
+typedef struct abi_namespace_legacy {
+    uint32_t struct_size;
+    moq_namespace_t track_namespace;
+    const moq_auth_token_t *auth_tokens;
+    size_t auth_token_count;
+} abi_namespace_legacy_t;
+_Static_assert(sizeof(abi_namespace_legacy_t) == ABI_PICK(40, 20, 20), "historical namespace extent");
+_Static_assert(_Alignof(abi_namespace_legacy_t) == sizeof(void *), "historical namespace alignment");
+_Static_assert(MOQ_PUBLISH_NAMESPACE_CFG_LEGACY_SIZE == sizeof(abi_namespace_legacy_t), "legacy initializer floor");
+_Static_assert(offsetof(moq_publish_namespace_cfg_t, cluster) == ABI_PICK(40, 20, 24), "new tail may add alignment padding");
+
+typedef struct abi_namespace_update_legacy {
+    uint32_t struct_size, flags;
+    moq_namespace_t track_namespace_prefix;
+    bool forward;
+    uint8_t reserved[7];
+    const moq_auth_token_t *auth_tokens;
+    size_t auth_token_count;
+} abi_namespace_update_legacy_t;
+_Static_assert(sizeof(abi_namespace_update_legacy_t) == ABI_PICK(48, 32, 32), "old update extent");
+_Static_assert(_Alignof(abi_namespace_update_legacy_t) == sizeof(void *), "old update alignment");
+_Static_assert(MOQ_NAMESPACE_UPDATE_CFG_V0_SIZE == sizeof(abi_namespace_update_legacy_t), "update floor");
+
 /* -- Pin vocabulary ----------------------------------------------------- */
 
 #define ABI_FIELD_END(T, f) (offsetof(T, f) + sizeof(((T *)0)->f))
@@ -439,6 +463,13 @@ PIN_AFTER(moq_simpair_cfg_t, client_defer_subscription_updates,
 /* -- Relay ------------------------------------------------------------------ */
 
 #ifdef ABI_HAVE_RELAY
+_Static_assert(sizeof(moqr_cluster_cfg_t) == MOQR_CLUSTER_CFG_V0_SIZE, "cluster cfg floor");
+_Static_assert(sizeof(moqr_cluster_info_t) == MOQR_CLUSTER_INFO_V0_SIZE, "cluster info floor");
+_Static_assert(sizeof(moqr_cluster_peer_cfg_t) == MOQR_CLUSTER_PEER_CFG_V0_SIZE, "cluster peer floor");
+_Static_assert(sizeof(moqr_bind_cluster_peer_cfg_t) == MOQR_BIND_CLUSTER_PEER_CFG_V0_SIZE, "bind peer floor");
+_Static_assert(sizeof(moqr_core_capacity_t) == MOQR_CORE_CAPACITY_V0_SIZE, "core capacity floor");
+_Static_assert(sizeof(moqr_bind_capacity_t) == MOQR_BIND_CAPACITY_V0_SIZE, "bind capacity floor");
+_Static_assert(sizeof(moqr_cluster_advertisement_id_t) == 16, "comparison ID uses full owner and serial");
 _Static_assert(sizeof(moqr_delivery_outcome_t) == 4,
                "relay delivery outcome width");
 _Static_assert(MOQR_DELIVERY_DISCARDED == 7u,

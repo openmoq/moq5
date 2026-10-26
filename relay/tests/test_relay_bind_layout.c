@@ -152,7 +152,7 @@ describe_bind(ca_t *a, moqr_core_t *core, uint32_t max_conns)
         return UINT64_MAX;
     }
     moqr_bind_capacity_t cap;
-    if (moqr_bind_capacity_describe(&cfg, &lim, &cap) != MOQR_OK) {
+    if (moqr_bind_capacity_describe(&cfg, &lim, &cap, sizeof(cap)) != MOQ_OK) {
         return UINT64_MAX;
     }
     return cap.structure_bytes;
@@ -582,7 +582,7 @@ typedef struct answer_fixture {
 } answer_fixture_t;
 
 static bool
-answer_fixture_open(answer_fixture_t *f)
+answer_fixture_open_conns(answer_fixture_t *f, bool cluster, uint32_t conns)
 {
     memset(f, 0, sizeof(*f));
     ca_init(&f->alloc);
@@ -616,11 +616,13 @@ answer_fixture_open(answer_fixture_t *f)
     cc.max_parked = 1;
     cc.log_budget.max_groups = 4;
     cc.log_budget.max_bytes = 1 << 20;
-    if (moqr_core_create(&cc, &f->core) != MOQR_OK) return false;
+    moqr_cluster_cfg_t cl; moqr_cluster_cfg_init(&cl);
+    cl.enabled = cluster; cl.local_hop_id = 50; cl.max_routes = 4; cl.max_hops = 4;
+    if (moqr_core_create_cluster(&cc, &cl, &f->core) != MOQ_OK) return false;
     moqr_bind_cfg_t bc;
     moqr_bind_cfg_init_sized(&bc, sizeof(bc), &f->alloc.vt);
     bc.core = f->core;
-    bc.max_conns = 1;
+    bc.max_conns = conns;
     bc.max_downstream_subs = 4;
     bc.max_open_subgroups = 4;
     bc.max_upstream_subs = 2;
@@ -628,6 +630,16 @@ answer_fixture_open(answer_fixture_t *f)
     bc.max_announces = 2;
     return moqr_bind_create(&bc, &f->bind) == MOQR_OK &&
            moqr_bind_conn_open(f->bind, f->server, MOQ_VERSION_DRAFT_22) == MOQR_OK;
+}
+
+static bool answer_fixture_open_mode(answer_fixture_t *f, bool cluster)
+{
+    return answer_fixture_open_conns(f, cluster, 1);
+}
+
+static bool answer_fixture_open(answer_fixture_t *f)
+{
+    return answer_fixture_open_mode(f, false);
 }
 
 static void
@@ -1183,10 +1195,384 @@ cleanup:
     return failures;
 }
 
-int
-main(void)
+
+/* A real incoming PUBLISH remains wire-live while a cluster route change
+ * replaces its source. Its old bytes cannot feed the replacement, and its
+ * cancellation survives actual session action pressure. */
+static int test_cluster_push_retirement(void)
 {
     int failures = 0;
+    answer_fixture_t f;
+#define CP_REQUIRE(x) do { bool ok_ = (x); MOQ_TEST_CHECK(ok_); if (!ok_) goto cleanup; } while (0)
+    CP_REQUIRE(answer_fixture_open_mode(&f, true));
+    CP_REQUIRE(moqr_bind_pump(f.bind, 2) == MOQR_OK);
+    b_conn_t *cn = &f.bind->conns[0];
+    moq_bytes_t part = MOQ_BYTES_LITERAL("push");
+    moqr_ns_t ns = {&part, 1};
+    uint64_t old_path[] = {99, 10}, new_path[] = {99, 20};
+    moq_cluster_metadata_t md = {old_path, 2, true, 9};
+    CP_REQUIRE(moqr_core_announce_cluster(f.core, cn->binding, ns, 1, &md, false) == MOQ_OK);
+    moq_publish_cfg_t pc; moq_publish_cfg_init(&pc);
+    pc.track_namespace = (moq_namespace_t){&part, 1}; pc.track_name = MOQ_BYTES_LITERAL("v");
+    moq_publication_t publication;
+    CP_REQUIRE(moq_session_publish(f.peer, &pc, 3, &publication) == MOQ_OK);
+    answer_transfer(&f, false, 3);
+    CP_REQUIRE(moqr_bind_pump(f.bind, 3) == MOQR_OK);
+    answer_transfer(&f, true, 3);
+    moq_event_t ev;
+    CP_REQUIRE(take(f.peer, MOQ_EVENT_PUBLISH_OK, &ev));
+    moq_event_cleanup(&ev);
+    b_pub_t *bp = NULL;
+    for (uint32_t i = 0; i < f.bind->n_pubs; i++) if (cn->pubs[i].used) bp = &cn->pubs[i];
+    CP_REQUIRE(bp != NULL);
+    moqr_track_t track = bp->track; uint64_t old_gen = bp->track_gen;
+    moq_publication_t incoming = {bp->pub_raw};
+    moqr_binding_t downstream, alternative;
+    CP_REQUIRE(moqr_core_binding_open(f.core, 100, &downstream) == MOQR_OK);
+    CP_REQUIRE(moqr_core_binding_open(f.core, 101, &alternative) == MOQR_OK);
+    moqr_subscribe_req_t req; moqr_subscribe_req_init(&req);
+    req.ns = ns; req.name = MOQ_BYTES_LITERAL("v"); req.cookie = 55;
+    moqr_sub_t sub;
+    CP_REQUIRE(moqr_core_subscribe(f.core, downstream, &req, &sub) == MOQR_OK);
+    moqr_intent_t items[8]; (void)moqr_core_poll_intents(f.core, items, 8);
+    md = (moq_cluster_metadata_t){new_path, 2, true, 1};
+    CP_REQUIRE(moqr_core_announce_cluster(f.core, alternative, ns, 2, &md, false) == MOQ_OK);
+    CP_REQUIRE(moqr_core_tick(f.core, 4) == MOQR_OK);
+    size_t n = moqr_core_poll_intents(f.core, items, 8);
+    moqr_intent_t cancel = {0}, next = {0}; unsigned cancels = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (items[i].kind == MOQR_INTENT_UPSTREAM_UNSUBSCRIBE) { cancel = items[i]; cancels++; }
+        if (items[i].kind == MOQR_INTENT_UPSTREAM_SUBSCRIBE) next = items[i];
+    }
+    CP_REQUIRE(cancels == 1 && cancel.binding_cookie == 1 && cancel.track_gen == old_gen);
+    CP_REQUIRE(next.kind == MOQR_INTENT_UPSTREAM_SUBSCRIBE && next.track_gen != old_gen &&
+               moqr_track_eq(next.track, track));
+    CP_REQUIRE(moqr_core_upstream_ok(f.core, next.track, next.track_gen, 77, false, 0, 0) == MOQR_OK);
+    /* No cancellation has reached the binding yet: generation alone guards ingest. */
+    MOQ_TEST_CHECK(!moqr_track_is_valid(bind_ingest_track(f.bind, cn, MOQ_SUBSCRIPTION_INVALID, incoming)));
+    moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg); sg.group_id = 3;
+    moq_subgroup_handle_t h;
+    CP_REQUIRE(moq_session_open_pub_subgroup(f.peer, publication, &sg, 5, &h) == MOQ_OK);
+    moq_rcbuf_t *payload;
+    CP_REQUIRE(moq_rcbuf_create(&f.alloc.vt, (const uint8_t *)"old", 3, &payload) == MOQ_OK);
+    moq_result_t wr = moq_session_write_object(f.peer, h, 0, payload, 5);
+    moq_rcbuf_decref(payload); CP_REQUIRE(wr == MOQ_OK);
+    answer_transfer(&f, false, 5);
+    unsigned objects = 0;
+    while (moq_session_poll_events(f.server, &ev, 1) == 1) {
+        if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) objects++;
+        bind_on_event(f.bind, cn, &ev, 5); moq_event_cleanup(&ev);
+    }
+    CP_REQUIRE(objects == 1);
+    moqr_core_stats_t stats; moqr_core_get_stats(f.core, &stats);
+    MOQ_TEST_CHECK(stats.ingested_total == 0);
+    /* Real full output ring refuses the first cancellation, without a test seam. */
+    for (unsigned i = 0; i < 16 && moq_session_action_capacity(f.server) != 0; i++) {
+        uint8_t byte = (uint8_t)('A' + i); moq_bytes_t filler = {&byte, 1};
+        moq_publish_namespace_cfg_t cfg; moq_publish_namespace_cfg_init(&cfg);
+        cfg.track_namespace = (moq_namespace_t){&filler, 1}; moq_announcement_t ann;
+        CP_REQUIRE(moq_session_publish_namespace(f.server, &cfg, 5, &ann) == MOQ_OK);
+    }
+    CP_REQUIRE(moq_session_action_capacity(f.server) == 0);
+    bool parked = false; moqr_intent_t deferred = {0};
+    CP_REQUIRE(bind_try_intent(f.bind, &cancel, 6, BIND_TRY_FRESH, &parked, &deferred));
+    MOQ_TEST_CHECK(bp->used && bp->cancel_owed && bp->track_gen == old_gen &&
+                   (cn->retry_pending & B_RETRY_CANCEL));
+    moq_action_t action;
+    while (moq_session_poll_actions(f.server, &action, 1) == 1) moq_action_cleanup(&action);
+    bind_retry_owed_cancels(f.bind, cn, 7);
+    MOQ_TEST_CHECK(!bp->used && !(cn->retry_pending & B_RETRY_CANCEL));
+    answer_transfer(&f, true, 7);
+    unsigned ended = 0;
+    while (moq_session_poll_events(f.peer, &ev, 1) == 1) {
+        if (ev.kind == MOQ_EVENT_PUBLISH_UNSUBSCRIBED) { ended++; MOQ_TEST_CHECK(ev.u.publish_unsubscribed.pub._opaque == publication._opaque); }
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK(ended == 1);
+    bind_retry_owed_cancels(f.bind, cn, 8);
+    MOQ_TEST_CHECK(moq_session_poll_actions(f.server, &action, 1) == 0);
+    uint64_t current = 0;
+    MOQ_TEST_CHECK(moqr_core_track_current_generation(f.core, track, &current) == MOQR_OK && current == next.track_gen);
+    MOQ_TEST_CHECK(f.bind->session_errors == 0);
+cleanup:
+    answer_fixture_close(&f);
+    MOQ_TEST_CHECK_EQ_INT((int)f.alloc.live, 0);
+#undef CP_REQUIRE
+    return failures;
+}
+
+
+/* A malformed terminal is generated by the real receiver: a second stream
+ * changes publisher priority within Group 0. When the old request's cancel
+ * is held by action pressure, its terminal must not reset a replacement's
+ * Group 10 or its already-accepted cached FETCH. Current-source controls
+ * retain the draft-22 malformed-track response. */
+static int test_cluster_malformed_terminal(bool push, bool replace)
+{
+    int failures = 0;
+    answer_fixture_t f, dw = {0};
+    moq_session_t *dp = NULL, *ds = NULL;
+#define CM_REQUIRE(x) do { if (!(x)) { \
+    fprintf(stderr, "malformed push=%d replace=%d prerequisite:%d: %s\n", \
+            push, replace, __LINE__, #x); failures++; goto cleanup; } } while (0)
+    CM_REQUIRE(answer_fixture_open_conns(&f, true, 2));
+    side_cfg_t dcfg = {.version = MOQ_VERSION_DRAFT_22};
+    dp = session(MOQ_PERSPECTIVE_CLIENT, &dcfg);
+    ds = session(MOQ_PERSPECTIVE_SERVER, &dcfg);
+    CM_REQUIRE(dp != NULL && ds != NULL);
+    run(dp, ds, 1); drain(dp); drain(ds);
+    CM_REQUIRE(moq_session_state(dp) == MOQ_SESS_ESTABLISHED &&
+               moq_session_state(ds) == MOQ_SESS_ESTABLISHED);
+    dw.peer = dp; dw.server = ds;
+    CM_REQUIRE(moqr_bind_conn_open(f.bind, ds, MOQ_VERSION_DRAFT_22) == MOQR_OK);
+    CM_REQUIRE(moqr_bind_pump(f.bind, 2) == MOQR_OK);
+    b_conn_t *up = &f.bind->conns[0], *down = &f.bind->conns[1];
+    moq_bytes_t part = MOQ_BYTES_LITERAL("source");
+    moqr_ns_t ns = {&part, 1};
+    uint64_t path[] = {99, 10}, better[] = {99, 20};
+    moq_cluster_metadata_t md = {path, 2, true, 9};
+    CM_REQUIRE(moqr_core_announce_cluster(f.core, up->binding, ns, 1, &md, false) == MOQ_OK);
+    moq_publication_t publication = MOQ_PUBLICATION_INVALID;
+    moq_subscription_t publisher_sub = MOQ_SUBSCRIPTION_INVALID;
+    moq_event_t ev;
+    if (push) {
+        moq_publish_cfg_t pc; moq_publish_cfg_init(&pc);
+        pc.track_namespace = (moq_namespace_t){&part, 1}; pc.track_name = MOQ_BYTES_LITERAL("v");
+        CM_REQUIRE(moq_session_publish(f.peer, &pc, 3, &publication) == MOQ_OK);
+        answer_transfer(&f, false, 3);
+        CM_REQUIRE(moqr_bind_pump(f.bind, 3) == MOQR_OK);
+        answer_transfer(&f, true, 3);
+        CM_REQUIRE(take(f.peer, MOQ_EVENT_PUBLISH_OK, &ev));
+        moq_event_cleanup(&ev);
+    }
+    moq_subscribe_cfg_t sc; moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = (moq_namespace_t){&part, 1}; sc.track_name = MOQ_BYTES_LITERAL("v");
+    sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+    moq_subscription_t subscription;
+    CM_REQUIRE(moq_session_subscribe(dp, &sc, 4, &subscription) == MOQ_OK);
+    answer_transfer(&dw, false, 4);
+    CM_REQUIRE(moqr_bind_pump(f.bind, 4) == MOQR_OK);
+    answer_transfer(&f, true, 4);
+    if (!push) {
+        CM_REQUIRE(take(f.peer, MOQ_EVENT_SUBSCRIBE_REQUEST, &ev));
+        publisher_sub = ev.u.subscribe_request.sub;
+        moq_event_cleanup(&ev);
+        moq_accept_subscribe_cfg_t ac; moq_accept_subscribe_cfg_init(&ac);
+        CM_REQUIRE(moq_session_accept_subscribe(f.peer, publisher_sub, &ac, 4) == MOQ_OK);
+        answer_transfer(&f, false, 4);
+        CM_REQUIRE(moqr_bind_pump(f.bind, 4) == MOQR_OK);
+    }
+    answer_transfer(&dw, true, 4);
+    CM_REQUIRE(take(dp, MOQ_EVENT_SUBSCRIBE_OK, &ev));
+    CM_REQUIRE(moq_subscription_eq(ev.u.subscribe_ok.sub, subscription));
+    moq_event_cleanup(&ev);
+    b_pub_t *bp = NULL; b_usub_t *us = NULL;
+    for (uint32_t i = 0; i < f.bind->n_pubs; i++) if (up->pubs[i].used) bp = &up->pubs[i];
+    for (uint32_t i = 0; i < f.bind->n_usubs; i++) if (up->usubs[i].used) us = &up->usubs[i];
+    CM_REQUIRE(push ? bp != NULL : us != NULL);
+    moqr_track_t track = push ? bp->track : us->track;
+    uint64_t old_gen = push ? bp->track_gen : us->track_gen;
+    uint64_t current_gen = old_gen;
+    uint64_t old_handle = push ? bp->pub_raw : us->ssub._opaque;
+
+    moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
+    sg.group_id = 0; sg.subgroup_id = 0; sg.publisher_priority = 10;
+    moq_subgroup_handle_t h;
+    CM_REQUIRE((push ? moq_session_open_pub_subgroup(f.peer, publication, &sg, 5, &h) :
+                       moq_session_open_subgroup(f.peer, publisher_sub, &sg, 5, &h)) == MOQ_OK);
+    moq_rcbuf_t *pl = NULL;
+    CM_REQUIRE(moq_rcbuf_create(&f.alloc.vt, (const uint8_t *)"old", 3, &pl) == MOQ_OK);
+    moq_result_t wr = moq_session_write_object(f.peer, h, 0, pl, 5);
+    moq_rcbuf_decref(pl); CM_REQUIRE(wr == MOQ_OK);
+    CM_REQUIRE(moq_session_close_subgroup(f.peer, h, 5) == MOQ_OK);
+    answer_transfer(&f, false, 5);
+    CM_REQUIRE(moqr_bind_pump(f.bind, 5) == MOQR_OK);
+    answer_transfer(&dw, true, 5); drain(dp);
+
+    moqr_intent_t cancel = {0};
+    if (replace) {
+        moqr_binding_t alternative;
+        CM_REQUIRE(moqr_core_binding_open(f.core, 101, &alternative) == MOQR_OK);
+        md = (moq_cluster_metadata_t){better, 2, true, 1};
+        CM_REQUIRE(moqr_core_announce_cluster(f.core, alternative, ns, 2, &md, false) == MOQ_OK);
+        CM_REQUIRE(moqr_core_tick(f.core, 6) == MOQR_OK);
+        moqr_intent_t items[8], next = {0};
+        size_t n = moqr_core_poll_intents(f.core, items, 8);
+        unsigned cancels = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (items[i].kind == MOQR_INTENT_UPSTREAM_UNSUBSCRIBE) { cancel = items[i]; cancels++; }
+            if (items[i].kind == MOQR_INTENT_UPSTREAM_SUBSCRIBE) next = items[i];
+        }
+        CM_REQUIRE(cancels == 1 && cancel.binding_cookie == 1 && cancel.track_gen == old_gen);
+        CM_REQUIRE(next.kind == MOQR_INTENT_UPSTREAM_SUBSCRIBE && next.track_gen != old_gen &&
+                   moqr_track_eq(next.track, track));
+        current_gen = next.track_gen;
+        CM_REQUIRE(moqr_core_upstream_ok(f.core, track, current_gen, 77, false, 0, 0) == MOQR_OK);
+    }
+    /* Hold the old cancellation with actual session output, not a fabricated
+     * cancel flag or a synthetic terminal event. */
+    for (unsigned i = 0; i < 16 && moq_session_action_capacity(f.server) != 0; i++) {
+        uint8_t byte = (uint8_t)('A' + i); moq_bytes_t filler = {&byte, 1};
+        moq_publish_namespace_cfg_t nc; moq_publish_namespace_cfg_init(&nc);
+        nc.track_namespace = (moq_namespace_t){&filler, 1}; moq_announcement_t ann;
+        CM_REQUIRE(moq_session_publish_namespace(f.server, &nc, 6, &ann) == MOQ_OK);
+    }
+    CM_REQUIRE(moq_session_action_capacity(f.server) == 0);
+    if (replace) {
+        bool parked = false; moqr_intent_t deferred = {0};
+        CM_REQUIRE(bind_try_intent(f.bind, &cancel, 6, BIND_TRY_FRESH, &parked, &deferred));
+        CM_REQUIRE((push ? bp->used && bp->cancel_owed : us->used && us->cancel_owed) &&
+                   (up->retry_pending & B_RETRY_CANCEL));
+    }
+    moqr_log_append_desc_t d; moqr_log_append_desc_init(&d);
+    d.group_id = 10; d.subgroup_id = 7; d.object_id = 0;
+    d.obj_state = MOQR_OBJ_OPEN; d.declared_len = 8; d.now_us = 7;
+    CM_REQUIRE(moqr_core_ingest(f.core, track, &d) == MOQR_OK);
+    CM_REQUIRE(moq_rcbuf_create(&f.alloc.vt, (const uint8_t *)"data", 4, &pl) == MOQ_OK);
+    moqr_result_t irc = moqr_core_append_chunk(f.core, track, 10, 7, 0, pl);
+    moq_rcbuf_decref(pl); CM_REQUIRE(irc == MOQR_OK);
+    CM_REQUIRE(moqr_bind_pump(f.bind, 7) == MOQR_OK);
+    answer_transfer(&dw, true, 7); drain(dp);
+    b_sg_t *target = NULL;
+    for (uint32_t i = 0; i < f.bind->n_sgs; i++)
+        if (down->sgs[i].used && down->sgs[i].group == 10 && down->sgs[i].subgroup == 7)
+            target = &down->sgs[i];
+    CM_REQUIRE(target != NULL && target->obj_begun && target->next_chunk == 1);
+    moq_subgroup_handle_t target_handle = target->h;
+    moq_fetch_cfg_t fc; moq_fetch_cfg_init(&fc);
+    fc.track_namespace = (moq_namespace_t){&part, 1}; fc.track_name = MOQ_BYTES_LITERAL("v");
+    fc.start_group = 10; fc.end_group = 10; fc.start_object = 0; fc.end_object = 0;
+    moq_fetch_t fetch;
+    CM_REQUIRE(moq_session_fetch(dp, &fc, 8, &fetch) == MOQ_OK);
+    answer_transfer(&dw, false, 8);
+    CM_REQUIRE(moqr_bind_pump(f.bind, 8) == MOQR_OK);
+    answer_transfer(&dw, true, 8);
+    CM_REQUIRE(take(dp, MOQ_EVENT_FETCH_OK, &ev)); moq_event_cleanup(&ev);
+    b_fetch_t *bf = NULL;
+    for (uint32_t i = 0; i < f.bind->n_fetches; i++)
+        if (down->fetches[i].used && down->fetches[i].standalone) bf = &down->fetches[i];
+    CM_REQUIRE(bf != NULL && bf->state == BF_STREAMING);
+    moq_fetch_t served_fetch = bf->sfetch;
+    CM_REQUIRE(dw.resets == 0 && moq_session_action_capacity(f.server) == 0);
+
+    /* One credit allows the session's terminal to commit before the binding
+     * retries its older cancel. The priority conflict is received on wire. */
+    moq_action_t action;
+    CM_REQUIRE(moq_session_poll_actions(f.server, &action, 1) == 1);
+    moq_action_cleanup(&action);
+    sg.publisher_priority = 11;
+    CM_REQUIRE((push ? moq_session_open_pub_subgroup(f.peer, publication, &sg, 9, &h) :
+                       moq_session_open_subgroup(f.peer, publisher_sub, &sg, 9, &h)) == MOQ_OK);
+    CM_REQUIRE(moq_rcbuf_create(&f.alloc.vt, (const uint8_t *)"bad", 3, &pl) == MOQ_OK);
+    wr = moq_session_write_object(f.peer, h, 1, pl, 9);
+    moq_rcbuf_decref(pl); CM_REQUIRE(wr == MOQ_OK);
+    answer_transfer(&f, false, 9);
+    unsigned terminals = 0;
+    while (moq_session_poll_events(f.server, &ev, 1) == 1) {
+        if (ev.kind == (push ? MOQ_EVENT_PUBLISH_FINISHED : MOQ_EVENT_UNSUBSCRIBED)) {
+            terminals++;
+            MOQ_TEST_CHECK(push ? ev.u.publish_finished.pub._opaque == old_handle :
+                                  ev.u.unsubscribed.sub._opaque == old_handle);
+            MOQ_TEST_CHECK((push ? ev.u.publish_finished.cause : ev.u.unsubscribed.cause) ==
+                           MOQ_REQUEST_TERMINAL_MALFORMED_TRACK);
+        }
+        bind_on_event(f.bind, up, &ev, 9); moq_event_cleanup(&ev);
+    }
+    CM_REQUIRE(terminals == 1);
+    MOQ_TEST_CHECK(push ? !bp->used : !us->used);
+    if (replace) {
+        MOQ_TEST_CHECK(target->used && target->obj_begun && !target->reset_owed &&
+                       target->h._opaque == target_handle._opaque);
+        MOQ_TEST_CHECK(bf->used && bf->state == BF_STREAMING &&
+                       bf->sfetch._opaque == served_fetch._opaque);
+        uint64_t gen = 0;
+        MOQ_TEST_CHECK(moqr_core_track_current_generation(f.core, track, &gen) == MOQR_OK && gen == current_gen);
+        CM_REQUIRE(moq_rcbuf_create(&f.alloc.vt, (const uint8_t *)"tail", 4, &pl) == MOQ_OK);
+        irc = moqr_core_append_chunk(f.core, track, 10, 7, 0, pl);
+        moq_rcbuf_decref(pl); CM_REQUIRE(irc == MOQR_OK);
+        CM_REQUIRE(moqr_core_complete_record(f.core, track, 10, 7, 0) == MOQR_OK);
+        CM_REQUIRE(moqr_core_seal_subgroup(f.core, track, 10, 7) == MOQR_OK);
+    }
+    /* Leave the upstream fillers queued: downstream progress is independent. */
+    unsigned objects = 0, fetch_objects = 0, fetch_ends = 0, dones = 0;
+    for (unsigned pass = 0; pass < 3; pass++) {
+        CM_REQUIRE(moqr_bind_pump(f.bind, 10 + pass) == MOQR_OK);
+        answer_transfer(&dw, true, 10 + pass);
+        while (moq_session_poll_events(dp, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED && ev.u.object_received.group_id == 10) {
+                objects++;
+                MOQ_TEST_CHECK(moq_rcbuf_len(ev.u.object_received.payload) == 8 &&
+                               memcmp(moq_rcbuf_data(ev.u.object_received.payload), "datatail", 8) == 0);
+            }
+            if (ev.kind == MOQ_EVENT_FETCH_OBJECT) fetch_objects++;
+            if (ev.kind == MOQ_EVENT_FETCH_COMPLETE) fetch_ends++;
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) {
+                dones++;
+                MOQ_TEST_CHECK(ev.u.subscribe_done.status_code == 0x12);
+            }
+            MOQ_TEST_CHECK(ev.kind != MOQ_EVENT_SESSION_CLOSED);
+            moq_event_cleanup(&ev);
+        }
+    }
+    if (replace) {
+        MOQ_TEST_CHECK(dw.resets == 0 && dones == 0);
+        MOQ_TEST_CHECK(objects == 1 && fetch_objects == 1 && fetch_ends == 1);
+    } else {
+        MOQ_TEST_CHECK(dw.resets == 2 && dw.reset_code == MOQ_STREAM_ERROR_MALFORMED_TRACK);
+        MOQ_TEST_CHECK(dones == 1 && objects == 0 && fetch_objects == 0 && fetch_ends == 0);
+    }
+    MOQ_TEST_CHECK(f.bind->session_errors == 0);
+    printf("malformed push=%d replace=%d terminals=%u resets=%u objects=%u fetch=%u/%u done=%u\n",
+           push, replace, terminals, dw.resets, objects, fetch_objects, fetch_ends, dones);
+cleanup:
+    answer_fixture_close(&f);
+    moq_session_destroy(dp); moq_session_destroy(ds);
+    MOQ_TEST_CHECK_EQ_INT((int)f.alloc.live, 0);
+#undef CM_REQUIRE
+    return failures;
+}
+
+static int test_cluster_sized_capacity(void)
+{
+    int failures = 0;
+    moqr_core_relay_cfg_t cc; moqr_core_relay_cfg_init_sized(&cc, sizeof(cc), moq_alloc_default());
+    moqr_core_limits_t limits;
+    MOQ_TEST_CHECK(moqr_core_limits_resolve(&cc, &limits) == MOQR_OK);
+    moqr_bind_cfg_t bc; moqr_bind_cfg_init_sized(&bc, sizeof(bc), moq_alloc_default());
+    struct { moqr_core_capacity_t value; uint64_t tail; } core;
+    struct { moqr_bind_capacity_t value; uint64_t tail; } bind;
+    memset(&core, 0xa5, sizeof(core)); memset(&bind, 0xa5, sizeof(bind));
+    MOQ_TEST_CHECK(moqr_core_capacity_describe(&cc, &core.value, MOQR_CORE_CAPACITY_V0_SIZE - 1) == MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK(moqr_bind_capacity_describe(&bc, &limits, &bind.value, MOQR_BIND_CAPACITY_V0_SIZE - 1) == MOQ_ERR_INVAL);
+    const uint8_t *a = (const uint8_t *)&core, *b = (const uint8_t *)&bind;
+    for (size_t i = 0; i < sizeof(core); i++) MOQ_TEST_CHECK(a[i] == 0xa5);
+    for (size_t i = 0; i < sizeof(bind); i++) MOQ_TEST_CHECK(b[i] == 0xa5);
+    MOQ_TEST_CHECK(moqr_core_cluster_capacity_describe(&cc, NULL, &core.value, sizeof(core)) == MOQ_OK);
+    MOQ_TEST_CHECK(moqr_bind_cluster_capacity_describe(&bc, &limits, NULL, &bind.value, sizeof(bind)) == MOQ_OK);
+    MOQ_TEST_CHECK(core.value.struct_size == MOQR_CORE_CAPACITY_V0_SIZE && bind.value.struct_size == MOQR_BIND_CAPACITY_V0_SIZE);
+    MOQ_TEST_CHECK(core.tail == UINT64_C(0xa5a5a5a5a5a5a5a5) && bind.tail == UINT64_C(0xa5a5a5a5a5a5a5a5));
+    moqr_cluster_info_t info;
+    MOQ_TEST_CHECK(moqr_cluster_cfg_resolve(NULL, &info, sizeof(info)) == MOQ_OK);
+    MOQ_TEST_CHECK(!info.enabled && info.routes_used == 0);
+    moqr_bind_capacity_t saved = bind.value;
+    info.struct_size = MOQR_CLUSTER_INFO_V0_SIZE - 1;
+    MOQ_TEST_CHECK(moqr_bind_cluster_capacity_describe(&bc, &limits, &info, &bind.value, sizeof(bind.value)) == MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK(memcmp(&saved, &bind.value, sizeof(saved)) == 0);
+    moqr_bind_cluster_peer_cfg_t peer; moqr_bind_cluster_peer_cfg_init(&peer);
+    MOQ_TEST_CHECK(peer.struct_size == MOQR_BIND_CLUSTER_PEER_CFG_V0_SIZE && !peer.has_relay_cost && peer.correlation_id == 0);
+    return failures;
+}
+
+int
+main(int argc, char **argv)
+{
+    int failures = 0;
+    for (unsigned push = 0; push < 2; push++)
+        for (unsigned replace = 0; replace < 2; replace++)
+            failures += test_cluster_malformed_terminal(push != 0, replace != 0);
+    if (argc == 2 && strcmp(argv[1], "malformed_terminal") == 0) return failures != 0;
+    failures += test_cluster_sized_capacity();
+    failures += test_cluster_push_retirement();
     failures += test_bind_word_count();
     failures += test_bind_capacity_slopes();
     failures += test_bind_pump_scratch_owned();

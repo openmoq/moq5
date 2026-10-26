@@ -469,6 +469,8 @@ typedef struct moq_cluster_info {
     uint64_t peer_hop_id;
     uint64_t peer_relay_cost;
 } moq_cluster_info_t;
+#define MOQ_CLUSTER_INFO_V0_SIZE \
+    (offsetof(moq_cluster_info_t, peer_relay_cost) + sizeof(uint64_t))
 MOQ_API moq_result_t moq_session_cluster_info(const moq_session_t *s, moq_cluster_info_t *out,
                                               size_t out_size);
 
@@ -4431,6 +4433,13 @@ typedef struct moq_publish_namespace_cfg {
     size_t                  auth_token_count;
     moq_cluster_metadata_t cluster;
 } moq_publish_namespace_cfg_t;
+
+/* Input v0 predates auth tokens. The historical pointer-only initializer
+ * covers through auth_token_count, not the newly aligned cluster offset. */
+#define MOQ_PUBLISH_NAMESPACE_CFG_V0_SIZE \
+    (offsetof(moq_publish_namespace_cfg_t, track_namespace) + sizeof(moq_namespace_t))
+#define MOQ_PUBLISH_NAMESPACE_CFG_LEGACY_SIZE \
+    (offsetof(moq_publish_namespace_cfg_t, auth_token_count) + sizeof(size_t))
 
 /* The pointer-only symbol initializes the frozen pre-cluster extent. */
 MOQ_API void moq_publish_namespace_cfg_init(moq_publish_namespace_cfg_t *cfg);

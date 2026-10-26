@@ -1,10 +1,11 @@
 # MoQ Cluster draft-01 support: design specification
 
-- **Date:** 2026-10-22
-- **Branch:** `feature/moq-cluster-01`
-- **Baseline:** `2a305fc7158c47501391d6f59774b157e215df13`
-- **Status:** approved and implemented; verification results are recorded in
-  [moq-cluster-01-plan.txt](moq-cluster-01-plan.txt)
+Historical design provenance: the original 2026-10-22 work used branch
+`feature/moq-cluster-01` and baseline
+`2a305fc7158c47501391d6f59774b157e215df13`. Its original implementation results
+remain in [moq-cluster-01-plan.txt](moq-cluster-01-plan.txt); they do not describe
+the current composition or its qualification status. The contracts below
+include the subsequent API/adoption corrections.
 
 ## Purpose and scope
 
@@ -28,7 +29,9 @@ dialing, worker scheduling, credentials, and reconnect policy belong to the
 host. This change does not introduce automatic peer discovery or a managed
 cluster service. A host can attach established sessions as cluster peers.
 Separate pattern-extension features are outside scope; describe their absence
-explicitly rather than inventing cluster-specific `NO_CAPACITY` semantics.
+explicitly. New cluster APIs use MOQ_ERR_CAPACITY for configured admission
+policy and MOQ_ERR_LIMIT for non-recyclable identity exhaustion; legacy relay
+operations retain their existing result vocabulary.
 
 ## Session configuration and public API
 

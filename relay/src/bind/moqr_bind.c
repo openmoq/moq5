@@ -481,7 +481,8 @@ typedef struct b_ann {
 /* What one peer was actually told, independent of current best-route state. */
 typedef struct b_cadv {
     b_ann_t ann;
-    uint64_t source_binding, source_advertisement, origin;
+    moqr_cluster_advertisement_id_t source_advertisement;
+    uint64_t origin;
 } b_cadv_t;
 
 /* A namespace update held for retry. draft-18 Section 6.2 makes the NAMESPACE
@@ -1629,19 +1630,38 @@ moqr_bind_cfg_resolve(const moqr_bind_cfg_t *cfg,
  * bind tables. */
 #define BIND_ANN_BYTES_MAX 4096u
 
-moqr_result_t
+static moqr_result_t bind_cluster_capacity(const moqr_bind_cfg_t *cfg,
+    const moqr_core_limits_t *lim, const moqr_cluster_info_t *cluster_info,
+    moqr_bind_capacity_t *out);
+
+moq_result_t
 moqr_bind_capacity_describe(const moqr_bind_cfg_t *cfg,
-                            const moqr_core_limits_t *lim,
-                            moqr_bind_capacity_t *out)
+    const moqr_core_limits_t *lim, moqr_bind_capacity_t *out, size_t out_size)
 {
     moqr_cluster_info_t cluster = {0};
+    cluster.struct_size = sizeof(cluster);
     if (cfg != NULL && BIND_CFG_HAS(cfg, core) && cfg->core != NULL)
-        moqr_core_cluster_info(cfg->core, &cluster);
-    return moqr_bind_cluster_capacity_describe(cfg, lim, &cluster, out);
+        (void)moqr_core_cluster_info(cfg->core, &cluster, sizeof(cluster));
+    return moqr_bind_cluster_capacity_describe(cfg, lim, &cluster, out, out_size);
 }
 
-moqr_result_t
+moq_result_t
 moqr_bind_cluster_capacity_describe(const moqr_bind_cfg_t *cfg,
+    const moqr_core_limits_t *lim, const moqr_cluster_info_t *cluster_info,
+    moqr_bind_capacity_t *out, size_t out_size)
+{
+    if (out == NULL || out_size < MOQR_BIND_CAPACITY_V0_SIZE) return MOQ_ERR_INVAL;
+    moqr_cluster_info_t cluster = {0};
+    if (cluster_info != NULL && !moqr_cluster_read(cluster_info, MOQR_CLUSTER_INFO_V0_SIZE,
+                                                  &cluster, sizeof(cluster))) return MOQ_ERR_INVAL;
+    moqr_bind_capacity_t value = {0};
+    moqr_result_t rc = bind_cluster_capacity(cfg, lim, &cluster, &value);
+    if (rc == MOQR_OK) moqr_cluster_write(out, out_size, &value, sizeof(value));
+    return moqr_result_public(rc);
+}
+
+static moqr_result_t
+bind_cluster_capacity(const moqr_bind_cfg_t *cfg,
     const moqr_core_limits_t *lim, const moqr_cluster_info_t *cluster_info,
     moqr_bind_capacity_t *out)
 {
@@ -1775,7 +1795,7 @@ moqr_bind_create(const moqr_bind_cfg_t *cfg, moqr_bind_t **out)
     memset(b, 0, sizeof(*b));
     b->alloc = *a;
     b->core = core;
-    moqr_core_cluster_info(core, &b->cluster_info);
+    moqr_core_cluster_info(core, &b->cluster_info, sizeof(b->cluster_info));
     /* Default map sizes FOLLOW the core's admission limits, so the
      * binding can never be under-provisioned relative to what the core
      * will admit. Explicit cfg values still win (tests use tiny maps to
@@ -2994,14 +3014,14 @@ bind_cluster_announce_current(moqr_bind_t *b, b_conn_t *cn, moqr_ns_t ns, uint64
 {
     int slot = ann_find(b, cn, raw);
     if (slot >= 0 && cn->anns[slot].discovered)
-        return moqr_core_announce_cluster(b->core, cn->binding, ns, raw,
-                                          &cn->anns[slot].cluster, false);
+        return moqr_result_legacy(moqr_core_announce_cluster(b->core, cn->binding, ns, raw,
+                                          &cn->anns[slot].cluster, false));
     moq_cluster_metadata_t metadata = {0};
     moq_result_t rc = moq_session_namespace_cluster(cn->session,
         (moq_announcement_t){raw}, &metadata, sizeof(metadata));
     if (rc != MOQ_OK && cn->cluster_negotiated) return MOQR_ERR_WRONG_STATE;
-    return moqr_core_announce_cluster(b->core, cn->binding, ns, raw,
-        cn->cluster_negotiated ? &metadata : NULL, false);
+    return moqr_result_legacy(moqr_core_announce_cluster(b->core, cn->binding, ns, raw,
+        cn->cluster_negotiated ? &metadata : NULL, false));
 }
 
 static bool
@@ -3461,13 +3481,22 @@ moqr_bind_conn_open(moqr_bind_t *b, moq_session_t *session, moq_version_t versio
     return bind_conn_open_cluster(b, session, version, NULL);
 }
 
-moqr_result_t
-moqr_bind_conn_open_cluster(moqr_bind_t *b, moq_session_t *session,
-    moq_version_t version, const moqr_bind_cluster_peer_cfg_t *cfg, size_t cfg_size)
+void
+moqr_bind_cluster_peer_cfg_init_sized(moqr_bind_cluster_peer_cfg_t *cfg, size_t size)
 {
-    if (cfg == NULL || cfg_size < sizeof(*cfg) || cfg->struct_size < sizeof(*cfg))
-        return MOQR_ERR_INVAL;
-    return bind_conn_open_cluster(b, session, version, cfg);
+    if (cfg == NULL || size < sizeof(uint32_t)) return;
+    const moqr_bind_cluster_peer_cfg_t value = {0};
+    moqr_cluster_write(cfg, size, &value, sizeof(value));
+}
+
+moq_result_t
+moqr_bind_conn_open_cluster(moqr_bind_t *b, moq_session_t *session,
+    moq_version_t version, const moqr_bind_cluster_peer_cfg_t *cfg)
+{
+    moqr_bind_cluster_peer_cfg_t value = {0};
+    if (cfg != NULL && !moqr_cluster_read(cfg, MOQR_BIND_CLUSTER_PEER_CFG_V0_SIZE,
+                                         &value, sizeof(value))) return MOQ_ERR_INVAL;
+    return moqr_result_public(bind_conn_open_cluster(b, session, version, &value));
 }
 
 /* The integer codec of the Object and Track Properties a connection reads
@@ -5085,8 +5114,8 @@ bind_cluster_update_current(moqr_bind_t *b, b_conn_t *cn, uint64_t handle)
     if (moq_session_namespace_owed_update(cn->session,
             (moq_announcement_t){handle}, &rec, sizeof(rec)) != MOQ_OK)
         return MOQR_ERR_STALE_HANDLE;
-    return moqr_core_announce_cluster(b->core, cn->binding,
-        cn->anns[slot].ns, handle, &rec.cluster, true);
+    return moqr_result_legacy(moqr_core_announce_cluster(b->core, cn->binding,
+        cn->anns[slot].ns, handle, &rec.cluster, true));
 }
 
 static bool
@@ -6059,19 +6088,36 @@ bind_ingest_track(moqr_bind_t *b, b_conn_t *cn, moq_subscription_t sub,
     if (moq_subscription_is_valid(sub)) {
         for (uint32_t i = 0; i < b->n_usubs; i++) {
             if (cn->usubs[i].used && cn->usubs[i].ssub._opaque == sub._opaque) {
-                return cn->usubs[i].cancel_owed ? MOQR_TRACK_INVALID
-                                                : cn->usubs[i].track;
+                uint64_t current;
+                return !cn->usubs[i].cancel_owed &&
+                    moqr_core_track_current_generation(b->core, cn->usubs[i].track, &current) == MOQR_OK &&
+                    current == cn->usubs[i].track_gen ? cn->usubs[i].track : MOQR_TRACK_INVALID;
             }
         }
     } else if (moq_publication_is_valid(pub)) {
         for (uint32_t i = 0; i < b->n_pubs; i++) {
             if (cn->pubs[i].used && cn->pubs[i].pub_raw == pub._opaque) {
-                return cn->pubs[i].cancel_owed ? MOQR_TRACK_INVALID
-                                               : cn->pubs[i].track;
+                uint64_t current;
+                return !cn->pubs[i].cancel_owed &&
+                    moqr_core_track_current_generation(b->core, cn->pubs[i].track, &current) == MOQR_OK &&
+                    current == cn->pubs[i].track_gen ? cn->pubs[i].track : MOQR_TRACK_INVALID;
             }
         }
     }
     return MOQR_TRACK_INVALID;
+}
+
+/* A request terminal can arrive after a source was replaced while its
+ * cancellation waited for output credit. The retained track handle alone
+ * does not authorize effects on its new source. An intentionally idled
+ * source still owns cleanup of its old retained log and cached FETCHes. */
+static bool
+bind_terminal_owns_track(moqr_bind_t *b, moqr_track_t track, uint64_t source_gen)
+{
+    uint64_t current = 0;
+    return (moqr_core_track_current_generation(b->core, track, &current) == MOQR_OK &&
+            current == source_gen) ||
+           moqr_core_internal_source_idle(b->core, track, source_gen);
 }
 
 static void bind_track_malformed(moqr_bind_t *b, b_conn_t *cn,
@@ -6288,8 +6334,13 @@ static void bind_cluster_sync(moqr_bind_t *b, b_conn_t *cn, uint64_t now_us, boo
         return;
     if (!cn->cluster_peer_ready) {
         uint64_t cost = cn->cluster_cost_override ? cn->cluster_cost : info.peer_relay_cost;
-        if (moqr_core_binding_set_cluster(b->core, cn->binding, info.negotiated, info.peer_hop_id,
-                                          cost, cn->cluster_correlation) != MOQR_OK) {
+        moqr_cluster_peer_cfg_t peer;
+        moqr_cluster_peer_cfg_init(&peer);
+        peer.negotiated = info.negotiated;
+        peer.peer_hop_id = info.peer_hop_id;
+        peer.effective_relay_cost = cost;
+        peer.correlation_id = cn->cluster_correlation;
+        if (moqr_core_binding_set_cluster(b->core, cn->binding, &peer) != MOQ_OK) {
             b->session_errors++;
             (void)moq_session_close(cn->session, BIND_SESSION_INTERNAL_ERROR,
                                     "cluster peer configuration failed", now_us);
@@ -6350,8 +6401,8 @@ static void bind_cluster_apply_ann(moqr_bind_t *b, b_conn_t *cn, uint32_t slot, 
     if (!a->used || !a->discovered || !a->cluster_pending)
         return;
     moqr_result_t rc;
-    BIND_CALL_RETRY(rc, moqr_core_announce_cluster(b->core, cn->binding, a->ns, a->ann_raw,
-                                                   &a->cluster, !a->cluster_initial));
+    BIND_CALL_RETRY(rc, moqr_result_legacy(moqr_core_announce_cluster(b->core, cn->binding, a->ns, a->ann_raw,
+                                                   &a->cluster, !a->cluster_initial)));
     if (rc == MOQR_ERR_WOULD_BLOCK)
         return;
     if (rc == MOQR_OK) {
@@ -6462,15 +6513,14 @@ static moq_result_t bind_cluster_namespace(moqr_bind_t *b, b_conn_t *cn, const m
             old = a;
     }
     moqr_cluster_route_t route;
-    moqr_result_t selected = moqr_core_cluster_route(b->core, cn->binding, ns, &route);
-    if (selected != MOQR_OK && selected != MOQR_DONE)
+    moq_result_t selected = moqr_core_cluster_route(b->core, cn->binding, ns, &route, sizeof(route));
+    if (selected != MOQ_OK && selected != MOQ_DONE)
         return MOQ_ERR_INVAL;
-    bool gone = selected == MOQR_DONE || route.prefix_count != ns.count;
+    bool gone = selected == MOQ_DONE || route.prefix_count != ns.count;
     bool changed =
         old != NULL && !gone &&
         (old->origin != route.origin_id ||
-         (route.origin_id == 0 && (old->source_binding != route.original_source_binding_cookie ||
-                                   old->source_advertisement != route.original_route_generation)));
+         (route.origin_id == 0 && !moqr_cluster_advertisement_id_eq(old->source_advertisement, route.advertisement)));
     if (old != NULL && (gone || changed)) {
         moq_result_t rc = moq_session_send_namespace_done(cn->session, handle, &suffix, now_us);
         if (rc != MOQ_OK)
@@ -6531,8 +6581,7 @@ static moq_result_t bind_cluster_namespace(moqr_bind_t *b, b_conn_t *cn, const m
         old->ann.ann_raw = it->cookie;
     }
     old->origin = route.origin_id;
-    old->source_binding = route.original_source_binding_cookie;
-    old->source_advertisement = route.original_route_generation;
+    old->source_advertisement = route.advertisement;
     return MOQ_OK;
 }
 
@@ -6807,6 +6856,11 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                     continue;
                 }
                 moqr_track_t track = cn->usubs[i].track;
+                if (!bind_terminal_owns_track(b, track, cn->usubs[i].track_gen)) {
+                    usub_release(b, &cn->usubs[i]);
+                    tracked = true;
+                    continue;
+                }
                 moqr_result_t mrc;
                 b->malformed_tracks++;
                 bind_reset_track_streams(b, track, now_us);
@@ -7320,6 +7374,11 @@ bind_on_event(moqr_bind_t *b, b_conn_t *cn, moq_event_t *ev,
                 ev->detail_size >= offsetof(moq_publish_finished_event_t, cause) +
                                        sizeof(ev->u.publish_finished.cause) &&
                 ev->u.publish_finished.cause == MOQ_REQUEST_TERMINAL_MALFORMED_TRACK;
+            if (malformed && !bind_terminal_owns_track(
+                    b, cn->pubs[i].track, cn->pubs[i].track_gen)) {
+                cn->pubs[i].used = false;
+                continue;
+            }
             if (malformed) {
                 b->malformed_tracks++;
                 bind_reset_track_streams(b, cn->pubs[i].track, now_us);
@@ -8196,19 +8255,38 @@ bind_try_intent(moqr_bind_t *b, const moqr_intent_t *it, uint64_t now_us,
         return true;
     }
     case MOQR_INTENT_UPSTREAM_UNSUBSCRIBE:
-        /* NOT deferrable: moq_session_unsubscribe WOULD_BLOCKs on UNSUBSCRIBE
-         * tombstone-capacity exhaustion (session_subscribe.c), which persists
-         * until late responses reclaim tombstones — not a transient full
-         * queue. Parking it would deadlock the retry head. It is upstream
-         * cleanup, not a downstream terminal: a dropped unsubscribe leaks an
-         * unwanted upstream subscription (bounded, per-track), never hangs a
-         * peer. Best-effort, as before. */
+        /* Retire only this source generation. A replacement can already own
+         * the same retained track when this queued intent reaches the bind. */
         for (uint32_t i = 0; i < b->n_usubs; i++) {
-            if (cn->usubs[i].used &&
-                moqr_track_eq(cn->usubs[i].track, it->track)) {
-                (void)moq_session_unsubscribe(cn->session, cn->usubs[i].ssub,
-                                              now_us);
-                usub_release(b, &cn->usubs[i]);
+            b_usub_t *us = &cn->usubs[i];
+            if (!us->used || !moqr_track_eq(us->track, it->track) ||
+                us->track_gen != it->track_gen) continue;
+            if (bind_cancel_settled(b, cn, bind_cancel_upstream_sub(cn, us->ssub, now_us),
+                                    "obsolete source cancellation failed", now_us)) {
+                usub_release(b, us);
+            } else {
+                us->cancel_owed = true;
+                cn->retry_pending |= B_RETRY_CANCEL;
+            }
+        }
+        for (uint32_t i = 0; i < b->n_pubs; i++) {
+            b_pub_t *bp = &cn->pubs[i];
+            if (!bp->used || !moqr_track_eq(bp->track, it->track) ||
+                bp->track_gen != it->track_gen) continue;
+            moq_publication_t pub = {bp->pub_raw};
+            uint64_t code = bp->cancel_code;
+            if (!bp->cancel_owed)
+                (void)moqr_reset_encode(moqr_bind_conn_version(b, cn->session),
+                                        MOQR_RESET_CANCELLED, &code);
+            b_meta_publish_t *mp = bind_meta_pub_find(b, cn, pub._opaque);
+            if (mp != NULL) bind_meta_pub_release(b, mp);
+            if (bind_cancel_settled(b, cn, bind_cancel_upstream_pub(cn, pub, code, now_us),
+                                    "obsolete source cancellation failed", now_us)) {
+                memset(bp, 0, sizeof(*bp));
+            } else {
+                bp->cancel_owed = true;
+                bp->cancel_code = code;
+                cn->retry_pending |= B_RETRY_CANCEL;
             }
         }
         return true;
@@ -10686,13 +10764,12 @@ bind_standalone_request(moqr_bind_t *b, b_conn_t *cn,
             q.remote_cookie = plan.remote_cookie;
             if (b->cluster_info.enabled) {
                 moqr_cluster_route_t selected;
-                if (moqr_core_cluster_route(b->core, cn->binding, req.ns, &selected) != MOQR_OK) {
+                if (moqr_core_cluster_route(b->core, cn->binding, req.ns, &selected, sizeof(selected)) != MOQ_OK) {
                     bind_fetch_refuse(b, cn, fq->fetch, MOQ_REQUEST_ERROR_DOES_NOT_EXIST, now_us);
                     return;
                 }
                 q.cluster_selected = true;
-                q.cluster_source_binding_cookie = selected.original_source_binding_cookie;
-                q.cluster_source_route_generation = selected.original_route_generation;
+                q.cluster_source_advertisement = selected.advertisement;
                 q.cluster_requester_hop_id = cn->cluster_peer_hop;
                 q.cluster_requester_correlation_id = cn->cluster_correlation;
             }

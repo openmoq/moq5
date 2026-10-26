@@ -93,7 +93,9 @@ typedef struct moqr_shards_cfg {
     /* Per directed shard-pair control-mailbox capacity (namespaces in flight);
      * 0 = default. A full mailbox is cursor lag, never loss — the journal holds
      * the durable state and the sender re-exports when space frees. Tests set this
-     * small to exercise the backpressure path. */
+     * small to exercise the backpressure path. Cluster mode also reserves one
+     * allocation-free withdrawal record per directed mailbox, so admission
+     * pressure cannot block capacity-releasing withdrawal. */
     uint32_t           mailbox_entries;
     /* Per-shard candidate-set journal capacity (namespaces tracked); 0 = default
      * (the core's max_ns_nodes). A shard's journal can exceed its trie nodes (it

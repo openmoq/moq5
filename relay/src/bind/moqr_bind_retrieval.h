@@ -203,8 +203,7 @@ moqr_result_t moqr_bind_retrieve_source_set(moqr_bind_t *b,
 typedef struct moqr_retrieve_standalone_query {
     uint64_t remote_cookie;   /* the owner shard's binding cookie here     */
     bool cluster_selected;
-    uint64_t cluster_source_binding_cookie;
-    uint64_t cluster_source_route_generation;
+    moqr_cluster_advertisement_id_t cluster_source_advertisement;
     uint64_t cluster_requester_hop_id;
     uint64_t cluster_requester_correlation_id;
     moqr_ns_t ns;             /* borrowed for the open call                */

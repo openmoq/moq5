@@ -58,6 +58,8 @@ impl Error {
     /// A non-replenishable implementation limit was reached; retrying
     /// unchanged cannot succeed.
     pub const LIMIT: Error = Error(sys::MOQ_ERR_LIMIT);
+    /// Configured admission policy refused the operation; draining alone need not help.
+    pub const CAPACITY: Error = Error(sys::MOQ_ERR_CAPACITY);
     /// Internal error.
     pub const INTERNAL: Error = Error(sys::MOQ_ERR_INTERNAL);
 
@@ -90,6 +92,7 @@ impl Error {
             Error::UNSUPPORTED => "UNSUPPORTED",
             Error::INPUT_NOT_CONSUMED => "INPUT_NOT_CONSUMED",
             Error::LIMIT => "LIMIT",
+            Error::CAPACITY => "CAPACITY",
             Error::INTERNAL => "INTERNAL",
             Error(sys::MOQ_DONE) => "DONE",
             _ => return None,
@@ -146,9 +149,10 @@ mod tests {
             (Error::UNSUPPORTED, sys::MOQ_ERR_UNSUPPORTED),
             (Error::INPUT_NOT_CONSUMED, sys::MOQ_ERR_INPUT_NOT_CONSUMED),
             (Error::LIMIT, sys::MOQ_ERR_LIMIT),
+            (Error::CAPACITY, sys::MOQ_ERR_CAPACITY),
             (Error::INTERNAL, sys::MOQ_ERR_INTERNAL),
         ];
-        assert_eq!(named.len(), 17, "every native code has a constant");
+        assert_eq!(named.len(), 18, "every native code has a constant");
         for (error, code) in named {
             assert_eq!(error.code(), code);
             assert!(error.name().is_some(), "{code} has no name");
@@ -160,6 +164,7 @@ mod tests {
     fn codes_round_trip() {
         assert_eq!(Error::from_code(-2), Error::INVAL);
         assert_eq!(Error::from_code(-16), Error::LIMIT);
+        assert_eq!(Error::from_code(-17), Error::CAPACITY);
         assert_eq!(
             format!("{:?}", Error::INTERRUPTED),
             "Error(INTERRUPTED, -13)"

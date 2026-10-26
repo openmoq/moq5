@@ -1122,9 +1122,20 @@ moq_result_t session_core_on_announcement_error(moq_session_t *s,
 
 /* -- Public API: publish_namespace ---------------------------------- */
 
+/* Exact old layout: ARM ILP32 is 20 bytes/alignment 4, whereas the appended
+ * metadata raises the current struct's alignment and starts at offset 24. */
+typedef struct publish_namespace_legacy_cfg {
+    uint32_t struct_size;
+    moq_namespace_t track_namespace;
+    const moq_auth_token_t *auth_tokens;
+    size_t auth_token_count;
+} publish_namespace_legacy_cfg_t;
+_Static_assert(sizeof(publish_namespace_legacy_cfg_t) == MOQ_PUBLISH_NAMESPACE_CFG_LEGACY_SIZE,
+               "namespace initializer preserves the actual historical extent");
+
 void(moq_publish_namespace_cfg_init)(moq_publish_namespace_cfg_t *cfg)
 {
-    moq_publish_namespace_cfg_init_sized(cfg, offsetof(moq_publish_namespace_cfg_t, cluster));
+    moq_publish_namespace_cfg_init_sized(cfg, MOQ_PUBLISH_NAMESPACE_CFG_LEGACY_SIZE);
 }
 
 void moq_publish_namespace_cfg_init_sized(moq_publish_namespace_cfg_t *cfg, size_t cfg_size)
@@ -1133,7 +1144,8 @@ void moq_publish_namespace_cfg_init_sized(moq_publish_namespace_cfg_t *cfg, size
         return;
     size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
     memset(cfg, 0, n);
-    cfg->struct_size = (uint32_t)n;
+    uint32_t written = (uint32_t)n;
+    memcpy(cfg, &written, sizeof(written));
 }
 
 moq_result_t moq_session_publish_namespace(moq_session_t *s,
@@ -1141,11 +1153,27 @@ moq_result_t moq_session_publish_namespace(moq_session_t *s,
     moq_announcement_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
-#define PNS_CFG_MIN offsetof(moq_publish_namespace_cfg_t, auth_tokens)
-#define PNS_CFG_HAS(f) (cfg->struct_size >= \
-    offsetof(moq_publish_namespace_cfg_t, f) + sizeof(cfg->f))
-    if (cfg->struct_size < PNS_CFG_MIN)
+    uint32_t cfg_size;
+    memcpy(&cfg_size, cfg, sizeof(cfg_size));
+    if (cfg_size < MOQ_PUBLISH_NAMESPACE_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
+    moq_publish_namespace_cfg_t local = {0};
+    local.struct_size = cfg_size;
+#define PNS_CFG_COPY(f) do { \
+    if (cfg_size >= offsetof(moq_publish_namespace_cfg_t, f) + sizeof(local.f)) \
+        memcpy(&local.f, (const uint8_t *)cfg + offsetof(moq_publish_namespace_cfg_t, f), \
+               sizeof(local.f)); \
+} while (0)
+    PNS_CFG_COPY(track_namespace);
+    if (cfg_size >= offsetof(moq_publish_namespace_cfg_t, auth_token_count) + sizeof(size_t)) {
+        PNS_CFG_COPY(auth_tokens);
+        PNS_CFG_COPY(auth_token_count);
+    }
+    PNS_CFG_COPY(cluster);
+#undef PNS_CFG_COPY
+    cfg = &local;
+#define PNS_CFG_HAS(f) (cfg_size >= \
+    offsetof(moq_publish_namespace_cfg_t, f) + sizeof(local.f))
     *out_handle = MOQ_ANNOUNCEMENT_INVALID;
 
     const moq_auth_token_t *auth_tokens = NULL;
