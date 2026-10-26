@@ -133,9 +133,10 @@ runtime SDK. Other loaders have no loaded-image qualification claim.
 
 The fixture retains child logs and rejects unexpected warnings. Its old-product
 mode asserts the actual same-path/different-content service generation error;
-a compiler or provider failure is not causal RED. The test requires a fresh work
-path or an exact ownership marker left by this fixture at that canonical path
-before deleting previous outputs. Existing unmarked directories, symlink roots
+a compiler or provider failure does not demonstrate that collision. The test
+requires a fresh work path or an exact ownership marker left by this fixture
+at that canonical path before deleting previous outputs. Existing unmarked
+directories, symlink roots
 and ancestors of the product source or fixture are refused. Multi-config
 invocations omit CMAKE_BUILD_TYPE; normal single-config uses remain covered.
 

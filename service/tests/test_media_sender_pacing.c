@@ -5339,7 +5339,8 @@ static void test_remove_blocked_write(moq_version_t version, int shape)
     MOQ_TEST_CHECK_EQ_INT(fix.reset_n, 0);
     MOQ_TEST_CHECK_EQ_INT(fix.done_n, 0);
     MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_reset_attempts(fix.s), 0);
-    if (failures != before) goto out;   /* a geometry failure is not causal RED */
+    /* Require the expected queue state before removal. */
+    if (failures != before) goto out;
     uint64_t base = version == MOQ_VERSION_DRAFT_22 ? fix.tr.recs[from].group : 0;
     MOQ_TEST_CHECK(base <= MOQ_QUIC_VARINT_MAX - 2u);
     if (base > MOQ_QUIC_VARINT_MAX - 2u) goto out;

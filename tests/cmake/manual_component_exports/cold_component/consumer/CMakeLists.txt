@@ -43,7 +43,6 @@ foreach(lang c cxx)
     endif()
 endforeach()
 # Let native CMake generation diagnose an unresolved Threads::Threads edge.
-# Checking this generated value after successful configuration is a GREEN oracle,
-# not a manufactured old-source failure in the consumer script.
+# Inspect the generated target information only after configuration succeeds.
 file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/cold-import.cmake" CONTENT
     "set(actual [==[$<TARGET_FILE:moq::${MOQ_COLD_COMPONENT}>]==])\nset(threads_found $<TARGET_EXISTS:Threads::Threads>)\n")
