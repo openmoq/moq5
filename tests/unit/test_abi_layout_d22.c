@@ -513,7 +513,12 @@ PIN_AT(moq_session_cfg_t, setup_auth_token_count, 168, 152 - ABI_SESSION_ENUM_SH
 PIN_AT(moq_session_cfg_t, max_fills, 176, 156 - ABI_SESSION_ENUM_SHIFT, 160);
 PIN_AT(moq_session_cfg_t, defer_subscription_updates, 180, 160 - ABI_SESSION_ENUM_SHIFT, 164);
 PIN_AT(moq_session_cfg_t, defer_fetch_ranges, 181, 161 - ABI_SESSION_ENUM_SHIFT, 165);
-PIN_SIZE(moq_session_cfg_t, 184, 164 - ABI_SESSION_ENUM_SHIFT, 168);
+PIN_THROUGH(moq_session_cfg_t, defer_fetch_ranges,
+            184, 164 - ABI_SESSION_ENUM_SHIFT, 168, 8, 4, 8);
+PIN_AFTER(moq_session_cfg_t, defer_fetch_ranges, cluster_hop_id);
+PIN_AFTER(moq_session_cfg_t, defer_fetch_ranges, cluster_enabled);
+PIN_AFTER(moq_session_cfg_t, defer_fetch_ranges, cluster_relay_cost);
+PIN_SIZE(moq_session_cfg_t, 208, 184 - ABI_SESSION_ENUM_SHIFT, 192);
 /* GOAWAY Timeout: at the previous sizeof (16/8/8). */
 PIN_AT(moq_goaway_event_t, has_timeout, 16, 8, 8);
 PIN_AT(moq_goaway_event_t, timeout_ms, 24, 16, 16);
@@ -610,20 +615,24 @@ PIN_SIZE(moq_subscribe_tracks_options_t, 16, 16, 16);
 
 /* Namespace updates: new records, each v0 the whole layout. */
 _Static_assert(MOQ_NAMESPACE_UPDATE_RECORD_V0_SIZE ==
-               sizeof(moq_namespace_update_record_t), "update record v0");
+               offsetof(moq_namespace_update_record_t, cluster), "update record v0");
 _Static_assert(MOQ_NAMESPACE_UPDATE_CFG_V0_SIZE ==
-               sizeof(moq_namespace_update_cfg_t), "update cfg v0");
+               offsetof(moq_namespace_update_cfg_t, cluster), "update cfg v0");
 PIN_AT(moq_namespace_update_record_t, update_request_id, 8, 8, 8);
 PIN_AT(moq_namespace_update_record_t, track_namespace_prefix, 16, 16, 16);
 PIN_AT(moq_namespace_update_record_t, forward, 32, 24, 24);
 PIN_AT(moq_namespace_update_record_t, tokens, 40, 32, 32);
 PIN_AT(moq_namespace_update_record_t, token_count, 48, 36, 36);
-PIN_SIZE(moq_namespace_update_record_t, 56, 40, 40);
+PIN_THROUGH(moq_namespace_update_record_t, token_count, 56, 40, 40, 8, 4, 8);
+PIN_AFTER(moq_namespace_update_record_t, token_count, cluster);
+PIN_SIZE(moq_namespace_update_record_t, 88, 60, 64);
 PIN_AT(moq_namespace_update_cfg_t, track_namespace_prefix, 8, 8, 8);
 PIN_AT(moq_namespace_update_cfg_t, forward, 24, 16, 16);
 PIN_AT(moq_namespace_update_cfg_t, auth_tokens, 32, 24, 24);
 PIN_AT(moq_namespace_update_cfg_t, auth_token_count, 40, 28, 28);
-PIN_SIZE(moq_namespace_update_cfg_t, 48, 32, 32);
+PIN_THROUGH(moq_namespace_update_cfg_t, auth_token_count, 48, 32, 32, 8, 4, 8);
+PIN_AFTER(moq_namespace_update_cfg_t, auth_token_count, cluster);
+PIN_SIZE(moq_namespace_update_cfg_t, 80, 52, 56);
 PIN_AT(moq_namespace_update_request_event_t, update_request_id, 8, 8, 8);
 PIN_AT(moq_namespace_update_request_event_t, update, 16, 16, 16);
 PIN_SIZE(moq_namespace_update_request_event_t, 24, 20, 24);
@@ -636,7 +645,9 @@ PIN_AT(moq_namespace_update_result_event_t, error_code, 24, 24, 24);
 PIN_AT(moq_namespace_update_result_event_t, reason, 32, 32, 32);
 PIN_AT(moq_namespace_update_result_event_t, has_expires, 48, 40, 40);
 PIN_AT(moq_namespace_update_result_event_t, expires_ms, 56, 48, 48);
-PIN_SIZE(moq_namespace_update_result_event_t, 64, 56, 56);
+PIN_THROUGH(moq_namespace_update_result_event_t, expires_ms, 64, 56, 56, 8, 4, 8);
+PIN_AFTER(moq_namespace_update_result_event_t, expires_ms, cluster);
+PIN_SIZE(moq_namespace_update_result_event_t, 96, 76, 80);
 PIN_SIZE(moq_ns_sub_update_result_event_t, 64, 56, 56);
 PIN_SIZE(moq_subscribe_tracks_update_result_event_t, 64, 56, 56);
 PIN_AT(moq_sub_update_cfg_t, fill, 56, 52, 56);
@@ -866,7 +877,9 @@ PIN_AT(moq_simpair_cfg_t, server_defer_subscription_updates, 168, 136, 152);
 PIN_AT(moq_simpair_cfg_t, client_defer_subscription_updates, 169, 137, 153);
 PIN_AT(moq_simpair_cfg_t, _reserved_cfg_tail, 172, 140, 156);
 PIN_AT(moq_simpair_cfg_t, client_max_data_streams, 176, 144, 160);
-PIN_SIZE(moq_simpair_cfg_t, 184, 148, 168);
+PIN_THROUGH(moq_simpair_cfg_t, client_max_data_streams, 184, 148, 168, 8, 4, 8);
+PIN_AFTER(moq_simpair_cfg_t, client_max_data_streams, client_cluster_hop_id);
+PIN_SIZE(moq_simpair_cfg_t, 224, 184, 208);
 #endif
 #ifdef ABI_HAVE_RELAY
 PIN_SIZE(moqr_bind_cfg_t, 88, 64, 64);
@@ -891,7 +904,9 @@ PIN_AT(moqr_shards_cfg_t, pump_turn_bytes, 336, 260, 280);
 PIN_AT(moqr_shards_cfg_t, pump_subgroup_slots, 344, 268, 288);
 PIN_AT(moqr_shards_cfg_t, fill_timeout_default_ms, 352, 272, 296);
 PIN_AT(moqr_shards_cfg_t, fill_timeout_max_ms, 360, 280, 304);
-PIN_SIZE(moqr_shards_cfg_t, 368, 288, 312);
+PIN_THROUGH(moqr_shards_cfg_t, fill_timeout_max_ms, 368, 288, 312, 8, 4, 8);
+PIN_AFTER(moqr_shards_cfg_t, fill_timeout_max_ms, cluster_enabled);
+PIN_SIZE(moqr_shards_cfg_t, 392, 308, 336);
 PIN_AT(moqr_subscribe_req_t, _reserved_range_end_holds, 92, 68, 76);
 PIN_AT(moqr_subscribe_req_t, range_end_holds, 96, 72, 80);
 PIN_THROUGH(moqr_subscribe_req_t, range_end_holds, 104, 76, 88, 8, 4, 8);

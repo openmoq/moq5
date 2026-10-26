@@ -2,6 +2,8 @@
 
 - [Architecture](architecture.md) — Sans-I/O model, actions/events, wire profiles and their capabilities, request streams, fills, scheduling, transport binding, concurrent subscriptions, module layout
 - [Conformance](conformance.md) — Per-draft status for drafts 16, 18 and 22, known limitations, interoperability evidence
+- [MoQ Cluster setup](../relay/README.md#cluster-routing) — Opt-in draft-22 session and relay configuration, peer policy and capacity planning
+- [MoQ Cluster design](moq-cluster-01-design.md) — Routing, metadata ownership, failover and validation; [pinned draft-01 text](draft-lcurley-moq-cluster-01.txt)
 - [Draft-22 wire reference](draft22-wire-reference.md) — Every draft-22 message, parameter, setup option, stream header and error registry, with the readings taken
 - [Draft-18 wire reference](draft18-wire-reference.md) — The vi64 integer encoding
 - [Adapters](adapters.md) — Adapter contract, per-adapter matrix, transport binding, reliable resets, porting checklist

@@ -71,6 +71,7 @@ static int harness_create_session(moq_perspective_t persp,
                                    uint32_t max_fills,
                                    uint32_t max_actions,
                                    uint32_t send_buffer,
+                                   bool cluster_enabled, uint64_t hop_id,
                                    moq_session_t **out)
 {
     moq_session_cfg_t cfg;
@@ -83,6 +84,10 @@ static int harness_create_session(moq_perspective_t persp,
     if (max_fills) cfg.max_fills = max_fills;
     if (max_actions) cfg.max_actions = max_actions;
     if (send_buffer) cfg.send_buffer_size = send_buffer;
+    cfg.cluster_enabled = cluster_enabled;
+    cfg.cluster_hop_id = hop_id;
+    cfg.cluster_has_relay_cost = cluster_enabled && persp == MOQ_PERSPECTIVE_CLIENT;
+    cfg.cluster_relay_cost = 0;
     return moq_session_create(&cfg, 0, out);
 }
 
@@ -219,6 +224,7 @@ int pico_wt_harness_setup(pico_wt_harness_t *h,
     h->phase = PICO_WT_HARNESS_SESSIONS;
     if (harness_create_session(MOQ_PERSPECTIVE_CLIENT, cap, 0,
                                cfg->max_events, cfg->version, 0, 0, 0,
+                               cfg->cluster_enabled, cfg->client_hop_id,
                                &h->client_session) != 0)
         return -1;
     if (harness_create_session(MOQ_PERSPECTIVE_SERVER, cap,
@@ -227,6 +233,7 @@ int pico_wt_harness_setup(pico_wt_harness_t *h,
                                cfg->server_max_fills,
                                cfg->server_max_actions,
                                cfg->server_send_buffer,
+                               cfg->cluster_enabled, cfg->server_hop_id,
                                &h->server_session) != 0)
         return -1;
 
@@ -322,7 +329,7 @@ const char *pico_wt_harness_check_attach_refusal(pico_wt_harness_t *h,
     /* The same inputs with a supported version attach. */
     moq_session_t *d16 = NULL;
     if (harness_create_session(MOQ_PERSPECTIVE_CLIENT, 16, 0, 0,
-                               MOQ_VERSION_DRAFT_16, 0, 0, 0, &d16) != 0)
+                               MOQ_VERSION_DRAFT_16, 0, 0, 0, false, 0, &d16) != 0)
         return "draft-16 session refused";
     cfg.session = d16;
     int rc = moq_pico_wt_conn_create(&cfg, &out);

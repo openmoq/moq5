@@ -49,6 +49,9 @@ struct moqr_shards {
      * indexed src*shard_count + dst; the diagonal is unused. */
     r_mailbox            *mbox;
     uint32_t              mbox_cap;        /* entries per mailbox */
+    bool                  cluster_enabled;
+    uint32_t              cluster_routes;
+    uint32_t              cluster_hops;
     /* Directed FIFO demand channels (K>1 only), indexed src*shard_count+dst
      * like the mailboxes; the diagonal is unused. */
     r_demand_channel_t   *dch;
@@ -366,6 +369,18 @@ typedef struct r_jentry {
     bool     cap_blocked;  /* mirror install refused for lack of core room */
 } r_jentry;
 
+/* Owned snapshot of one original route slot. The exporter keeps the current
+ * state until every destination accepted it. No borrowed core view crosses a
+ * step or a mailbox lock. */
+typedef struct r_cluster_snapshot {
+    bool present;
+    uint8_t *canon;
+    uint32_t canon_len;
+    uint64_t *hops;
+    moqr_cluster_export_t record;
+    uint64_t sent;
+} r_cluster_snapshot;
+
 typedef struct r_ctrl_msg {   /* one namespace's latest net state (coalesced) */
     bool     used;
     uint64_t round;        /* barrier stamp: visible at round + 1 */
@@ -373,6 +388,10 @@ typedef struct r_ctrl_msg {   /* one namespace's latest net state (coalesced) */
     uint16_t origin;       /* the announcing shard (constant per directed box) */
     uint8_t *canon;        /* owned */
     uint32_t canon_len;
+    bool cluster;
+    uint32_t source_index;
+    uint64_t *hops;       /* owned; copied before publishing the slot */
+    moqr_cluster_export_t record;
 } r_ctrl_msg;
 
 /* A directed control channel is a COALESCING set of per-namespace net states, not
@@ -386,8 +405,9 @@ struct r_mailbox {
     /* Leaf lock for this ONE directed mailbox: the producer (the source
      * shard's outbound phase) and the consumer (the destination shard's
      * inbound phase) may run on different threads; every slot/count access
-     * happens under it. Strictly a leaf — the critical sections call only
-     * journal/bitset helpers and the shared allocator, never another mailbox,
+     * happens under it. Strictly a leaf — critical sections call journal
+     * helpers, the shared allocator, and (for cluster snapshots) the owning
+     * shard's non-callback route import. They never enter another mailbox,
      * a shard phase, or anything that can call back in, so the lock order
      * "caller's shard domain -> one mailbox -> nothing" has no cycles. The
      * deterministic runner takes it uncontended (same code path). */
@@ -417,6 +437,8 @@ typedef struct r_pdemand {
     uint8_t     *canon;        /* owned ns+name key (canon2 layout)        */
     uint32_t     canon_len;
     uint16_t     origin;       /* owner shard the mirror pointed at        */
+    uint64_t     source_binding_cookie, source_route_generation;
+    uint64_t     requester_hop_id, requester_correlation_id;
     uint8_t      state;
     uint32_t     term_code;    /* TERMINATING: the wire code to commit     */
     bool         term_overrun; /* TERMINATING: count as table overrun, not
@@ -546,6 +568,8 @@ typedef struct r_demand_msg {
     uint64_t     demand_id;
     moqr_track_t track;        /* the REQUESTER's track handle             */
     uint64_t     track_gen;
+    uint64_t     source_binding_cookie, source_route_generation;
+    uint64_t     requester_hop_id, requester_correlation_id;
     uint8_t     *canon;        /* DEMAND: owned ns+name key (msg-owned)    */
     uint32_t     canon_len;
     bool         has_largest;  /* ACK: the owner track's largest location  */
@@ -610,6 +634,7 @@ typedef struct r_demand_msg {
      * Location's raw object field (its group is fill_end_group).
      * fetch_capacity: a REJECT because the owner had no room for it. */
     bool         fetch_standalone;
+    bool         cluster_selected;
     bool         fetch_eot;
     bool         fetch_capacity;
     uint32_t     fetch_admit;
@@ -852,6 +877,9 @@ typedef struct r_fret {
      * REQ carries it, the request's raw range form, and the owner's
      * admission once OPEN arrives (begun). */
     bool      standalone;
+    bool      cluster_selected;
+    uint64_t  source_binding_cookie, source_route_generation;
+    uint64_t  requester_hop_id, requester_correlation_id;
     uint8_t  *canon;
     uint32_t  canon_len;
     uint32_t  range_form;
@@ -906,6 +934,7 @@ struct r_mgr {
     /* pseudo-bindings: pb[j] mirrors origin j; pb[shard] unused. */
     moqr_binding_t *pb;
     moqr_binding_t  mgr_bind;   /* wildcard namespace watcher */
+    r_cluster_snapshot *cluster; /* indexed by originating core route slot */
     /* remote-owner demand recorded by the router, forwarded by the demand
      * phase, and resolved by the inbound drain (refused by default; admitted
      * with data pumped back when admission is enabled). */
@@ -1170,6 +1199,155 @@ mbox_push(moqr_shards_t *s, uint16_t src, uint16_t dst, uint8_t op,
 out:
     pthread_mutex_unlock(&mb->mu);
     return pushed;
+}
+
+/* Publish a whole original-source snapshot under one leaf lock. A reused
+ * source slot replaces its predecessor, including while the consumer lags. */
+static bool
+mbox_push_cluster(moqr_shards_t *s, uint16_t src, uint16_t dst,
+                  uint32_t index, const r_cluster_snapshot *snapshot,
+                  bool *allocation_failed)
+{
+    r_mailbox *mb = &s->mbox[(uint32_t)src * s->shard_count + dst];
+    uint8_t *canon = NULL;
+    uint64_t *hops = NULL;
+    size_t hop_bytes = snapshot->present
+        ? snapshot->record.route.metadata.hop_count * sizeof(uint64_t) : 0;
+    if (snapshot->present) {
+        canon = canon_dup(snapshot->canon, snapshot->canon_len, &s->alloc);
+        if (canon == NULL) { *allocation_failed = true; return false; }
+        hops = sh_alloc(&s->alloc, hop_bytes);
+        if (hops == NULL) {
+            sh_free(&s->alloc, canon, snapshot->canon_len);
+            *allocation_failed = true;
+            return false;
+        }
+        memcpy(hops, snapshot->hops, hop_bytes);
+    }
+    bool pushed = false;
+    pthread_mutex_lock(&mb->mu);
+    r_ctrl_msg *slot = NULL;
+    for (uint32_t i = 0; i < mb->cap; ++i) {
+        if (mb->slots[i].used && mb->slots[i].cluster &&
+            mb->slots[i].source_index == index) {
+            slot = &mb->slots[i];
+            break;
+        }
+        if (!mb->slots[i].used && slot == NULL) slot = &mb->slots[i];
+    }
+    if (slot != NULL) {
+        if (slot->used) {
+            sh_free(&s->alloc, slot->canon, slot->canon_len);
+            sh_free(&s->alloc, slot->hops,
+                    slot->record.route.metadata.hop_count * sizeof(uint64_t));
+        } else {
+            mb->count++;
+        }
+        memset(slot, 0, sizeof(*slot));
+        slot->used = true;
+        slot->cluster = true;
+        slot->round = s->round;
+        slot->origin = src;
+        slot->source_index = index;
+        slot->op = snapshot->present ? R_OP_ANNOUNCE : R_OP_UNANNOUNCE;
+        slot->canon = canon;
+        slot->canon_len = snapshot->present ? snapshot->canon_len : 0;
+        slot->hops = hops;
+        if (snapshot->present) slot->record = snapshot->record;
+        slot->record.source_index = index;
+        slot->record.route.metadata.hop_ids = hops;
+        pushed = true;
+    }
+    pthread_mutex_unlock(&mb->mu);
+    if (!pushed) {
+        sh_free(&s->alloc, canon, snapshot->canon_len);
+        sh_free(&s->alloc, hops, hop_bytes);
+    }
+    return pushed;
+}
+
+/* Capture after all local mutations. Comparisons include source identity and
+ * charged/warm cost, so an alternative changing below the best path is still
+ * replicated. Imports are excluded by the core exporter. */
+static void
+shard_cluster_outbound(moqr_shards_t *s, uint16_t shard, uint64_t *wake)
+{
+    r_mgr *m = s->shards[shard].mgr;
+    for (uint32_t i = 0; i < s->cluster_routes; ++i) {
+        moqr_cluster_export_t record;
+        memset(&record, 0, sizeof(record));
+        moqr_result_t rc = moqr_core_cluster_export(m->core, i, &record);
+        if (rc != MOQR_OK && rc != MOQR_DONE) {
+            m->oom = true;
+            return;
+        }
+        bool present = rc == MOQR_OK;
+        r_cluster_snapshot *snapshot = &m->cluster[i];
+        if (present) {
+            uint32_t canon_len = 0;
+            uint8_t *canon = canon_build(record.ns.parts, record.ns.count,
+                                        &canon_len, &m->alloc);
+            if (canon == NULL) { m->oom = true; return; }
+            const moqr_cluster_route_t *a = &snapshot->record.route;
+            const moqr_cluster_route_t *b = &record.route;
+            size_t hop_bytes = b->metadata.hop_count * sizeof(uint64_t);
+            bool same = snapshot->present && snapshot->canon_len == canon_len &&
+                memcmp(snapshot->canon, canon, canon_len) == 0 &&
+                a->source_binding_cookie == b->source_binding_cookie &&
+                a->source_session_cookie == b->source_session_cookie &&
+                a->route_generation == b->route_generation &&
+                snapshot->record.revision == record.revision &&
+                a->accumulated_cost == b->accumulated_cost &&
+                a->warm == b->warm &&
+                a->metadata.has_route_cost == b->metadata.has_route_cost &&
+                a->metadata.route_cost == b->metadata.route_cost &&
+                a->metadata.hop_count == b->metadata.hop_count &&
+                snapshot->record.source_peer_hop_id == record.source_peer_hop_id &&
+                snapshot->record.source_correlation_id == record.source_correlation_id &&
+                memcmp(snapshot->hops, b->metadata.hop_ids, hop_bytes) == 0;
+            if (same) {
+                sh_free(&m->alloc, canon, canon_len);
+            } else {
+                uint64_t *hops = sh_alloc(&m->alloc, hop_bytes);
+                if (hops == NULL) {
+                    sh_free(&m->alloc, canon, canon_len);
+                    m->oom = true;
+                    return;
+                }
+                memcpy(hops, b->metadata.hop_ids, hop_bytes);
+                sh_free(&m->alloc, snapshot->canon, snapshot->canon_len);
+                sh_free(&m->alloc, snapshot->hops,
+                        snapshot->record.route.metadata.hop_count * sizeof(uint64_t));
+                snapshot->canon = canon;
+                snapshot->canon_len = canon_len;
+                snapshot->hops = hops;
+                snapshot->record = record;
+                snapshot->record.ns.parts = NULL;
+                snapshot->record.ns.count = 0;
+                memset(snapshot->record.ns_parts, 0,
+                       sizeof(snapshot->record.ns_parts));
+                snapshot->record.route.metadata.hop_ids = hops;
+                snapshot->present = true;
+                snapshot->sent = 0;
+            }
+        } else if (snapshot->present) {
+            snapshot->present = false;
+            snapshot->sent = 0;
+        }
+        for (uint16_t d = 0; d < s->shard_count; ++d) {
+            if (d == shard || ((snapshot->sent >> d) & 1u) != 0) continue;
+            bool allocation_failed = false;
+            if (mbox_push_cluster(s, shard, d, i, snapshot, &allocation_failed)) {
+                snapshot->sent |= 1ull << d;
+                if (wake != NULL) *wake |= 1ull << d;
+            } else if (allocation_failed) {
+                /* No queued message can return credit for an allocation
+                 * refusal. Surface it instead of silently stranding state. */
+                m->oom = true;
+                return;
+            }
+        }
+    }
 }
 
 /* -- the demand channel (FIFO; sibling to — never part of — the mailbox) ----- */
@@ -1501,6 +1679,24 @@ shards_router(void *ctx, const moqr_intent_t *it, uint64_t now_us)
         d->canon = canon;
         d->canon_len = clen;
         d->origin = (uint16_t)(it->binding_cookie - base);
+        if (m->s->cluster_enabled) {
+            moqr_cluster_route_t route;
+            moqr_result_t rc = moqr_core_cluster_upstream_route(m->core,
+                it->track, it->track_gen, &route, &d->requester_hop_id,
+                &d->requester_correlation_id);
+            if (rc != MOQR_OK) {
+                /* The source can withdraw after this intent was queued and
+                 * before the binding drains it. Its generation is then moot;
+                 * never turn it into a fresh lookup on a replacement route. */
+                sh_free(&m->alloc, d->canon, d->canon_len);
+                m->pend_len--;
+                if (rc != MOQR_DONE && rc != MOQR_ERR_STALE_HANDLE &&
+                    rc != MOQR_ERR_WRONG_STATE) m->oom = true;
+                return true;
+            }
+            d->source_binding_cookie = route.source_binding_cookie;
+            d->source_route_generation = route.route_generation;
+        }
         d->state = D_ST_RECORDED;
         d->term_overrun = false;
         d->term_quiet = false;
@@ -1589,6 +1785,9 @@ shards_router(void *ctx, const moqr_intent_t *it, uint64_t now_us)
     }
     if (it->kind != MOQR_INTENT_NS_FOUND && it->kind != MOQR_INTENT_NS_GONE) {
         return true;
+    }
+    if (m->s->cluster_enabled) {
+        return true; /* route snapshots observe all alternatives, not fan-out */
     }
     uint8_t op = (it->kind == MOQR_INTENT_NS_FOUND) ? R_OP_ANNOUNCE
                                                     : R_OP_UNANNOUNCE;
@@ -1778,6 +1977,15 @@ mgr_free(r_mgr *m)
         return;
     }
     const moq_alloc_t *a = &m->alloc;
+    if (m->cluster != NULL) {
+        for (uint32_t i = 0; i < m->s->cluster_routes; ++i) {
+            sh_free(a, m->cluster[i].canon, m->cluster[i].canon_len);
+            sh_free(a, m->cluster[i].hops,
+                    m->cluster[i].record.route.metadata.hop_count * sizeof(uint64_t));
+        }
+        sh_free(a, m->cluster,
+                (size_t)m->s->cluster_routes * sizeof(*m->cluster));
+    }
     if (m->jrn != NULL) {
         for (uint32_t i = 0; i < m->jrn_len; i++) {
             sh_free(a, m->jrn[i].canon, m->jrn[i].canon_len);
@@ -1837,6 +2045,16 @@ mgr_create(moqr_shards_t *s, uint16_t shard, moqr_core_t *core)
     m->jrn_cap = s->jrn_cap;
     m->pend_cap = s->pend_cap;
     m->psub_cap = s->pend_cap;
+    if (s->cluster_enabled) {
+        m->cluster = sh_alloc(a, (size_t)s->cluster_routes * sizeof(*m->cluster));
+        if (m->cluster == NULL) {
+            mgr_free(m);
+            return NULL;
+        }
+        memset(m->cluster, 0, (size_t)s->cluster_routes * sizeof(*m->cluster));
+        for (uint32_t i = 0; i < s->cluster_routes; ++i)
+            m->cluster[i].sent = UINT64_MAX;
+    }
     m->jrn = sh_alloc(a, (size_t)m->jrn_cap * sizeof(m->jrn[0]));
     m->pend = sh_alloc(a, (size_t)m->pend_cap * sizeof(m->pend[0]));
     m->psub = sh_alloc(a, (size_t)m->psub_cap * sizeof(m->psub[0]));
@@ -1904,6 +2122,9 @@ mgr_open_bindings(r_mgr *m)
     if (rc != MOQR_OK) {
         return rc;
     }
+    if (m->s->cluster_enabled) {
+        return MOQR_OK; /* snapshots enumerate all sources directly */
+    }
     /* Zero-count wildcard prefix: matches every announce; opened on an empty
      * trie at create, so there is no replay backlog to overflow the intent
      * ring. */
@@ -1921,6 +2142,44 @@ mgr_open_bindings(r_mgr *m)
 static bool
 shard_apply_slot(r_mgr *m, r_mailbox *mb, r_ctrl_msg *slot)
 {
+    if (slot->cluster) {
+        moqr_cluster_export_t record = slot->record;
+        moq_bytes_t parts[R_NS_MAX_PARTS];
+        if (slot->op == R_OP_ANNOUNCE)
+            record.ns = canon_to_ns(slot->canon, parts);
+        record.route.metadata.hop_ids = slot->hops;
+        moqr_result_t rc = moqr_core_cluster_import(m->core,
+            m->pb[slot->origin], &record, slot->op == R_OP_UNANNOUNCE);
+        if (rc == MOQR_ERR_WRONG_STATE && slot->op == R_OP_ANNOUNCE) {
+            /* A source pool slot was reused for a different namespace. The
+             * old lifetime withdraws before its replacement is admitted. */
+            rc = moqr_core_cluster_import(m->core, m->pb[slot->origin],
+                                          &record, true);
+            if (rc == MOQR_OK || rc == MOQR_DONE) {
+                m->reconcile_owed_local_drain = true;
+                rc = moqr_core_cluster_import(m->core, m->pb[slot->origin],
+                                              &record, false);
+            }
+        }
+        if (rc == MOQR_ERR_WOULD_BLOCK || rc == MOQR_ERR_CAPACITY ||
+            rc == MOQR_ERR_NOMEM) return false;
+        if (rc != MOQR_OK && rc != MOQR_DONE) {
+            m->oom = true;
+            return false;
+        }
+        m->reconcile_owed_local_drain = true;
+        sh_free(&m->alloc, slot->canon, slot->canon_len);
+        sh_free(&m->alloc, slot->hops,
+                slot->record.route.metadata.hop_count * sizeof(uint64_t));
+        slot->used = false;
+        slot->hops = NULL;
+        mb->count--;
+        /* A full control mailbox may have held the producer on an unsent
+         * alternative. Return credit on this same durable pop; concurrent
+         * steppers must not depend on an unrelated future session event. */
+        m->s->shards[m->shard].pop_wake |= 1ull << slot->origin;
+        return true;
+    }
     uint64_t bit = 1ull << slot->origin;
     if (slot->op == R_OP_ANNOUNCE) {
         r_jentry *e = jrn_get(m, slot->canon, slot->canon_len);
@@ -1989,6 +2248,9 @@ shard_reconcile(moqr_shards_t *s, uint16_t shard, uint64_t now_us)
     if (m == NULL) {
         return;
     }
+    if (s->cluster_enabled) {
+        return; /* import applies atomic source-slot snapshots */
+    }
     uint64_t room_epoch = moqr_core_room_epoch(m->core);
     if (m->cap_blocked_count != 0 && room_epoch != m->cap_epoch) {
         /* Room may have appeared in the core since a mirror install was
@@ -2022,6 +2284,10 @@ shard_outbound(moqr_shards_t *s, uint16_t shard, uint64_t *pushed_dst_mask)
 {
     r_mgr *m = s->shards[shard].mgr;
     if (m == NULL) {
+        return;
+    }
+    if (s->cluster_enabled) {
+        shard_cluster_outbound(s, shard, pushed_dst_mask);
         return;
     }
     uint32_t i = 0;
@@ -2246,6 +2512,9 @@ shards_sa_open(void *ctx, const moqr_retrieve_standalone_query_t *q,
     if (m == NULL || q == NULL || handle == NULL || m->fret == NULL) {
         return MOQR_ERR_INVAL;
     }
+    if (m->s->cluster_enabled && !q->cluster_selected) {
+        return MOQR_ERR_WRONG_STATE; /* never dispatch an unfiltered mirror */
+    }
     uint64_t base = MOQR_SHARD_COOKIE_BASE;
     if (q->remote_cookie < base || q->remote_cookie - base >= m->s->shard_count ||
         q->remote_cookie - base == m->shard) {
@@ -2283,6 +2552,11 @@ shards_sa_open(void *ctx, const moqr_retrieve_standalone_query_t *q,
     memset(f, 0, sizeof(*f));
     f->used = true;
     f->standalone = true;
+    f->cluster_selected = q->cluster_selected;
+    f->source_binding_cookie = q->cluster_source_binding_cookie;
+    f->source_route_generation = q->cluster_source_route_generation;
+    f->requester_hop_id = q->cluster_requester_hop_id;
+    f->requester_correlation_id = q->cluster_requester_correlation_id;
     f->req_owed = true;
     f->origin = (uint16_t)(q->remote_cookie - base);
     f->id = ++m->next_fill_id;
@@ -2724,11 +2998,26 @@ shard_pd_forwarded(moqr_pd_desc_t pd)
            pd.tag == MOQR_CODE_WIRE_D22;
 }
 
+/* A track handle identifies retained storage; a source transition can keep
+ * that handle and change only track_gen. Every queued response must match
+ * the current source generation before touching that storage. */
+static bool
+pend_source_current(const r_mgr *m, const r_pdemand *d)
+{
+    uint64_t generation = 0;
+    return moqr_core_track_current_generation(m->core, d->track, &generation)
+               == MOQR_OK && generation == d->track_gen;
+}
+
 static bool
 pend_terminal_step(moqr_shards_t *s, r_mgr *m, r_pdemand *d,
                    moqr_pd_desc_t done, moqr_reset_desc_t reset,
                    bool graceful, uint64_t now_us)
 {
+    if (!pend_source_current(m, d) &&
+        !moqr_core_internal_source_idle(m->core, d->track, d->track_gen)) {
+        return true; /* never abandon records belonging to a replacement */
+    }
     /* The terminal this shard is resolving into its own core, recorded where
      * it is actually consumed rather than where it arrived. */
     m->last_done_pd = done;
@@ -3099,6 +3388,11 @@ requester_fill_phase(moqr_shards_t *s, uint16_t shard,
             if (f->standalone) {
                 /* The key moves to the channel with the REQ. */
                 msg.fetch_standalone = true;
+                msg.cluster_selected = f->cluster_selected;
+                msg.source_binding_cookie = f->source_binding_cookie;
+                msg.source_route_generation = f->source_route_generation;
+                msg.requester_hop_id = f->requester_hop_id;
+                msg.requester_correlation_id = f->requester_correlation_id;
                 msg.fetch_range_form = f->range_form;
                 msg.fetch_relative_start = f->relative_start;
                 msg.fetch_join_demand = f->join_demand_id;
@@ -3384,6 +3678,24 @@ shard_demand_phase(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
     for (uint32_t i = 0; i < m->pend_len; i++) {
         r_pdemand *d = &m->pend[i];
         bool drop = false;
+        if (!pend_source_current(m, d)) {
+            if (d->state == D_ST_RECORDED) {
+                drop = true;
+            } else if ((d->state == D_ST_ACKED || d->state == D_ST_TERMINATING) &&
+                       moqr_core_internal_source_idle(m->core, d->track,
+                                                       d->track_gen)) {
+                /* An idle release keeps this old log, so its unfinished
+                 * records still need ordinary quiet cancellation cleanup. */
+                if (d->state == D_ST_ACKED) {
+                    d->state = D_ST_TERMINATING;
+                    d->term_code = 0;
+                    d->term_overrun = false;
+                    d->term_quiet = true;
+                }
+            } else {
+                d->state = D_ST_UNDEMANDING;
+            }
+        }
         if (d->state == D_ST_TERMINATING) {
             /* Commit the local terminal, one retryable stage at a time; the
              * triggering channel head stays durable (and keeps every later
@@ -3474,6 +3786,10 @@ shard_demand_phase(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
             msg.demand_id = d->demand_id;
             msg.track = d->track;
             msg.track_gen = d->track_gen;
+            msg.source_binding_cookie = d->source_binding_cookie;
+            msg.source_route_generation = d->source_route_generation;
+            msg.requester_hop_id = d->requester_hop_id;
+            msg.requester_correlation_id = d->requester_correlation_id;
             msg.canon = canon_dup(d->canon, d->canon_len, &m->alloc);
             msg.canon_len = d->canon_len;
             if (msg.canon != NULL &&
@@ -4247,7 +4563,11 @@ owner_admit_demand(moqr_shards_t *s, uint16_t shard, uint16_t src,
     req.cookie = msg->demand_id;
     moqr_sub_t sub;
     memset(&sub, 0, sizeof(sub));
-    moqr_result_t rc = moqr_core_subscribe(m->core, m->pb[src], &req, &sub);
+    moqr_result_t rc = s->cluster_enabled
+        ? moqr_core_subscribe_cluster(m->core, m->pb[src], &req,
+            msg->source_binding_cookie, msg->source_route_generation,
+            msg->requester_hop_id, msg->requester_correlation_id, &sub)
+        : moqr_core_subscribe(m->core, m->pb[src], &req, &sub);
     if (rc == MOQR_ERR_WOULD_BLOCK) {
         return false;   /* intent ring full: DEMAND stays durable */
     }
@@ -4336,8 +4656,13 @@ owner_sa_accept(moqr_shards_t *s, uint16_t shard, uint16_t src,
         o->plan.wire.error_code = R_ERR_INVALID_JOINING;
         return true;
     }
-    moqr_result_t rc = moqr_core_internal_retrieve_open(m->core, m->pb[src], &req,
-                                                        now_us, &o->owner, &o->plan);
+    moqr_result_t rc = s->cluster_enabled && msg->cluster_selected
+        ? moqr_core_internal_retrieve_open_cluster(m->core, m->pb[src], &req,
+            msg->source_binding_cookie, msg->source_route_generation,
+            msg->requester_hop_id, msg->requester_correlation_id,
+            now_us, &o->owner, &o->plan)
+        : moqr_core_internal_retrieve_open(m->core, m->pb[src], &req,
+                                           now_us, &o->owner, &o->plan);
     if (rc == MOQR_OK && joined != NULL && o->plan.wire.admit == MOQR_FETCH_ACCEPT &&
         !moqr_track_eq(o->plan.track, joined->otrack)) {
         (void)moqr_core_fetch_close(m->core, o->owner);
@@ -4481,6 +4806,36 @@ shard_demand_inbound(moqr_shards_t *s, uint16_t shard, uint64_t now_us,
         }
         r_demand_msg_t *msg;
         while ((msg = dch_head(s, src, shard)) != NULL) {
+            if ((msg->kind >= D_MSG_DONE && msg->kind <= D_MSG_SG_SEAL) ||
+                msg->kind == D_MSG_METADATA) {
+                r_pdemand *d = pend_find(m, msg->demand_id);
+                if (!demand_reply_matches(d, src, msg)) {
+                    dch_pop(s, src, shard);
+                    continue; /* a reply for another retained/source identity */
+                }
+                if (!pend_source_current(m, d)) {
+                    if ((d->state == D_ST_ACKED || d->state == D_ST_TERMINATING) &&
+                        moqr_core_internal_source_idle(m->core, d->track,
+                                                        d->track_gen)) {
+                        if (d->state == D_ST_ACKED) {
+                            d->state = D_ST_TERMINATING;
+                            d->term_code = 0;
+                            d->term_overrun = false;
+                            d->term_quiet = true;
+                        }
+                        break; /* quiet old-log cleanup precedes later replies */
+                    }
+                    /* Source changes run before this FIFO drain. Old queued
+                     * objects, chunks, resets, metadata and terminals must
+                     * neither write nor scrub the replacement's log. Keep
+                     * the old owner's cancel obligation, without a local
+                     * source terminal that could end the replacement. */
+                    d->state = D_ST_UNDEMANDING;
+                    if (msg->kind == D_MSG_DONE) pend_retire(m, d);
+                    dch_pop(s, src, shard);
+                    continue;
+                }
+            }
             if (msg->kind == D_MSG_DEMAND) {
                 bool durable =
                     s->admit_remote
@@ -5467,6 +5822,18 @@ shards_templates(const moqr_shards_cfg_t *cfg, const moq_alloc_t *a,
     }
 }
 
+static moqr_cluster_cfg_t
+shards_cluster_cfg(const moqr_shards_cfg_t *cfg)
+{
+    moqr_cluster_cfg_t out;
+    moqr_cluster_cfg_init_sized(&out, sizeof(out));
+    out.enabled = SHARDS_CFG_HAS(cfg, cluster_enabled) && cfg->cluster_enabled;
+    out.local_hop_id = SHARDS_CFG_HAS(cfg, cluster_hop_id) ? cfg->cluster_hop_id : 0;
+    out.max_routes = SHARDS_CFG_HAS(cfg, max_cluster_routes) ? cfg->max_cluster_routes : 0;
+    out.max_hops = SHARDS_CFG_HAS(cfg, max_cluster_hops) ? cfg->max_cluster_hops : 0;
+    return out;
+}
+
 moqr_result_t
 moqr_shards_cfg_resolve(const moqr_shards_cfg_t *cfg,
                         moqr_shards_limits_t *out)
@@ -5506,6 +5873,14 @@ moqr_shards_cfg_resolve(const moqr_shards_cfg_t *cfg,
     moqr_core_relay_cfg_t core_tmpl;
     moqr_bind_cfg_t bind_tmpl;
     shards_templates(cfg, a, &core_tmpl, &bind_tmpl);
+
+    moqr_cluster_cfg_t cluster_cfg = shards_cluster_cfg(cfg);
+    if (cluster_cfg.enabled) {
+        moqr_core_capacity_t capacity;
+        if (moqr_core_cluster_capacity_describe(&core_tmpl, &cluster_cfg,
+                                               &capacity) != MOQR_OK)
+            return MOQR_ERR_INVAL;
+    }
 
     out->jrn_cap =
         (SHARDS_CFG_HAS(cfg, journal_entries) && cfg->journal_entries != 0)
@@ -5608,11 +5983,16 @@ moqr_shards_capacity_describe(const moqr_shards_cfg_t *cfg,
     uint64_t K2 = cap_mul(K, K);
 
     moqr_core_capacity_t cc;
-    if (moqr_core_capacity_describe(&core_tmpl, &cc) != MOQR_OK) {
+    moqr_cluster_cfg_t cluster_cfg = shards_cluster_cfg(cfg);
+    if (moqr_core_cluster_capacity_describe(&core_tmpl, &cluster_cfg, &cc) != MOQR_OK) {
         return MOQR_ERR_INVAL;
     }
     moqr_bind_capacity_t bc;
-    if (moqr_bind_capacity_describe(&bind_tmpl, &clim, &bc) != MOQR_OK) {
+    moqr_cluster_info_t cluster_info;
+    if (moqr_cluster_cfg_resolve(&cluster_cfg, &cluster_info) != MOQR_OK)
+        return MOQR_ERR_INVAL;
+    if (moqr_bind_cluster_capacity_describe(&bind_tmpl, &clim, &cluster_info,
+                                           &bc) != MOQR_OK) {
         return MOQR_ERR_INVAL;
     }
     out->core_structure_bytes = cc.structure_bytes;
@@ -5640,6 +6020,10 @@ moqr_shards_capacity_describe(const moqr_shards_cfg_t *cfg,
                     cap_mul(lim.pend_cap,
                             sizeof(r_pdemand) + sizeof(r_psub))));
         st = cap_add(st, cap_mul(K, mgr));
+        if (cluster_cfg.enabled) {
+            uint64_t routes = cluster_cfg.max_routes != 0 ? cluster_cfg.max_routes : 256u;
+            st = cap_add(st, cap_mul(K, cap_mul(routes, sizeof(r_cluster_snapshot))));
+        }
         st = cap_add(st, cap_mul(K2, sizeof(moqr_binding_t)));
         if (lim.admit) {
             uint64_t rows = cap_mul(2u * (uint64_t)lim.pend_cap,
@@ -5711,6 +6095,19 @@ moqr_shards_capacity_describe(const moqr_shards_cfg_t *cfg,
                            cap_add(cap_add(cap_mul(2u, hdr), R_CANON_FT_MAX),
                                    cap_add(MOQR_BIND_META_SET_MAX, hdr))));
         }
+    }
+
+    if (K > 1u && cluster_cfg.enabled) {
+        uint64_t routes = cluster_cfg.max_routes != 0 ? cluster_cfg.max_routes : 256u;
+        uint64_t hops = cluster_cfg.max_hops != 0 ? cluster_cfg.max_hops : 32u;
+        uint64_t hop_bytes = cap_mul(hops, sizeof(uint64_t));
+        out->canon_byte_ceiling = cap_add(out->canon_byte_ceiling,
+            cap_add(cap_mul(K, cap_mul(routes, cap_add(R_CANON_NS_MAX, hop_bytes))),
+                    cap_mul(K2, cap_mul(lim.mbox_cap, hop_bytes))));
+        /* Snapshot replacement and mailbox push allocate before releasing
+         * their old bytes; at most one such operation per source shard. */
+        out->staging_byte_ceiling = cap_add(out->staging_byte_ceiling,
+            cap_mul(K, cap_add(R_CANON_NS_MAX, hop_bytes)));
     }
 
     uint64_t total = cap_mul(K, out->per_shard_bytes);
@@ -5789,6 +6186,10 @@ moqr_shards_create(const moqr_shards_cfg_t *cfg, moqr_shards_t **out)
      * given, else sized off the core's namespace-node budget. Self-echo suppression
      * is per-entry, so it needs no separate pool. */
     s->jrn_cap = lim.jrn_cap;
+    moqr_cluster_cfg_t cluster_cfg = shards_cluster_cfg(cfg);
+    s->cluster_enabled = cluster_cfg.enabled;
+    s->cluster_routes = cluster_cfg.max_routes != 0 ? cluster_cfg.max_routes : 256u;
+    s->cluster_hops = cluster_cfg.max_hops != 0 ? cluster_cfg.max_hops : 32u;
 
     /* Pending remote-owner demand bound (per shard): at most one upstream attempt
      * per track, so the core's max_tracks is the natural default; explicit knob
@@ -5933,7 +6334,7 @@ moqr_shards_create(const moqr_shards_cfg_t *cfg, moqr_shards_t **out)
         ccfg.trace = sh->trace;
         ccfg.shard_index = i;
         ccfg.shard_count = (uint16_t)k;
-        if (moqr_core_create(&ccfg, &sh->core) != MOQR_OK) {
+        if (moqr_core_create_cluster(&ccfg, &cluster_cfg, &sh->core) != MOQR_OK) {
             moqr_shards_destroy(s);
             return MOQR_ERR_NOMEM;
         }
@@ -6070,6 +6471,8 @@ moqr_shards_destroy(moqr_shards_t *s)
             for (uint32_t i = 0; mb->slots != NULL && i < mb->cap; i++) {
                 if (mb->slots[i].used) {
                     sh_free(&s->alloc, mb->slots[i].canon, mb->slots[i].canon_len);
+                    sh_free(&s->alloc, mb->slots[i].hops,
+                            mb->slots[i].record.route.metadata.hop_count * sizeof(uint64_t));
                 }
             }
             sh_free(&s->alloc, mb->slots, (size_t)mb->cap * sizeof(r_ctrl_msg));

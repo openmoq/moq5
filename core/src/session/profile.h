@@ -695,6 +695,7 @@ typedef struct moq_profile_ops {
      * request naming one is refused with DOES_NOT_EXIST before the
      * application sees it, and the application may not publish under one. */
     bool reserved_session_namespaces;
+    bool cluster_metadata; /* profile supports negotiated cluster advertisements */
     /* Relative group starts clamp at the location ceiling. False preserves
      * legacy NEXT_GROUP's empty window when no successor is representable. */
     bool relative_group_clamps;

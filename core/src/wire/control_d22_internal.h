@@ -37,6 +37,10 @@ typedef struct moq_d22_kvp {
 } moq_d22_kvp_t;
 
 typedef struct moq_d22_setup_options {
+    bool has_hop_id;
+    bool has_relay_cost;
+    uint64_t hop_id;
+    uint64_t relay_cost;
     bool has_path;
     bool has_authority;
     bool has_implementation;

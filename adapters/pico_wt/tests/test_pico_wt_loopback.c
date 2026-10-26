@@ -35,6 +35,7 @@ static void drain_events(moq_session_t *s)
 /* The rows below run against the shipping library only; the private-endpoint
  * build compiles just the rows that need the adapter's private sources. */
 #if !defined(MOQ_PICO_WT_LOOPBACK_PRIVATE)
+#include "../../../tests/test_cluster_transport_flow.h"
 
 /* -- Full protocol flow: handshake → subscribe → object ------------- */
 
@@ -164,6 +165,31 @@ static void test_pico_wt_loopback(void)
     CHECK(!moq_pico_wt_conn_is_fatal(h.server_conn));
 
 cleanup:
+    pico_wt_harness_cleanup(&h);
+}
+
+static int cluster_wt_pump(void *ctx)
+{
+    return pico_wt_harness_pump((pico_wt_harness_t *)ctx, 200);
+}
+static void test_cluster_packet_flow(void)
+{
+    pico_wt_harness_t h;
+    pico_wt_harness_cfg_t cfg = {.cid_byte = 0x22,
+                                 .request_capacity = 16,
+                                 .version = MOQ_VERSION_DRAFT_22,
+                                 .cluster_enabled = true,
+                                 .client_hop_id = 101,
+                                 .server_hop_id = 202};
+    if (pico_wt_harness_setup(&h, &cfg) != 0 || pico_wt_harness_handshake(&h) != 0) {
+        CHECK(0);
+        pico_wt_harness_cleanup(&h);
+        return;
+    }
+    failures +=
+        cluster_packet_flow(h.client_session, h.server_session, &h, cluster_wt_pump, &h.now);
+    CHECK(!moq_pico_wt_conn_is_fatal(h.client_conn));
+    CHECK(!moq_pico_wt_conn_is_fatal(h.server_conn));
     pico_wt_harness_cleanup(&h);
 }
 
@@ -1317,6 +1343,7 @@ int main(void)
     return failures ? 1 : 0;
 #else
     test_pico_wt_loopback();
+    test_cluster_packet_flow();
     test_datagram_too_large();
     test_stop_sending_round_trip();
     test_close_double_close();
@@ -1339,7 +1366,7 @@ int main(void)
             test_control_arbitration(v ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_16, srv != 0);
 
     if (failures == 0)
-        printf("test_pico_wt_loopback: PASS (%d tests)\n", 22);
+        printf("test_pico_wt_loopback: PASS (%d tests)\n", 23);
     else
         fprintf(stderr, "test_pico_wt_loopback: %d failure(s)\n",
                 failures);
