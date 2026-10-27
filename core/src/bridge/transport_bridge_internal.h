@@ -491,6 +491,12 @@ static inline bool bridge_stream_is_session_control(
  * owns action-capacity admission, including when its subgroup slot was reaped. */
 uint8_t bridge_session_subgroup_header_size(
     const moq_session_t *s, const moq_send_data_action_t *data);
+/* Private first-open facts, unrelated to FIN acknowledgement/commit. */
+bool bridge_session_resolve_data_open(moq_session_t *s, moq_stream_ref_t ref,
+                                      uint64_t owner, uint8_t disposition);
+bool bridge_session_suppress_data_open(moq_session_t *s, moq_stream_ref_t ref,
+                                       uint64_t owner);
+void bridge_session_abandon_data_opens(moq_session_t *s);
 bool bridge_session_is_fetch_header(
     const moq_session_t *s, const moq_send_data_action_t *data);
 /* Pure profile classification: a complete subgroup/FETCH type, without

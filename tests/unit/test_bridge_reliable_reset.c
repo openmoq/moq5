@@ -503,6 +503,7 @@ static void test_done_counts_reset_stream(moq_version_t v, bool reliable)
     }
     drain_events(p.c);
     p.lossy = true;
+    const uint64_t next_uni = p.sep.next_uni_id;
     moq_subgroup_handle_t sg = open_sg(&p, sh, 6);
     write_obj(&p, sg, 0);
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_reset_subgroup(p.sv, sg, 0x1, p.now), (int)MOQ_OK);
@@ -510,13 +511,35 @@ static void test_done_counts_reset_stream(moq_version_t v, bool reliable)
     moq_done_subscribe_cfg_init(&dc);
     dc.status_code = 0x2;   /* TRACK_ENDED */
     dc.stream_count = 1;
-    MOQ_TEST_CHECK_EQ_INT((int)moq_session_done_subscribe(p.sv, sh, &dc, p.now), (int)MOQ_OK);
-    pump(&p);
+    /* The bridge has not yet opened the queued header's stream. A refused
+     * DONE must have no terminal effect; drive real open/header/reset work
+     * before retrying, without advancing the receiver's recovery deadline. */
+    moq_result_t rc = moq_session_done_subscribe(p.sv, sh, &dc, p.now);
+    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_WOULD_BLOCK);
+    if (rc != MOQ_ERR_WOULD_BLOCK) { pair_close(&p); return; }
     moq_event_t ev;
+    for (unsigned retry = 0; retry < 16; retry++) {
+        pump(&p);
+        bool premature = take(p.c, MOQ_EVENT_SUBSCRIBE_DONE, &ev);
+        MOQ_TEST_CHECK(!premature);
+        if (premature) moq_event_cleanup(&ev);
+        rc = moq_session_done_subscribe(p.sv, sh, &dc, p.now);
+        if (rc != MOQ_ERR_WOULD_BLOCK) break;
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(p.sep.next_uni_id, next_uni + 1);
+    pump(&p);
     bool done = take(p.c, MOQ_EVENT_SUBSCRIBE_DONE, &ev);
-    if (done) moq_event_cleanup(&ev);
+    if (done) {
+        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.stream_count, 1);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.status_code, 0x2);
+        moq_event_cleanup(&ev);
+    }
     if (reliable) MOQ_TEST_CHECK(done);
     else MOQ_TEST_CHECK(!done);
+    bool duplicate = take(p.c, MOQ_EVENT_SUBSCRIBE_DONE, &ev);
+    MOQ_TEST_CHECK(!duplicate);
+    if (duplicate) moq_event_cleanup(&ev);
     pair_close(&p);
 }
 

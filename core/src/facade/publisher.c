@@ -10,6 +10,20 @@
 #include <stddef.h>
 #include <string.h>
 
+/* The facade owns all application streams for its slots. Select the session's
+ * actual count inside terminal advancement, after unresolved opens settle. */
+static moq_result_t publisher_done_subscribe(moq_session_t *s, moq_subscription_t sub,
+    const moq_done_subscribe_cfg_t *cfg, uint64_t now_us)
+{
+    return session_done_subscribe(s, sub, cfg, now_us, true);
+}
+
+static moq_result_t publisher_finish_publish(moq_session_t *s, moq_publication_t pub,
+    const moq_finish_publish_cfg_t *cfg, uint64_t now_us)
+{
+    return session_finish_publish(s, pub, cfg, now_us, true);
+}
+
 typedef enum {
     PUB_NS_NONE = 0,
     PUB_NS_PENDING,
@@ -103,10 +117,9 @@ typedef struct {
      * neither false-skip nor false-join. */
     uint64_t              target_op;
     uint64_t              done_op;
-    /* Streams (subgroups) the facade opened for this destination -- every
-     * open goes through the facade, so the count is EXACT and a terminal
-     * done can report it instead of the unknown sentinel. Cleared with the
-     * slot. */
+    /* Logical subgroup opens admitted by the facade. The private terminal
+     * selects actual session open decisions; this statistic is never the
+     * wire authority. Cleared with the slot. */
     uint64_t              streams_opened;
     /* An end_track terminal in progress on this destination: the open
      * subgroup (sg) is the terminal one (eot_sg), its END_OF_TRACK has been
@@ -901,7 +914,7 @@ static void track_retire_slot(moq_publisher_t *pub, moq_pub_track_t *t,
  * open subgroup FIRST (streams close before the
  * terminal control message, d16:3436/d18:4227), then SUBSCRIBE_DONE /
  * PUBLISH_DONE with SUBSCRIPTION_ENDED (0x3, the finite end was genuinely
- * reached) and the EXACT per-destination stream count. Retry-idempotent
+ * reached) and the session-selected per-destination stream count. Retry-idempotent
  * with the finish_subscribers discipline: state mutates only after a
  * successful/stale session call, a cleared slot goes inactive so retries
  * skip it, and the watermark driving eligibility is monotone. Deferrals:
@@ -967,7 +980,7 @@ static moq_result_t track_run_completions(moq_publisher_t *pub,
             moq_finish_publish_cfg_init(&fcfg);
             fcfg.status_code = 0x3;   /* SUBSCRIPTION_ENDED */
             fcfg.stream_count = sl->streams_opened;
-            moq_result_t rc = moq_session_finish_publish(pub->session,
+            moq_result_t rc = publisher_finish_publish(pub->session,
                 t->publication, &fcfg, now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
             if (rc != MOQ_OK && rc != MOQ_ERR_STALE_HANDLE) return rc;
@@ -980,7 +993,7 @@ static moq_result_t track_run_completions(moq_publisher_t *pub,
         moq_done_subscribe_cfg_init(&dcfg);
         dcfg.status_code = 0x3;       /* SUBSCRIPTION_ENDED */
         dcfg.stream_count = sl->streams_opened;
-        moq_result_t rc = moq_session_done_subscribe(pub->session, sl->sub,
+        moq_result_t rc = publisher_done_subscribe(pub->session, sl->sub,
                                                      &dcfg, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc != MOQ_OK && rc != MOQ_ERR_STALE_HANDLE) return rc;
@@ -4079,7 +4092,7 @@ moq_result_t moq_pub_remove_track(moq_publisher_t *pub,
         if (psl && psl->streaming && !must_reset) return MOQ_ERR_WRONG_STATE;
         if (psl && psl->sg_open) {
             /* Only a subgroup with nothing omitted closes cleanly. The
-             * reported stream count is EXACT either way; the peer's
+             * session selects the observed count; the peer's
              * completed-stream gate counts identifiable resets like FINs.
              * Slot state -- INCLUDING streaming, so a later finish-stage
              * WOULD_BLOCK retry cannot wedge on the mid-stream guard --
@@ -4100,8 +4113,8 @@ moq_result_t moq_pub_remove_track(moq_publisher_t *pub,
         moq_finish_publish_cfg_t fcfg;
         moq_finish_publish_cfg_init(&fcfg);
         fcfg.status_code = MOQ_PUB_DONE_TRACK_ENDED;   /* not INTERNAL_ERROR (0) */
-        fcfg.stream_count = psl ? psl->streams_opened : 0;   /* exact */
-        moq_result_t rc = moq_session_finish_publish(pub->session,
+        fcfg.stream_count = psl ? psl->streams_opened : 0;   /* logical statistic; terminal selects actual count */
+        moq_result_t rc = publisher_finish_publish(pub->session,
             track->publication, &fcfg, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc != MOQ_OK && rc != MOQ_ERR_STALE_HANDLE) return rc;
@@ -4135,14 +4148,14 @@ moq_result_t moq_pub_remove_track(moq_publisher_t *pub,
             sl->sg_open = false;
         }
         /* The subgroup is reset above, so the done is valid (it requires no open
-         * data stream). Stream count is EXACT -- the facade opened every stream
-         * for this subscription itself (zero for datagram-only delivery). On
+         * data stream). The session selects the transport-observed count
+         * (zero for known datagram-only delivery). On
          * success the session frees the subscription; clear our slot to match. */
         moq_done_subscribe_cfg_t dcfg;
         moq_done_subscribe_cfg_init(&dcfg);
         dcfg.status_code = MOQ_PUB_DONE_TRACK_ENDED;
         dcfg.stream_count = sl->streams_opened;
-        moq_result_t rc = moq_session_done_subscribe(pub->session, sl->sub,
+        moq_result_t rc = publisher_done_subscribe(pub->session, sl->sub,
                                                      &dcfg, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK)
             return MOQ_ERR_WOULD_BLOCK;
@@ -4841,8 +4854,8 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
              * by the terminal Location;
              * everything else -- open-ended windows the track never
              * reached, Forward-0 pauses -- is TRACK_ENDED (0x2): the track
-             * is no longer being published. Stream count is EXACT: the
-             * facade opened every stream for this subscription itself.
+             * is no longer being published. The session selects the count after actual
+             * open decisions settle.
              * Retry-safe: sg_open clears only on a successful close, the
              * slot clears only after a successful/stale done, so a
              * WOULD_BLOCK retry resumes exactly where it stopped and never
@@ -4866,7 +4879,7 @@ moq_result_t moq_pub_end_track(moq_publisher_t *pub, moq_pub_track_t *track,
                               * every end on a draft without
                               * SUBSCRIPTION_ENDED) */
             dcfg.stream_count = slot->streams_opened;
-            moq_result_t rc = moq_session_done_subscribe(pub->session,
+            moq_result_t rc = publisher_done_subscribe(pub->session,
                                                          slot->sub, &dcfg,
                                                          now_us);
             if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
@@ -4928,15 +4941,15 @@ moq_result_t moq_pub_finish_subscribers(moq_publisher_t *pub,
         }
 
         /* Send the session-level done with the caller's status code. Stream
-         * count is EXACT -- the facade opened every stream for this
-         * subscription itself (zero for datagram-only delivery). On success
+         * count comes from settled session open decisions
+         * (zero for known datagram-only delivery). On success
          * the session frees the subscription, so clear our slot to match
          * (and to stay idempotent). */
         moq_done_subscribe_cfg_t dcfg;
         moq_done_subscribe_cfg_init(&dcfg);
         dcfg.status_code = status_code;
         dcfg.stream_count = slot->streams_opened;
-        moq_result_t rc = moq_session_done_subscribe(pub->session, slot->sub,
+        moq_result_t rc = publisher_done_subscribe(pub->session, slot->sub,
                                                      &dcfg, now_us);
         if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
         if (rc != MOQ_OK && rc != MOQ_ERR_STALE_HANDLE) return rc;
@@ -6513,11 +6526,10 @@ moq_result_t moq_pub_unpublish_track(moq_publisher_t *pub,
      * The zeroed default is INTERNAL_ERROR, which would report this normal
      * end as an error. */
     fcfg.status_code = MOQ_PUB_DONE_TRACK_ENDED;
-    /* Exact stream count: the facade opened every stream for this
-     * publication; a zero would let the peer finalize before in-flight
-     * streams arrive. */
+    /* This logical statistic is not the wire authority. The private terminal
+     * selects the actual count within its advancing transaction. */
     fcfg.stream_count = psl ? psl->streams_opened : 0;
-    moq_result_t rc = moq_session_finish_publish(pub->session,
+    moq_result_t rc = publisher_finish_publish(pub->session,
         track->publication, &fcfg, now_us);
     if (rc == MOQ_ERR_WOULD_BLOCK) return MOQ_ERR_WOULD_BLOCK;
     if (rc != MOQ_OK && rc != MOQ_ERR_STALE_HANDLE) return rc;

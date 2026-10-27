@@ -2,9 +2,9 @@
 #define MOQ_CORE_SPI_H
 
 /*
- * Same-build interface between libmoq-core and the relay and media service
+ * Same-build interface between libmoq-core and the relay, media service and virtual transport
  * built with it. Each symbol here is exported from the core library so a
- * shared relay or service library can call it, which makes it a private
+ * shared sibling library can call it, which makes it a private
  * same-build ABI: a binary dependency between components built together, not
  * a stable or public ABI. No installed header declares it, and it changes with
  * the core it ships beside. tests/cmake/check_core_spi_symbols.cmake pins the
@@ -60,6 +60,43 @@ MOQ_API moq_result_t moq_core_internal_track_properties_validate(
 MOQ_API moq_result_t moq_core_internal_pub_reset_group(
     moq_publisher_t *pub, moq_pub_track_t *track,
     uint64_t error_code, uint64_t now_us, bool *out_did_reset);
+
+/* Shipping virtual transport observation. Not a second exclusive owner:
+ * native bridge ownership overrides polling. Identity is never dereferenced.
+ * Poll is one observing batch with the public selection/borrow contract;
+ * unlike raw polling it retains first-open records until passive feedback.
+ * The caller consumes/cleans every action before finish. No advancing call
+ * on this sender is allowed while its batch borrows are outstanding. */
+typedef struct moq_core_observed_open {
+    uint64_t ref;
+    uint64_t owner;
+    uint8_t mode;
+} moq_core_observed_open_t;
+
+#define MOQ_CORE_VIRTUAL_OPENED 1u
+#define MOQ_CORE_VIRTUAL_SUPPRESSED 2u
+
+MOQ_API moq_result_t moq_core_internal_virtual_register(
+    moq_session_t *s, const void *observer);
+MOQ_API void moq_core_internal_virtual_unregister(
+    moq_session_t *s, const void *observer);
+/* cap==0 is a passive availability check, including native-owner priority. */
+MOQ_API moq_result_t moq_core_internal_virtual_poll(
+    moq_session_t *s, const void *observer, moq_action_t *actions,
+    moq_core_observed_open_t *opens, size_t cap, size_t *out_count);
+/* SUPPRESSED requires permanent cancellation/refusal of this stream ref:
+ * the driver must never open it later, including for a FIN-only action.
+ * A failed reservation with a still-live producer does not prove that fact;
+ * leave it unresolved for EXTERNAL abort instead. */
+MOQ_API bool moq_core_internal_virtual_resolve(
+    moq_session_t *s, const void *observer,
+    const moq_core_observed_open_t *open, uint8_t disposition);
+/* abort_batch is only for hard driver failure after all transferred actions
+ * were cleaned. Unresolved facts become EXTERNAL, never guessed suppressed.
+ * A permanently cancelled, proven non-opening may be resolved SUPPRESSED
+ * beforehand under the no-future-open requirement above. */
+MOQ_API moq_result_t moq_core_internal_virtual_finish(
+    moq_session_t *s, const void *observer, bool abort_batch);
 
 #ifdef __cplusplus
 }

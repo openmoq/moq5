@@ -49,6 +49,7 @@ typedef struct fixture {
     uint64_t stopped_group, stopped_subgroup;
     unsigned received[2][40][20], reopened, post_stop_payloads, left;
     unsigned dones;
+    unsigned done_received; /* actual application delivery, without a deadline tick */
     uint64_t done_streams, done_status;
     unsigned stopped_resets, pending_acks, pending_errors;
     unsigned stopped_fins, other_resets, other_fins;
@@ -165,6 +166,7 @@ static bool peer_events(fixture_t *f)
             }
         } else if (e.kind == MOQ_EVENT_SUBSCRIBE_DONE) {
             ++f->dones;
+            f->done_received = 1;
             f->done_streams = e.u.subscribe_done.stream_count;
             f->done_status = e.u.subscribe_done.status_code;
         } else if (e.kind == MOQ_EVENT_SUBSCRIBE_OK &&
@@ -541,7 +543,11 @@ static bool isolation(fixture_t *f, bool timed, unsigned mode)
     CHECK(f->left == 0 && f->reopened == 0);
     CHECK(moq_pub_finish_subscribers(f->publisher, f->track, 2, f->now) == MOQ_OK);
     CHECK(settle(f));
-    CHECK(f->dones == 1 && f->done_streams == 3);
+    /* SimPair observes each first admission: original group 0, reopened
+     * group 0 after reset, and group 1. RESET retains the historical count;
+     * even the timed row sends the identifying header before its reset. */
+    CHECK(f->done_received == 1 && f->dones == 1);
+    CHECK(f->done_streams == 3 && f->done_status == 2);
     return true;
 }
 
@@ -1274,8 +1280,8 @@ static bool finite_window_terminal_pressure(fixture_t *f, bool stop)
         completed = f->sender->action_head == f->sender->action_tail
             && f->sender->event_head == f->sender->event_tail
             && f->stopped_resets == (stop ? 1u : 0u)
-            && (d22 ? f->dones == 0 && moq_pub_active_subscriptions(f->publisher, f->track) == 1
-                    : f->dones == 1 && moq_pub_active_subscriptions(f->publisher, f->track) == 0);
+            && (d22 ? f->done_received == 0 && moq_pub_active_subscriptions(f->publisher, f->track) == 1
+                    : f->done_received == 1 && moq_pub_active_subscriptions(f->publisher, f->track) == 0);
         if (completed) break;
     }
     if (!completed && blocked == 16 && handled == 0) {
@@ -1283,13 +1289,15 @@ static bool finite_window_terminal_pressure(fixture_t *f, bool stop)
         CHECK(f->sender->event_head == event_head && f->sender->event_tail == event_tail);
         CHECK(moq_pub_active_subscriptions(f->publisher, f->track) == 1);
         CHECK(moq_rcbuf_refcount(f->payload) == refs);
-        CHECK(f->dones == 0 && f->stopped_resets == 0 && f->stopped_fins == 0);
+        CHECK(f->done_received == 0 && f->stopped_resets == 0 && f->stopped_fins == 0);
         fprintf(stderr, "%s: no progress in 16 drivers; finite owner retained, events=%zu/%zu\n",
             case_name, event_tail - event_head, f->sender->event_cap);
     }
     CHECK(completed);
     CHECK(f->stopped_fins == (!stop && !d22 ? 1u : 0u));
-    if (!d22) CHECK(f->done_streams == 1 && f->done_status == 0x3);
+    /* Only group 0 was opened on the finite pull before the event pressure.
+     * FIN or identifiable RESET completes that one observed stream. */
+    if (!d22) CHECK(f->dones == 1 && f->done_streams == 1 && f->done_status == 0x3);
 #ifdef MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED
     if (f->manual) CHECK(f->terminals == (stop ? 1u : 0u));
 #endif
@@ -1298,7 +1306,7 @@ static bool finite_window_terminal_pressure(fixture_t *f, bool stop)
     CHECK(write_object(f, 1, 0, false) == MOQ_OK);
     CHECK(settle(f));
     CHECK(f->received[0][1][0] == 0 && f->received[1][1][0] == 1);
-    CHECK(f->dones == (d22 ? 0u : 1u));
+    CHECK(f->done_received == (d22 ? 0u : 1u));
     return true;
 }
 
@@ -1381,7 +1389,7 @@ static bool ordinary_retirement_terminal_pressure(fixture_t *f, bool stop)
             event_tail - event_head, f->sender->event_cap);
     }
     CHECK(completed);
-    CHECK(f->other_fins == 0 && f->stopped_fins == 0 && f->dones == 0);
+    CHECK(f->other_fins == 0 && f->stopped_fins == 0 && f->done_received == 0);
 #ifdef MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED
     if (f->manual) CHECK(f->terminals == (stop ? 1u : 0u));
 #endif
@@ -1398,7 +1406,10 @@ static bool ordinary_retirement_terminal_pressure(fixture_t *f, bool stop)
     CHECK(f->received[0][1][0] == 1 && f->received[1][1][0] == 1);
     CHECK(moq_pub_finish_subscribers(f->publisher, f->track, 2, f->now) == MOQ_OK);
     CHECK(settle(f));
-    CHECK(f->dones == 1 && f->done_streams == 2);
+    /* The paused pull's original group 0 still counts after retirement;
+     * resuming opens group 1. Both headers were admitted through SimPair. */
+    CHECK(f->done_received == 1 && f->dones == 1);
+    CHECK(f->done_streams == 2 && f->done_status == 2);
     CHECK(f->other_resets == 1 && f->stopped_resets == (stop ? 1u : 0u));
     return true;
 }

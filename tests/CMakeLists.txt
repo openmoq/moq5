@@ -386,6 +386,9 @@ add_test(NAME bridge_pass_costs_work COMMAND test_scheduling_work --pass-costs)
 add_test(NAME bridge_scan_work_probes COMMAND test_scheduling_work --scan-work)
 add_test(NAME bridge_expiry_walk_probes COMMAND test_scheduling_work --expiry-walk)
 add_test(NAME session_queue_scans_probes COMMAND test_scheduling_work --session-scans)
+# Private accounting calls stay in the existing internals fixture; scheduling
+# continues to link the shipping core, including its public DT03 wire checks.
+add_test(NAME bridge_open_accounting COMMAND test_scheduling_work --delivery-timeouts)
 
 add_executable(test_stream_order unit/test_stream_order.c
     ../core/src/bridge/stream_order.c)
@@ -1091,7 +1094,8 @@ if(TARGET moq::sim)
     add_executable(test_delivery_timers unit/test_delivery_timers.c)
     target_link_libraries(test_delivery_timers PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME delivery_timers COMMAND test_delivery_timers)
-    add_executable(test_delivery_timeout_params unit/test_delivery_timeout_params.c)
+    add_executable(test_delivery_timeout_params unit/test_delivery_timeout_params.c
+        unit/accept_publish_historical.c)
     target_link_libraries(test_delivery_timeout_params PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME delivery_timeout_params COMMAND test_delivery_timeout_params)
     add_executable(test_scheduling_order unit/test_scheduling_order.c)
@@ -1137,6 +1141,12 @@ if(TARGET moq::sim)
     add_executable(test_session_stream_count unit/test_session_stream_count.c)
     target_link_libraries(test_session_stream_count PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME session_stream_count COMMAND test_session_stream_count)
+
+    # The shipping shared simulator must call only the exact same-build core SPI.
+    add_executable(test_sim_open_accounting unit/test_sim_open_accounting.c)
+    target_link_libraries(test_sim_open_accounting PRIVATE moq::core moq::sim)
+    add_test(NAME sim_open_accounting COMMAND test_sim_open_accounting)
+    set_tests_properties(sim_open_accounting PROPERTIES TIMEOUT 60)
 
     add_executable(test_publish_done_history unit/test_publish_done_history.c)
     target_link_libraries(test_publish_done_history PRIVATE moq::core moq::sim)

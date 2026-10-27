@@ -52,6 +52,32 @@ static void drain_all(moq_simpair_t *sp) {
         for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
 }
 
+/* END_OF_TRACK can create a new status stream, so an observing transport
+ * must admit it before the finite DONE is encoded. Only lossless SimPair
+ * cases use this bounded retry; raw scanners below keep their own driving. */
+static moq_result_t end_track_virtual(moq_simpair_t *sp,
+    moq_publisher_t *pub, moq_pub_track_t *track)
+{
+    for (unsigned i = 0; i < 16; ++i) {
+        moq_result_t rc = moq_pub_end_track(pub, track, moq_simpair_now_us(sp));
+        if (rc != MOQ_ERR_WOULD_BLOCK) return rc;
+        rc = moq_simpair_run_until_quiescent(sp, 16, NULL);
+        if (rc != MOQ_OK) return rc;
+    }
+    return MOQ_ERR_WOULD_BLOCK;
+}
+
+static moq_result_t flush_virtual(moq_simpair_t *sp, moq_publisher_t *pub)
+{
+    for (unsigned i = 0; i < 16; ++i) {
+        moq_result_t rc = moq_pub_flush(pub, moq_simpair_now_us(sp));
+        if (rc != MOQ_ERR_WOULD_BLOCK) return rc;
+        rc = moq_simpair_run_until_quiescent(sp, 16, NULL);
+        if (rc != MOQ_OK) return rc;
+    }
+    return MOQ_ERR_WOULD_BLOCK;
+}
+
 /* -- Tests -------------------------------------------------------- */
 
 static void test_create_destroy(void) {
@@ -667,15 +693,67 @@ static void test_end_track_with_stream_keys(void)
     MOQ_TEST_CHECK(moq_pub_end_track(pub, track, moq_simpair_now_us(sp)) ==
                    MOQ_ERR_WOULD_BLOCK);
     moq_action_t act;
-    MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(srv, &act, 1), 1);
-    moq_action_cleanup(&act);
-    MOQ_TEST_CHECK(moq_pub_end_track(pub, track, moq_simpair_now_us(sp)) ==
-                   MOQ_OK);
     bool fin = false;
-    while (moq_session_poll_actions(srv, &act, 1) == 1) {
-        if (act.kind == MOQ_ACTION_SEND_DATA && act.u.send_data.fin) fin = true;
+    size_t polled = moq_session_poll_actions(srv, &act, 1);
+    MOQ_TEST_CHECK_EQ_SIZE(polled, 1);
+    if (polled == 1) {
+        /* The unrelated SUBSCRIBE is the non-data queue head. Removing it
+         * restores room for FIN; no first data header has escaped yet. */
+        const bool request_stream = moq_session_version(srv) != MOQ_VERSION_DRAFT_16;
+        MOQ_TEST_CHECK_EQ_INT(act.kind, request_stream
+                              ? MOQ_ACTION_OPEN_BIDI_STREAM : MOQ_ACTION_SEND_CONTROL);
+        const uint8_t *bytes = NULL;
+        size_t len = 0;
+        if (act.kind == MOQ_ACTION_OPEN_BIDI_STREAM) {
+            MOQ_TEST_CHECK(act.u.open_bidi_stream.stream_ref._v != 0);
+            bytes = act.u.open_bidi_stream.data;
+            len = act.u.open_bidi_stream.len;
+        } else if (act.kind == MOQ_ACTION_SEND_CONTROL) {
+            bytes = act.u.send_control.data;
+            len = act.u.send_control.len;
+        }
+        MOQ_TEST_CHECK(bytes && len > 0);
+        if (bytes && len > 0) {
+            moq_buf_reader_t r;
+            moq_control_envelope_t env;
+            moq_buf_reader_init(&r, bytes, len);
+            /* D18/D22 share the vi64 type + uint16 envelope here. */
+            moq_result_t rc = request_stream ? moq_d18_decode_envelope(&r, &env)
+                                            : moq_control_decode_envelope(&r, &env);
+            MOQ_TEST_CHECK(rc == MOQ_OK);
+            if (rc == MOQ_OK) MOQ_TEST_CHECK_EQ_U64(env.msg_type, 0x03); /* SUBSCRIBE */
+        }
         moq_action_cleanup(&act);
     }
+    MOQ_TEST_CHECK_EQ_SIZE(moq_session_action_capacity(srv), 1);
+    /* This subscription ends with the EOT object, not a finite DONE. The
+     * retry only owes its closing FIN and therefore needs queue capacity. */
+    MOQ_TEST_CHECK(moq_pub_end_track(pub, track, moq_simpair_now_us(sp)) == MOQ_OK);
+    size_t keys = 0;
+    bool first_header = false;
+    uint64_t keyed_ref = 0;
+    while (moq_session_poll_actions(srv, &act, 1) == 1) {
+        if (act.kind == MOQ_ACTION_SET_DATA_PRIORITY) {
+            keys++;
+            MOQ_TEST_CHECK(!first_header);
+            keyed_ref = act.u.set_data_priority.stream_ref._v;
+            MOQ_TEST_CHECK(keyed_ref != 0);
+        } else if (act.kind == MOQ_ACTION_SEND_DATA) {
+            MOQ_TEST_CHECK_EQ_SIZE(keys, 1);
+            MOQ_TEST_CHECK_EQ_U64(act.u.send_data.stream_ref._v, keyed_ref);
+            if (!first_header) {
+                MOQ_TEST_CHECK(act.u.send_data.header_len > 0);
+                MOQ_TEST_CHECK(!act.u.send_data.fin);
+                first_header = true;
+            }
+            if (act.u.send_data.fin) fin = true;
+        }
+        moq_action_cleanup(&act); /* deliberate raw escape, not virtual OPENED */
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(keys, 1);
+    MOQ_TEST_CHECK(first_header);
+    MOQ_TEST_CHECK(moq_pub_end_track(pub, track, moq_simpair_now_us(sp)) == MOQ_OK);
+    while (moq_session_poll_actions(srv, &act, 1) == 1) moq_action_cleanup(&act);
     MOQ_TEST_CHECK(fin);
 
     moq_pub_destroy(pub);
@@ -737,8 +815,7 @@ static void test_end_track(void) {
         moq_simpair_now_us(sp)) == MOQ_OK);
     moq_rcbuf_decref(p0);
 
-    MOQ_TEST_CHECK(moq_pub_end_track(pub, track,
-        moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(end_track_virtual(sp, pub, track) == MOQ_OK);
 
     /* Write-after-end is now defined: WRONG_STATE, no ownership taken (we still
      * own the ref and decref it). */
@@ -776,8 +853,7 @@ static void test_end_track(void) {
     moq_rcbuf_decref(ps);
 
     /* Repeated end_track is idempotent. */
-    MOQ_TEST_CHECK(moq_pub_end_track(pub, track,
-        moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(end_track_virtual(sp, pub, track) == MOQ_OK);
 
     moq_simpair_run_until_quiescent(sp, 16, NULL);
 
@@ -985,6 +1061,8 @@ static void test_finish_subscribers_not_terminal(void) {
     MOQ_TEST_CHECK(moq_pub_write_object(pub, track, 0, 0, p0, now) == MOQ_OK);
     moq_rcbuf_decref(p0);
 
+    /* Resolve the first actual virtual open before this immediate-finish case. */
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 8, NULL) == MOQ_OK);
     /* Finish the subscriber -> the track is still live, not ended. */
     MOQ_TEST_CHECK(moq_pub_finish_subscribers(pub, track,
         MOQ_PUB_DONE_TRACK_ENDED, now) == MOQ_OK);
@@ -1018,25 +1096,17 @@ static void test_finish_subscribers_would_block(void) {
     test_alloc_state_t as = {0};
     moq_alloc_t alloc = test_allocator(&as);
 
-    moq_session_cfg_t ccfg = MOQ_SESSION_CFG_INIT;
-    ccfg.alloc = &alloc;
-    ccfg.perspective = MOQ_PERSPECTIVE_CLIENT;
-    ccfg.send_request_capacity = true;
-    ccfg.initial_request_capacity = 16;
-
-    moq_session_cfg_t scfg = MOQ_SESSION_CFG_INIT;
-    scfg.alloc = &alloc;
-    scfg.perspective = MOQ_PERSPECTIVE_SERVER;
-    scfg.send_request_capacity = true;
-    scfg.initial_request_capacity = 16;
-    scfg.max_actions = 1;
-
-    moq_session_t *client = NULL, *server = NULL;
-    moq_session_create(&ccfg, 0, &client);
-    moq_session_create(&scfg, 0, &server);
-    moq_session_start(client, 0);
-    pump_actions_to_peer(client, server, 0);
-    pump_actions_to_peer(server, client, 0);
+    moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
+    cfg.alloc = &alloc;
+    cfg.max_actions = 1;
+    cfg.client_send_request_capacity = cfg.server_send_request_capacity = true;
+    cfg.client_initial_request_capacity = cfg.server_initial_request_capacity = 16;
+    moq_simpair_t *sp = NULL;
+    MOQ_TEST_CHECK(moq_simpair_create(&cfg, &sp) == MOQ_OK);
+    if (!sp) return;
+    moq_session_t *client = moq_simpair_client(sp), *server = moq_simpair_server(sp);
+    MOQ_TEST_CHECK(moq_simpair_start(sp) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
     { moq_event_t ev;
       if (moq_session_poll_events(client, &ev, 1) == 1) moq_event_cleanup(&ev);
       if (moq_session_poll_events(server, &ev, 1) == 1) moq_event_cleanup(&ev); }
@@ -1058,28 +1128,35 @@ static void test_finish_subscribers_would_block(void) {
     sub1cfg.track_name = MOQ_BYTES_LITERAL("t");
     moq_subscription_t sub1;
     moq_session_subscribe(client, &sub1cfg, 0, &sub1);
-    pump_actions_to_peer(client, server, 0);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
     { moq_event_t ev;
       if (moq_session_poll_events(server, &ev, 1) == 1) {
           moq_pub_event_result_t res; moq_pub_handle_event(pub, &ev, 0, &res);
           moq_event_cleanup(&ev);
       } }
-    pump_actions_to_peer(server, client, 0);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
     { moq_event_t ev;
       if (moq_session_poll_events(client, &ev, 1) == 1) moq_event_cleanup(&ev); }
 
     /* Open a live subgroup so finish must close it before sending the DONE. */
     uint8_t d[] = { 0xBB };
     moq_rcbuf_t *p = NULL; moq_rcbuf_create(&alloc, d, 1, &p);
-    moq_pub_write_object(pub, track, 0, 0, p, 0);
+    moq_result_t write_rc = MOQ_ERR_WOULD_BLOCK;
+    for (unsigned i = 0; i < 9 && write_rc == MOQ_ERR_WOULD_BLOCK; ++i) {
+        write_rc = moq_pub_write_object(pub, track, 0, 0, p, 0);
+        if (write_rc == MOQ_ERR_WOULD_BLOCK)
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
+    }
+    MOQ_TEST_CHECK(write_rc == MOQ_OK);
     moq_rcbuf_decref(p);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
 
     /* Fill the 1-slot queue so finish's first action WOULD_BLOCK. */
     moq_publish_namespace_cfg_t nscfg; moq_publish_namespace_cfg_init(&nscfg);
     moq_bytes_t blocker_ns[] = { MOQ_BYTES_LITERAL("blk") };
     nscfg.track_namespace.parts = blocker_ns; nscfg.track_namespace.count = 1;
     moq_announcement_t blocker_ann;
-    moq_session_publish_namespace(server, &nscfg, 0, &blocker_ann);
+    MOQ_TEST_CHECK(moq_session_publish_namespace(server, &nscfg, 0, &blocker_ann) == MOQ_OK);
 
     moq_result_t rc = moq_pub_finish_subscribers(pub, track,
         MOQ_PUB_DONE_TRACK_ENDED, 0);
@@ -1092,22 +1169,15 @@ static void test_finish_subscribers_would_block(void) {
      * until the finish completes. */
     int done_n = 0;
     for (int k = 0; k < 9 && done_n == 0; k++) {
-        { moq_action_t acts[16]; size_t na;
-          while ((na = moq_session_poll_actions(server, acts, 16)) > 0)
-              for (size_t i = 0; i < na; i++) {
-                  if (acts[i].kind == MOQ_ACTION_SEND_CONTROL)
-                      moq_session_on_control_bytes(client,
-                          acts[i].u.send_control.data,
-                          acts[i].u.send_control.len, 0);
-                  else if (acts[i].kind == MOQ_ACTION_SEND_DATA)
-                      FEED_SEND_DATA(client,
-                          acts[i].u.send_data.stream_ref, acts[i], 0);
-                  moq_action_cleanup(&acts[i]);
-              } }
+        MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
         { moq_event_t ev[8]; size_t ne;
           while ((ne = moq_session_poll_events(client, ev, 8)) > 0)
               for (size_t i = 0; i < ne; i++) {
-                  if (ev[i].kind == MOQ_EVENT_SUBSCRIBE_DONE) done_n++;
+                  if (ev[i].kind == MOQ_EVENT_SUBSCRIBE_DONE) {
+                      done_n++;
+                      MOQ_TEST_CHECK_EQ_U64(ev[i].u.subscribe_done.status_code, MOQ_PUB_DONE_TRACK_ENDED);
+                      MOQ_TEST_CHECK_EQ_U64(ev[i].u.subscribe_done.stream_count, 1);
+                  }
                   moq_event_cleanup(&ev[i]);
               } }
         if (rc == MOQ_ERR_WOULD_BLOCK)
@@ -1130,8 +1200,7 @@ static void test_finish_subscribers_would_block(void) {
       while ((na = moq_session_poll_actions(client, acts, 16)) > 0)
           for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
     }
-    moq_session_destroy(server);
-    moq_session_destroy(client);
+    moq_simpair_destroy(sp);
     MOQ_TEST_CHECK(as.balance == 0);
     MOQ_TEST_PASS("finish_subscribers_would_block");
 }
@@ -1406,6 +1475,9 @@ static void test_remove_track_with_open_sg(void) {
     /* Remove track with open subgroup — namespace is ACCEPTED. */
     moq_result_t rc = moq_pub_remove_track(pub, track,
         moq_simpair_now_us(sp));
+    MOQ_TEST_CHECK(rc == MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
+    rc = moq_pub_remove_track(pub, track, moq_simpair_now_us(sp));
     MOQ_TEST_CHECK(rc == MOQ_OK);
 
     moq_pub_destroy(pub);
@@ -5420,7 +5492,7 @@ static void test_remove_track_while_streaming(void) {
 
     /* Remove track while streaming. Should reset subgroup. */
     MOQ_TEST_CHECK(moq_pub_remove_track(pub, track,
-        moq_simpair_now_us(sp)) == MOQ_OK);
+        moq_simpair_now_us(sp)) == MOQ_ERR_WOULD_BLOCK);
 
     /* Verify RESET_DATA was queued. */
     moq_action_t acts[16];
@@ -5431,6 +5503,8 @@ static void test_remove_track_while_streaming(void) {
         moq_action_cleanup(&acts[i]);
     }
     MOQ_TEST_CHECK(found_reset);
+    MOQ_TEST_CHECK(moq_pub_remove_track(pub, track,
+        moq_simpair_now_us(sp)) == MOQ_OK);
 
     moq_pub_destroy(pub);
     drain_all(sp);
@@ -7756,7 +7830,7 @@ static void test_publish_track_write(void) {
 
     /* end_track on a published track ends it: END_OF_TRACK on its own stream,
      * then PUBLISH_DONE counting both streams. */
-    rc = moq_pub_end_track(pub, track, moq_simpair_now_us(sp));
+    rc = end_track_virtual(sp, pub, track);
     MOQ_TEST_CHECK(rc == MOQ_OK);
     MOQ_TEST_CHECK(!moq_pub_track_is_published(pub, track));
     moq_simpair_run_until_quiescent(sp, 8, NULL);
@@ -11509,7 +11583,7 @@ static void test_publication_end_status(moq_version_t ver)
         moq_simpair_run_until_quiescent(sp, 8, NULL);
 
         uint64_t now = moq_simpair_now_us(sp);
-        moq_result_t rc = how == 0 ? moq_pub_end_track(pub, track, now)
+        moq_result_t rc = how == 0 ? end_track_virtual(sp, pub, track)
                         : how == 1 ? moq_pub_unpublish_track(pub, track, now)
                                    : moq_pub_remove_track(pub, track, now);
         MOQ_TEST_CHECK_EQ_INT(rc, MOQ_OK);
@@ -12496,8 +12570,7 @@ static void test_window_end_track(moq_version_t ver, bool excluded)
     moq_simpair_run_until_quiescent(sp, 8, NULL);
     MOQ_TEST_CHECK_EQ_INT(fanout_count_objects(sp, 0, 0, d0, sizeof(d0)), 1);
 
-    MOQ_TEST_CHECK(moq_pub_end_track(pub, track,
-        moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(end_track_virtual(sp, pub, track) == MOQ_OK);
     moq_simpair_run_until_quiescent(sp, 8, NULL);
     int nstatus = 0, ndone = 0; uint64_t done_status = 0;
     { moq_event_t ev;
@@ -12524,8 +12597,7 @@ static void test_window_end_track(moq_version_t ver, bool excluded)
     MOQ_TEST_CHECK(moq_session_state(moq_simpair_server(sp))
                    == MOQ_SESS_ESTABLISHED);
     /* Terminal + idempotent. */
-    MOQ_TEST_CHECK(moq_pub_end_track(pub, track,
-        moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(end_track_virtual(sp, pub, track) == MOQ_OK);
 
     moq_pub_destroy(pub);
     drain_all(sp);
@@ -12732,8 +12804,7 @@ static void test_window_end_track_canonical_location(moq_version_t ver)
                        == MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(windows_count(sp, 10, 0, 0xAB), 1);
 
-        MOQ_TEST_CHECK(moq_pub_end_track(pub, track,
-            moq_simpair_now_us(sp)) == MOQ_OK);
+        MOQ_TEST_CHECK(end_track_virtual(sp, pub, track) == MOQ_OK);
         moq_simpair_run_until_quiescent(sp, 8, NULL);
         int nstatus = 0; uint64_t st_g = 0, st_o = 1;
         { moq_event_t ev;
@@ -12782,8 +12853,7 @@ static void test_window_end_track_canonical_location(moq_version_t ver)
                        == MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT(windows_count(sp, 10, 0, 0xAC), 1);
 
-        MOQ_TEST_CHECK(moq_pub_end_track(pub, track,
-            moq_simpair_now_us(sp)) == MOQ_OK);
+        MOQ_TEST_CHECK(end_track_virtual(sp, pub, track) == MOQ_OK);
         moq_simpair_run_until_quiescent(sp, 8, NULL);
         int nstatus = 0, ndone = 0;
         uint64_t done_status = 0, done_count = UINT64_MAX;
@@ -14432,7 +14502,7 @@ static void declare_make_sg_stale(moq_simpair_t *sp, moq_publisher_t *pub,
           }
           moq_action_cleanup(&acts[i]);
       } }
-    MOQ_TEST_CHECK(found_ref);   /* the write really opened a stream */
+    MOQ_TEST_CHECK(found_ref);   /* logical stream ref, escaped raw: not OPENED */
     MOQ_TEST_CHECK(moq_session_on_data_stop(sv, ref, 0x0,
         moq_simpair_now_us(sp)) == MOQ_OK);
     { moq_action_t acts[8]; size_t na;
@@ -14479,14 +14549,15 @@ static void test_declare_stale_completion(moq_version_t ver,
 
     /* Completion must survive the stale clean-close: normalize the
      * subgroup state, keep the destination, and send exactly ONE terminal
-     * with 0x3 and the exact stream count. */
+     * with 0x3 and the honest raw-unknown stream count. */
     MOQ_TEST_CHECK(moq_pub_declare_groups_complete_through(pub, track, 3,
                                                            now) == MOQ_OK);
     {
         declare_scan_t sc; declare_scan_actions(sv, ver, &sc);
         MOQ_TEST_CHECK_EQ_INT(sc.dones, 1);
         MOQ_TEST_CHECK_EQ_U64(sc.status, 0x3);
-        MOQ_TEST_CHECK_EQ_U64(sc.streams, 1);
+        /* Raw first-header escape above; D16/D18 MUST send 2^62-1. */
+        MOQ_TEST_CHECK_EQ_U64(sc.streams, (UINT64_C(1) << 62) - 1);
     }
     if (publication_mode) {
         /* Publication state cleared consistently: a fresh publish_track is
@@ -14548,14 +14619,15 @@ static void test_declare_stale_armed_reset(moq_version_t ver)
                            (size_t)1);
 
     /* Completion still terminates the paused, covered destination with 0x3
-     * and the exact count (the one opened-then-stale stream). */
+     * and the raw-unknown count (the first header was discarded). */
     MOQ_TEST_CHECK(moq_pub_declare_groups_complete_through(pub, track, 3,
                                                            now) == MOQ_OK);
     {
         declare_scan_t sc; declare_scan_actions(sv, ver, &sc);
         MOQ_TEST_CHECK_EQ_INT(sc.dones, 1);
         MOQ_TEST_CHECK_EQ_U64(sc.status, 0x3);
-        MOQ_TEST_CHECK_EQ_U64(sc.streams, 1);
+        /* Raw first-header escape above; D16/D18 MUST send 2^62-1. */
+        MOQ_TEST_CHECK_EQ_U64(sc.streams, (UINT64_C(1) << 62) - 1);
     }
     MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track),
                            (size_t)0);
@@ -14680,6 +14752,9 @@ static void test_declare_end_track_blocked_preflight(moq_version_t ver)
     MOQ_TEST_CHECK_EQ_U64(declare_hist_group(sv), 3);
     MOQ_TEST_CHECK_EQ_SIZE(moq_pub_active_subscriptions(pub, track),
                            (size_t)1);
+    /* The status-only end_track queued a new first header. Observe its real
+     * virtual admission before declaring the finite terminal. */
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
     /* Now declare(3): exactly ONE proper completion -- 0x3 with the exact
      * count (the terminal subgroup alone). */
     MOQ_TEST_CHECK(moq_pub_declare_groups_complete_through(pub, track, 3,
@@ -15041,7 +15116,7 @@ static void test_mono_crossed_and_blocked(moq_version_t ver, bool abandon)
         MOQ_TEST_CHECK_EQ_INT(declare_client_dones(sp, NULL, NULL), 0);
         MOQ_TEST_CHECK(moq_pub_end_group(pub, track, now) == MOQ_OK);
     }
-    MOQ_TEST_CHECK(moq_pub_flush(pub, now) == MOQ_OK);
+    MOQ_TEST_CHECK(flush_virtual(sp, pub) == MOQ_OK);
     moq_simpair_run_until_quiescent(sp, 8, NULL);
     {
         uint64_t st = ~0ull;
@@ -15313,7 +15388,7 @@ static void test_mono_datagram_no_arm(moq_version_t ver)
     MOQ_TEST_CHECK(mono_write_stream_eog(pub, track, &alloc, sp, 3, 1, true,
                                          0xA9) == MOQ_OK);
     MOQ_TEST_CHECK(moq_pub_end_group(pub, track, now) == MOQ_OK);
-    MOQ_TEST_CHECK(moq_pub_flush(pub, now) == MOQ_OK);
+    MOQ_TEST_CHECK(flush_virtual(sp, pub) == MOQ_OK);
     moq_simpair_run_until_quiescent(sp, 8, NULL);
     {
         uint64_t st = ~0ull;
@@ -15987,8 +16062,7 @@ static void subgroup_header_case(uint64_t version, const char *label)
         MOQ_TEST_CHECK_EQ_U64(t.n[0][4][dest], 0);
         MOQ_TEST_CHECK_EQ_U64(t.n[1][3][dest], 0);
     }
-    MOQ_TEST_CHECK(moq_pub_end_track(pub, track,
-        moq_simpair_now_us(sp)) == MOQ_OK);
+    MOQ_TEST_CHECK(end_track_virtual(sp, pub, track) == MOQ_OK);
 
     moq_rcbuf_decref(pl);
     moq_rcbuf_decref(pr);
@@ -17676,6 +17750,9 @@ static void hist_fin_rollover_case(moq_version_t ver, int c)
                                          HIST_TAG(0)) == MOQ_OK);
     MOQ_TEST_CHECK(mono_write_stream_eog(pub, track, &alloc, sp, 30, second,
                                          c == 2, HIST_TAG(second)) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_pub_finish_subscribers(pub, track,
+                       MOQ_PUB_DONE_TRACK_ENDED, moq_simpair_now_us(sp)) == MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 16, NULL) == MOQ_OK);
     MOQ_TEST_CHECK(moq_pub_finish_subscribers(pub, track,
                        MOQ_PUB_DONE_TRACK_ENDED, moq_simpair_now_us(sp)) == MOQ_OK);
     hist_stream_ends(sp, 30, &fins, &resets);

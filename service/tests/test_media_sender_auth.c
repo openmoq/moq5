@@ -1064,7 +1064,21 @@ static void test_catalog_admission_snapshot(moq_version_t version, const char *n
     check_write(&a.f, a.f.track, MOQ_ERR_WRONG_STATE);
     if (failures != before) goto done;
     if (credit) {
-        admission_pump(&a);
+        /* Retiring the old publication first opens its END_OF_TRACK stream.
+         * Resolve that admission through the real peer before expecting the
+         * replacement's first attempt. Keep its request credit blocked and
+         * stop as soon as that attempt occurs, so no retry is hidden. */
+        for (unsigned i = 0; i < 24; ++i) {
+            admission_pump(&a);
+            admission_flush(&a);
+            uint64_t attempts = 0;
+            moq_result_t rc = MOQ_ERR_INTERNAL;
+            MOQ_TEST_CHECK(moq_media_sender_test_publish_admission(
+                a.f.sender, a.f.replacement, &attempts, &rc));
+            if (failures != before) goto done;
+            if (attempts) break;
+        }
+        MOQ_TEST_CHECK(a.media_ends == 1 && a.media_subgroups == 1 && a.media_finished == 1);
         admission_expect(&a, a.f.replacement, 1, MOQ_ERR_REQUEST_BLOCKED);
         admission_expect(&a, NULL, 2, refusal);
         admission_check_snapshot(&a, snapshot, true);
@@ -1652,6 +1666,10 @@ static void test_withheld_ack_terminal(bool complete)
     MOQ_TEST_CHECK(f->queued_healthy != NULL);
     if (complete) MOQ_TEST_CHECK(moq_media_sender_complete(f->sender) == MOQ_OK);
     if (failures != before) goto done;
+    /* Healthy completion needs the hook after its first-header admission;
+     * the late publication's ACK remains withheld throughout these drives. */
+    for (unsigned i = 0; complete && i < 24 && p.healthy_finished == 0; ++i)
+        pending_drive(&p);
     for (unsigned i = 0; i < 2; ++i) {
         pending_drive(&p);
         terminal_marker(&p, !complete);
@@ -1830,7 +1848,8 @@ done:
 
 /* add -> end -> complete before any registration pump. In this settled hook
  * the first allocation snapshots demand; the second snapshots maintenance.
- * Refuse just that second snapshot, twice, while the healthy track fully ends. */
+ * Refuse just that second snapshot, twice, while the healthy track's first
+ * terminal admission resolves and the following hook fully ends it. */
 static void test_unregistered_end_completion(void)
 {
     int before = failures;
@@ -1849,7 +1868,10 @@ static void test_unregistered_end_completion(void)
         admission_expect(&p.a, p.late, 0, MOQ_OK);
         MOQ_TEST_CHECK(f->selections == 3 && p.a.selected[AUTH_NEW_MEDIA] == 0);
         MOQ_TEST_CHECK(p.late_requests == 0 && p.late_finished == 0);
-        MOQ_TEST_CHECK(p.healthy_ends == 1 && p.healthy_finished == 1);
+        /* The first hook emits the healthy terminal; its transport admission
+         * is resolved by pending_flush, so only the second hook can finish. */
+        MOQ_TEST_CHECK(p.healthy_ends == 1);
+        MOQ_TEST_CHECK(p.healthy_finished == (i == 0 ? 0u : 1u));
         terminal_marker(&p, true);
         terminal_waiting(&p);
         if (failures != before) goto done;
@@ -1898,7 +1920,8 @@ static void test_peer_finished_before_ack(void)
     MOQ_TEST_CHECK(f->queued_healthy != NULL);
     MOQ_TEST_CHECK(moq_media_sender_complete(f->sender) == MOQ_OK);
     if (failures != before) goto done;
-    pending_drive(&p);
+    for (unsigned i = 0; i < 24 && p.healthy_finished == 0; ++i)
+        pending_drive(&p);
     terminal_waiting(&p);
     MOQ_TEST_CHECK(p.healthy_objects == 1 && p.healthy_finished == 1 && f->track_closed == 0);
     if (failures != before) goto done;

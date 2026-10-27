@@ -28,6 +28,8 @@
  */
 #include <moq/moq.h>
 #include <moq/sim.h>
+#include <moq/control_d18.h>
+#include "../../core/src/wire/control_d22_internal.h"
 #include "test_support.h"
 #include "test_binding_support.h"
 #include "../../core/src/session/session_internal.h"
@@ -35,17 +37,78 @@
 #include <string.h>
 #include <stdlib.h>
 
+typedef struct count_alloc { int64_t live; } count_alloc_t;
+static void *ca_alloc(size_t n, void *ctx)
+{
+    count_alloc_t *c = ctx;
+    void *p = malloc(n);
+    if (p) c->live++;
+    return p;
+}
+static void *ca_realloc(void *p, size_t o, size_t n, void *ctx)
+{
+    count_alloc_t *c = ctx;
+    (void)o;
+    if (!p) { void *r = malloc(n); if (r) c->live++; return r; }
+    return realloc(p, n);
+}
+static void ca_free(void *p, size_t n, void *ctx)
+{
+    count_alloc_t *c = ctx;
+    (void)n;
+    if (p) c->live--;
+    free(p);
+}
+
 typedef struct pair {
     moq_simpair_t *sp;
     moq_session_t *c;   /* subscriber unless stated otherwise */
     moq_session_t *sv;  /* publisher unless stated otherwise */
 } pair_t;
 
-static bool mk_pair_cfg(pair_t *p, moq_version_t version,
-                        uint32_t max_actions, uint32_t max_events)
+/* Bounded observation of actual outgoing draft-22 DONE bytes. Raw handoff
+ * is not OPENED; this records no transport disposition or guessed count. */
+static struct {
+    size_t n;
+    bool decoded, fin;
+    uint64_t status, streams;
+} done_wire;
+
+static void capture_done(const uint8_t *data, size_t len, bool fin)
 {
+    moq_buf_reader_t r;
+    moq_buf_reader_init(&r, data, len);
+    while (r.pos < r.len) {
+        moq_control_envelope_t env;
+        if (moq_d22_decode_envelope(&r, &env) != MOQ_OK) return;
+        if (env.msg_type != 0x0b) continue;
+        ++done_wire.n;
+        moq_d18_publish_done_t d; /* draft-22 uses the same vi64 body */
+        done_wire.decoded = moq_d18_decode_publish_done(env.payload, env.payload_len, &d) == MOQ_OK;
+        done_wire.fin = fin && r.pos == r.len;
+        if (done_wire.decoded) {
+            done_wire.status = d.status_code;
+            done_wire.streams = d.stream_count;
+        }
+    }
+}
+
+static void capture_sim_done(void *ctx, const moq_sim_trace_record_t *r)
+{
+    (void)ctx;
+    if (r->kind == MOQ_SIM_TRACE_ACTION && r->from == MOQ_PERSPECTIVE_SERVER &&
+        r->action_kind == MOQ_ACTION_SEND_BIDI_STREAM)
+        capture_done(r->detail_bytes.data, r->detail_bytes.len, r->fin);
+}
+
+static bool mk_pair_cfg_alloc(pair_t *p, moq_version_t version,
+                        uint32_t max_actions, uint32_t max_events,
+                        const moq_alloc_t *alloc)
+{
+    memset(&done_wire, 0, sizeof(done_wire));
     moq_simpair_cfg_t scfg = MOQ_SIMPAIR_CFG_INIT;
-    scfg.alloc = moq_alloc_default();
+    scfg.trace_fn = capture_sim_done;
+    scfg.alloc = alloc;
     scfg.version = version;
     scfg.max_actions = max_actions;
     scfg.max_events = max_events;
@@ -56,6 +119,12 @@ static bool mk_pair_cfg(pair_t *p, moq_version_t version,
     p->c = moq_simpair_client(p->sp);
     p->sv = moq_simpair_server(p->sp);
     return true;
+}
+
+static bool mk_pair_cfg(pair_t *p, moq_version_t version,
+                        uint32_t max_actions, uint32_t max_events)
+{
+    return mk_pair_cfg_alloc(p, version, max_actions, max_events, moq_alloc_default());
 }
 
 static bool mk_pair(pair_t *p)
@@ -242,6 +311,9 @@ static int count_kind(moq_session_t *s, moq_event_kind_t kind, moq_event_t *firs
 
 static void deliver(moq_session_t *to, const moq_action_t *a, bool from_server, uint64_t now)
 {
+    if (from_server && a->kind == MOQ_ACTION_SEND_BIDI_STREAM)
+        capture_done(a->u.send_bidi_stream.data, a->u.send_bidi_stream.len,
+                     a->u.send_bidi_stream.fin);
     switch (a->kind) {
     case MOQ_ACTION_OPEN_UNI_CONTROL:
         moq_session_on_control_bytes(to, a->u.open_uni_control.data, a->u.open_uni_control.len, now);
@@ -317,11 +389,12 @@ static void raw_run(moq_session_t *c, moq_session_t *sv, uint64_t now)
     }
 }
 
-static moq_session_t *raw_session(moq_perspective_t persp, moq_version_t version,
-                                  uint32_t max_fills, uint32_t max_receive_buffer_bytes)
+static moq_session_t *raw_session_alloc(moq_perspective_t persp, moq_version_t version,
+                                  uint32_t max_fills, uint32_t max_receive_buffer_bytes,
+                                  const moq_alloc_t *alloc)
 {
     moq_session_cfg_t cfg;
-    moq_session_cfg_init_sized(&cfg, sizeof(cfg), moq_alloc_default(), persp);
+    moq_session_cfg_init_sized(&cfg, sizeof(cfg), alloc, persp);
     cfg.version = version;
     cfg.send_request_capacity = true;
     cfg.initial_request_capacity = 64;
@@ -334,11 +407,13 @@ static moq_session_t *raw_session(moq_perspective_t persp, moq_version_t version
     return s;
 }
 
-static bool raw_pair_v(moq_session_t **c, moq_session_t **sv, moq_version_t version,
-                       uint32_t c_fills, uint32_t sv_fills, uint32_t c_recv_budget)
+static bool raw_pair_v_alloc(moq_session_t **c, moq_session_t **sv, moq_version_t version,
+                       uint32_t c_fills, uint32_t sv_fills, uint32_t c_recv_budget,
+                       const moq_alloc_t *alloc)
 {
-    *c = raw_session(MOQ_PERSPECTIVE_CLIENT, version, c_fills, c_recv_budget);
-    *sv = raw_session(MOQ_PERSPECTIVE_SERVER, version, sv_fills, 0);
+    memset(&done_wire, 0, sizeof(done_wire));
+    *c = raw_session_alloc(MOQ_PERSPECTIVE_CLIENT, version, c_fills, c_recv_budget, alloc);
+    *sv = raw_session_alloc(MOQ_PERSPECTIVE_SERVER, version, sv_fills, 0, alloc);
     if (!*c || !*sv) {
         if (*c) moq_session_destroy(*c);
         if (*sv) moq_session_destroy(*sv);
@@ -347,6 +422,12 @@ static bool raw_pair_v(moq_session_t **c, moq_session_t **sv, moq_version_t vers
     raw_run(*c, *sv, 1);
     drain(*c); drain(*sv);
     return true;
+}
+
+static bool raw_pair_v(moq_session_t **c, moq_session_t **sv, moq_version_t version,
+                       uint32_t c_fills, uint32_t sv_fills, uint32_t c_recv_budget)
+{
+    return raw_pair_v_alloc(c, sv, version, c_fills, sv_fills, c_recv_budget, moq_alloc_default());
 }
 
 static bool raw_pair(moq_session_t **c, moq_session_t **sv, uint32_t c_fills, uint32_t sv_fills,
@@ -403,6 +484,94 @@ static int first_index_of(const moq_action_t *acts, size_t n, uint32_t kind)
 {
     for (size_t i = 0; i < n; i++) if (acts[i].kind == kind) return (int)i;
     return -1;
+}
+
+/* Apply only to a raw, unobservable fill history after its real header and
+ * terminal were attributed. A missing/malformed wire DONE, wrong processed
+ * total or finite count FAILS before ticking. This is the receiver's existing
+ * bounded recovery, not a replacement for known finite/zero completion. */
+static int recover_raw_fill_done(moq_session_t *c, moq_subscription_t sub,
+                                 moq_publication_t pub, uint64_t processed,
+                                 uint64_t status)
+{
+    int failures = 0;
+    bool publication = moq_publication_is_valid(pub);
+    MOQ_TEST_CHECK(publication != moq_subscription_is_valid(sub));
+    MOQ_TEST_CHECK_EQ_SIZE(done_wire.n, 1);
+    MOQ_TEST_CHECK(done_wire.decoded && done_wire.fin);
+    MOQ_TEST_CHECK_EQ_U64(done_wire.streams, UINT64_MAX);
+    MOQ_TEST_CHECK_EQ_U64(done_wire.status, status);
+    int slot = publication ? pub_resolve_handle(c, pub) : sub_resolve_handle(c, sub);
+    MOQ_TEST_CHECK(slot >= 0);
+    if (slot < 0) return failures;
+    bool pending = publication ? c->publishes[slot].done_pending : c->subs[slot].done_pending;
+    uint64_t count = publication ? c->publishes[slot].done_stream_count : c->subs[slot].done_stream_count;
+    uint64_t actual = publication ? c->publishes[slot].processed_stream_count : c->subs[slot].processed_stream_count;
+    uint64_t code = publication ? c->publishes[slot].done_status_code : c->subs[slot].done_status_code;
+    uint64_t deadline = publication ? c->publishes[slot].done_deadline_us : c->subs[slot].done_deadline_us;
+    moq_event_kind_t kind = publication ? MOQ_EVENT_PUBLISH_FINISHED : MOQ_EVENT_SUBSCRIBE_DONE;
+    MOQ_TEST_CHECK(pending);
+    MOQ_TEST_CHECK_EQ_U64(count, done_wire.streams);
+    MOQ_TEST_CHECK_EQ_U64(code, status);
+    MOQ_TEST_CHECK_EQ_U64(actual, processed);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(c, kind), 0);
+    MOQ_TEST_CHECK(deadline > c->last_now_us && deadline != UINT64_MAX);
+    MOQ_TEST_CHECK(moq_session_next_deadline_us(c) <= deadline);
+    if (done_wire.n != 1 || !done_wire.decoded || !done_wire.fin ||
+        done_wire.streams != UINT64_MAX || done_wire.status != status ||
+        !pending || count != UINT64_MAX || code != status ||
+        actual != processed || deadline <= c->last_now_us || deadline == UINT64_MAX)
+        return failures;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_tick(c, deadline - 1), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(c, kind), 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_tick(c, deadline), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(c, kind), 1);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_tick(c, deadline), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(c, kind), 1);
+    for (size_t i = c->event_head; i < c->event_tail; ++i) {
+        const moq_event_t *event = &c->events[i % c->event_cap];
+        if (event->kind != kind) continue;
+        if (publication) {
+            MOQ_TEST_CHECK(moq_publication_eq(event->u.publish_finished.pub, pub));
+            MOQ_TEST_CHECK_EQ_U64(event->u.publish_finished.status_code, status);
+            MOQ_TEST_CHECK_EQ_U64(event->u.publish_finished.stream_count, done_wire.streams);
+        } else {
+            MOQ_TEST_CHECK(moq_subscription_eq(event->u.subscribe_done.sub, sub));
+            MOQ_TEST_CHECK_EQ_U64(event->u.subscribe_done.status_code, status);
+            MOQ_TEST_CHECK_EQ_U64(event->u.subscribe_done.stream_count, done_wire.streams);
+        }
+    }
+    return failures;
+}
+
+/* Lossless SimPair has a real virtual-open observer. Keep these finite and
+ * prompt; genuine raw cases above retain their independent sentinel/deadline. */
+static int check_sim_fill_done(moq_session_t *c, moq_subscription_t sub,
+                               moq_publication_t pub, uint64_t count,
+                               uint64_t status)
+{
+    int failures = 0;
+    bool publication = moq_publication_is_valid(pub);
+    moq_event_kind_t kind = publication ? MOQ_EVENT_PUBLISH_FINISHED : MOQ_EVENT_SUBSCRIBE_DONE;
+    MOQ_TEST_CHECK_EQ_SIZE(done_wire.n, 1);
+    MOQ_TEST_CHECK(done_wire.decoded && done_wire.fin);
+    MOQ_TEST_CHECK_EQ_U64(done_wire.streams, count);
+    MOQ_TEST_CHECK_EQ_U64(done_wire.status, status);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(c, kind), 1);
+    for (size_t i = c->event_head; i < c->event_tail; ++i) {
+        const moq_event_t *event = &c->events[i % c->event_cap];
+        if (event->kind != kind) continue;
+        if (publication) {
+            MOQ_TEST_CHECK(moq_publication_eq(event->u.publish_finished.pub, pub));
+            MOQ_TEST_CHECK_EQ_U64(event->u.publish_finished.status_code, status);
+            MOQ_TEST_CHECK_EQ_U64(event->u.publish_finished.stream_count, count);
+        } else {
+            MOQ_TEST_CHECK(moq_subscription_eq(event->u.subscribe_done.sub, sub));
+            MOQ_TEST_CHECK_EQ_U64(event->u.subscribe_done.status_code, status);
+            MOQ_TEST_CHECK_EQ_U64(event->u.subscribe_done.stream_count, count);
+        }
+    }
+    return failures;
 }
 
 /* -- A complete fill: request, stream, objects, gap, FIN, terminal once. --- */
@@ -1337,8 +1506,10 @@ static int test_short_poll_keeps_ownership(void)
 static int test_publish_initiated_fill(void)
 {
     int failures = 0;
+    count_alloc_t ca = {0};
+    moq_alloc_t alloc = { &ca, ca_alloc, ca_realloc, ca_free };
     pair_t p;
-    if (!mk_pair(&p)) { MOQ_TEST_CHECK(false); return failures; }
+    if (!mk_pair_cfg_alloc(&p, MOQ_VERSION_DRAFT_22, 0, 0, &alloc)) { MOQ_TEST_CHECK(false); return failures; }
     /* Here the server publishes and the client is the subscriber. */
     drain(p.c); drain(p.sv);
     moq_publish_cfg_t pc;
@@ -1412,14 +1583,19 @@ static int test_publish_initiated_fill(void)
     moq_finish_publish_cfg_t fc;
     moq_finish_publish_cfg_init(&fc);
     fc.stream_count = 1;   /* the subgroup; the session adds its two fills */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_finish_publish(p.sv, spub, &fc, 7), (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_actions(p.sv, MOQ_ACTION_RESET_DATA), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(done_wire.n, 0);
+    pump(&p);             /* actual admission of the second empty fill header */
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_finish_publish(p.sv, spub, &fc, 7), (int)MOQ_OK);
     MOQ_TEST_CHECK_EQ_SIZE(queued_actions(p.sv, MOQ_ACTION_RESET_DATA), 1);
     MOQ_TEST_CHECK(take(p.sv, MOQ_EVENT_FILL_TERMINAL, &ev));
     MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.reason, (int)MOQ_FILL_PARENT_TERMINATED);
     pump(&p);
-    /* The reset fill stream is the third processed stream: it satisfies the
-     * PUBLISH_DONE count, so the publication's terminal surfaces exactly
-     * once, alongside the child's. */
+    /* All three real virtual opens retain their history after retirement. */
+    MOQ_TEST_CHECK_EQ_SIZE(p.c->fills.live, 0);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(p.c, MOQ_EVENT_FILL_TERMINAL), 1);
+    failures += check_sim_fill_done(p.c, MOQ_SUBSCRIPTION_INVALID, cpub, 3, 0);
     bag_t b;
     pull_all(p.c, &b);
     const moq_event_t *pf = NULL, *ft = NULL;
@@ -1431,6 +1607,7 @@ static int test_publish_initiated_fill(void)
     MOQ_TEST_CHECK_EQ_SIZE(p.c->fills.live, 0);
     MOQ_TEST_CHECK_EQ_SIZE(p.sv->fills.live, 0);
     moq_simpair_destroy(p.sp);
+    MOQ_TEST_CHECK_EQ_U64(ca.live, 0);
     return failures;
 }
 
@@ -1439,8 +1616,10 @@ static int test_publish_initiated_fill(void)
 static int test_stream_count_includes_fills(void)
 {
     int failures = 0;
+    count_alloc_t ca = {0};
+    moq_alloc_t alloc = { &ca, ca_alloc, ca_realloc, ca_free };
     pair_t p;
-    if (!mk_pair(&p)) { MOQ_TEST_CHECK(false); return failures; }
+    if (!mk_pair_cfg_alloc(&p, MOQ_VERSION_DRAFT_22, 0, 0, &alloc)) { MOQ_TEST_CHECK(false); return failures; }
     drain(p.c); drain(p.sv);
     moq_location_filter_cfg_t loc;
     moq_location_filter_cfg_init(&loc);
@@ -1458,20 +1637,27 @@ static int test_stream_count_includes_fills(void)
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_end_fill(p.sv, sfill, 3), (int)MOQ_OK);
     pump(&p);
     drain(p.sv);
-    /* The application opened no data stream of its own; the session adds
-     * the one fill stream it opened. A count of one is satisfied by it, so
-     * the terminal surfaces at once. */
+    /* Application count zero plus one observed session-owned fill is one. */
     moq_done_subscribe_cfg_t dc;
     moq_done_subscribe_cfg_init(&dc);
     dc.status_code = 0x2;
     dc.stream_count = 0;
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_done_subscribe(p.sv, ssub, &dc, 4), (int)MOQ_OK);
     pump(&p);
-    MOQ_TEST_CHECK(take(p.c, MOQ_EVENT_SUBSCRIBE_DONE, &ev));
-    MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.stream_count, 1);
+    failures += check_sim_fill_done(p.c, csub, MOQ_PUBLICATION_INVALID, 1, 0x2);
+    bool received = take(p.c, MOQ_EVENT_SUBSCRIBE_DONE, &ev);
+    MOQ_TEST_CHECK(received);
+    if (received) {
+        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.stream_count, 1);
+        moq_event_cleanup(&ev);
+    }
     drain(p.c);
 
-    /* The unknown sentinel on this profile is UINT64_MAX: it defers. */
+    /* Isolate the explicit application-unknown control in a fresh pair. */
+    moq_simpair_destroy(p.sp);
+    MOQ_TEST_CHECK_EQ_U64(ca.live, 0);
+    if (!mk_pair_cfg_alloc(&p, MOQ_VERSION_DRAFT_22, 0, 0, &alloc)) { MOQ_TEST_CHECK(false); return failures; }
+    /* The explicit unknown sentinel on this profile also defers. */
     failures += establish(&p, NULL, true, 2, 0, &csub, &ssub);
     drain(p.c); drain(p.sv);
     dc.stream_count = UINT64_MAX;
@@ -1485,6 +1671,7 @@ static int test_stream_count_includes_fills(void)
         MOQ_TEST_CHECK_EQ_U64(p.c->subs[cslot].done_stream_count, UINT64_MAX);
     }
     moq_simpair_destroy(p.sp);
+    MOQ_TEST_CHECK_EQ_U64(ca.live, 0);
     return failures;
 }
 
@@ -1658,8 +1845,10 @@ static int test_parent_rejected(void)
 static int test_cancel_before_header(void)
 {
     int failures = 0;
+    count_alloc_t ca = {0};
+    moq_alloc_t alloc = { &ca, ca_alloc, ca_realloc, ca_free };
     moq_session_t *c, *sv;
-    if (!raw_pair(&c, &sv, 0, 0, 0)) { MOQ_TEST_CHECK(false); return failures; }
+    if (!raw_pair_v_alloc(&c, &sv, MOQ_VERSION_DRAFT_22, 0, 0, 0, &alloc)) { MOQ_TEST_CHECK(false); return failures; }
     moq_location_filter_cfg_t loc = abs_start(3, 0);
     moq_fill_cfg_t fill;
     moq_fill_cfg_init(&fill);
@@ -1693,10 +1882,9 @@ static int test_cancel_before_header(void)
     moq_event_cleanup(&ev);
     MOQ_TEST_CHECK_EQ_SIZE(c->fills.live, 0);
     MOQ_TEST_CHECK_EQ_SIZE(sv->fills.live, 0);
-    /* The stopped stream's RESET counted it as processed. The publisher's
-     * done -- its own count of 0 plus the one fill stream the session
-     * opened -- names exactly that stream, so the subscription finalizes on
-     * the count at once, not at the terminal-wait deadline. */
+    /* The attributable RESET credits exactly one processed stream. The raw
+     * fill handoff nevertheless leaves the sender unable to assert an exact
+     * total, so require unknown and the receiver's retained deadline. */
     int cslot = sub_resolve_handle(c, ch);
     MOQ_TEST_CHECK(cslot >= 0);
     if (cslot >= 0) MOQ_TEST_CHECK_EQ_U64(c->subs[cslot].processed_stream_count, 1);
@@ -1705,16 +1893,21 @@ static int test_cancel_before_header(void)
     dc.status_code = 0; dc.stream_count = 0;
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_done_subscribe(sv, sh, &dc, 20), (int)MOQ_OK);
     raw_run(c, sv, 21);
-    MOQ_TEST_CHECK_EQ_INT(count_kind(c, MOQ_EVENT_SUBSCRIBE_DONE, &ev), 1);
-    MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.stream_count, 1);
-    moq_event_cleanup(&ev);
+    failures += recover_raw_fill_done(c, ch, MOQ_PUBLICATION_INVALID, 1, 0);
+    int dones = count_kind(c, MOQ_EVENT_SUBSCRIBE_DONE, &ev);
+    MOQ_TEST_CHECK_EQ_INT(dones, 1);
+    if (dones) {
+        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.stream_count, UINT64_MAX);
+        moq_event_cleanup(&ev);
+    }
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c), (int)MOQ_SESS_ESTABLISHED);
     moq_session_destroy(c); moq_session_destroy(sv);
+    MOQ_TEST_CHECK_EQ_U64(ca.live, 0);
 
     /* Cancelled before the header, and the subscription ends first: no
      * stream can be counted any more, so the slot goes with the parent and
      * no second terminal is published. */
-    if (!raw_pair(&c, &sv, 0, 0, 0)) { MOQ_TEST_CHECK(false); return failures; }
+    if (!raw_pair_v_alloc(&c, &sv, MOQ_VERSION_DRAFT_22, 0, 0, 0, &alloc)) { MOQ_TEST_CHECK(false); return failures; }
     MOQ_TEST_CHECK(raw_establish(c, sv, MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 0, &fill, &ch, &sh));
     MOQ_TEST_CHECK(take(c, MOQ_EVENT_FILL_CREATED, &ev));
     cfill = ev.u.fill_created.fill;
@@ -1731,6 +1924,7 @@ static int test_cancel_before_header(void)
     moq_event_cleanup(&ev);
     MOQ_TEST_CHECK_EQ_SIZE(sv->fills.live, 0);
     moq_session_destroy(c); moq_session_destroy(sv);
+    MOQ_TEST_CHECK_EQ_U64(ca.live, 0);
     return failures;
 }
 
@@ -1788,13 +1982,15 @@ static int test_header_after_no_stream(void)
 /* -- PUBLISH_DONE reaches the subscriber before the fill data. ------------ */
 
 /* The request bidi is delivered first; the fill's object and FIN follow.
- * The subscription's terminal is published exactly once, after the stream
- * it was waiting for, and the fill ends COMPLETE with no error cause. */
+ * The fill ends promptly COMPLETE, independent of the raw unknown-count
+ * parent's retained deadline and exactly-once terminal. */
 static int test_done_before_fill_data(void)
 {
     int failures = 0;
+    count_alloc_t ca = {0};
+    moq_alloc_t alloc = { &ca, ca_alloc, ca_realloc, ca_free };
     moq_session_t *c, *sv;
-    if (!raw_pair(&c, &sv, 0, 0, 0)) { MOQ_TEST_CHECK(false); return failures; }
+    if (!raw_pair_v_alloc(&c, &sv, MOQ_VERSION_DRAFT_22, 0, 0, 0, &alloc)) { MOQ_TEST_CHECK(false); return failures; }
     moq_location_filter_cfg_t loc = abs_start(3, 0);
     moq_fill_cfg_t fill;
     moq_fill_cfg_init(&fill);
@@ -1825,6 +2021,10 @@ static int test_done_before_fill_data(void)
             deliver(c, &acts[i], true, 8);
     for (size_t i = 0; i < n; i++) moq_action_cleanup(&acts[i]);
     raw_run(c, sv, 9);
+    MOQ_TEST_CHECK_EQ_SIZE(c->fills.live, 0);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(c, MOQ_EVENT_FILL_TERMINAL), 1);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(c, MOQ_EVENT_FILL_OBJECT), 1);
+    failures += recover_raw_fill_done(c, ch, MOQ_PUBLICATION_INVALID, 1, 0);
     bag_t b;
     pull_all(c, &b);
     const moq_event_t *ft = NULL;
@@ -1841,6 +2041,7 @@ static int test_done_before_fill_data(void)
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c), (int)MOQ_SESS_ESTABLISHED);
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(sv), (int)MOQ_SESS_ESTABLISHED);
     moq_session_destroy(c); moq_session_destroy(sv);
+    MOQ_TEST_CHECK_EQ_U64(ca.live, 0);
     return failures;
 }
 
@@ -1940,8 +2141,10 @@ static int test_update_filter_inheriting_fill(void)
 static int test_done_resets_fills_before_terminal(void)
 {
     int failures = 0;
+    count_alloc_t ca = {0};
+    moq_alloc_t alloc = { &ca, ca_alloc, ca_realloc, ca_free };
     moq_session_t *c, *sv;
-    if (!raw_pair(&c, &sv, 0, 0, 0)) { MOQ_TEST_CHECK(false); return failures; }
+    if (!raw_pair_v_alloc(&c, &sv, MOQ_VERSION_DRAFT_22, 0, 0, 0, &alloc)) { MOQ_TEST_CHECK(false); return failures; }
     moq_location_filter_cfg_t loc = abs_start(3, 0);
     moq_fill_cfg_t fill;
     moq_fill_cfg_init(&fill);
@@ -1968,6 +2171,9 @@ static int test_done_resets_fills_before_terminal(void)
     MOQ_TEST_CHECK(reset < done);
     for (size_t i = 0; i < n; i++) { deliver(c, &acts[i], true, 9); moq_action_cleanup(&acts[i]); }
     raw_run(c, sv, 10);
+    MOQ_TEST_CHECK_EQ_SIZE(c->fills.live, 0);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(c, MOQ_EVENT_FILL_TERMINAL), 1);
+    failures += recover_raw_fill_done(c, ch, MOQ_PUBLICATION_INVALID, 1, 0);
     bag_t b;
     pull_all(c, &b);
     const moq_event_t *ft = NULL;
@@ -1977,6 +2183,10 @@ static int test_done_resets_fills_before_terminal(void)
     bag_free(&b);
     drain(sv);
 
+    /* Independent parent, fresh clocks after the subscription deadline. */
+    moq_session_destroy(c); moq_session_destroy(sv);
+    MOQ_TEST_CHECK_EQ_U64(ca.live, 0);
+    if (!raw_pair_v_alloc(&c, &sv, MOQ_VERSION_DRAFT_22, 0, 0, 0, &alloc)) { MOQ_TEST_CHECK(false); return failures; }
     /* The publication family: the server publishes, the client's update
      * asks for the fill, the server opens it and finishes. */
     moq_publish_cfg_t pc;
@@ -2028,6 +2238,9 @@ static int test_done_resets_fills_before_terminal(void)
     MOQ_TEST_CHECK(reset < done);
     for (size_t i = 0; i < n; i++) { deliver(c, &acts[i], true, 22); moq_action_cleanup(&acts[i]); }
     raw_run(c, sv, 23);
+    MOQ_TEST_CHECK_EQ_SIZE(c->fills.live, 0);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(c, MOQ_EVENT_FILL_TERMINAL), 1);
+    failures += recover_raw_fill_done(c, MOQ_SUBSCRIPTION_INVALID, cpub, 2, 0);
     pull_all(c, &b);
     ft = NULL;
     MOQ_TEST_CHECK_EQ_INT(bag_count(&b, MOQ_EVENT_PUBLISH_FINISHED, NULL), 1);
@@ -2037,6 +2250,7 @@ static int test_done_resets_fills_before_terminal(void)
     MOQ_TEST_CHECK_EQ_SIZE(c->fills.live, 0);
     MOQ_TEST_CHECK_EQ_SIZE(sv->fills.live, 0);
     moq_session_destroy(c); moq_session_destroy(sv);
+    MOQ_TEST_CHECK_EQ_U64(ca.live, 0);
     return failures;
 }
 
@@ -2189,8 +2403,10 @@ static int test_unknown_stream_count(void)
 static int test_stream_count_adds_session_fills(void)
 {
     int failures = 0;
+    count_alloc_t ca = {0};
+    moq_alloc_t alloc = { &ca, ca_alloc, ca_realloc, ca_free };
     moq_session_t *c, *sv;
-    if (!raw_pair(&c, &sv, 4, 1, 0)) { MOQ_TEST_CHECK(false); return failures; }
+    if (!raw_pair_v_alloc(&c, &sv, MOQ_VERSION_DRAFT_22, 4, 1, 0, &alloc)) { MOQ_TEST_CHECK(false); return failures; }
     moq_location_filter_cfg_t loc = abs_start(3, 0);
     moq_fill_cfg_t fill;
     moq_fill_cfg_init(&fill);
@@ -2222,19 +2438,32 @@ static int test_stream_count_adds_session_fills(void)
     int cslot = sub_resolve_handle(c, ch);
     MOQ_TEST_CHECK(cslot >= 0);
     if (cslot >= 0) MOQ_TEST_CHECK_EQ_U64(c->subs[cslot].processed_stream_count, 2);
-    /* The application opened nothing itself: the wire carries 2. */
+    /* Two fills were attributed and completed; raw sender history is still
+     * unobservable, so the actual wire must carry unknown rather than 2. */
     moq_done_subscribe_cfg_t dc;
     moq_done_subscribe_cfg_init(&dc);
     dc.status_code = 0; dc.stream_count = 0;
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_done_subscribe(sv, sh, &dc, 10), (int)MOQ_OK);
     raw_run(c, sv, 11);
-    MOQ_TEST_CHECK_EQ_INT(count_kind(c, MOQ_EVENT_SUBSCRIBE_DONE, &ev), 1);
-    MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.stream_count, 2);
-    moq_event_cleanup(&ev);
+    failures += recover_raw_fill_done(c, ch, MOQ_PUBLICATION_INVALID, 2, 0);
+    int dones = count_kind(c, MOQ_EVENT_SUBSCRIBE_DONE, &ev);
+    MOQ_TEST_CHECK_EQ_INT(dones, 1);
+    if (dones) {
+        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.stream_count, UINT64_MAX);
+        moq_event_cleanup(&ev);
+    }
     drain(sv);
 
-    /* Saturation: an application count just below the sentinel plus one
-     * fill stream is sent as the sentinel, which defers. */
+    moq_session_destroy(c); moq_session_destroy(sv);
+    MOQ_TEST_CHECK_EQ_U64(ca.live, 0);
+    if (!raw_pair_v_alloc(&c, &sv, MOQ_VERSION_DRAFT_22, 4, 1, 0, &alloc)) { MOQ_TEST_CHECK(false); return failures; }
+    /* Preserve the finite/saturating addition oracle independently of raw
+     * transport visibility; no open is inferred from these arithmetic pins. */
+    MOQ_TEST_CHECK_EQ_U64(fill_stream_count(c, 0, 2), 2);
+    MOQ_TEST_CHECK_EQ_U64(fill_stream_count(c, UINT64_MAX - 2, 1), UINT64_MAX - 1);
+    MOQ_TEST_CHECK_EQ_U64(fill_stream_count(c, UINT64_MAX - 1, 1), UINT64_MAX);
+    /* A large explicit application count plus unobservable fill history
+     * remains unknown; use fresh clocks after the prior deadline. */
     {
         moq_subscribe_cfg_t scfg;
         subscribe_cfg_with_fill(&scfg, &fill);
@@ -2269,6 +2498,7 @@ static int test_stream_count_adds_session_fills(void)
     }
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(c), (int)MOQ_SESS_ESTABLISHED);
     moq_session_destroy(c); moq_session_destroy(sv);
+    MOQ_TEST_CHECK_EQ_U64(ca.live, 0);
     return failures;
 }
 
@@ -2329,29 +2559,6 @@ static int test_stopped_subgroup_counts(void)
 }
 
 /* -- Allocations balance with fill objects still queued at destroy. ------- */
-
-typedef struct count_alloc { int64_t live; } count_alloc_t;
-static void *ca_alloc(size_t n, void *ctx)
-{
-    count_alloc_t *c = ctx;
-    void *p = malloc(n);
-    if (p) c->live++;
-    return p;
-}
-static void *ca_realloc(void *p, size_t o, size_t n, void *ctx)
-{
-    count_alloc_t *c = ctx;
-    (void)o;
-    if (!p) { void *r = malloc(n); if (r) c->live++; return r; }
-    return realloc(p, n);
-}
-static void ca_free(void *p, size_t n, void *ctx)
-{
-    count_alloc_t *c = ctx;
-    (void)n;
-    if (p) c->live--;
-    free(p);
-}
 
 static int test_destroy_with_queued_objects(void)
 {

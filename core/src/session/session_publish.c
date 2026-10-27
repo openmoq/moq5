@@ -135,6 +135,8 @@ moq_result_t session_core_on_publish_update_ok(moq_session_t *s, int slot,
     ev.u.publication_update_ok.expires_ms = has_expires ? expires_ms : 0;
     moq_result_t rc = push_event(s, &ev);
     if (rc < 0) return rc;   /* retryable; update_pending still set */
+    session_normalize_dt_selection(s, &e->dt_upd_has_object,
+        &e->dt_upd_object_ms, &e->dt_upd_has_subgroup, &e->dt_upd_subgroup_ms);
     if (e->role == MOQ_PUB_ROLE_PUBLISHER) {
         /* This side updated its own PUBLISH: its delivery timeouts are the
          * publisher-side carriers from now on. */
@@ -227,6 +229,7 @@ moq_result_t session_core_on_publish_update_ok(moq_session_t *s, int slot,
 void pub_free_entry(moq_session_t *s, int slot)
 {
     moq_pub_entry_t *e = &s->publishes[slot];
+    session_forget_owner_opens(s, e->handle._opaque);
     if (e->mt_failing) {
         e->mt_failing = false;
         s->mt_failing_count--;
@@ -1716,6 +1719,52 @@ static moq_result_t pub_update_prepare(moq_session_t *s, int slot,
 static void pub_update_abort(moq_session_t *s, pub_update_prep_t *prep);
 static moq_result_t pub_update_queue(moq_session_t *s, int slot, pub_update_prep_t *prep);
 
+/* Read actual historical allocations through bytes, not the larger current
+ * type. Each appended semantic block keeps the PR's existing last-field gate;
+ * old padding and torn blocks remain absent in the normalized local. */
+static moq_result_t accept_publish_cfg_read(const moq_accept_publish_cfg_t *src,
+                                           moq_accept_publish_cfg_t *out)
+{
+    uint32_t size;
+    memcpy(&size, src, sizeof(size));
+    if (size < MOQ_ACCEPT_PUBLISH_CFG_V0_SIZE) return MOQ_ERR_INVAL;
+    memset(out, 0, sizeof(*out));
+    memcpy(out, src, MOQ_ACCEPT_PUBLISH_CFG_V0_SIZE);
+#define ACC_READ_HAS(f) \
+    (size >= offsetof(moq_accept_publish_cfg_t, f) + sizeof(out->f))
+#define ACC_READ(f) \
+    memcpy((uint8_t *)out + offsetof(moq_accept_publish_cfg_t, f), \
+           (const uint8_t *)src + offsetof(moq_accept_publish_cfg_t, f), \
+           sizeof(out->f))
+    if (ACC_READ_HAS(new_group_request)) {
+        ACC_READ(has_new_group_request);
+        ACC_READ(new_group_request);
+    }
+    if (ACC_READ_HAS(end_group)) {
+        ACC_READ(filter);
+        ACC_READ(start_group);
+        ACC_READ(start_object);
+        ACC_READ(end_group);
+    }
+    if (ACC_READ_HAS(forward)) {
+        ACC_READ(has_forward);
+        ACC_READ(forward);
+    }
+    if (ACC_READ_HAS(has_expires)) {
+        ACC_READ(expires_ms);
+        ACC_READ(has_expires);
+    }
+    if (ACC_READ_HAS(subgroup_delivery_timeout_ms)) {
+        ACC_READ(delivery_timeout_flags);
+        ACC_READ(reserved);
+        ACC_READ(object_delivery_timeout_ms);
+        ACC_READ(subgroup_delivery_timeout_ms);
+    }
+#undef ACC_READ
+#undef ACC_READ_HAS
+    return MOQ_OK;
+}
+
 moq_result_t moq_session_accept_publish(
     moq_session_t *s,
     moq_publication_t pub,
@@ -1723,6 +1772,10 @@ moq_result_t moq_session_accept_publish(
     uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
+    moq_accept_publish_cfg_t local;
+    moq_result_t read_rc = accept_publish_cfg_read(cfg, &local);
+    if (read_rc < 0) return read_rc;
+    cfg = &local;
     /* ABI-additive cfg: the new-group-request, filter, and forward fields are
      * appended; callers compiled against the smaller struct remain valid and
      * send nothing. The filter and forward tails are read as COMPLETE SEMANTIC
@@ -1785,6 +1838,7 @@ moq_result_t moq_session_accept_publish(
                                                       dt_sg, dt_sg_ms);
         if (drc < 0) return drc;
     }
+    session_normalize_dt_selection(s, &dt_obj, &dt_obj_ms, &dt_sg, &dt_sg_ms);
     if (has_expires && !s->profile->publish_initial_parameters)
         return MOQ_ERR_UNSUPPORTED;
     /* Same filter validity rules as the wire encoders (unknown type / inverted
@@ -2329,8 +2383,7 @@ static moq_result_t pub_reject_update_control(moq_session_t *s,
     rc = s->profile->encode_publish_done(s, &w,
         &(moq_finish_publish_encode_args_t){
             .request_id = pe->request_id, .status_code = 0x8,
-            .stream_count = session_done_stream_count(s,
-                pe->subgroup_streams_opened, pe->fill_streams_opened) });
+            .stream_count = session_owner_stream_count(s, pe->handle._opaque, false) });
     if (rc < 0) return rc;
     size_t total = moq_buf_writer_offset(&w);
     size_t actions = s->action_cap == 1 ? 1 : 2;
@@ -2345,6 +2398,18 @@ static moq_result_t pub_reject_update_control(moq_session_t *s,
     rc = pub_reset_subgroups(s, d->target_slot);
     if (rc < 0) return rc;
     if (action_queue_avail(s) < actions) return MOQ_ERR_WOULD_BLOCK;
+    if (session_owner_open_blocked(s, pe->handle._opaque))
+        return MOQ_ERR_WOULD_BLOCK;
+    /* The preceding encode was a sizing bound only (unknown while opens
+     * were unresolved). Re-encode the terminal from settled facts before
+     * either envelope is queued. Input/ID/auth remain retained on refusal. */
+    moq_buf_writer_init(&w, buf + split, sizeof(buf) - split);
+    rc = s->profile->encode_publish_done(s, &w,
+        &(moq_finish_publish_encode_args_t){ .request_id = pe->request_id,
+            .status_code = 0x8,
+            .stream_count = session_owner_stream_count(s, pe->handle._opaque, false) });
+    if (rc < 0) return rc;
+    total = split + moq_buf_writer_offset(&w);
     if (actions == 1) {
         rc = queue_send_control(s, buf, total);
     } else {
@@ -2436,7 +2501,8 @@ static moq_result_t pub_inbound_update_prepare(moq_session_t *s, size_t slot,
         p->fail_fill = fill_unserved_opens_stream(&p->feff, p->snap_has,
             p->snap_group, p->snap_object,
             !(v->valid ? v->forward : u->has_forward ? u->forward : e->send_allowed));
-        if (p->fail_fill && action_queue_avail(s) < ok_actions + 2)
+        if (p->fail_fill && (action_queue_avail(s) < ok_actions + 2 ||
+                            !session_open_credit(s)))
             return MOQ_ERR_WOULD_BLOCK;
         return MOQ_OK;
     }
@@ -2539,7 +2605,7 @@ static void pub_inbound_update_commit(moq_session_t *s, size_t slot, const moq_s
                               !e->send_allowed, receipt);
     } else if (p->fail_fill) {
         fill_open_failed(s, u->fill_request_id, p->feff.subscriber_priority,
-                         &e->fill_streams_opened);
+                         fill_parent_pub(s, slot));
     }
 }
 
@@ -2593,10 +2659,11 @@ static void pub_inbound_update_event(const moq_session_t *s, const moq_pub_entry
  * sending on it, so a drain reference absorbs what is in flight unless the
  * peer's FIN was already observed (draft-16 carries the terminal on the
  * control channel and never drains). */
-static moq_result_t pub_queue_update_done(moq_session_t *s, size_t slot,
-                                          uint64_t done_count)
+static moq_result_t pub_queue_update_done(moq_session_t *s, size_t slot)
 {
     moq_pub_entry_t *pe = &s->publishes[slot];
+    if (session_owner_open_blocked(s, pe->handle._opaque)) return MOQ_ERR_WOULD_BLOCK;
+    uint64_t done_count = session_owner_stream_count(s, pe->handle._opaque, false);
     uint8_t buf[64];
     moq_buf_writer_t dw;
     moq_buf_writer_init(&dw, buf, sizeof(buf));
@@ -2618,6 +2685,7 @@ static moq_result_t pub_queue_update_done(moq_session_t *s, size_t slot,
  * action that closes it. */
 static bool pub_owes_closures(const moq_session_t *s, size_t slot)
 {
+    if (session_owner_open_blocked(s, s->publishes[slot].handle._opaque)) return true;
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
         if ((s->subgroups[i].state == MOQ_SG_RESET_OWED ||
              s->subgroups[i].state == MOQ_SG_TERMINAL_OWED) &&
@@ -2634,8 +2702,7 @@ void pub_release_held_dones(moq_session_t *s)
             continue;
         if (action_queue_avail(s) < 1)
             return;
-        if (s->send_cap - s->send_len < 64) return;
-        if (pub_queue_update_done(s, i, s->publishes[i].held_done_count) < 0)
+        if (pub_queue_update_done(s, i) < 0)
             return;
         pub_free_entry(s, (int)i);
     }
@@ -2653,14 +2720,15 @@ static moq_result_t pub_inbound_update_fail_terminal(moq_session_t *s, size_t sl
 
     size_t n_err = session_update_error_count(s, n_before);
     size_t err_total = 0, done_len = 0;
-    const uint64_t done_count = session_done_stream_count(s,
-        pe->subgroup_streams_opened, pe->fill_streams_opened);
+    const uint64_t done_count = session_owner_stream_count(s, pe->handle._opaque, false);
     moq_result_t rc = session_update_fail_len(s, &pe->owed_update, pe->request_id,
                          done_count, ea, n_before, &err_total, &done_len);
     if (rc < 0) return rc;
     size_t fills = fill_parent_actions_needed(s, fill_parent_pub(s, slot));
-    if (action_queue_avail(s) < n_err + 1)
+    size_t reserve_done = n_err < s->action_cap ? 1u : 0u;
+    if (action_queue_avail(s) < n_err + reserve_done)
         return MOQ_ERR_WOULD_BLOCK;
+    if (done_len > SIZE_MAX - err_total) return MOQ_ERR_BUFFER;
     if (req_stream && err_total + done_len > s->send_cap)
         return MOQ_ERR_BUFFER;              /* can never fit */
     if (err_total + done_len > s->send_cap - s->send_len)
@@ -2675,7 +2743,7 @@ static moq_result_t pub_inbound_update_fail_terminal(moq_session_t *s, size_t sl
         if ((sg->state == MOQ_SG_OPEN || sg->state == MOQ_SG_STREAMING) &&
             moq_publication_is_valid(sg->pub) &&
             moq_publication_eq(sg->pub, pe->handle))
-            sg_reset_or_owe(s, (size_t)i, 0x1 /* CANCELLED */, n_err + 1 + fills);
+            sg_reset_or_owe(s, (size_t)i, 0x1 /* CANCELLED */, n_err + reserve_done + fills);
     }
     uint8_t buf[64 + 1024];
     for (size_t k = 0; k < n_err; k++) {
@@ -2694,13 +2762,12 @@ static moq_result_t pub_inbound_update_fail_terminal(moq_session_t *s, size_t sl
      * the entry is freed, and the terminal is held while any subgroup or fill
      * stream still owes its reset. The cancellation keeps the slot reserved
      * for the PUBLISH_DONE. */
-    fill_parent_cancel_keep(s, fill_parent_pub(s, slot), MOQ_FILL_ERROR_NONE, 0, 1);
-    if (pub_owes_closures(s, slot)) {
+    fill_parent_cancel_keep(s, fill_parent_pub(s, slot), MOQ_FILL_ERROR_NONE, 0, reserve_done);
+    if (pub_owes_closures(s, slot) || action_queue_avail(s) == 0) {
         pe->state = MOQ_PUB_DONE_HELD;
-        pe->held_done_count = done_count;
         return MOQ_DONE;
     }
-    return pub_queue_update_done(s, slot, done_count);
+    return pub_queue_update_done(s, slot);
 }
 
 /* Surface an update the session would accept and leave its answer to the
@@ -2964,14 +3031,15 @@ moq_result_t moq_session_reject_publication_update(
     if (req_stream && !pub_peer_fin_observed(e) &&
         s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
-    if (action_queue_avail(s) < session_update_error_count(s, n_before) + 1)
+    size_t errors = session_update_error_count(s, n_before);
+    if (action_queue_avail(s) < errors + (errors < s->action_cap ? 1u : 0u))
         return MOQ_ERR_WOULD_BLOCK;
     size_t err_total = 0, done_len = 0;
     rc = session_update_fail_len(s, &e->owed_update, e->request_id,
-                         session_done_stream_count(s, e->subgroup_streams_opened,
-                                                   e->fill_streams_opened),
+                         session_owner_stream_count(s, e->handle._opaque, false),
                          &ea, n_before, &err_total, &done_len);
     if (rc < 0) return rc;
+    if (done_len > SIZE_MAX - err_total) return MOQ_ERR_BUFFER;
     if (err_total + done_len > s->send_cap) return MOQ_ERR_BUFFER;
     if (err_total + done_len > s->send_cap - s->send_len) return MOQ_ERR_WOULD_BLOCK;
 
@@ -3214,6 +3282,8 @@ static moq_result_t pub_update_queue(moq_session_t *s, int slot, pub_update_prep
         ? prep->args.delivery_timeout_us / 1000u : prep->args.dt_object_ms;
     e->dt_upd_subgroup_ms = prep->args.has_delivery_timeout
         ? prep->args.delivery_timeout_us / 1000u : prep->args.dt_subgroup_ms;
+    session_normalize_dt_selection(s, &e->dt_upd_has_object,
+        &e->dt_upd_object_ms, &e->dt_upd_has_subgroup, &e->dt_upd_subgroup_ms);
     s->profile->commit_request(s, &prep->req_ep);
     return MOQ_OK;
 }
@@ -3240,7 +3310,6 @@ moq_result_t moq_session_update_publication(
     bool forward = has_forward && cfg->forward;
     bool has_generic_timeout = cfg->has_delivery_timeout;
     uint64_t generic_timeout_us = has_generic_timeout ? cfg->delivery_timeout_us : 0;
-    if (typed_options && has_generic_timeout) return MOQ_ERR_UNSUPPORTED;
 
     const moq_auth_token_t *auth_tokens = NULL;
     size_t auth_token_count = 0;
@@ -3271,6 +3340,7 @@ moq_result_t moq_session_update_publication(
     if (!typed_options && (has_location || has_fill))
         return MOQ_ERR_UNSUPPORTED;
     if (timeout_flags && has_generic_timeout) return MOQ_ERR_INVAL;
+    if (typed_options && has_generic_timeout) return MOQ_ERR_UNSUPPORTED;
     {
         moq_result_t drc = session_check_dt_selection(s,
             (timeout_flags & MOQ_SUBSCRIPTION_UPDATE_OBJECT_DELIVERY_TIMEOUT) != 0,
@@ -3421,6 +3491,12 @@ moq_result_t moq_session_finish_publish(
     const moq_finish_publish_cfg_t *cfg,
     uint64_t now_us)
 {
+    return session_finish_publish(s, pub, cfg, now_us, false);
+}
+
+moq_result_t session_finish_publish(moq_session_t *s, moq_publication_t pub,
+    const moq_finish_publish_cfg_t *cfg, uint64_t now_us, bool owned_count)
+{
     if (!s || !cfg) return MOQ_ERR_INVAL;
     if (cfg->struct_size < sizeof(moq_finish_publish_cfg_t))
         return MOQ_ERR_INVAL;
@@ -3470,6 +3546,7 @@ moq_result_t moq_session_finish_publish(
      * reciprocal FIN (unless it already arrived). */
     moq_pub_entry_t *pe = &s->publishes[slot];
     bool req_stream = (pe->rs.ref._v != 0);
+    if (session_owner_open_blocked(s, pe->handle._opaque)) return MOQ_ERR_WOULD_BLOCK;
     bool need_drain = req_stream && !pub_peer_fin_observed(pe);
     /* PUBLISH_DONE plus a RESET for every fill stream still open: ending the
      * subscription resets them. */
@@ -3483,7 +3560,10 @@ moq_result_t moq_session_finish_publish(
     moq_finish_publish_encode_args_t args = {
         .request_id = pe->request_id,
         .status_code = cfg->status_code,
-        .stream_count = fill_stream_count(s, cfg->stream_count, pe->fill_streams_opened),
+        .stream_count = owned_count
+            ? session_owner_stream_count(s, pe->handle._opaque, false)
+            : fill_stream_count(s, cfg->stream_count,
+                session_owner_stream_count(s, pe->handle._opaque, true)),
         .reason = cfg->reason.data,
         .reason_len = cfg->reason.len,
     };
@@ -3644,6 +3724,8 @@ moq_result_t moq_session_open_pub_subgroup(
     moq_action_meta_t meta;
     sg_stream_meta(s, &probe, &meta);
     meta.subgroup_header = true;
+    meta.opens_data = true;
+    if (!session_open_credit(s)) return MOQ_ERR_WOULD_BLOCK;
 
     moq_data_priority_t key;
     session_subgroup_data_key(&meta, &key);

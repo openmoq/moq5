@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <stdlib.h>
 #include "session_internal.h"
+#include "../spi/core_spi.h"
 #include "../bridge/transport_bridge_internal.h"
 #include "../internal/validate.h"
 #include "session_event_admission.h"
@@ -55,15 +56,57 @@ moq_result_t session_check_dt_selection(const moq_session_t *s,
     return MOQ_OK;
 }
 
+void session_normalize_dt_selection(const moq_session_t *s,
+                                    bool *has_object, uint64_t *object_ms,
+                                    bool *has_subgroup, uint64_t *subgroup_ms)
+{
+    if (!s->profile->single_delivery_timeout ||
+        (!*has_object && !*has_subgroup)) return;
+    /* Validation has established one representable, nonzero wire value.
+     * Either public alias selects that value for BOTH local semantic slots. */
+    uint64_t ms = *has_object ? *object_ms : *subgroup_ms;
+    *has_object = *has_subgroup = true;
+    *object_ms = *subgroup_ms = ms;
+}
+
+void moq_track_delivery_timeouts_cfg_init_sized(
+    moq_track_delivery_timeouts_cfg_t *cfg, size_t cfg_size)
+{
+    if (!cfg) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(uint32_t)) return;
+    memset(cfg, 0, n);
+    uint32_t size = (uint32_t)n;
+    memcpy(cfg, &size, sizeof(size));
+}
+
+static moq_result_t track_delivery_timeouts_cfg_read(
+    const moq_track_delivery_timeouts_cfg_t *src,
+    moq_track_delivery_timeouts_cfg_t *out)
+{
+    uint32_t size;
+    memcpy(&size, src, sizeof(size));
+    if (size < MOQ_TRACK_DELIVERY_TIMEOUTS_CFG_V0_SIZE) return MOQ_ERR_INVAL;
+    memset(out, 0, sizeof(*out));
+    memcpy(out, src, MOQ_TRACK_DELIVERY_TIMEOUTS_CFG_V0_SIZE);
+    return MOQ_OK;
+}
+
 moq_result_t moq_session_track_properties_add_delivery_timeouts(
     const moq_session_t *s, const uint8_t *in, size_t in_len,
-    bool has_object, uint64_t object_ms, bool has_subgroup,
-    uint64_t subgroup_ms, uint8_t *out, size_t out_cap, size_t *out_len)
+    const moq_track_delivery_timeouts_cfg_t *cfg,
+    uint8_t *out, size_t out_cap, size_t *out_len)
 {
-    if (!s || !out || !out_len || (in_len > 0 && !in)) return MOQ_ERR_INVAL;
+    if (!s || !cfg || !out || !out_len || (in_len > 0 && !in)) return MOQ_ERR_INVAL;
+    moq_track_delivery_timeouts_cfg_t local;
+    moq_result_t rc = track_delivery_timeouts_cfg_read(cfg, &local);
+    if (rc < 0) return rc;
+    bool has_object = local.has_object_delivery_timeout;
+    uint64_t object_ms = has_object ? local.object_delivery_timeout_ms : 0;
+    bool has_subgroup = local.has_subgroup_delivery_timeout;
+    uint64_t subgroup_ms = has_subgroup ? local.subgroup_delivery_timeout_ms : 0;
     if (!has_object && !has_subgroup) return MOQ_ERR_INVAL;
-    moq_result_t rc = session_check_dt_selection(s, has_object, object_ms,
-                                                 has_subgroup, subgroup_ms);
+    rc = session_check_dt_selection(s, has_object, object_ms, has_subgroup, subgroup_ms);
     if (rc < 0) return rc;
     const moq_profile_ops_t *p = s->profile;
     if (p->single_delivery_timeout || !has_subgroup)
@@ -561,6 +604,11 @@ moq_result_t session_advance_entry(moq_session_t *s, uint64_t now_us)
 
 void decref_queued_data_payloads(moq_session_t *s)
 {
+    /* Called only on session close/destroy. Bridge-held copies can report a
+     * late outcome, but no closed-session record or owner can be credited. */
+    if (s->pending_opens)
+        memset(s->pending_opens, 0, s->action_cap * sizeof(*s->pending_opens));
+    s->pending_open_count = 0;
     for (size_t i = s->action_head; i < s->action_tail; i++) {
         moq_action_t *a = &s->actions[i % s->action_cap];
 #ifdef MOQ_SESSION_SWEEP_TESTING
@@ -916,7 +964,7 @@ moq_result_t moq_session_register_transport_owner(moq_session_t *s,
                                                   const void *owner)
 {
     if (!s || !owner) return MOQ_ERR_INVAL;
-    if (s->transport_owner && s->transport_owner != owner)
+    if (s->virtual_batch || (s->transport_owner && s->transport_owner != owner))
         return MOQ_ERR_WRONG_STATE;
     s->transport_owner = owner;
     return MOQ_OK;
@@ -926,6 +974,9 @@ void moq_session_unregister_transport_owner(moq_session_t *s,
                                             const void *owner)
 {
     if (s && owner && s->transport_owner == owner) {
+        /* Cancel bridge-owned, still-unopened refs before dropping retained
+         * output. Core-owned headers remain pending for a replacement owner. */
+        bridge_session_abandon_data_opens(s);
         s->transport_owner = NULL;
         s->has_owner_deadline = false;
         s->owner_deadline_us = 0;
@@ -1010,6 +1061,190 @@ moq_result_t moq_session_set_data_priority_updates(moq_session_t *s,
 /* The scheduling record of a SEND_DATA action, from the stream it rides:
  * a subgroup stream, a FETCH response stream, or a fill fetch stream. Fills
  * in the public scheduling snapshot too when the producer left it absent. */
+static moq_open_counts_t *owner_open_counts(moq_session_t *s, uint64_t owner)
+{
+    int slot = sub_resolve_handle(s, (moq_subscription_t){owner});
+    if (slot >= 0) return &s->subs[slot].opened;
+    slot = pub_resolve_handle(s, (moq_publication_t){owner});
+    return slot >= 0 ? &s->publishes[slot].opened : NULL;
+}
+
+bool session_open_credit(const moq_session_t *s)
+{
+    return s->next_stream_ref != 0 && s->pending_open_count < s->action_cap;
+}
+
+bool session_owner_open_pending(const moq_session_t *s, uint64_t owner)
+{
+    if (!s->pending_open_count) return false;
+    for (size_t i = 0; i < s->action_cap; ++i)
+        if (s->pending_opens[i].ref && s->pending_opens[i].owner == owner)
+            return true;
+    return false;
+}
+
+bool session_owner_open_blocked(const moq_session_t *s, uint64_t owner)
+{
+    /* Raw callers supply their own application count. Without an observing
+     * transport an unresolved session-owned count is honestly unknown. */
+    return (s->transport_owner || s->virtual_observer) &&
+           session_owner_open_pending(s, owner);
+}
+
+void session_forget_owner_opens(moq_session_t *s, uint64_t owner)
+{
+    for (size_t i = 0; s->pending_open_count && i < s->action_cap; ++i) {
+        moq_pending_open_t *p = &s->pending_opens[i];
+        if (p->ref && p->owner == owner) {
+            memset(p, 0, sizeof(*p));
+            s->pending_open_count--;
+        }
+    }
+}
+
+uint64_t session_owner_stream_count(const moq_session_t *s, uint64_t owner,
+                                    bool fills_only)
+{
+    const moq_open_counts_t *c = NULL;
+    int slot = sub_resolve_handle(s, (moq_subscription_t){owner});
+    if (slot >= 0) c = &s->subs[slot].opened;
+    else {
+        slot = pub_resolve_handle(s, (moq_publication_t){owner});
+        if (slot >= 0) c = &s->publishes[slot].opened;
+    }
+    uint64_t unknown = s->profile->stream_count_unknown;
+    if (!c || c->fill_external || (!fills_only && c->subgroup_external))
+        return unknown;
+    for (size_t i = 0; s->pending_open_count && i < s->action_cap; ++i) {
+        const moq_pending_open_t *p = &s->pending_opens[i];
+        if (p->ref && p->owner == owner &&
+            (!fills_only || p->mode == MOQ_SCHED_MODE_FILL)) return unknown;
+    }
+    return fills_only ? c->fill : fill_stream_count(s, c->subgroup, c->fill);
+}
+
+moq_result_t moq_core_internal_virtual_register(moq_session_t *s, const void *observer)
+{
+    if (!s || !observer) return MOQ_ERR_INVAL;
+    if (s->virtual_batch || (s->virtual_observer && s->virtual_observer != observer))
+        return MOQ_ERR_WRONG_STATE;
+    s->virtual_observer = observer;
+    return MOQ_OK;
+}
+
+void moq_core_internal_virtual_unregister(moq_session_t *s, const void *observer)
+{
+    if (!s || !observer || s->virtual_observer != observer) return;
+    /* Do not cancel native bridge records, or fabricate suppression when the
+     * virtual observer disappears without providing its fact. */
+    for (size_t i = 0; i < s->action_cap; ++i) {
+        moq_pending_open_t p = s->pending_opens[i];
+        if (p.ref && p.virtual_handed)
+            (void)bridge_session_resolve_data_open(s, moq_stream_ref_from_u64(p.ref),
+                                                  p.owner, MOQ_DATA_EXTERNAL);
+    }
+    s->virtual_observer = NULL;
+    s->virtual_batch = false;
+    s->virtual_batch_epoch = 0;
+}
+
+bool moq_core_internal_virtual_resolve(moq_session_t *s, const void *observer,
+    const moq_core_observed_open_t *open, uint8_t disposition)
+{
+    if (!s || !open || !observer || s->virtual_observer != observer ||
+        s->transport_owner || !s->virtual_batch ||
+        s->virtual_batch_epoch != s->borrow_epoch ||
+        (disposition != MOQ_CORE_VIRTUAL_OPENED &&
+         disposition != MOQ_CORE_VIRTUAL_SUPPRESSED)) return false;
+    const uint8_t data_disposition = disposition == MOQ_CORE_VIRTUAL_OPENED
+        ? MOQ_DATA_OPENED : MOQ_DATA_SUPPRESSED;
+    for (size_t i = 0; i < s->action_cap; ++i) {
+        const moq_pending_open_t *p = &s->pending_opens[i];
+        if (p->ref == open->ref && p->owner == open->owner &&
+            p->mode == open->mode && p->handed && p->virtual_handed)
+            return bridge_session_resolve_data_open(s,
+                moq_stream_ref_from_u64(open->ref), open->owner, data_disposition);
+    }
+    return false;
+}
+
+moq_result_t moq_core_internal_virtual_finish(moq_session_t *s,
+    const void *observer, bool abort_batch)
+{
+    if (!s || !observer || s->virtual_observer != observer || !s->virtual_batch)
+        return MOQ_ERR_WRONG_STATE;
+    bool unresolved = false;
+    for (size_t i = 0; i < s->action_cap; ++i) {
+        moq_pending_open_t p = s->pending_opens[i];
+        if (!p.ref || !p.virtual_handed) continue;
+        if (!abort_batch) { unresolved = true; continue; }
+        /* Failure is not evidence of non-opening: admission may have
+         * succeeded before stale feedback was rejected. */
+        (void)bridge_session_resolve_data_open(s, moq_stream_ref_from_u64(p.ref),
+                                              p.owner, MOQ_DATA_EXTERNAL);
+    }
+    if (unresolved) return MOQ_ERR_WRONG_STATE;
+    bool valid = s->virtual_batch_epoch == s->borrow_epoch;
+    s->virtual_batch = false;
+    s->virtual_batch_epoch = 0;
+    return valid ? MOQ_OK : MOQ_ERR_WRONG_STATE;
+}
+
+static moq_result_t session_begin_data_open(moq_session_t *s,
+    moq_stream_ref_t ref, const moq_action_meta_t *meta)
+{
+    if (!session_open_credit(s)) return MOQ_ERR_WOULD_BLOCK;
+    if (!ref._v || !owner_open_counts(s, meta->owner)) return MOQ_ERR_INVAL;
+    for (size_t i = 0; i < s->action_cap; ++i) {
+        moq_pending_open_t *p = &s->pending_opens[i];
+        if (p->ref) continue;
+        *p = (moq_pending_open_t){ .ref = ref._v, .owner = meta->owner,
+                                  .mode = meta->mode };
+        s->pending_open_count++;
+        return MOQ_OK;
+    }
+    return MOQ_ERR_WOULD_BLOCK;
+}
+
+bool bridge_session_resolve_data_open(moq_session_t *s, moq_stream_ref_t ref,
+                                      uint64_t owner, uint8_t disposition)
+{
+    if (!s || !ref._v || !s->pending_open_count) return false;
+    if (disposition != MOQ_DATA_OPENED && disposition != MOQ_DATA_SUPPRESSED &&
+        disposition != MOQ_DATA_EXTERNAL) return false;
+    for (size_t i = 0; i < s->action_cap; ++i) {
+        moq_pending_open_t *p = &s->pending_opens[i];
+        if (p->ref != ref._v || p->owner != owner) continue;
+        moq_open_counts_t *c = owner_open_counts(s, p->owner);
+        if (c) {
+            uint64_t *n = p->mode == MOQ_SCHED_MODE_FILL ? &c->fill : &c->subgroup;
+            bool *external = p->mode == MOQ_SCHED_MODE_FILL
+                ? &c->fill_external : &c->subgroup_external;
+            if (disposition == MOQ_DATA_OPENED && *n < s->profile->stream_count_unknown)
+                ++*n;
+            if (disposition == MOQ_DATA_EXTERNAL) *external = true;
+        }
+        memset(p, 0, sizeof(*p));
+        s->pending_open_count--;
+        s->open_counts_changed = true;
+        return true;
+    }
+    return false; /* stale/duplicate refs never correct a replacement owner */
+}
+
+static void session_open_handed(moq_session_t *s, const moq_action_t *a,
+                                const moq_action_meta_t *m)
+{
+    if (a->kind != MOQ_ACTION_SEND_DATA || !m->opens_data ||
+        !s->pending_open_count) return;
+    for (size_t i = 0; i < s->action_cap; ++i)
+        if (s->pending_opens[i].ref == a->u.send_data.stream_ref._v &&
+            s->pending_opens[i].owner == m->owner) {
+            s->pending_opens[i].handed = true;
+            return;
+        }
+}
+
 static void derive_stream_meta(moq_session_t *s, moq_action_t *queued,
                                moq_action_meta_t *m)
 {
@@ -1071,6 +1306,10 @@ moq_result_t push_action_ex(moq_session_t *s, const moq_action_t *a,
         m->publisher_priority = (uint8_t)queued->u.send_data.scheduling_priority;
     }
     m->deadline_us = deadline_us;
+    if (a->kind == MOQ_ACTION_SEND_DATA && m->opens_data) {
+        moq_result_t rc = session_begin_data_open(s, a->u.send_data.stream_ref, m);
+        if (rc != MOQ_OK) return rc;
+    }
     session_action_enqueued(s, queued, m);
     s->action_tail++;
     session_refresh_idle(s, s->last_now_us);
@@ -2812,7 +3051,10 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     size_t off_action_meta = ALIGN_UP(off_actions + act_bytes,
                                       _Alignof(moq_action_meta_t));
     size_t action_meta_bytes = action_cap * sizeof(moq_action_meta_t);
-    size_t off_events  = ALIGN_UP(off_action_meta + action_meta_bytes, evt_align);
+    size_t off_opens = ALIGN_UP(off_action_meta + action_meta_bytes,
+                                _Alignof(moq_pending_open_t));
+    size_t open_bytes = action_cap * sizeof(moq_pending_open_t);
+    size_t off_events  = ALIGN_UP(off_opens + open_bytes, evt_align);
     size_t evt_bytes   = event_cap * sizeof(moq_event_t);
     size_t location_cap = profile->encode_publish_state_notify ? event_cap : 0;
     size_t location_bytes = location_cap * sizeof(moq_state_location_cell_t);
@@ -2997,6 +3239,11 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
      * under-size a region. */
     if (act_bytes / sizeof(moq_action_t) != action_cap ||
         action_meta_bytes / sizeof(moq_action_meta_t) != action_cap ||
+        off_action_meta + action_meta_bytes < off_action_meta ||
+        open_bytes / sizeof(moq_pending_open_t) != action_cap ||
+        off_opens < off_action_meta + action_meta_bytes ||
+        off_opens + open_bytes < off_opens ||
+        off_events < off_opens + open_bytes ||
         off_action_meta < off_actions ||
         evt_bytes / sizeof(moq_event_t)  != event_cap  ||
         location_bytes / sizeof(moq_state_location_cell_t) != location_cap ||
@@ -3069,6 +3316,7 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
 
     s->actions    = (moq_action_t *)(mem + off_actions);
     s->action_meta = (moq_action_meta_t *)(mem + off_action_meta);
+    s->pending_opens = (moq_pending_open_t *)(mem + off_opens);
     s->action_cap = action_cap;
     s->events     = (moq_event_t *)(mem + off_events);
     s->event_cap  = event_cap;
@@ -4064,6 +4312,10 @@ _Static_assert(offsetof(moq_send_data_action_t, scheduling_priority) >=
 
 static void session_action_poll_prepare(moq_session_t *s)
 {
+    if (s->open_counts_changed && session_is_active(s)) {
+        s->open_counts_changed = false;
+        session_retry_owed_stream_actions(s);
+    }
     if (session_is_active(s)) session_expire_queued_data(s);
     ts_retry_pending(s);
     ann_retry_pending(s);
@@ -4156,7 +4408,7 @@ bool bridge_session_claim_data_reset(moq_session_t *s,
     return true;
 }
 
-void bridge_session_discard_reset_data(moq_session_t *s, moq_stream_ref_t ref)
+static void discard_ref_data(moq_session_t *s, moq_stream_ref_t ref, bool data_only)
 {
     size_t dst = s->action_head;
     const size_t tail = s->action_tail;
@@ -4164,7 +4416,9 @@ void bridge_session_discard_reset_data(moq_session_t *s, moq_stream_ref_t ref)
         const size_t from = src % s->action_cap;
         moq_action_t *a = &s->actions[from];
         moq_stream_ref_t data_ref;
-        if (action_data_stream(a, &data_ref) && data_ref._v == ref._v) {
+        if (action_data_stream(a, &data_ref) && data_ref._v == ref._v &&
+            (!data_only || (a->kind == MOQ_ACTION_SEND_DATA &&
+                           !s->action_meta[from].terminal_barrier))) {
             session_action_dequeued(s, a, &s->action_meta[from]);
             moq_action_cleanup(a);
             continue;
@@ -4179,6 +4433,40 @@ void bridge_session_discard_reset_data(moq_session_t *s, moq_stream_ref_t ref)
     for (; dst < tail; ++dst) {
         memset(&s->actions[dst % s->action_cap], 0, sizeof(*s->actions));
         memset(&s->action_meta[dst % s->action_cap], 0, sizeof(*s->action_meta));
+    }
+}
+
+void bridge_session_discard_reset_data(moq_session_t *s, moq_stream_ref_t ref)
+{
+    discard_ref_data(s, ref, false);
+}
+
+bool bridge_session_suppress_data_open(moq_session_t *s, moq_stream_ref_t ref,
+                                       uint64_t owner)
+{
+    /* Resolve only a still-pending exact identity. An already-open or stale
+     * ref cannot be reclassified just because its map entry retired. */
+    if (!bridge_session_resolve_data_open(s, ref, owner, MOQ_DATA_SUPPRESSED))
+        return false;
+    discard_ref_data(s, ref, true); /* preserve event/reset obligations */
+    return true;
+}
+
+void bridge_session_abandon_data_opens(moq_session_t *s)
+{
+    for (size_t i = 0; s->pending_open_count && i < s->action_cap; ++i) {
+        moq_pending_open_t p = s->pending_opens[i];
+        if (!p.ref || !p.handed) continue;
+        moq_stream_ref_t ref = moq_stream_ref_from_u64(p.ref);
+        /* This is a local cancellation, not a fabricated peer STOP, expiry
+         * or transport commit. Freeze producers before discarding the header. */
+        for (int32_t j = s->sg_occ_head; j >= 0; j = s->subgroups[j].occ_next)
+            if (s->subgroups[j].stream_ref._v == p.ref &&
+                (s->subgroups[j].state == MOQ_SG_OPEN ||
+                 s->subgroups[j].state == MOQ_SG_STREAMING))
+                sg_reset_or_owe(s, (size_t)j, 0x1 /* CANCELLED */, 0);
+        if (p.mode == MOQ_SCHED_MODE_FILL) fill_abandon_unopened(s, ref);
+        (void)bridge_session_suppress_data_open(s, ref, p.owner);
     }
 }
 
@@ -4249,6 +4537,7 @@ static bool bridge_session_poll_action_impl(moq_session_t *s, moq_action_t *out,
         action_waits_for_terminal(s, selected))
         return false;
     *meta = s->action_meta[selected % s->action_cap];
+    session_open_handed(s, &s->actions[selected % s->action_cap], meta);
     action_take(s, selected, out);
     out->borrow_epoch = s->borrow_epoch;
     session_action_poll_settled(s, true);
@@ -4312,6 +4601,7 @@ bool bridge_session_poll_ready_action(moq_session_t *s, moq_action_t *out,
         if (s->action_meta[selected % s->action_cap].terminal_barrier)
             return false;
         *meta = s->action_meta[selected % s->action_cap];
+        session_open_handed(s, &s->actions[selected % s->action_cap], meta);
         action_take(s, selected, out);
         out->borrow_epoch = s->borrow_epoch;
         session_action_poll_settled(s, true);
@@ -4403,16 +4693,16 @@ bool bridge_session_poll_mapped_action(moq_session_t *s, moq_action_t *out,
     if (gate(ctx, &s->actions[at], &s->action_meta[at], true) !=
         BRIDGE_ACTION_READY) return false;
     *meta = s->action_meta[at];
+    session_open_handed(s, &s->actions[at], meta);
     action_take(s, best, out);
     out->borrow_epoch = s->borrow_epoch;
     session_action_poll_settled(s, true);
     return true;
 }
 
-moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
-                                          void *out, size_t cap,
-                                          size_t element_size,
-                                          size_t *out_count)
+static moq_result_t session_poll_actions(moq_session_t *s,
+    void *out, size_t cap, size_t element_size, size_t *out_count,
+    const void *observer, moq_core_observed_open_t *opens)
 {
     if (out_count) *out_count = 0;
     if (!s || !out || !out_count) return MOQ_ERR_INVAL;
@@ -4435,6 +4725,7 @@ moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
 
     while (n < cap && s->action_head < s->action_tail) {
         moq_action_t taken;
+        moq_core_observed_open_t observed = {0};
         if (!session_is_active(s) || !sg_take_terminal_action(s, &taken)) {
             size_t idx = action_select(s);
             const moq_action_t *head = &s->actions[idx % s->action_cap];
@@ -4445,12 +4736,51 @@ moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
             }
             if (head->kind == MOQ_ACTION_SEND_DATA && element_size < send_data_needed)
                 break;
+            if (head->kind == MOQ_ACTION_SEND_DATA) {
+                if (observer) {
+                    for (size_t i = 0; i < s->action_cap; ++i) {
+                        moq_pending_open_t *p = &s->pending_opens[i];
+                        if (p->ref != head->u.send_data.stream_ref._v ||
+                            p->owner != s->action_meta[idx % s->action_cap].owner ||
+                            p->handed) continue;
+                        p->handed = true;
+                        p->virtual_handed = true;
+                        observed = (moq_core_observed_open_t){p->ref, p->owner, p->mode};
+                        break;
+                    }
+                } else {
+                    (void)bridge_session_resolve_data_open(s, head->u.send_data.stream_ref,
+                        s->action_meta[idx % s->action_cap].owner, MOQ_DATA_EXTERNAL);
+                }
+            }
             action_take(s, idx, &taken);
+        }
+        /* A terminal can replace a never-polled header. Raw RESET handoff
+         * remains unobservable, but must release its bounded pending credit. */
+        if (taken.kind == MOQ_ACTION_RESET_DATA && s->pending_open_count) {
+            for (size_t i = 0; i < s->action_cap; ++i) {
+                moq_pending_open_t p = s->pending_opens[i];
+                if (p.ref == taken.u.reset_data.stream_ref._v) {
+                    if (observer) {
+                        /* A first SEND_DATA in this same batch may already
+                         * carry the sole token for this ref. */
+                        if (p.handed) break;
+                        s->pending_opens[i].handed = true;
+                        s->pending_opens[i].virtual_handed = true;
+                        observed = (moq_core_observed_open_t){p.ref, p.owner, p.mode};
+                    } else {
+                        (void)bridge_session_resolve_data_open(s,
+                            taken.u.reset_data.stream_ref, p.owner, MOQ_DATA_EXTERNAL);
+                    }
+                    break;
+                }
+            }
         }
         memset(dst, 0, element_size);
         memcpy(dst, &taken, copy);
         uint64_t epoch = s->borrow_epoch;
         memcpy(dst + offsetof(moq_action_t, borrow_epoch), &epoch, sizeof(epoch));
+        if (opens) opens[n] = observed;
         dst += element_size;
         n++;
         if (session_is_active(s)) sg_retry_owed_resets(s);
@@ -4468,6 +4798,35 @@ moq_result_t moq_session_poll_actions_ex(moq_session_t *s,
 
     *out_count = n;
     return MOQ_OK;
+}
+
+moq_result_t moq_session_poll_actions_ex(moq_session_t *s, void *out,
+    size_t cap, size_t element_size, size_t *out_count)
+{
+    if (s && s->virtual_batch) {
+        if (out_count) *out_count = 0;
+        return MOQ_ERR_WRONG_STATE;
+    }
+    return session_poll_actions(s, out, cap, element_size, out_count, NULL, NULL);
+}
+
+moq_result_t moq_core_internal_virtual_poll(moq_session_t *s,
+    const void *observer, moq_action_t *actions, moq_core_observed_open_t *opens,
+    size_t cap, size_t *out_count)
+{
+    if (out_count) *out_count = 0;
+    if (!s || !observer || !out_count) return MOQ_ERR_INVAL;
+    if (s->virtual_observer != observer || s->transport_owner || s->virtual_batch)
+        return MOQ_ERR_WRONG_STATE;
+    if (!cap) return MOQ_OK;
+    if (!actions || !opens) return MOQ_ERR_INVAL;
+    moq_result_t rc = session_poll_actions(s, actions, cap, sizeof(*actions),
+                                          out_count, observer, opens);
+    if (*out_count) {
+        s->virtual_batch = true;
+        s->virtual_batch_epoch = s->borrow_epoch;
+    }
+    return rc;
 }
 
 static size_t event_min_poll_size(uint32_t kind)

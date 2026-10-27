@@ -276,6 +276,8 @@ moq_group_order_t moq_session_subscription_group_order(
 static void sub_free_entry(moq_session_t *s, size_t slot)
 {
     moq_sub_entry_t *e = &s->subs[slot];
+    session_forget_owner_opens(s, e->handle._opaque);
+    memset(&e->opened, 0, sizeof(e->opened));
     if (e->mt_failing) {
         e->mt_failing = false;
         s->mt_failing_count--;
@@ -3506,6 +3508,8 @@ moq_result_t session_core_on_subscribe_update_ok(moq_session_t *s, int slot,
     e->update_has_filter = false;
     /* §9.8: latch acknowledged timeout carriers and recompute the retained
      * legacy projection from the COMPLETE current pair. */
+    session_normalize_dt_selection(s, &e->dt_upd_has_object,
+        &e->dt_upd_object_ms, &e->dt_upd_has_subgroup, &e->dt_upd_subgroup_ms);
     if (e->dt_upd_has_object) {
         e->dt_sub_has_object = true;
         e->dt_sub_object_ms = e->dt_upd_object_ms;
@@ -3918,7 +3922,8 @@ static moq_result_t sub_update_prepare(moq_session_t *s, size_t slot,
         p->fail_fill = fill_unserved_opens_stream(&p->feff, p->snap_has,
             p->snap_group, p->snap_object,
             !(v->valid ? v->forward : u->has_forward ? u->forward : e->forward));
-        if (p->fail_fill && action_queue_avail(s) < ok_actions + 2)
+        if (p->fail_fill && (action_queue_avail(s) < ok_actions + 2 ||
+                            !session_open_credit(s)))
             return MOQ_ERR_WOULD_BLOCK;
         return MOQ_OK;
     }
@@ -4031,7 +4036,7 @@ static void sub_update_commit(moq_session_t *s, size_t slot, const moq_sub_updat
                               !e->forward, receipt);
     } else if (p->fail_fill) {
         fill_open_failed(s, u->fill_request_id, p->feff.subscriber_priority,
-                         &e->fill_streams_opened);
+                         fill_parent_sub(s, slot));
     }
 }
 
@@ -4160,6 +4165,7 @@ moq_result_t session_update_fail_len(moq_session_t *s, const moq_owed_update_t *
         size_t len = 0;
         moq_result_t rc = session_update_encode_error(s, o, ea, k, n_err, buf, sizeof(buf), &len);
         if (rc < 0) return rc;
+        if (len > SIZE_MAX - *err_total) return MOQ_ERR_BUFFER;
         *err_total += len;
     }
     moq_buf_writer_t dw;
@@ -4200,8 +4206,7 @@ moq_result_t session_update_fail_len(moq_session_t *s, const moq_owed_update_t *
  * drains. The reference is taken when the REQUEST_ERROR goes out, so a held
  * terminal's request stream already absorbs what the peer still sends. */
 static bool sub_owes_closures(const moq_session_t *s, size_t slot);
-static moq_result_t sub_queue_update_done(moq_session_t *s, size_t slot,
-                                          uint64_t done_count);
+static moq_result_t sub_queue_update_done(moq_session_t *s, size_t slot);
 
 static moq_result_t sub_update_fail_terminal(moq_session_t *s, size_t slot,
                                              const moq_request_error_encode_args_t *ea,
@@ -4219,8 +4224,8 @@ static moq_result_t sub_update_fail_terminal(moq_session_t *s, size_t slot,
      * WOULD_BLOCK rather than partial output. */
     size_t n_err = session_update_error_count(s, n_before);
     size_t err_total = 0, done_len = 0;
-    const uint64_t done_count = session_done_stream_count(s,
-        ue->subgroup_streams_opened, ue->fill_streams_opened);
+    /* Only a sizing bound: the actual count is selected at final encoding. */
+    const uint64_t done_count = session_owner_stream_count(s, ue->handle._opaque, false);
     moq_result_t rc = session_update_fail_len(s, &ue->owed_update, ue->request_id,
                          done_count, ea, n_before, &err_total, &done_len);
     if (rc < 0) return rc;
@@ -4230,10 +4235,12 @@ static moq_result_t sub_update_fail_terminal(moq_session_t *s, size_t slot,
      * the rest are retained by the children until actions drain, so they are
      * not reserved (a batch larger than the queue could never be made). */
     size_t fills = fill_parent_actions_needed(s, fill_parent_sub(s, slot));
-    if (action_queue_avail(s) < n_err + 1)
+    size_t reserve_done = n_err < s->action_cap ? 1u : 0u;
+    if (action_queue_avail(s) < n_err + reserve_done)
         return MOQ_ERR_WOULD_BLOCK;
 
     bool req_stream = moq_session_uses_request_streams(s);
+    if (done_len > SIZE_MAX - err_total) return MOQ_ERR_BUFFER;
     if (req_stream && err_total + done_len > s->send_cap)
         return MOQ_ERR_BUFFER;              /* can never fit */
     if (err_total + done_len > s->send_cap - s->send_len)
@@ -4245,7 +4252,7 @@ static moq_result_t sub_update_fail_terminal(moq_session_t *s, size_t slot,
     /* Reserved above: from here nothing refuses. The resets that fit go
      * first, leaving the messages' slots free and, while the queue has them,
      * the fill children's. */
-    sub_cancel_subgroups(s, slot, n_err + 1 + fills);
+    sub_cancel_subgroups(s, slot, n_err + reserve_done + fills);
     moq_stream_ref_t up_ref = s->subs[slot].rs.ref;
     uint8_t buf[64 + 1024];
     for (size_t k = 0; k < n_err; k++) {
@@ -4263,21 +4270,22 @@ static moq_result_t sub_update_fail_terminal(moq_session_t *s, size_t slot,
      * here, not when the entry is freed, and the terminal is held while any
      * subgroup or fill stream still owes its reset. The cancellation keeps the
      * slot reserved for the PUBLISH_DONE. */
-    fill_parent_cancel_keep(s, fill_parent_sub(s, slot), MOQ_FILL_ERROR_NONE, 0, 1);
-    if (sub_owes_closures(s, slot)) {
+    fill_parent_cancel_keep(s, fill_parent_sub(s, slot), MOQ_FILL_ERROR_NONE, 0, reserve_done);
+    if (sub_owes_closures(s, slot) || action_queue_avail(s) == 0) {
         ue->state = MOQ_SUB_DONE_HELD;
-        ue->held_done_count = done_count;
         return MOQ_DONE;
     }
-    return sub_queue_update_done(s, slot, done_count);
+    return sub_queue_update_done(s, slot);
 }
 
 /* The PUBLISH_DONE(UPDATE_FAILED) ending subscription `slot`, with FIN on its
  * request bidi (or on the control channel); the caller reserved its slot and
  * bytes. */
-static moq_result_t sub_queue_update_done(moq_session_t *s, size_t slot,
-                                          uint64_t done_count)
+static moq_result_t sub_queue_update_done(moq_session_t *s, size_t slot)
 {
+    if (session_owner_open_blocked(s, s->subs[slot].handle._opaque))
+        return MOQ_ERR_WOULD_BLOCK;
+    uint64_t done_count = session_owner_stream_count(s, s->subs[slot].handle._opaque, false);
     uint8_t buf[64];
     moq_buf_writer_t dw;
     moq_buf_writer_init(&dw, buf, sizeof(buf));
@@ -4299,6 +4307,7 @@ static moq_result_t sub_queue_update_done(moq_session_t *s, size_t slot,
  * action that closes it. */
 static bool sub_owes_closures(const moq_session_t *s, size_t slot)
 {
+    if (session_owner_open_blocked(s, s->subs[slot].handle._opaque)) return true;
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
         if ((s->subgroups[i].state == MOQ_SG_RESET_OWED ||
              s->subgroups[i].state == MOQ_SG_TERMINAL_OWED) &&
@@ -4325,8 +4334,7 @@ void session_release_held_dones(moq_session_t *s)
             continue;
         if (action_queue_avail(s) < 1)
             return;
-        if (s->send_cap - s->send_len < 64) return;
-        if (sub_queue_update_done(s, (size_t)i, s->subs[i].held_done_count) < 0)
+        if (sub_queue_update_done(s, (size_t)i) < 0)
             return;
         sub_free_entry(s, (size_t)i);
     }
@@ -4732,14 +4740,15 @@ moq_result_t moq_session_reject_subscription_update(
     if (req_stream && e->rs.ref._v != 0 && !e->rs.recv_fin &&
         s->drain_ref_count >= s->drain_ref_cap)
         return MOQ_ERR_WOULD_BLOCK;
-    if (action_queue_avail(s) < session_update_error_count(s, n_before) + 1)
+    size_t errors = session_update_error_count(s, n_before);
+    if (action_queue_avail(s) < errors + (errors < s->action_cap ? 1u : 0u))
         return MOQ_ERR_WOULD_BLOCK;
     size_t err_total = 0, done_len = 0;
     rc = session_update_fail_len(s, &e->owed_update, e->request_id,
-                         session_done_stream_count(s, e->subgroup_streams_opened,
-                                                   e->fill_streams_opened),
+                         session_owner_stream_count(s, e->handle._opaque, false),
                          &ea, n_before, &err_total, &done_len);
     if (rc < 0) return rc;
+    if (done_len > SIZE_MAX - err_total) return MOQ_ERR_BUFFER;
     if (err_total + done_len > s->send_cap) return MOQ_ERR_BUFFER;
     if (err_total + done_len > s->send_cap - s->send_len) return MOQ_ERR_WOULD_BLOCK;
 
@@ -5145,8 +5154,12 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
     entry->dt_sub_object_ms = object_ms;
     entry->dt_sub_has_subgroup = (timeout_flags & MOQ_SUBSCRIBE_SUBGROUP_DELIVERY_TIMEOUT) != 0;
     entry->dt_sub_subgroup_ms = subgroup_ms;
+    session_normalize_dt_selection(s, &entry->dt_sub_has_object,
+        &entry->dt_sub_object_ms, &entry->dt_sub_has_subgroup,
+        &entry->dt_sub_subgroup_ms);
     entry->delivery_timeout_us = ms_to_us_sat(dt_negotiate_ms(
-        entry->dt_sub_has_object, object_ms, entry->dt_sub_has_subgroup, subgroup_ms));
+        entry->dt_sub_has_object, entry->dt_sub_object_ms,
+        entry->dt_sub_has_subgroup, entry->dt_sub_subgroup_ms));
     entry->subscriber_priority = cfg->has_subscriber_priority ? cfg->subscriber_priority : 128;
     entry->group_order = (uint8_t)cfg->group_order;
     /* Commit the effective Forward State (default true) so the data-plane
@@ -5344,6 +5357,7 @@ moq_result_t session_accept_subscribe_receipt(moq_session_t *s,
     bool fail_fill = s->subs[slot].fill_unserved &&
         fill_unserved_opens_stream(&s->subs[slot].fill_unserved_input, snap_has,
                                    snap_g, snap_o, !s->subs[slot].forward);
+    if (fail_fill && !session_open_credit(s)) return MOQ_ERR_WOULD_BLOCK;
 
     /* Reserve-before-mutate: SUBSCRIBE_OK (1 action + ok_len send bytes) PLUS the
      * failed fill's header and RESET PLUS every Joining FETCH (§10.12.2)
@@ -5407,7 +5421,7 @@ moq_result_t session_accept_subscribe_receipt(moq_session_t *s,
     if (fail_fill)
         fill_open_failed(s, s->subs[slot].request_id,
                          s->subs[slot].fill_unserved_input.subscriber_priority,
-                         &s->subs[slot].fill_streams_opened);
+                         fill_parent_sub(s, (size_t)slot));
     s->subs[slot].fill_unserved = false;
     /* Release/reject the Joining FETCHes buffered against this subscription
      * (capacity reserved above): FETCH_REQUEST per release, INVALID_RANGE per
@@ -5913,6 +5927,12 @@ moq_result_t moq_session_done_subscribe(
     const moq_done_subscribe_cfg_t *cfg,
     uint64_t now_us)
 {
+    return session_done_subscribe(s, sub, cfg, now_us, false);
+}
+
+moq_result_t session_done_subscribe(moq_session_t *s, moq_subscription_t sub,
+    const moq_done_subscribe_cfg_t *cfg, uint64_t now_us, bool owned_count)
+{
     if (!s || !cfg) return MOQ_ERR_INVAL;
     if (cfg->struct_size < sizeof(moq_done_subscribe_cfg_t))
         return MOQ_ERR_INVAL;
@@ -5955,6 +5975,8 @@ moq_result_t moq_session_done_subscribe(
             return MOQ_ERR_WRONG_STATE;
     }
 
+    if (session_owner_open_blocked(s, e->handle._opaque)) return MOQ_ERR_WOULD_BLOCK;
+
     /* PUBLISH_DONE plus a RESET for every fill stream still open: ending the
      * subscription resets them. */
     if (action_queue_avail(s) < 1 + fill_parent_actions_needed(s, fill_parent_sub(s, (size_t)slot)))
@@ -5977,7 +5999,10 @@ moq_result_t moq_session_done_subscribe(
     moq_finish_publish_encode_args_t args = {
         .request_id = e->request_id,
         .status_code = cfg->status_code,
-        .stream_count = fill_stream_count(s, cfg->stream_count, e->fill_streams_opened),
+        .stream_count = owned_count
+            ? session_owner_stream_count(s, e->handle._opaque, false)
+            : fill_stream_count(s, cfg->stream_count,
+                session_owner_stream_count(s, e->handle._opaque, true)),
         .reason = cfg->reason.data,
         .reason_len = cfg->reason.len,
     };
@@ -6093,7 +6118,6 @@ moq_result_t moq_session_update_subscription(
     bool forward = has_forward && cfg->forward;
     bool has_generic_timeout = cfg->has_delivery_timeout;
     uint64_t generic_timeout_us = has_generic_timeout ? cfg->delivery_timeout_us : 0;
-    if (typed_options && has_generic_timeout) return MOQ_ERR_UNSUPPORTED;
 
     const moq_auth_token_t *auth_tokens = NULL;
     size_t auth_token_count = 0;
@@ -6129,6 +6153,7 @@ moq_result_t moq_session_update_subscription(
     if (!typed_options && (has_location || has_fill))
         return MOQ_ERR_UNSUPPORTED;
     if (timeout_flags && has_generic_timeout) return MOQ_ERR_INVAL;
+    if (typed_options && has_generic_timeout) return MOQ_ERR_UNSUPPORTED;
     {
         moq_result_t drc = session_check_dt_selection(s,
             (timeout_flags & MOQ_SUBSCRIPTION_UPDATE_OBJECT_DELIVERY_TIMEOUT) != 0,
@@ -6344,6 +6369,8 @@ moq_result_t moq_session_update_subscription(
     e->dt_upd_has_subgroup = args.dt_has_subgroup || has_generic_timeout;
     e->dt_upd_object_ms = has_generic_timeout ? generic_timeout_us / 1000u : object_ms;
     e->dt_upd_subgroup_ms = has_generic_timeout ? generic_timeout_us / 1000u : subgroup_ms;
+    session_normalize_dt_selection(s, &e->dt_upd_has_object,
+        &e->dt_upd_object_ms, &e->dt_upd_has_subgroup, &e->dt_upd_subgroup_ms);
     /* the acknowledged filter TYPE latches at the ACK (its requester-
      * side consumer is the Joining-FETCH eligibility gate); pend it here. */
     e->update_has_filter = has_filter;

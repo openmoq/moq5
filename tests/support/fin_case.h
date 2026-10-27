@@ -64,8 +64,10 @@ typedef enum fin_bridge_ingress {
  */
 /* Test-only storage for a full private owner plus its bounded owned-byte copy;
  * this is not a production frame or admission limit. Family size assertions
- * below the concrete snapshot definitions keep growth explicit. */
-#define FIN_BR_SNAP_MAX 1296
+ * below the concrete snapshot definitions keep growth explicit. The full
+ * publication owner grew by 16 bytes when its held count became two opened
+ * counts and their observation flags; retain the complete owner snapshot. */
+#define FIN_BR_SNAP_MAX 1312
 
 /* Alignment-safe opaque storage: a byte array would be under-aligned for the
  * family's real snapshot type. */

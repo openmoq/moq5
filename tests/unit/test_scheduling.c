@@ -18,6 +18,7 @@
  */
 #include <moq/moq.h>
 #include <moq/codec.h>
+#include <moq/publisher.h>
 #include <moq/transport_bridge.h>
 #include "test_support.h"
 #include "test_binding_support.h"
@@ -47,6 +48,9 @@ typedef struct {
     uint64_t done_wait_us;   /* the PUBLISH_DONE stream wait (0: default) */
 } pools_t;
 static pools_t g_pools;
+/* Only the server pool is constrained: the real peer must still be able to
+ * request the overflow fill. Restored immediately after pair creation. */
+static uint32_t g_server_fills;
 
 #define ASC  MOQ_GROUP_ORDER_ASCENDING
 #define DESC MOQ_GROUP_ORDER_DESCENDING
@@ -83,6 +87,8 @@ typedef struct {
     uint64_t accepted_seq;
     size_t   len;
     uint8_t  head[PAYLOAD_LEN];
+    uint8_t  bytes[32]; /* exact small writes for opt-in peer replay */
+    bool     complete;
     bool     fin;
     bool     sent;
 } mt_chunk_t;
@@ -146,6 +152,10 @@ typedef struct {
     size_t   queued;
     bool     drained_cap;   /* advertise and call the drained notice */
     bool     refuse_control;
+    bool     refuse_resets;
+    bool     limit_uni;
+    uint32_t uni_credit;
+    uint32_t uni_attempts;
     mt_stream_t streams[MT_MAX_STREAMS];
     mt_chunk_t  chunks[MT_MAX_CHUNKS];
     size_t      nchunks;
@@ -153,8 +163,8 @@ typedef struct {
     mt_ctrl_t   ctrl[MT_MAX_CTRL];
     size_t      nctrl;
     /* What went to the wire, in order: data chunks, resets. */
-    struct { uint64_t sid; uint8_t head[PAYLOAD_LEN]; size_t len; bool fin;
-             bool reset; } wire[MT_MAX_CHUNKS];
+    struct { uint64_t sid; uint8_t head[PAYLOAD_LEN], bytes[32]; size_t len; bool fin;
+             bool reset, complete; uint64_t reset_code; } wire[MT_MAX_CHUNKS];
     size_t   nwire;
     uint32_t priority_calls;
     uint32_t refuse_run;        /* refused writes since the last acceptance */
@@ -197,6 +207,9 @@ static bool mt_is_uni(uint64_t sid)
 static moq_transport_result_t mt_open_uni(void *ctx, uint64_t *out)
 {
     mt_t *m = ctx;
+    ++m->uni_attempts;
+    if (m->limit_uni && m->uni_credit == 0) return MOQ_TRANSPORT_WOULD_BLOCK;
+    if (m->limit_uni) --m->uni_credit;
     *out = m->next_uni;
     m->next_uni += 4;
     return MOQ_TRANSPORT_OK;
@@ -311,6 +324,8 @@ static moq_transport_result_t mt_write(void *ctx, uint64_t sid,
     c->accepted_seq = ++m->op_seq;
     c->len = len;
     if (len) memcpy(c->head, data, len < PAYLOAD_LEN ? len : PAYLOAD_LEN);
+    c->complete = len <= sizeof(c->bytes);
+    if (c->complete && len) memcpy(c->bytes, data, len);
     c->fin = fin;
     m->queued += len;
     return MOQ_TRANSPORT_OK;
@@ -334,7 +349,7 @@ static moq_transport_result_t mt_reset(void *ctx, uint64_t sid, uint64_t code)
     }
     st->reset_attempts++;
     st->reset_code = code;
-    if (st->refuse_reset) return MOQ_TRANSPORT_WOULD_BLOCK;
+    if (st->refuse_reset || m->refuse_resets) return MOQ_TRANSPORT_WOULD_BLOCK;
     m->refuse_run = 0;
     for (size_t i = 0; i < m->nchunks; i++)
         if (m->chunks[i].sid == sid && !m->chunks[i].sent) {
@@ -346,6 +361,7 @@ static moq_transport_result_t mt_reset(void *ctx, uint64_t sid, uint64_t code)
         memset(&m->wire[m->nwire], 0, sizeof(m->wire[0]));
         m->wire[m->nwire].sid = sid;
         m->wire[m->nwire].reset = true;
+        m->wire[m->nwire].reset_code = code;
         m->wire_seq[m->nwire] = ++m->op_seq;
         m->nwire++;
     }
@@ -445,6 +461,9 @@ static bool mt_serve_one(mt_t *m)
         m->wire[m->nwire].len = best->len;
         m->wire[m->nwire].fin = best->fin;
         m->wire[m->nwire].reset = false;
+        m->wire[m->nwire].complete = best->complete;
+        if (best->complete && best->len)
+            memcpy(m->wire[m->nwire].bytes, best->bytes, best->len);
         m->nwire++;
     }
     bool more = false;
@@ -478,6 +497,7 @@ typedef struct {
     fake_endpoint_t sub_ep;
     uint64_t now;
     void *ops_copy;   /* the publisher bridge's ops object, when not &mt->ops */
+    size_t delivered_wire;
 } pair_t;
 
 /* How the next pair's publisher endpoint offers budget_spent to its bridge,
@@ -648,6 +668,7 @@ static bool pair_init_retained(pair_t *p, moq_version_t ver, size_t cap,
     cc.max_subscriptions = sc.max_subscriptions = g_pools.subscriptions;
     cc.max_open_subgroups = sc.max_open_subgroups = g_pools.subgroups;
     cc.max_publishes = sc.max_publishes = g_pools.publishes;
+    sc.max_fills = g_server_fills;
     cc.done_wait_timeout_us = sc.done_wait_timeout_us = g_pools.done_wait_us;
     if (moq_session_create(&cc, 0, &p->sub) < 0) return false;
     if (moq_session_create(&sc, 0, &p->pub) < 0) return false;
@@ -783,6 +804,29 @@ static void serve_all(pair_t *p)
         }
     }
     CHECK_TABLE_COUNTS(p->pub_br);
+}
+
+/* Existing scheduling rows inspect prefixes only. Completion rows opt into
+ * replay of exact captured writes; never pretend a truncated log is wire. */
+static bool deliver_captured(pair_t *p)
+{
+    for (; p->delivered_wire < p->mt->nwire; ++p->delivered_wire) {
+        size_t i = p->delivered_wire;
+        moq_result_t rc;
+        if (p->mt->wire[i].reset)
+            rc = moq_transport_bridge_on_peer_stream_reset(p->sub_br,
+                p->mt->wire[i].sid, p->mt->wire[i].reset_code, p->now);
+        else {
+            MOQ_TEST_CHECK(p->mt->wire[i].complete);
+            if (!p->mt->wire[i].complete) return false;
+            rc = moq_transport_bridge_on_peer_uni_bytes(p->sub_br,
+                p->mt->wire[i].sid, p->mt->wire[i].bytes, p->mt->wire[i].len,
+                p->mt->wire[i].fin, p->now);
+        }
+        MOQ_TEST_CHECK_EQ_INT((int)rc, MOQ_OK);
+        if (rc != MOQ_OK) return false;
+    }
+    return true;
 }
 
 typedef struct {
@@ -3233,13 +3277,24 @@ static bool regression_owner(pair_t *p, bool publication, const char *name,
     moq_bytes_t part = MOQ_BYTES_LITERAL("live");
     moq_bytes_t track_name = { (const uint8_t *)name, strlen(name) };
     if (publication) {
-        REG_REQUIRE(timeout_ms == 0); /* timeout rows use SUBSCRIBE */
         moq_publish_cfg_t pc;
         moq_publish_cfg_init_sized(&pc, sizeof(pc));
         pc.track_namespace = (moq_namespace_t){ &part, 1 };
         pc.track_name = track_name;
         pc.has_subscriber_priority = p->ver == MOQ_VERSION_DRAFT_22;
         pc.subscriber_priority = priority;
+        uint8_t props[32];
+        size_t props_len = 0;
+        if (timeout_ms) {
+            moq_track_delivery_timeouts_cfg_t timeouts;
+            moq_track_delivery_timeouts_cfg_init(&timeouts);
+            timeouts.has_object_delivery_timeout = true;
+            timeouts.object_delivery_timeout_ms = timeout_ms;
+            REG_REQUIRE(moq_session_track_properties_add_delivery_timeouts(p->pub,
+                NULL, 0, &timeouts,
+                props, sizeof(props), &props_len) == MOQ_OK);
+            pc.track_properties = (moq_bytes_t){ props, props_len };
+        }
         REG_REQUIRE(moq_session_publish(p->pub, &pc, p->now, &out->pub) == MOQ_OK);
     } else {
         moq_subscribe_cfg_t sc;
@@ -3725,6 +3780,16 @@ static bool expiry_successor_row(pair_t *p, expiry_successor_t which,
     REG_REQUIRE(moq_session_write_object(p->pub, sg, 0, *payload, p->now) == MOQ_OK);
     if (!cancel_first) {
         REG_REQUIRE(moq_session_close_subgroup(p->pub, sg, p->now) == MOQ_OK);
+        if (header_refused) {
+            size_t tail = p->pub->action_tail, bytes = p->pub->send_len;
+            size_t refs = moq_rcbuf_refcount(*payload);
+            REG_REQUIRE(regression_finish(p, &owner, 1, "successor") == MOQ_ERR_WOULD_BLOCK);
+            REG_REQUIRE(p->pub->action_tail == tail && p->pub->send_len == bytes);
+            REG_REQUIRE(moq_rcbuf_refcount(*payload) == refs);
+            uint64_t next = p->mt->next_uni;
+            REG_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+            REG_REQUIRE(p->mt->next_uni == next + 4); /* real open; write still refused */
+        }
         REG_REQUIRE(regression_finish(p, &owner, 1, "successor") == MOQ_OK);
     }
     REG_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
@@ -4595,6 +4660,7 @@ static bool sa_scenario(pair_t *p, sa_run_t *r)
             !publish_group(p, &lo, 3, g, 0, 128, 2, false, NULL)) return false;
     }
     bool closed = false, done = false;
+    size_t next_done = 0;
     for (int step = 0; step < 4000; step++) {
         if (step == 6 && !closed) {
             for (size_t g = 0; g < SA_GROUPS; g++)
@@ -4602,18 +4668,22 @@ static bool sa_scenario(pair_t *p, sa_run_t *r)
                     return false;
             closed = true;
         }
-        if (step == 12 && !done) {
+        if (step >= 12 && !done) {
             const track_t *t[3] = { &hi, &mid, &lo };
-            for (size_t i = 0; i < 3; i++) {
+            /* An observing bridge may still owe some first opens under the
+             * shared budget. Keep driving normally below and retry only the
+             * unaccepted owner, in order; an accepted DONE is never repeated. */
+            for (; next_done < 3; next_done++) {
                 moq_done_subscribe_cfg_t dc;
                 moq_done_subscribe_cfg_init(&dc);
                 dc.status_code = 0x3;
                 dc.stream_count = SA_GROUPS;
-                if (moq_session_done_subscribe(p->pub, t[i]->sub, &dc,
-                                               p->now) != MOQ_OK)
-                    return false;
+                moq_result_t rc = moq_session_done_subscribe(
+                    p->pub, t[next_done]->sub, &dc, p->now);
+                if (rc == MOQ_ERR_WOULD_BLOCK) break;
+                if (rc != MOQ_OK) return false;
             }
-            done = true;
+            done = next_done == 3;
         }
         const uint32_t before = mt_refused(p->mt);
         p->mt->refuse_run = p->mt->worst_refuse_run = 0;
@@ -7666,7 +7736,7 @@ static void test_object_timeout_after_handover(void)
  * to open a new stream to deliver additional Objects in that Subgroup".
  * Drafts 18 and 22: draft-16 times a whole subgroup from its open, so its
  * earlier subgroup would time out too. */
-static void test_object_timeout_before_open(void)
+static void test_object_timeout_before_open_case(bool lost_header)
 {
     static const moq_version_t vers[] = { MOQ_VERSION_DRAFT_18,
                                           MOQ_VERSION_DRAFT_22 };
@@ -7678,33 +7748,1294 @@ static void test_object_timeout_before_open(void)
         track_t t;
         MOQ_TEST_CHECK(subscribe_timed(&p, "v", -1, NONE, NONE, 50, &t));
         MOQ_TEST_CHECK_EQ_SIZE(moq_transport_bridge_stream_count(p.pub_br), 3);
+        uint64_t first_data_uni = p.mt->next_uni;
         moq_subgroup_handle_t g1;
         MOQ_TEST_CHECK(publish_group(&p, &t, 1, 1, 0, 128, 2, true, &g1));
         moq_transport_bridge_service(p.pub_br, p.now);
+        if (!lost_header) {
+            serve_all(&p);
+            MOQ_TEST_CHECK(deliver_captured(&p));
+        }
         MOQ_TEST_CHECK(publish_group(&p, &t, 1, 2, 0, 128, 2, false, NULL));
         moq_transport_bridge_service(p.pub_br, p.now);
         uint64_t next_uni = p.mt->next_uni;
         p.now += 51 * 1000;
         moq_transport_bridge_service(p.pub_br, p.now);
-        MOQ_TEST_CHECK_EQ_INT((int)moq_session_close_subgroup(p.pub, g1,
-                                                              p.now), MOQ_OK);
+        /* A plain application reset before network service intentionally
+         * loses the accepted prefix in the negative control. */
+        moq_result_t close_rc = lost_header
+            ? moq_session_reset_subgroup(p.pub, g1, 1, p.now)
+            : moq_session_close_subgroup(p.pub, g1, p.now);
+        MOQ_TEST_CHECK_EQ_INT((int)close_rc, MOQ_OK);
         serve_all(&p);
+        MOQ_TEST_CHECK(deliver_captured(&p));
+        shuttle(&p);
         MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.pub_br));
         MOQ_TEST_CHECK_EQ_U64(p.mt->next_uni, next_uni);
         uint32_t w[8];
         size_t n = wire_objects(&p, w, 8);
-        MOQ_TEST_CHECK_EQ_SIZE(n, 2);
+        MOQ_TEST_CHECK_EQ_SIZE(n, lost_header ? 0 : 2);
         for (size_t i = 0; i < n; i++)
             MOQ_TEST_CHECK_EQ_INT((int)((w[i] >> 16) & 0xff), 1);
         MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(p.pub),
                               MOQ_SESS_ESTABLISHED);
+        bool prefix_seen = false, fin_seen = false, reset_seen = false;
+        for (size_t i = 0; i < p.mt->nwire; ++i) {
+            if (p.mt->wire[i].sid != first_data_uni) continue;
+            prefix_seen |= !p.mt->wire[i].reset && p.mt->wire[i].len != 0;
+            fin_seen |= p.mt->wire[i].fin;
+            reset_seen |= p.mt->wire[i].reset;
+        }
+        MOQ_TEST_CHECK(lost_header ? !prefix_seen && reset_seen : prefix_seen && fin_seen);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        int peer_slot = sub_resolve_handle(p.sub, t.csub);
+        MOQ_TEST_CHECK(peer_slot >= 0);
+        if (peer_slot >= 0)
+            MOQ_TEST_CHECK_EQ_U64(p.sub->subs[peer_slot].processed_stream_count,
+                                  lost_header ? 0 : 1);
+#endif
+        /* The unopened subgroup must not inflate a later terminal. Ask for
+         * a deferred priority UPDATE and reject it through the real session
+         * path: the library, rather than this test, chooses Stream Count. */
+        drain_events(p.sub);
+        drain_events(p.pub);
+        MOQ_TEST_CHECK(moq_session_set_defer_subscription_updates(p.pub, true)
+                       == MOQ_OK);
+        moq_subscription_update_cfg_t update;
+        moq_subscription_update_cfg_init_sized(&update, sizeof(update));
+        update.has_subscriber_priority = true;
+        update.subscriber_priority = 64;
+        MOQ_TEST_CHECK(moq_session_update_subscription(p.sub, t.csub,
+                       &update, p.now) == MOQ_OK);
+        shuttle(&p);
+        uint64_t update_id = 0;
+        bool got_update = false;
+        moq_event_t ev;
+        while (moq_session_poll_events(p.pub, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED &&
+                ev.u.subscribe_updated.answer_owed) {
+                got_update = true;
+                update_id = ev.u.subscribe_updated.update_request_id;
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(got_update);
+        if (got_update) {
+            moq_reject_subscription_update_cfg_t reject;
+            moq_reject_subscription_update_cfg_init_sized(&reject, sizeof(reject));
+            reject.update_request_id = update_id;
+            reject.error_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+            MOQ_TEST_CHECK(moq_session_reject_subscription_update(p.pub, t.sub,
+                           &reject, p.now) == MOQ_OK);
+            for (unsigned i = 0; i < 4; ++i)
+                MOQ_TEST_CHECK(moq_transport_bridge_service(p.pub_br, p.now) == MOQ_OK);
+            uint64_t advertised = UINT64_MAX;
+            unsigned wire_done = 0;
+            for (size_t i = 0; i < p.mt->nctrl; ++i) {
+                const mt_ctrl_t *c = &p.mt->ctrl[i];
+                moq_buf_reader_t r;
+                moq_buf_reader_init(&r, c->data, c->len);
+                while (moq_buf_reader_remaining(&r)) {
+                    moq_control_envelope_t env;
+                    moq_result_t wire_rc = moq_control_decode_envelope(&r, &env);
+                    MOQ_TEST_CHECK(wire_rc == MOQ_OK);
+                    if (wire_rc != MOQ_OK) break;
+                    if (env.msg_type != MOQ_D16_PUBLISH_DONE) continue;
+                    moq_buf_reader_t body;
+                    uint64_t status = UINT64_MAX;
+                    moq_buf_reader_init(&body, env.payload, env.payload_len);
+                    MOQ_TEST_CHECK(moq_buf_read_vi64(&body, &status) == MOQ_OK);
+                    MOQ_TEST_CHECK(moq_buf_read_vi64(&body, &advertised) == MOQ_OK);
+                    MOQ_TEST_CHECK(status == 8 && advertised == 1 && c->fin);
+                    ++wire_done;
+                }
+            }
+            MOQ_TEST_CHECK_EQ_INT((int)wire_done, 1);
+            shuttle(&p);
+            size_t done = 0;
+            while (moq_session_poll_events(p.sub, &ev, 1) > 0) {
+                if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) {
+                    ++done;
+                    MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.stream_count, advertised);
+                    MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.status_code, 8);
+                }
+                moq_event_cleanup(&ev);
+            }
+            bool awaiting_terminal = done == 0; /* public event observation */
+            uint64_t deadline = moq_session_next_deadline_us(p.sub);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+            int slot = sub_resolve_handle(p.sub, t.csub);
+            bool held = slot >= 0 && p.sub->subs[slot].done_pending;
+            MOQ_TEST_CHECK(held == awaiting_terminal);
+            if (held) {
+                MOQ_TEST_CHECK_EQ_U64(p.sub->subs[slot].done_stream_count, advertised);
+                MOQ_TEST_CHECK_EQ_U64(p.sub->subs[slot].done_deadline_us, deadline);
+            }
+#endif
+            uint64_t actual = (p.mt->next_uni - first_data_uni) / 4;
+            MOQ_TEST_CHECK_EQ_U64(actual, 1);
+            fprintf(stderr, "%s d%d actual=%llu advertised=%llu done=%zu awaiting=%d\n",
+                    lost_header ? "PR62-COUNT-LOST" : "PR62-COUNT",
+                    draft_of(p.ver), (unsigned long long)actual,
+                    (unsigned long long)advertised, done, awaiting_terminal);
+            MOQ_TEST_CHECK_EQ_U64(advertised, 1);
+            MOQ_TEST_CHECK_EQ_SIZE(done, lost_header ? 0 : 1);
+            MOQ_TEST_CHECK(awaiting_terminal == lost_header);
+            if (lost_header && awaiting_terminal) {
+                MOQ_TEST_CHECK(deadline > p.now && deadline < UINT64_MAX);
+                MOQ_TEST_CHECK(moq_session_tick(p.sub, deadline - 1) == MOQ_OK);
+                bool premature = false;
+                while (moq_session_poll_events(p.sub, &ev, 1)) {
+                    premature |= ev.kind == MOQ_EVENT_SUBSCRIBE_DONE;
+                    moq_event_cleanup(&ev);
+                }
+                MOQ_TEST_CHECK(!premature);
+                MOQ_TEST_CHECK(moq_session_tick(p.sub, deadline) == MOQ_OK);
+                unsigned recovered = 0;
+                while (moq_session_poll_events(p.sub, &ev, 1)) {
+                    if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) {
+                        ++recovered;
+                        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.stream_count, 1);
+                        MOQ_TEST_CHECK_EQ_U64(ev.u.subscribe_done.status_code, 8);
+                    }
+                    moq_event_cleanup(&ev);
+                }
+                MOQ_TEST_CHECK_EQ_INT((int)recovered, 1);
+            }
+        }
         pair_destroy(&p);
     }
     MOQ_TEST_PASS("an expired subgroup waiting for a stream never opens one");
 }
 
+static void test_object_timeout_before_open(void)
+{
+    test_object_timeout_before_open_case(false);
+    test_object_timeout_before_open_case(true);
+}
+
+#ifdef MOQ_SESSION_SWEEP_TESTING
+/* These rows deliberately call private session/bridge helpers. The shipping
+ * scheduling target retains its public wire/terminal coverage above. */
+static void accounting_drive(pair_t *p)
+{
+    /* Data and request/control are distinct model queues. Drive BOTH before
+     * observing a terminal; neither queue alone proves peer delivery. */
+    shuttle(p);
+    serve_all(p);
+    MOQ_TEST_CHECK(deliver_captured(p));
+    shuttle(p);
+    serve_all(p);
+    MOQ_TEST_CHECK(deliver_captured(p));
+    shuttle(p);
+}
+
+/* Actual-open accounting: the transport's next_uni/accepted writes are the
+ * oracle. Private records are inspected only for admission/lifetime, never
+ * used as a substitute for observing an endpoint open. */
+#define ACCOUNT_REQUIRE(expr) do { \
+    if (!(expr)) { \
+        fprintf(stderr, "FAIL: %s:%d: %s\n", __FILE__, __LINE__, #expr); \
+        failures++; \
+        return false; \
+    } \
+} while (0)
+
+static uint64_t accounting_owner(const regression_owner_t *o)
+{
+    return o->publication ? o->pub._opaque : o->track.sub._opaque;
+}
+
+static bool accounting_group(pair_t *p, const regression_owner_t *o, uint64_t group,
+                              bool object, moq_stream_ref_t *ref)
+{
+    moq_subgroup_cfg_t cfg;
+    moq_subgroup_cfg_init(&cfg);
+    cfg.group_id = group;
+    moq_subgroup_handle_t sg;
+    moq_result_t rc = o->publication
+        ? moq_session_open_pub_subgroup(p->pub, o->pub, &cfg, p->now, &sg)
+        : moq_session_open_subgroup(p->pub, o->track.sub, &cfg, p->now, &sg);
+    ACCOUNT_REQUIRE(rc == MOQ_OK);
+    *ref = p->pub->subgroups[moq_handle_slot(sg._opaque)].stream_ref;
+    if (object) ACCOUNT_REQUIRE(write_object(p, sg, 1, group, 0, 0) == MOQ_OK);
+    ACCOUNT_REQUIRE(moq_session_close_subgroup(p->pub, sg, p->now) == MOQ_OK);
+    return true;
+}
+
+static moq_result_t accounting_finish(pair_t *p, const regression_owner_t *o,
+                                      bool owned, uint64_t caller_count)
+{
+    if (o->publication) {
+        moq_finish_publish_cfg_t cfg;
+        moq_finish_publish_cfg_init(&cfg);
+        cfg.status_code = 2;
+        cfg.stream_count = caller_count;
+        return session_finish_publish(p->pub, o->pub, &cfg, p->now, owned);
+    }
+    moq_done_subscribe_cfg_t cfg;
+    moq_done_subscribe_cfg_init(&cfg);
+    cfg.status_code = 2;
+    cfg.stream_count = caller_count;
+    return session_done_subscribe(p->pub, o->track.sub, &cfg, p->now, owned);
+}
+
+static bool accounting_peer_done(pair_t *p, const regression_owner_t *o,
+                                  uint64_t count, uint64_t status)
+{
+    unsigned found = 0;
+    moq_event_t ev;
+    while (moq_session_poll_events(p->sub, &ev, 1)) {
+        bool match = o->publication
+            ? ev.kind == MOQ_EVENT_PUBLISH_FINISHED &&
+              moq_publication_eq(ev.u.publish_finished.pub, o->peer_pub)
+            : ev.kind == MOQ_EVENT_SUBSCRIBE_DONE &&
+              moq_subscription_eq(ev.u.subscribe_done.sub, o->track.csub);
+        if (match) {
+            uint64_t n = o->publication ? ev.u.publish_finished.stream_count
+                                         : ev.u.subscribe_done.stream_count;
+            uint64_t code = o->publication ? ev.u.publish_finished.status_code
+                                            : ev.u.subscribe_done.status_code;
+            const bool valid = n == count && code == status;
+            moq_event_cleanup(&ev);
+            ACCOUNT_REQUIRE(valid);
+            ++found;
+        } else {
+            moq_event_cleanup(&ev);
+        }
+    }
+    ACCOUNT_REQUIRE(found == 1);
+    return true;
+}
+
+/* DONE is attempted BEFORE the bridge even sees a header. Its encoded bytes
+ * cannot be repaired later: admission itself must refuse until resolution. */
+static bool accounting_suppressed_row(pair_t *p, bool publication, bool owned)
+{
+    regression_owner_t o;
+    ACCOUNT_REQUIRE(regression_owner(p, publication, "account-zero", 128, 50, &o));
+    uint64_t first = p->mt->next_uni;
+    p->mt->limit_uni = true;
+    p->mt->uni_credit = 0;
+    moq_stream_ref_t ref;
+    ACCOUNT_REQUIRE(accounting_group(p, &o, 1, true, &ref));
+    size_t tail = p->pub->action_tail, bytes = p->pub->send_len;
+    ACCOUNT_REQUIRE(accounting_finish(p, &o, owned, owned ? 99 : 0) == MOQ_ERR_WOULD_BLOCK);
+    ACCOUNT_REQUIRE(p->pub->action_tail == tail && p->pub->send_len == bytes);
+    ACCOUNT_REQUIRE(session_owner_open_pending(p->pub, accounting_owner(&o)));
+    uint32_t attempts = p->mt->uni_attempts;
+    ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    ACCOUNT_REQUIRE(p->mt->next_uni == first && p->mt->uni_attempts > attempts);
+    p->now += 51000;
+    for (unsigned i = 0; i < 4; ++i) {
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        drain_events(p->pub);
+    }
+    ACCOUNT_REQUIRE(!session_owner_open_pending(p->pub, accounting_owner(&o)));
+    ACCOUNT_REQUIRE(p->mt->next_uni == first);
+    ACCOUNT_REQUIRE(!bridge_session_resolve_data_open(p->pub, ref,
+        accounting_owner(&o), MOQ_DATA_OPENED)); /* duplicate/stale, not an open */
+    ACCOUNT_REQUIRE(accounting_finish(p, &o, owned, owned ? 99 : 0) == MOQ_OK);
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(accounting_peer_done(p, &o, 0, 2));
+    ACCOUNT_REQUIRE(p->pub->pending_open_count == 0);
+    return true;
+}
+
+/* An empty stream counts; an accepted open with a refused FIRST write also
+ * counts. Retrying writes/FIN and late stale suppression never undo it. */
+static bool accounting_opened_row(pair_t *p, bool publication, bool refuse_header)
+{
+    regression_owner_t o;
+    ACCOUNT_REQUIRE(regression_owner(p, publication, "account-open", 128, 50, &o));
+    uint64_t first = p->mt->next_uni;
+    if (refuse_header) p->mt->cap = 0;
+    moq_stream_ref_t ref;
+    ACCOUNT_REQUIRE(accounting_group(p, &o, 1, refuse_header, &ref));
+    ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    ACCOUNT_REQUIRE(p->mt->next_uni == first + 4);
+    ACCOUNT_REQUIRE(!session_owner_open_pending(p->pub, accounting_owner(&o)));
+    ACCOUNT_REQUIRE(!bridge_session_suppress_data_open(p->pub, ref, accounting_owner(&o)));
+    if (refuse_header) {
+        ACCOUNT_REQUIRE(p->mt->nchunks == 0);
+        p->mt->refuse_resets = true;
+        p->now += 51000;
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        p->mt->cap = 1u << 20;
+        accounting_drive(p); /* accepted prefix really reaches the peer */
+        p->mt->refuse_resets = false;
+    }
+    for (unsigned i = 0; i < 4; ++i)
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    ACCOUNT_REQUIRE(p->mt->next_uni == first + 4);
+    ACCOUNT_REQUIRE(accounting_finish(p, &o, true, 0) == MOQ_OK);
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(accounting_peer_done(p, &o, 1, 2));
+    return true;
+}
+
+/* Draft-16 shares ordinary subgroup accounting, but neither fill nor the
+ * later publication UPDATE eligibility is inferred for it. */
+static bool accounting_d16_row(pair_t *p, bool publication, bool refuse_open)
+{
+    regression_owner_t o;
+    ACCOUNT_REQUIRE(regression_owner(p, publication, "account-d16", 128, 0, &o));
+    uint64_t first = p->mt->next_uni;
+    p->mt->limit_uni = true;
+    p->mt->uni_credit = refuse_open ? 0 : 1;
+    moq_stream_ref_t ref;
+    ACCOUNT_REQUIRE(accounting_group(p, &o, 1, refuse_open, &ref));
+    size_t tail = p->pub->action_tail, bytes = p->pub->send_len;
+    uint64_t next_ref = p->pub->next_stream_ref;
+    ACCOUNT_REQUIRE(accounting_finish(p, &o, true, 0) == MOQ_ERR_WOULD_BLOCK);
+    ACCOUNT_REQUIRE(p->pub->action_tail == tail && p->pub->send_len == bytes &&
+                    p->pub->next_stream_ref == next_ref);
+    ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    if (refuse_open) {
+        ACCOUNT_REQUIRE(p->mt->next_uni == first && p->mt->uni_attempts > 0);
+        tail = p->pub->action_tail; bytes = p->pub->send_len;
+        ACCOUNT_REQUIRE(accounting_finish(p, &o, true, 0) == MOQ_ERR_WOULD_BLOCK);
+        ACCOUNT_REQUIRE(p->pub->action_tail == tail && p->pub->send_len == bytes);
+        p->mt->uni_credit = 1;
+    }
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(p->mt->next_uni == first + 4);
+    ACCOUNT_REQUIRE(!session_owner_open_pending(p->pub, accounting_owner(&o)));
+    ACCOUNT_REQUIRE(accounting_finish(p, &o, true, 0) == MOQ_OK);
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(accounting_peer_done(p, &o, 1, 2));
+    ACCOUNT_REQUIRE(p->pub->pending_open_count == 0);
+    return true;
+}
+
+static bool accounting_update_row(pair_t *p, bool publication, bool automatic, bool core_owned)
+{
+    regression_owner_t o;
+    ACCOUNT_REQUIRE(regression_owner(p, publication, "account-update", 128, 50, &o));
+    uint64_t first = p->mt->next_uni;
+    p->mt->limit_uni = true;
+    p->mt->uni_credit = 0;
+    moq_stream_ref_t ref;
+    ACCOUNT_REQUIRE(accounting_group(p, &o, 1, true, &ref));
+    uint8_t core_header[32]; size_t core_header_len = 0;
+    ACCOUNT_REQUIRE(!core_owned || automatic);
+    if (core_owned) {
+        /* The original automatic ingress: no publisher bridge service before
+         * core expiry. The untimed header is still CORE-owned, not suppressed. */
+        ACCOUNT_REQUIRE(p->pub->pending_open_count == 1 && p->pub->action_timed == 1);
+        bool unhanded = false;
+        for (size_t i = 0; i < p->pub->action_cap; ++i) {
+            const moq_pending_open_t *opening = &p->pub->pending_opens[i];
+            if (opening->ref == ref._v && opening->owner == accounting_owner(&o))
+                unhanded = !opening->handed;
+        }
+        for (size_t i = p->pub->action_head; i < p->pub->action_tail; ++i) {
+            const moq_action_t *a = &p->pub->actions[i % p->pub->action_cap];
+            const moq_action_meta_t *m = &p->pub->action_meta[i % p->pub->action_cap];
+            if (a->kind == MOQ_ACTION_SEND_DATA && m->subgroup_header &&
+                a->u.send_data.stream_ref._v == ref._v) {
+                ACCOUNT_REQUIRE(core_header_len == 0 && m->opens_data &&
+                    m->owner == accounting_owner(&o) && m->deadline_us == UINT64_MAX);
+                core_header_len = a->u.send_data.header_len;
+                ACCOUNT_REQUIRE(core_header_len > 0 && core_header_len <= sizeof(core_header));
+                memcpy(core_header, a->u.send_data.header, core_header_len);
+            }
+        }
+        ACCOUNT_REQUIRE(unhanded && core_header_len > 0 && p->mt->nchunks == 0 &&
+            p->pub_br->pending_count == 0 && !mt_retry_dstream(p->pub_br, ref));
+    } else {
+        /* Both rows exercise BRIDGE expiry of an unopened stream. The decoded
+         * automatic path below does not shuttle the request, so it otherwise
+         * first services the publisher after expiry: core expiry can remove the
+         * timed object while preserving its untimed header, whose open decision
+         * is still pending. Retain the fresh object in the bridge explicitly. */
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        ACCOUNT_REQUIRE(p->mt->next_uni == first && p->mt->uni_attempts > 0);
+        ACCOUNT_REQUIRE(session_owner_open_pending(p->pub, accounting_owner(&o)));
+        bool timed_retained = false, header_handed = false;
+        for (size_t i = 0; i < p->pub->action_cap; ++i) {
+            const moq_pending_open_t *opening = &p->pub->pending_opens[i];
+            if (opening->ref == ref._v && opening->owner == accounting_owner(&o))
+                header_handed = opening->handed;
+        }
+        for (uint32_t i = 0; i < p->pub_br->pending_count; ++i) {
+            const bridge_pending_item_t *item = &p->pub_br->pending[i];
+            if (item->stream_ref._v == ref._v && item->meta.owner == accounting_owner(&o) &&
+                item->meta.deadline_us > p->now && item->meta.deadline_us != UINT64_MAX)
+                timed_retained = true;
+        }
+        const bridge_dstream_t *retained = mt_retry_dstream(p->pub_br, ref);
+        if (retained) {
+            ACCOUNT_REQUIRE(!retained->has_sid);
+            for (uint32_t i = 0; i < retained->q_len; ++i) {
+                const bridge_data_item_t *item = &retained->q[(retained->q_head + i) % retained->q_cap];
+                if (item->meta.owner == accounting_owner(&o) &&
+                    item->meta.deadline_us > p->now && item->meta.deadline_us != UINT64_MAX)
+                    timed_retained = true;
+            }
+        }
+        ACCOUNT_REQUIRE(header_handed && timed_retained);
+    }
+    ACCOUNT_REQUIRE(moq_session_set_defer_subscription_updates(p->pub, true) == MOQ_OK);
+    moq_result_t rc;
+    if (publication) {
+        moq_publication_update_cfg_t u;
+        moq_publication_update_cfg_init_sized(&u, sizeof(u));
+        u.has_subscriber_priority = true; u.subscriber_priority = 64;
+        rc = moq_session_update_publication(p->sub, o.peer_pub, &u, p->now);
+    } else {
+        moq_subscription_update_cfg_t u;
+        moq_subscription_update_cfg_init_sized(&u, sizeof(u));
+        u.has_subscriber_priority = true; u.subscriber_priority = 64;
+        rc = moq_session_update_subscription(p->sub, o.track.csub, &u, p->now);
+    }
+    ACCOUNT_REQUIRE(rc == MOQ_OK);
+    if (automatic) {
+        /* Isolate the core's decoded-unsupported route. The peer has a REAL
+         * pending update; consume its output and supply the decoder's normal
+         * target/endpoint plus unsupported flag, without a public test seam.
+         * The parent DT03 above independently covers the complete wire route. */
+        int peer_slot = publication ? pub_resolve_handle(p->sub, o.peer_pub)
+                                   : sub_resolve_handle(p->sub, o.track.csub);
+        int slot = publication ? pub_resolve_handle(p->pub, o.pub)
+                              : sub_resolve_handle(p->pub, o.track.sub);
+        ACCOUNT_REQUIRE(peer_slot >= 0 && slot >= 0);
+        uint64_t id = publication ? p->sub->publishes[peer_slot].update_request_id
+                                 : p->sub->subs[peer_slot].update_request_id;
+        moq_action_t a;
+        while (moq_session_poll_actions(p->sub, &a, 1)) moq_action_cleanup(&a);
+        moq_decoded_request_update_t d = {0};
+        d.request_id = id;
+        d.target_kind = publication ? MOQ_REQ_PUBLISH : MOQ_REQ_SUBSCRIPTION;
+        d.target_slot = slot;
+        d.has_unsupported = true;
+        d.endpoint.kind = d.target_kind;
+        d.endpoint.slot = slot;
+        d.endpoint.has_request_id = true;
+        d.endpoint.request_id = id;
+        d.endpoint.has_stream_ref = true;
+        d.endpoint.stream_ref = publication ? p->pub->publishes[slot].rs.ref
+                                            : p->pub->subs[slot].rs.ref;
+        ACCOUNT_REQUIRE(session_core_on_request_update(p->pub, &d) == MOQ_OK);
+    } else {
+        shuttle(p);
+        moq_event_t ev;
+        bool found = false;
+        uint64_t id = 0;
+        while (moq_session_poll_events(p->pub, &ev, 1)) {
+            if (publication && ev.kind == MOQ_EVENT_PUBLISH_UPDATED) {
+                found = ev.u.publish_updated.answer_owed;
+                id = ev.u.publish_updated.update_request_id;
+            } else if (!publication && ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED) {
+                found = ev.u.subscribe_updated.answer_owed;
+                id = ev.u.subscribe_updated.update_request_id;
+            }
+            moq_event_cleanup(&ev);
+        }
+        ACCOUNT_REQUIRE(found);
+        moq_reject_subscription_update_cfg_t reject;
+        moq_reject_subscription_update_cfg_init_sized(&reject, sizeof(reject));
+        reject.update_request_id = id;
+        reject.error_code = MOQ_REQUEST_ERROR_INTERNAL_ERROR;
+        rc = publication ? moq_session_reject_publication_update(p->pub, o.pub, &reject, p->now)
+                         : moq_session_reject_subscription_update(p->pub, o.track.sub, &reject, p->now);
+        ACCOUNT_REQUIRE(rc == MOQ_OK);
+    }
+    /* No finite DONE may have been encoded while the opening decision was
+     * unresolved, even if error/closure actions are already queued. */
+    for (size_t i = p->pub->action_head; i < p->pub->action_tail; ++i)
+        ACCOUNT_REQUIRE(p->pub->action_meta[i % p->pub->action_cap].terminal_owner == 0);
+    p->now += 51000;
+    p->mt->cap = 1u << 20;
+    for (unsigned i = 0; i < 4; ++i)
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    uint64_t expected_count = 0, reset_seq = 0;
+    if (core_owned) {
+        /* Expiry did not dispose of the core-owned header. With credit still
+         * zero the opening obligation and held terminal must remain live. */
+        ACCOUNT_REQUIRE(p->mt->next_uni == first && p->mt->nchunks == 0 &&
+                        p->pub->pending_open_count == 1);
+        ACCOUNT_REQUIRE(session_owner_open_pending(p->pub, accounting_owner(&o)));
+        for (size_t i = p->pub->action_head; i < p->pub->action_tail; ++i)
+            ACCOUNT_REQUIRE(p->pub->action_meta[i % p->pub->action_cap].terminal_owner == 0);
+        for (size_t i = 0; i < p->mt->nctrl; ++i) {
+            moq_buf_reader_t r;
+            moq_buf_reader_init(&r, p->mt->ctrl[i].data, p->mt->ctrl[i].len);
+            while (moq_buf_reader_remaining(&r)) {
+                moq_control_envelope_t env;
+                ACCOUNT_REQUIRE(moq_control_decode_envelope(&r, &env) == MOQ_OK);
+                ACCOUNT_REQUIRE(env.msg_type != MOQ_D16_PUBLISH_DONE);
+            }
+        }
+        shuttle(p); /* REQUEST_ERROR can progress while the data open waits. */
+        moq_event_t ev;
+        while (moq_session_poll_events(p->sub, &ev, 1)) {
+            bool done = o.publication ? ev.kind == MOQ_EVENT_PUBLISH_FINISHED
+                                     : ev.kind == MOQ_EVENT_SUBSCRIBE_DONE;
+            moq_event_cleanup(&ev);
+            ACCOUNT_REQUIRE(!done);
+        }
+        ACCOUNT_REQUIRE(p->mt->next_uni == first && p->pub->pending_open_count == 1);
+        drain_events(p->pub); /* return any timeout-event credit */
+        /* Real transport recovery, not a disposition call or timer invented
+         * by the fixture. Hold RESET so this model actually delivers the
+         * reliable prefix instead of discarding unsent chunks at reset. */
+        p->mt->refuse_resets = true;
+        p->mt->uni_credit = 1;
+        serve_all(p);
+        ACCOUNT_REQUIRE(p->mt->next_uni == first + 4 && p->pub->pending_open_count == 0);
+        ACCOUNT_REQUIRE(p->mt->nwire == 1 && !p->mt->wire[0].reset && !p->mt->wire[0].fin &&
+            p->mt->wire[0].complete && p->mt->wire[0].len == core_header_len &&
+            memcmp(p->mt->wire[0].bytes, core_header, core_header_len) == 0);
+        ACCOUNT_REQUIRE(deliver_captured(p)); /* receiver can attribute the header */
+        int peer_slot = publication ? pub_resolve_handle(p->sub, o.peer_pub)
+                                   : sub_resolve_handle(p->sub, o.track.csub);
+        ACCOUNT_REQUIRE(peer_slot >= 0);
+        ACCOUNT_REQUIRE(publication ? p->sub->publishes[peer_slot].processed_stream_count == 0
+                                    : p->sub->subs[peer_slot].processed_stream_count == 0);
+        p->mt->refuse_resets = false;
+        for (unsigned i = 0; i < 4; ++i)
+            ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        ACCOUNT_REQUIRE(p->mt->nwire == 2 && p->mt->wire[1].reset &&
+            p->mt->wire[1].sid == p->mt->wire[0].sid &&
+            p->mt->wire[1].reset_code == MOQ_RESET_DELIVERY_TIMEOUT);
+        mt_stream_t *stream = mt_stream(p->mt, p->mt->wire[0].sid);
+        ACCOUNT_REQUIRE(stream && stream->reset_reliable == core_header_len);
+        reset_seq = p->mt->wire_seq[1];
+        ACCOUNT_REQUIRE(reset_seq != 0 && deliver_captured(p));
+        ACCOUNT_REQUIRE(publication ? p->sub->publishes[peer_slot].processed_stream_count == 1
+                                    : p->sub->subs[peer_slot].processed_stream_count == 1);
+        uint32_t objects[1];
+        ACCOUNT_REQUIRE(wire_objects(p, objects, 1) == 0);
+        expected_count = 1;
+    }
+    ACCOUNT_REQUIRE(!session_owner_open_pending(p->pub, accounting_owner(&o)));
+    /* Inspect the actual accepted terminal bytes before shuttle consumes
+     * this control log. Neither a private zero nor peer silence proves it. */
+    unsigned wire_done = 0;
+    for (size_t i = 0; i < p->mt->nctrl; ++i) {
+        const mt_ctrl_t *c = &p->mt->ctrl[i];
+        moq_buf_reader_t r;
+        moq_buf_reader_init(&r, c->data, c->len);
+        while (moq_buf_reader_remaining(&r)) {
+            moq_control_envelope_t env;
+            ACCOUNT_REQUIRE(moq_control_decode_envelope(&r, &env) == MOQ_OK);
+            if (env.msg_type != MOQ_D16_PUBLISH_DONE) continue;
+            moq_buf_reader_t body;
+            uint64_t status, count;
+            moq_buf_reader_init(&body, env.payload, env.payload_len);
+            ACCOUNT_REQUIRE(moq_buf_read_vi64(&body, &status) == MOQ_OK);
+            ACCOUNT_REQUIRE(moq_buf_read_vi64(&body, &count) == MOQ_OK);
+            ACCOUNT_REQUIRE(status == 8 && count == expected_count && c->fin);
+            if (core_owned) ACCOUNT_REQUIRE(c->accepted_seq > reset_seq);
+            ++wire_done;
+        }
+    }
+    ACCOUNT_REQUIRE(wire_done == 1);
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(p->mt->next_uni == first + (core_owned ? 4u : 0u));
+    ACCOUNT_REQUIRE(p->mt->nwire == (core_owned ? 2u : 0u));
+    ACCOUNT_REQUIRE(accounting_peer_done(p, &o, expected_count, 8));
+    return true;
+}
+
+static bool accounting_credit_row(pair_t *p, bool publication)
+{
+    regression_owner_t o;
+    ACCOUNT_REQUIRE(regression_owner(p, publication, "account-credit", 128, 50, &o));
+    p->mt->limit_uni = true; p->mt->uni_credit = 0;
+    uint64_t first = p->mt->next_uni;
+    moq_stream_ref_t last = {0};
+    for (size_t i = 0; i < p->pub->action_cap; ++i) {
+        ACCOUNT_REQUIRE(accounting_group(p, &o, i + 1, true, &last));
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    }
+    ACCOUNT_REQUIRE(p->pub->pending_open_count == p->pub->action_cap);
+    size_t tail = p->pub->action_tail;
+    uint64_t next = p->pub->next_stream_ref;
+    moq_subgroup_cfg_t cfg;
+    moq_subgroup_cfg_init(&cfg); cfg.group_id = 99;
+    moq_subgroup_handle_t sg;
+    moq_result_t rc = publication
+        ? moq_session_open_pub_subgroup(p->pub, o.pub, &cfg, p->now, &sg)
+        : moq_session_open_subgroup(p->pub, o.track.sub, &cfg, p->now, &sg);
+    ACCOUNT_REQUIRE(rc == MOQ_ERR_WOULD_BLOCK && !moq_subgroup_is_valid(sg));
+    ACCOUNT_REQUIRE(p->pub->action_tail == tail && p->pub->next_stream_ref == next);
+    ACCOUNT_REQUIRE(!bridge_session_resolve_data_open(p->pub, last,
+        accounting_owner(&o) ^ UINT64_C(0x10000), MOQ_DATA_OPENED));
+    ACCOUNT_REQUIRE(p->pub->pending_open_count == p->pub->action_cap);
+    p->now += 51000;
+    for (unsigned i = 0; i < 6; ++i) {
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        drain_events(p->pub);
+    }
+    ACCOUNT_REQUIRE(p->pub->pending_open_count == 0 && p->mt->next_uni == first);
+    p->mt->uni_credit = 1;
+    moq_stream_ref_t fresh;
+    ACCOUNT_REQUIRE(accounting_group(p, &o, 100, false, &fresh));
+    ACCOUNT_REQUIRE(fresh._v != last._v);
+    ACCOUNT_REQUIRE(!bridge_session_suppress_data_open(p->pub, last, accounting_owner(&o)));
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(p->mt->next_uni == first + 4);
+    ACCOUNT_REQUIRE(accounting_finish(p, &o, true, 0) == MOQ_OK);
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(accounting_peer_done(p, &o, 1, 2));
+    regression_owner_t replacement;
+    ACCOUNT_REQUIRE(regression_owner(p, publication, "account-reuse", 128, 0, &replacement));
+    ACCOUNT_REQUIRE(accounting_owner(&replacement) != accounting_owner(&o));
+    moq_stream_ref_t reused;
+    ACCOUNT_REQUIRE(accounting_group(p, &replacement, 1, false, &reused));
+    ACCOUNT_REQUIRE(!bridge_session_resolve_data_open(p->pub, reused,
+        accounting_owner(&o), MOQ_DATA_OPENED));
+    ACCOUNT_REQUIRE(session_owner_open_pending(p->pub, accounting_owner(&replacement)));
+    p->mt->uni_credit = 1;
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(accounting_finish(p, &replacement, true, 0) == MOQ_OK);
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(accounting_peer_done(p, &replacement, 1, 2));
+    return true;
+}
+
+/* A raw handoff is not an endpoint open. Conversely, destruction of retained
+ * never-opened work is a proven local suppression, and an earlier actual
+ * open remains counted after the bridge/map has disappeared. */
+static bool accounting_detach_row(pair_t *p, bool publication, unsigned mode)
+{
+    regression_owner_t o;
+    ACCOUNT_REQUIRE(regression_owner(p, publication, "account-detach", 128, 0, &o));
+    uint64_t first = p->mt->next_uni;
+    p->mt->limit_uni = true;
+    p->mt->uni_credit = mode == 2 ? 1 : 0;
+    if (mode == 2) p->mt->cap = 0;
+    moq_stream_ref_t ref;
+    ACCOUNT_REQUIRE(accounting_group(p, &o, 1, false, &ref));
+    if (mode == 1 || mode == 2)
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    moq_transport_bridge_destroy(p->pub_br);
+    p->pub_br = NULL;
+    p->mt->bridge = NULL;
+    ACCOUNT_REQUIRE(p->mt->next_uni == first + (mode == 2 ? 4u : 0u));
+    moq_action_t a;
+    if (mode == 0 || mode == 3) {
+        ACCOUNT_REQUIRE(p->pub->pending_open_count == 1); /* still core-owned */
+        while (moq_session_poll_actions(p->pub, &a, 1)) moq_action_cleanup(&a);
+        ACCOUNT_REQUIRE(p->pub->pending_open_count == 0);
+        ACCOUNT_REQUIRE(session_owner_stream_count(p->pub, accounting_owner(&o), false)
+                    == p->pub->profile->stream_count_unknown);
+    }
+    uint64_t want = mode == 1 ? 0 : mode == 2 ? 1
+        : mode == 3 ? 7 : p->pub->profile->stream_count_unknown;
+    ACCOUNT_REQUIRE(accounting_finish(p, &o, mode != 3, 7) == MOQ_OK);
+    unsigned found = 0;
+    while (moq_session_poll_actions(p->pub, &a, 1)) {
+        const uint8_t *data = NULL;
+        size_t len = 0;
+        if (a.kind == MOQ_ACTION_SEND_CONTROL) {
+            data = a.u.send_control.data; len = a.u.send_control.len;
+        } else if (a.kind == MOQ_ACTION_SEND_BIDI_STREAM) {
+            data = a.u.send_bidi_stream.data; len = a.u.send_bidi_stream.len;
+        }
+        if (len) {
+            moq_buf_reader_t r;
+            moq_control_envelope_t e;
+            moq_buf_reader_init(&r, data, len);
+            ACCOUNT_REQUIRE(moq_control_decode_envelope(&r, &e) == MOQ_OK);
+            if (e.msg_type == MOQ_D16_PUBLISH_DONE) {
+                moq_buf_reader_t body;
+                uint64_t code, count;
+                moq_buf_reader_init(&body, e.payload, e.payload_len);
+                ACCOUNT_REQUIRE(moq_buf_read_vi64(&body, &code) == MOQ_OK);
+                ACCOUNT_REQUIRE(moq_buf_read_vi64(&body, &count) == MOQ_OK);
+                ACCOUNT_REQUIRE(code == 2 && count == want);
+                ++found;
+            }
+        }
+        moq_action_cleanup(&a);
+    }
+    ACCOUNT_REQUIRE(found == 1);
+    ACCOUNT_REQUIRE(!bridge_session_resolve_data_open(p->pub, ref,
+        accounting_owner(&o), MOQ_DATA_OPENED));
+    return true;
+}
+
+/* Empty/aborted real fills and the no-child failed-fill path all carry the
+ * FULL parent identity, even while their headers are blocked. */
+static bool accounting_publication_fill(pair_t *p, regression_owner_t *o,
+                                         moq_fill_t *fill)
+{
+    memset(o, 0, sizeof(*o)); o->publication = true;
+    moq_bytes_t part = MOQ_BYTES_LITERAL("live");
+    moq_publish_cfg_t pc;
+    moq_publish_cfg_init_sized(&pc, sizeof(pc));
+    pc.track_namespace = (moq_namespace_t){ &part, 1 };
+    pc.track_name = MOQ_BYTES_LITERAL("account-pub-fill");
+    ACCOUNT_REQUIRE(moq_session_publish(p->pub, &pc, p->now, &o->pub) == MOQ_OK);
+    shuttle(p);
+    moq_event_t e;
+    bool found = false;
+    while (moq_session_poll_events(p->sub, &e, 1)) {
+        if (e.kind == MOQ_EVENT_PUBLISH_REQUEST) {
+            o->peer_pub = e.u.publish_request.pub; found = true;
+        }
+        moq_event_cleanup(&e);
+    }
+    ACCOUNT_REQUIRE(found);
+    moq_accept_publish_cfg_t ac;
+    moq_accept_publish_cfg_init(&ac);
+    ACCOUNT_REQUIRE(moq_session_accept_publish(p->sub, o->peer_pub, &ac, p->now) == MOQ_OK);
+    shuttle(p); drain_events(p->pub); drain_events(p->sub);
+    /* Establish the publisher's Largest through an actual delivered stream,
+     * rather than assuming advertisement seeds its internal track history. */
+    moq_stream_ref_t initial;
+    ACCOUNT_REQUIRE(accounting_group(p, o, 6, true, &initial));
+    accounting_drive(p); drain_events(p->pub); drain_events(p->sub);
+    moq_fill_cfg_t fc;
+    moq_fill_cfg_init(&fc);
+    moq_publication_update_cfg_t u;
+    moq_publication_update_cfg_init_sized(&u, sizeof(u));
+    u.fill = &fc;
+    ACCOUNT_REQUIRE(moq_session_update_publication(p->sub, o->peer_pub, &u, p->now) == MOQ_OK);
+    shuttle(p);
+    found = false;
+    while (moq_session_poll_events(p->pub, &e, 1)) {
+        if (e.kind == MOQ_EVENT_FILL_REQUEST) {
+            ACCOUNT_REQUIRE(moq_publication_eq(e.u.fill_request.pub, o->pub));
+            *fill = e.u.fill_request.fill; found = true;
+        }
+        moq_event_cleanup(&e);
+    }
+    drain_events(p->sub);
+    ACCOUNT_REQUIRE(found && moq_fill_is_valid(*fill));
+    return true;
+}
+
+static bool accounting_fill_row(pair_t *p, unsigned mode, bool publication)
+{
+    fill_row_name = "actual-open";
+    fill_row_cap = p->mt->cap;
+    regression_owner_t o = {0};
+    moq_fill_t fill = MOQ_FILL_INVALID;
+    if (publication) ACCOUNT_REQUIRE(accounting_publication_fill(p, &o, &fill));
+    else {
+        fill_track_t f;
+        ACCOUNT_REQUIRE(start_fill(p, ASC, ASC, 128, -1, &f));
+        o.track = f.track; fill = f.fill;
+    }
+    uint64_t first = p->mt->next_uni;
+    p->mt->limit_uni = true; p->mt->uni_credit = 0;
+    if (mode == 2) {
+        /* Existing rejected/overflowed-fill commit helper: no live child
+         * owns the header, but the session and bridge must retain its parent. */
+        fill_open_failed(p->pub, 9999, 128,
+            publication ? fill_parent_pub(p->pub, (size_t)pub_resolve_handle(p->pub, o.pub))
+                : fill_parent_sub(p->pub, (size_t)sub_resolve_handle(p->pub, o.track.sub)));
+    } else {
+        ACCOUNT_REQUIRE(moq_session_open_fill(p->pub, fill, p->now) == MOQ_OK);
+        if (mode == 0) ACCOUNT_REQUIRE(moq_session_end_fill(p->pub, fill, p->now) == MOQ_OK);
+        else ACCOUNT_REQUIRE(moq_session_abort_fill(p->pub, fill, 1, p->now) == MOQ_OK);
+    }
+    size_t tail = p->pub->action_tail, bytes = p->pub->send_len;
+    ACCOUNT_REQUIRE(accounting_finish(p, &o, false, publication ? 1 : 0) == MOQ_ERR_WOULD_BLOCK);
+    ACCOUNT_REQUIRE(p->pub->action_tail == tail && p->pub->send_len == bytes);
+    ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    ACCOUNT_REQUIRE(p->mt->next_uni == first);
+    ACCOUNT_REQUIRE(session_owner_open_pending(p->pub, accounting_owner(&o)));
+    p->mt->refuse_resets = mode == 1;
+    p->mt->uni_credit = 1;
+    if (mode == 2) {
+        /* The deliberately synthetic initiating id is inspected as sender
+         * wire only; do not feed an unrequested fill into the real peer. */
+        for (unsigned i = 0; i < 4; ++i)
+            ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        ACCOUNT_REQUIRE(p->mt->next_uni == first + 4);
+        ACCOUNT_REQUIRE(session_owner_stream_count(p->pub, accounting_owner(&o), true) == 1);
+        ACCOUNT_REQUIRE(regression_finish(p, &o, publication ? 1 : 0, "failed-fill") == MOQ_OK);
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        size_t done_count; uint64_t done_seq;
+        ACCOUNT_REQUIRE(regression_done(p, "failed-fill", publication ? 2 : 1, &done_count, &done_seq));
+        ACCOUNT_REQUIRE(done_count == 1 && done_seq > 0);
+        return true;
+    }
+    accounting_drive(p);
+    p->mt->refuse_resets = false;
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(p->mt->next_uni == first + 4);
+    ACCOUNT_REQUIRE(accounting_finish(p, &o, false, publication ? 1 : 0) == MOQ_OK);
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(accounting_peer_done(p, &o, publication ? 2 : 1, 2));
+    return true;
+}
+
+static moq_result_t accounting_fill_answer(pair_t *p, const regression_owner_t *o,
+                                          unsigned producer, uint64_t id)
+{
+    if (producer == 0) {
+        moq_accept_subscribe_cfg_t ac;
+        moq_accept_subscribe_cfg_init(&ac);
+        ac.has_largest = true;
+        ac.largest_group = 6;
+        ac.largest_object = 1;
+        return moq_session_accept_subscribe(p->pub, o->track.sub, &ac, p->now);
+    }
+    moq_accept_subscription_update_cfg_t ac;
+    moq_accept_subscription_update_cfg_init_sized(&ac, sizeof(ac));
+    ac.update_request_id = id;
+    return producer == 1
+        ? moq_session_accept_subscription_update(p->pub, o->track.sub, &ac, p->now)
+        : moq_session_accept_publication_update(p->pub, o->pub, &ac, p->now);
+}
+
+/* Exercise the THREE real answer producers, not just fill_open_failed(). A
+ * waiting real child fills the server pool; endpoint-refused ordinary opens
+ * independently exhaust record credit. No private counter is manufactured. */
+static bool accounting_failed_fill_answer_row(pair_t *p, unsigned producer, bool deferred)
+{
+    fill_row_name = "failed-fill-answer";
+    fill_row_cap = p->mt->cap;
+    fill_track_t seed;
+    ACCOUNT_REQUIRE(start_fill(p, ASC, ASC, 128, -1, &seed));
+    ACCOUNT_REQUIRE(p->pub->fills.live == 1 && p->pub->fill_cap == 1);
+    regression_owner_t o = {0}, blocker;
+    if (producer != 0) {
+        ACCOUNT_REQUIRE(regression_owner(p, producer == 2, "failed-fill-target", 128, 0, &o));
+        moq_stream_ref_t ref;
+        ACCOUNT_REQUIRE(accounting_group(p, &o, 6, true, &ref));
+        accounting_drive(p);
+        drain_events(p->pub); drain_events(p->sub);
+    }
+    ACCOUNT_REQUIRE(regression_owner(p, false, "failed-fill-credit", 128, 50, &blocker));
+    uint64_t first = p->mt->next_uni;
+    p->mt->limit_uni = true; p->mt->uni_credit = 0;
+    for (size_t i = 0; i < p->pub->action_cap; ++i) {
+        moq_stream_ref_t ref;
+        ACCOUNT_REQUIRE(accounting_group(p, &blocker, i + 1, true, &ref));
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    }
+    ACCOUNT_REQUIRE(p->pub->pending_open_count == p->pub->action_cap);
+    ACCOUNT_REQUIRE(p->mt->next_uni == first);
+
+    moq_fill_cfg_t fc;
+    moq_fill_cfg_init(&fc);
+    moq_location_filter_cfg_t loc;
+    moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    moq_result_t rc;
+    if (producer == 0) {
+        moq_bytes_t part = MOQ_BYTES_LITERAL("live");
+        moq_subscribe_cfg_t sc;
+        moq_subscribe_cfg_init(&sc);
+        sc.track_namespace = (moq_namespace_t){ &part, 1 };
+        sc.track_name = MOQ_BYTES_LITERAL("failed-fill-initial");
+        sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
+        sc.fill = &fc;
+        rc = moq_session_subscribe(p->sub, &sc, p->now, &o.track.csub);
+    } else {
+        ACCOUNT_REQUIRE(moq_session_set_defer_subscription_updates(p->pub, deferred) == MOQ_OK);
+        if (producer == 1) {
+            moq_subscription_update_cfg_t u;
+            moq_subscription_update_cfg_init_sized(&u, sizeof(u));
+            u.fill = &fc; u.location = &loc;
+            rc = moq_session_update_subscription(p->sub, o.track.csub, &u, p->now);
+        } else {
+            moq_publication_update_cfg_t u;
+            moq_publication_update_cfg_init_sized(&u, sizeof(u));
+            u.fill = &fc; u.location = &loc;
+            rc = moq_session_update_publication(p->sub, o.peer_pub, &u, p->now);
+        }
+    }
+    ACCOUNT_REQUIRE(rc == MOQ_OK);
+    uint64_t initiating_id = 0, update_id = 0;
+    bool created = false, requested = false;
+    moq_event_t ev;
+    while (moq_session_poll_events(p->sub, &ev, 1)) {
+        if (ev.kind == MOQ_EVENT_FILL_CREATED) {
+            created = producer == 2
+                ? moq_publication_eq(ev.u.fill_created.pub, o.peer_pub)
+                : moq_subscription_eq(ev.u.fill_created.sub, o.track.csub);
+            initiating_id = ev.u.fill_created.initiating_request_id;
+        }
+        moq_event_cleanup(&ev);
+    }
+    ACCOUNT_REQUIRE(created);
+    bool automatic = producer != 0 && !deferred;
+    int slot = producer == 2 ? pub_resolve_handle(p->pub, o.pub)
+                             : producer == 1 ? sub_resolve_handle(p->pub, o.track.sub) : -1;
+    moq_stream_ref_t input_ref = {0};
+    if (automatic) {
+        ACCOUNT_REQUIRE(slot >= 0);
+        input_ref = producer == 2 ? p->pub->publishes[slot].rs.ref : p->pub->subs[slot].rs.ref;
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->sub_br, p->now) == MOQ_OK);
+        /* Capture the REAL encoded UPDATE on its existing request bidi.
+         * Feed the public core input once, then retry the retained input
+         * with no bytes. This isolates pre-ACK ID commit from bridge retries. */
+        uint8_t wire[512]; size_t len = 0; unsigned writes = 0;
+        for (size_t i = 0; i < p->sub_ep.count; ++i) {
+            const fake_op_t *op = &p->sub_ep.ops[i];
+            if (op->kind != FAKE_OP_WRITE) continue;
+            ACCOUNT_REQUIRE(!op->fin && op->data_len <= sizeof(wire));
+            memcpy(wire, op->data, op->data_len); len = op->data_len; ++writes;
+        }
+        ACCOUNT_REQUIRE(writes == 1 && len != 0);
+        fake_endpoint_clear_ops(&p->sub_ep);
+        ACCOUNT_REQUIRE(moq_session_process_pending(p->pub, p->now) == MOQ_OK);
+        size_t profile_size = p->pub->profile->state_size;
+        void *profile_before = malloc(profile_size ? profile_size : 1);
+        ACCOUNT_REQUIRE(profile_before != NULL);
+        memcpy(profile_before, p->pub->profile_state, profile_size);
+        size_t tail = p->pub->action_tail, bytes = p->pub->send_len;
+        uint64_t next = p->pub->next_stream_ref;
+        moq_open_counts_t opens = producer == 2 ? p->pub->publishes[slot].opened
+                                               : p->pub->subs[slot].opened;
+        rc = moq_session_on_bidi_stream_bytes(p->pub, input_ref, wire, len, false, p->now);
+        bool same_ids = memcmp(profile_before, p->pub->profile_state, profile_size) == 0;
+        free(profile_before);
+        ACCOUNT_REQUIRE(rc == MOQ_ERR_WOULD_BLOCK && same_ids);
+        ACCOUNT_REQUIRE(p->pub->action_tail == tail && p->pub->send_len == bytes &&
+                        p->pub->next_stream_ref == next && p->pub->fills.live == 1);
+        const moq_request_stream_t *rs = producer == 2 ? &p->pub->publishes[slot].rs : &p->pub->subs[slot].rs;
+        const moq_sub_update_snapshot_t *snap = producer == 2
+            ? &p->pub->publishes[slot].update_snapshot : &p->pub->subs[slot].update_snapshot;
+        const moq_owed_update_t *pending = producer == 2
+            ? &p->pub->publishes[slot].owed_update : &p->pub->subs[slot].owed_update;
+        const moq_open_counts_t *actual = producer == 2
+            ? &p->pub->publishes[slot].opened : &p->pub->subs[slot].opened;
+        ACCOUNT_REQUIRE(rs->recv_len == len && memcmp(rs->recv_buf, wire, len) == 0);
+        ACCOUNT_REQUIRE(snap->valid && snap->request_id == initiating_id && !pending->owed);
+        ACCOUNT_REQUIRE(opens.subgroup == actual->subgroup && opens.fill == actual->fill &&
+            opens.subgroup_external == actual->subgroup_external && opens.fill_external == actual->fill_external);
+        ACCOUNT_REQUIRE(producer == 2 ? p->pub->publishes[slot].filter_type != MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START
+                                     : p->pub->subs[slot].filter_type != MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START);
+        ACCOUNT_REQUIRE(producer == 2 ? p->pub->publishes[slot].fill_streams_opened == 0
+                                     : p->pub->subs[slot].fill_streams_opened == 0);
+        update_id = snap->request_id;
+        requested = true;
+    } else shuttle(p);
+    while (moq_session_poll_events(p->pub, &ev, 1)) {
+        if (producer == 0 && ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
+            o.track.sub = ev.u.subscribe_request.sub; requested = true;
+        } else if (producer == 1 && ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED) {
+            requested = ev.u.subscribe_updated.answer_owed &&
+                moq_subscription_eq(ev.u.subscribe_updated.sub, o.track.sub);
+            update_id = ev.u.subscribe_updated.update_request_id;
+        } else if (producer == 2 && ev.kind == MOQ_EVENT_PUBLISH_UPDATED) {
+            requested = ev.u.publish_updated.answer_owed &&
+                moq_publication_eq(ev.u.publish_updated.pub, o.pub);
+            update_id = ev.u.publish_updated.update_request_id;
+        }
+        moq_event_cleanup(&ev);
+    }
+    ACCOUNT_REQUIRE(requested);
+    slot = producer == 2 ? pub_resolve_handle(p->pub, o.pub)
+                         : sub_resolve_handle(p->pub, o.track.sub);
+    ACCOUNT_REQUIRE(slot >= 0 && action_queue_avail(p->pub) >= 3);
+    moq_owed_update_t *owed = producer == 2 ? &p->pub->publishes[slot].owed_update
+                                           : &p->pub->subs[slot].owed_update;
+    if (producer == 0) {
+        ACCOUNT_REQUIRE(p->pub->subs[slot].fill_unserved);
+        ACCOUNT_REQUIRE(p->pub->subs[slot].request_id == initiating_id);
+    } else if (!automatic) {
+        ACCOUNT_REQUIRE(owed->owed && owed->rec.fill_request_id == initiating_id);
+    }
+    /* Normalize drained send storage before observing the answer's effects;
+     * an advancing call may reclaim that storage even when it refuses. */
+    ACCOUNT_REQUIRE(moq_session_process_pending(p->pub, p->now) == MOQ_OK);
+    /* Deferred ingress has committed its id; automatic ingress has retained
+     * its bytes and snapshot but NOT committed the id. A second refusal
+     * must preserve either retry obligation and all accepted parent state. */
+    union { moq_sub_entry_t sub; moq_pub_entry_t pub; } before;
+    void *entry = producer == 2 ? (void *)&p->pub->publishes[slot]
+                                : (void *)&p->pub->subs[slot];
+    size_t entry_size = producer == 2 ? sizeof(before.pub) : sizeof(before.sub);
+    memcpy(&before, entry, entry_size);
+    size_t head = p->pub->action_head, tail = p->pub->action_tail, bytes = p->pub->send_len;
+    uint64_t next = p->pub->next_stream_ref;
+    size_t profile_size = p->pub->profile->state_size;
+    void *profile_before = malloc(profile_size ? profile_size : 1);
+    ACCOUNT_REQUIRE(profile_before != NULL);
+    memcpy(profile_before, p->pub->profile_state, profile_size);
+    rc = automatic ? moq_session_on_bidi_stream_bytes(p->pub, input_ref, NULL, 0, false, p->now)
+                   : accounting_fill_answer(p, &o, producer, update_id);
+    bool profile_same = memcmp(profile_before, p->pub->profile_state, profile_size) == 0;
+    free(profile_before);
+    ACCOUNT_REQUIRE(rc == MOQ_ERR_WOULD_BLOCK);
+    ACCOUNT_REQUIRE(memcmp(&before, entry, entry_size) == 0 && profile_same);
+    ACCOUNT_REQUIRE(p->pub->action_head == head && p->pub->action_tail == tail &&
+                    p->pub->send_len == bytes && p->pub->next_stream_ref == next);
+    ACCOUNT_REQUIRE(p->pub->fills.live == 1 && p->mt->next_uni == first);
+
+    p->now += 51000;
+    for (unsigned i = 0; i < 6; ++i) {
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        drain_events(p->pub);
+    }
+    ACCOUNT_REQUIRE(p->pub->pending_open_count == 0 && p->mt->next_uni == first);
+    rc = automatic ? moq_session_on_bidi_stream_bytes(p->pub, input_ref, NULL, 0, false, p->now)
+                   : accounting_fill_answer(p, &o, producer, update_id);
+    ACCOUNT_REQUIRE(rc == MOQ_OK);
+    ACCOUNT_REQUIRE(p->pub->next_stream_ref == next + 1 && p->pub->fills.live == 1);
+    ACCOUNT_REQUIRE(producer == 0 ? !p->pub->subs[slot].fill_unserved : !owed->owed);
+    unsigned headers = 0, resets = 0;
+    uint8_t expected[32];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, expected, sizeof(expected));
+    ACCOUNT_REQUIRE(p->pub->profile->encode_fetch_header(p->pub, &w, initiating_id) == MOQ_OK);
+    size_t expected_len = moq_buf_writer_offset(&w);
+    for (size_t i = p->pub->action_head; i < p->pub->action_tail; ++i) {
+        const moq_action_t *a = &p->pub->actions[i % p->pub->action_cap];
+        const moq_action_meta_t *meta = &p->pub->action_meta[i % p->pub->action_cap];
+        if (a->kind != MOQ_ACTION_SEND_DATA && a->kind != MOQ_ACTION_RESET_DATA) continue;
+        ACCOUNT_REQUIRE(meta->owner == accounting_owner(&o) && meta->mode == MOQ_SCHED_MODE_FILL);
+        if (a->kind == MOQ_ACTION_SEND_DATA) {
+            ACCOUNT_REQUIRE(meta->opens_data && a->u.send_data.stream_ref._v == next &&
+                a->u.send_data.header_len == expected_len &&
+                memcmp(a->u.send_data.header, expected, expected_len) == 0);
+            ++headers;
+        } else {
+            ACCOUNT_REQUIRE(a->u.reset_data.stream_ref._v == next &&
+                            a->u.reset_data.reliable_size == expected_len);
+            ++resets;
+        }
+    }
+    ACCOUNT_REQUIRE(headers == 1 && resets == 1);
+    /* Hold RESET until the captured prefix actually reaches the peer. The
+     * model's RESET_AT op otherwise deliberately discards unsent chunks. */
+    p->mt->refuse_resets = true; p->mt->uni_credit = 1;
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(p->mt->next_uni == first + 4);
+    bool bound = false;
+    int peer_slot = producer == 2 ? pub_resolve_handle(p->sub, o.peer_pub)
+                                  : sub_resolve_handle(p->sub, o.track.csub);
+    ACCOUNT_REQUIRE(peer_slot >= 0);
+    if (producer != 0) ACCOUNT_REQUIRE(producer == 2
+        ? !p->sub->publishes[peer_slot].update_pending : !p->sub->subs[peer_slot].update_pending);
+    ACCOUNT_REQUIRE(moq_session_state(p->pub) == MOQ_SESS_ESTABLISHED &&
+                    moq_session_state(p->sub) == MOQ_SESS_ESTABLISHED);
+    moq_fill_parent_t peer_parent = producer == 2
+        ? fill_parent_pub(p->sub, (size_t)peer_slot)
+        : fill_parent_sub(p->sub, (size_t)peer_slot);
+    for (size_t i = 0; i < p->sub->fill_cap; ++i) {
+        const moq_fill_entry_t *f = &p->sub->fill_storage[i];
+        if (f->active && f->initiating_id == initiating_id && f->stream_bound) {
+            ACCOUNT_REQUIRE(f->parent.family == peer_parent.family &&
+                f->parent.slot == peer_parent.slot && f->parent.generation == peer_parent.generation);
+            bound = true;
+        }
+    }
+    ACCOUNT_REQUIRE(bound);
+    ACCOUNT_REQUIRE(session_owner_stream_count(p->pub, accounting_owner(&o), true) == 1);
+    ACCOUNT_REQUIRE(session_owner_stream_count(p->pub, seed.track.sub._opaque, true) == 0);
+    p->mt->refuse_resets = false;
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(accounting_finish(p, &o, false, producer == 0 ? 0 : 1) == MOQ_OK);
+    accounting_drive(p);
+    ACCOUNT_REQUIRE(accounting_peer_done(p, &o, producer == 0 ? 1 : 2, 2));
+    ACCOUNT_REQUIRE(p->mt->next_uni == first + 4);
+    return true;
+}
+
+static bool accounting_facade_row(pair_t *p, moq_publisher_t **facade)
+{
+    moq_pub_cfg_t pc;
+    moq_pub_cfg_init_sized(&pc, sizeof(pc));
+    pc.accept_mode = MOQ_PUB_ACCEPT_ALL;
+    ACCOUNT_REQUIRE(moq_pub_create(p->pub, moq_alloc_default(), &pc, facade) == MOQ_OK);
+    moq_pub_track_cfg_t tc;
+    moq_pub_track_cfg_init_sized(&tc, sizeof(tc));
+    moq_bytes_t part = MOQ_BYTES_LITERAL("live");
+    tc.track_namespace = (moq_namespace_t){ &part, 1 };
+    tc.track_name = MOQ_BYTES_LITERAL("account-fanout");
+    uint8_t props[32]; size_t props_len = 0;
+    moq_track_delivery_timeouts_cfg_t timeouts;
+    moq_track_delivery_timeouts_cfg_init(&timeouts);
+    timeouts.has_object_delivery_timeout = true;
+    timeouts.object_delivery_timeout_ms = 50;
+    ACCOUNT_REQUIRE(moq_session_track_properties_add_delivery_timeouts(p->pub,
+        NULL, 0, &timeouts, props, sizeof(props), &props_len) == MOQ_OK);
+    tc.track_properties = (moq_bytes_t){ props, props_len };
+    /* D18 forbids duplicate same-track SUBSCRIBEs in one session. Two
+     * independent owners exercise that profile; D22 retains actual fanout. */
+    moq_pub_track_t *tracks[2] = {NULL, NULL};
+    unsigned ntracks = p->ver == MOQ_VERSION_DRAFT_22 ? 1u : 2u;
+    for (unsigned i = 0; i < ntracks; ++i) {
+        tc.track_name = i ? MOQ_BYTES_LITERAL("account-other") : MOQ_BYTES_LITERAL("account-fanout");
+        ACCOUNT_REQUIRE(moq_pub_add_track(*facade, &tc, p->now, &tracks[i]) == MOQ_OK);
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+        moq_subscribe_cfg_t sc;
+        moq_subscribe_cfg_init(&sc);
+        sc.track_namespace = tc.track_namespace;
+        sc.track_name = ntracks == 2 && i ? MOQ_BYTES_LITERAL("account-other") : MOQ_BYTES_LITERAL("account-fanout");
+        moq_subscription_t sub;
+        ACCOUNT_REQUIRE(moq_session_subscribe(p->sub, &sc, p->now, &sub) == MOQ_OK);
+        shuttle(p);
+        ACCOUNT_REQUIRE(moq_pub_tick(*facade, p->now) == MOQ_OK);
+        shuttle(p);
+        drain_events(p->sub);
+    }
+    unsigned active = 0;
+    for (unsigned i = 0; i < ntracks; ++i)
+        active += (unsigned)moq_pub_active_subscriptions(*facade, tracks[i]);
+    ACCOUNT_REQUIRE(active == 2);
+    uint64_t first = p->mt->next_uni;
+    p->mt->limit_uni = true; p->mt->uni_credit = 1;
+    moq_rcbuf_t *payload = NULL;
+    ACCOUNT_REQUIRE(moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)"x", 1, &payload) == MOQ_OK);
+    bool written = true;
+    for (unsigned i = 0; i < ntracks; ++i) {
+        written &= moq_pub_write_object(*facade, tracks[i], 1, 0, payload, p->now) == MOQ_OK;
+        written &= moq_pub_end_group(*facade, tracks[i], p->now) == MOQ_OK;
+    }
+    moq_rcbuf_decref(payload);
+    ACCOUNT_REQUIRE(written);
+    ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+    serve_all(p);
+    ACCOUNT_REQUIRE(deliver_captured(p));
+    ACCOUNT_REQUIRE(p->mt->next_uni == first + 4);
+    bool blocked = false;
+    moq_result_t rc;
+    for (unsigned i = 0; i < ntracks; ++i) {
+        rc = moq_pub_finish_subscribers(*facade, tracks[i], 2, p->now);
+        ACCOUNT_REQUIRE(rc == MOQ_OK || rc == MOQ_ERR_WOULD_BLOCK);
+        blocked |= rc == MOQ_ERR_WOULD_BLOCK;
+    }
+    ACCOUNT_REQUIRE(blocked);
+    p->now += 51000;
+    for (unsigned i = 0; i < 4; ++i) {
+        ACCOUNT_REQUIRE(moq_transport_bridge_service(p->pub_br, p->now) == MOQ_OK);
+        rc = moq_pub_tick(*facade, p->now);
+        ACCOUNT_REQUIRE(rc == MOQ_OK || rc == MOQ_ERR_WOULD_BLOCK);
+    }
+    for (unsigned i = 0; i < ntracks; ++i)
+        ACCOUNT_REQUIRE(moq_pub_finish_subscribers(*facade, tracks[i], 2, p->now) == MOQ_OK);
+    accounting_drive(p);
+    unsigned zero = 0, one = 0;
+    moq_event_t e;
+    while (moq_session_poll_events(p->sub, &e, 1)) {
+        if (e.kind == MOQ_EVENT_SUBSCRIBE_DONE) {
+            zero += e.u.subscribe_done.stream_count == 0;
+            one += e.u.subscribe_done.stream_count == 1;
+        }
+        moq_event_cleanup(&e);
+    }
+    ACCOUNT_REQUIRE(zero == 1 && one == 1 && p->mt->next_uni == first + 4);
+    return true;
+}
+
+static void *accounting_refuse_alloc(size_t size, void *ctx)
+{
+    (void)size;
+    ++*(unsigned *)ctx;
+    return NULL;
+}
+
+static void *accounting_refuse_realloc(void *ptr, size_t old_size, size_t size, void *ctx)
+{
+    (void)ptr; (void)old_size;
+    return accounting_refuse_alloc(size, ctx);
+}
+
+static void accounting_refuse_free(void *ptr, size_t size, void *ctx)
+{
+    (void)ptr; (void)size;
+    ++*(unsigned *)ctx; /* no successful allocation may require a free */
+}
+
+static void test_open_accounting_allocation(void)
+{
+    unsigned calls = 0;
+    moq_alloc_t alloc = { .ctx = &calls, .alloc = accounting_refuse_alloc,
+        .realloc = accounting_refuse_realloc, .free = accounting_refuse_free };
+    const uint32_t capacities[] = { 8, UINT32_MAX };
+    for (size_t i = 0; i < sizeof(capacities) / sizeof(capacities[0]); ++i) {
+        moq_session_cfg_t cfg;
+        moq_session_cfg_init_sized(&cfg, sizeof(cfg), &alloc, MOQ_PERSPECTIVE_SERVER);
+        cfg.version = MOQ_VERSION_DRAFT_22;
+        cfg.max_actions = capacities[i];
+        moq_session_t *s = NULL;
+        calls = 0;
+        moq_result_t rc = moq_session_create(&cfg, 0, &s);
+        MOQ_TEST_CHECK(rc == (i == 0 ? MOQ_ERR_NOMEM : MOQ_ERR_INVAL));
+        MOQ_TEST_CHECK(s == NULL && calls == (i == 0 ? 1u : 0u));
+    }
+}
+
+static void test_open_accounting(void)
+{
+    test_open_accounting_allocation();
+    for (unsigned family = 0; family < 2; ++family) {
+        for (unsigned refused = 0; refused < 2; ++refused) {
+            pair_t p;
+            bool ready = pair_init(&p, MOQ_VERSION_DRAFT_16, 1u << 20, true);
+            MOQ_TEST_CHECK(ready);
+            if (ready) MOQ_TEST_CHECK(accounting_d16_row(&p, family != 0, refused != 0));
+            pair_destroy(&p);
+        }
+    }
+    for (unsigned row = 0; row < 5; ++row) {
+        unsigned producer = row < 3 ? row : row - 2;
+        pair_t p;
+        g_server_fills = 1;
+        bool ready = pair_init_retained(&p, MOQ_VERSION_DRAFT_22, 1u << 20,
+            true, 128, 8, 1u << 20, 64, true);
+        g_server_fills = 0;
+        MOQ_TEST_CHECK(ready);
+        if (ready) MOQ_TEST_CHECK(accounting_failed_fill_answer_row(&p, producer, row < 3));
+        pair_destroy(&p);
+    }
+    static const moq_version_t versions[] = { MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_22 };
+    for (size_t v = 0; v < 2; ++v) {
+        for (unsigned family = 0; family < 2; ++family) {
+            for (unsigned row = 0; row < 12; ++row) {
+                pair_t p;
+                bool ready = pair_init_retained(&p, versions[v], 1u << 20,
+                    true, 128, 8, 1u << 20, 64, true);
+                MOQ_TEST_CHECK(ready);
+                if (ready) {
+                    bool ok = row < 2 ? accounting_suppressed_row(&p, family != 0, row != 0)
+                        : row < 4 ? accounting_opened_row(&p, family != 0, row == 3)
+                        : row < 6 ? accounting_update_row(&p, family != 0, row == 5, false)
+                        : row == 6 ? accounting_credit_row(&p, family != 0)
+                        : row == 11 ? accounting_update_row(&p, family != 0, true, true)
+                        : accounting_detach_row(&p, family != 0, row - 7);
+                    if (row == 4 || row == 5 || row == 11)
+                        fprintf(stderr, "PR62-UPDATE d%d publish=%u automatic=%u core-owned=%u complete=%d\n",
+                            draft_of(p.ver), family, row == 4 ? 0u : 1u, row == 11 ? 1u : 0u, (int)ok);
+                    MOQ_TEST_CHECK(ok);
+                }
+                pair_destroy(&p);
+            }
+        }
+        /* Fill is a draft-22 capability; do not invent it for draft-18. */
+        unsigned first_row = versions[v] == MOQ_VERSION_DRAFT_22 ? 0u : 6u;
+        for (unsigned row = first_row; row < 7; ++row) {
+            pair_t p;
+            moq_publisher_t *facade = NULL;
+            bool ready = pair_init(&p, versions[v], 1u << 20, true);
+            MOQ_TEST_CHECK(ready);
+            if (ready) MOQ_TEST_CHECK(row < 6 ? accounting_fill_row(&p, row % 3, row >= 3)
+                                             : accounting_facade_row(&p, &facade));
+            moq_pub_destroy(facade);
+            pair_destroy(&p);
+        }
+    }
+    MOQ_TEST_PASS("actual opens settle before terminal encoding for both parent families");
+}
+
+#undef ACCOUNT_REQUIRE
+#endif /* MOQ_SESSION_SWEEP_TESTING: private accounting rows */
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--delivery-timeouts") == 0) {
+        test_object_timeout_in_bridge();
+        test_object_timeout_after_handover();
+        test_object_timeout_before_open();
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        test_open_accounting();
+#endif
+        fprintf(stderr, "PR62 delivery-timeouts failures=%d\n", failures);
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--shared-admission") == 0) {
         test_ops_copy_setup();
         test_shared_admission_refusals();
@@ -7850,6 +9181,9 @@ int main(int argc, char **argv)
     test_object_timeout_in_bridge();
     test_object_timeout_after_handover();
     test_object_timeout_before_open();
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    test_open_accounting();
+#endif
     if (failures) {
         fprintf(stderr, "test_scheduling: %d failure(s)\n", failures);
         return 1;

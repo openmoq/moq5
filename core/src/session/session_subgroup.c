@@ -1006,6 +1006,8 @@ moq_result_t moq_session_open_subgroup(
     moq_action_meta_t meta;
     sg_stream_meta(s, &probe, &meta);
     meta.subgroup_header = true;
+    meta.opens_data = true;
+    if (!session_open_credit(s)) return MOQ_ERR_WOULD_BLOCK;
 
     moq_data_priority_t key;
     session_subgroup_data_key(&meta, &key);

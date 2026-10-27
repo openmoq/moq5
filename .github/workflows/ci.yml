@@ -240,10 +240,14 @@ jobs:
           done
           core="$(find build/service-surface-shared/core -name 'libmoq-core.so*' -type f -print -quit)"
           test -n "$core"
-          for sym in moq_pub_callbacks_init_sized moq_pub_object_cfg_init_sized moq_pub_begin_object_cfg_init_sized moq_sub_joining_fetch_cfg_init_sized; do
-            nm -D --defined-only "$core" | grep -q " $sym\$" ||
+          core_exports="$(nm -D --defined-only "$core")"
+          for sym in moq_pub_callbacks_init_sized moq_pub_object_cfg_init_sized moq_pub_begin_object_cfg_init_sized moq_sub_joining_fetch_cfg_init_sized moq_track_delivery_timeouts_cfg_init_sized moq_session_track_properties_add_delivery_timeouts; do
+            grep -q " $sym\$" <<< "$core_exports" ||
               { echo "missing core export: $sym"; exit 1; }
           done
+          if grep -q ' moq_track_delivery_timeouts_cfg_init$' <<< "$core_exports"; then
+            echo 'unexpected pointer-only timeout initializer export'; exit 1
+          fi
 
   swift-service-binding:
     name: Swift Service Binding (macOS)

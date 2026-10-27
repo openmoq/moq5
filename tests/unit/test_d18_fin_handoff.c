@@ -11257,8 +11257,20 @@ typedef struct fu_extra {
 
 static fu_extra_t g_fu_extra;
 
+/* This family's first headers escape through public raw action polling in
+ * arm_failed_update_subscription_shape(), not an observing transport. D18
+ * section10.11 requires unknown, 2^62-1, for its automatic DONE. Keep the
+ * expected count and wire image independent of the live owner inventory and
+ * the profile's count selection. vi64 needs nine bytes here, not one. */
+static const uint64_t k_fu_raw_unknown_count = UINT64_C(0x3fffffffffffffff);
+static const uint8_t k_fu_raw_done[] = {
+    0x0b, 0x00, 0x0b, 0x08, 0xff, 0x3f, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00
+};
+
 /* The exact send-buffer cost of the terminal's two atomic messages, declared
- * from the same encoders the output oracle uses. */
+ * against that independent raw DONE image; its eight-byte growth is real
+ * send-arena usage, not extra snapshot capacity. */
 static size_t g_fu_committed_bytes;
 
 static void fu_declare_committed_bytes(void)
@@ -11268,9 +11280,13 @@ static void fu_declare_committed_bytes(void)
     moq_buf_writer_t dw;
     moq_buf_writer_init(&dw, done, sizeof(done));
     MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_d18_encode_publish_done(&dw, 0x8, 0, (moq_bytes_t){0}),
+        (int)moq_d18_encode_publish_done(&dw, 0x8, k_fu_raw_unknown_count,
+                                       (moq_bytes_t){0}),
         (int)MOQ_OK);
-    g_fu_committed_bytes = n + moq_buf_writer_offset(&dw);
+    failures += txs_check_span_bytes(done, moq_buf_writer_offset(&dw),
+                                    k_fu_raw_done, sizeof(k_fu_raw_done),
+                                    "raw failed-update DONE");
+    g_fu_committed_bytes = n + sizeof(k_fu_raw_done);
 }
 
 static void fu_extra_read(const moq_session_t *s, fu_extra_t *v)
@@ -11416,14 +11432,9 @@ static void want_failed_update_output(txs_norm_vec_t *v, moq_stream_ref_t ref)
     size_t err_len = enc_request_error(err, sizeof(err), 0x17, 0, NULL);
     want_bidi_msg(v, ref, false, err, err_len);
 
-    /* Stream Count: every subgroup stream the subscription opened. */
-    uint8_t done[128];
-    moq_buf_writer_t dw;
-    moq_buf_writer_init(&dw, done, sizeof(done));
-    MOQ_TEST_CHECK_EQ_INT(
-        (int)moq_d18_encode_publish_done(&dw, 0x8, g_fu_sg_count, (moq_bytes_t){0}),
-        (int)MOQ_OK);
-    want_bidi_msg(v, ref, true, done, moq_buf_writer_offset(&dw));
+    /* Logical subgroup inventory cannot attest raw transport opening. Keep
+     * the exact unknown-count envelope, terminal FIN and action ordering. */
+    want_bidi_msg(v, ref, true, k_fu_raw_done, sizeof(k_fu_raw_done));
 }
 
 static void test_axis3_fin_terminals(void)

@@ -171,7 +171,9 @@ static bool terminal_pair(fixture *f, uint64_t count, packet out[8])
                 NEED(e.msg_type == MOQ_D16_PUBLISH_DONE);
                 NEED(moq_d16_decode_publish_done(e.payload, e.payload_len, &done) == MOQ_OK);
                 NEED(done.request_id == 0 && done.status_code == 0x8);
-                NEED(done.stream_count == count);
+                /* This fixture polls raw actions, not an observing bridge.
+                 * Nonzero logical opens therefore have no actual-open fact. */
+                NEED(done.stream_count == (count ? MOQ_QUIC_VARINT_MAX : 0));
             } else NEED(false);
             messages++;
         }

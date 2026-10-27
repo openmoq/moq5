@@ -523,8 +523,16 @@ static void settle(fx_t *f, unsigned n, bool poll)
 static void end_and_remove(fx_t *f, int track)
 {
     CHECK(moq_pub_end_track(f->pub, f->pt[track], f->now) == MOQ_OK);
-    CHECK(moq_pub_remove_track(f->pub, f->pt[track], f->now) == MOQ_OK);
-    f->pt[track] = NULL;
+    moq_result_t rc = moq_pub_remove_track(f->pub, f->pt[track], f->now);
+    /* The terminal's first header must reach the observing transport before
+     * its finite count can be committed. WOULD_BLOCK retains the track;
+     * retry without advancing the clock or draining application queues. */
+    for (unsigned i = 0; i < 16 && rc == MOQ_ERR_WOULD_BLOCK; i++) {
+        step(f, 0);
+        rc = moq_pub_remove_track(f->pub, f->pt[track], f->now);
+    }
+    CHECK(rc == MOQ_OK);
+    if (rc == MOQ_OK) f->pt[track] = NULL;
 }
 
 /* Once each: TRACK_ENDED, then TRACK_REMOVED. */

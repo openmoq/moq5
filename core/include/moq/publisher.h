@@ -13,6 +13,15 @@ typedef struct moq_publisher moq_publisher_t;
 typedef struct moq_pub_track moq_pub_track_t;
 typedef struct moq_pub_deferred moq_pub_deferred_t;
 
+/* Terminal Stream Count: the facade uses actual stream-open decisions from
+ * the observing transport, including empty streams and fills. A header suppressed
+ * before open contributes zero. Completion can return WOULD_BLOCK while an
+ * opening decision is unresolved. Raw action polling cannot report that fact;
+ * when such a handoff makes the count unobservable, the draft's unknown
+ * sentinel is sent and the receiver uses its bounded terminal wait. A known
+ * no-stream result remains zero. No transport commit/FIN acknowledgement is
+ * synthesized to establish an open. */
+
 /* -- Accept policy ------------------------------------------------ */
 
 typedef enum moq_pub_accept_mode {
@@ -452,7 +461,7 @@ typedef struct moq_pub_track_cfg {
      * MOQ_ERR_WRONG_STATE before any state changes) and uses the evidence
      * to auto-complete finite subscription filters: on drafts 16 and 18 a
      * destination whose filter End Group is provably complete is terminated
-     * with SUBSCRIPTION_ENDED and the exact stream count, the same
+     * with SUBSCRIPTION_ENDED and the terminal stream count above, the same
      * completion flow as moq_pub_declare_groups_complete_through (draft-22
      * keeps it established; see there). Declaring it opts
      * the track out of honoring a later End-widening at or below the
@@ -538,8 +547,8 @@ MOQ_API moq_result_t moq_pub_add_track(
  * or a Forward/filter cut already armed a reset (an armed reset is never
  * converted into a clean close, and both cases proceed even mid-stream);
  * otherwise it is closed cleanly (FIN). Subscriptions are completed with the
- * track-ended status. Every terminal carries the EXACT count of streams the
- * facade opened for that destination, whether it ended by FIN or RESET
+ * track-ended status. Every terminal carries the count described above,
+ * whether streams ended by FIN or RESET
  * (identifiable resets satisfy the peer's completed-stream gate like FINs).
  * A CLEAN mid-stream object (nothing armed, nothing omitted) refuses with
  * MOQ_ERR_WRONG_STATE -- finish it or abandon via moq_pub_reset_group first.
@@ -605,8 +614,8 @@ MOQ_API moq_result_t moq_pub_publish_track(
  * truncated work is never closed as finished. An armed reset (Forward/filter
  * cut) PROGRESSES first, even mid-stream: the affected subgroup is RESET --
  * never FIN'd -- before the clean close/finish, so only a CLEAN mid-stream
- * object still returns WRONG_STATE. The finish reports the EXACT count of
- * streams the facade opened for the publication (a reset stream counts at
+ * object still returns WRONG_STATE. The finish reports the terminal count
+ * described above (a reset stream counts at
  * the peer like a completed one).
  * On MOQ_ERR_WOULD_BLOCK the operation is INCOMPLETE (publish_requested
  * remains set): drain session actions and retry moq_pub_unpublish_track()
@@ -943,8 +952,8 @@ MOQ_API moq_result_t moq_pub_write_object(
  * first (streams close before the done), then the subscription is ended
  * with SUBSCRIPTION_ENDED when its finite filter end was genuinely passed
  * on a draft that defines that status (16 and 18), TRACK_ENDED otherwise
- * (always on draft-22), carrying the EXACT count of streams the facade
- * opened for it -- retryably and idempotently across WOULD_BLOCK.
+ * (always on draft-22), carrying the terminal count described above --
+ * retryably and idempotently across WOULD_BLOCK.
  *
  * A published track (moq_pub_publish_track) is ended the same way on its
  * publication: the END_OF_TRACK status object first, on a fresh subgroup of
@@ -991,10 +1000,9 @@ MOQ_API moq_result_t moq_pub_end_track(
  *
  * For each active subscriber: any open live subgroup is closed first (completing
  * a subscription requires no open data stream), then the subscription is
- * completed and its state freed. The reported stream count is EXACT -- the
- * facade opened every stream for the subscription itself, so a datagram-only
- * or never-delivered subscriber reports zero and a peer never waits on streams
- * that will not arrive.
+ * completed and its state freed. The terminal count follows the contract
+ * above: a known datagram-only or entirely suppressed destination reports zero;
+ * an actual open counts even if its header never reaches the peer.
  *
  * Idempotent and WOULD_BLOCK-safe: a finished subscriber is never completed
  * twice, and a retry after MOQ_ERR_WOULD_BLOCK resumes without duplicating or

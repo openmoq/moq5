@@ -93,6 +93,8 @@ typedef struct {
     uint64_t type;
     uint64_t id;        /* REQUEST_OK / REQUEST_ERROR request id (draft-16) */
     uint64_t code;      /* REQUEST_ERROR error code, PUBLISH_DONE status, close code */
+    uint64_t stream_count;
+    bool     done_decoded;
     size_t   reason_len;
     bool     fin;
 } msg_t;
@@ -131,8 +133,11 @@ static void log_messages(wire_log_t *l, const uint8_t *data, size_t len, bool fi
                 }
             } else if (env.msg_type == TYPE_PUBLISH_DONE) {
                 moq_d16_publish_done_t d;
-                if (moq_d16_decode_publish_done(env.payload, env.payload_len, &d) == MOQ_OK)
+                if (moq_d16_decode_publish_done(env.payload, env.payload_len, &d) == MOQ_OK) {
                     m->code = d.status_code;
+                    m->stream_count = d.stream_count;
+                    m->done_decoded = true;
+                }
             }
         } else {
             /* Draft-18 and draft-22 share these two bodies. */
@@ -143,8 +148,11 @@ static void log_messages(wire_log_t *l, const uint8_t *data, size_t len, bool fi
                 }
             } else if (env.msg_type == TYPE_PUBLISH_DONE) {
                 moq_d18_publish_done_t d;
-                if (moq_d18_decode_publish_done(env.payload, env.payload_len, &d) == MOQ_OK)
+                if (moq_d18_decode_publish_done(env.payload, env.payload_len, &d) == MOQ_OK) {
                     m->code = d.status_code;
+                    m->stream_count = d.stream_count;
+                    m->done_decoded = true;
+                }
             }
         }
     }
@@ -231,6 +239,39 @@ static size_t queued_events(const moq_session_t *s, moq_event_kind_t kind)
     for (size_t i = s->event_head; i < s->event_tail; i++)
         if (s->events[i % s->event_cap].kind == kind) n++;
     return n;
+}
+
+/* Independent wire oracle: d16/d18 PUBLISH_DONE require 2^62-1 when
+ * uncountable; d22 requires 2^64-1. Do not derive this from the profile. */
+static uint64_t normative_unknown_count(moq_version_t version)
+{
+    return version == MOQ_VERSION_DRAFT_22
+        ? UINT64_MAX : (UINT64_C(1) << 62) - UINT64_C(1);
+}
+
+/* SimPair observes actual admission, independently of receiver processing.
+ * Lossless finite completion must be prompt; no receiver deadline is ticked. */
+static int check_sim_done(pair_t *p, uint64_t processed)
+{
+    int failures = 0;
+    const uint64_t unknown = normative_unknown_count(p->v);
+    MOQ_TEST_CHECK_EQ_U64(p->c->profile->stream_count_unknown, unknown);
+    MOQ_TEST_CHECK_EQ_U64(p->sv->profile->stream_count_unknown, unknown);
+    const msg_t *wire = nth_type(TYPE_PUBLISH_DONE, 0);
+    MOQ_TEST_CHECK(wire && wire->done_decoded);
+    if (!wire || !wire->done_decoded) return failures;
+    MOQ_TEST_CHECK_EQ_U64(wire->code, 0x8);
+    MOQ_TEST_CHECK_EQ_U64(wire->stream_count, processed);
+    if (p->v != MOQ_VERSION_DRAFT_16) MOQ_TEST_CHECK(wire->fin);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(p->c, MOQ_EVENT_PUBLISH_FINISHED), 1);
+    for (size_t i = p->c->event_head; i < p->c->event_tail; ++i) {
+        const moq_event_t *event = &p->c->events[i % p->c->event_cap];
+        if (event->kind != MOQ_EVENT_PUBLISH_FINISHED) continue;
+        MOQ_TEST_CHECK(moq_publication_eq(event->u.publish_finished.pub, p->cpub));
+        MOQ_TEST_CHECK_EQ_U64(event->u.publish_finished.status_code, 0x8);
+        MOQ_TEST_CHECK_EQ_U64(event->u.publish_finished.stream_count, processed);
+    }
+    return failures;
 }
 
 static size_t queued_actions(const moq_session_t *s)
@@ -971,10 +1012,15 @@ static int test_reject_retry(moq_version_t v)
     pump(&p);
     MOQ_TEST_CHECK_EQ_SIZE(count_type(TYPE_REQUEST_ERROR), 1);
     MOQ_TEST_CHECK_EQ_SIZE(count_type(TYPE_PUBLISH_DONE), 1);
+    failures += check_sim_done(&p, 1);
     moq_event_t ev;
-    MOQ_TEST_CHECK(take(p.c, MOQ_EVENT_PUBLISH_FINISHED, &ev));
-    MOQ_TEST_CHECK_EQ_U64(ev.u.publish_finished.status_code, 0x8);
-    moq_event_cleanup(&ev);
+    bool received = take(p.c, MOQ_EVENT_PUBLISH_FINISHED, &ev);
+    MOQ_TEST_CHECK(received);
+    if (received) {
+        MOQ_TEST_CHECK_EQ_U64(ev.u.publish_finished.status_code, 0x8);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.publish_finished.stream_count, 1);
+        moq_event_cleanup(&ev);
+    }
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(p.c), (int)MOQ_SESS_ESTABLISHED);
     MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(p.sv), (int)MOQ_SESS_ESTABLISHED);
     failures += finish(&p);
@@ -1037,6 +1083,7 @@ static void mark_sent(pair_t *p, uint64_t id)
 static int check_subscriber_ended(pair_t *p)
 {
     int failures = 0;
+    failures += check_sim_done(p, 1);
     moq_event_t ev;
     size_t oks = 0, dones = 0;
     while (moq_session_poll_events(p->c, &ev, 1) > 0) {
@@ -1267,6 +1314,7 @@ static int test_fill_d22(bool accept)
         pump(&p);
         /* The subscriber's fill ends with the refusal's code; the
          * publication ends with UPDATE_FAILED. */
+        failures += check_sim_done(&p, 1);
         bool saw_fill = false, saw_done = false;
         while (moq_session_poll_events(p.c, &ev, 1) > 0) {
             if (ev.kind == MOQ_EVENT_FILL_TERMINAL &&
@@ -1292,9 +1340,8 @@ static int test_fill_d22(bool accept)
     return failures;
 }
 
-/* The PUBLISH_DONE(UPDATE_FAILED) a rejected update forces carries the
- * number of data streams the publisher opened for the publication: zero
- * when it opened none, else every subgroup stream it opened. */
+/* Automatic rejection has known zero without candidates and the exact finite
+ * observed total after SimPair admitted the data streams. Both are prompt. */
 static int test_reject_stream_count(moq_version_t v, size_t subgroups)
 {
     int failures = 0;
@@ -1319,13 +1366,15 @@ static int test_reject_stream_count(moq_version_t v, size_t subgroups)
     uint64_t id = take_updates(&p, NULL);
     MOQ_TEST_CHECK_EQ_INT((int)reject_upd(&p, id, 0x5, NULL, 4), (int)MOQ_OK);
     pump(&p);
+    if (subgroups) failures += check_sim_done(&p, subgroups);
     moq_event_t ev;
     size_t dones = 0;
     while (moq_session_poll_events(p.c, &ev, 1) > 0) {
         if (ev.kind == MOQ_EVENT_PUBLISH_FINISHED) {
             dones++;
             MOQ_TEST_CHECK_EQ_U64(ev.u.publish_finished.status_code, 0x8);
-            MOQ_TEST_CHECK_EQ_U64(ev.u.publish_finished.stream_count, subgroups);
+            MOQ_TEST_CHECK_EQ_U64(ev.u.publish_finished.stream_count,
+                                  subgroups);
         }
         moq_event_cleanup(&ev);
     }
@@ -1632,6 +1681,71 @@ done:
 
 #undef QUERY_REQUIRE
 
+/* Public application counts remain finite and authoritative when no fill
+ * history is unobservable. These controls must finish at ingress, without
+ * advancing a terminal recovery deadline. */
+static int test_public_count_authority(moq_version_t v, size_t streams)
+{
+    int failures = 0;
+    pair_t p;
+    MOQ_TEST_CHECK(mk(&p, v, 0, true));
+    if (!p.sp) return failures;
+    /* Legacy setup mixes explicit API times with a stationary sim clock.
+     * Align to the latest endpoint before this fixed-time ingress control;
+     * every subsequent operation and pump uses that same authoritative time. */
+    uint64_t now = moq_simpair_now_us(p.sp);
+    if (p.c->last_now_us > now) now = p.c->last_now_us;
+    if (p.sv->last_now_us > now) now = p.sv->last_now_us;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_simpair_advance_to(p.sp, now), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(p.c->last_now_us, now);
+    MOQ_TEST_CHECK_EQ_U64(p.sv->last_now_us, now);
+    for (size_t g = 0; g < streams; ++g) {
+        moq_subgroup_cfg_t sc; moq_subgroup_cfg_init(&sc);
+        sc.group_id = 6 + g;
+        moq_subgroup_handle_t sg;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_open_pub_subgroup(p.sv, p.spub, &sc, now, &sg), (int)MOQ_OK);
+        moq_rcbuf_t *pl = NULL;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)"x", 1, &pl), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_write_object(p.sv, sg, 0, pl, now), (int)MOQ_OK);
+        moq_rcbuf_decref(pl);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_session_close_subgroup(p.sv, sg, now), (int)MOQ_OK);
+    }
+    pump(&p);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(p.c, MOQ_EVENT_PUBLISH_FINISHED), 0);
+    drain(p.c);
+    int slot = pub_resolve_handle(p.c, p.cpub);
+    MOQ_TEST_CHECK(slot >= 0);
+    if (slot >= 0) MOQ_TEST_CHECK_EQ_U64(p.c->publishes[slot].processed_stream_count, streams);
+    uint64_t before = moq_simpair_now_us(p.sp);
+    MOQ_TEST_CHECK_EQ_U64(before, now);
+    MOQ_TEST_CHECK_EQ_U64(p.c->last_now_us, before);
+    MOQ_TEST_CHECK_EQ_U64(p.sv->last_now_us, before);
+    moq_finish_publish_cfg_t cfg; moq_finish_publish_cfg_init(&cfg);
+    cfg.status_code = 0x3; cfg.stream_count = streams;
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_finish_publish(p.sv, p.spub, &cfg, before), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(p.c, MOQ_EVENT_PUBLISH_FINISHED), 0);
+    pump(&p);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(p.c, MOQ_EVENT_PUBLISH_FINISHED), 1);
+    const msg_t *wire = nth_type(TYPE_PUBLISH_DONE, 0);
+    MOQ_TEST_CHECK_EQ_SIZE(count_type(TYPE_PUBLISH_DONE), 1);
+    MOQ_TEST_CHECK(wire && wire->done_decoded);
+    if (wire && wire->done_decoded) MOQ_TEST_CHECK_EQ_U64(wire->stream_count, streams);
+    moq_event_t event;
+    bool received = take(p.c, MOQ_EVENT_PUBLISH_FINISHED, &event);
+    MOQ_TEST_CHECK(received);
+    if (received) {
+        MOQ_TEST_CHECK_EQ_U64(event.u.publish_finished.status_code, 0x3);
+        MOQ_TEST_CHECK_EQ_U64(event.u.publish_finished.stream_count, streams);
+        moq_event_cleanup(&event);
+    }
+    MOQ_TEST_CHECK_EQ_U64(moq_simpair_now_us(p.sp), before);
+    MOQ_TEST_CHECK_EQ_U64(p.c->last_now_us, before);
+    MOQ_TEST_CHECK_EQ_U64(p.sv->last_now_us, before);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(p.c, MOQ_EVENT_PUBLISH_FINISHED), 0);
+    failures += finish(&p);
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -1660,6 +1774,8 @@ int main(void)
         failures += test_refused_would_block(v);
         failures += test_reject_stream_count(v, 0);
         failures += test_reject_stream_count(v, 2);
+        failures += test_public_count_authority(v, 0);
+        failures += test_public_count_authority(v, 2);
         failures += test_query_lifecycle(v, true);
         failures += test_query_lifecycle(v, false);
         if (v != MOQ_VERSION_DRAFT_22)

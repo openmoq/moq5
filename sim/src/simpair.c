@@ -320,6 +320,10 @@ moq_result_t moq_simpair_create(const moq_simpair_cfg_t *cfg,
     if (rc < 0)
         goto fail;
 
+    rc = moq_core_internal_virtual_register(sp->client, sp);
+    if (rc < 0) goto fail;
+    rc = moq_core_internal_virtual_register(sp->server, sp);
+    if (rc < 0) goto fail;
     *out = sp;
     return MOQ_OK;
 
@@ -338,6 +342,8 @@ void moq_simpair_destroy(moq_simpair_t *sp)
     sim_delay_clear(sp);
     sim_held_clear(sp);
     moq_alloc_t alloc = sp->alloc;
+    moq_core_internal_virtual_unregister(sp->client, sp);
+    moq_core_internal_virtual_unregister(sp->server, sp);
     moq_session_destroy(sp->client);
     moq_session_destroy(sp->server);
     alloc.free(sp, sizeof(moq_simpair_t), alloc.ctx);
@@ -408,6 +414,14 @@ moq_result_t moq_simpair_step_directional(moq_simpair_t *sp,
                                           size_t *out_to_client)
 {
     if (!sp) return MOQ_ERR_INVAL;
+    /* A real bridge may legitimately attach after the virtual handshake.
+     * It overrides this driver. Refuse BOTH directions before any step,
+     * delayed delivery or held-input retry can consume the bridged side. */
+    size_t count = 0;
+    moq_result_t ready = moq_core_internal_virtual_poll(sp->client, sp, NULL, NULL, 0, &count);
+    if (ready != MOQ_OK) return ready;
+    ready = moq_core_internal_virtual_poll(sp->server, sp, NULL, NULL, 0, &count);
+    if (ready != MOQ_OK) return ready;
     sp->step++;
 
     size_t to_server = 0;

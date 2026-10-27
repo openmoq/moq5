@@ -12,9 +12,14 @@
 #define MOQ_SCHED_MODE_FILL     3u
 #define MOQ_SCHED_MODE_FETCH    4u
 
+#define MOQ_DATA_OPENED       1u
+#define MOQ_DATA_SUPPRESSED   2u
+#define MOQ_DATA_EXTERNAL     3u
+
 typedef struct moq_action_meta {
     uint64_t terminal_owner;     /* owner of PUBLISH_DONE; 0 for other actions */
     bool subgroup_header;       /* the stream prefix, never an object header */
+    bool opens_data;            /* fresh parent-counted stream, not a write */
     /* An empty data placeholder retains its scheduling identity until the
      * outgoing terminal event and its replacement RESET_DATA commit. */
     bool terminal_barrier;

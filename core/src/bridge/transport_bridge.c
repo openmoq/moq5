@@ -822,6 +822,7 @@ static void bridge_dstreams_clear(moq_transport_bridge_t *b)
 
 static void bridge_clear_all_state(moq_transport_bridge_t *b)
 {
+    bridge_session_abandon_data_opens(b->session);
     bridge_cleanup_all_pending(b);
     b->pending_control = false;
     b->pending_control_fin = false;
@@ -3082,6 +3083,9 @@ static moq_result_t dispatch_send_data(moq_transport_bridge_t *b,
         e->origin = BRIDGE_ORIGIN_LOCAL;
     }
 
+    (void)bridge_session_resolve_data_open(b->session, ref,
+        meta ? meta->owner : 0, MOQ_DATA_OPENED);
+
     /* Enqueue as header+payload pending item — try_send_data does the
      * actual two-phase write and handles partial progress. */
     bridge_pending_item_t p;
@@ -3236,7 +3240,11 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
          * retained work was never opened and has nothing to reset. */
         if (is_bidi) return MOQ_OK;
         uint64_t queued = bridge_pending_stream_bytes(b, ref, 0, false);
-        if (queued == 0) return MOQ_OK;
+        if (queued == 0) {
+            if (meta && meta->mode == MOQ_SCHED_MODE_SUBGROUP)
+                (void)bridge_session_suppress_data_open(b->session, ref, owner);
+            return MOQ_OK;
+        }
         bridge_pending_item_t p;
         memset(&p, 0, sizeof(p));
         p.kind = PENDING_RESET_STREAM;
@@ -4020,7 +4028,7 @@ static moq_result_t bridge_expire_data(moq_transport_bridge_t *b,
     bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
     /* A subgroup that times out before its stream opens gets no stream, not
      * even for its header (draft-18 8: SHOULD NOT open a new stream for it). */
-    const bool unopened = !e;
+    const bool unopened = !e && (!d || !d->has_sid);
     moq_reset_data_action_t reset = { .stream_ref = ref,
         .reliable_size = e ? e->subgroup_header_len : 0 };
     bool pending_reset = false;
@@ -4086,6 +4094,8 @@ static moq_result_t bridge_expire_data(moq_transport_bridge_t *b,
         ++dst;
     }
     b->pending_count = dst;
+    if (unopened)
+        (void)bridge_session_suppress_data_open(b->session, ref, meta.owner);
     if (d) {
         if (reset_ready && !pending_reset && !d->has_reset) {
             const bool was_open = bridge_dstream_open_head(d);
@@ -4116,6 +4126,7 @@ static moq_result_t bridge_try_deferred_reset(moq_transport_bridge_t *b,
     if (d->reset_pass == b->pass_seq) return MOQ_OK;
     bridge_stream_entry_t *e = bridge_find_by_ref(b, d->ref);
     if (!e) {
+        (void)bridge_session_suppress_data_open(b->session, d->ref, d->key.owner);
         *accepted = true; /* no transport stream was opened */
         return bridge_dstream_free(b, d);
     }
@@ -5024,6 +5035,8 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
                 e->kind = BRIDGE_STREAM_UNI;
                 e->origin = BRIDGE_ORIGIN_LOCAL;
             }
+            (void)bridge_session_resolve_data_open(b->session, p->stream_ref,
+                p->meta.owner, MOQ_DATA_OPENED);
             p->kind = PENDING_HEADER_PAYLOAD;
             bridge_item_set_sid(p, e->transport_id);
         }

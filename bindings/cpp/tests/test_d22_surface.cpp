@@ -2397,6 +2397,36 @@ static void test_publisher_observer_goaway(int &failures)
     }
 }
 
+// The approved C builder is usable from the installed public C++ headers;
+// no separate C++ overload or timeout record is introduced here.
+static void test_sized_timeout_builder(int &failures)
+{
+    static_assert(offsetof(moq_track_delivery_timeouts_cfg_t, struct_size) == 0);
+    static_assert(MOQ_TRACK_DELIVERY_TIMEOUTS_CFG_V0_SIZE ==
+        offsetof(moq_track_delivery_timeouts_cfg_t, subgroup_delivery_timeout_ms) + sizeof(uint64_t));
+    auto p = establish_pair(failures, MOQ_VERSION_DRAFT_22);
+    moq_track_delivery_timeouts_cfg_t cfg;
+    moq_track_delivery_timeouts_cfg_init(&cfg);
+    MOQ_CHECK(cfg.struct_size == sizeof(cfg));
+    MOQ_CHECK(!cfg.has_object_delivery_timeout && !cfg.has_subgroup_delivery_timeout);
+    cfg.has_object_delivery_timeout = true;
+    cfg.object_delivery_timeout_ms = 0;
+    cfg.has_subgroup_delivery_timeout = true;
+    cfg.subgroup_delivery_timeout_ms = UINT64_MAX;
+    uint8_t out[32];
+    size_t len = 0;
+    using builder_fn = moq_result_t (*)(const moq_session_t *, const uint8_t *, size_t,
+        const moq_track_delivery_timeouts_cfg_t *, uint8_t *, size_t, size_t *);
+    builder_fn builder = &moq_session_track_properties_add_delivery_timeouts;
+    moq_result_t rc = builder(p.server.raw(), nullptr, 0, &cfg, out, sizeof(out), &len);
+    MOQ_CHECK(rc == MOQ_OK);
+    MOQ_CHECK(len > 0 && len <= sizeof(out));
+    if (rc != MOQ_OK || len == 0 || len > sizeof(out)) return;
+    uint8_t same[32]; size_t same_len = 0;
+    MOQ_CHECK(builder(p.server.raw(), out, len, &cfg, same, sizeof(same), &same_len) == MOQ_OK);
+    MOQ_CHECK(same_len == len && std::memcmp(out, same, len) == 0);
+}
+
 int main()
 {
     int failures = 0;
@@ -2428,6 +2458,7 @@ int main()
     test_typed_publication_update(failures);
     test_data_committed(failures);
     test_initial_admission_and_timeouts(failures);
+    test_sized_timeout_builder(failures);
     test_historical_state_snapshots(failures);
     test_first_object(failures);
     test_prior_gaps_and_malformed(failures);

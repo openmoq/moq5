@@ -390,7 +390,18 @@ its acceptance refuses them and they follow in a publication UPDATE. Draft-22
 subscription UPDATE refuses the old generic `delivery_timeout_us` selection;
 on drafts 16 and 18 it cannot be combined with the typed one. The publisher's
 own values go in its Track Properties through
-`moq_session_track_properties_add_delivery_timeouts()`. Tests:
+`moq_session_track_properties_add_delivery_timeouts()` with a sized
+`moq_track_delivery_timeouts_cfg_t`, initialized by
+`moq_track_delivery_timeouts_cfg_init()`. Each presence boolean selects its
+following `_ms` value; unselected values are ignored and an empty selection
+is invalid. The frozen v0 floor covers through the last value; future tails
+are ignored. The helper builds borrowed publisher input without advancing
+the session or sending a property update. Input/output spans must not overlap;
+BUFFER may leave partial output, and output length is valid only on success.
+Draft-16 requires a nonzero singleton within its QUIC-varint range; draft-18/22
+preserve independent selections, including zero and UINT64_MAX. The unreleased
+scalar signature is replaced, with no scalar compatibility alias or exported
+pointer-only initializer. Tests:
 `delivery_timeout_params`, `subscription_timeout_input`,
 `subscription_admission_options`, `subscription_update_options`.
 The FIN-started timer/commit-report path has focused core/bridge coverage in

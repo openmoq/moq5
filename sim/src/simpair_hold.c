@@ -167,8 +167,20 @@ void sim_held_clear(moq_simpair_t *sp)
 static void sim_report_committed(moq_simpair_t *sp, int dslot)
 {
     moq_session_t *sender = session_of(sp, sp->stream_map[dslot].sender);
-    (void)moq_session_on_data_committed(sender,
-        moq_stream_ref_from_u64(sp->stream_map[dslot].sender_ref), sp->now_us);
+    moq_stream_ref_t ref = moq_stream_ref_from_u64(sp->stream_map[dslot].sender_ref);
+    if (sp->borrowed_sender == sender) {
+        for (size_t i = 0; i < sp->committed_count; ++i)
+            if (sp->committed[i]._v == ref._v) return;
+        /* Each accepted FIN originates in one of this batch's actions.
+         * Refuse loudly if that bound is ever violated; never overrun. */
+        if (sp->committed_count == MOQ_SIM_ACTION_BATCH) {
+            sp->committed_overflow = true;
+            return;
+        }
+        sp->committed[sp->committed_count++] = ref;
+    } else {
+        (void)moq_session_on_data_committed(sender, ref, sp->now_us);
+    }
 }
 
 /* -- Control channel ------------------------------------------------------ */

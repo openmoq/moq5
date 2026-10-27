@@ -45,6 +45,9 @@ MOQ5_SYSVAL(uint32_t, MOQ_LOC_METADATA_HAS_VIDEO_CONFIG);
 MOQ5_SYSVAL(uint32_t, MOQ_LOC_METADATA_HAS_AUDIO_CONFIG);
 MOQ5_SYSVAL(uint32_t, MOQ_LOC_METADATA_PRESENT_MASK);
 
+/* The core publisher-property builder's offsetof-based frozen input floor. */
+MOQ5_SYSVAL(size_t, MOQ_TRACK_DELIVERY_TIMEOUTS_CFG_V0_SIZE);
+
 /* Frozen v0 floors of the sized records the service tier reads and writes. */
 MOQ5_SYSVAL(size_t, MOQ_ENDPOINT_CFG_V0_SIZE);
 MOQ5_SYSVAL(size_t, MOQ_ENDPOINT_TERMINAL_V0_SIZE);

@@ -2901,6 +2901,12 @@ static void test_removal_accounting(bool via_complete)
      * the finalize, then each removed track's teardown. */
     for (int i = 0; via_complete && i < 4; i++) drive(&fix, now);
 
+    /* Removal's END_OF_TRACK opens a real stream. The first hook queues its
+     * header, SimPair observes admission, and a later hook can commit DONE.
+     * Keep the same time and collect all output for the exact checks below. */
+    for (unsigned i = 0; !via_complete && i < 16 && fix.done_n == 0; i++)
+        drive(&fix, now);
+
     if (!via_complete) {
         /* The demanded AUDIO track is unaffected: its object still leaves. */
         const tr_exp_t audio[1] = { { 1, 0, 0, 0x23, 3 } };

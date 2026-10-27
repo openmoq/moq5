@@ -1,7 +1,7 @@
 # check_core_spi_symbols.cmake — pin the core's private same-build SPI exports.
 #
 # moq_core_internal_* symbols (core/src/spi/core_spi.h) are exported from the
-# shared libmoq-core only so relay/service libraries built with that core can call
+# shared libmoq-core only so relay/service/simulator libraries built with that core can call
 # them. They are a private same-build ABI: the header is NOT installed and this
 # is NOT a stable third-party/application ABI.
 #
@@ -52,6 +52,11 @@ endif()
 # The complete private SPI surface (core/src/spi/core_spi.h MOQ_API symbols).
 set(BASE_SYMBOLS
     moq_core_internal_pub_reset_group
+    moq_core_internal_virtual_register
+    moq_core_internal_virtual_unregister
+    moq_core_internal_virtual_poll
+    moq_core_internal_virtual_resolve
+    moq_core_internal_virtual_finish
     moq_core_internal_track_max_cache_duration
     moq_core_internal_track_properties_validate
 )

@@ -263,6 +263,25 @@ typedef struct moq_owed_update {
     moq_sub_update_t  rec;
 } moq_owed_update_t;
 
+/* Actual transport decisions, separate from logical facade/core opens. */
+typedef struct moq_open_counts {
+    uint64_t subgroup;
+    uint64_t fill;
+    bool subgroup_external;
+    bool fill_external;
+} moq_open_counts_t;
+
+/* At most action_cap unresolved headers, including those retained by the
+ * bridge. Full handles include family, session and generation. No slot pointer
+ * or historical stream table survives resolution. */
+typedef struct moq_pending_open {
+    uint64_t ref;
+    uint64_t owner;
+    uint8_t mode;
+    bool handed;
+    bool virtual_handed; /* in existing padding; distinct from native handoff */
+} moq_pending_open_t;
+
 typedef struct moq_sub_entry {
     uint8_t           subscriber_priority;
     /* Publisher role: the request asked for no Track Properties in its
@@ -384,18 +403,13 @@ typedef struct moq_sub_entry {
      * snapshot the publisher resolved -- and used to attribute objects
      * arriving on an alias several subscriptions share. */
     moq_resolved_window_t window;
-    /* Publisher role: the fill fetch streams the session itself opened for
-     * this subscription -- through moq_session_open_fill and for a fill it
-     * could not admit (header then RESET). Added to the application's own
-     * data-stream count in PUBLISH_DONE, saturating to the profile's unknown
-     * sentinel. */
+    /* Logical fill headers queued, including failed fills. Actual terminal
+     * counts use opened, not this admission/statistics counter. */
     uint64_t           fill_streams_opened;
-    /* Publisher role: the subgroup streams opened for this subscription,
-     * saturating; with fill_streams_opened, the Stream Count of a
-     * PUBLISH_DONE the session sends itself. */
+    /* Logical subgroup headers queued, retained for admission/statistics.
+     * Never use these logical counters as actual wire Stream Count. */
     uint64_t           subgroup_streams_opened;
-    /* MOQ_*_DONE_HELD: the Stream Count of the held PUBLISH_DONE. */
-    uint64_t           held_done_count;
+    moq_open_counts_t  opened;
     /* Publisher role, pending only: the SUBSCRIBE carried a fill request the
      * pool could not admit. The effective request (inherited values filled
      * in) is kept so the accept can resolve its range against the accept
@@ -814,14 +828,11 @@ typedef struct moq_pub_entry {
     moq_request_stream_t rs;
     uint64_t           track_alias;
     bool               send_allowed;
-    /* Publisher role: fill fetch streams the session opened for this
-     * publication (see moq_sub_entry_t.fill_streams_opened). */
+    /* Logical fill headers queued (see moq_sub_entry_t.fill_streams_opened). */
     uint64_t           fill_streams_opened;
-    /* Publisher role: the subgroup streams opened for this publication (see
-     * moq_sub_entry_t.subgroup_streams_opened). */
+    /* Logical subgroup headers queued, never the wire count authority. */
     uint64_t           subgroup_streams_opened;
-    /* MOQ_*_DONE_HELD: the Stream Count of the held PUBLISH_DONE. */
-    uint64_t           held_done_count;
+    moq_open_counts_t  opened;
     /* Publisher role: the Forward state this side put on its PUBLISH, the
      * subscription's initial setting where the response carries none. */
     bool               publish_forward;
@@ -2150,6 +2161,10 @@ struct moq_session {
     /* The one transport owner (a transport bridge) attached to this session,
      * or NULL. Opaque identity only; see moq_session_register_transport_owner. */
     const void              *transport_owner;
+    /* Capability only; native ownership remains exclusive and takes priority. */
+    const void              *virtual_observer;
+    bool                     virtual_batch;
+    uint64_t                 virtual_batch_epoch;
     /* The registered owner's own next deadline (its local hold-age expiry),
      * folded into moq_session_next_deadline_us. moq_session_tick never
      * consumes it: only the owner's own service rearms or clears it. */
@@ -2199,6 +2214,9 @@ struct moq_session {
     size_t        action_head;
     size_t        action_tail;
     moq_action_meta_t *action_meta;   /* parallel to actions */
+    moq_pending_open_t *pending_opens; /* action_cap entries, session allocation */
+    size_t pending_open_count;
+    bool open_counts_changed;
     /* A summary of the queued actions [action_head, action_tail): how many
      * carry a finite OBJECT_DELIVERY_TIMEOUT expiry, and how many are not
      * data (the kinds the poll's data scheduling does not reorder). It lets
@@ -2710,6 +2728,20 @@ moq_result_t push_action(moq_session_t *s, const moq_action_t *a);
 moq_result_t push_action_ex(moq_session_t *s, const moq_action_t *a,
                             const moq_action_meta_t *meta, uint64_t deadline_us);
 void session_tag_owner_done(moq_session_t *s, uint64_t owner);
+bool session_open_credit(const moq_session_t *s);
+bool session_owner_open_pending(const moq_session_t *s, uint64_t owner);
+bool session_owner_open_blocked(const moq_session_t *s, uint64_t owner);
+void session_forget_owner_opens(moq_session_t *s, uint64_t owner);
+uint64_t session_owner_stream_count(const moq_session_t *s, uint64_t owner,
+                                    bool fills_only);
+bool bridge_session_resolve_data_open(moq_session_t *s, moq_stream_ref_t ref,
+                                      uint64_t owner, uint8_t disposition);
+/* Private facade entry points select the owned count in the SAME advancing
+ * transaction as the existing public caller-count terminal. */
+moq_result_t session_done_subscribe(moq_session_t *s, moq_subscription_t sub,
+    const moq_done_subscribe_cfg_t *cfg, uint64_t now_us, bool owned_count);
+moq_result_t session_finish_publish(moq_session_t *s, moq_publication_t pub,
+    const moq_finish_publish_cfg_t *cfg, uint64_t now_us, bool owned_count);
 /* Keep the queued-action summary (action_timed, action_nondata) as an action
  * enters the ring or leaves it, called with the action and its scheduling
  * record as they stand at that moment. A queued action rewritten in place
@@ -3878,7 +3910,8 @@ bool fill_unserved_opens_stream(const moq_fill_input_t *effective, bool has_larg
  * the caller reserved with its response. The stream is counted in
  * *streams_opened (saturating), as any fill stream the session opens. */
 void fill_open_failed(moq_session_t *s, uint64_t initiating_id,
-                      uint8_t subscriber_priority, uint64_t *streams_opened);
+                      uint8_t subscriber_priority, moq_fill_parent_t parent);
+void fill_abandon_unopened(moq_session_t *s, moq_stream_ref_t ref);
 /* The Stream Count PUBLISH_DONE carries: the application's own data streams
  * plus the fill streams the session opened, saturating to the profile's
  * unknown sentinel; a sentinel from the application is sent unchanged. */
@@ -4315,6 +4348,13 @@ moq_result_t session_check_dt_selection(const moq_session_t *s,
                                        bool has_object, uint64_t object_ms,
                                        bool has_subgroup, uint64_t subgroup_ms);
 
+/* Canonicalize an already validated selection: draft-16's single wire value
+ * fills both semantic slots. An absent selection and independent drafts are
+ * unchanged. Use for initial state and pending/acknowledged update carriers. */
+void session_normalize_dt_selection(const moq_session_t *s,
+                                    bool *has_object, uint64_t *object_ms,
+                                    bool *has_subgroup, uint64_t *subgroup_ms);
+
 /* The owner-wide key for a changed subscriber priority. The caller reserved
  * session_owner_priority_slots() action slots. */
 moq_result_t session_update_owner_priority(moq_session_t *s, uint64_t owner,
@@ -4701,13 +4741,6 @@ moq_result_t session_update_fail_len(moq_session_t *s, const moq_owed_update_t *
                                      const moq_request_error_encode_args_t *ea,
                                      uint32_t n_before, size_t *err_total,
                                      size_t *done_len);
-/* The Stream Count of a PUBLISH_DONE the session sends on its own: every
- * data stream it opened for the request, subgroup and fill streams alike
- * (zero when it opened none), saturating to the profile's unknown
- * sentinel. */
-uint64_t session_done_stream_count(const moq_session_t *s,
-                                   uint64_t subgroup_streams_opened,
-                                   uint64_t fill_streams_opened);
 moq_result_t session_core_on_subscribe_update_ok(moq_session_t *s, int slot,
     bool has_largest, uint64_t largest_group, uint64_t largest_object,
     bool has_expires, uint64_t expires_ms);

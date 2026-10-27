@@ -715,8 +715,16 @@ static void test_done_with_queued_terminals(moq_version_t ver)
         write_obj(&f, g, 0, false);
         end_group(&f);
     }
-    CHECK(moq_pub_finish_subscribers(f.pub, f.video, MOQ_PUB_DONE_TRACK_ENDED,
-                                     f.now) == MOQ_OK);
+    moq_result_t rc = moq_pub_finish_subscribers(f.pub, f.video,
+                                               MOQ_PUB_DONE_TRACK_ENDED, f.now);
+    /* Resolve the queued first headers through SimPair, leaving both the
+     * application's object queue and its full terminal lane untouched. */
+    for (unsigned i = 0; i < 16 && rc == MOQ_ERR_WOULD_BLOCK; i++) {
+        cycle(&f);
+        rc = moq_pub_finish_subscribers(f.pub, f.video,
+                                        MOQ_PUB_DONE_TRACK_ENDED, f.now);
+    }
+    CHECK(rc == MOQ_OK);
     unsigned objects = 0;
     for (unsigned i = 0; i < 32; i++) {
         cycle(&f);

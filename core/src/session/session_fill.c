@@ -24,6 +24,7 @@
  */
 #include "session_internal.h"
 #include "fill_range_internal.h"
+#include <assert.h>
 
 /* -- Pool ---------------------------------------------------------------- *
  * The configured capacity is recorded at create; the storage is allocated
@@ -737,11 +738,13 @@ void fill_stream_meta(const moq_session_t *s, const moq_fill_entry_t *f,
     out->publisher_priority = 128;
     out->fill_group_order = (uint8_t)f->delivery.group_order;
     out->group_order = MOQ_GROUP_ORDER_ASCENDING;
-    if (f->parent.family == MOQ_FILL_PARENT_SUBSCRIBE && f->parent.slot < s->sub_cap) {
+    if (f->parent.family == MOQ_FILL_PARENT_SUBSCRIBE && f->parent.slot < s->sub_cap &&
+        s->subs[f->parent.slot].generation == f->parent.generation) {
         const moq_sub_entry_t *se = &s->subs[f->parent.slot];
         out->owner = se->handle._opaque;
         out->group_order = session_group_order(se->group_order, se->track_group_order);
-    } else if (f->parent.family == MOQ_FILL_PARENT_PUBLISH && f->parent.slot < s->pub_cap) {
+    } else if (f->parent.family == MOQ_FILL_PARENT_PUBLISH && f->parent.slot < s->pub_cap &&
+               s->publishes[f->parent.slot].generation == f->parent.generation) {
         const moq_pub_entry_t *pe = &s->publishes[f->parent.slot];
         out->owner = pe->handle._opaque;
         out->group_order = session_group_order(pe->group_order, pe->track_group_order);
@@ -774,7 +777,9 @@ static moq_result_t push_fill_header(moq_session_t *s, uint64_t initiating_id,
     a.u.send_data.fin = false;
     a.u.send_data.scheduling_priority = UINT64_C(0x10000) |
         ((uint64_t)subscriber_priority << 8) | 128;
-    rc = push_action_ex(s, &a, meta, UINT64_MAX);
+    moq_action_meta_t opening = *meta;
+    opening.opens_data = true;
+    rc = push_action_ex(s, &a, &opening, UINT64_MAX);
     if (rc < 0) return rc;
     s->next_stream_ref++;
     *out_ref = a.u.send_data.stream_ref;
@@ -819,12 +824,29 @@ bool fill_unserved_opens_stream(const moq_fill_input_t *effective, bool has_larg
     return rc == MOQ_OK && r.outcome == MOQ_FILL_RANGE_STREAM;
 }
 
-void fill_open_failed(moq_session_t *s, uint64_t initiating_id,
-                      uint8_t subscriber_priority, uint64_t *streams_opened)
+void fill_abandon_unopened(moq_session_t *s, moq_stream_ref_t ref)
 {
+    for (size_t i = 0; s->fill_storage && i < s->fill_cap; ++i) {
+        moq_fill_entry_t *e = &s->fill_storage[i];
+        if (!e->active || e->role != MOQ_FILL_PUBLISHER || !e->stream_bound ||
+            e->stream._v != ref._v) continue;
+        (void)moq_fill_abort(&s->fills, ref_of(s, i));
+    }
+    fill_service(s);
+}
+
+void fill_open_failed(moq_session_t *s, uint64_t initiating_id,
+                      uint8_t subscriber_priority, moq_fill_parent_t parent)
+{
+    /* Preflighted by the answer transaction before ACK/state commits. */
+    assert(session_open_credit(s));
+    moq_fill_entry_t carrier = { .parent = parent };
+    moq_action_meta_t meta;
+    fill_stream_meta(s, &carrier, &meta);
+    meta.subscriber_priority = subscriber_priority;
     moq_stream_ref_t ref;
     uint8_t hdr_len = 0;
-    if (push_fill_header(s, initiating_id, subscriber_priority, NULL, &ref, &hdr_len) < 0)
+    if (push_fill_header(s, initiating_id, subscriber_priority, &meta, &ref, &hdr_len) < 0)
         return;
     moq_action_t a;
     memset(&a, 0, sizeof(a));
@@ -834,8 +856,8 @@ void fill_open_failed(moq_session_t *s, uint64_t initiating_id,
     a.u.reset_data.stream_ref = ref;
     a.u.reset_data.error_code = 0;
     a.u.reset_data.reliable_size = hdr_len;
-    (void)push_action(s, &a);   /* both actions reserved by the caller */
-    count_stream_opened(streams_opened);
+    (void)push_action_ex(s, &a, &meta, UINT64_MAX); /* both actions reserved */
+    count_stream_opened(parent_streams_opened(s, parent));
 }
 
 uint64_t fill_stream_count(const moq_session_t *s, uint64_t app_count,
@@ -845,15 +867,6 @@ uint64_t fill_stream_count(const moq_session_t *s, uint64_t app_count,
     if (app_count >= unknown || fill_streams_opened == 0) return app_count;
     if (fill_streams_opened >= unknown - app_count) return unknown;
     return app_count + fill_streams_opened;
-}
-
-uint64_t session_done_stream_count(const moq_session_t *s,
-                                   uint64_t subgroup_streams_opened,
-                                   uint64_t fill_streams_opened)
-{
-    uint64_t unknown = s->profile->stream_count_unknown;
-    if (subgroup_streams_opened > unknown) subgroup_streams_opened = unknown;
-    return fill_stream_count(s, subgroup_streams_opened, fill_streams_opened);
 }
 
 moq_result_t moq_session_open_fill(moq_session_t *s, moq_fill_t fill, uint64_t now_us)

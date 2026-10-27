@@ -2992,18 +2992,53 @@ MOQ_API moq_result_t moq_session_track_properties_add_group_order(
     const moq_session_t *s, const uint8_t *in, size_t in_len,
     moq_group_order_t order, uint8_t *out, size_t out_cap, size_t *out_len);
 
+/* Publisher Track Property choices, in exact milliseconds. Presence selects
+ * a value; an unselected value is ignored. Zero initialization selects none. */
+typedef struct moq_track_delivery_timeouts_cfg {
+    uint32_t struct_size;
+    bool has_object_delivery_timeout;
+    uint64_t object_delivery_timeout_ms;
+    bool has_subgroup_delivery_timeout;
+    uint64_t subgroup_delivery_timeout_ms;
+} moq_track_delivery_timeouts_cfg_t;
+
+/* Frozen v0 extent THROUGH the last value, not a moving sizeof(current). */
+#define MOQ_TRACK_DELIVERY_TIMEOUTS_CFG_V0_SIZE \
+    (offsetof(moq_track_delivery_timeouts_cfg_t, subgroup_delivery_timeout_ms) \
+     + sizeof(uint64_t))
+
+/* Clears/stamps min(cfg_size, sizeof current); writes nothing below the size
+ * word. The function-like initializer passes the caller's actual extent. */
+MOQ_API void moq_track_delivery_timeouts_cfg_init_sized(
+    moq_track_delivery_timeouts_cfg_t *cfg, size_t cfg_size);
+#define moq_track_delivery_timeouts_cfg_init(cfg) \
+    moq_track_delivery_timeouts_cfg_init_sized((cfg), sizeof(*(cfg)))
+
 /*
- * As moq_session_track_properties_add_group_order(), for the publisher's
- * delivery timeouts: OBJECT_ and SUBGROUP_DELIVERY_TIMEOUT (draft-18 12.1 and
- * 12.2, draft-22 10.1 and 10.2), or draft-16's single delivery timeout
- * (11.1), whose selected values must then be equal and neither 0.
- * At least one is selected. A set already carrying the same value is copied
- * unchanged; another value is MOQ_ERR_INVAL. They add at most 32 bytes.
+ * Build publisher Track Properties for an accept or PUBLISH, encoded for the
+ * session's draft. Requires cfg covering MOQ_TRACK_DELIVERY_TIMEOUTS_CFG_V0_SIZE
+ * and at least one selection; future tails are ignored. Draft-16 11.1 has one
+ * DELIVERY_TIMEOUT: selected values must be equal, nonzero and <= 2^62-1.
+ * Draft-18 12.1/12.2 and draft-22 10.1/10.2 have independent values, including
+ * zero and UINT64_MAX. A selected existing value is kept if equal, rejected
+ * with MOQ_ERR_INVAL if conflicting. Draft-18/22 also reject duplicate selected
+ * properties, including inside Immutable Properties, and preserve the input
+ * bytes when the selected values are already present. Other properties are
+ * not semantically validated here; accept/PUBLISH validates the whole set.
+ *
+ * All spans and cfg are borrowed for this call. in may be NULL only when
+ * in_len is zero; s, cfg, out and out_len must be non-NULL. Input/output spans
+ * must not overlap. No session advance or profile/request state mutation.
+ * MOQ_ERR_INVAL for invalid arguments, selections or malformed input;
+ * MOQ_ERR_NOMEM if scratch allocation fails; MOQ_ERR_BUFFER if out is too
+ * small (at most 32 bytes are added). On failure out contents and *out_len
+ * are unspecified; only success supplies a valid output length. This builds
+ * publisher input, not a property-update message for received properties.
  */
 MOQ_API moq_result_t moq_session_track_properties_add_delivery_timeouts(
     const moq_session_t *s, const uint8_t *in, size_t in_len,
-    bool has_object, uint64_t object_ms, bool has_subgroup,
-    uint64_t subgroup_ms, uint8_t *out, size_t out_cap, size_t *out_len);
+    const moq_track_delivery_timeouts_cfg_t *cfg,
+    uint8_t *out, size_t out_cap, size_t *out_len);
 
 /*
  * REDIRECT (§10.6.1) target, set on a reject cfg only when
@@ -3148,7 +3183,8 @@ MOQ_API moq_result_t moq_session_unsubscribe(moq_session_t *s,
  *
  * Valid for publisher-role subscriptions in ESTABLISHED state.
  * Returns MOQ_ERR_WOULD_BLOCK while an outgoing subgroup terminal event/reset
- * is still owed; it must commit before this completion can overtake it.
+ * or an observing transport's stream-opening decision is still owed. Drive
+ * the transport and retry; this completion cannot overtake that work.
  * Returns MOQ_ERR_WRONG_STATE if subgroups are still open, or while an
  * answer to a subscription update is owed (answer it first: a rejection
  * itself ends the subscription with UPDATE_FAILED).
@@ -5324,7 +5360,8 @@ MOQ_API void moq_finish_publish_cfg_init(moq_finish_publish_cfg_t *cfg);
  * Finish a publisher-initiated subscription. Advancing call.
  * Queues the terminal completion message and frees the entry.
  * Returns MOQ_ERR_WOULD_BLOCK while an outgoing subgroup terminal event/reset
- * is still owed, before queuing any completion or freeing this owner.
+ * or an observing transport's stream-opening decision is still owed, before
+ * queuing any completion or freeing this owner. Drive the transport and retry.
  * Returns MOQ_ERR_WRONG_STATE while an answer to an update is owed (answer
  * it first: a rejection itself ends the subscription with UPDATE_FAILED).
  * Returns MOQ_ERR_STALE_HANDLE once the session has ended the publication

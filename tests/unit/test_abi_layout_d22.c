@@ -136,6 +136,15 @@ _Static_assert(MOQ_NAMESPACE_UPDATE_CFG_V0_SIZE == sizeof(abi_namespace_update_l
 
 /* -- Session configuration --------------------------------------------- */
 
+PIN_AT(moq_track_delivery_timeouts_cfg_t, struct_size, 0, 0, 0);
+PIN_AT(moq_track_delivery_timeouts_cfg_t, has_object_delivery_timeout, 4, 4, 4);
+PIN_AT(moq_track_delivery_timeouts_cfg_t, object_delivery_timeout_ms, 8, 8, 8);
+PIN_AT(moq_track_delivery_timeouts_cfg_t, has_subgroup_delivery_timeout, 16, 16, 16);
+PIN_AT(moq_track_delivery_timeouts_cfg_t, subgroup_delivery_timeout_ms, 24, 20, 24);
+PIN_SIZE(moq_track_delivery_timeouts_cfg_t, 32, 28, 32);
+_Static_assert(MOQ_TRACK_DELIVERY_TIMEOUTS_CFG_V0_SIZE == ABI_PICK(32, 28, 32),
+               "timeout builder frozen v0 extent");
+
 /* The baseline perspective enum saves four bytes on i386 with short enums;
  * the 8-byte-aligned models absorb that change before initial capacity. */
 #define ABI_SESSION_ENUM_SHIFT (sizeof(moq_perspective_t) < 4 ? 4 : 0)

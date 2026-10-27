@@ -3,11 +3,13 @@
 
 #include "moq/sim.h"
 #include "moq/wire.h"
+#include "../../core/src/spi/core_spi.h"
 
 #include <stddef.h>
 #include <string.h>
 
 #define MOQ_SIM_MAX_DATA_STREAMS 16
+#define MOQ_SIM_ACTION_BATCH 16
 /* Bidi slots are reclaimed only when both halves close (or on RESET/STOP), which
  * models real QUIC: a half-closed request bidi (one side FIN'd, the peer's half
  * still open) legitimately persists until both ends close. Real QUIC has a vast
@@ -142,8 +144,16 @@ struct moq_simpair {
      * channel also pauses the session's other unidirectional inputs. */
     sim_inbound_t     ctrl_in[2];
     bool              ctrl_uni_pair[2];
+    /* At most one accepted FIN per action in the current source batch.
+     * Delay source-advancing commitment feedback until all its borrows die. */
+    moq_session_t    *borrowed_sender;
+    moq_stream_ref_t committed[MOQ_SIM_ACTION_BATCH];
+    size_t           committed_count;
+    bool             committed_overflow;
     moq_version_t     version;   /* both sessions; 0 = session default */
 };
+
+moq_result_t sim_finish_batch(moq_simpair_t *sp, bool abort_batch);
 
 /* -- simpair_fault.c ------------------------------------------------- */
 

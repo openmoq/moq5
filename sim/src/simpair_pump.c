@@ -76,7 +76,27 @@ int sim_bidi_find_by_responder(moq_simpair_t *sp, uint64_t responder_ref,
     return -1;
 }
 
-moq_result_t pump_direction(moq_simpair_t *sp,
+moq_result_t sim_finish_batch(moq_simpair_t *sp, bool abort_batch)
+{
+    moq_session_t *sender = sp->borrowed_sender;
+    if (!sender) return MOQ_OK;
+    moq_result_t rc = moq_core_internal_virtual_finish(sender, sp, abort_batch);
+    if (rc < 0 && !abort_batch) {
+        /* All spans have been consumed, but an unresolved fact is uncertain. */
+        (void)moq_core_internal_virtual_finish(sender, sp, true);
+    }
+    sp->borrowed_sender = NULL;
+    if (sp->committed_overflow) rc = MOQ_ERR_INTERNAL;
+    for (size_t i = 0; i < sp->committed_count; ++i) {
+        moq_result_t commit = moq_session_on_data_committed(sender, sp->committed[i], sp->now_us);
+        if (commit < 0 && rc == MOQ_OK) rc = commit;
+    }
+    sp->committed_count = 0;
+    sp->committed_overflow = false;
+    return rc;
+}
+
+static moq_result_t pump_direction_observed(moq_simpair_t *sp,
                             moq_session_t *from_session,
                             moq_session_t *to_session,
                             moq_perspective_t from,
@@ -85,9 +105,15 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                             size_t *delivered_reverse)
 {
     uint8_t mutate_buf[2048];
-    moq_action_t actions[16];
+    moq_action_t actions[MOQ_SIM_ACTION_BATCH];
+    moq_core_observed_open_t opens[MOQ_SIM_ACTION_BATCH];
     size_t n;
-    while ((n = moq_session_poll_actions(from_session, actions, 16)) > 0) {
+    for (;;) {
+        moq_result_t polled = moq_core_internal_virtual_poll(from_session, sp,
+            actions, opens, MOQ_SIM_ACTION_BATCH, &n);
+        if (polled < 0 && polled != MOQ_ERR_WOULD_BLOCK) return polled;
+        if (!n) break;
+        sp->borrowed_sender = from_session;
         /* Reorder pass: adjacent swap of eligible pairs. */
         for (size_t ri = 0; ri + 1 < n; ri++) {
             if (sim_reorder_eligible(actions[ri].kind) &&
@@ -99,13 +125,59 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                 moq_action_t tmp = actions[ri];
                 actions[ri] = actions[ri + 1];
                 actions[ri + 1] = tmp;
+                moq_core_observed_open_t token = opens[ri];
+                opens[ri] = opens[ri + 1];
+                opens[ri + 1] = token;
                 ri++;
             }
         }
 
         for (size_t i = 0; i < n; i++) {
+            uint64_t admitted_rx = 0;
+            int admitted_slot = -1;
+            bool admitted_new = false;
             trace_action(sp, from, to, &actions[i]);
             (*delivered)++;
+
+            /* Virtual stream admission is an actual bounded transport fact,
+             * before wire loss/mutation/splitting. Failed reservation is not
+             * an open. Losing the first header does not undo a real open. */
+            if (actions[i].kind == MOQ_ACTION_SEND_DATA) {
+                const uint64_t ref = actions[i].u.send_data.stream_ref._v;
+                moq_result_t admitted = sim_stream_map_get_or_create(sp,
+                    ref, from, &admitted_rx, &admitted_slot, &admitted_new);
+                /* Reordering may move a later chunk ahead of its first-header
+                 * action. The corresponding full token still belongs to this
+                 * batch; resolve it at the actual first map admission. */
+                for (size_t k = 0; k < n; ++k) {
+                    if (!opens[k].ref || opens[k].ref != ref) continue;
+                    /* Reservation failure is not OPENED, but this hard
+                     * failure does not cancel the sender's live stream.
+                     * Leave its fact unresolved for truthful EXTERNAL abort,
+                     * rather than claiming irrevocable suppression. */
+                    if (admitted < 0) break;
+                    bool resolved = moq_core_internal_virtual_resolve(from_session,
+                        sp, &opens[k], MOQ_CORE_VIRTUAL_OPENED);
+                    if (!resolved) {
+                        for (size_t j = i; j < n; ++j) moq_action_cleanup(&actions[j]);
+                        return MOQ_ERR_INTERNAL;
+                    }
+                    opens[k].ref = 0;
+                    break;
+                }
+                if (admitted < 0) {
+                    for (size_t j = i; j < n; ++j) moq_action_cleanup(&actions[j]);
+                    return admitted;
+                }
+            } else if (actions[i].kind == MOQ_ACTION_RESET_DATA && opens[i].ref) {
+                int slot = sim_stream_map_find(sp, actions[i].u.reset_data.stream_ref._v, from);
+                if (!moq_core_internal_virtual_resolve(from_session, sp, &opens[i],
+                        slot >= 0 ? MOQ_CORE_VIRTUAL_OPENED : MOQ_CORE_VIRTUAL_SUPPRESSED)) {
+                    for (size_t j = i; j < n; ++j) moq_action_cleanup(&actions[j]);
+                    return MOQ_ERR_INTERNAL;
+                }
+                opens[i].ref = 0;
+            }
 
             if (sim_fault_fires(sp, *delivered - 1, actions[i].kind)) {
                 trace_fault_drop(sp, from, to, &actions[i]);
@@ -210,19 +282,9 @@ moq_result_t pump_direction(moq_simpair_t *sp,
                     }
                 }
             } else if (actions[i].kind == MOQ_ACTION_SEND_DATA) {
-                uint64_t rx_ref = 0;
-                int dslot = -1;
-                bool map_created = false;
-                moq_result_t map_rc = sim_stream_map_get_or_create(
-                    sp, actions[i].u.send_data.stream_ref._v, from,
-                    &rx_ref, &dslot, &map_created);
-                if (map_rc < 0) {
-                    moq_action_cleanup(&actions[i]);
-                    for (size_t j = i + 1; j < n; j++)
-                        moq_action_cleanup(&actions[j]);
-                    return map_rc;
-                }
-                moq_stream_ref_t ref = moq_stream_ref_from_u64(rx_ref);
+                int dslot = admitted_slot;
+                bool map_created = admitted_new;
+                moq_stream_ref_t ref = moq_stream_ref_from_u64(admitted_rx);
                 bool fin = actions[i].u.send_data.fin;
                 moq_result_t rc;
 
@@ -608,6 +670,8 @@ moq_result_t pump_direction(moq_simpair_t *sp,
 
             moq_action_cleanup(&actions[i]);
         }
+        moq_result_t settled = sim_finish_batch(sp, false);
+        if (settled < 0) return settled;
     }
 
     /* Injection phase: synthetic RESET/STOP for active streams. */
@@ -762,4 +826,17 @@ moq_result_t pump_direction(moq_simpair_t *sp,
     }
 
     return MOQ_OK;
+}
+
+moq_result_t pump_direction(moq_simpair_t *sp, moq_session_t *from_session,
+    moq_session_t *to_session, moq_perspective_t from, moq_perspective_t to,
+    size_t *delivered, size_t *delivered_reverse)
+{
+    moq_result_t rc = pump_direction_observed(sp, from_session, to_session,
+                                             from, to, delivered, delivered_reverse);
+    if (sp->borrowed_sender) {
+        moq_result_t ended = sim_finish_batch(sp, true);
+        if (rc == MOQ_OK) rc = ended;
+    }
+    return rc;
 }

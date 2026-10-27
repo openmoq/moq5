@@ -327,6 +327,18 @@ MOQ_SIM_API moq_result_t moq_simpair_start(moq_simpair_t *sp);
  * Pump one deterministic step:
  *   client actions -> server inputs, then server actions -> client inputs.
  *
+ * SimPair observes actual admission to its bounded virtual stream map before
+ * wire faults. A lost first header still counts as an opened stream. Owned
+ * completion may return MOQ_ERR_WOULD_BLOCK before this opening decision;
+ * pump the pair, then retry the same operation. Public raw action polling on
+ * either session escapes observation and keeps its uncountable history.
+ *
+ * A native transport bridge may attach to either session when no virtual
+ * batch is borrowed. Native ownership takes priority: stepping this pair
+ * then returns MOQ_ERR_WRONG_STATE before changing the step or delivering
+ * held/delayed inputs on either side. This does not migrate active virtual
+ * streams; callers must finish virtual driving before attaching a bridge.
+ *
  * out_delivered receives the number of actions handled when non-NULL.
  *
  * A receiving session that refuses an input with MOQ_ERR_WOULD_BLOCK (its
