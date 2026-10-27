@@ -471,7 +471,15 @@ static void no_effect_refusal(moq_version_t version, unsigned which)
             want = MOQ_ERR_UNSUPPORTED; break;
     case 2: u.delivery_timeout_flags = 4; break;
     case 3: u.reserved = 1; break;
-    case 4: u.delivery_timeout_flags = 1; want = MOQ_ERR_UNSUPPORTED; break;
+    case 4:
+        /* Draft-16: its single DELIVERY_TIMEOUT is never 0 (9.2.2.2).
+         * Draft-18: typed timeouts beside the generic one state two values. */
+        u.delivery_timeout_flags = 1;
+        if (version == MOQ_VERSION_DRAFT_18) {
+            u.old.has_delivery_timeout = true;
+            u.old.delivery_timeout_us = 123000;
+        }
+        break;
     case 5:
         REQUIRE(input_layout_ready());
         u.location = &loc;

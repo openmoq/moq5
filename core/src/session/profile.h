@@ -77,6 +77,11 @@ typedef struct moq_publish_ok_encode_args {
     bool forward;
     bool has_expires;
     uint64_t expires_ms;
+    /* The subscriber's delivery timeouts, checked by the session. */
+    bool dt_has_object;
+    uint64_t dt_object_ms;
+    bool dt_has_subgroup;
+    uint64_t dt_subgroup_ms;
 } moq_publish_ok_encode_args_t;
 
 /*
@@ -243,6 +248,15 @@ typedef struct moq_profile_ops {
     moq_result_t (*track_properties_add_group_order)(const uint8_t *in, size_t len,
                                                      uint8_t order, uint8_t *out,
                                                      size_t cap, size_t *out_len);
+    /* `in` with the publisher's OBJECT_ (or SUBGROUP_) DELIVERY_TIMEOUT =
+     * `ms` added the same way. Draft-16's single DELIVERY_TIMEOUT stands for
+     * either. */
+    moq_result_t (*track_properties_add_object_timeout)(
+        const uint8_t *in, size_t len, uint64_t ms, uint8_t *out, size_t cap,
+        size_t *out_len);
+    moq_result_t (*track_properties_add_subgroup_timeout)(
+        const uint8_t *in, size_t len, uint64_t ms, uint8_t *out, size_t cap,
+        size_t *out_len);
     /* MAX_CACHE_DURATION (0x04) in a track properties blob, searching the
      * mutable list and Immutable Properties: true with its milliseconds when
      * present. A blob that does not parse states nothing past the failure. */
@@ -702,6 +716,9 @@ typedef struct moq_profile_ops {
     /* Initial SUBSCRIBE carries semantic admission options and independently
      * selectable object/subgroup delivery timeouts in milliseconds. */
     bool subscription_admission_options;
+    /* One DELIVERY_TIMEOUT stands for both timeout types, and it is never 0
+     * (draft-16 9.2.2.2 and 11.1). */
+    bool single_delivery_timeout;
     /* SUBSCRIBE_TRACKS carries GROUP_ORDER and INCLUDE_PROPERTIES, observed
      * through the request event's options record. */
     bool subscribe_tracks_options;

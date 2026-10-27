@@ -428,12 +428,11 @@ struct SessionControlTests {
         #expect(u.update.options?.objectDeliveryTimeoutMs == 900)
         #expect(u.update.options?.subgroupDeliveryTimeoutMs == nil)
 
+        // Draft-18 carries the timeouts too (10.2.3, 10.2.4).
         let (c18, _) = try pair(.draft18)
         let sub18 = try Subscriber(session: c18)
-        #expect(throws: MoQError.unsupported) {
-            try sub18.subscribe(track: track(), filter: .latestObject,
+        _ = try sub18.subscribe(track: track(), filter: .latestObject,
                                 objectDeliveryTimeoutMs: 300, subgroupDeliveryTimeoutMs: nil)
-        }
     }
 
     @Test("The publisher facade reports the session GOAWAY with its URI")

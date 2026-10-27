@@ -180,14 +180,23 @@ int main(void)
     for (unsigned i = 0; i < sizeof(valid) / sizeof(valid[0]); ++i) {
         RUN(MOQ_VERSION_DRAFT_22, valid[i], sizeof(timeout_block_t), MOQ_OK);
         RUN(MOQ_VERSION_DRAFT_22, valid[i], sizeof(timeout_block_t) + 8, MOQ_OK);
+        /* Draft-16 has one DELIVERY_TIMEOUT, a QUIC varint never 0
+         * (9.2.2.2): each of these selects 0, a value past the varint or two
+         * different values. */
         RUN(MOQ_VERSION_DRAFT_16, valid[i], sizeof(timeout_block_t),
-            valid[i].flags ? MOQ_ERR_UNSUPPORTED : MOQ_OK);
+            valid[i].flags ? MOQ_ERR_INVAL : MOQ_OK);
         ++cases;
         if (row(MOQ_VERSION_DRAFT_22, valid[i], sizeof(timeout_block_t), MOQ_OK, true))
             ++failed;
-        RUN(MOQ_VERSION_DRAFT_18, valid[i], sizeof(timeout_block_t),
-            valid[i].flags ? MOQ_ERR_UNSUPPORTED : MOQ_OK);
+        /* Draft-18 carries both independently (10.2.3, 10.2.4). */
+        RUN(MOQ_VERSION_DRAFT_18, valid[i], sizeof(timeout_block_t), MOQ_OK);
     }
+    /* What draft-16's single DELIVERY_TIMEOUT can state. */
+    const timeout_block_t d16_valid[] = {
+        {1, 0, 40, 0}, {2, 0, 0, 40}, {3, 0, 40, 40}
+    };
+    for (unsigned i = 0; i < sizeof(d16_valid) / sizeof(d16_valid[0]); ++i)
+        RUN(MOQ_VERSION_DRAFT_16, d16_valid[i], sizeof(timeout_block_t), MOQ_OK);
     const timeout_block_t invalid_flags = {4, 0, 0, 0};
     const timeout_block_t invalid_reserved = {0, 1, 0, 0};
     for (size_t n = 0; n < sizeof(timeout_block_t); ++n) {

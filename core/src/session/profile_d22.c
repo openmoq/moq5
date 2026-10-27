@@ -2221,6 +2221,10 @@ static const moq_profile_ops_t d22_ops = {
     .track_properties_add_dynamic_groups = moq_d18_op_track_properties_add_dynamic_groups,
     .track_properties_group_order = moq_d18_op_track_properties_group_order,
     .track_properties_add_group_order = moq_d18_op_track_properties_add_group_order,
+    .track_properties_add_object_timeout =
+        moq_d18_op_track_properties_add_object_timeout,
+    .track_properties_add_subgroup_timeout =
+        moq_d18_op_track_properties_add_subgroup_timeout,
     .track_properties_max_cache = moq_d18_op_track_properties_max_cache,
 
     /* Request admission and dispatch: the shared engine. */

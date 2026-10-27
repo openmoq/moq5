@@ -3586,10 +3586,27 @@ static moq_result_t d16_encode_subscribe(moq_session_t *s,
         }
     }
 
-    /* Params must be in ascending type order:
+    /* Params must be in ascending type order: DELIVERY_TIMEOUT 0x02,
      * AUTH_TOKEN 0x03, FORWARD 0x10, SUBSCRIBER_PRIORITY 0x20,
      * SUBSCRIPTION_FILTER 0x21, GROUP_ORDER 0x22. */
     size_t pbi = 0;
+    if (args->dt_has_object || args->dt_has_subgroup) {
+        /* The single DELIVERY_TIMEOUT stands for both types (9.2.2.2); the
+         * session checked that the selected values agree. */
+        uint64_t ms = args->dt_has_object ? args->dt_object_ms
+                                          : args->dt_subgroup_ms;
+        size_t n = moq_quic_varint_encode(ms, local_param_bufs[pbi], 16);
+        if (n == 0) {
+            s->output_scratch_len = scratch_saved;
+            return MOQ_ERR_INVAL;
+        }
+        memmove(params + 1, params, param_count * sizeof(*params));
+        params[0] = (moq_kvp_entry_t){
+            .type = MOQ_MSG_PARAM_DELIVERY_TIMEOUT,
+            .value = local_param_bufs[pbi], .value_len = n,
+            .is_varint = true, .raw = NULL, .raw_len = 0 };
+        param_count++; pbi++;
+    }
     if (args->has_forward && !args->forward) {
         size_t n = moq_quic_varint_encode(0, local_param_bufs[pbi], 16);
         params[param_count] = (moq_kvp_entry_t){
@@ -3800,8 +3817,12 @@ static moq_result_t d16_encode_request_update_op(moq_session_t *s,
     uint8_t fbuf[40];   /* encoded subscription-filter value */
     size_t pbi = 0;
 
-    if (args->has_delivery_timeout) {
-        uint64_t ms = args->delivery_timeout_us / 1000;
+    if (args->has_delivery_timeout || args->dt_has_object ||
+        args->dt_has_subgroup) {
+        /* The single DELIVERY_TIMEOUT stands for both types (9.2.2.2). */
+        uint64_t ms = args->has_delivery_timeout
+            ? args->delivery_timeout_us / 1000
+            : args->dt_has_object ? args->dt_object_ms : args->dt_subgroup_ms;
         if (ms == 0) goto inval;
         size_t n = moq_quic_varint_encode(ms, param_bufs[pbi], 8);
         if (n == 0) goto inval;
@@ -4046,6 +4067,17 @@ static moq_result_t d16_track_properties_add_group_order(const uint8_t *in,
                                 out, cap, out_len);
 }
 
+/* DELIVERY_TIMEOUT = `ms` added to a Track Extension list (11.1): one type
+ * stands for both. */
+#define D16_EXT_DELIVERY_TIMEOUT 0x02u
+static moq_result_t d16_track_properties_add_delivery_timeout(
+    const uint8_t *in, size_t len, uint64_t ms, uint8_t *out, size_t cap,
+    size_t *out_len)
+{
+    return moq_kvp_list_add_int(in, len, false, D16_EXT_DELIVERY_TIMEOUT, ms,
+                                out, cap, out_len);
+}
+
 /* §11.1.1 MAX_CACHE_DURATION Track Extension (0x04), milliseconds. */
 #define D16_EXT_MAX_CACHE_DURATION 0x04u
 static bool d16_track_properties_max_cache(const uint8_t *data, size_t len,
@@ -4073,14 +4105,29 @@ static moq_result_t d16_encode_publish_ok_op(
     const moq_publish_ok_encode_args_t *args)
 {
     (void)s;
-    /* Ascending type order: FORWARD 0x10, SUBSCRIBER_PRIORITY 0x20,
-     * SUBSCRIPTION_FILTER 0x21, GROUP_ORDER 0x22, NEW_GROUP_REQUEST 0x32. */
-    moq_kvp_entry_t params[5];
+    /* Ascending type order: DELIVERY_TIMEOUT 0x02, FORWARD 0x10,
+     * SUBSCRIBER_PRIORITY 0x20, SUBSCRIPTION_FILTER 0x21, GROUP_ORDER 0x22,
+     * NEW_GROUP_REQUEST 0x32. */
+    moq_kvp_entry_t params[6];
     size_t param_count = 0;
-    uint8_t param_bufs[4][16];
+    uint8_t param_bufs[5][16];
     size_t pbi = 0;
     /* type varint + up to three 8-byte location varints. */
     uint8_t filter_buf[32];
+
+    /* The single DELIVERY_TIMEOUT stands for both types (9.2.2.2); the
+     * session checked that the selected values agree. */
+    if (args->dt_has_object || args->dt_has_subgroup) {
+        uint64_t ms = args->dt_has_object ? args->dt_object_ms
+                                          : args->dt_subgroup_ms;
+        size_t n = moq_quic_varint_encode(ms, param_bufs[pbi], 16);
+        if (n == 0) return MOQ_ERR_INVAL;
+        params[param_count] = (moq_kvp_entry_t){
+            .type = MOQ_MSG_PARAM_DELIVERY_TIMEOUT,
+            .value = param_bufs[pbi], .value_len = n,
+            .is_varint = true, .raw = NULL, .raw_len = 0 };
+        param_count++; pbi++;
+    }
 
     /* PUBLISH_OK FORWARD: omission defaults to 1 (§9.2.2.8 -- only
      * REQUEST_UPDATE means "unchanged"), so only 0 is worth sending, same as
@@ -5168,6 +5215,11 @@ static const moq_profile_ops_t d16_ops = {
     .validate_track_properties = d16_validate_track_properties,
     .track_properties_group_order = d16_track_properties_group_order,
     .track_properties_add_group_order = d16_track_properties_add_group_order,
+    .track_properties_add_object_timeout =
+        d16_track_properties_add_delivery_timeout,
+    .track_properties_add_subgroup_timeout =
+        d16_track_properties_add_delivery_timeout,
+    .single_delivery_timeout = true,
     .track_properties_max_cache = d16_track_properties_max_cache,
     /* §2.4.2: "When a subscriber detects a Malformed Track, it MUST
      * UNSUBSCRIBE any subscription and FETCH_CANCEL any fetch for that Track

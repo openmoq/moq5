@@ -460,8 +460,15 @@ static void validation(moq_version_t version)
     no_effect_refusal(&p, &u, version == MOQ_VERSION_DRAFT_22 ? MOQ_ERR_INVAL : MOQ_ERR_UNSUPPORTED);
     u.location = NULL;
     if (version != MOQ_VERSION_DRAFT_22) {
+        /* Draft-16's single DELIVERY_TIMEOUT is never 0 (9.2.2.2); on
+         * draft-18 a 0 means no timeout (8). */
         u.delivery_timeout_flags = 1;
-        no_effect_refusal(&p, &u, MOQ_ERR_UNSUPPORTED);
+        if (version == MOQ_VERSION_DRAFT_16)
+            no_effect_refusal(&p, &u, MOQ_ERR_INVAL);
+        /* Typed timeouts beside the generic one state two values. */
+        u.old.has_delivery_timeout = true; u.old.delivery_timeout_us = 123000;
+        no_effect_refusal(&p, &u, MOQ_ERR_INVAL);
+        u.old.has_delivery_timeout = false; u.old.delivery_timeout_us = 0;
         u.delivery_timeout_flags = 0;
         moq_fill_cfg_t fill; moq_fill_cfg_init(&fill); u.fill = &fill;
         no_effect_refusal(&p, &u, MOQ_ERR_UNSUPPORTED);

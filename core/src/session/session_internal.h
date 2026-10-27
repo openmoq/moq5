@@ -4307,6 +4307,14 @@ static inline size_t session_owner_priority_slots(const moq_session_t *s,
            new_priority != old_priority ? 1u : 0u;
 }
 
+/* A subscriber's or publisher's delivery-timeout selection on this draft:
+ * each value within the draft's integer range, and draft-16's single
+ * DELIVERY_TIMEOUT needs the selected values equal and not 0 (9.2.2.2,
+ * 11.1). MOQ_OK or MOQ_ERR_INVAL. */
+moq_result_t session_check_dt_selection(const moq_session_t *s,
+                                       bool has_object, uint64_t object_ms,
+                                       bool has_subgroup, uint64_t subgroup_ms);
+
 /* The owner-wide key for a changed subscriber priority. The caller reserved
  * session_owner_priority_slots() action slots. */
 moq_result_t session_update_owner_priority(moq_session_t *s, uint64_t owner,

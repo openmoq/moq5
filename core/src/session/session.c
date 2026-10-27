@@ -40,6 +40,53 @@ moq_result_t moq_session_track_properties_add_group_order(
         in, in_len, (uint8_t)order, out, out_cap, out_len);
 }
 
+moq_result_t session_check_dt_selection(const moq_session_t *s,
+                                       bool has_object, uint64_t object_ms,
+                                       bool has_subgroup, uint64_t subgroup_ms)
+{
+    uint64_t max = s->profile->location_varint_max;
+    if ((has_object && object_ms > max) || (has_subgroup && subgroup_ms > max))
+        return MOQ_ERR_INVAL;
+    if (!s->profile->single_delivery_timeout) return MOQ_OK;
+    if ((has_object && object_ms == 0) || (has_subgroup && subgroup_ms == 0))
+        return MOQ_ERR_INVAL;
+    if (has_object && has_subgroup && object_ms != subgroup_ms)
+        return MOQ_ERR_INVAL;
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_track_properties_add_delivery_timeouts(
+    const moq_session_t *s, const uint8_t *in, size_t in_len,
+    bool has_object, uint64_t object_ms, bool has_subgroup,
+    uint64_t subgroup_ms, uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    if (!s || !out || !out_len || (in_len > 0 && !in)) return MOQ_ERR_INVAL;
+    if (!has_object && !has_subgroup) return MOQ_ERR_INVAL;
+    moq_result_t rc = session_check_dt_selection(s, has_object, object_ms,
+                                                 has_subgroup, subgroup_ms);
+    if (rc < 0) return rc;
+    const moq_profile_ops_t *p = s->profile;
+    if (p->single_delivery_timeout || !has_subgroup)
+        return p->track_properties_add_object_timeout(
+            in, in_len, has_object ? object_ms : subgroup_ms, out, out_cap,
+            out_len);
+    if (!has_object)
+        return p->track_properties_add_subgroup_timeout(
+            in, in_len, subgroup_ms, out, out_cap, out_len);
+    /* Both types: the object one into scratch, then the subgroup one. */
+    if (in_len > SIZE_MAX - 16) return MOQ_ERR_INVAL;
+    size_t cap = in_len + 16, len = 0;
+    uint8_t *tmp = (uint8_t *)s->alloc.alloc(cap, s->alloc.ctx);
+    if (!tmp) return MOQ_ERR_NOMEM;
+    rc = p->track_properties_add_object_timeout(in, in_len, object_ms, tmp,
+                                                cap, &len);
+    if (rc >= 0)
+        rc = p->track_properties_add_subgroup_timeout(tmp, len, subgroup_ms,
+                                                      out, out_cap, out_len);
+    s->alloc.free(tmp, cap, s->alloc.ctx);
+    return rc;
+}
+
 moq_result_t session_scan_dt_props(const moq_session_t *s,
                                    const uint8_t *data, size_t len,
                                    bool strict_local, moq_dt_scan_t *out)
