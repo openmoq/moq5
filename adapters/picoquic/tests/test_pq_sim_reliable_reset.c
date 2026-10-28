@@ -33,6 +33,7 @@
 #include <picoquic_utils.h>
 
 #include "../../../tests/unit/test_binding_support.h"
+#include "../../../core/src/session/session_internal.h"
 #include "support/pq_attach_refusal.h"
 
 #include <stdio.h>
@@ -277,6 +278,16 @@ static int run_done_count(uint8_t cid, moq_version_t v, bool reliable)
     sim_pump(&s, 200);
     (void)client_saw(&s, MOQ_EVENT_SUBSCRIBE_OK);
 
+    moq_sub_entry_t *entry = NULL;
+    for (size_t i = 0; i < s.server_session->sub_cap; i++)
+        if (moq_subscription_eq(s.server_session->subs[i].handle, ss))
+            entry = &s.server_session->subs[i];
+    CHECK(entry != NULL);
+    if (entry == NULL) { sim_cleanup(&s); return 0; }
+    picoquic_cnx_t *cnx = s.test_ctx->cnx_server;
+    const uint64_t sid = picoquic_get_next_local_stream_id(cnx, 1);
+    const uint64_t sent = cnx->nb_packets_sent, now = s.now;
+
     moq_subgroup_cfg_t sgc;
     moq_subgroup_cfg_init(&sgc);
     sgc.group_id = 6;
@@ -292,9 +303,44 @@ static int run_done_count(uint8_t cid, moq_version_t v, bool reliable)
     moq_done_subscribe_cfg_init(&dc);
     dc.status_code = 0x2;
     dc.stream_count = 1;
+    /* The reset was requested before any stream bytes could leave. DONE
+     * cannot overtake the adapter's still-unresolved opening decision. */
+    const size_t head = s.server_session->action_head;
+    const size_t tail = s.server_session->action_tail;
+    const size_t send_len = s.server_session->send_len;
+    CHECK(s.server_session->pending_open_count == 1);
+    CHECK(entry->opened.subgroup == 0);
+    CHECK(moq_session_done_subscribe(s.server_session, ss, &dc, s.now) == MOQ_ERR_WOULD_BLOCK);
+    CHECK(s.server_session->action_head == head && s.server_session->action_tail == tail &&
+          s.server_session->send_len == send_len && s.server_session->pending_open_count == 1);
+    CHECK(entry->state == MOQ_SUB_ESTABLISHED && entry->opened.subgroup == 0);
+    CHECK(picoquic_get_next_local_stream_id(cnx, 1) == sid);
+
+    /* Settle actions once, without a simulator round: the provider opens
+     * exactly one stream, but the queued header has still not been sent. */
+    CHECK(moq_pq_service(s.server_conn, s.now) == 0);
+    CHECK(s.server_session->pending_open_count == 0);
+    CHECK(entry->opened.subgroup == dc.stream_count && entry->opened.fill == 0 &&
+          !entry->opened.subgroup_external && !entry->opened.fill_external);
+    CHECK(picoquic_get_next_local_stream_id(cnx, 1) == sid + 4);
+    picoquic_stream_head_t *stream = picoquic_find_stream(cnx, sid);
+    CHECK(stream != NULL);
+    if (stream != NULL) CHECK(stream->sent_offset == 0);
+    CHECK(s.now == now && cnx->nb_packets_sent == sent);
     CHECK(moq_session_done_subscribe(s.server_session, ss, &dc, s.now) == MOQ_OK);
     sim_pump(&s, 300);
-    got = client_saw(&s, MOQ_EVENT_SUBSCRIBE_DONE) ? 1 : 0;
+    unsigned done_count = 0;
+    moq_event_t ev;
+    while (moq_session_poll_events(s.client_session, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) {
+            CHECK(ev.u.subscribe_done.stream_count == dc.stream_count);
+            CHECK(ev.u.subscribe_done.status_code == dc.status_code);
+            done_count++;
+        }
+        moq_event_cleanup(&ev);
+    }
+    CHECK(done_count <= 1);
+    got = done_count == 1 ? 1 : 0;
     CHECK(!moq_pq_conn_is_fatal(s.client_conn));
     CHECK(!moq_pq_conn_is_fatal(s.server_conn));
     sim_cleanup(&s);
