@@ -259,6 +259,10 @@ if(MOQ_BUILD_TESTS)
     include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
     set(_picoquic_abi_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-abi-context.cmake")
     moq_write_consumer_abi_context("${_picoquic_abi_context}")
+    # C-only consumers reuse the producer's build context and exported
+    # dependency targets; they do not configure the provider source again.
+    set(_picoquic_consumer_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
+    moq_write_consumer_context("${_picoquic_consumer_context}")
     # Children that link this build's archives also take its OpenSSL selection.
     include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerProviderContext.cmake")
     set(_picoquic_openssl_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-openssl-context.cmake")
@@ -1329,8 +1333,6 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
     if(MOQ_BUILD_PACKAGE_EXPORTS)
     set(_threaded_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer-threaded")
     set(_threaded_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-threaded-test-build")
-    include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
-    moq_nested_cxx_args(_threaded_consumer_cxx)
     # Forward the parent's compile/link flags and build type: the consumer
     # links the parent's archives, so a sanitizer parent build needs a
     # consumer instrumented the same way.
@@ -1338,16 +1340,10 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
         COMMAND ${CMAKE_COMMAND} -E env bash -c
             "set -e; \
              '${CMAKE_COMMAND}' -E rm -rf '${_threaded_consumer_bld}'; \
-             '${CMAKE_COMMAND}' -C '${_picoquic_abi_context}' \
+             '${CMAKE_COMMAND}' -C '${_picoquic_consumer_context}' \
                  -C '${_picoquic_openssl_context}' -S '${_threaded_consumer_src}' \
                  -B '${_threaded_consumer_bld}' \
-                 -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
-                 -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
-                 -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
-                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}'${_threaded_consumer_cxx} \
-                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
-                 -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
-                 -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
+                 -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' && \
              '${CMAKE_COMMAND}' --build '${_threaded_consumer_bld}' && \
              '${_threaded_consumer_bld}/moq_adapter_threaded_consumer_test'")
     include("${PROJECT_SOURCE_DIR}/tests/cmake/RejectConsumerWarnings.cmake")
@@ -1422,28 +1418,23 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PACKAGE_EXPORTS)
     set(_adapter_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_adapter_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
     set(_adapter_consumer_deps "")
-    include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
-    moq_nested_cxx_args(_adapter_consumer_cxx FLAGS)
-    foreach(_dep IN ITEMS PTLS_INCLUDE_DIR MOQ_PTLS_LIB_DIR OPENSSL_INCLUDE_DIR
-                          OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
-        if(${_dep})
-            string(APPEND _adapter_consumer_deps " -D${_dep}='${${_dep}}'")
-        endif()
-    endforeach()
+    if(NOT _MOQ_PICOQUIC_SOURCE_ADDED)
+        # Imported providers still use FindPicoquic; source-built providers
+        # are already represented by the build-tree dependency export.
+        foreach(_dep IN ITEMS PTLS_INCLUDE_DIR MOQ_PTLS_LIB_DIR)
+            if(${_dep})
+                string(APPEND _adapter_consumer_deps " -D${_dep}='${${_dep}}'")
+            endif()
+        endforeach()
+    endif()
     add_test(NAME adapter_consumer
         COMMAND ${CMAKE_COMMAND} -E env bash -c
             "set -e; \
              '${CMAKE_COMMAND}' -E rm -rf '${_adapter_consumer_bld}'; \
-             '${CMAKE_COMMAND}' -C '${_picoquic_abi_context}' -S '${_adapter_consumer_src}' \
+             '${CMAKE_COMMAND}' -C '${_picoquic_consumer_context}' \
+                 -C '${_picoquic_openssl_context}' -S '${_adapter_consumer_src}' \
                  -B '${_adapter_consumer_bld}' \
                  -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
-                 -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
-                 -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
-                 -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_adapter_consumer_cxx} \
-                 -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
-                 -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' \
-                 -DCMAKE_OSX_SYSROOT='${CMAKE_OSX_SYSROOT}' \
                  -DMOQ_CONSUMER_WARNINGS_AS_ERRORS='${MOQ_WARNINGS_AS_ERRORS}' \
                  ${_adapter_consumer_deps} && \
              '${CMAKE_COMMAND}' --build '${_adapter_consumer_bld}' && \

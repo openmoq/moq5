@@ -18,11 +18,20 @@
 #      partial-create relations -- capture the result, check it, leave the loop
 #      before counting a failed thread, report the count, join only that prefix
 #      -- cannot be reordered or dropped one at a time.
-set -u
+set -uo pipefail
 src="${1:-}"
 cml="${2:-}"
 [ -n "$src" ] || { echo "usage: $0 <test_relay_snapshot_cap.c> [CMakeLists.txt]" >&2; exit 2; }
 [ -r "$src" ] || { echo "FAIL: cannot read $src" >&2; exit 1; }
+
+if command -v sha256sum >/dev/null 2>&1; then
+    digest_cmd=(sha256sum)
+elif command -v shasum >/dev/null 2>&1; then
+    digest_cmd=(shasum -a 256)
+else
+    echo "FAIL: source-pin verification requires sha256sum or shasum" >&2
+    exit 1
+fi
 
 failures=0
 fail() { echo "FAIL: $*" >&2; failures=$((failures + 1)); }
@@ -128,10 +137,10 @@ printf '%s\n' "$join" | grep -q 'pthread_join' ||
 # fabrication and unreachability at once: an added emitter, an added early
 # return, or a real receipt left unreachable all change the region.
 region_digest() {
-    body_of "$1" | norm | shasum -a 256 | cut -d' ' -f1
+    body_of "$1" | norm | "${digest_cmd[@]}" | cut -d' ' -f1
 }
 pin_region() {
-    got=$(region_digest "$1")
+    got=$(region_digest "$1") || { fail "cannot hash $1"; return; }
     [ "$got" = "$2" ] ||
         fail "$1 is not its pinned canonical region (digest $got)"
 }

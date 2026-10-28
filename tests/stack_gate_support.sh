@@ -111,19 +111,34 @@ stack_clang_diagnostics() {
     ' "$2"
 }
 
+stack_usage_validate() {
+    # GCC -fstack-usage: dynamic,bounded includes compile-time-bounded
+    # adjustments in the function body (including outgoing call arguments).
+    # Its byte count is an upper bound, not evidence of an unbounded VLA.
+    # https://gcc.gnu.org/onlinedocs/gcc-14.3.0/gcc/Developer-Options.html#index-fstack-usage
+    awk -F '\t' '
+        {
+            name=$1; sub(/^.*:/,"",name)
+            if (NF!=3 || name=="" || ++seen[name]!=1 || $2!~/^[0-9]+$/ ||
+                ($3!="static" && $3!="dynamic,bounded")) {
+                print "UNEXPECTED[stack.inventory]: " $0 > "/dev/stderr"; bad=1
+            }
+        }
+        END {
+            if (NR==0) {
+                print "UNEXPECTED[stack.inventory]: empty inventory" > "/dev/stderr"; bad=1
+            }
+            exit bad
+        }
+    ' "$1"
+}
+
 stack_inventory() {
     local unit=$1
     test -s "$out/$unit.o" && test -s "$out/$unit.su" ||
         stack_fail measurement.missing "$unit object or stack-usage inventory absent"
-    awk -F '\t' '
-        {
-            name=$1; sub(/^.*:/,"",name)
-            if (NF!=3 || name=="" || ++seen[name]!=1 || $2!~/^[0-9]+$/ || $3!="static") {
-                print "UNEXPECTED[stack.inventory]: " $0 > "/dev/stderr"; bad=1
-            }
-        }
-        END {exit bad}
-    ' "$out/$unit.su" || stack_fail measurement.invalid "$unit malformed/ambiguous/nonstatic inventory"
+    stack_usage_validate "$out/$unit.su" ||
+        stack_fail measurement.invalid "$unit malformed/ambiguous/unbounded inventory"
     printf '%q ' "$nm_tool" -P "$out/$unit.o" > "$out/$unit-nm.command.log"
     printf '\n' >> "$out/$unit-nm.command.log"
     local rc
@@ -160,8 +175,8 @@ stack_symbol_count() {
 stack_frame() {
     awk -F '\t' -v name="$2" '
         {owner=$1; sub(/^.*:/,"",owner)}
-        owner==name {n++; size=$2}
-        END {if(n!=1) exit 1; print size}
+        owner==name {n++; size=$2; qualifier=$3}
+        END {if(n!=1) exit 1; printf "%s\t%s\n",size,qualifier}
     ' "$out/$1.su"
 }
 
@@ -184,7 +199,7 @@ stack_inline() {
 }
 
 stack_owner() {
-    local unit=$1 child=$2 parent=${3:-} emitted_parent=${4:-${3:-}} count su_count relation_count
+    local unit=$1 child=$2 parent=${3:-} emitted_parent=${4:-${3:-}} count su_count relation_count record
     count=$(stack_symbol_count "$unit" "$child")
     su_count=$(awk -F '\t' -v name="$child" '{owner=$1; sub(/^.*:/,"",owner); if(owner==name)n++} END {print n+0}' "$out/$unit.su")
     measured_owner=$child
@@ -214,9 +229,15 @@ stack_owner() {
     fi
     test "$(stack_symbol_count "$unit" "$measured_owner")" -eq 1 ||
         stack_fail owner.missing "$measured_owner not emitted exactly once"
-    measured_frame=$(stack_frame "$unit" "$measured_owner") ||
-        stack_fail owner.missing "$measured_owner lacks exact static frame"
-    printf 'MEASURE[%s]: %s bytes; exact emitted owner %s\n' "$child" "$measured_frame" "$measured_owner"
+    record=$(stack_frame "$unit" "$measured_owner") ||
+        stack_fail owner.missing "$measured_owner lacks unique bounded frame"
+    IFS=$'\t' read -r measured_frame measured_qualifier <<< "$record"
+    if [[ $measured_qualifier == dynamic,bounded ]]; then
+        printf 'MEASURE[%s]: %s bytes upper bound (dynamic,bounded); exact emitted owner %s\n' \
+            "$child" "$measured_frame" "$measured_owner"
+    else
+        printf 'MEASURE[%s]: %s bytes; exact emitted owner %s\n' "$child" "$measured_frame" "$measured_owner"
+    fi
 }
 
 stack_owner_controls() {

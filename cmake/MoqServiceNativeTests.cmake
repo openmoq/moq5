@@ -28,8 +28,12 @@ add_library(media_relay_native_host STATIC
     "${_moq_native_cli}/wtcfg.c")
 target_include_directories(media_relay_native_host PRIVATE
     "${_moq_native_cli}" "${PROJECT_SOURCE_DIR}/media/msf/vendor")
+# The reused relay CLI sources call clock_gettime/nanosleep; under strict C11
+# glibc declares them only when a POSIX feature level is selected, which the
+# CLI's own targets get from the compiler's GNU default dialect.
 target_compile_definitions(media_relay_native_host PRIVATE
-    MOQR_PUMP_TESTING MOQR_DUAL_LISTENER)
+    MOQR_PUMP_TESTING MOQR_DUAL_LISTENER
+    $<$<PLATFORM_ID:Linux>:_POSIX_C_SOURCE=200809L>)
 target_link_libraries(media_relay_native_host PRIVATE moqr-admin
     moq::adapter-msquic-managed moq::adapter-wtquic-msquic-managed
     Threads::Threads)

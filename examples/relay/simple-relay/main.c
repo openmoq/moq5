@@ -1,7 +1,13 @@
 /* One lane, one SDK runtime, no application-side forwarding algorithm. */
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _DARWIN_C_SOURCE
 #define _DARWIN_C_SOURCE 1
+#endif
+#ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE 1
+#endif
 #include <moq/msquic_managed.h>
 #include <moq/relay/moqr_shards.h>
 #include <signal.h>
