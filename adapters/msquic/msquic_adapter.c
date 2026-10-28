@@ -526,6 +526,36 @@ static void guard_leave(moq_msquic_conn_t *c)
 static QUIC_STATUS stream_event_cb(HQUIC stream, void *ctx,
                                    QUIC_STREAM_EVENT *ev);
 
+/*
+ * STREAMS_AVAILABLE reports the peer's limit minus the streams MsQuic has
+ * counted, and MsQuic counts a local stream only when its worker processes
+ * the queued StreamStart. Starts the adapter queued but MsQuic has not yet
+ * processed are already spent, so they come off the report. A report below
+ * the pending count leaves no credit (never a wrapped one).
+ */
+static uint16_t credit_after_pending(uint16_t reported, uint32_t pending)
+{
+    return reported > pending ? (uint16_t)(reported - pending) : 0;
+}
+
+/*
+ * Release a local stream's pending-start reservation, once: at its
+ * START_COMPLETE (MsQuic has processed the start, successfully or not, and
+ * later reports reflect it), or at its SHUTDOWN_COMPLETE if no
+ * START_COMPLETE preceded it.
+ */
+static void stream_settle_start(moq_msquic_conn_t *c,
+                                struct moq_msq_stream *ms)
+{
+    if (!ms->start_pending)
+        return;
+    ms->start_pending = false;
+    if (ms->is_bidi)
+        c->bidi_starts_pending--;
+    else
+        c->uni_starts_pending--;
+}
+
 static moq_transport_result_t ep_open(void *ctx, bool bidi,
                                       uint64_t *out_id)
 {
@@ -576,12 +606,15 @@ static moq_transport_result_t ep_open(void *ctx, bool bidi,
         return refused_by_peer_close(c, status) ? MOQ_TRANSPORT_WOULD_BLOCK
                                                 : MOQ_TRANSPORT_ERROR;
     }
+    ms->start_pending = true;
     if (bidi) {
         c->local_bidi_count++;
+        c->bidi_starts_pending++;
         if (c->credit_known)
             c->bidi_credit--;
     } else {
         c->local_uni_count++;
+        c->uni_starts_pending++;
         if (c->credit_known)
             c->uni_credit--;
     }
@@ -941,6 +974,7 @@ static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
 
     switch (ev->Type) {
     case QUIC_STREAM_EVENT_START_COMPLETE:
+        stream_settle_start(c, ms);
         if (QUIC_FAILED(ev->START_COMPLETE.Status)) {
             /* the credit gate should make this unreachable; if the
              * transport refuses a start anyway, the bridge already
@@ -1170,6 +1204,7 @@ static QUIC_STATUS stream_event_locked(HQUIC stream, void *ctx,
         /* Final retirement also settles cancellation ownership. It is never
          * byte/FIN ACK evidence and cannot repair a previously recorded loss. */
         stream_record_output_loss(c, ms);
+        stream_settle_start(c, ms);
         /* all this stream's events (completions included) precede
          * this one; the handle dies here */
         if (ms->stream != NULL &&
@@ -1320,8 +1355,10 @@ static QUIC_STATUS conn_event_locked(HQUIC conn, void *ctx,
         break;
 
     case QUIC_CONNECTION_EVENT_STREAMS_AVAILABLE:
-        c->bidi_credit = ev->STREAMS_AVAILABLE.BidirectionalCount;
-        c->uni_credit = ev->STREAMS_AVAILABLE.UnidirectionalCount;
+        c->bidi_credit = credit_after_pending(
+            ev->STREAMS_AVAILABLE.BidirectionalCount, c->bidi_starts_pending);
+        c->uni_credit = credit_after_pending(
+            ev->STREAMS_AVAILABLE.UnidirectionalCount, c->uni_starts_pending);
         c->credit_known = true;
         /* fresh credit may unblock a parked open */
         conn_service(c);

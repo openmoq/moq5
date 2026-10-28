@@ -56,6 +56,9 @@ struct moq_msq_stream {
     uint64_t ideal_send;       /* last IDEAL_SEND_BUFFER_SIZE (0 = none) */
     bool is_bidi;
     bool is_local;
+    bool start_pending;        /* local: StreamStart accepted, neither
+                                  START_COMPLETE nor SHUTDOWN_COMPLETE seen
+                                  yet; counted in *_starts_pending */
     bool fin_fed;              /* bridge already got this stream's FIN */
     bool paused;               /* bridge is backed up on this stream:
                                   arriving receives are rejected (0 bytes
@@ -181,10 +184,15 @@ struct moq_msquic_conn {
     bool is_client;
 
     /* peer stream credit, tracked from STREAMS_AVAILABLE; open_* gates
-     * on it once known (credit_known) and returns WOULD_BLOCK at zero */
+     * on it once known (credit_known) and returns WOULD_BLOCK at zero.
+     * StreamStart is queued, and MsQuic counts a stream against the peer's
+     * limit only when it processes that start, so a reported count still
+     * includes the starts in flight: *_starts_pending is subtracted. */
     uint16_t bidi_credit;
     uint16_t uni_credit;
     bool credit_known;
+    uint32_t bidi_starts_pending;
+    uint32_t uni_starts_pending;
 
     /* datagram availability (DATAGRAM_STATE_CHANGED) + in-flight cap */
     bool dgram_send_enabled;

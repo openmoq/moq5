@@ -1280,6 +1280,298 @@ static void t_credit_gating(void)
         printf("PASS: credit_gating\n");
 }
 
+/* --- credit: queued starts ------------------------------------------------------------ */
+
+/*
+ * STREAMS_AVAILABLE reports MaxTotalStreamCount - TotalStreamCount as MsQuic
+ * sees it, and MsQuic counts a local stream only when it processes the queued
+ * StreamStart (the same worker operation that indicates START_COMPLETE). A
+ * start the adapter queued but MsQuic has not yet processed is therefore not
+ * subtracted from the reported count. The gate must subtract it, or it admits
+ * opens the peer never granted: FAIL_BLOCKED refuses them in START_COMPLETE,
+ * which the adapter treats as a fatal transport error.
+ *
+ * Every row runs in both directions. The fake's StreamStart always queues
+ * (QUIC_STATUS_PENDING); the test plays MsQuic's worker by delivering each
+ * START_COMPLETE, and plays the peer by delivering the count MsQuic would
+ * report at that point.
+ */
+
+#define CREDIT_OPEN_BOUND 8 /* past every grant below: an unbounded gate
+                               shows up as exactly this many admissions */
+
+static const char *dir_name(bool bidi)
+{
+    return bidi ? "bidi" : "uni";
+}
+
+static void deliver_available_dir(struct rig *r, bool bidi, uint16_t n)
+{
+    deliver_streams_available(r, bidi ? n : 0, bidi ? 0 : n);
+}
+
+static moq_transport_result_t open_dir(struct rig *r, bool bidi,
+                                       uint64_t *id)
+{
+    return bidi ? r->ops->open_bidi(r->conn, id)
+                : r->ops->open_uni(r->conn, id);
+}
+
+static uint32_t starts_pending(const struct rig *r, bool bidi)
+{
+    return bidi ? r->conn->bidi_starts_pending
+                : r->conn->uni_starts_pending;
+}
+
+/* Open until the gate refuses, at most CREDIT_OPEN_BOUND times; returns
+ * the number admitted. Any refusal other than WOULD_BLOCK fails the row. */
+static int opens_admitted(struct rig *r, bool bidi)
+{
+    uint64_t id = 0;
+    int n = 0;
+
+    while (n < CREDIT_OPEN_BOUND) {
+        moq_transport_result_t res = open_dir(r, bidi, &id);
+
+        if (res != MOQ_TRANSPORT_OK) {
+            CHECK(res == MOQ_TRANSPORT_WOULD_BLOCK);
+            break;
+        }
+        n++;
+    }
+    return n;
+}
+
+/* MsQuic's worker processes the start of the index-th local stream. */
+static void complete_start(struct rig *r, int index, QUIC_STATUS status)
+{
+    fake_msq_stream_t *st = fake_msq_stream_at(&r->fake, index);
+
+    CHECK(st != NULL && st->started);
+    if (st != NULL && st->started)
+        fake_msq_deliver_start_complete(st, status);
+}
+
+/* A report that arrives while starts are still queued is reduced by them. */
+static void t_credit_counts_queued_starts(void)
+{
+    for (int d = 0; d < 2; d++) {
+        bool bidi = d == 1;
+        int before = failures;
+        struct rig r;
+
+        CHECK(rig_up(&r, MOQ_PERSPECTIVE_CLIENT) == 0);
+
+        /* peer grants 2; both opens are queued, neither processed yet */
+        deliver_available_dir(&r, bidi, 2);
+        CHECK(opens_admitted(&r, bidi) == 2);
+        CHECK(starts_pending(&r, bidi) == 2);
+
+        /* the peer raises its limit to 3 before MsQuic has processed either
+         * queued start: MsQuic reports 3 - 0 = 3, but 2 of those are spoken
+         * for, so exactly 1 open is legal */
+        deliver_available_dir(&r, bidi, 3);
+        CHECK(opens_admitted(&r, bidi) == 1);
+        CHECK(starts_pending(&r, bidi) == 3);
+
+        /* MsQuic processes all three; the next report (limit 4: 4 - 3)
+         * already counts them, so nothing comes off it */
+        for (int i = 0; i < 3; i++)
+            complete_start(&r, i, QUIC_STATUS_SUCCESS);
+        CHECK(starts_pending(&r, bidi) == 0);
+        deliver_available_dir(&r, bidi, 1);
+        CHECK(opens_admitted(&r, bidi) == 1);
+        CHECK(!moq_msquic_conn_is_fatal(r.conn));
+
+        rig_down(&r);
+        if (failures == before)
+            printf("PASS: credit_counts_queued_starts_%s\n", dir_name(bidi));
+    }
+}
+
+/* Only the starts still queued come off a report; the processed ones are
+ * already in MsQuic's count. */
+static void t_credit_mixed_pending_completed(void)
+{
+    for (int d = 0; d < 2; d++) {
+        bool bidi = d == 1;
+        int before = failures;
+        struct rig r;
+
+        CHECK(rig_up(&r, MOQ_PERSPECTIVE_CLIENT) == 0);
+
+        deliver_available_dir(&r, bidi, 4);
+        CHECK(opens_admitted(&r, bidi) == 4);
+
+        /* MsQuic has processed the 1st and 3rd starts, not the 2nd and 4th */
+        complete_start(&r, 0, QUIC_STATUS_SUCCESS);
+        complete_start(&r, 2, QUIC_STATUS_SUCCESS);
+        CHECK(starts_pending(&r, bidi) == 2);
+
+        /* peer limit 6, MsQuic has counted 2: it reports 4, of which the
+         * 2 queued starts are spoken for */
+        deliver_available_dir(&r, bidi, 4);
+        CHECK(opens_admitted(&r, bidi) == 2);
+        CHECK(starts_pending(&r, bidi) == 4);
+
+        /* everything processed; peer limit 8 - 6 counted = 2 */
+        complete_start(&r, 1, QUIC_STATUS_SUCCESS);
+        for (int i = 3; i < 6; i++)
+            complete_start(&r, i, QUIC_STATUS_SUCCESS);
+        CHECK(starts_pending(&r, bidi) == 0);
+        deliver_available_dir(&r, bidi, 2);
+        CHECK(opens_admitted(&r, bidi) == 2);
+        CHECK(!moq_msquic_conn_is_fatal(r.conn));
+
+        rig_down(&r);
+        if (failures == before)
+            printf("PASS: credit_mixed_pending_completed_%s\n",
+                   dir_name(bidi));
+    }
+}
+
+/*
+ * Opens issued before the first STREAMS_AVAILABLE are not gated, so a first
+ * report can be below the starts already queued. That leaves no credit (not
+ * a wrapped count), and the starts the peer did not grant still fail in
+ * START_COMPLETE: that refusal stays a fatal transport error, and each start
+ * is settled exactly once whatever its outcome.
+ */
+static void t_credit_report_below_pending(void)
+{
+    for (int d = 0; d < 2; d++) {
+        bool bidi = d == 1;
+        int before = failures;
+        struct rig r;
+        uint64_t id = 0;
+
+        CHECK(rig_up(&r, MOQ_PERSPECTIVE_CLIENT) == 0);
+
+        for (int i = 0; i < 3; i++)
+            CHECK(open_dir(&r, bidi, &id) == MOQ_TRANSPORT_OK);
+        CHECK(starts_pending(&r, bidi) == 3);
+
+        /* peer limit 1, nothing counted yet */
+        deliver_available_dir(&r, bidi, 1);
+        CHECK(opens_admitted(&r, bidi) == 0);
+
+        /* MsQuic admits the first start and refuses the two the peer never
+         * granted (FAIL_BLOCKED) */
+        complete_start(&r, 0, QUIC_STATUS_SUCCESS);
+        CHECK(!moq_msquic_conn_is_fatal(r.conn));
+        complete_start(&r, 1, QUIC_STATUS_STREAM_LIMIT_REACHED);
+        CHECK(moq_msquic_conn_is_fatal(r.conn));
+        complete_start(&r, 2, QUIC_STATUS_STREAM_LIMIT_REACHED);
+        CHECK(starts_pending(&r, bidi) == 0);
+
+        rig_down(&r);
+        if (failures == before)
+            printf("PASS: credit_report_below_pending_%s\n", dir_name(bidi));
+    }
+}
+
+/*
+ * A StreamStart refused synchronously queued nothing: it takes no pending
+ * reservation, no credit and no stream id, and the opens after it number
+ * and gate as if it never happened.
+ */
+static void t_credit_sync_start_refusal(void)
+{
+    for (int d = 0; d < 2; d++) {
+        bool bidi = d == 1;
+        int before = failures;
+        struct rig r;
+        uint64_t id = 0;
+
+        CHECK(rig_up(&r, MOQ_PERSPECTIVE_CLIENT) == 0);
+
+        deliver_available_dir(&r, bidi, 4);
+        CHECK(open_dir(&r, bidi, &id) == MOQ_TRANSPORT_OK);
+        CHECK(open_dir(&r, bidi, &id) == MOQ_TRANSPORT_OK);
+        r.fake.stream_start_fails = 1;
+        CHECK(open_dir(&r, bidi, &id) == MOQ_TRANSPORT_ERROR);
+        CHECK(starts_pending(&r, bidi) == 2);
+        fake_msq_stream_t *refused = fake_msq_stream_at(&r.fake, 2);
+        CHECK(refused != NULL && !refused->started && refused->closed);
+
+        /* peer limit 4, nothing counted yet: the 2 queued starts are spoken
+         * for, the refused one is not */
+        deliver_available_dir(&r, bidi, 4);
+        CHECK(opens_admitted(&r, bidi) == 2);
+        CHECK(starts_pending(&r, bidi) == 4);
+
+        /* every accepted start carries the id MsQuic assigns (a mismatch
+         * would be fatal at START_COMPLETE); index 2 is the refused handle */
+        complete_start(&r, 0, QUIC_STATUS_SUCCESS);
+        complete_start(&r, 1, QUIC_STATUS_SUCCESS);
+        complete_start(&r, 3, QUIC_STATUS_SUCCESS);
+        complete_start(&r, 4, QUIC_STATUS_SUCCESS);
+        CHECK(starts_pending(&r, bidi) == 0);
+        CHECK(!moq_msquic_conn_is_fatal(r.conn));
+
+        rig_down(&r);
+        if (failures == before)
+            printf("PASS: credit_sync_start_refusal_%s\n", dir_name(bidi));
+    }
+}
+
+/*
+ * Retirement settles a start once. START_COMPLETE then SHUTDOWN_COMPLETE is
+ * the normal pair and releases the reservation exactly once; a stream
+ * retired with no START_COMPLETE releases it at SHUTDOWN_COMPLETE; a start
+ * MsQuic aborts as the connection goes down (QUIC_STATUS_ABORTED) settles and
+ * stays fatal; and destroying the connection with starts still queued
+ * leaves no allocation behind.
+ */
+static void t_credit_teardown_pending_starts(void)
+{
+    for (int d = 0; d < 2; d++) {
+        bool bidi = d == 1;
+        int before = failures;
+        struct rig r;
+
+        CHECK(rig_up(&r, MOQ_PERSPECTIVE_CLIENT) == 0);
+
+        deliver_available_dir(&r, bidi, 4);
+        CHECK(opens_admitted(&r, bidi) == 4);
+        CHECK(starts_pending(&r, bidi) == 4);
+
+        /* processed, then retired: one release, not two */
+        fake_msq_stream_t *st0 = fake_msq_stream_at(&r.fake, 0);
+        complete_start(&r, 0, QUIC_STATUS_SUCCESS);
+        CHECK(st0 != NULL);
+        if (st0 != NULL)
+            deliver_stream_event(st0, QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE, 0);
+        CHECK(starts_pending(&r, bidi) == 3);
+
+        /* retired with no START_COMPLETE */
+        fake_msq_stream_t *st1 = fake_msq_stream_at(&r.fake, 1);
+        CHECK(st1 != NULL);
+        if (st1 != NULL)
+            deliver_stream_event(st1, QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE, 0);
+        CHECK(starts_pending(&r, bidi) == 2);
+
+        /* peer limit 6, MsQuic has counted 1 (stream 0): it reports 5, of
+         * which the 2 starts still queued are spoken for */
+        deliver_available_dir(&r, bidi, 5);
+        CHECK(opens_admitted(&r, bidi) == 3);
+        CHECK(starts_pending(&r, bidi) == 5);
+        CHECK(!moq_msquic_conn_is_fatal(r.conn));
+
+        /* the connection goes down with starts queued: MsQuic aborts them */
+        complete_start(&r, 2, QUIC_STATUS_ABORTED);
+        CHECK(moq_msquic_conn_is_fatal(r.conn));
+        CHECK(starts_pending(&r, bidi) == 4);
+
+        /* streams 3..6 never see START_COMPLETE; destroy still balances
+         * every allocation (rig_down) */
+        rig_down(&r);
+        if (failures == before)
+            printf("PASS: credit_teardown_pending_starts_%s\n",
+                   dir_name(bidi));
+    }
+}
+
 /* --- reliable reset ------------------------------------------------------------------- */
 
 /* MsQuic's reliable-reset event and stream parameter are preview API, which
@@ -2363,6 +2655,11 @@ int main(void)
     t_flush_failure_ordering();
     t_flush_failure_in_op();
     t_credit_gating();
+    t_credit_counts_queued_starts();
+    t_credit_mixed_pending_completed();
+    t_credit_report_below_pending();
+    t_credit_sync_start_refusal();
+    t_credit_teardown_pending_starts();
     t_teardown_ops();
     t_reliable_reset();
     t_reliable_reset_abandoned();
