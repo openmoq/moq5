@@ -71,6 +71,29 @@ typedef struct rig {
     uint64_t                   now;
 } rig_t;
 
+/* An arm's rig embeds eight full connection fakes and each driver carries its
+ * tap buffers: several MiB together, more than an ordinary 8 MiB stack holds
+ * beneath main and the fake's own initialisation scratch. Each arm keeps them
+ * in one zeroed heap block, released only after every driver and the rig are
+ * torn down. */
+typedef struct arm {
+    rig_t        r;
+    shx_driver_t d[4];
+} arm_t;
+
+static arm_t *
+arm_new(void)
+{
+    arm_t *a = calloc(1, sizeof(*a));
+
+    if (a == NULL) {
+        printf("FAIL: %s:%d: arm storage (%zu bytes) not allocated\n",
+               __FILE__, __LINE__, sizeof(*a));
+        g_failures++;
+    }
+    return a;
+}
+
 static const char *
 alpn_of(moq_version_t v)
 {
@@ -265,23 +288,30 @@ run_pd_forward_held(const char *label, moq_version_t pub_ver,
                     uint64_t want_status, int hold_writes)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(mixed_rig_up(&r));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(shx_driver_open(&pub, &r.fake, pub_ver, alpn_of(pub_ver)));
-    T_CHECK(shx_driver_open(&sub, &r.fake, sub_ver, alpn_of(sub_ver)));
-    T_CHECK(establish(&r, &pub));
-    T_CHECK(establish(&r, &sub));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
+
+    T_CHECK(mixed_rig_up(r));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(shx_driver_open(pub, &r->fake, pub_ver, alpn_of(pub_ver)));
+    T_CHECK(shx_driver_open(sub, &r->fake, sub_ver, alpn_of(sub_ver)));
+    T_CHECK(establish(r, pub));
+    T_CHECK(establish(r, sub));
 
     /* Each connection really did negotiate its own draft. */
-    T_CHECK(moqr_bind_conn_version(r.bind, NULL) == 0);
+    T_CHECK(moqr_bind_conn_version(r->bind, NULL) == 0);
 
-    shx_driver_t *ds[2] = { &pub, &sub };
+    shx_driver_t *ds[2] = { pub, sub };
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
                            { NS1, sizeof(NS1) - 1 } };
     moq_publish_namespace_cfg_t pcfg;
@@ -291,9 +321,9 @@ run_pd_forward_held(const char *label, moq_version_t pub_ver,
 
     moq_announcement_t ann;
 
-    T_CHECK(moq_session_publish_namespace(pub.sess, &pcfg, pub.now, &ann) ==
+    T_CHECK(moq_session_publish_namespace(pub->sess, &pcfg, pub->now, &ann) ==
             MOQ_OK);
-    pump_rounds(&r, ds, 2, 8);
+    pump_rounds(r, ds, 2, 8);
 
     moq_subscribe_cfg_t sc;
 
@@ -304,26 +334,26 @@ run_pd_forward_held(const char *label, moq_version_t pub_ver,
 
     moq_subscription_t sh;
 
-    T_CHECK(moq_session_subscribe(sub.sess, &sc, sub.now, &sh) == MOQ_OK);
+    T_CHECK(moq_session_subscribe(sub->sess, &sc, sub->now, &sh) == MOQ_OK);
 
     moq_subgroup_handle_t sgh;
     bool sg_open = false;
 
     for (int i = 0; i < 24 && !sg_open; i++) {
-        pump_rounds(&r, ds, 2, 2);
-        pub_accept_and_open(&pub, &sgh, &sg_open);
+        pump_rounds(r, ds, 2, 2);
+        pub_accept_and_open(pub, &sgh, &sg_open);
     }
     T_CHECK(sg_open);
-    T_CHECK(pub_push(&pub, sgh, 0));
-    pump_rounds(&r, ds, 2, 10);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+    T_CHECK(pub_push(pub, sgh, 0));
+    pump_rounds(r, ds, 2, 10);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
 
     /* Close the subgroup first: a subscription with an open subgroup refuses
      * DONE (WRONG_STATE), exactly as a real publisher must finish its streams
      * before ending the subscription. */
-    pub.now += 1000;
-    T_CHECK(moq_session_close_subgroup(pub.sess, sgh, pub.now) == MOQ_OK);
-    pump_rounds(&r, ds, 2, 8);
+    pub->now += 1000;
+    T_CHECK(moq_session_close_subgroup(pub->sess, sgh, pub->now) == MOQ_OK);
+    pump_rounds(r, ds, 2, 8);
 
     /* Hold the downstream terminal write across `hold_writes` pumps. The
      * descriptor was captured with the UPSTREAM generation before the hold, so
@@ -339,10 +369,10 @@ run_pd_forward_held(const char *label, moq_version_t pub_ver,
 
     moq_done_subscribe_cfg_init(&dcfg);
     dcfg.status_code = up_status;
-    pub.now += 1000;
-    T_CHECK(moq_session_done_subscribe(pub.sess, pub.subscribe_handle, &dcfg,
-                                       pub.now) == MOQ_OK);
-    pump_rounds(&r, ds, 2, 16);
+    pub->now += 1000;
+    T_CHECK(moq_session_done_subscribe(pub->sess, pub->subscribe_handle, &dcfg,
+                                       pub->now) == MOQ_OK);
+    pump_rounds(r, ds, 2, 16);
 
     if (hold_writes > 0) {
         /* The injected blocks were all consumed, so the terminal that landed
@@ -350,24 +380,25 @@ run_pd_forward_held(const char *label, moq_version_t pub_ver,
         T_CHECK(moqr_bind_debug_sub_done_blocks_left() == 0);
         moqr_bind_debug_block_sub_done(0);
     }
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
     printf("ORACLE %s up=0x%llx decoded=0x%llx want=0x%llx\n", label,
            (unsigned long long)up_status,
-           (unsigned long long)sub.last_done_status,
+           (unsigned long long)sub->last_done_status,
            (unsigned long long)want_status);
-    T_CHECK(sub.done_status_count == 1);
-    T_CHECK(sub.last_done_status == want_status);
+    T_CHECK(sub->done_status_count == 1);
+    T_CHECK(sub->last_done_status == want_status);
 
     /* exactly once */
-    pump_rounds(&r, ds, 2, 8);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
+    pump_rounds(r, ds, 2, 8);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -388,22 +419,29 @@ run_reset_forward(const char *label, moq_version_t pub_ver,
                   moq_version_t sub_ver, uint64_t up_code, uint64_t want_code)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
 
-    g_rig_streaming = true;
-    T_CHECK(mixed_rig_up(&r));
-    g_rig_streaming = false;
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(shx_driver_open(&pub, &r.fake, pub_ver, alpn_of(pub_ver)));
-    T_CHECK(shx_driver_open(&sub, &r.fake, sub_ver, alpn_of(sub_ver)));
-    T_CHECK(establish(&r, &pub));
-    T_CHECK(establish(&r, &sub));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
 
-    shx_driver_t *ds[2] = { &pub, &sub };
+    g_rig_streaming = true;
+    T_CHECK(mixed_rig_up(r));
+    g_rig_streaming = false;
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(shx_driver_open(pub, &r->fake, pub_ver, alpn_of(pub_ver)));
+    T_CHECK(shx_driver_open(sub, &r->fake, sub_ver, alpn_of(sub_ver)));
+    T_CHECK(establish(r, pub));
+    T_CHECK(establish(r, sub));
+
+    shx_driver_t *ds[2] = { pub, sub };
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
                            { NS1, sizeof(NS1) - 1 } };
     moq_publish_namespace_cfg_t pcfg;
@@ -413,9 +451,9 @@ run_reset_forward(const char *label, moq_version_t pub_ver,
 
     moq_announcement_t ann;
 
-    T_CHECK(moq_session_publish_namespace(pub.sess, &pcfg, pub.now, &ann) ==
+    T_CHECK(moq_session_publish_namespace(pub->sess, &pcfg, pub->now, &ann) ==
             MOQ_OK);
-    pump_rounds(&r, ds, 2, 8);
+    pump_rounds(r, ds, 2, 8);
 
     moq_subscribe_cfg_t sc;
 
@@ -426,56 +464,58 @@ run_reset_forward(const char *label, moq_version_t pub_ver,
 
     moq_subscription_t sh;
 
-    T_CHECK(moq_session_subscribe(sub.sess, &sc, sub.now, &sh) == MOQ_OK);
+    T_CHECK(moq_session_subscribe(sub->sess, &sc, sub->now, &sh) == MOQ_OK);
 
     moq_subgroup_handle_t sgh;
     bool sg_open = false;
 
     for (int i = 0; i < 24 && !sg_open; i++) {
-        pump_rounds(&r, ds, 2, 2);
-        pub_accept_and_open(&pub, &sgh, &sg_open);
+        pump_rounds(r, ds, 2, 2);
+        pub_accept_and_open(pub, &sgh, &sg_open);
     }
     T_CHECK(sg_open);
-    T_CHECK(pub_push(&pub, sgh, 0));
-    pump_rounds(&r, ds, 2, 10);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+    T_CHECK(pub_push(pub, sgh, 0));
+    pump_rounds(r, ds, 2, 10);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
 
     /* Begin object 1 and send half of it: stream-through forwarding has now
      * BEGUN the downstream object, so the reset below owes a downstream
      * terminal. */
-    pub.now += 1000;
-    T_CHECK(moq_session_begin_object(pub.sess, sgh, 1, 32, pub.now) == MOQ_OK);
+    pub->now += 1000;
+    T_CHECK(moq_session_begin_object(pub->sess, sgh, 1, 32, pub->now) ==
+            MOQ_OK);
 
     uint8_t half[16];
     moq_rcbuf_t *pl = NULL;
 
     memset(half, 0x61, sizeof(half));
     T_CHECK(moq_rcbuf_create(moq_alloc_default(), half, sizeof(half), &pl) >= 0);
-    pub.now += 1000;
-    T_CHECK(moq_session_write_object_data(pub.sess, sgh, pl, pub.now) ==
+    pub->now += 1000;
+    T_CHECK(moq_session_write_object_data(pub->sess, sgh, pl, pub->now) ==
             MOQ_OK);
     moq_rcbuf_decref(pl);
-    pump_rounds(&r, ds, 2, 10);
+    pump_rounds(r, ds, 2, 10);
 
     /* The upstream stream dies abnormally with its own draft's number. */
-    pub.now += 1000;
-    T_CHECK(moq_session_reset_subgroup(pub.sess, sgh, up_code, pub.now) ==
+    pub->now += 1000;
+    T_CHECK(moq_session_reset_subgroup(pub->sess, sgh, up_code, pub->now) ==
             MOQ_OK);
-    pump_rounds(&r, ds, 2, 16);
+    pump_rounds(r, ds, 2, 16);
 
     printf("ORACLE %s up=0x%llx decoded=0x%llx want=0x%llx count=%d\n", label,
            (unsigned long long)up_code,
-           (unsigned long long)sub.last_sg_reset_code,
-           (unsigned long long)want_code, sub.sg_reset_count);
-    T_CHECK(sub.sg_reset_count == 1);
-    T_CHECK(sub.last_sg_reset_code == want_code);
+           (unsigned long long)sub->last_sg_reset_code,
+           (unsigned long long)want_code, sub->sg_reset_count);
+    T_CHECK(sub->sg_reset_count == 1);
+    T_CHECK(sub->last_sg_reset_code == want_code);
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -588,38 +628,46 @@ static int
 run_initial_deny_control(const char *label, moq_version_t sub_ver)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
+
+    if (arm == NULL) {
+        return g_failures - before;
+    }
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
 
     g_reval_decision = MOQR_AUTH_DENY;
     g_reval_lease = 0;
     g_deny_code = 0x7u;
-    T_CHECK(mixed_rig_up_auth(&r, reval_hook));
-    if (r.m == NULL) {
-        rig_down(&r);
+    T_CHECK(mixed_rig_up_auth(r, reval_hook));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
         return g_failures - before;
     }
     moq_subscription_t sh;
 
-    (void)ext_stage(&r, &pub, &sub, sub_ver, &sh);
-    shx_driver_t *ds[2] = { &pub, &sub };
+    (void)ext_stage(r, pub, sub, sub_ver, &sh);
+    shx_driver_t *ds[2] = { pub, sub };
 
-    pump_rounds(&r, ds, 2, 24);
+    pump_rounds(r, ds, 2, 24);
     printf("ORACLE %s done_count=%d err_count=%d\n", label,
-           sub.done_status_count,
-           shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_ERROR));
+           sub->done_status_count,
+           shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_ERROR));
     /* The denial rode the REQUEST_ERROR domain: no status was invented. */
-    T_CHECK(sub.done_status_count == 0);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_ERROR) >= 1);
+    T_CHECK(sub->done_status_count == 0);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_ERROR) >= 1);
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    rig_down(r);
     g_reval_decision = MOQR_AUTH_ALLOW;
     g_deny_code = 0;
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -630,8 +678,14 @@ run_reval_extension(const char *label, moq_version_t sub_ver,
                     uint64_t deny_code, uint64_t want_status)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
+
+    if (arm == NULL) {
+        return g_failures - before;
+    }
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
 
     g_reval_decision = MOQR_AUTH_ALLOW;
     /* An immediately-due lease: the managed pump reads the monotonic clock
@@ -640,39 +694,41 @@ run_reval_extension(const char *label, moq_version_t sub_ver,
      * until the decision flips. */
     g_reval_lease = 1;
     g_deny_code = 0;
-    T_CHECK(mixed_rig_up_auth(&r, reval_hook));
-    if (r.m == NULL) {
-        rig_down(&r);
+    T_CHECK(mixed_rig_up_auth(r, reval_hook));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
         return g_failures - before;
     }
     moq_subscription_t sh;
 
-    T_CHECK(ext_stage(&r, &pub, &sub, sub_ver, &sh));
-    shx_driver_t *ds[2] = { &pub, &sub };
+    T_CHECK(ext_stage(r, pub, sub, sub_ver, &sh));
+    shx_driver_t *ds[2] = { pub, sub };
 
     /* The lease comes due and the recheck denies with the policy code. */
     g_reval_decision = MOQR_AUTH_DENY;
     g_deny_code = deny_code;
-    for (int i = 0; i < 60 && sub.done_status_count == 0; i++) {
-        pump_rounds(&r, ds, 2, 4);
+    for (int i = 0; i < 60 && sub->done_status_count == 0; i++) {
+        pump_rounds(r, ds, 2, 4);
     }
 
     printf("ORACLE %s deny=0x%llx decoded=0x%llx want=0x%llx count=%d\n",
            label, (unsigned long long)deny_code,
-           (unsigned long long)sub.last_done_status,
-           (unsigned long long)want_status, sub.done_status_count);
-    T_CHECK(sub.done_status_count == 1);
-    T_CHECK(sub.last_done_status == want_status);
+           (unsigned long long)sub->last_done_status,
+           (unsigned long long)want_status, sub->done_status_count);
+    T_CHECK(sub->done_status_count == 1);
+    T_CHECK(sub->last_done_status == want_status);
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    rig_down(r);
     g_reval_decision = MOQR_AUTH_ALLOW;
     g_reval_lease = 0;
     g_deny_code = 0;
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -759,33 +815,41 @@ run_pd_replacement(const char *label, moq_version_t ver_a, moq_version_t ver_b,
                    uint64_t want_status)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub_a, pub_b, sub;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(mixed_rig_up(&r));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(shx_driver_open(&pub_a, &r.fake, ver_a, alpn_of(ver_a)));
-    T_CHECK(shx_driver_open(&sub, &r.fake, sub_ver, alpn_of(sub_ver)));
-    T_CHECK(shx_driver_open(&pub_b, &r.fake, ver_b, alpn_of(ver_b)));
-    T_CHECK(establish(&r, &pub_a));
-    T_CHECK(establish(&r, &sub));
-    T_CHECK(establish(&r, &pub_b));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub_a = &arm->d[0];
+    shx_driver_t *const pub_b = &arm->d[1];
+    shx_driver_t *const sub = &arm->d[2];
 
-    shx_driver_t *ds[3] = { &pub_a, &sub, &pub_b };
+    T_CHECK(mixed_rig_up(r));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(shx_driver_open(pub_a, &r->fake, ver_a, alpn_of(ver_a)));
+    T_CHECK(shx_driver_open(sub, &r->fake, sub_ver, alpn_of(sub_ver)));
+    T_CHECK(shx_driver_open(pub_b, &r->fake, ver_b, alpn_of(ver_b)));
+    T_CHECK(establish(r, pub_a));
+    T_CHECK(establish(r, sub));
+    T_CHECK(establish(r, pub_b));
+
+    shx_driver_t *ds[3] = { pub_a, sub, pub_b };
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
                            { NS1, sizeof(NS1) - 1 } };
     moq_subgroup_handle_t sgh;
 
-    T_CHECK(stage_track(&r, ds, 3, &pub_a, &sub, nsp, &sgh));
+    T_CHECK(stage_track(r, ds, 3, pub_a, sub, nsp, &sgh));
 
     /* Hold the terminal until released, so the replacement lands while the
      * previous generation's terminal is still owed. */
     moqr_bind_debug_block_sub_done(HOLD_UNTIL_RELEASED);
-    end_upstream(&r, ds, 3, &pub_a, sgh, up_status);
-    T_CHECK(sub.done_status_count == 0);   /* genuinely held */
+    end_upstream(r, ds, 3, pub_a, sgh, up_status);
+    T_CHECK(sub->done_status_count == 0);   /* genuinely held */
 
     /* The replacement announces the SAME namespace on the other draft: a new
      * upstream generation while the previous generation's terminal is owed. */
@@ -796,33 +860,34 @@ run_pd_replacement(const char *label, moq_version_t ver_a, moq_version_t ver_b,
 
     moq_announcement_t ann_b;
 
-    T_CHECK(moq_session_publish_namespace(pub_b.sess, &pcfg, pub_b.now,
+    T_CHECK(moq_session_publish_namespace(pub_b->sess, &pcfg, pub_b->now,
                                           &ann_b) == MOQ_OK);
-    pump_rounds(&r, ds, 3, 12);
-    T_CHECK(sub.done_status_count == 0);   /* still held, across the takeover */
+    pump_rounds(r, ds, 3, 12);
+    T_CHECK(sub->done_status_count == 0);   /* still held, across takeover */
 
     moqr_bind_debug_block_sub_done(0);
-    for (int i = 0; i < 24 && sub.done_status_count == 0; i++) {
-        pump_rounds(&r, ds, 3, 4);
+    for (int i = 0; i < 24 && sub->done_status_count == 0; i++) {
+        pump_rounds(r, ds, 3, 4);
     }
 
     printf("ORACLE %s up=0x%llx decoded=0x%llx want=0x%llx count=%d\n", label,
            (unsigned long long)up_status,
-           (unsigned long long)sub.last_done_status,
-           (unsigned long long)want_status, sub.done_status_count);
-    T_CHECK(sub.done_status_count == 1);
-    T_CHECK(sub.last_done_status == want_status);
+           (unsigned long long)sub->last_done_status,
+           (unsigned long long)want_status, sub->done_status_count);
+    T_CHECK(sub->done_status_count == 1);
+    T_CHECK(sub->last_done_status == want_status);
 
-    pump_rounds(&r, ds, 3, 8);
-    T_CHECK(sub.done_status_count == 1);   /* exactly once */
+    pump_rounds(r, ds, 3, 8);
+    T_CHECK(sub->done_status_count == 1);   /* exactly once */
 
-    shx_driver_close(&pub_a);
-    shx_driver_close(&pub_b);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub_a);
+    shx_driver_close(pub_b);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -838,67 +903,77 @@ run_pd_mixed_generation(const char *label, moq_version_t sub_ver,
                         uint64_t want_from_d18)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub16, pub18, sub_a, sub_b;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(mixed_rig_up(&r));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(shx_driver_open(&pub16, &r.fake, D16, alpn_of(D16)));
-    T_CHECK(shx_driver_open(&pub18, &r.fake, D18, alpn_of(D18)));
-    T_CHECK(shx_driver_open(&sub_a, &r.fake, sub_ver, alpn_of(sub_ver)));
-    T_CHECK(shx_driver_open(&sub_b, &r.fake, sub_ver, alpn_of(sub_ver)));
-    T_CHECK(establish(&r, &pub16));
-    T_CHECK(establish(&r, &pub18));
-    T_CHECK(establish(&r, &sub_a));
-    T_CHECK(establish(&r, &sub_b));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub16 = &arm->d[0];
+    shx_driver_t *const pub18 = &arm->d[1];
+    shx_driver_t *const sub_a = &arm->d[2];
+    shx_driver_t *const sub_b = &arm->d[3];
 
-    shx_driver_t *ds[4] = { &pub16, &pub18, &sub_a, &sub_b };
+    T_CHECK(mixed_rig_up(r));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(shx_driver_open(pub16, &r->fake, D16, alpn_of(D16)));
+    T_CHECK(shx_driver_open(pub18, &r->fake, D18, alpn_of(D18)));
+    T_CHECK(shx_driver_open(sub_a, &r->fake, sub_ver, alpn_of(sub_ver)));
+    T_CHECK(shx_driver_open(sub_b, &r->fake, sub_ver, alpn_of(sub_ver)));
+    T_CHECK(establish(r, pub16));
+    T_CHECK(establish(r, pub18));
+    T_CHECK(establish(r, sub_a));
+    T_CHECK(establish(r, sub_b));
+
+    shx_driver_t *ds[4] = { pub16, pub18, sub_a, sub_b };
     moq_bytes_t ns_a[2] = { { NS0, sizeof(NS0) - 1 },
                             { NS1, sizeof(NS1) - 1 } };
     moq_bytes_t ns_b[2] = { { NS0, sizeof(NS0) - 1 },
                             { NS2, sizeof(NS2) - 1 } };
     moq_subgroup_handle_t sg_a, sg_b;
 
-    T_CHECK(stage_track(&r, ds, 4, &pub16, &sub_a, ns_a, &sg_a));
-    T_CHECK(stage_track(&r, ds, 4, &pub18, &sub_b, ns_b, &sg_b));
+    T_CHECK(stage_track(r, ds, 4, pub16, sub_a, ns_a, &sg_a));
+    T_CHECK(stage_track(r, ds, 4, pub18, sub_b, ns_b, &sg_b));
 
     /* Both terminals owed at once, neither on the wire. */
     moqr_bind_debug_block_sub_done(HOLD_UNTIL_RELEASED);
-    end_upstream(&r, ds, 4, &pub16, sg_a, up_status);
-    end_upstream(&r, ds, 4, &pub18, sg_b, up_status);
-    T_CHECK(sub_a.done_status_count == 0);
-    T_CHECK(sub_b.done_status_count == 0);
+    end_upstream(r, ds, 4, pub16, sg_a, up_status);
+    end_upstream(r, ds, 4, pub18, sg_b, up_status);
+    T_CHECK(sub_a->done_status_count == 0);
+    T_CHECK(sub_b->done_status_count == 0);
 
     moqr_bind_debug_block_sub_done(0);
     for (int i = 0; i < 32 &&
-                    (sub_a.done_status_count == 0 ||
-                     sub_b.done_status_count == 0); i++) {
-        pump_rounds(&r, ds, 4, 4);
+                    (sub_a->done_status_count == 0 ||
+                     sub_b->done_status_count == 0); i++) {
+        pump_rounds(r, ds, 4, 4);
     }
 
     printf("ORACLE %s up=0x%llx from_d16=0x%llx (want 0x%llx) "
            "from_d18=0x%llx (want 0x%llx)\n", label,
            (unsigned long long)up_status,
-           (unsigned long long)sub_a.last_done_status,
+           (unsigned long long)sub_a->last_done_status,
            (unsigned long long)want_from_d16,
-           (unsigned long long)sub_b.last_done_status,
+           (unsigned long long)sub_b->last_done_status,
            (unsigned long long)want_from_d18);
-    T_CHECK(sub_a.done_status_count == 1);
-    T_CHECK(sub_b.done_status_count == 1);
-    T_CHECK(sub_a.last_done_status == want_from_d16);
-    T_CHECK(sub_b.last_done_status == want_from_d18);
+    T_CHECK(sub_a->done_status_count == 1);
+    T_CHECK(sub_b->done_status_count == 1);
+    T_CHECK(sub_a->last_done_status == want_from_d16);
+    T_CHECK(sub_b->last_done_status == want_from_d18);
 
-    shx_driver_close(&pub16);
-    shx_driver_close(&pub18);
-    shx_driver_close(&sub_a);
-    shx_driver_close(&sub_b);
-    rig_down(&r);
+    shx_driver_close(pub16);
+    shx_driver_close(pub18);
+    shx_driver_close(sub_a);
+    shx_driver_close(sub_b);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -968,20 +1043,27 @@ run_migration_case(const char *label, up_signal_t sig, bool accepted,
                    int64_t want_done, int64_t want_error)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(mixed_rig_up(&r));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(shx_driver_open(&pub, &r.fake, pub_ver, alpn_of(pub_ver)));
-    T_CHECK(shx_driver_open(&sub, &r.fake, sub_ver, alpn_of(sub_ver)));
-    T_CHECK(establish(&r, &pub));
-    T_CHECK(establish(&r, &sub));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
 
-    shx_driver_t *ds[2] = { &pub, &sub };
+    T_CHECK(mixed_rig_up(r));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(shx_driver_open(pub, &r->fake, pub_ver, alpn_of(pub_ver)));
+    T_CHECK(shx_driver_open(sub, &r->fake, sub_ver, alpn_of(sub_ver)));
+    T_CHECK(establish(r, pub));
+    T_CHECK(establish(r, sub));
+
+    shx_driver_t *ds[2] = { pub, sub };
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
                            { NS1, sizeof(NS1) - 1 } };
     moq_publish_namespace_cfg_t pcfg;
@@ -991,9 +1073,9 @@ run_migration_case(const char *label, up_signal_t sig, bool accepted,
 
     moq_announcement_t ann;
 
-    T_CHECK(moq_session_publish_namespace(pub.sess, &pcfg, pub.now, &ann) ==
+    T_CHECK(moq_session_publish_namespace(pub->sess, &pcfg, pub->now, &ann) ==
             MOQ_OK);
-    pump_rounds(&r, ds, 2, 8);
+    pump_rounds(r, ds, 2, 8);
 
     moq_subscribe_cfg_t sc;
 
@@ -1004,14 +1086,14 @@ run_migration_case(const char *label, up_signal_t sig, bool accepted,
 
     moq_subscription_t sh;
 
-    T_CHECK(moq_session_subscribe(sub.sess, &sc, sub.now, &sh) == MOQ_OK);
+    T_CHECK(moq_session_subscribe(sub->sess, &sc, sub->now, &sh) == MOQ_OK);
 
     /* Wait for the relay's upstream SUBSCRIBE to reach the publisher. */
-    for (int i = 0; i < 24 && !pub.got_subscribe; i++) {
-        pump_rounds(&r, ds, 2, 2);
+    for (int i = 0; i < 24 && !pub->got_subscribe; i++) {
+        pump_rounds(r, ds, 2, 2);
     }
-    T_CHECK(pub.got_subscribe);
-    pub.got_subscribe = false;
+    T_CHECK(pub->got_subscribe);
+    pub->got_subscribe = false;
 
     moq_subgroup_handle_t sgh;
 
@@ -1019,63 +1101,64 @@ run_migration_case(const char *label, up_signal_t sig, bool accepted,
         moq_accept_subscribe_cfg_t acfg;
 
         moq_accept_subscribe_cfg_init(&acfg);
-        pub.now += 1000;
-        T_CHECK(moq_session_accept_subscribe(pub.sess, pub.subscribe_handle,
-                                             &acfg, pub.now) == MOQ_OK);
+        pub->now += 1000;
+        T_CHECK(moq_session_accept_subscribe(pub->sess, pub->subscribe_handle,
+                                             &acfg, pub->now) == MOQ_OK);
         /* An object makes the subscription genuinely ACTIVE downstream. */
         moq_subgroup_cfg_t sgc;
 
         moq_subgroup_cfg_init(&sgc);
         sgc.group_id = 1;
         sgc.publisher_priority = 100;
-        pub.now += 1000;
-        T_CHECK(moq_session_open_subgroup(pub.sess, pub.subscribe_handle, &sgc,
-                                          pub.now, &sgh) == MOQ_OK);
-        T_CHECK(pub_push(&pub, sgh, 0));
-        pump_rounds(&r, ds, 2, 10);
-        T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
-        pub.now += 1000;
-        T_CHECK(moq_session_close_subgroup(pub.sess, sgh, pub.now) == MOQ_OK);
-        pump_rounds(&r, ds, 2, 8);
+        pub->now += 1000;
+        T_CHECK(moq_session_open_subgroup(pub->sess, pub->subscribe_handle,
+                                          &sgc, pub->now, &sgh) == MOQ_OK);
+        T_CHECK(pub_push(pub, sgh, 0));
+        pump_rounds(r, ds, 2, 10);
+        T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+        pub->now += 1000;
+        T_CHECK(moq_session_close_subgroup(pub->sess, sgh, pub->now) == MOQ_OK);
+        pump_rounds(r, ds, 2, 8);
     }
 
-    T_CHECK(pub_signal_rc(&pub, sig) == MOQ_OK);
-    for (int i = 0; i < 40 && sub.done_status_count == 0 &&
-                    sub.sub_error_count == 0; i++) {
-        pump_rounds(&r, ds, 2, 4);
+    T_CHECK(pub_signal_rc(pub, sig) == MOQ_OK);
+    for (int i = 0; i < 40 && sub->done_status_count == 0 &&
+                    sub->sub_error_count == 0; i++) {
+        pump_rounds(r, ds, 2, 4);
     }
 
     printf("ORACLE %s done{n=%d code=0x%llx} error{n=%d code=0x%llx "
-           "retry=%d after=%llu}\n", label, sub.done_status_count,
-           (unsigned long long)sub.last_done_status, sub.sub_error_count,
-           (unsigned long long)sub.last_sub_error,
-           (int)sub.last_sub_error_can_retry,
-           (unsigned long long)sub.last_sub_error_retry_ms);
+           "retry=%d after=%llu}\n", label, sub->done_status_count,
+           (unsigned long long)sub->last_done_status, sub->sub_error_count,
+           (unsigned long long)sub->last_sub_error,
+           (int)sub->last_sub_error_can_retry,
+           (unsigned long long)sub->last_sub_error_retry_ms);
 
     if (want_done >= 0) {
-        T_CHECK(sub.done_status_count == 1);
-        T_CHECK(sub.last_done_status == (uint64_t)want_done);
-        T_CHECK(sub.sub_error_count == 0);   /* not a request error */
+        T_CHECK(sub->done_status_count == 1);
+        T_CHECK(sub->last_done_status == (uint64_t)want_done);
+        T_CHECK(sub->sub_error_count == 0);   /* not a request error */
     } else {
-        T_CHECK(sub.sub_error_count == 1);
-        T_CHECK(sub.last_sub_error == (uint64_t)want_error);
-        T_CHECK(sub.done_status_count == 0); /* no terminal was invented */
+        T_CHECK(sub->sub_error_count == 1);
+        T_CHECK(sub->last_sub_error == (uint64_t)want_error);
+        T_CHECK(sub->done_status_count == 0); /* no terminal was invented */
         /* The relay implements no reissue policy: it must never hand back a
          * retryable answer, whatever the upstream offered. */
-        T_CHECK(!sub.last_sub_error_can_retry);
-        T_CHECK(sub.last_sub_error_retry_ms == 0);
+        T_CHECK(!sub->last_sub_error_can_retry);
+        T_CHECK(sub->last_sub_error_retry_ms == 0);
     }
 
     /* exactly once */
-    pump_rounds(&r, ds, 2, 8);
-    T_CHECK(sub.done_status_count + sub.sub_error_count == 1);
+    pump_rounds(r, ds, 2, 8);
+    T_CHECK(sub->done_status_count + sub->sub_error_count == 1);
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -1150,41 +1233,49 @@ static int
 run_migration_unreachable(const char *label)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(mixed_rig_up(&r));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(mig_stage(&r, &pub, &sub, D16, D16, true));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
+
+    T_CHECK(mixed_rig_up(r));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(mig_stage(r, pub, sub, D16, D16, true));
 
     /* draft-16 cannot express it: the library refuses the operation rather
      * than inventing a message the profile does not define. */
     moq_request_goaway_cfg_t g;
 
     moq_request_goaway_cfg_init(&g);
-    pub.now += 1000;
+    pub->now += 1000;
     moq_result_t rc16 = moq_session_request_goaway_subscribe(
-        pub.sess, pub.subscribe_handle, &g, pub.now);
+        pub->sess, pub->subscribe_handle, &g, pub->now);
 
     printf("ORACLE %s d16_request_goaway=%d\n", label, (int)rc16);
     T_CHECK(rc16 == MOQ_ERR_INVAL);
 
-    shx_driver_t *ds[2] = { &pub, &sub };
+    shx_driver_t *ds[2] = { pub, sub };
 
-    pump_rounds(&r, ds, 2, 8);
+    pump_rounds(r, ds, 2, 8);
     /* A refused signal is not a terminal: nothing was said downstream. */
-    T_CHECK(sub.done_status_count == 0);
-    T_CHECK(sub.sub_error_count == 0);
+    T_CHECK(sub->done_status_count == 0);
+    T_CHECK(sub->sub_error_count == 0);
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -1204,59 +1295,67 @@ run_migration_probe(const char *label, moq_version_t sub_ver, bool accepted,
                     int64_t want_done, int64_t want_error)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(mixed_rig_up(&r));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(mig_stage(&r, &pub, &sub, D18, sub_ver, accepted));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
+
+    T_CHECK(mixed_rig_up(r));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(mig_stage(r, pub, sub, D18, sub_ver, accepted));
 
     uint32_t slot = 0;
     uint64_t handle = 0;
 
-    T_CHECK(moqr_bind_debug_first_usub(r.bind, &slot, &handle));
+    T_CHECK(moqr_bind_debug_first_usub(r->bind, &slot, &handle));
 
-    shx_driver_t *ds[2] = { &pub, &sub };
+    shx_driver_t *ds[2] = { pub, sub };
 
-    r.now += 1000;
-    moqr_bind_debug_upstream_terminated(r.bind, slot,
+    r->now += 1000;
+    moqr_bind_debug_upstream_terminated(r->bind, slot,
                                         MOQ_REQUEST_FAMILY_SUBSCRIBE, handle,
-                                        accepted ? 1 : 0, r.now);
-    for (int i = 0; i < 40 && sub.done_status_count == 0 &&
-                    sub.sub_error_count == 0; i++) {
-        pump_rounds(&r, ds, 2, 4);
+                                        accepted ? 1 : 0, r->now);
+    for (int i = 0; i < 40 && sub->done_status_count == 0 &&
+                    sub->sub_error_count == 0; i++) {
+        pump_rounds(r, ds, 2, 4);
     }
 
     printf("ORACLE %s done{n=%d code=0x%llx} error{n=%d code=0x%llx "
-           "retry=%d after=%llu}\n", label, sub.done_status_count,
-           (unsigned long long)sub.last_done_status, sub.sub_error_count,
-           (unsigned long long)sub.last_sub_error,
-           (int)sub.last_sub_error_can_retry,
-           (unsigned long long)sub.last_sub_error_retry_ms);
+           "retry=%d after=%llu}\n", label, sub->done_status_count,
+           (unsigned long long)sub->last_done_status, sub->sub_error_count,
+           (unsigned long long)sub->last_sub_error,
+           (int)sub->last_sub_error_can_retry,
+           (unsigned long long)sub->last_sub_error_retry_ms);
 
     if (want_done >= 0) {
-        T_CHECK(sub.done_status_count == 1);
-        T_CHECK(sub.last_done_status == (uint64_t)want_done);
-        T_CHECK(sub.sub_error_count == 0);
+        T_CHECK(sub->done_status_count == 1);
+        T_CHECK(sub->last_done_status == (uint64_t)want_done);
+        T_CHECK(sub->sub_error_count == 0);
     } else {
-        T_CHECK(sub.sub_error_count == 1);
-        T_CHECK(sub.last_sub_error == (uint64_t)want_error);
-        T_CHECK(sub.done_status_count == 0);
-        T_CHECK(!sub.last_sub_error_can_retry);
-        T_CHECK(sub.last_sub_error_retry_ms == 0);
+        T_CHECK(sub->sub_error_count == 1);
+        T_CHECK(sub->last_sub_error == (uint64_t)want_error);
+        T_CHECK(sub->done_status_count == 0);
+        T_CHECK(!sub->last_sub_error_can_retry);
+        T_CHECK(sub->last_sub_error_retry_ms == 0);
     }
-    pump_rounds(&r, ds, 2, 8);
-    T_CHECK(sub.done_status_count + sub.sub_error_count == 1);
+    pump_rounds(r, ds, 2, 8);
+    T_CHECK(sub->done_status_count + sub->sub_error_count == 1);
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -1270,51 +1369,58 @@ static int
 run_migration_probe_guards(const char *label)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(mixed_rig_up(&r));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(mig_stage(&r, &pub, &sub, D18, D18, true));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
+
+    T_CHECK(mixed_rig_up(r));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(mig_stage(r, pub, sub, D18, D18, true));
 
     uint32_t slot = 0;
     uint64_t handle = 0;
 
-    T_CHECK(moqr_bind_debug_first_usub(r.bind, &slot, &handle));
+    T_CHECK(moqr_bind_debug_first_usub(r->bind, &slot, &handle));
 
-    shx_driver_t *ds[2] = { &pub, &sub };
+    shx_driver_t *ds[2] = { pub, sub };
     moqr_bind_stats_t st0;
 
-    moqr_bind_get_stats(r.bind, &st0);
+    moqr_bind_get_stats(r->bind, &st0);
 
-    r.now += 1000;
+    r->now += 1000;
     /* right handle, a family the relay never originates */
-    moqr_bind_debug_upstream_terminated(r.bind, slot,
+    moqr_bind_debug_upstream_terminated(r->bind, slot,
                                         MOQ_REQUEST_FAMILY_FETCH, handle, 0,
-                                        r.now);
+                                        r->now);
     /* right family, a handle no upstream subscription owns */
-    moqr_bind_debug_upstream_terminated(r.bind, slot,
+    moqr_bind_debug_upstream_terminated(r->bind, slot,
                                         MOQ_REQUEST_FAMILY_SUBSCRIBE,
-                                        handle ^ 0xDEADBEEFull, 1, r.now);
+                                        handle ^ 0xDEADBEEFull, 1, r->now);
     /* a connection slot that is not in use */
-    moqr_bind_debug_upstream_terminated(r.bind, 0xFFFFu,
+    moqr_bind_debug_upstream_terminated(r->bind, 0xFFFFu,
                                         MOQ_REQUEST_FAMILY_SUBSCRIBE, handle,
-                                        0, r.now);
-    pump_rounds(&r, ds, 2, 12);
+                                        0, r->now);
+    pump_rounds(r, ds, 2, 12);
 
     moqr_bind_stats_t st1;
 
-    moqr_bind_get_stats(r.bind, &st1);
+    moqr_bind_get_stats(r->bind, &st1);
 
     printf("ORACLE %s done=%d error=%d session_errors=%llu->%llu\n", label,
-           sub.done_status_count, sub.sub_error_count,
+           sub->done_status_count, sub->sub_error_count,
            (unsigned long long)st0.session_errors,
            (unsigned long long)st1.session_errors);
-    T_CHECK(sub.done_status_count == 0);
-    T_CHECK(sub.sub_error_count == 0);
+    T_CHECK(sub->done_status_count == 0);
+    T_CHECK(sub->sub_error_count == 0);
     T_CHECK(st1.session_errors == st0.session_errors);
 
     /* The upstream subscription is still there and still usable: the real
@@ -1322,26 +1428,27 @@ run_migration_probe_guards(const char *label)
     uint32_t slot2 = 0;
     uint64_t handle2 = 0;
 
-    T_CHECK(moqr_bind_debug_first_usub(r.bind, &slot2, &handle2));
+    T_CHECK(moqr_bind_debug_first_usub(r->bind, &slot2, &handle2));
     T_CHECK(slot2 == slot);
     T_CHECK(handle2 == handle);
 
-    r.now += 1000;
-    moqr_bind_debug_upstream_terminated(r.bind, slot,
+    r->now += 1000;
+    moqr_bind_debug_upstream_terminated(r->bind, slot,
                                         MOQ_REQUEST_FAMILY_SUBSCRIBE, handle,
-                                        0, r.now);
-    for (int i = 0; i < 40 && sub.done_status_count == 0; i++) {
-        pump_rounds(&r, ds, 2, 4);
+                                        0, r->now);
+    for (int i = 0; i < 40 && sub->done_status_count == 0; i++) {
+        pump_rounds(r, ds, 2, 4);
     }
-    T_CHECK(sub.done_status_count == 1);
-    T_CHECK(sub.last_done_status == 0x4u);   /* GOAWAY -> GOING_AWAY */
+    T_CHECK(sub->done_status_count == 1);
+    T_CHECK(sub->last_done_status == 0x4u);   /* GOAWAY -> GOING_AWAY */
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -1371,52 +1478,59 @@ run_upstream_error_width(const char *label, moq_version_t pub_ver,
                          bool expect_delivered, uint64_t want_code)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(mixed_rig_up(&r));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(mig_stage(&r, &pub, &sub, pub_ver, sub_ver, false));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
 
-    shx_driver_t *ds[2] = { &pub, &sub };
+    T_CHECK(mixed_rig_up(r));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(mig_stage(r, pub, sub, pub_ver, sub_ver, false));
+
+    shx_driver_t *ds[2] = { pub, sub };
     moqr_bind_stats_t st0;
 
-    moqr_bind_get_stats(r.bind, &st0);
+    moqr_bind_get_stats(r->bind, &st0);
 
     /* The upstream refuses the relay's SUBSCRIBE with the wide code. */
     moq_reject_subscribe_cfg_t rj;
 
     moq_reject_subscribe_cfg_init(&rj);
     rj.error_code = up_code;
-    pub.now += 1000;
-    T_CHECK(moq_session_reject_subscribe(pub.sess, pub.subscribe_handle, &rj,
-                                         pub.now) == MOQ_OK);
+    pub->now += 1000;
+    T_CHECK(moq_session_reject_subscribe(pub->sess, pub->subscribe_handle, &rj,
+                                         pub->now) == MOQ_OK);
 
-    for (int i = 0; i < 40 && sub.sub_error_count == 0; i++) {
-        pump_rounds(&r, ds, 2, 4);
+    for (int i = 0; i < 40 && sub->sub_error_count == 0; i++) {
+        pump_rounds(r, ds, 2, 4);
     }
 
     moqr_bind_stats_t st1;
 
-    moqr_bind_get_stats(r.bind, &st1);
+    moqr_bind_get_stats(r->bind, &st1);
     printf("ORACLE %s up=0x%llx decoded{n=%d code=0x%llx} want=0x%llx\n", label,
-           (unsigned long long)up_code, sub.sub_error_count,
-           (unsigned long long)sub.last_sub_error,
+           (unsigned long long)up_code, sub->sub_error_count,
+           (unsigned long long)sub->last_sub_error,
            (unsigned long long)want_code);
 
     if (expect_delivered) {
-        T_CHECK(sub.sub_error_count == 1);
+        T_CHECK(sub->sub_error_count == 1);
         /* The whole 64-bit value, not its low half. */
-        T_CHECK(sub.last_sub_error == want_code);
-        T_CHECK(sub.done_status_count == 0);
+        T_CHECK(sub->last_sub_error == want_code);
+        T_CHECK(sub->done_status_count == 0);
     } else {
         /* draft-16 cannot express it: the session refuses the code rather than
          * altering it, so nothing false reaches the subscriber. */
-        T_CHECK(sub.sub_error_count == 0);
-        T_CHECK(sub.done_status_count == 0);
+        T_CHECK(sub->sub_error_count == 0);
+        T_CHECK(sub->done_status_count == 0);
         /* ...and the refusal is not paid for elsewhere: no session was closed
          * and no connection was torn down on the way out. */
         T_CHECK(st1.session_errors == st0.session_errors);
@@ -1424,15 +1538,16 @@ run_upstream_error_width(const char *label, moq_version_t pub_ver,
         uint32_t uslot = 0;
         uint64_t uhandle = 0;
 
-        T_CHECK(moqr_bind_debug_first_usub(r.bind, &uslot, &uhandle));
+        T_CHECK(moqr_bind_debug_first_usub(r->bind, &uslot, &uhandle));
     }
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -1451,57 +1566,65 @@ run_authored_reqerr(const char *label, moq_version_t sub_ver, uint64_t code,
                     bool expect_delivered, uint64_t want)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
+
+    if (arm == NULL) {
+        return g_failures - before;
+    }
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
 
     g_reval_decision = MOQR_AUTH_DENY;
     g_reval_lease = 0;
     g_deny_code = 0;
     g_request_error_only = code;
-    T_CHECK(mixed_rig_up_auth(&r, reval_hook));
-    if (r.m == NULL) {
-        rig_down(&r);
+    T_CHECK(mixed_rig_up_auth(r, reval_hook));
+    if (r->m == NULL) {
+        rig_down(r);
         g_request_error_only = 0;
         g_reval_decision = MOQR_AUTH_ALLOW;
+        free(arm);
         return g_failures - before;
     }
     moq_subscription_t sh;
 
-    (void)ext_stage(&r, &pub, &sub, sub_ver, &sh);
-    shx_driver_t *ds[2] = { &pub, &sub };
+    (void)ext_stage(r, pub, sub, sub_ver, &sh);
+    shx_driver_t *ds[2] = { pub, sub };
     moqr_bind_stats_t st0;
 
-    moqr_bind_get_stats(r.bind, &st0);
-    pump_rounds(&r, ds, 2, 24);
+    moqr_bind_get_stats(r->bind, &st0);
+    pump_rounds(r, ds, 2, 24);
 
     moqr_bind_stats_t st1;
 
-    moqr_bind_get_stats(r.bind, &st1);
+    moqr_bind_get_stats(r->bind, &st1);
     printf("ORACLE %s authored=0x%llx decoded{n=%d code=0x%llx}\n", label,
-           (unsigned long long)code, sub.sub_error_count,
-           (unsigned long long)sub.last_sub_error);
+           (unsigned long long)code, sub->sub_error_count,
+           (unsigned long long)sub->last_sub_error);
 
     if (expect_delivered) {
-        T_CHECK(sub.sub_error_count >= 1);
-        T_CHECK(sub.last_sub_error == want);
+        T_CHECK(sub->sub_error_count >= 1);
+        T_CHECK(sub->last_sub_error == want);
     } else {
         /* Refused, not altered: the subscriber is told nothing false. */
-        T_CHECK(sub.last_sub_error != code);
-        T_CHECK(sub.last_sub_error == 0);
+        T_CHECK(sub->last_sub_error != code);
+        T_CHECK(sub->last_sub_error == 0);
     }
     /* No collateral either way: the denial is a request answer, never a
      * PUBLISH_DONE, and it costs no session. */
-    T_CHECK(sub.done_status_count == 0);
+    T_CHECK(sub->done_status_count == 0);
     T_CHECK(st1.session_errors == st0.session_errors);
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    rig_down(r);
     g_request_error_only = 0;
     g_reval_decision = MOQR_AUTH_ALLOW;
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 

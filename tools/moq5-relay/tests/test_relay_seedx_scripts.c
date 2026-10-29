@@ -85,6 +85,29 @@ typedef struct rig {
     uint64_t              now;
 } rig_t;
 
+/* An arm's rig embeds eight full connection fakes and each driver carries its
+ * tap buffers: several MiB together, more than an ordinary 8 MiB stack holds
+ * beneath main and the fake's own initialisation scratch. Each arm keeps them
+ * in one zeroed heap block, released only after every driver and the rig are
+ * torn down. */
+typedef struct arm {
+    rig_t        r;
+    shx_driver_t d[4];
+} arm_t;
+
+static arm_t *
+arm_new(void)
+{
+    arm_t *a = calloc(1, sizeof(*a));
+
+    if (a == NULL) {
+        printf("FAIL: %s:%d: arm storage (%zu bytes) not allocated\n",
+               __FILE__, __LINE__, sizeof(*a));
+        g_failures++;
+    }
+    return a;
+}
+
 /* Stream-through ingest/forwarding (the production CLI configuration) for
  * the arms that need a mid-flight downstream object; whole-object elsewhere. */
 static bool g_rig_streaming = false;
@@ -399,21 +422,28 @@ run_withdraw_script(const char *label, moq_version_t version,
                     upstream_kind_t upstream, bool fragment)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(rig_up(&r, version, authorize));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(shx_driver_open(&pub, &r.fake, version, alpn_of(version)));
-    T_CHECK(shx_driver_open(&sub, &r.fake, version, alpn_of(version)));
-    pub.fragment = fragment;
-    T_CHECK(establish(&r, &pub));
-    T_CHECK(establish(&r, &sub));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
 
-    shx_driver_t *ds[2] = { &pub, &sub };
+    T_CHECK(rig_up(r, version, authorize));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(shx_driver_open(pub, &r->fake, version, alpn_of(version)));
+    T_CHECK(shx_driver_open(sub, &r->fake, version, alpn_of(version)));
+    pub->fragment = fragment;
+    T_CHECK(establish(r, pub));
+    T_CHECK(establish(r, sub));
+
+    shx_driver_t *ds[2] = { pub, sub };
 
     /* downstream namespace interest */
     moq_bytes_t pfx[1] = { { NS0, sizeof(NS0) - 1 } };
@@ -425,9 +455,9 @@ run_withdraw_script(const char *label, moq_version_t version,
     nscfg.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
     moq_ns_sub_handle_t nsh;
 
-    T_CHECK(moq_session_subscribe_namespace(sub.sess, &nscfg, sub.now,
+    T_CHECK(moq_session_subscribe_namespace(sub->sess, &nscfg, sub->now,
                                             &nsh) == MOQ_OK);
-    pump_rounds(&r, ds, 2, 8);
+    pump_rounds(r, ds, 2, 8);
 
     /* announce */
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 }, { NS1, sizeof(NS1) - 1 } };
@@ -437,12 +467,12 @@ run_withdraw_script(const char *label, moq_version_t version,
     pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
     moq_announcement_t ann;
 
-    T_CHECK(moq_session_publish_namespace(pub.sess, &pcfg, pub.now, &ann) ==
+    T_CHECK(moq_session_publish_namespace(pub->sess, &pcfg, pub->now, &ann) ==
             MOQ_OK);
-    pump_rounds(&r, ds, 2, 12);
+    pump_rounds(r, ds, 2, 12);
 
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_NAMESPACE_FOUND) == 1);
-    const shx_tap_t *tap = response_tap(&sub);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_NAMESPACE_FOUND) == 1);
+    const shx_tap_t *tap = response_tap(sub);
 
     T_CHECK(tap != NULL);
     ns_oracle_t o;
@@ -454,9 +484,9 @@ run_withdraw_script(const char *label, moq_version_t version,
     }
 
     /* the withdrawal under test */
-    withdraw(&r, &pub, ann);
-    pump_rounds(&r, ds, 2, 12);
-    assert_upstream(&pub, upstream);
+    withdraw(r, pub, ann);
+    pump_rounds(r, ds, 2, 12);
+    assert_upstream(pub, upstream);
 
     T_CHECK(tap != NULL);
     if (tap != NULL) {
@@ -467,14 +497,14 @@ run_withdraw_script(const char *label, moq_version_t version,
         T_CHECK(o.ns_after_done == 0);      /* nothing until a fresh pub   */
         T_CHECK(o.suffix_ok);               /* the exact suffix, "alpha"   */
     }
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_NAMESPACE_GONE) == 1);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_NAMESPACE_GONE) == 1);
 
     /* fresh publication: the NAMESPACE may (and must) appear again */
     moq_announcement_t ann2;
 
-    T_CHECK(moq_session_publish_namespace(pub.sess, &pcfg, pub.now, &ann2) ==
+    T_CHECK(moq_session_publish_namespace(pub->sess, &pcfg, pub->now, &ann2) ==
             MOQ_OK);
-    pump_rounds(&r, ds, 2, 12);
+    pump_rounds(r, ds, 2, 12);
     if (tap != NULL) {
         ns_oracle_scan(tap, NS1, sizeof(NS1) - 1, &o);
         T_CHECK(o.ns_count == 2);
@@ -484,26 +514,27 @@ run_withdraw_script(const char *label, moq_version_t version,
     /* a SECOND withdraw + third publication: repeated request-stream
      * teardown must leave the publisher session healthy and the routing
      * fresh (a re-announce cycle is not a one-shot capability) */
-    withdraw(&r, &pub, ann2);
-    pump_rounds(&r, ds, 2, 12);
+    withdraw(r, pub, ann2);
+    pump_rounds(r, ds, 2, 12);
     moq_announcement_t ann3;
 
-    T_CHECK(moq_session_publish_namespace(pub.sess, &pcfg, pub.now, &ann3) ==
+    T_CHECK(moq_session_publish_namespace(pub->sess, &pcfg, pub->now, &ann3) ==
             MOQ_OK);
-    pump_rounds(&r, ds, 2, 12);
+    pump_rounds(r, ds, 2, 12);
     if (tap != NULL) {
         ns_oracle_scan(tap, NS1, sizeof(NS1) - 1, &o);
         T_CHECK(o.ns_count == 3);
         T_CHECK(o.done_count == 2);
-        T_CHECK(shx_ev_count(&pub, MOQ_EVENT_SESSION_CLOSED) == 0);
+        T_CHECK(shx_ev_count(pub, MOQ_EVENT_SESSION_CLOSED) == 0);
     }
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -636,8 +667,14 @@ static int
 run_credit_script(void)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
+
+    if (arm == NULL) {
+        return g_failures - before;
+    }
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
     moqr_shards_t *shards = NULL;
     sx_pair_t pair; /* the reference ledger for the owner->requester pair */
 
@@ -645,9 +682,9 @@ run_credit_script(void)
     pair.capacity = CREDIT_CAP;
 
     /* K=2 rig with the production multi-lane pump */
-    memset(&r, 0, sizeof(r));
-    fake_mgd_init(&r.fake);
-    moq_msq_test_api_override = fake_mgd_table(&r.fake);
+    memset(r, 0, sizeof(*r));
+    fake_mgd_init(&r->fake);
+    moq_msq_test_api_override = fake_mgd_table(&r->fake);
     moq_msq_test_no_doorbell = true;
 
     moqr_shards_cfg_t shcfg;
@@ -658,7 +695,7 @@ run_credit_script(void)
     shcfg.live_visibility = true; /* per-shard stepping, no shared round */
     shcfg.demand_channel_entries = CREDIT_CAP;
     T_CHECK(moqr_shards_create(&shcfg, &shards) == MOQR_OK);
-    r.ctx = moqr_test_mk_lanes_ctx(shards, 2);
+    r->ctx = moqr_test_mk_lanes_ctx(shards, 2);
 
     moq_msquic_managed_cfg_t scfg;
 
@@ -676,20 +713,22 @@ run_credit_script(void)
     scfg.lane_count = 2;
     scfg.max_connections = 4;
     scfg.on_lane_pump = moqr_test_lanes_pump();
-    scfg.on_lane_pump_user = r.ctx;
-    T_CHECK(moq_msquic_managed_create(&scfg, &r.m) == MOQ_OK);
-    if (r.m == NULL) {
+    scfg.on_lane_pump_user = r->ctx;
+    T_CHECK(moq_msquic_managed_create(&scfg, &r->m) == MOQ_OK);
+    if (r->m == NULL) {
+        free(r->ctx);
         moqr_shards_destroy(shards);
         moq_msq_test_api_override = NULL;
         moq_msq_test_no_doorbell = false;
+        free(arm);
         return g_failures - before;
     }
-    moq_msquic_managed_lane_t *lane0 = moq_msquic_managed_lane(r.m, 0);
-    moq_msquic_managed_lane_t *lane1 = moq_msquic_managed_lane(r.m, 1);
+    moq_msquic_managed_lane_t *lane0 = moq_msquic_managed_lane(r->m, 0);
+    moq_msquic_managed_lane_t *lane1 = moq_msquic_managed_lane(r->m, 1);
 
     /* pub -> lane 0 (round robin), sub -> lane 1 */
-    T_CHECK(shx_driver_open(&pub, &r.fake, MOQ_VERSION_DRAFT_18, "moqt-18"));
-    T_CHECK(shx_driver_open(&sub, &r.fake, MOQ_VERSION_DRAFT_18, "moqt-18"));
+    T_CHECK(shx_driver_open(pub, &r->fake, MOQ_VERSION_DRAFT_18, "moqt-18"));
+    T_CHECK(shx_driver_open(sub, &r->fake, MOQ_VERSION_DRAFT_18, "moqt-18"));
 
 #define STEP0() do { (void)moq_msquic_lane_wake(lane0);                   \
                      (void)moq_msq_test_lane_step(lane0); } while (0)
@@ -698,26 +737,26 @@ run_credit_script(void)
 #define ROUNDS(n)                                                         \
     do {                                                                  \
         for (int r2 = 0; r2 < (n); r2++) {                                \
-            (void)shx_round(&pub); (void)shx_round(&sub);                 \
+            (void)shx_round(pub); (void)shx_round(sub);                 \
             STEP0(); STEP1();                                             \
-            (void)shx_round(&pub); (void)shx_round(&sub);                 \
+            (void)shx_round(pub); (void)shx_round(sub);                 \
         }                                                                 \
     } while (0)
 #define ROUNDS_LANE0_ONLY(n)                                              \
     do {                                                                  \
         for (int r2 = 0; r2 < (n); r2++) {                                \
-            (void)shx_round(&pub); STEP0(); (void)shx_round(&pub);        \
+            (void)shx_round(pub); STEP0(); (void)shx_round(pub);        \
         }                                                                 \
     } while (0)
 
     for (int i = 0; i < 24 &&
-                    (shx_ev_count(&pub, MOQ_EVENT_SETUP_COMPLETE) < 1 ||
-                     shx_ev_count(&sub, MOQ_EVENT_SETUP_COMPLETE) < 1);
+                    (shx_ev_count(pub, MOQ_EVENT_SETUP_COMPLETE) < 1 ||
+                     shx_ev_count(sub, MOQ_EVENT_SETUP_COMPLETE) < 1);
          i++) {
         ROUNDS(2);
     }
-    T_CHECK(shx_ev_count(&pub, MOQ_EVENT_SETUP_COMPLETE) == 1);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SETUP_COMPLETE) == 1);
+    T_CHECK(shx_ev_count(pub, MOQ_EVENT_SETUP_COMPLETE) == 1);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SETUP_COMPLETE) == 1);
 
     /* announce on shard 0's namespace, subscribe cross-shard from lane 1 */
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
@@ -728,7 +767,7 @@ run_credit_script(void)
     pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
     moq_announcement_t ann;
 
-    T_CHECK(moq_session_publish_namespace(pub.sess, &pcfg, pub.now, &ann) ==
+    T_CHECK(moq_session_publish_namespace(pub->sess, &pcfg, pub->now, &ann) ==
             MOQ_OK);
     ROUNDS(8);
 
@@ -740,43 +779,43 @@ run_credit_script(void)
     sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
     moq_subscription_t sh;
 
-    T_CHECK(moq_session_subscribe(sub.sess, &sc, sub.now, &sh) == MOQ_OK);
+    T_CHECK(moq_session_subscribe(sub->sess, &sc, sub->now, &sh) == MOQ_OK);
 
     credit_pub_state_t ps;
 
     memset(&ps, 0, sizeof(ps));
     for (int i = 0; i < 24 && !ps.sg_open; i++) {
         ROUNDS(2);
-        credit_pub_drive(&pub, &ps);
+        credit_pub_drive(pub, &ps);
     }
     T_CHECK(ps.sg_open);
     /* settle the acceptance round-trip (owner ACK over the channel, the
      * requester's SUBSCRIBE_OK to the subscriber) BEFORE the stall begins */
     ROUNDS(10);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
 
     /* STALL the requester lane, then push capacity + 1 objects. Each push is
      * one offer; the ledger decides accepted vs held from configuration
      * arithmetic and is checked against production after every transition. */
-    T_CHECK(credit_push_one(&pub, &ps, 0));
+    T_CHECK(credit_push_one(pub, &ps, 0));
     T_CHECK(sx_pair_offer(&pair));               /* accepted, occ 1 */
     T_CHECK(sx_pair_check(&pair) == 0);
     ROUNDS_LANE0_ONLY(4);
 
-    T_CHECK(credit_push_one(&pub, &ps, 1));
+    T_CHECK(credit_push_one(pub, &ps, 1));
     T_CHECK(sx_pair_offer(&pair));               /* accepted, occ 2 = cap */
     T_CHECK(sx_pair_check(&pair) == 0);
     ROUNDS_LANE0_ONLY(4);
 
     T_CHECK(!sx_pair_offer(&pair));              /* the 3rd offer is HELD */
-    T_CHECK(credit_push_one(&pub, &ps, 2));
+    T_CHECK(credit_push_one(pub, &ps, 2));
     T_CHECK(sx_pair_check(&pair) == 0 && pair.held_current == 1);
     ROUNDS_LANE0_ONLY(4);
 
     /* production check side: the channel holds data, nothing delivered yet,
      * and the producer lane is quiescent */
     T_CHECK(moqr_shards_debug_demand_channel_bytes(shards, 0, 1) > 0);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 0);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 0);
 
     moq_msq_test_lane_row_t l0;
 
@@ -788,7 +827,7 @@ run_credit_script(void)
      * runs again. */
     (void)moq_msquic_lane_wake(lane1);
     (void)moq_msq_test_lane_step(lane1);
-    (void)shx_round(&sub);
+    (void)shx_round(sub);
     while (sx_pair_consume(&pair)) {             /* the drain empties it */
         T_CHECK(sx_pair_check(&pair) == 0);
     }
@@ -803,7 +842,7 @@ run_credit_script(void)
     while (sx_pair_consume(&pair)) {
         T_CHECK(sx_pair_check(&pair) == 0);
     }
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 3);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 3);
     T_CHECK(pair.consumed_total == 3 && pair.occupancy == 0);
     T_CHECK(moqr_shards_debug_demand_channel_bytes(shards, 0, 1) == 0);
 
@@ -812,17 +851,18 @@ run_credit_script(void)
 #undef ROUNDS
 #undef ROUNDS_LANE0_ONLY
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    (void)moq_msquic_managed_stop(r.m);
-    moq_msquic_managed_destroy(r.m);
-    free(r.ctx);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    (void)moq_msquic_managed_stop(r->m);
+    moq_msquic_managed_destroy(r->m);
+    free(r->ctx);
     moqr_shards_destroy(shards);
     moq_msq_test_api_override = NULL;
     moq_msq_test_no_doorbell = false;
     if (g_failures == before) {
         printf("PASS: seedx_credit\n");
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -851,13 +891,19 @@ static int
 run_cancel_script(void)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
+
+    if (arm == NULL) {
+        return g_failures - before;
+    }
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
     moqr_shards_t *shards = NULL;
 
-    memset(&r, 0, sizeof(r));
-    fake_mgd_init(&r.fake);
-    moq_msq_test_api_override = fake_mgd_table(&r.fake);
+    memset(r, 0, sizeof(*r));
+    fake_mgd_init(&r->fake);
+    moq_msq_test_api_override = fake_mgd_table(&r->fake);
     moq_msq_test_no_doorbell = true;
 
     moqr_shards_cfg_t shcfg;
@@ -868,7 +914,7 @@ run_cancel_script(void)
     shcfg.live_visibility = true;
     shcfg.demand_channel_entries = 8; /* roomy: credit never interferes */
     T_CHECK(moqr_shards_create(&shcfg, &shards) == MOQR_OK);
-    r.ctx = moqr_test_mk_lanes_ctx(shards, 2);
+    r->ctx = moqr_test_mk_lanes_ctx(shards, 2);
 
     moq_msquic_managed_cfg_t scfg;
 
@@ -885,40 +931,42 @@ run_cancel_script(void)
     scfg.lane_count = 2;
     scfg.max_connections = 4;
     scfg.on_lane_pump = moqr_test_lanes_pump();
-    scfg.on_lane_pump_user = r.ctx;
-    T_CHECK(moq_msquic_managed_create(&scfg, &r.m) == MOQ_OK);
-    if (r.m == NULL) {
+    scfg.on_lane_pump_user = r->ctx;
+    T_CHECK(moq_msquic_managed_create(&scfg, &r->m) == MOQ_OK);
+    if (r->m == NULL) {
+        free(r->ctx);
         moqr_shards_destroy(shards);
         moq_msq_test_api_override = NULL;
         moq_msq_test_no_doorbell = false;
+        free(arm);
         return g_failures - before;
     }
-    moq_msquic_managed_lane_t *lane0 = moq_msquic_managed_lane(r.m, 0);
-    moq_msquic_managed_lane_t *lane1 = moq_msquic_managed_lane(r.m, 1);
+    moq_msquic_managed_lane_t *lane0 = moq_msquic_managed_lane(r->m, 0);
+    moq_msquic_managed_lane_t *lane1 = moq_msquic_managed_lane(r->m, 1);
 
-    T_CHECK(shx_driver_open(&pub, &r.fake, MOQ_VERSION_DRAFT_18, "moqt-18"));
-    T_CHECK(shx_driver_open(&sub, &r.fake, MOQ_VERSION_DRAFT_18, "moqt-18"));
+    T_CHECK(shx_driver_open(pub, &r->fake, MOQ_VERSION_DRAFT_18, "moqt-18"));
+    T_CHECK(shx_driver_open(sub, &r->fake, MOQ_VERSION_DRAFT_18, "moqt-18"));
 
 #define CROUNDS(n)                                                        \
     do {                                                                  \
         for (int r2 = 0; r2 < (n); r2++) {                                \
-            (void)shx_round(&pub); (void)shx_round(&sub);                 \
+            (void)shx_round(pub); (void)shx_round(sub);                 \
             (void)moq_msquic_lane_wake(lane0);                            \
             (void)moq_msq_test_lane_step(lane0);                          \
             (void)moq_msquic_lane_wake(lane1);                            \
             (void)moq_msq_test_lane_step(lane1);                          \
-            (void)shx_round(&pub); (void)shx_round(&sub);                 \
+            (void)shx_round(pub); (void)shx_round(sub);                 \
         }                                                                 \
     } while (0)
 
     for (int i = 0; i < 24 &&
-                    (shx_ev_count(&pub, MOQ_EVENT_SETUP_COMPLETE) < 1 ||
-                     shx_ev_count(&sub, MOQ_EVENT_SETUP_COMPLETE) < 1);
+                    (shx_ev_count(pub, MOQ_EVENT_SETUP_COMPLETE) < 1 ||
+                     shx_ev_count(sub, MOQ_EVENT_SETUP_COMPLETE) < 1);
          i++) {
         CROUNDS(2);
     }
-    T_CHECK(shx_ev_count(&pub, MOQ_EVENT_SETUP_COMPLETE) == 1);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SETUP_COMPLETE) == 1);
+    T_CHECK(shx_ev_count(pub, MOQ_EVENT_SETUP_COMPLETE) == 1);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SETUP_COMPLETE) == 1);
 
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
                            { NS1, sizeof(NS1) - 1 } };
@@ -928,7 +976,7 @@ run_cancel_script(void)
     pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
     moq_announcement_t ann;
 
-    T_CHECK(moq_session_publish_namespace(pub.sess, &pcfg, pub.now, &ann) ==
+    T_CHECK(moq_session_publish_namespace(pub->sess, &pcfg, pub->now, &ann) ==
             MOQ_OK);
     CROUNDS(8);
 
@@ -940,53 +988,54 @@ run_cancel_script(void)
     sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
     moq_subscription_t sh;
 
-    T_CHECK(moq_session_subscribe(sub.sess, &sc, sub.now, &sh) == MOQ_OK);
+    T_CHECK(moq_session_subscribe(sub->sess, &sc, sub->now, &sh) == MOQ_OK);
 
     credit_pub_state_t ps;
 
     memset(&ps, 0, sizeof(ps));
     for (int i = 0; i < 24 && !ps.sg_open; i++) {
         CROUNDS(2);
-        credit_pub_drive(&pub, &ps);
+        credit_pub_drive(pub, &ps);
     }
     T_CHECK(ps.sg_open);
     CROUNDS(10);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
 
     /* one delivered object proves the pipe end-to-end */
-    T_CHECK(credit_push_one(&pub, &ps, 0));
+    T_CHECK(credit_push_one(pub, &ps, 0));
     CROUNDS(10);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
 
     /* the CANCEL, settled */
-    T_CHECK(moq_session_unsubscribe(sub.sess, sh, sub.now) == MOQ_OK);
+    T_CHECK(moq_session_unsubscribe(sub->sess, sh, sub->now) == MOQ_OK);
     CROUNDS(12);
 
     /* precedence, upstream half: the relay tears the upstream subscription
      * down -- the publisher observes it. */
-    T_CHECK(shx_ev_count(&pub, MOQ_EVENT_UNSUBSCRIBED) == 1);
+    T_CHECK(shx_ev_count(pub, MOQ_EVENT_UNSUBSCRIBED) == 1);
 
     /* precedence, downstream half: pushes after the acknowledged cancel
      * never reach the subscriber (the push itself may legitimately be
      * refused upstream -- only the subscriber count is the invariant) */
-    (void)credit_push_one(&pub, &ps, 1);
-    (void)credit_push_one(&pub, &ps, 2);
+    (void)credit_push_one(pub, &ps, 1);
+    (void)credit_push_one(pub, &ps, 2);
     CROUNDS(12);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
 
 #undef CROUNDS
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    (void)moq_msquic_managed_stop(r.m);
-    moq_msquic_managed_destroy(r.m);
-    free(r.ctx);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    (void)moq_msquic_managed_stop(r->m);
+    moq_msquic_managed_destroy(r->m);
+    free(r->ctx);
     moqr_shards_destroy(shards);
     moq_msq_test_api_override = NULL;
     moq_msq_test_no_doorbell = false;
     if (g_failures == before) {
         printf("PASS: seedx_cancel\n");
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -994,22 +1043,29 @@ static int
 run_d18_reject_script(void)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pub, sub;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(rig_up(&r, MOQ_VERSION_DRAFT_18, deny_announce_authz));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(shx_driver_open(&pub, &r.fake, MOQ_VERSION_DRAFT_18,
-                            alpn_of(MOQ_VERSION_DRAFT_18)));
-    T_CHECK(shx_driver_open(&sub, &r.fake, MOQ_VERSION_DRAFT_18,
-                            alpn_of(MOQ_VERSION_DRAFT_18)));
-    T_CHECK(establish(&r, &pub));
-    T_CHECK(establish(&r, &sub));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pub = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
 
-    shx_driver_t *ds[2] = { &pub, &sub };
+    T_CHECK(rig_up(r, MOQ_VERSION_DRAFT_18, deny_announce_authz));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(shx_driver_open(pub, &r->fake, MOQ_VERSION_DRAFT_18,
+                            alpn_of(MOQ_VERSION_DRAFT_18)));
+    T_CHECK(shx_driver_open(sub, &r->fake, MOQ_VERSION_DRAFT_18,
+                            alpn_of(MOQ_VERSION_DRAFT_18)));
+    T_CHECK(establish(r, pub));
+    T_CHECK(establish(r, sub));
+
+    shx_driver_t *ds[2] = { pub, sub };
     moq_bytes_t pfx[1] = { { NS0, sizeof(NS0) - 1 } };
     moq_subscribe_namespace_cfg_t nscfg;
 
@@ -1019,9 +1075,9 @@ run_d18_reject_script(void)
     nscfg.namespace_interest = MOQ_NAMESPACE_INTEREST_NAMESPACE_STATE;
     moq_ns_sub_handle_t nsh;
 
-    T_CHECK(moq_session_subscribe_namespace(sub.sess, &nscfg, sub.now, &nsh) ==
-            MOQ_OK);
-    pump_rounds(&r, ds, 2, 8);
+    T_CHECK(moq_session_subscribe_namespace(sub->sess, &nscfg, sub->now,
+                                            &nsh) == MOQ_OK);
+    pump_rounds(r, ds, 2, 8);
 
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 }, { NS1, sizeof(NS1) - 1 } };
     moq_publish_namespace_cfg_t pcfg;
@@ -1030,20 +1086,20 @@ run_d18_reject_script(void)
     pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
     moq_announcement_t ann;
 
-    T_CHECK(moq_session_publish_namespace(pub.sess, &pcfg, pub.now, &ann) ==
+    T_CHECK(moq_session_publish_namespace(pub->sess, &pcfg, pub->now, &ann) ==
             MOQ_OK);
-    pump_rounds(&r, ds, 2, 12);
+    pump_rounds(r, ds, 2, 12);
 
     /* the driver observes the rejection */
-    T_CHECK(shx_ev_count(&pub, MOQ_EVENT_NAMESPACE_REJECTED) == 1);
+    T_CHECK(shx_ev_count(pub, MOQ_EVENT_NAMESPACE_REJECTED) == 1);
     /* wire: REQUEST_ERROR (0x5) on the request stream, then FIN — and NO
      * stream abort: rejection-without-processing is FIN-shaped, distinct
      * from processed cancellation */
-    int err_frames = count_type_in_child_tap(&pub, FRAME_REQUEST_ERROR);
+    int err_frames = count_type_in_child_tap(pub, FRAME_REQUEST_ERROR);
     bool fin_on_err_stream = false;
 
     for (int i = 0; i < SHX_MAX_STREAMS; i++) {
-        const shx_tap_t *t = &pub.tap[i];
+        const shx_tap_t *t = &pub->tap[i];
 
         if (!t->used) {
             continue;
@@ -1059,17 +1115,18 @@ run_d18_reject_script(void)
     }
     T_CHECK(err_frames == 1);
     T_CHECK(fin_on_err_stream);
-    T_CHECK(count_child_stream_aborts(&pub) == 0);
+    T_CHECK(count_child_stream_aborts(pub) == 0);
     /* downstream: the denied namespace never reaches the subscriber */
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_NAMESPACE_FOUND) == 0);
-    T_CHECK(count_type_in_child_tap(&sub, FRAME_NAMESPACE) == 0);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_NAMESPACE_FOUND) == 0);
+    T_CHECK(count_type_in_child_tap(sub, FRAME_NAMESPACE) == 0);
 
-    shx_driver_close(&pub);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pub);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: seedx_d18_reject\n");
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -1154,8 +1211,15 @@ static int
 run_multipub_script(const char *label, moq_version_t version)
 {
     int before = g_failures;
-    rig_t r = { 0 };
-    shx_driver_t pa = { 0 }, pb = { 0 }, sub = { 0 };
+    arm_t *const arm = arm_new();
+
+    if (arm == NULL) {
+        return g_failures - before;
+    }
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pa = &arm->d[0];
+    shx_driver_t *const pb = &arm->d[1];
+    shx_driver_t *const sub = &arm->d[2];
     moq_announcement_t ann_a = { 0 }, ann_b = { 0 };
     moq_subscription_t sh_a = { 0 }, sh_b = { 0 };
     moq_subgroup_handle_t sgh_a = { 0 }, sgh_b = { 0 };
@@ -1172,25 +1236,25 @@ run_multipub_script(const char *label, moq_version_t version)
         }                                                                 \
     } while (0)
 
-    MP_REQUIRE(rig_up(&r, version, NULL));
-    MP_REQUIRE(shx_driver_open(&pa, &r.fake, version, alpn_of(version)));
-    MP_REQUIRE(shx_driver_open(&pb, &r.fake, version, alpn_of(version)));
-    MP_REQUIRE(shx_driver_open(&sub, &r.fake, version, alpn_of(version)));
-    MP_REQUIRE(establish(&r, &pa));
-    MP_REQUIRE(establish(&r, &pb));
-    MP_REQUIRE(establish(&r, &sub));
+    MP_REQUIRE(rig_up(r, version, NULL));
+    MP_REQUIRE(shx_driver_open(pa, &r->fake, version, alpn_of(version)));
+    MP_REQUIRE(shx_driver_open(pb, &r->fake, version, alpn_of(version)));
+    MP_REQUIRE(shx_driver_open(sub, &r->fake, version, alpn_of(version)));
+    MP_REQUIRE(establish(r, pa));
+    MP_REQUIRE(establish(r, pb));
+    MP_REQUIRE(establish(r, sub));
 
-    shx_driver_t *ds[3] = { &pa, &pb, &sub };
+    shx_driver_t *ds[3] = { pa, pb, sub };
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
                            { NS1, sizeof(NS1) - 1 } };
     moq_publish_namespace_cfg_t pcfg;
 
     moq_publish_namespace_cfg_init(&pcfg);
     pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
-    MP_REQUIRE(moq_session_publish_namespace(pa.sess, &pcfg, pa.now,
+    MP_REQUIRE(moq_session_publish_namespace(pa->sess, &pcfg, pa->now,
                                               &ann_a) == MOQ_OK);
-    pump_rounds(&r, ds, 3, 8);
-    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_NAMESPACE_ACCEPTED) == 1);
+    pump_rounds(r, ds, 3, 8);
+    MP_REQUIRE(shx_ev_count(pa, MOQ_EVENT_NAMESPACE_ACCEPTED) == 1);
 
     /* A owns the namespace and has established downstream demand BEFORE
      * B replaces it. The replacement must explicitly retire this generation. */
@@ -1200,98 +1264,101 @@ run_multipub_script(const char *label, moq_version_t version)
     sc.track_namespace = pcfg.track_namespace;
     sc.track_name = (moq_bytes_t){ (const uint8_t *)"t", 1 };
     sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
-    MP_REQUIRE(moq_session_subscribe(sub.sess, &sc, sub.now, &sh_a) == MOQ_OK);
+    MP_REQUIRE(moq_session_subscribe(sub->sess, &sc, sub->now, &sh_a) ==
+               MOQ_OK);
     for (int i = 0; i < 24 && !sg_a; i++) {
-        pump_rounds(&r, ds, 3, 2);
-        multipub_drive_pub(&pa, &sgh_a, &sg_a, 1);
+        pump_rounds(r, ds, 3, 2);
+        multipub_drive_pub(pa, &sgh_a, &sg_a, 1);
     }
     MP_REQUIRE(sg_a);
-    MP_REQUIRE(multipub_push(&pa, sgh_a, 0));
-    pump_rounds(&r, ds, 3, 10);
-    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_SUBSCRIBE_REQUEST) == 1);
-    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_SUBSCRIBE_REQUEST) == 0);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
-    MP_REQUIRE(multipub_payload_count(&sub, 0x50) == 1);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 0);
+    MP_REQUIRE(multipub_push(pa, sgh_a, 0));
+    pump_rounds(r, ds, 3, 10);
+    MP_REQUIRE(shx_ev_count(pa, MOQ_EVENT_SUBSCRIBE_REQUEST) == 1);
+    MP_REQUIRE(shx_ev_count(pb, MOQ_EVENT_SUBSCRIBE_REQUEST) == 0);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+    MP_REQUIRE(multipub_payload_count(sub, 0x50) == 1);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_DONE) == 0);
 
-    MP_REQUIRE(moq_session_publish_namespace(pb.sess, &pcfg, pb.now,
+    MP_REQUIRE(moq_session_publish_namespace(pb->sess, &pcfg, pb->now,
                                               &ann_b) == MOQ_OK);
-    pump_rounds(&r, ds, 3, 12);
-    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_ACCEPTED) == 1);
-    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_REJECTED) == 0);
-    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_CANCELLED) == 0);
-    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_NAMESPACE_CANCELLED) == 1);
-    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_UNSUBSCRIBED) == 1);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
-    MP_REQUIRE(sub.done_status_count == 1 && sub.last_done_status == 0x2);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
-    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_SUBSCRIBE_REQUEST) == 0);
+    pump_rounds(r, ds, 3, 12);
+    MP_REQUIRE(shx_ev_count(pb, MOQ_EVENT_NAMESPACE_ACCEPTED) == 1);
+    MP_REQUIRE(shx_ev_count(pb, MOQ_EVENT_NAMESPACE_REJECTED) == 0);
+    MP_REQUIRE(shx_ev_count(pb, MOQ_EVENT_NAMESPACE_CANCELLED) == 0);
+    MP_REQUIRE(shx_ev_count(pa, MOQ_EVENT_NAMESPACE_CANCELLED) == 1);
+    MP_REQUIRE(shx_ev_count(pa, MOQ_EVENT_UNSUBSCRIBED) == 1);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
+    MP_REQUIRE(sub->done_status_count == 1 && sub->last_done_status == 0x2);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
+    MP_REQUIRE(shx_ev_count(pb, MOQ_EVENT_SUBSCRIBE_REQUEST) == 0);
 
     /* Retired A cannot leak more payload. Standing demand ended explicitly;
      * this policy does not silently retarget an already accepted request. */
-    MP_REQUIRE(!multipub_push(&pa, sgh_a, 1));
-    pump_rounds(&r, ds, 3, 8);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
-    MP_REQUIRE(multipub_payload_count(&sub, 0x51) == 0);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
+    MP_REQUIRE(!multipub_push(pa, sgh_a, 1));
+    pump_rounds(r, ds, 3, 8);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+    MP_REQUIRE(multipub_payload_count(sub, 0x51) == 0);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
 
     /* Fresh demand must reach only the newer owner and carry fresh bytes,
      * never A's retained log. There is no second namespace announcement. */
-    sub.now += 1000;
-    MP_REQUIRE(moq_session_subscribe(sub.sess, &sc, sub.now, &sh_b) == MOQ_OK);
+    sub->now += 1000;
+    MP_REQUIRE(moq_session_subscribe(sub->sess, &sc, sub->now, &sh_b) ==
+               MOQ_OK);
     for (int i = 0; i < 24 && !sg_b; i++) {
-        pump_rounds(&r, ds, 3, 2);
-        multipub_drive_pub(&pb, &sgh_b, &sg_b, 2);
+        pump_rounds(r, ds, 3, 2);
+        multipub_drive_pub(pb, &sgh_b, &sg_b, 2);
     }
     MP_REQUIRE(sg_b);
-    MP_REQUIRE(multipub_push(&pb, sgh_b, 2));
-    pump_rounds(&r, ds, 3, 12);
-    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_SUBSCRIBE_REQUEST) == 1);
-    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_SUBSCRIBE_REQUEST) == 1);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 2);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_ERROR) == 0);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 2);
-    MP_REQUIRE(multipub_payload_count(&sub, 0x50) == 1);
-    MP_REQUIRE(multipub_payload_count(&sub, 0x51) == 0);
-    MP_REQUIRE(multipub_payload_count(&sub, 0x52) == 1);
+    MP_REQUIRE(multipub_push(pb, sgh_b, 2));
+    pump_rounds(r, ds, 3, 12);
+    MP_REQUIRE(shx_ev_count(pa, MOQ_EVENT_SUBSCRIBE_REQUEST) == 1);
+    MP_REQUIRE(shx_ev_count(pb, MOQ_EVENT_SUBSCRIBE_REQUEST) == 1);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_OK) == 2);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_ERROR) == 0);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 2);
+    MP_REQUIRE(multipub_payload_count(sub, 0x50) == 1);
+    MP_REQUIRE(multipub_payload_count(sub, 0x51) == 0);
+    MP_REQUIRE(multipub_payload_count(sub, 0x52) == 1);
 
     /* Late close of the retired publisher must not terminate B's demand. */
-    fake_mgd_deliver_peer_close(pa.child, 0);
-    fake_mgd_deliver_shutdown_complete(pa.child);
-    pa.child = NULL;
-    shx_driver_t *remaining[2] = { &pb, &sub };
+    fake_mgd_deliver_peer_close(pa->child, 0);
+    fake_mgd_deliver_shutdown_complete(pa->child);
+    pa->child = NULL;
+    shx_driver_t *remaining[2] = { pb, sub };
 
-    pump_rounds(&r, remaining, 2, 12);
-    MP_REQUIRE(multipub_push(&pb, sgh_b, 3));
-    pump_rounds(&r, remaining, 2, 8);
-    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_NAMESPACE_ACCEPTED) == 1);
-    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_NAMESPACE_CANCELLED) == 1);
-    MP_REQUIRE(shx_ev_count(&pa, MOQ_EVENT_UNSUBSCRIBED) == 1);
-    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_ACCEPTED) == 1);
-    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_NAMESPACE_CANCELLED) == 0);
-    MP_REQUIRE(shx_ev_count(&pb, MOQ_EVENT_SUBSCRIBE_REQUEST) == 1);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 2);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
-    MP_REQUIRE(sub.done_status_count == 1 && sub.last_done_status == 0x2);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 3);
-    MP_REQUIRE(multipub_payload_count(&sub, 0x50) == 1);
-    MP_REQUIRE(multipub_payload_count(&sub, 0x51) == 0);
-    MP_REQUIRE(multipub_payload_count(&sub, 0x52) == 1);
-    MP_REQUIRE(multipub_payload_count(&sub, 0x53) == 1);
-    MP_REQUIRE(shx_ev_count(&sub, MOQ_EVENT_SESSION_CLOSED) == 0);
+    pump_rounds(r, remaining, 2, 12);
+    MP_REQUIRE(multipub_push(pb, sgh_b, 3));
+    pump_rounds(r, remaining, 2, 8);
+    MP_REQUIRE(shx_ev_count(pa, MOQ_EVENT_NAMESPACE_ACCEPTED) == 1);
+    MP_REQUIRE(shx_ev_count(pa, MOQ_EVENT_NAMESPACE_CANCELLED) == 1);
+    MP_REQUIRE(shx_ev_count(pa, MOQ_EVENT_UNSUBSCRIBED) == 1);
+    MP_REQUIRE(shx_ev_count(pb, MOQ_EVENT_NAMESPACE_ACCEPTED) == 1);
+    MP_REQUIRE(shx_ev_count(pb, MOQ_EVENT_NAMESPACE_CANCELLED) == 0);
+    MP_REQUIRE(shx_ev_count(pb, MOQ_EVENT_SUBSCRIBE_REQUEST) == 1);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_OK) == 2);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
+    MP_REQUIRE(sub->done_status_count == 1 && sub->last_done_status == 0x2);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 3);
+    MP_REQUIRE(multipub_payload_count(sub, 0x50) == 1);
+    MP_REQUIRE(multipub_payload_count(sub, 0x51) == 0);
+    MP_REQUIRE(multipub_payload_count(sub, 0x52) == 1);
+    MP_REQUIRE(multipub_payload_count(sub, 0x53) == 1);
+    MP_REQUIRE(shx_ev_count(sub, MOQ_EVENT_SESSION_CLOSED) == 0);
     printf("ORACLE %s newer-owner=B retired-A=1 track-ended=0x2 "
            "fresh-objects=2 stale-objects=0\n", label);
 
 cleanup:
-    shx_driver_close(&pa);
-    shx_driver_close(&pb);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pa);
+    shx_driver_close(pb);
+    shx_driver_close(sub);
+    rig_down(r);
 #undef MP_REQUIRE
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -1302,20 +1369,27 @@ static int
 run_multipub_noalt_script(const char *label, moq_version_t version)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pa, sub;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(rig_up(&r, version, NULL));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(shx_driver_open(&pa, &r.fake, version, alpn_of(version)));
-    T_CHECK(shx_driver_open(&sub, &r.fake, version, alpn_of(version)));
-    T_CHECK(establish(&r, &pa));
-    T_CHECK(establish(&r, &sub));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pa = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
 
-    shx_driver_t *ds[2] = { &pa, &sub };
+    T_CHECK(rig_up(r, version, NULL));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(shx_driver_open(pa, &r->fake, version, alpn_of(version)));
+    T_CHECK(shx_driver_open(sub, &r->fake, version, alpn_of(version)));
+    T_CHECK(establish(r, pa));
+    T_CHECK(establish(r, sub));
+
+    shx_driver_t *ds[2] = { pa, sub };
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
                            { NS1, sizeof(NS1) - 1 } };
     moq_publish_namespace_cfg_t pcfg;
@@ -1324,9 +1398,9 @@ run_multipub_noalt_script(const char *label, moq_version_t version)
     pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
     moq_announcement_t ann_a;
 
-    T_CHECK(moq_session_publish_namespace(pa.sess, &pcfg, pa.now, &ann_a) ==
+    T_CHECK(moq_session_publish_namespace(pa->sess, &pcfg, pa->now, &ann_a) ==
             MOQ_OK);
-    pump_rounds(&r, ds, 2, 8);
+    pump_rounds(r, ds, 2, 8);
 
     moq_subscribe_cfg_t sc;
 
@@ -1336,44 +1410,45 @@ run_multipub_noalt_script(const char *label, moq_version_t version)
     sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
     moq_subscription_t sh;
 
-    T_CHECK(moq_session_subscribe(sub.sess, &sc, sub.now, &sh) == MOQ_OK);
+    T_CHECK(moq_session_subscribe(sub->sess, &sc, sub->now, &sh) == MOQ_OK);
     moq_subgroup_handle_t sgh_a;
     bool sg_a = false;
 
     for (int i = 0; i < 24 && !sg_a; i++) {
-        pump_rounds(&r, ds, 2, 2);
-        multipub_drive_pub(&pa, &sgh_a, &sg_a, 1);
+        pump_rounds(r, ds, 2, 2);
+        multipub_drive_pub(pa, &sgh_a, &sg_a, 1);
     }
     T_CHECK(sg_a);
-    T_CHECK(multipub_push(&pa, sgh_a, 0));
-    pump_rounds(&r, ds, 2, 10);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+    T_CHECK(multipub_push(pa, sgh_a, 0));
+    pump_rounds(r, ds, 2, 10);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
 
-    fake_mgd_deliver_peer_close(pa.child, 0);
-    fake_mgd_deliver_shutdown_complete(pa.child);
-    pa.child = NULL;
-    shx_driver_t *ds1[1] = { &sub };
+    fake_mgd_deliver_peer_close(pa->child, 0);
+    fake_mgd_deliver_shutdown_complete(pa->child);
+    pa->child = NULL;
+    shx_driver_t *ds1[1] = { sub };
 
-    pump_rounds(&r, ds1, 1, 12);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
+    pump_rounds(r, ds1, 1, 12);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
     /* ORACLE <label>_publish_done_status: the decoded PUBLISH_DONE status
      * for a source lost with no alternate is TRACK_ENDED (0x2) — "the track
      * is no longer being published" (d16 §13.4.3 / d18 §15.10.3). 0x6 is
      * TOO_FAR_BEHIND (d16) / EXPIRED (d18): a different meaning per draft
      * and never this one. */
     printf("ORACLE %s_publish_done_status decoded=0x%llx\n", label,
-           (unsigned long long)sub.last_done_status);
-    T_CHECK(sub.done_status_count == 1);
-    T_CHECK(sub.last_done_status == 0x2);
+           (unsigned long long)sub->last_done_status);
+    T_CHECK(sub->done_status_count == 1);
+    T_CHECK(sub->last_done_status == 0x2);
     /* exactly once: further pumping never doubles the terminal */
-    pump_rounds(&r, ds1, 1, 8);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
+    pump_rounds(r, ds1, 1, 8);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
 
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -1389,24 +1464,31 @@ static int
 run_multipub_noalt_begun_script(const char *label, moq_version_t version)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pa, sub;
+    arm_t *const arm = arm_new();
+
+    if (arm == NULL) {
+        return g_failures - before;
+    }
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pa = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
 
     g_rig_streaming = true;
-    bool up = rig_up(&r, version, NULL);
+    bool up = rig_up(r, version, NULL);
 
     g_rig_streaming = false;
     T_CHECK(up);
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
         return g_failures - before;
     }
-    T_CHECK(shx_driver_open(&pa, &r.fake, version, alpn_of(version)));
-    T_CHECK(shx_driver_open(&sub, &r.fake, version, alpn_of(version)));
-    T_CHECK(establish(&r, &pa));
-    T_CHECK(establish(&r, &sub));
+    T_CHECK(shx_driver_open(pa, &r->fake, version, alpn_of(version)));
+    T_CHECK(shx_driver_open(sub, &r->fake, version, alpn_of(version)));
+    T_CHECK(establish(r, pa));
+    T_CHECK(establish(r, sub));
 
-    shx_driver_t *ds[2] = { &pa, &sub };
+    shx_driver_t *ds[2] = { pa, sub };
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
                            { NS1, sizeof(NS1) - 1 } };
     moq_publish_namespace_cfg_t pcfg;
@@ -1415,9 +1497,9 @@ run_multipub_noalt_begun_script(const char *label, moq_version_t version)
     pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
     moq_announcement_t ann_a;
 
-    T_CHECK(moq_session_publish_namespace(pa.sess, &pcfg, pa.now, &ann_a) ==
+    T_CHECK(moq_session_publish_namespace(pa->sess, &pcfg, pa->now, &ann_a) ==
             MOQ_OK);
-    pump_rounds(&r, ds, 2, 8);
+    pump_rounds(r, ds, 2, 8);
 
     moq_subscribe_cfg_t sc;
 
@@ -1427,24 +1509,24 @@ run_multipub_noalt_begun_script(const char *label, moq_version_t version)
     sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
     moq_subscription_t sh;
 
-    T_CHECK(moq_session_subscribe(sub.sess, &sc, sub.now, &sh) == MOQ_OK);
+    T_CHECK(moq_session_subscribe(sub->sess, &sc, sub->now, &sh) == MOQ_OK);
     moq_subgroup_handle_t sgh_a;
     bool sg_a = false;
 
     for (int i = 0; i < 24 && !sg_a; i++) {
-        pump_rounds(&r, ds, 2, 2);
-        multipub_drive_pub(&pa, &sgh_a, &sg_a, 1);
+        pump_rounds(r, ds, 2, 2);
+        multipub_drive_pub(pa, &sgh_a, &sg_a, 1);
     }
     T_CHECK(sg_a);
-    T_CHECK(multipub_push(&pa, sgh_a, 0));
-    pump_rounds(&r, ds, 2, 10);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+    T_CHECK(multipub_push(pa, sgh_a, 0));
+    pump_rounds(r, ds, 2, 10);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
 
     /* Begin object 1 (32 declared) and send only half: the relay's
      * stream-through forwarding begins the downstream object, which is
      * then mid-flight when the source dies. */
-    pa.now += 1000;
-    T_CHECK(moq_session_begin_object(pa.sess, sgh_a, 1, 32, pa.now) ==
+    pa->now += 1000;
+    T_CHECK(moq_session_begin_object(pa->sess, sgh_a, 1, 32, pa->now) ==
             MOQ_OK);
     uint8_t half[16];
     moq_rcbuf_t *pl = NULL;
@@ -1452,39 +1534,40 @@ run_multipub_noalt_begun_script(const char *label, moq_version_t version)
     memset(half, 0x61, sizeof(half));
     T_CHECK(moq_rcbuf_create(moq_alloc_default(), half, sizeof(half), &pl) >=
             0);
-    pa.now += 1000;
-    T_CHECK(moq_session_write_object_data(pa.sess, sgh_a, pl, pa.now) ==
+    pa->now += 1000;
+    T_CHECK(moq_session_write_object_data(pa->sess, sgh_a, pl, pa->now) ==
             MOQ_OK);
     moq_rcbuf_decref(pl);
-    pump_rounds(&r, ds, 2, 10);
+    pump_rounds(r, ds, 2, 10);
 
-    fake_mgd_deliver_peer_close(pa.child, 0);
-    fake_mgd_deliver_shutdown_complete(pa.child);
-    pa.child = NULL;
-    shx_driver_t *ds1[1] = { &sub };
+    fake_mgd_deliver_peer_close(pa->child, 0);
+    fake_mgd_deliver_shutdown_complete(pa->child);
+    pa->child = NULL;
+    shx_driver_t *ds1[1] = { sub };
 
-    pump_rounds(&r, ds1, 1, 12);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
+    pump_rounds(r, ds1, 1, 12);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
     /* ORACLE <label>_publish_done_status: PUBLISH_DONE TRACK_ENDED (0x2). */
     printf("ORACLE %s_publish_done_status decoded=0x%llx\n", label,
-           (unsigned long long)sub.last_done_status);
-    T_CHECK(sub.done_status_count == 1);
-    T_CHECK(sub.last_done_status == 0x2);
+           (unsigned long long)sub->last_done_status);
+    T_CHECK(sub->done_status_count == 1);
+    T_CHECK(sub->last_done_status == 0x2);
     /* ORACLE <label>_subgroup_reset_code: the begun downstream subgroup is
      * reset with CANCELLED (0x1) — its own registry, never the PUBLISH_DONE
      * status by numeric coincidence. */
     printf("ORACLE %s_subgroup_reset_code decoded=0x%llx count=%d\n", label,
-           (unsigned long long)sub.last_sg_reset_code, sub.sg_reset_count);
-    T_CHECK(sub.sg_reset_count == 1);
-    T_CHECK(sub.last_sg_reset_code == 0x1);
-    pump_rounds(&r, ds1, 1, 8);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
+           (unsigned long long)sub->last_sg_reset_code, sub->sg_reset_count);
+    T_CHECK(sub->sg_reset_count == 1);
+    T_CHECK(sub->last_sg_reset_code == 0x1);
+    pump_rounds(r, ds1, 1, 8);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
 
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -1497,20 +1580,27 @@ static int
 run_range_complete_script(const char *label, moq_version_t version)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pa, sub;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(rig_up(&r, version, NULL));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(shx_driver_open(&pa, &r.fake, version, alpn_of(version)));
-    T_CHECK(shx_driver_open(&sub, &r.fake, version, alpn_of(version)));
-    T_CHECK(establish(&r, &pa));
-    T_CHECK(establish(&r, &sub));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pa = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
 
-    shx_driver_t *ds[2] = { &pa, &sub };
+    T_CHECK(rig_up(r, version, NULL));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(shx_driver_open(pa, &r->fake, version, alpn_of(version)));
+    T_CHECK(shx_driver_open(sub, &r->fake, version, alpn_of(version)));
+    T_CHECK(establish(r, pa));
+    T_CHECK(establish(r, sub));
+
+    shx_driver_t *ds[2] = { pa, sub };
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
                            { NS1, sizeof(NS1) - 1 } };
     moq_publish_namespace_cfg_t pcfg;
@@ -1519,9 +1609,9 @@ run_range_complete_script(const char *label, moq_version_t version)
     pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
     moq_announcement_t ann_a;
 
-    T_CHECK(moq_session_publish_namespace(pa.sess, &pcfg, pa.now, &ann_a) ==
+    T_CHECK(moq_session_publish_namespace(pa->sess, &pcfg, pa->now, &ann_a) ==
             MOQ_OK);
-    pump_rounds(&r, ds, 2, 8);
+    pump_rounds(r, ds, 2, 8);
 
     moq_subscribe_cfg_t sc;
 
@@ -1534,18 +1624,18 @@ run_range_complete_script(const char *label, moq_version_t version)
     sc.end_group = 1;   /* exactly group 1 */
     moq_subscription_t sh;
 
-    T_CHECK(moq_session_subscribe(sub.sess, &sc, sub.now, &sh) == MOQ_OK);
+    T_CHECK(moq_session_subscribe(sub->sess, &sc, sub->now, &sh) == MOQ_OK);
     moq_subgroup_handle_t sgh_a;
     bool sg_a = false;
 
     for (int i = 0; i < 24 && !sg_a; i++) {
-        pump_rounds(&r, ds, 2, 2);
-        multipub_drive_pub(&pa, &sgh_a, &sg_a, 1);
+        pump_rounds(r, ds, 2, 2);
+        multipub_drive_pub(pa, &sgh_a, &sg_a, 1);
     }
     T_CHECK(sg_a);
-    T_CHECK(multipub_push(&pa, sgh_a, 0));
-    pa.now += 1000;
-    T_CHECK(moq_session_close_subgroup(pa.sess, sgh_a, pa.now) == MOQ_OK);
+    T_CHECK(multipub_push(pa, sgh_a, 0));
+    pa->now += 1000;
+    T_CHECK(moq_session_close_subgroup(pa->sess, sgh_a, pa->now) == MOQ_OK);
     /* Group 2 proves the range boundary: the bounded sub must complete at
      * the end of group 1, never receive group 2. */
     moq_subgroup_cfg_t sgc2;
@@ -1555,25 +1645,26 @@ run_range_complete_script(const char *label, moq_version_t version)
     sgc2.publisher_priority = 100;
     moq_subgroup_handle_t sgh_b;
 
-    pa.now += 1000;
-    T_CHECK(moq_session_open_subgroup(pa.sess, pa.subscribe_handle, &sgc2,
-                                      pa.now, &sgh_b) == MOQ_OK);
-    T_CHECK(multipub_push(&pa, sgh_b, 0));
-    pump_rounds(&r, ds, 2, 16);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
+    pa->now += 1000;
+    T_CHECK(moq_session_open_subgroup(pa->sess, pa->subscribe_handle, &sgc2,
+                                      pa->now, &sgh_b) == MOQ_OK);
+    T_CHECK(multipub_push(pa, sgh_b, 0));
+    pump_rounds(r, ds, 2, 16);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) == 1);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_DONE) == 1);
     /* ORACLE <label>_range_done_status: SUBSCRIPTION_ENDED (0x3). */
     printf("ORACLE %s_range_done_status decoded=0x%llx\n", label,
-           (unsigned long long)sub.last_done_status);
-    T_CHECK(sub.done_status_count == 1);
-    T_CHECK(sub.last_done_status == 0x3);
+           (unsigned long long)sub->last_done_status);
+    T_CHECK(sub->done_status_count == 1);
+    T_CHECK(sub->last_done_status == 0x3);
 
-    shx_driver_close(&pa);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pa);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -1613,20 +1704,27 @@ static int
 run_wide_send_script(const char *label, moq_version_t version)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t pa, sub;
+    arm_t *const arm = arm_new();
 
-    T_CHECK(rig_up(&r, version, NULL));
-    if (r.m == NULL) {
-        rig_down(&r);
+    if (arm == NULL) {
         return g_failures - before;
     }
-    T_CHECK(shx_driver_open(&pa, &r.fake, version, alpn_of(version)));
-    T_CHECK(shx_driver_open(&sub, &r.fake, version, alpn_of(version)));
-    T_CHECK(establish(&r, &pa));
-    T_CHECK(establish(&r, &sub));
+    rig_t *const r = &arm->r;
+    shx_driver_t *const pa = &arm->d[0];
+    shx_driver_t *const sub = &arm->d[1];
 
-    shx_driver_t *ds[2] = { &pa, &sub };
+    T_CHECK(rig_up(r, version, NULL));
+    if (r->m == NULL) {
+        rig_down(r);
+        free(arm);
+        return g_failures - before;
+    }
+    T_CHECK(shx_driver_open(pa, &r->fake, version, alpn_of(version)));
+    T_CHECK(shx_driver_open(sub, &r->fake, version, alpn_of(version)));
+    T_CHECK(establish(r, pa));
+    T_CHECK(establish(r, sub));
+
+    shx_driver_t *ds[2] = { pa, sub };
     moq_bytes_t nsp[2] = { { NS0, sizeof(NS0) - 1 },
                            { NS1, sizeof(NS1) - 1 } };
     moq_publish_namespace_cfg_t pcfg;
@@ -1635,9 +1733,9 @@ run_wide_send_script(const char *label, moq_version_t version)
     pcfg.track_namespace = (moq_namespace_t){ .parts = nsp, .count = 2 };
     moq_announcement_t ann_a;
 
-    T_CHECK(moq_session_publish_namespace(pa.sess, &pcfg, pa.now, &ann_a) ==
+    T_CHECK(moq_session_publish_namespace(pa->sess, &pcfg, pa->now, &ann_a) ==
             MOQ_OK);
-    pump_rounds(&r, ds, 2, 8);
+    pump_rounds(r, ds, 2, 8);
 
     moq_subscribe_cfg_t sc;
 
@@ -1647,17 +1745,17 @@ run_wide_send_script(const char *label, moq_version_t version)
     sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
     moq_subscription_t sh;
 
-    T_CHECK(moq_session_subscribe(sub.sess, &sc, sub.now, &sh) == MOQ_OK);
+    T_CHECK(moq_session_subscribe(sub->sess, &sc, sub->now, &sh) == MOQ_OK);
     moq_subgroup_handle_t sgh_a;
     bool sg_a = false;
 
     for (int i = 0; i < 24 && !sg_a; i++) {
-        pump_rounds(&r, ds, 2, 2);
-        multipub_drive_pub(&pa, &sgh_a, &sg_a, 1);
+        pump_rounds(r, ds, 2, 2);
+        multipub_drive_pub(pa, &sgh_a, &sg_a, 1);
     }
     T_CHECK(sg_a);
-    pump_rounds(&r, ds, 2, 8);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
+    pump_rounds(r, ds, 2, 8);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_OK) == 1);
 
     /* the whole burst is written before the relay's lane runs again, so one
      * service pass forwards it as one batch */
@@ -1668,16 +1766,16 @@ run_wide_send_script(const char *label, moq_version_t version)
         memset(body, (int)(0x60u + oid), sizeof(body));
         T_CHECK(moq_rcbuf_create(moq_alloc_default(), body, sizeof(body),
                                  &pl) == MOQ_OK);
-        pa.now += 1000;
-        T_CHECK(moq_session_write_object(pa.sess, sgh_a, oid, pl, pa.now) ==
+        pa->now += 1000;
+        T_CHECK(moq_session_write_object(pa->sess, sgh_a, oid, pl, pa->now) ==
                 MOQ_OK);
         moq_rcbuf_decref(pl);
     }
-    pump_rounds(&r, ds, 2, 16);
+    pump_rounds(r, ds, 2, 16);
 
     /* the shape under test: a downstream data-stream send whose bytes
      * exceed the fake's stable-copy cap */
-    const fake_msq_t *sf = &sub.child->fake;
+    const fake_msq_t *sf = &sub->child->fake;
     uint64_t widest = 0;
 
     for (int i = 0; i < sf->send_count; i++) {
@@ -1688,20 +1786,20 @@ run_wide_send_script(const char *label, moq_version_t version)
     printf("ORACLE %s widest_downstream_send=%llu cap=%u\n", label,
            (unsigned long long)widest, (unsigned)FAKE_MSQ_SEND_CAP);
     T_CHECK(widest > FAKE_MSQ_SEND_CAP);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) ==
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) ==
             (int)WIDE_OBJECTS);
     for (uint32_t oid = 0; oid < WIDE_OBJECTS; oid++) {
-        T_CHECK(wide_payload_count(&sub, (uint8_t)(0x60u + oid)) == 1);
+        T_CHECK(wide_payload_count(sub, (uint8_t)(0x60u + oid)) == 1);
     }
 
     /* the subgroup end follows the burst on the same stream as a FIN */
-    pa.now += 1000;
-    T_CHECK(moq_session_close_subgroup(pa.sess, sgh_a, pa.now) == MOQ_OK);
-    pump_rounds(&r, ds, 2, 16);
+    pa->now += 1000;
+    T_CHECK(moq_session_close_subgroup(pa->sess, sgh_a, pa->now) == MOQ_OK);
+    pump_rounds(r, ds, 2, 16);
     bool fin_seen = false;
 
     for (int i = 0; i < SHX_MAX_STREAMS; i++) {
-        const shx_tap_t *tap = &sub.tap[i];
+        const shx_tap_t *tap = &sub->tap[i];
 
         if (tap->used && (tap->id & 2u) != 0 && tap->len > 0 &&
             tap->fin_seen) {
@@ -1709,17 +1807,18 @@ run_wide_send_script(const char *label, moq_version_t version)
         }
     }
     T_CHECK(fin_seen);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) ==
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) ==
             (int)WIDE_OBJECTS);
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SESSION_CLOSED) == 0);
-    T_CHECK(!sub.child->closed && sub.child->shutdowns == 0);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SESSION_CLOSED) == 0);
+    T_CHECK(!sub->child->closed && sub->child->shutdowns == 0);
 
-    shx_driver_close(&pa);
-    shx_driver_close(&sub);
-    rig_down(&r);
+    shx_driver_close(pa);
+    shx_driver_close(sub);
+    rig_down(r);
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
@@ -1771,13 +1870,20 @@ run_readmission_script(const char *label, bool cross, bool replacement,
                        int generations)
 {
     int before = g_failures;
-    rig_t r;
-    shx_driver_t p1, p2, sub;
+    arm_t *const arm = arm_new();
+
+    if (arm == NULL) {
+        return g_failures - before;
+    }
+    rig_t *const r = &arm->r;
+    shx_driver_t *const p1 = &arm->d[0];
+    shx_driver_t *const p2 = &arm->d[1];
+    shx_driver_t *const sub = &arm->d[2];
     moqr_shards_t *shards = NULL;
 
-    memset(&r, 0, sizeof(r));
-    fake_mgd_init(&r.fake);
-    moq_msq_test_api_override = fake_mgd_table(&r.fake);
+    memset(r, 0, sizeof(*r));
+    fake_mgd_init(&r->fake);
+    moq_msq_test_api_override = fake_mgd_table(&r->fake);
     moq_msq_test_no_doorbell = true;
 
     moqr_shards_cfg_t shcfg;
@@ -1788,7 +1894,7 @@ run_readmission_script(const char *label, bool cross, bool replacement,
     shcfg.live_visibility = true;
     shcfg.demand_channel_entries = 8;
     T_CHECK(moqr_shards_create(&shcfg, &shards) == MOQR_OK);
-    r.ctx = moqr_test_mk_lanes_ctx(shards, 2);
+    r->ctx = moqr_test_mk_lanes_ctx(shards, 2);
 
     moq_msquic_managed_cfg_t scfg;
 
@@ -1805,55 +1911,57 @@ run_readmission_script(const char *label, bool cross, bool replacement,
     scfg.lane_count = 2;
     scfg.max_connections = 4;
     scfg.on_lane_pump = moqr_test_lanes_pump();
-    scfg.on_lane_pump_user = r.ctx;
-    T_CHECK(moq_msquic_managed_create(&scfg, &r.m) == MOQ_OK);
-    if (r.m == NULL) {
+    scfg.on_lane_pump_user = r->ctx;
+    T_CHECK(moq_msquic_managed_create(&scfg, &r->m) == MOQ_OK);
+    if (r->m == NULL) {
+        free(r->ctx);
         moqr_shards_destroy(shards);
         moq_msq_test_api_override = NULL;
         moq_msq_test_no_doorbell = false;
+        free(arm);
         return g_failures - before;
     }
-    moq_msquic_managed_lane_t *lane0 = moq_msquic_managed_lane(r.m, 0);
-    moq_msquic_managed_lane_t *lane1 = moq_msquic_managed_lane(r.m, 1);
+    moq_msquic_managed_lane_t *lane0 = moq_msquic_managed_lane(r->m, 0);
+    moq_msquic_managed_lane_t *lane1 = moq_msquic_managed_lane(r->m, 1);
 
     /* the round-robin puts driver 1 on lane 0 and driver 2 on lane 1: the
      * publishers take lane 0 (= owner shard of ns0); the subscriber takes
      * lane 1 for the cross-shard shape or lane 0 for single-shard */
-    T_CHECK(shx_driver_open(&p1, &r.fake, MOQ_VERSION_DRAFT_18, "moqt-18"));
+    T_CHECK(shx_driver_open(p1, &r->fake, MOQ_VERSION_DRAFT_18, "moqt-18"));
     if (cross) {
-        T_CHECK(shx_driver_open(&sub, &r.fake, MOQ_VERSION_DRAFT_18,
+        T_CHECK(shx_driver_open(sub, &r->fake, MOQ_VERSION_DRAFT_18,
                                 "moqt-18"));
-        T_CHECK(shx_driver_open(&p2, &r.fake, MOQ_VERSION_DRAFT_18,
+        T_CHECK(shx_driver_open(p2, &r->fake, MOQ_VERSION_DRAFT_18,
                                 "moqt-18"));
     } else {
-        T_CHECK(shx_driver_open(&p2, &r.fake, MOQ_VERSION_DRAFT_18,
+        T_CHECK(shx_driver_open(p2, &r->fake, MOQ_VERSION_DRAFT_18,
                                 "moqt-18"));
-        T_CHECK(shx_driver_open(&sub, &r.fake, MOQ_VERSION_DRAFT_18,
+        T_CHECK(shx_driver_open(sub, &r->fake, MOQ_VERSION_DRAFT_18,
                                 "moqt-18"));
     }
 
 #define RROUNDS(n)                                                        \
     do {                                                                  \
         for (int r2 = 0; r2 < (n); r2++) {                                \
-            (void)shx_round(&p1); (void)shx_round(&p2);                   \
-            (void)shx_round(&sub);                                        \
+            (void)shx_round(p1); (void)shx_round(p2);                   \
+            (void)shx_round(sub);                                        \
             (void)moq_msquic_lane_wake(lane0);                            \
             (void)moq_msq_test_lane_step(lane0);                          \
             (void)moq_msquic_lane_wake(lane1);                            \
             (void)moq_msq_test_lane_step(lane1);                          \
-            (void)shx_round(&p1); (void)shx_round(&p2);                   \
-            (void)shx_round(&sub);                                        \
+            (void)shx_round(p1); (void)shx_round(p2);                   \
+            (void)shx_round(sub);                                        \
         }                                                                 \
     } while (0)
 
     for (int i = 0; i < 24 &&
-                    (shx_ev_count(&p1, MOQ_EVENT_SETUP_COMPLETE) < 1 ||
-                     shx_ev_count(&p2, MOQ_EVENT_SETUP_COMPLETE) < 1 ||
-                     shx_ev_count(&sub, MOQ_EVENT_SETUP_COMPLETE) < 1);
+                    (shx_ev_count(p1, MOQ_EVENT_SETUP_COMPLETE) < 1 ||
+                     shx_ev_count(p2, MOQ_EVENT_SETUP_COMPLETE) < 1 ||
+                     shx_ev_count(sub, MOQ_EVENT_SETUP_COMPLETE) < 1);
          i++) {
         RROUNDS(2);
     }
-    T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SETUP_COMPLETE) == 1);
+    T_CHECK(shx_ev_count(sub, MOQ_EVENT_SETUP_COMPLETE) == 1);
 
     moq_bytes_t nsp[1] = { { (const uint8_t *)"sched-ns-3", 10 } };
     moq_publish_namespace_cfg_t pcfg;
@@ -1866,7 +1974,7 @@ run_readmission_script(const char *label, bool cross, bool replacement,
     uint32_t group = 1;
 
     for (int gen = 0; gen < generations; gen++) {
-        shx_driver_t *pub = (replacement && gen > 0) ? &p2 : &p1;
+        shx_driver_t *pub = (replacement && gen > 0) ? p2 : p1;
         moq_announcement_t ann;
 
         pub->now += 1000;
@@ -1882,10 +1990,10 @@ run_readmission_script(const char *label, bool cross, bool replacement,
         sc.track_name = (moq_bytes_t){ (const uint8_t *)"t", 1 };
         sc.filter = MOQ_SUBSCRIBE_FILTER_ABSOLUTE_START;
         moq_subscription_t sh;
-        int ok_before = shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK);
+        int ok_before = shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_OK);
 
-        sub.now += 1000;
-        T_CHECK(moq_session_subscribe(sub.sess, &sc, sub.now, &sh) ==
+        sub->now += 1000;
+        T_CHECK(moq_session_subscribe(sub->sess, &sc, sub->now, &sh) ==
                 MOQ_OK);
         moq_subgroup_handle_t sgh;
         bool sg = false;
@@ -1897,13 +2005,13 @@ run_readmission_script(const char *label, bool cross, bool replacement,
         RROUNDS(10); /* settle the acceptance round-trip downstream */
         /* generation gen: the fresh subscription must be ACCEPTED... */
         T_CHECK(sg);
-        T_CHECK(shx_ev_count(&sub, MOQ_EVENT_SUBSCRIBE_OK) == ok_before + 1);
+        T_CHECK(shx_ev_count(sub, MOQ_EVENT_SUBSCRIBE_OK) == ok_before + 1);
         /* ...and must CARRY DATA */
         if (sg) {
             T_CHECK(multipub_push(pub, sgh, 0));
             RROUNDS(10);
             objs++;
-            T_CHECK(shx_ev_count(&sub, MOQ_EVENT_OBJECT_RECEIVED) >= objs);
+            T_CHECK(shx_ev_count(sub, MOQ_EVENT_OBJECT_RECEIVED) >= objs);
         }
         group++;
         /* revoke this generation (the last one stays live) */
@@ -1916,18 +2024,19 @@ run_readmission_script(const char *label, bool cross, bool replacement,
     }
 #undef RROUNDS
 
-    shx_driver_close(&p1);
-    shx_driver_close(&p2);
-    shx_driver_close(&sub);
-    (void)moq_msquic_managed_stop(r.m);
-    moq_msquic_managed_destroy(r.m);
-    free(r.ctx);
+    shx_driver_close(p1);
+    shx_driver_close(p2);
+    shx_driver_close(sub);
+    (void)moq_msquic_managed_stop(r->m);
+    moq_msquic_managed_destroy(r->m);
+    free(r->ctx);
     moqr_shards_destroy(shards);
     moq_msq_test_api_override = NULL;
     moq_msq_test_no_doorbell = false;
     if (g_failures == before) {
         printf("PASS: %s\n", label);
     }
+    free(arm);
     return g_failures - before;
 }
 
