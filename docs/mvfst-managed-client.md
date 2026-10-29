@@ -103,6 +103,7 @@ callback fires.
 |-------|---------|-------------|
 | `max_num_ptos` | 0 (mvfst default: 7) | Max consecutive PTOs before connection close |
 | `initial_rtt_us` | 0 (mvfst default: 50000) | Initial RTT estimate in microseconds |
+| `keep_alive_interval_ms` | 0 (off) | Send a QUIC PING once the connection has been idle this long, on the client and on each accepted server connection; must be below the effective idle timeout to fire. The service endpoint sets 15000 |
 
 Set `max_num_ptos = 2` and `initial_rtt_us = 10000` for fast
 connection failure detection in tests.

@@ -20,4 +20,16 @@ namespace proxygen { class WebTransport; }
 moq_proxygen_wt_managed_t *moq_proxygen_wt_test_start(
     const moq_proxygen_wt_managed_cfg_t *cfg, proxygen::WebTransport *fake_wt);
 
+/* Serial test-only probe. Set before public create(), read after stop().
+ * Captures the actual transport after installation in connect_coro and stops
+ * before QUIC start or H3 session construction. No DNS lookup with numeric host. */
+struct moq_proxygen_keepalive_probe {
+    bool observed = false;
+    bool enabled = false;
+    uint64_t interval_ms = 0;
+    uint64_t bidi = 0, uni = 0;
+    bool datagrams = false, drop_old = false;
+};
+void moq_proxygen_wt_test_set_keepalive_probe(moq_proxygen_keepalive_probe *probe);
+
 #endif

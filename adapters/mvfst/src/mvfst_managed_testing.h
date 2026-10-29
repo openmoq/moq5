@@ -47,6 +47,23 @@ bool moq_mvfst_managed_test_has_client_session(const moq_mvfst_managed_t *m);
 size_t moq_mvfst_managed_test_client_quic_versions(
     const moq_mvfst_managed_t *m, uint32_t *out, size_t cap);
 
+/* Serial test-only probes. Set before create; read after stop joins. The
+ * client probe halts at actual transport installation before start(). The
+ * server probe marks the real registration block and stops startup before
+ * listen/bind; check server_registered BEFORE driving the separate handoff. */
+typedef struct moq_mvfst_keepalive_probe {
+    bool observed;
+    bool server_registered;
+    bool enabled;
+    uint64_t interval_ms;
+    uint64_t bidi, uni;
+    bool datagrams, drop_old;
+    uint64_t ptos, rtt_us;
+} moq_mvfst_keepalive_probe;
+void moq_mvfst_managed_test_set_keepalive_probe(moq_mvfst_keepalive_probe *probe);
+bool moq_mvfst_managed_test_server_keepalive(moq_mvfst_managed_t *m,
+    moq_mvfst_keepalive_probe *factory_out, moq_mvfst_keepalive_probe *worker_out);
+
 /*
  * The earliest deadline the pump would hand its one-shot AsyncTimeout — the
  * exact fold (min of session deadlines and the live application deadline) that

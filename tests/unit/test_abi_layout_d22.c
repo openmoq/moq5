@@ -998,11 +998,15 @@ _Static_assert(MOQR_DISCOVERY_V0_SIZE == ABI_PICK(608, 332, 336),
 #ifdef ABI_HAVE_MVFST
 PIN_AT(moq_mvfst_managed_cfg_t, _reserved_target, 192, 120, 124);
 PIN_AT(moq_mvfst_managed_cfg_t, target, 200, 124, 128);
-PIN_SIZE(moq_mvfst_managed_cfg_t, 208, 128, 136);
+PIN_AT(moq_mvfst_managed_cfg_t, _reserved_keep_alive, 208, 128, 132);
+PIN_AT(moq_mvfst_managed_cfg_t, keep_alive_interval_ms, 212, 132, 136);
+PIN_SIZE(moq_mvfst_managed_cfg_t, 216, 136, 144);
 #endif
 #ifdef ABI_HAVE_PROXYGEN
 PIN_AT(moq_proxygen_wt_managed_cfg_t, target, 136, 76, 80);
-PIN_SIZE(moq_proxygen_wt_managed_cfg_t, 144, 80, 88);
+PIN_AT(moq_proxygen_wt_managed_cfg_t, _reserved_keep_alive, 144, 80, 84);
+PIN_AT(moq_proxygen_wt_managed_cfg_t, keep_alive_interval_ms, 148, 84, 88);
+PIN_SIZE(moq_proxygen_wt_managed_cfg_t, 152, 88, 96);
 #endif
 
 /* -- New structs with a frozen v0 layout -------------------------------- *

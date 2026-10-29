@@ -243,6 +243,25 @@ typedef struct moq_mvfst_managed_cfg {
      *   consulted for each client's SETUP; NULL serves every authority and
      *   path. A malformed target is MOQ_ERR_INVAL at create(). */
     const moq_connection_target_t *target;
+
+    /* Reserved: the 4 bytes of tail padding the layout that ended at target
+     * leaves on ILP32 targets that align uint64_t to 8. keep_alive_interval_ms
+     * is placed AFTER this slot so its struct_size gate lands past that old
+     * sizeof. Never read. */
+    uint32_t              _reserved_keep_alive;
+
+    /* Appended (struct_size append-only ABI) — QUIC keepalive.
+     *
+     * keep_alive_interval_ms: on every connection this facade owns (the client
+     *   connection, and each accepted server connection), send a QUIC PING
+     *   once the connection has been idle this many milliseconds, so a
+     *   quiet but live connection -- e.g. a publisher with no subscriber yet --
+     *   is not reaped by the peer's idle timeout. An interval at or above the
+     *   connection's effective idle timeout never fires. 0 disables keepalive:
+     *   the default, and what a caller whose struct_size does not cover this
+     *   field gets. This is transport keepalive only; it implies no MoQ or
+     *   session deadline. */
+    uint32_t              keep_alive_interval_ms;
 } moq_mvfst_managed_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen v0 prefix (the

@@ -283,6 +283,26 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME proxygen_wt_managed_scheduler COMMAND test_wt_managed_scheduler)
     set_tests_properties(proxygen_wt_managed_scheduler PROPERTIES TIMEOUT 40)
 
+    # Managed keepalive: keep_alive_interval_ms reaches the client connection's
+    # QUIC settings; 0 and prefix-sized callers leave it off. Same seam object.
+    add_executable(test_wt_managed_keepalive tests/test_wt_managed_keepalive.cpp)
+    target_include_directories(test_wt_managed_keepalive PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_wt_managed_keepalive PRIVATE
+        moq-adapter-proxygen-wt-managed-test-internals
+        moq::adapter-proxygen-wt proxygen::proxygen)
+    if(_cares_dir)
+        target_link_directories(test_wt_managed_keepalive PRIVATE "${_cares_dir}")
+    endif()
+    target_compile_features(test_wt_managed_keepalive PRIVATE cxx_std_20)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_wt_managed_keepalive PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror> -Wno-unused-parameter)
+    endif()
+    add_test(NAME proxygen_wt_managed_keepalive COMMAND test_wt_managed_keepalive)
+    set_tests_properties(proxygen_wt_managed_keepalive PROPERTIES TIMEOUT 30)
+
     # -- Cold-consumer tests ------------------------------------------
     if(MOQ_BUILD_PACKAGE_EXPORTS)
     include(${CMAKE_CURRENT_SOURCE_DIR}/../mvfst/tests/consumer_context.cmake)

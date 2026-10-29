@@ -322,6 +322,16 @@ if(MOQ_BUILD_TESTS)
         COMMAND test_mvfst_managed_client_contract)
     set_tests_properties(mvfst_managed_client_contract PROPERTIES TIMEOUT 30)
 
+    # Managed keepalive: keep_alive_interval_ms reaches the QUIC settings the
+    # facade's connections carry; 0 and prefix-sized callers leave it off.
+    add_executable(test_mvfst_managed_keepalive
+        tests/test_managed_keepalive.cpp)
+    target_link_libraries(test_mvfst_managed_keepalive PRIVATE
+        moq-adapter-mvfst-test-internals mvfst::mvfst)
+    add_test(NAME mvfst_managed_keepalive
+        COMMAND test_mvfst_managed_keepalive)
+    set_tests_properties(mvfst_managed_keepalive PROPERTIES TIMEOUT 30)
+
     # Same-TU access to the real fatal path without an exported testing hook.
     add_executable(test_mvfst_managed_fatal_history
         tests/test_managed_fatal_history.cpp src/mvfst_endpoint_ops.cpp)

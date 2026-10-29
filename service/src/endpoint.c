@@ -1679,6 +1679,10 @@ static moq_result_t ep_create_mvfst(moq_endpoint_t *ep,
         fc.cert_path = ep->ca_file;
     fc.on_lane_pump = ep_mvfst_pump;
     fc.user_ctx = ep;
+    /* Same idle-publisher policy as the picoquic raw-QUIC backend: emit QUIC
+     * keepalive before common relay idle timers can reap a quiet publisher.
+     * Sized init covered the field. */
+    fc.keep_alive_interval_ms = 15000;
     /* app service-deadline (media_sender catalog refresh, etc.): folded into the
      * EventBase pump's earliest deadline. Sized init covered the block. */
     fc.app_deadline_us = moq_endpoint_app_deadline_us;
@@ -1794,6 +1798,10 @@ static moq_result_t ep_create_proxygen(moq_endpoint_t *ep,
     fc.target = ep->target.target_present ? &ep->target : NULL;
     fc.on_pump = ep_proxygen_pump;
     fc.user_ctx = ep;
+    /* Same idle-publisher policy as the picoquic WebTransport backend: emit
+     * QUIC keepalive before common relay idle timers can reap a quiet
+     * publisher. */
+    fc.keep_alive_interval_ms = 15000;
     moq_proxygen_wt_managed_t *fac = NULL;
     moq_result_t crc = moq_proxygen_wt_managed_create(&fc, &fac);
     if (crc < 0) return crc;

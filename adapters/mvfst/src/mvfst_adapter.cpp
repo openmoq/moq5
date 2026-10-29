@@ -252,6 +252,50 @@ struct moq_mvfst_conn
     }
 };
 
+/* The QUIC settings every connection a managed facade owns carries over the
+ * transport defaults: the client connection, each accepted server connection
+ * and the server-wide override all apply exactly this, so a setting added here
+ * reaches all three. Takes values, not the facade, because the server override
+ * runs on worker threads. */
+static void managed_transport_settings(quic::TransportSettings &ts,
+                                       uint16_t max_num_ptos,
+                                       uint32_t initial_rtt_us,
+                                       uint32_t keep_alive_interval_ms)
+{
+    ts.advertisedInitialMaxStreamsBidi = 100;
+    ts.advertisedInitialMaxStreamsUni = 100;
+
+    ts.datagramConfig.enabled = true;
+    ts.datagramConfig.sendDropOldDataFirst = true;
+    if (max_num_ptos)
+        ts.maxNumPTOs = max_num_ptos;
+    if (initial_rtt_us)
+        ts.initialRtt = std::chrono::microseconds(initial_rtt_us);
+    /* mvfst arms its keepalive timer with the idle timer, so the PING goes out
+     * once the connection has been idle for the interval. */
+    if (keep_alive_interval_ms) {
+        ts.enableKeepalive = true;
+        ts.keepAliveTimeout = std::chrono::milliseconds(keep_alive_interval_ms);
+    }
+}
+
+#ifdef MOQ_MVFST_TESTING
+static moq_mvfst_keepalive_probe *keepalive_probe = nullptr;
+static void capture_keepalive(moq_mvfst_keepalive_probe &out,
+                              const quic::TransportSettings &ts)
+{
+    out.observed = true;
+    out.enabled = ts.enableKeepalive;
+    out.interval_ms = (uint64_t)ts.keepAliveTimeout.count();
+    out.bidi = ts.advertisedInitialMaxStreamsBidi;
+    out.uni = ts.advertisedInitialMaxStreamsUni;
+    out.datagrams = ts.datagramConfig.enabled;
+    out.drop_old = ts.datagramConfig.sendDropOldDataFirst;
+    out.ptos = ts.maxNumPTOs;
+    out.rtt_us = (uint64_t)ts.initialRtt.count();
+}
+#endif
+
 class managed_server_factory : public quic::QuicServerTransportFactory {
 public:
     managed_server_factory(moq_mvfst_managed *owner,
@@ -335,6 +379,7 @@ struct moq_mvfst_managed {
     std::string cert_path;
     uint16_t max_num_ptos = 0;
     uint32_t initial_rtt_us = 0;
+    uint32_t keep_alive_interval_ms = 0;
 
     /* TLS server name (SNI + cert-verifier identity); empty = use `host`. */
     std::string sni;
@@ -689,6 +734,31 @@ inline void moq_mvfst_conn::notify_parent_pump() noexcept
     if (parent) parent->server_request_pump();
 }
 
+/* Register the factory and the final worker override together. The worker
+ * replaces factory settings before invoking this callback (QuicServerWorker::
+ * makeTransport); observing only the factory would miss that overwrite. */
+template<class Server>
+static void configure_managed_server(Server &server, moq_mvfst_managed *owner,
+    const std::shared_ptr<quic::ServerCongestionControllerFactory> &cc)
+{
+    uint16_t ptos = owner->max_num_ptos;
+    uint32_t irtt = owner->initial_rtt_us;
+    uint32_t ka = owner->keep_alive_interval_ms;
+    server.setTransportSettingsOverrideFn(
+        [ptos, irtt, ka](quic::TransportSettings &sts) {
+            managed_transport_settings(sts, ptos, irtt, ka);
+        });
+    server.setQuicServerTransportFactory(
+        std::make_unique<managed_server_factory>(owner, cc));
+#ifdef MOQ_MVFST_TESTING
+    /* Only the real server startup instantiation may set this observation.
+     * The recording handoff below must never make missing startup wiring pass. */
+    if constexpr (std::is_same_v<Server, quic::QuicServer>) {
+        if (keepalive_probe) keepalive_probe->server_registered = true;
+    }
+#endif
+}
+
 quic::QuicServerTransport::Ptr managed_server_factory::make(
     folly::EventBase * /*evb*/,
     std::unique_ptr<quic::FollyAsyncUDPSocketAlias> sock,
@@ -742,22 +812,19 @@ quic::QuicServerTransport::Ptr managed_server_factory::make(
          * its factory. Use that same server-owned factory at both stages. */
         t->setCongestionControllerFactory(cc_);
         auto ts = t->getTransportSettings();
-        ts.advertisedInitialMaxStreamsBidi = 100;
-        ts.advertisedInitialMaxStreamsUni = 100;
-
-        ts.datagramConfig.enabled = true;
-        ts.datagramConfig.sendDropOldDataFirst = true;
-        if (owner_->max_num_ptos)
-            ts.maxNumPTOs = owner_->max_num_ptos;
-        if (owner_->initial_rtt_us)
-            ts.initialRtt =
-                std::chrono::microseconds(owner_->initial_rtt_us);
+        managed_transport_settings(ts, owner_->max_num_ptos,
+                                   owner_->initial_rtt_us,
+                                   owner_->keep_alive_interval_ms);
         t->setTransportSettings(ts);
         conn->transport = t;
 
         owner_->conns.push_back(std::move(conn));
         auto *c = owner_->conns.back().get();
         owner_->conn_count.store(owner_->conns.size());
+#ifdef MOQ_MVFST_TESTING
+        /* Keep callback ownership intact while stopping before session/accept. */
+        if (keepalive_probe) return t;
+#endif
 
         moq_result_t rc = moq_session_create(
             &owner_->session_cfg, 0, &c->session);
@@ -830,6 +897,15 @@ static bool cfg_has_field(const moq_mvfst_managed_cfg_t *cfg,
 #define CFG_HAS(cfg, field) \
     cfg_has_field(cfg, offsetof(moq_mvfst_managed_cfg_t, field), \
                   sizeof((cfg)->field))
+
+/* keep_alive_interval_ms starts at or past the sizeof of the layout that ended
+ * at target, so an old caller's tail padding is never read as it. */
+static_assert(offsetof(moq_mvfst_managed_cfg_t, keep_alive_interval_ms) >=
+                  ((offsetof(moq_mvfst_managed_cfg_t, target) +
+                    sizeof(const moq_connection_target_t *) +
+                    alignof(moq_mvfst_managed_cfg_t) - 1u) &
+                   ~(alignof(moq_mvfst_managed_cfg_t) - 1u)),
+              "keep_alive_interval_ms must start past the previous sizeof");
 
 /* Frozen v0 prefix size: the layout up to and including the callback pointers,
  * ending just before the first appended field (goaway_timeout_us). The
@@ -989,6 +1065,8 @@ moq_result_t moq_mvfst_managed_create(
         }
         if (CFG_HAS(cfg, max_num_ptos)) m->max_num_ptos = cfg->max_num_ptos;
         if (CFG_HAS(cfg, initial_rtt_us)) m->initial_rtt_us = cfg->initial_rtt_us;
+        if (CFG_HAS(cfg, keep_alive_interval_ms))
+            m->keep_alive_interval_ms = cfg->keep_alive_interval_ms;
         if (CFG_HAS(cfg, max_connections) && cfg->max_connections)
             m->max_connections = cfg->max_connections;
         m->on_lane_pump = cfg->on_lane_pump;
@@ -1137,27 +1215,17 @@ moq_result_t moq_mvfst_managed_create(
                 auto cc = std::make_shared<quic::ServerCongestionControllerFactory>();
                 m->server->setCongestionControllerFactory(cc);
                 m->server->setFizzContext(sctx);
-                /* The worker applies the server-wide settings to every
-                 * accepted transport after the factory runs, so QUIC
-                 * DATAGRAM (and the stream credit) must be advertised through
-                 * the server's override for the server to actually
-                 * negotiate them. */
-                {
-                    uint16_t ptos = m->max_num_ptos;
-                    uint32_t irtt = m->initial_rtt_us;
-                    m->server->setTransportSettingsOverrideFn(
-                        [ptos, irtt](quic::TransportSettings &sts) {
-                            sts.advertisedInitialMaxStreamsBidi = 100;
-                            sts.advertisedInitialMaxStreamsUni = 100;
-                            sts.datagramConfig.enabled = true;
-                            sts.datagramConfig.sendDropOldDataFirst = true;
-                            if (ptos) sts.maxNumPTOs = ptos;
-                            if (irtt)
-                                sts.initialRtt = std::chrono::microseconds(irtt);
-                        });
+                configure_managed_server(*m->server, m, cc);
+#ifdef MOQ_MVFST_TESTING
+                if (keepalive_probe) {
+                    /* Unconditional opt-in stop, even if registration is
+                     * removed: the test must fail its observation assertion,
+                     * never fall through to listening as a negative control. */
+                    signal_init(m, MOQ_OK);
+                    teardown(m);
+                    return;
                 }
-                m->server->setQuicServerTransportFactory(
-                    std::make_unique<managed_server_factory>(m, cc));
+#endif
 
                 folly::SocketAddress bind_addr;
                 if (m->host.empty())
@@ -1290,18 +1358,21 @@ moq_result_t moq_mvfst_managed_create(
 
                     auto ts =
                         m->transport->getTransportSettings();
-                    ts.advertisedInitialMaxStreamsBidi = 100;
-                    ts.advertisedInitialMaxStreamsUni = 100;
-
-                    ts.datagramConfig.enabled = true;
-                    ts.datagramConfig.sendDropOldDataFirst = true;
-                    if (m->max_num_ptos)
-                        ts.maxNumPTOs = m->max_num_ptos;
-                    if (m->initial_rtt_us)
-                        ts.initialRtt =
-                            std::chrono::microseconds(
-                                m->initial_rtt_us);
+                    managed_transport_settings(ts, m->max_num_ptos,
+                                               m->initial_rtt_us,
+                                               m->keep_alive_interval_ms);
                     m->transport->setTransportSettings(ts);
+#ifdef MOQ_MVFST_TESTING
+                    if (keepalive_probe) {
+                        capture_keepalive(*keepalive_probe,
+                                          m->transport->getTransportSettings());
+                        signal_init(m, MOQ_OK);
+                        teardown(m);
+                        if (evb_ptr) { evb_ptr->loop(); evb_ptr.reset(); }
+                        return; /* no start(), socket bind, or packet send */
+                    }
+#endif
+
 
                     m->transport->start(&m->transport_start_cb,
                                          &m->transport_start_cb);
@@ -1330,6 +1401,7 @@ moq_result_t moq_mvfst_managed_create(
                     m->enable_credit_gating();
                 }
             } catch (...) {
+
                 signal_init(m, MOQ_ERR_INTERNAL);
                 teardown(m);
                 if (evb_ptr) { evb_ptr->loop(); evb_ptr.reset(); }
@@ -2818,6 +2890,68 @@ extern "C" bool moq_mvfst_managed_test_has_client_session(
     const moq_mvfst_managed_t *m)
 {
     return m ? m->has_client_session() : false;
+}
+
+extern "C" void moq_mvfst_managed_test_set_keepalive_probe(
+    moq_mvfst_keepalive_probe *probe)
+{
+    keepalive_probe = probe;
+}
+
+/* No listening socket or packet input. Drive the production registration and
+ * factory, then the registered callback at the worker's final settings handoff.
+ * The copied defaults intentionally DISCARD the factory's settings first.
+ * This pins adapter wiring, not upstream worker dispatch or wire behavior. */
+extern "C" bool moq_mvfst_managed_test_server_keepalive(
+    moq_mvfst_managed_t *m, moq_mvfst_keepalive_probe *factory_out,
+    moq_mvfst_keepalive_probe *worker_out)
+{
+    struct handoff {
+        quic::QuicServer::TransportSettingsOverrideFn override_fn;
+        std::unique_ptr<quic::QuicServerTransportFactory> factory;
+        void setTransportSettingsOverrideFn(
+            quic::QuicServer::TransportSettingsOverrideFn fn) {
+            override_fn = std::move(fn);
+        }
+        void setQuicServerTransportFactory(
+            std::unique_ptr<quic::QuicServerTransportFactory> f) {
+            factory = std::move(f);
+        }
+    } server;
+    if (!m || !m->thread_exited.load() ||
+        m->perspective != MOQ_PERSPECTIVE_SERVER) return false;
+    folly::EventBase evb;
+    auto cc = std::make_shared<quic::ServerCongestionControllerFactory>();
+    configure_managed_server(server, m, cc);
+    if (!server.factory || !server.override_fn) return false;
+    /* QuicServerTransport construction asks for the local address. Supply
+     * only that virtual boundary; never create/bind an OS socket. */
+    struct address_socket : quic::FollyAsyncUDPSocketAlias {
+        folly::SocketAddress local{"127.0.0.1", 443};
+        explicit address_socket(folly::EventBase *base)
+            : quic::FollyAsyncUDPSocketAlias(base) {}
+        const folly::SocketAddress &address() const override { return local; }
+    };
+    m->running.store(true);
+    auto transport = server.factory->make(&evb,
+        std::make_unique<address_socket>(&evb),
+        folly::SocketAddress("127.0.0.1", 443), quic::QuicVersion::QUIC_V1,
+        std::make_shared<fizz::server::FizzServerContext>());
+    m->running.store(false);
+    bool ok = bool(transport);
+    if (transport) {
+        capture_keepalive(*factory_out, transport->getTransportSettings());
+        quic::TransportSettings worker_settings;
+        server.override_fn(worker_settings);
+        transport->setTransportSettings(worker_settings);
+        capture_keepalive(*worker_out, transport->getTransportSettings());
+    }
+    for (auto &conn : m->conns) conn->destroy();
+    m->conns.clear();
+    m->conn_count.store(0);
+    transport.reset();
+    evb.loop();
+    return ok;
 }
 
 extern "C" size_t moq_mvfst_managed_test_client_quic_versions(

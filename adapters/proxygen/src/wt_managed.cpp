@@ -36,6 +36,7 @@
 #include <fizz/protocol/CertificateVerifier.h>   /* fizz::InsecureCertificateVerifier */
 
 #include <quic/client/QuicClientTransport.h>
+#include <quic/congestion_control/CongestionControllerFactory.h>
 #include <quic/common/events/FollyQuicEventBase.h>
 #include <quic/common/udpsocket/FollyQuicAsyncUDPSocket.h>
 #include <quic/fizz/client/handshake/FizzClientQuicHandshakeContext.h>
@@ -65,6 +66,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef MOQ_PROXYGEN_WT_TESTING
+#include "wt_managed_testing.h"
+static moq_proxygen_keepalive_probe *keepalive_probe = nullptr;
+#endif
 
 namespace {
 
@@ -221,6 +227,7 @@ struct moq_proxygen_wt_managed {
     bool        send_request_capacity = false;
     uint64_t    initial_request_capacity = 0;
     uint64_t    goaway_timeout_us = 0;
+    uint32_t    keep_alive_interval_ms = 0;
     std::vector<std::string> alpn;          /* WT-Available-Protocols offer
                                              * (never empty after create) */
     /* The connection target the session is bound with when its profile
@@ -308,6 +315,23 @@ struct moq_proxygen_wt_managed {
     folly::coro::Task<void> connect_coro();   /* CONNECT + session + adapter */
 };
 
+/* The QUIC settings the managed client's connection carries over the
+ * transport defaults. */
+static void client_transport_settings(quic::TransportSettings &ts,
+                                      uint32_t keep_alive_interval_ms)
+{
+    ts.advertisedInitialMaxStreamsBidi = 100;
+    ts.advertisedInitialMaxStreamsUni = 100;
+    ts.datagramConfig.enabled = true;
+    ts.datagramConfig.sendDropOldDataFirst = true;
+    /* mvfst arms its keepalive timer with the idle timer, so the PING goes out
+     * once the connection has been idle for the interval. */
+    if (keep_alive_interval_ms) {
+        ts.enableKeepalive = true;
+        ts.keepAliveTimeout = std::chrono::milliseconds(keep_alive_interval_ms);
+    }
+}
+
 void moq_proxygen_wt_managed::schedule_pump_soon()
 {
     /* Re-arm the pump on the EventBase at a fixed 5ms responsiveness cap,
@@ -388,6 +412,8 @@ folly::coro::Task<void> moq_proxygen_wt_managed::connect_coro()
                        .build();
         transport = quic::QuicClientTransport::newClient(
             qevb, std::move(qsock), std::move(hsk));
+        transport->setCongestionControllerFactory(
+            std::make_shared<quic::DefaultCongestionControllerFactory>());
         transport->addNewPeerAddress(
             folly::SocketAddress(host, (uint16_t)port, /*allowNameLookup*/true));
         /* SNI only -- server identity is verified by identity_verifier above,
@@ -395,11 +421,25 @@ folly::coro::Task<void> moq_proxygen_wt_managed::connect_coro()
         transport->setHostname(server_name);
         {
             auto ts = transport->getTransportSettings();
-            ts.advertisedInitialMaxStreamsBidi = 100;
-            ts.advertisedInitialMaxStreamsUni = 100;
-            ts.datagramConfig.enabled = true;
-            ts.datagramConfig.sendDropOldDataFirst = true;
+            client_transport_settings(ts, keep_alive_interval_ms);
             transport->setTransportSettings(ts);
+#ifdef MOQ_PROXYGEN_WT_TESTING
+            if (keepalive_probe) {
+                const auto &installed = transport->getTransportSettings();
+                keepalive_probe->observed = true;
+                keepalive_probe->enabled = installed.enableKeepalive;
+                keepalive_probe->interval_ms =
+                    (uint64_t)installed.keepAliveTimeout.count();
+                keepalive_probe->bidi = installed.advertisedInitialMaxStreamsBidi;
+                keepalive_probe->uni = installed.advertisedInitialMaxStreamsUni;
+                keepalive_probe->datagrams = installed.datagramConfig.enabled;
+                keepalive_probe->drop_old =
+                    installed.datagramConfig.sendDropOldDataFirst;
+                signal_init(MOQ_OK);
+                co_return; /* no start(), socket bind, or packet send */
+            }
+#endif
+
         }
 
         /* H3 upstream session over the transport. startNow() prepares the
@@ -619,6 +659,24 @@ void (moq_proxygen_wt_managed_cfg_init)(moq_proxygen_wt_managed_cfg_t *cfg)
     ((cfg)->struct_size >= offsetof(moq_proxygen_wt_managed_cfg_t, field) + \
         sizeof((cfg)->field))
 
+/* keep_alive_interval_ms starts at or past the sizeof of the layout that ended
+ * at target, so an old caller's tail padding is never read as it. */
+static_assert(offsetof(moq_proxygen_wt_managed_cfg_t, keep_alive_interval_ms) >=
+                  ((offsetof(moq_proxygen_wt_managed_cfg_t, target) +
+                    sizeof(const moq_connection_target_t *) +
+                    alignof(moq_proxygen_wt_managed_cfg_t) - 1u) &
+                   ~(alignof(moq_proxygen_wt_managed_cfg_t) - 1u)),
+              "keep_alive_interval_ms must start past the previous sizeof");
+
+/* The keepalive interval a caller's config asks for: 0 unless its struct_size
+ * covers the field. */
+static uint32_t cfg_keep_alive_interval_ms(
+    const moq_proxygen_wt_managed_cfg_t *cfg)
+{
+    return CFG_HAS(cfg, keep_alive_interval_ms) ? cfg->keep_alive_interval_ms
+                                                : 0;
+}
+
 moq_result_t moq_proxygen_wt_managed_create(
     const moq_proxygen_wt_managed_cfg_t *cfg,
     moq_proxygen_wt_managed_t **out)
@@ -688,6 +746,7 @@ moq_result_t moq_proxygen_wt_managed_create(
             m->initial_request_capacity = cfg->initial_request_capacity;
         if (CFG_HAS(cfg, goaway_timeout_us))
             m->goaway_timeout_us = cfg->goaway_timeout_us;
+        m->keep_alive_interval_ms = cfg_keep_alive_interval_ms(cfg);
         m->alpn = std::move(offer);
         {
             /* One CONNECT identity: the explicit target, else host:port and
@@ -943,4 +1002,9 @@ moq_proxygen_wt_managed_t *moq_proxygen_wt_test_start(
     }
     return m;
 }
+void moq_proxygen_wt_test_set_keepalive_probe(moq_proxygen_keepalive_probe *probe)
+{
+    keepalive_probe = probe;
+}
+
 #endif /* MOQ_PROXYGEN_WT_TESTING */
