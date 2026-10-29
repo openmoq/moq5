@@ -354,6 +354,40 @@ typedef struct moq_wtquic_msquic_managed_cfg {
     MOQ_WTQUIC_MSQUIC_CFG_TAIL_ALIGNAS
     uint64_t (*app_lane_deadline_us)(void *ctx, uint32_t lane_index);
     void *app_lane_deadline_ctx;
+
+    /* appended: WebTransport stream resources -- ONE ABI block, read only
+     * when struct_size covers THROUGH peer_bidi_streams (all three fields
+     * are honored together or not at all). Like the blocks above, it starts
+     * at the aggregate's own alignment. Applies to every connection of this
+     * facade, client or server. Every field defaults with 0.
+     *
+     * max_local_streams: the provider's local WebTransport reservations per
+     * connection -- locally opened uni and bidi streams together, including
+     * pending starts and retained terminal handles. Forwarded unchanged to
+     * wtquic's client/listener max_local_streams; 0 = the provider default
+     * (16), otherwise 1..1024. At the limit a local open waits (the
+     * adapter's WOULD_BLOCK) without a native open.
+     *
+     * peer_uni_streams / peer_bidi_streams: the native QUIC stream credit
+     * granted to the peer (wtquic tuning peer_unidi/bidi_stream_count). The
+     * uni credit covers HTTP/3's three critical streams plus the peer's
+     * WebTransport uni streams; the bidi credit covers the CONNECT stream
+     * (server) plus its WebTransport bidi streams. 0 = the provider default
+     * (8 uni, 7 bidi). The resolved credits must be at least 3 uni and 1
+     * bidi and at most 1024 together.
+     *
+     * The provider backs every peer credit and every local reservation
+     * independently, so a peer stream never waits for storage a local stream
+     * holds, nor a local open for storage a peer stream holds. The attach adapter sizes its stream table from the
+     * provider's queried api_capacity (credits plus max_local_streams; 31 by
+     * default, at most 2048), allocated once per connection at about 64 KiB
+     * per entry -- in addition to, not counted in, the provider's own 64 MiB
+     * stream-capacity ceiling. Values outside these bounds fail create() with
+     * MOQ_ERR_INVAL before any transport effect. Set via
+     * moq_wtquic_msquic_managed_cfg_init_sized. */
+    MOQ_WTQUIC_MSQUIC_CFG_TAIL_ALIGNAS uint32_t max_local_streams;
+    uint32_t peer_uni_streams;
+    uint32_t peer_bidi_streams;
 } moq_wtquic_msquic_managed_cfg_t;
 
 /* How a server path authorizes the client's serialized Origin. Facade-owned:

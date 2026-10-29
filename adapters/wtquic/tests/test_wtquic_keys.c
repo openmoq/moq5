@@ -4,7 +4,7 @@
  * This drives the adapter's real endpoint entry point ep_open_uni() and the
  * peer-open handler ev_stream_opened(), not just the internal allocator, so
  * it catches the distinctions that matter to the bridge:
- *   - table pressure (a full 16-slot table) -> MOQ_TRANSPORT_WOULD_BLOCK
+ *   - table pressure (the configured table is full) -> MOQ_TRANSPORT_WOULD_BLOCK
  *     (retryable), and the key is NEVER UINT64_MAX;
  *   - key exhaustion -> MOQ_TRANSPORT_ERROR (fatal, terminates the
  *     connection) — NOT an endless WOULD_BLOCK open-and-abort retry loop;
@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include <wtquic/wtquic.h>
+#include "wtquic_stream_budget_fake.h"
 
 #include <moq/session.h>
 #include <moq/transport_bridge.h>
@@ -198,17 +199,20 @@ int main(void)
 {
     int failures = 0;
     moq_wtquic_conn_t c;
+    static struct moq_wtq_stream local_streams[TEST_STREAM_CAPACITY];
 
     /* A conn with just enough state for ep_open_uni: a non-NULL session so
      * the "not bound yet" guard passes; the uni path never derefs bridge. */
     memset(&c, 0, sizeof(c));
+    c.streams = local_streams;
+    c.stream_capacity = TEST_STREAM_CAPACITY;
     c.next_stream_key = 1;
     c.ws = (wtq_session_t *)(void *)0x1; /* sentinel: only checked != NULL */
 
     /* Fill the 16-slot table via the REAL endpoint op. Every id distinct,
      * monotonic, and never the reserved UINT64_MAX sentinel. */
-    uint64_t ids[MOQ_WTQ_MAX_STREAMS];
-    for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++) {
+    uint64_t ids[TEST_STREAM_CAPACITY];
+    for (int i = 0; i < TEST_STREAM_CAPACITY; i++) {
         uint64_t id = 0xDEAD;
         CHECK(ep_open_uni(&c, &id) == MOQ_TRANSPORT_OK);
         CHECK(id != UINT64_MAX);
@@ -231,7 +235,7 @@ int main(void)
         uint64_t id = 0;
         CHECK(ep_open_uni(&c, &id) == MOQ_TRANSPORT_OK);
         CHECK(id != UINT64_MAX);
-        for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
+        for (int i = 0; i < TEST_STREAM_CAPACITY; i++)
             CHECK(id != ids[i]); /* never a reused key */
     }
 
@@ -250,11 +254,14 @@ int main(void)
      * ev_stream_opened returns without touching the bridge. */
     {
         moq_wtquic_conn_t p;
+        static struct moq_wtq_stream peer_streams[TEST_STREAM_CAPACITY];
         memset(&p, 0, sizeof(p));
+        p.streams = peer_streams;
+        p.stream_capacity = TEST_STREAM_CAPACITY;
         p.next_stream_key = 1;
         p.ws = (wtq_session_t *)(void *)0x1;
         g_stream_n = 0;
-        for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
+        for (int i = 0; i < TEST_STREAM_CAPACITY; i++)
             p.streams[i].in_use = true; /* table already full */
         struct wtq_stream *peer = new_stream(false);
         peer->native_id = 3;
@@ -295,7 +302,7 @@ int main(void)
         CHECK(g_session_closes == 1);                /* exactly one close */
         /* NO opaque key was issued: no adapter slot references the
          * stream, none became active, and the counter never moved. */
-        for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++) {
+        for (int i = 0; i < TEST_STREAM_CAPACITY; i++) {
             CHECK(pp->streams[i].st != (wtq_stream_t *)peer);
             CHECK(!pp->streams[i].in_use);
         }
@@ -307,7 +314,7 @@ int main(void)
         ev_stream_opened((wtq_session_t *)(void *)0x1, peer2, false, pp);
         CHECK(peer2->aborts == 1);
         CHECK(g_session_closes == 1);                /* still exactly one */
-        for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++) {
+        for (int i = 0; i < TEST_STREAM_CAPACITY; i++) {
             CHECK(pp->streams[i].st != (wtq_stream_t *)peer2);
             CHECK(!pp->streams[i].in_use);
         }
@@ -357,7 +364,7 @@ int main(void)
         conn_service(cc);
         /* the adapter registered exactly one slot; that's the abort target */
         int active = 0;
-        for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
+        for (int i = 0; i < TEST_STREAM_CAPACITY; i++)
             if (cc->streams[i].in_use) { g_abort_key = cc->streams[i].id; active++; }
         CHECK(active == 1);
         g_abort_ref = ref;
@@ -390,7 +397,7 @@ int main(void)
         CHECK(!cc->term_overflow);
         CHECK(moq_transport_bridge_find_ref(cc->bridge, g_abort_key)._v == 0);
         int still = 0;
-        for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
+        for (int i = 0; i < TEST_STREAM_CAPACITY; i++)
             if (cc->streams[i].in_use) still++;
         CHECK(still == 0);
         CHECK(target != NULL && target->aborts == 1);
@@ -417,7 +424,7 @@ int main(void)
         CHECK(push_action(sess, &a) == MOQ_OK);
         conn_service(cc);
         uint64_t k1 = 0, k2 = 0;
-        for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
+        for (int i = 0; i < TEST_STREAM_CAPACITY; i++)
             if (cc->streams[i].in_use) {
                 if (k1 == 0) k1 = cc->streams[i].id;
                 else k2 = cc->streams[i].id;
@@ -464,7 +471,7 @@ int main(void)
         CHECK(moq_transport_bridge_find_ref(cc->bridge, k1)._v == 0);
         CHECK(moq_transport_bridge_find_ref(cc->bridge, k2)._v == 0);
         still = 0;
-        for (int i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
+        for (int i = 0; i < TEST_STREAM_CAPACITY; i++)
             if (cc->streams[i].in_use) still++;
         CHECK(still == 0);
         CHECK(target1 != NULL && target1->aborts == 1);
@@ -502,7 +509,7 @@ int main(void)
         cc->streams[0].in_use = true;
         cc->streams[0].st = (wtq_stream_t *)st;
         cc->streams[0].id = 1;
-        cc->term_count = sizeof(cc->term_events) / sizeof(cc->term_events[0]);
+        cc->term_count = cc->term_capacity;
 
         g_session_closes = 0;
         cc->in_service = true; /* hold the drain to observe the latch */

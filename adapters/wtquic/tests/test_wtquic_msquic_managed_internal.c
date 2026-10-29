@@ -3403,6 +3403,7 @@ static struct {
     uint16_t ports[16];        /* the port each call asked for, in order */
     const char *subproto0;
     const char *subproto1;
+    uint32_t max_local_streams;
 } g_lc;
 
 /* The substitute CALLEE: it stands where wtq_msquic_listener_start stands and
@@ -3426,6 +3427,7 @@ static wtq_result_t lc_start(wtq_msquic_env_t *env,
     g_lc.accept_prepare = cfg->accept_prepare;
     g_lc.accept_abandon = cfg->accept_abandon;
     g_lc.on_quiesced = cfg->on_transport_quiesced;
+    g_lc.max_local_streams = cfg->max_local_streams;
     g_lc.port = cfg->port;
     if (g_lc.calls <= sizeof(g_lc.ports) / sizeof(g_lc.ports[0]))
         g_lc.ports[g_lc.calls - 1] = cfg->port;
@@ -5049,6 +5051,187 @@ static void test_commit_table_dispatch(void)
     if (g_fail == before) puts("PASS: msquic managed commit table dispatch");
 }
 
+/* --- the stream-resource block: ABI gating, bounds, forwarding ---------- *
+ *
+ * max_local_streams reaches the native client/listener config the callee is
+ * handed (the provider's own local-reservation field, not a facade copy);
+ * the credits reach the environment tuning, unset ones resolved to the
+ * provider defaults. A config sized before the block, or ending inside it,
+ * reads none of it, and a block outside the provider's plan bounds is
+ * refused before any effect. */
+
+static uint32_t g_captured_client_local = 0xFFFFFFFFu;
+static unsigned g_captured_client_calls;
+static wtq_result_t local_capture_connect(wtq_msquic_env_t *env,
+                                          const wtq_msquic_client_cfg_t *cfg,
+                                          wtq_session_t **out)
+{
+    (void)env;
+    g_captured_client_calls++;
+    g_captured_client_local = cfg->max_local_streams;
+    *out = FAKE_WS;
+    return WTQ_OK;
+}
+
+static void test_stream_resource_forwarding(void)
+{
+    acnt_t a;
+    acnt_init(&a);
+    moq_alloc_t alloc = { &a, acnt_alloc, acnt_realloc, acnt_free };
+    wtq_msquic_tuning_t defaults;
+    wtq_msquic_tuning_init(&defaults);
+    moq_wtquic_msquic_managed_test_set_transport(local_capture_connect,
+                                                 trivial_release);
+
+    /* client: every field forwarded where the provider reads it */
+    static const struct { uint32_t local, uni, bidi, want_uni, want_bidi; }
+        client_rows[] = {
+        { 0, 0, 0, 8, 7 },          /* all defaults */
+        { 1, 3, 1, 3, 1 },          /* smallest explicit plan */
+        { 1024, 1017, 7, 1017, 7 }, /* largest L and U+B */
+        { 48, 131, 0, 131, 7 },     /* unset bidi keeps the default */
+    };
+    for (size_t i = 0; i < sizeof(client_rows) / sizeof(client_rows[0]); i++) {
+        moq_wtquic_msquic_managed_cfg_t cfg;
+        moq_wtquic_msquic_managed_cfg_init_sized(&cfg, sizeof(cfg));
+        cfg.alloc = &alloc;
+        cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+        cfg.host = "127.0.0.1";
+        cfg.port = 443;
+        cfg.on_lane_pump = pump;
+        cfg.max_local_streams = client_rows[i].local;
+        cfg.peer_uni_streams = client_rows[i].uni;
+        cfg.peer_bidi_streams = client_rows[i].bidi;
+        g_captured_client_calls = 0;
+        g_captured_client_local = 0xFFFFFFFFu;
+        moq_wtquic_msquic_managed_t *m = NULL;
+        CHECK(moq_wtquic_msquic_managed_create(&cfg, &m) == MOQ_OK);
+        if (m != NULL) {
+            CHECK(g_captured_client_calls == 1);
+            CHECK(g_captured_client_local == client_rows[i].local);
+            wtq_msquic_env_cfg_t ecfg;
+            moq_wtquic_msquic_managed_test_fill_env_cfg(m, &ecfg);
+            CHECK(ecfg.tuning.struct_size == sizeof(ecfg.tuning));
+            CHECK(ecfg.tuning.peer_unidi_stream_count == client_rows[i].want_uni);
+            CHECK(ecfg.tuning.peer_bidi_stream_count == client_rows[i].want_bidi);
+            CHECK(ecfg.tuning.idle_timeout_ms == defaults.idle_timeout_ms);
+            moq_wtquic_msquic_managed_stop(m);
+            moq_wtquic_msquic_managed_destroy(m);
+        }
+    }
+
+    /* A config sized before the block, or ending inside it (covering L, or
+     * L and the uni credit, but not the bidi credit), reads none of it: the
+     * block is one unit. Every field past struct_size holds a valid,
+     * non-default value, so a field read on its own coverage is forwarded
+     * and visible below. */
+    {
+        const size_t block = offsetof(moq_wtquic_msquic_managed_cfg_t,
+                                      max_local_streams);
+        const size_t prefixes[] = {
+            block,
+            block + sizeof(uint32_t),
+            offsetof(moq_wtquic_msquic_managed_cfg_t, peer_bidi_streams),
+        };
+        for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+            moq_wtquic_msquic_managed_cfg_t cfg;
+            memset(&cfg, 0, sizeof(cfg));
+            moq_wtquic_msquic_managed_cfg_init_sized(&cfg, prefixes[i]);
+            CHECK(cfg.struct_size == prefixes[i]);
+            cfg.alloc = &alloc;
+            cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+            cfg.host = "127.0.0.1";
+            cfg.port = 443;
+            cfg.on_lane_pump = pump;
+            cfg.max_local_streams = 5;    /* past struct_size: never read */
+            cfg.peer_uni_streams = 131;
+            cfg.peer_bidi_streams = 2;
+            g_captured_client_calls = 0;
+            g_captured_client_local = 0xFFFFFFFFu;
+            moq_wtquic_msquic_managed_t *m = NULL;
+            CHECK(moq_wtquic_msquic_managed_create(&cfg, &m) == MOQ_OK);
+            if (m != NULL) {
+                CHECK(g_captured_client_calls == 1);
+                CHECK(g_captured_client_local == 0);
+                wtq_msquic_env_cfg_t ecfg;
+                moq_wtquic_msquic_managed_test_fill_env_cfg(m, &ecfg);
+                CHECK(ecfg.tuning.peer_unidi_stream_count ==
+                      defaults.peer_unidi_stream_count);
+                CHECK(ecfg.tuning.peer_bidi_stream_count ==
+                      defaults.peer_bidi_stream_count);
+                moq_wtquic_msquic_managed_stop(m);
+                moq_wtquic_msquic_managed_destroy(m);
+            }
+        }
+    }
+
+    /* outside the plan bounds: INVAL with no allocation and no provider call */
+    static const struct { uint32_t local, uni, bidi; } bad[] = {
+        { 1025, 0, 0 }, { 0, 2, 0 }, { 0, 1025, 1 }, { 0, 3, 1025 },
+        { 0, 1000, 25 }, { 0, 1020, 0 }, { 0, 0, 1018 },
+        { UINT32_MAX, 0, 0 }, { 0, UINT32_MAX, 1 }, { 0, 3, UINT32_MAX },
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        acnt_t fa;
+        acnt_init(&fa);
+        moq_alloc_t falloc = { &fa, acnt_alloc, acnt_realloc, acnt_free };
+        moq_wtquic_msquic_managed_cfg_t cfg;
+        moq_wtquic_msquic_managed_cfg_init_sized(&cfg, sizeof(cfg));
+        cfg.alloc = &falloc;
+        cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+        cfg.host = "127.0.0.1";
+        cfg.port = 443;
+        cfg.on_lane_pump = pump;
+        cfg.max_local_streams = bad[i].local;
+        cfg.peer_uni_streams = bad[i].uni;
+        cfg.peer_bidi_streams = bad[i].bidi;
+        g_captured_client_calls = 0;
+        moq_wtquic_msquic_managed_t *m = (moq_wtquic_msquic_managed_t *)0x1;
+        CHECK(moq_wtquic_msquic_managed_create(&cfg, &m) == MOQ_ERR_INVAL);
+        CHECK(m == NULL);
+        CHECK(g_captured_client_calls == 0);
+        CHECK(acnt_live(&fa) == 0);
+        acnt_destroy(&fa);
+    }
+    moq_wtquic_msquic_managed_test_set_transport(trivial_connect, trivial_release);
+
+    /* server: the listener is handed the same local-reservation value */
+    moq_wtquic_msquic_managed_test_no_listener(true);
+    moq_wtquic_msquic_managed_test_set_listener_start(lc_start);
+    static const uint32_t server_locals[] = { 0, 1, 64, 1024 };
+    for (size_t i = 0; i < sizeof(server_locals) / sizeof(server_locals[0]); i++) {
+        moq_wtquic_msquic_managed_cfg_t cfg;
+        moq_wtquic_msquic_managed_cfg_init_sized(&cfg, sizeof(cfg));
+        cfg.alloc = &alloc;
+        cfg.perspective = MOQ_PERSPECTIVE_SERVER;
+        cfg.cert_path = "c";
+        cfg.key_path = "k";
+        cfg.on_lane_pump = pump;
+        cfg.max_local_streams = server_locals[i];
+        cfg.peer_bidi_streams = 9;
+        memset(&g_lc, 0, sizeof(g_lc));
+        g_lc.max_local_streams = 0xFFFFFFFFu;
+        moq_wtquic_msquic_managed_t *m = NULL;
+        CHECK(moq_wtquic_msquic_managed_create(&cfg, &m) == MOQ_OK);
+        CHECK(g_lc.calls == 1);
+        CHECK(g_lc.max_local_streams == server_locals[i]);
+        if (m != NULL) {
+            wtq_msquic_env_cfg_t ecfg;
+            moq_wtquic_msquic_managed_test_fill_env_cfg(m, &ecfg);
+            CHECK(ecfg.tuning.peer_unidi_stream_count ==
+                  defaults.peer_unidi_stream_count);
+            CHECK(ecfg.tuning.peer_bidi_stream_count == 9);
+            moq_wtquic_msquic_managed_stop(m);
+            moq_wtquic_msquic_managed_destroy(m);
+        }
+    }
+    moq_wtquic_msquic_managed_test_set_listener_start(NULL);
+    moq_wtquic_msquic_managed_test_no_listener(false);
+
+    CHECK(acnt_live(&a) == 0);
+    acnt_destroy(&a);
+}
+
 int main(int argc, char **argv)
 {
     test_commit_table_dispatch();
@@ -5119,6 +5302,7 @@ int main(int argc, char **argv)
     test_wait_state_machine();
     test_wt_profile_abi_forwarding();
     test_origin_abi_roles_bounds_forwarding();
+    test_stream_resource_forwarding();
 
     if (g_fail != 0) {
         fprintf(stderr, "FAILED: test_wtquic_msquic_managed_internal (%d)\n",

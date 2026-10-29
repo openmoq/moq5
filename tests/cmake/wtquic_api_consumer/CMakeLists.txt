@@ -40,6 +40,6 @@ else()
     set(ext c)
 endif()
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/main.${ext}"
-    "#include <moq/${header}.h>\nint main(void) { ${type} cfg; ${init}(&cfg, sizeof(cfg)); return 0; }\n")
+    "#include <moq/${header}.h>\n#include <wtquic/session.h>\nstatic wtq_result_t (*volatile budget_query)(const wtq_session_t *, wtq_stream_budget_t *) = wtq_session_stream_budget;\nint main(void) { ${type} cfg; ${init}(&cfg, sizeof(cfg)); return budget_query == 0; }\n")
 add_executable(consumer "${CMAKE_CURRENT_BINARY_DIR}/main.${ext}")
 target_link_libraries(consumer PRIVATE moq::${COMPONENT})

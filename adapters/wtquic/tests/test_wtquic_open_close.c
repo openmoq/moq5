@@ -7,6 +7,7 @@
 #include <moq/session.h>
 #include <moq/transport_bridge.h>
 #include <moq/wtquic.h>
+#include "wtquic_stream_budget_fake.h"
 
 enum {
     CLEAN_CODE = 0x42,

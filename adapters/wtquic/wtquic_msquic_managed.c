@@ -203,6 +203,19 @@ _Static_assert(offsetof(moq_wtquic_msquic_managed_cfg_t, origin) >=
                "sizeof, never inside its trailing padding");
 _Static_assert(sizeof(moq_wtquic_msquic_managed_cfg_t) > sizeof(mm_cfg_prev_full_t),
                "the new config must be strictly larger than the old one");
+_Static_assert(offsetof(moq_wtquic_msquic_managed_cfg_t, max_local_streams) >=
+                   offsetof(moq_wtquic_msquic_managed_cfg_t,
+                            app_lane_deadline_ctx) + sizeof(void *) &&
+               offsetof(moq_wtquic_msquic_managed_cfg_t, max_local_streams) %
+                       _Alignof(moq_wtquic_msquic_cfg_tail_align_t) == 0,
+               "the stream-resource block starts at the aggregate's alignment, "
+               "past the per-lane deadline block");
+
+/* wtquic's accepted stream plan (wtquic_msquic.h): 3 <= U, 1 <= B,
+ * U + B <= 1024, and 1 <= L <= 1024 when set. Checked at create() so a bad
+ * block has no effects. */
+#define MM_MAX_PEER_STREAMS 1024u
+#define MM_MAX_LOCAL_STREAMS 1024u
 
 
 /*
@@ -566,6 +579,11 @@ struct moq_wtquic_msquic_managed {
     bool streaming_objects;
     uint64_t session_idle_timeout_us;
     uint32_t webtransport_profile;  /* wtq_webtransport_profile_t; 0 = current */
+    /* Stream resources forwarded to the provider: local reservations
+     * (0 = provider default) and the resolved native peer credits. */
+    uint32_t max_local_streams;
+    uint32_t peer_uni_streams;
+    uint32_t peer_bidi_streams;
     /* the Origin contract: owned copies, freed in destroy */
     char *origin;                   /* client only; NULL = none */
     uint32_t origin_policy;         /* server only; 0 = UNSET */
@@ -1614,6 +1632,10 @@ static void mm_fill_env_cfg(moq_wtquic_msquic_managed_t *m,
     wtq_msquic_tuning_init(&ecfg->tuning);
     if (m->idle_timeout_ms != 0)
         ecfg->tuning.idle_timeout_ms = m->idle_timeout_ms;
+    /* create() resolved unset credits to the provider defaults and checked
+     * the plan, so these are always in range. */
+    ecfg->tuning.peer_unidi_stream_count = (uint16_t)m->peer_uni_streams;
+    ecfg->tuning.peer_bidi_stream_count = (uint16_t)m->peer_bidi_streams;
     m->datagram_receive_enabled = ecfg->tuning.datagram_receive_enabled;
 }
 
@@ -1660,6 +1682,7 @@ static moq_result_t mm_client_start(moq_wtquic_msquic_managed_t *m)
     ccfg.user = c;
     ccfg.guard = mm_lane_guard(c->lane);
     ccfg.on_transport_quiesced = mm_on_quiesced;
+    ccfg.max_local_streams = m->max_local_streams; /* 0 = provider default */
 
     /* Hold the lane guard across connect AND through publishing c->ws: a
      * connect-time callback blocks on the lane until the handle is stored, so
@@ -1883,6 +1906,8 @@ static moq_result_t mm_server_start(moq_wtquic_msquic_managed_t *m)
      * compat listener accepts only the matching ":protocol = webtransport"
      * CONNECT. Listener-wide; memset zeroed the v3 tail, struct_size covers it. */
     lcfg.webtransport_profile = m->webtransport_profile;
+    /* Copied once by the listener for every child; 0 = provider default. */
+    lcfg.max_local_streams = m->max_local_streams;
 
 #if defined(MOQ_WTQ_MM_TESTING)
     g_mm_test_last_listener_profile = lcfg.webtransport_profile;
@@ -2570,6 +2595,26 @@ moq_result_t moq_wtquic_msquic_managed_create(
         if (prc != MOQ_OK)
             return prc;
     }
+    /* The stream-resource block is read whole or not at all. Unset credits
+     * take the provider's own defaults; the resolved plan must be one the
+     * provider accepts. */
+    wtq_msquic_tuning_t pre_tuning;
+    wtq_msquic_tuning_init(&pre_tuning);
+    uint32_t pre_local = 0;
+    uint32_t pre_uni = pre_tuning.peer_unidi_stream_count;
+    uint32_t pre_bidi = pre_tuning.peer_bidi_stream_count;
+    if (MM_CFG_HAS(peer_bidi_streams)) {
+        if (cfg->max_local_streams > MM_MAX_LOCAL_STREAMS)
+            return MOQ_ERR_INVAL;
+        pre_local = cfg->max_local_streams;
+        if (cfg->peer_uni_streams != 0)
+            pre_uni = cfg->peer_uni_streams;
+        if (cfg->peer_bidi_streams != 0)
+            pre_bidi = cfg->peer_bidi_streams;
+        if (pre_uni < 3 || pre_bidi < 1 || pre_uni > MM_MAX_PEER_STREAMS ||
+            pre_bidi > MM_MAX_PEER_STREAMS - pre_uni)
+            return MOQ_ERR_INVAL;
+    }
 
     moq_wtquic_msquic_managed_t *m =
         cfg->alloc->alloc(sizeof(*m), cfg->alloc->ctx);
@@ -2623,6 +2668,9 @@ moq_result_t moq_wtquic_msquic_managed_create(
         m->session_idle_timeout_us = cfg->session_idle_timeout_us;
     /* validated in the preflight above, before anything was allocated */
     m->webtransport_profile = pre_profile;
+    m->max_local_streams = pre_local;
+    m->peer_uni_streams = pre_uni;
+    m->peer_bidi_streams = pre_bidi;
     /* app_deadline_us + app_deadline_ctx are ONE ABI block: gated on the LAST
      * field's fit, so the pair is read together or not at all — never the
      * callback with a context read past the caller's struct. */

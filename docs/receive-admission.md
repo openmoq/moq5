@@ -45,7 +45,8 @@ test, not a measurement of a transport's receive buffering.
 ## WT runtime qualification and retained input
 
 WT adapter creation requires a `wt_session` config tail and the public
-`wtq_session_receive_contract` query. The frozen original config prefix is
+`wtq_session_receive_contract` and `wtq_session_stream_budget` queries. The
+frozen original config prefix is
 40 bytes on LP64 and 20 on ILP32; an absent or partially present binding
 returns `MOQ_ERR_UNSUPPORTED` before allocation. The query certifies only a
 corrected provider registration, never merely the legacy pause bit. Its
@@ -63,9 +64,14 @@ in a bootstrap established callback; managed callsites already have the real
 session there. Pre-establishment failure is a bootstrap terminal, not a fatal
 state of an adapter that was never created.
 
-Before bridge creation, the adapter reserves 16 payload slots of 65535 bytes
-and advertises HOLD_INPUT. Thus the reserved payload is 1048560 bytes, plus
-metadata and allocation overhead; this is not total provider memory. A refused
+Before bridge creation, the adapter reserves `api_capacity` payload slots of
+65535 bytes and twice as many terminal-event records, with checked sizes, and
+advertises HOLD_INPUT. The default 31-slot budget reserves 2031585 payload
+bytes, plus metadata and allocation overhead. This adapter allocation is
+separate from the provider's `capacity_bytes` and its 64 MiB ceiling; neither
+is a total connection or process-memory bound. Allocation failure unwinds
+construction before any stream callbacks.
+A refused
 chunk and FIN stay associated with the stream key, even after natural terminal
 and provider-handle destruction. Replay attempts at most once per service pass;
 another refusal retains ownership. Acceptance, including owned WOULD_BLOCK,
@@ -73,14 +79,14 @@ discharges debt. RESET and connection teardown cancel it. Held streams are not
 resumed, and callbacks cannot replace the creation-time session binding.
 
 Capacity is reserved before a new WT stream is published to the adapter.
-The qualified MsQuic provider uses eight peer uni and seven peer bidi credits,
-with at most fifteen peer records including sparse implicit opens and retained
-terminal leases. Its sixteen engine entries reserve three peer critical slots
-and either one client CONNECT plus twelve WT slots, or seven server request
-slots plus six WT slots. WT counts local/peer and uni/bidi streams together.
-Full pools defer valid stream admission instead of aborting a seventeenth
-stream or allocating overflow records. Request parsers retain their existing
-storage; these counts do not bound all provider/OS memory or byte windows.
+The required MsQuic provider backs its effective native peer uni/bidi grants
+independently from bounded local WT reservations. Defaults are eight peer uni,
+seven peer bidi and sixteen local reservations, with 31 API records. HTTP
+classification uses the peer reservations; there is no smaller shared WT
+subpartition. The adapter validates and mirrors the effective API capacity,
+not a fixed default. Local exhaustion is retryable without a native open;
+advertised peer capacity is not cancelled to relieve local pressure. These
+counts do not bound all provider/OS memory or byte windows.
 
 Retained input keeps the API stream lease, and native stream-ID credit follows
 safe lease retirement rather than FIN alone. Ready streams join a bounded FIFO;

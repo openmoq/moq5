@@ -9,6 +9,13 @@ if(FIXTURE_LIBRARY)
 else()
     find_package(wtquic CONFIG REQUIRED)
 endif()
+if(PROBE_COMPONENT STREQUAL "msquic" AND FIXTURE_MSQUIC_LIBRARY)
+    add_library(wtq::msquic UNKNOWN IMPORTED)
+    set_target_properties(wtq::msquic PROPERTIES
+        IMPORTED_LOCATION "${FIXTURE_MSQUIC_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${FIXTURE_MSQUIC_INCLUDE}"
+        INTERFACE_LINK_LIBRARIES wtq::wtquic)
+endif()
 # A caller's static-only check preference must not turn this into header-only
 # discovery, and its check variables must not be overwritten by the helper.
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
@@ -17,7 +24,11 @@ if(DEFINED NESTED_DIAGNOSTIC_MARKER)
     # Arm only after compiler detection, so the API check is the producer.
     file(WRITE "${NESTED_DIAGNOSTIC_MARKER}" "${NESTED_DIAGNOSTIC}")
 endif()
-moq_check_wtquic_api(ok why)
+if(PROBE_COMPONENT STREQUAL "msquic")
+    moq_check_wtquic_msquic_api(ok why)
+else()
+    moq_check_wtquic_api(ok why)
+endif()
 if(DEFINED NESTED_DIAGNOSTIC_MARKER)
     file(REMOVE "${NESTED_DIAGNOSTIC_MARKER}")
 endif()

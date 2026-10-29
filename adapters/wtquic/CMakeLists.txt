@@ -129,6 +129,14 @@ if(MOQ_BUILD_WTQUIC_MSQUIC_MANAGED)
             "component was not found (build/install wtquic with its msquic "
             "backend).")
     endif()
+    # The facade forwards max_local_streams to the provider's client/listener
+    # configs: refuse an older MsQuic header, or a backend/core missing a
+    # probed entry point, here, with the same contract message installed
+    # consumers get from the package preflight.
+    moq_check_wtquic_msquic_api(_moq_wt_msquic_api_ok _moq_wt_msquic_api_reason)
+    if(NOT _moq_wt_msquic_api_ok)
+        message(FATAL_ERROR "${_moq_wt_msquic_api_reason}")
+    endif()
     find_package(Threads REQUIRED) # the facade owns a coordinator thread
     add_library(moq-adapter-wtquic-msquic-managed
         wtquic_msquic_managed.c
@@ -152,6 +160,21 @@ if(MOQ_BUILD_WTQUIC_MSQUIC_MANAGED)
         C_VISIBILITY_PRESET hidden
         POSITION_INDEPENDENT_CODE ON
     )
+    # A shared facade exports only its own moq_wtquic_msquic_* API. When
+    # wtquic's MsQuic backend is a static archive, its WTQ_API functions are
+    # linked into this image and would otherwise be re-exported from here;
+    # callers that use wtquic directly link wtq::msquic themselves (it is a
+    # PUBLIC dependency). Pinned by wtquic_msquic_managed_symbol_policy.
+    get_target_property(_wtq_mm_type moq-adapter-wtquic-msquic-managed TYPE)
+    if(_wtq_mm_type STREQUAL "SHARED_LIBRARY")
+        if(APPLE)
+            target_link_options(moq-adapter-wtquic-msquic-managed PRIVATE
+                "LINKER:-exported_symbol,_moq_wtquic_msquic_*")
+        elseif(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_link_options(moq-adapter-wtquic-msquic-managed PRIVATE
+                "LINKER:--exclude-libs,ALL")
+        endif()
+    endif()
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(moq-adapter-wtquic-msquic-managed PRIVATE
             -Wall -Wextra -Wpedantic
@@ -463,6 +486,18 @@ int main(void) { return p == 0; }
     set_tests_properties(wtquic_adapter_symbol_policy PROPERTIES
         LABELS "wtquic")
 
+    # Export policy for the MsQuic managed facade: exactly the API declared in
+    # moq/wtquic_msquic_managed.h and, for a shared library, nothing outside
+    # the moq_ namespace (no re-exported wtquic implementation).
+    if(TARGET moq-adapter-wtquic-msquic-managed)
+        add_test(NAME wtquic_msquic_managed_symbol_policy
+            COMMAND ${CMAKE_COMMAND}
+                -DLIB=$<TARGET_FILE:moq-adapter-wtquic-msquic-managed>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_wtquic_msquic_managed_symbols.cmake)
+        set_tests_properties(wtquic_msquic_managed_symbol_policy PROPERTIES
+            LABELS "wtquic")
+    endif()
+
     # Installed consumer: installs this build to a scratch prefix and
     # builds find_package(libmoq COMPONENTS adapter-wtquic) against it.
     get_filename_component(_wtquic_dep_prefix "${wtquic_DIR}/../../.."
@@ -549,6 +584,23 @@ int main(void) { return p == 0; }
     target_compile_definitions(test_wtquic_keys PRIVATE MOQ_BUILDING)
     add_test(NAME wtquic_keys COMMAND test_wtquic_keys)
     set_tests_properties(wtquic_keys PROPERTIES LABELS "wtquic")
+
+    # Stream table sized from the provider's queried api_capacity, and the
+    # checked layout arithmetic; real adapter/bridge over a fake WT provider.
+    add_executable(test_wtquic_capacity tests/test_wtquic_capacity.c)
+    target_link_libraries(test_wtquic_capacity PRIVATE moq::core)
+    target_include_directories(test_wtquic_capacity PRIVATE
+        ${PROJECT_SOURCE_DIR}/core/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        $<TARGET_PROPERTY:wtq::wtquic,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_compile_definitions(test_wtquic_capacity PRIVATE MOQ_BUILDING WTQ_STATIC)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_wtquic_capacity PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME wtquic_capacity COMMAND test_wtquic_capacity)
+    set_tests_properties(wtquic_capacity PROPERTIES LABELS "wtquic" TIMEOUT 30)
 
     # Public startup through the real adapter/bridge, with a fake WT provider.
     add_executable(test_wtquic_open_close tests/test_wtquic_open_close.c)
@@ -924,6 +976,27 @@ int main(void) { return p == 0; }
                     TIMEOUT 180
                     RESOURCE_LOCK ipv4_port_shadow)
             endif()
+
+            # Stream-resource block over real MsQuic: managed server and client
+            # hold a mixed persistent load and still deliver media before EOF;
+            # forwarded local reservations bound local opens. Public API only.
+            add_executable(test_wtquic_msquic_managed_capacity
+                tests/test_wtquic_msquic_managed_capacity.c)
+            target_link_libraries(test_wtquic_msquic_managed_capacity PRIVATE
+                moq::adapter-wtquic-msquic-managed Threads::Threads)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_wtquic_msquic_managed_capacity PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME wtquic_msquic_managed_capacity
+                COMMAND test_wtquic_msquic_managed_capacity
+                    ${CMAKE_CURRENT_BINARY_DIR}/cert.pem
+                    ${CMAKE_CURRENT_BINARY_DIR}/key.pem)
+            set_tests_properties(wtquic_msquic_managed_capacity PROPERTIES
+                FIXTURES_REQUIRED wtquic_certs
+                LABELS "network;wtquic"
+                TIMEOUT 180)
 
             # Autonomous bounded-poll delivery: a MANAGED subscriber must deliver
             # a whole track to a bounded-poll app with no explicit receiver wake

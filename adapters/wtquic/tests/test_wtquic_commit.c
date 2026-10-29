@@ -11,6 +11,7 @@
 #include <moq/session.h>
 #include <moq/transport_bridge.h>
 #include <moq/wtquic.h>
+#include "wtquic_stream_budget_fake.h"
 #include "wtquic_attach_bootstrap.h"
 #include "../../../tests/unit/test_alloc_support.h"
 
@@ -397,7 +398,7 @@ static bool mapped(struct side *s, uint64_t key)
 static unsigned retained_slots(const moq_wtquic_conn_t *conn)
 {
     unsigned n = 0;
-    for (unsigned i = 0; i < MOQ_WTQ_MAX_STREAMS; ++i)
+    for (unsigned i = 0; i < TEST_STREAM_CAPACITY; ++i)
         if (conn->streams[i].in_use) ++n;
     return n;
 }
@@ -406,7 +407,7 @@ static void callback_burst(wtq_session_t *s)
     moq_wtquic_conn_t *conn = s->conn;
     unsigned feeds = s->feed_count;
     CHECK(conn->in_service);
-    CHECK(retained_slots(conn) == MOQ_WTQ_MAX_STREAMS);
+    CHECK(retained_slots(conn) == TEST_STREAM_CAPACITY);
     ++s->burst_calls;
     burst_active = true;
     for (unsigned i = 0; i < s->stream_count; ++i) {
@@ -433,9 +434,9 @@ static void callback_burst(wtq_session_t *s)
         CHECK(st->refs == 1); /* adapter lease, after provider close */
     }
     CHECK(s->feed_count == feeds);
-    CHECK(retained_slots(conn) == MOQ_WTQ_MAX_STREAMS);
+    CHECK(retained_slots(conn) == TEST_STREAM_CAPACITY);
     CHECK(conn->term_count == 2 * s->burst_streams);
-    CHECK(conn->term_count > MOQ_WTQ_MAX_STREAMS);
+    CHECK(conn->term_count > TEST_STREAM_CAPACITY);
     CHECK(!conn->term_overflow);
     uint64_t rejected = UINT64_MAX;
     unsigned native_count = s->stream_count;
@@ -849,14 +850,14 @@ static bool burst_body(struct fixture *f, bool from_send, bool stop,
     struct side *side = f->sender;
     wtq_session_t *s = &side->wt;
     unsigned base = retained_slots(s->conn);
-    NEED(base < MOQ_WTQ_MAX_STREAMS);
-    unsigned n = MOQ_WTQ_MAX_STREAMS - base;
-    NEED(n > MOQ_WTQ_MAX_STREAMS / 2);
+    NEED(base < TEST_STREAM_CAPACITY);
+    unsigned n = TEST_STREAM_CAPACITY - base;
+    NEED(n > TEST_STREAM_CAPACITY / 2);
     unsigned first_feed = s->feed_count;
     s->burst_stop = stop; s->burst_duplicates = duplicates;
     s->burst_close_session = session_close;
-    wtq_stream_t *streams[MOQ_WTQ_MAX_STREAMS] = {0};
-    uint64_t keys[MOQ_WTQ_MAX_STREAMS] = {0};
+    wtq_stream_t *streams[TEST_STREAM_CAPACITY] = {0};
+    uint64_t keys[TEST_STREAM_CAPACITY] = {0};
     for (unsigned i = 0; i < n; ++i) {
         if (from_send && i + 1 == n) s->burst_from_send = true;
         if (!group(f, i + 1, true, &streams[i], &keys[i])) return false;
@@ -975,8 +976,8 @@ static bool teardown_retry_body(struct fixture *f, bool queue_open,
 {
     struct side *s = f->sender;
     unsigned fin_pending = 0;
-    for (unsigned i = 0; retained_slots(s->wt.conn) < MOQ_WTQ_MAX_STREAMS &&
-                         i < MOQ_WTQ_MAX_STREAMS; ++i) {
+    for (unsigned i = 0; retained_slots(s->wt.conn) < TEST_STREAM_CAPACITY &&
+                         i < TEST_STREAM_CAPACITY; ++i) {
         wtq_stream_t *st = NULL;
         uint64_t key = UINT64_MAX;
         if (!group(f, 10 + i, false, &st, &key)) return false;
@@ -984,7 +985,7 @@ static bool teardown_retry_body(struct fixture *f, bool queue_open,
         NEED(mapped(s, key));
         ++fin_pending;
     }
-    NEED(retained_slots(s->wt.conn) == MOQ_WTQ_MAX_STREAMS);
+    NEED(retained_slots(s->wt.conn) == TEST_STREAM_CAPACITY);
     NEED(fin_pending > 0);
     NEED(!moq_transport_bridge_has_outbound_pending(s->wt.conn->bridge));
     unsigned opened_before = s->wt.stream_count;
@@ -1014,7 +1015,7 @@ static bool teardown_retry_body(struct fixture *f, bool queue_open,
         CHECK(!s->wt.conn->in_service);
         CHECK(!s->wt.conn->close_pending && !s->wt.conn->close_fed);
         CHECK(!moq_transport_bridge_is_terminal(s->wt.conn->bridge));
-        CHECK(s->wt.feed_count == first_feed + MOQ_WTQ_MAX_STREAMS);
+        CHECK(s->wt.feed_count == first_feed + TEST_STREAM_CAPACITY);
         /* The provider's session outcome is deferred until its caller unwinds. */
         moq_wtquic_conn_events()->on_closed(&s->wt, code, NULL, 0, clean, s->wt.conn);
     } else {
@@ -1022,7 +1023,7 @@ static bool teardown_retry_body(struct fixture *f, bool queue_open,
     }
     printf("observed %s filled_slots=%u fin_pending=%u provider_streams=%u "
            "fatal=%u closed=%u fatal_code=%" PRIu64 " commits=%u\n",
-        case_name, (unsigned)MOQ_WTQ_MAX_STREAMS, fin_pending, opened_before,
+        case_name, (unsigned)TEST_STREAM_CAPACITY, fin_pending, opened_before,
         moq_transport_bridge_is_fatal(s->wt.conn->bridge) ? 1u : 0u,
         moq_transport_bridge_is_closed(s->wt.conn->bridge) ? 1u : 0u,
         moq_transport_bridge_fatal_code(s->wt.conn->bridge), s->wt.commit_feeds);
@@ -1032,8 +1033,8 @@ static bool teardown_retry_body(struct fixture *f, bool queue_open,
     CHECK(s->wt.commit_feeds == 0);
     CHECK(s->wt.stream_count == opened_before);
     CHECK(queue_open ? s->wt.open_calls > calls_before : s->wt.open_calls == calls_before);
-    CHECK(s->wt.feed_count == first_feed + MOQ_WTQ_MAX_STREAMS + 1);
-    if (s->wt.feed_count == first_feed + MOQ_WTQ_MAX_STREAMS + 1) {
+    CHECK(s->wt.feed_count == first_feed + TEST_STREAM_CAPACITY + 1);
+    if (s->wt.feed_count == first_feed + TEST_STREAM_CAPACITY + 1) {
         for (unsigned i = first_feed; i < s->wt.feed_count - 1; ++i)
             CHECK(s->wt.feeds[i].kind == FEED_STREAM_CLOSE);
         CHECK(s->wt.feeds[s->wt.feed_count - 1].kind == FEED_SESSION_CLOSE);

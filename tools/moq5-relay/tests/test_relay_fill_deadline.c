@@ -142,8 +142,13 @@ serve_main(void *arg)
     return NULL;
 }
 
-/* A free UDP port on loopback. The serve config names fixed ports; asking the
- * kernel for one keeps parallel test runs from colliding. */
+/* A UDP port no IPv4 socket holds on ANY local address. The serve config
+ * names fixed ports; asking the kernel for one keeps parallel test runs from
+ * colliding. The relay's MsQuic listener binds the wildcard whatever host it
+ * is configured with (adapters/common/moq_listen_port.h), so the pick must be
+ * free on the wildcard: a port free on loopback alone can still be held by a
+ * socket bound to another local address, and an explicit port is never
+ * replaced or retried. */
 static uint16_t
 free_udp_port(void)
 {
@@ -154,7 +159,7 @@ free_udp_port(void)
     struct sockaddr_in a;
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
     a.sin_port = 0;
     socklen_t len = sizeof(a);
     uint16_t port = 0;

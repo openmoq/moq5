@@ -7,6 +7,7 @@
 #include "../../../core/src/session/session_internal.h"
 #include <stdio.h>
 #include <string.h>
+#include "wtquic_stream_budget_fake.h"
 
 static unsigned feeds, refused, exact_replays, accepted_replays;
 static uint64_t watched_key;
@@ -34,13 +35,13 @@ static moq_result_t observe_uni(moq_transport_bridge_t *b, uint64_t id,
  * retention separately from the fake's static backing storage. */
 static wtq_stream_t *expired;
 static unsigned retained, stale_calls;
-static unsigned query_calls, abort_calls;
+static unsigned query_calls, abort_calls, transport_effects;
 static unsigned session_refs;
 static wtq_result_t (*service_probe)(wtq_session_t *);
 void wtq_session_add_ref(wtq_session_t *s) { (void)s; session_refs++; }
 void wtq_session_release(wtq_session_t *s) { (void)s; session_refs--; }
 wtq_result_t wtq_session_service_stream_admission(wtq_session_t *s)
-{ return service_probe ? service_probe(s) : s ? WTQ_OK : WTQ_ERR_INVALID_ARG; }
+{ transport_effects++; return service_probe ? service_probe(s) : s ? WTQ_OK : WTQ_ERR_INVALID_ARG; }
 static wtq_result_t contract_rc = WTQ_OK;
 static size_t contract_quantum = 65535;
 static wtq_receive_pause_mode_t contract_mode = WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED;
@@ -53,6 +54,7 @@ wtq_result_t wtq_session_receive_contract(const wtq_session_t *s,
     return s ? contract_rc : WTQ_ERR_INVALID_ARG;
 }
 struct wtq_stream { bool bidi; unsigned pauses, resumes; };
+static wtq_stream_t *(*open_probe)(bool bidi);
 static struct wtq_stream fake_stream;
 static wtq_result_t g_pause_rc, g_resume_rc;
 static bool close_on_resume, close_on_pause, replace_on_resume;
@@ -69,25 +71,26 @@ static struct wtq_stream *new_stream(bool bidi)
     return &fake_stream;
 }
 wtq_result_t wtq_session_open_uni(wtq_session_t *s, wtq_stream_t **out)
-{ (void)s; *out = new_stream(false); return WTQ_OK; }
+{ (void)s; transport_effects++; *out = open_probe ? open_probe(false) : new_stream(false); return WTQ_OK; }
 wtq_result_t wtq_session_open_bidi(wtq_session_t *s, wtq_stream_t **out)
-{ (void)s; *out = new_stream(true); return WTQ_OK; }
+{ (void)s; transport_effects++; *out = open_probe ? open_probe(true) : new_stream(true); return WTQ_OK; }
 uint64_t wtq_stream_id(const wtq_stream_t *st)
 { check_handle(st); return WTQ_STREAM_ID_UNKNOWN; }
 bool wtq_stream_is_bidi(const wtq_stream_t *st)
 { check_handle(st); return st->bidi; }
 wtq_result_t wtq_stream_abort(wtq_stream_t *st, uint32_t code)
-{ check_handle(st); (void)code; abort_calls++; return WTQ_OK; }
+{ check_handle(st); (void)code; transport_effects++; abort_calls++; return WTQ_OK; }
 wtq_result_t wtq_stream_reset(wtq_stream_t *st, uint32_t code)
-{ check_handle(st); (void)code; return WTQ_OK; }
+{ check_handle(st); (void)code; transport_effects++; return WTQ_OK; }
 wtq_result_t wtq_stream_stop_sending(wtq_stream_t *st, uint32_t code)
-{ check_handle(st); (void)code; return WTQ_OK; }
+{ check_handle(st); (void)code; transport_effects++; return WTQ_OK; }
 wtq_result_t wtq_stream_send(wtq_stream_t *st, const wtq_span_t *sp,
                             size_t n, uint32_t flags, void *ctx)
-{ check_handle(st); (void)sp; (void)n; (void)flags; (void)ctx; return WTQ_OK; }
+{ check_handle(st); (void)sp; (void)n; (void)flags; (void)ctx; transport_effects++; return WTQ_OK; }
 wtq_result_t wtq_stream_pause_receive(wtq_stream_t *st)
 {
     check_handle(st);
+    transport_effects++;
     st->pauses++;
     if (close_on_pause) { close_on_pause = false; resume_terminal(st); }
     return g_pause_rc;
@@ -95,6 +98,7 @@ wtq_result_t wtq_stream_pause_receive(wtq_stream_t *st)
 wtq_result_t wtq_stream_resume_receive(wtq_stream_t *st)
 {
     check_handle(st);
+    transport_effects++;
     st->resumes++;
     if (close_on_resume) { close_on_resume = false; resume_terminal(st); }
     return g_resume_rc;
@@ -116,10 +120,10 @@ wtq_result_t wtq_stream_enable_send_commit(wtq_stream_t *st)
 { (void)st; return WTQ_ERR_UNSUPPORTED; }
 wtq_result_t wtq_session_close(wtq_session_t *s, uint32_t code,
                               const uint8_t *r, size_t n)
-{ (void)s; (void)code; (void)r; (void)n; return WTQ_OK; }
+{ (void)s; (void)code; (void)r; (void)n; transport_effects++; return WTQ_OK; }
 wtq_result_t wtq_session_send_datagram(wtq_session_t *s, const wtq_span_t *sp,
                                        size_t n)
-{ (void)s; (void)sp; (void)n; return WTQ_OK; }
+{ (void)s; (void)sp; (void)n; transport_effects++; return WTQ_OK; }
 size_t wtq_session_datagram_max_size(const wtq_session_t *s)
 { (void)s; return 0; }
 void wtq_stream_add_ref(wtq_stream_t *st)
@@ -226,7 +230,7 @@ int main(int argc, char **argv)
         /* Keep this generation discriminator to one resume operation. A
          * replacement takes an earlier slot, already visited by this scan;
          * the next service pass owns its independent pause reconciliation. */
-        struct moq_wtq_stream *last = &c->streams[MOQ_WTQ_MAX_STREAMS - 1];
+        struct moq_wtq_stream *last = &c->streams[TEST_STREAM_CAPACITY - 1];
         CHECK(!last->in_use);
         *last = *original;
         memset(original, 0, sizeof(*original));

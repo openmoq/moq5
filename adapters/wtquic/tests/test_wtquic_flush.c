@@ -13,6 +13,7 @@
 #include <time.h>
 #include <moq/wtquic_msquic_managed.h>
 #include <wtquic/wtquic_msquic.h>
+#include "wtquic_stream_budget_fake.h"
 #include "../wtquic_adapter_internal.h"
 #include "../../../core/src/session/session_outbound_internal.h"
 #include "../../../core/src/bridge/transport_bridge_internal.h"

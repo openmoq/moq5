@@ -311,19 +311,34 @@ WebTransport path across 1200 B, 8 KiB and 64 KiB object sizes.
   (GOAWAY drain) need external service calls.
 - Receive admission requires the strengthened wtquic runtime contract before
   bridge creation. The qualified MsQuic provider uses effective peer stream
-  limits of eight uni and seven bidi, a 65535-byte callback quantum, and
-  FLOW_CONTROLLED receive pause. Old/accounted-only providers are unsupported.
-- **Open wtquic defect, being corrected in wtquic:** the fixed engine pool
-  admits twelve concurrent WT streams on a client and six on a server,
-  counting local and peer streams together. A further WT stream waits for an
-  entry instead of being admitted. A draft-18 peer carries each request on its
-  own long-lived stream, so a publisher with a few tracks fills a server
-  session and its media streams wait until requests close. The remaining
-  entries preserve critical streams and request parser state. Sixteen
-  API/adapter records are a separate bound: terminal input debt retains its
-  stream lease until the record retires. Native peer stream credit follows
-  safe lease retirement, not FIN alone. These bounds do not bound all native
-  or OS memory.
+  limits defaulting to eight uni and seven bidi, a 65535-byte callback quantum,
+  and FLOW_CONTROLLED receive pause. Old/accounted-only providers are unsupported.
+- The provider must also expose `wtq_session_stream_budget`. The adapter
+  preallocates its stable stream records from the query's `api_capacity`
+  (native peer grants U+B plus the provider's `max_local_streams` L), and
+  twice as many terminal-event records, in one allocation at create. There is
+  no adapter-side capacity setting and no hidden 16-record clamp. Default
+  capacity is 31 (U=8, B=7, L=16), with peer and local reservations
+  independently backed by the provider: a waiting peer stream does not wait
+  for a local one, nor a local open for a peer stream. The largest accepted
+  plan is 2048 records; a snapshot outside the provider's bounds, or a total
+  this platform cannot represent, refuses create() with
+  `MOQ_ERR_UNSUPPORTED` before any allocation. Each adapter record reserves
+  65535 payload bytes: 2031585 bytes at the default capacity and 134215680
+  bytes (128 MiB) at the maximum, plus record metadata, the terminal queue,
+  bridge storage and allocator overhead. This is separate from, and not
+  counted in, the provider's 64 MiB `capacity_bytes` ceiling; neither is a
+  total connection or process-memory bound.
+  Terminal input debt retains its stream lease until
+  the record retires. Native peer stream credit follows safe lease retirement,
+  not FIN alone. These limits do not bound all native or OS memory.
+- The MsQuic managed facade forwards its optional stream-resource block
+  (`max_local_streams`, `peer_uni_streams`, `peer_bidi_streams`) to the
+  provider: `max_local_streams` to the client/listener `max_local_streams`
+  (the same local-reservation meaning; 0 = the provider default of 16) and
+  the two credits to the provider's native peer grants (0 = 8 uni / 7 bidi).
+  The adapter table follows the resulting `api_capacity`. Neither the relay
+  configuration nor the service tier exposes these fields.
 - Adapter service invokes bounded provider admission only after bridge,
   endpoint, replay and resume calls return. Attach callers must keep servicing
   under their serialized lane, including when there are no incoming packets.

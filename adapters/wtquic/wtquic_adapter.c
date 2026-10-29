@@ -24,6 +24,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
 
@@ -34,8 +35,12 @@
 #include "wtquic_adapter_internal.h"
 #include "../../core/src/session/session_outbound_internal.h"
 
-#define MOQ_WTQ_MAX_STREAMS 16 /* mirrors wtquic's session handle pool */
 #define MOQ_WTQ_RECEIVE_QUANTUM 65535u
+/* The provider's accepted stream-plan bounds (wtquic_msquic.h): native peer
+ * grants U+B <= 1024 and local reservations L <= 1024, so api_capacity =
+ * U+B+L <= 2048. A snapshot outside them is refused, never truncated. */
+#define MOQ_WTQ_MAX_PEER_STREAMS 1024u
+#define MOQ_WTQ_MAX_LOCAL_STREAMS 1024u
 
 typedef struct {
     uint32_t struct_size;
@@ -103,7 +108,11 @@ struct moq_wtquic_conn {
     struct moq_wtq_send_rec *sends; /* actual retained adapter send ownership */
     moq_wtquic_hook_fn hook;
     void *hook_user;
-    struct moq_wtq_stream streams[MOQ_WTQ_MAX_STREAMS];
+    /* api_capacity entries, allocated with the conn at create and never
+     * resized: no stream callback allocates. */
+    struct moq_wtq_stream *streams;
+    size_t stream_capacity;
+    size_t alloc_size;            /* the conn's single allocation */
     /* Opaque transport-key allocator: every local AND peer stream key
      * comes from this one monotonic counter (bridge contract:
      * connection-lifetime unique, never UINT64_MAX). Native QUIC ids
@@ -125,7 +134,8 @@ struct moq_wtquic_conn {
      * contributes at most one send outcome (commit or STOP) and one close;
      * duplicate outcomes are latched before enqueue. Endpoint operations may
      * produce these callbacks synchronously, so bridge feeds are deferred. */
-    struct moq_wtq_stream_event term_events[2 * MOQ_WTQ_MAX_STREAMS];
+    struct moq_wtq_stream_event *term_events; /* 2 * stream_capacity */
+    size_t   term_capacity;
     size_t   term_count;
     bool     term_overflow;
     moq_transport_endpoint_ops_t ops;
@@ -134,6 +144,13 @@ struct moq_wtquic_conn {
     uint64_t service_epoch;
     bool misrouted;
 };
+
+/* The stream table and the terminal queue trail the conn in one allocation. */
+_Static_assert(sizeof(moq_wtquic_conn_t) % _Alignof(struct moq_wtq_stream) == 0,
+               "stream table follows the conn aligned");
+_Static_assert(sizeof(struct moq_wtq_stream) %
+                   _Alignof(struct moq_wtq_stream_event) == 0,
+               "terminal queue follows the stream table aligned");
 
 static uint64_t now_us(void)
 {
@@ -161,7 +178,7 @@ static stream_add_rc_t stream_add(moq_wtquic_conn_t *c, wtq_stream_t *st,
      * UINT64_MAX sentinel is never issued and a key is never reused. */
     if (c->next_stream_key == UINT64_MAX)
         return STREAM_ADD_EXHAUSTED;
-    for (size_t i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
+    for (size_t i = 0; i < c->stream_capacity; i++)
         if (!c->streams[i].in_use) {
             c->streams[i].in_use = true;
             c->streams[i].paused = false;
@@ -179,7 +196,7 @@ static stream_add_rc_t stream_add(moq_wtquic_conn_t *c, wtq_stream_t *st,
 static struct moq_wtq_stream *stream_find(moq_wtquic_conn_t *c,
                                           uint64_t id)
 {
-    for (size_t i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
+    for (size_t i = 0; i < c->stream_capacity; i++)
         if (c->streams[i].in_use && c->streams[i].id == id)
             return &c->streams[i];
     return NULL;
@@ -188,7 +205,7 @@ static struct moq_wtq_stream *stream_find(moq_wtquic_conn_t *c,
 static struct moq_wtq_stream *stream_find_by_handle(moq_wtquic_conn_t *c,
                                                     wtq_stream_t *st)
 {
-    for (size_t i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
+    for (size_t i = 0; i < c->stream_capacity; i++)
         if (c->streams[i].in_use && c->streams[i].st == st)
             return &c->streams[i];
     return NULL;
@@ -500,7 +517,7 @@ static void stream_retire_if_idle(struct moq_wtq_stream *ms);
 static void stream_enqueue(moq_wtquic_conn_t *c, struct moq_wtq_stream *ms,
                             stream_event_kind_t kind, uint32_t code)
 {
-    if (c->term_count == sizeof(c->term_events) / sizeof(c->term_events[0])) {
+    if (c->term_count == c->term_capacity) {
         c->term_overflow = true;
         return;
     }
@@ -609,7 +626,7 @@ static void pause_stream_for_backpressure(moq_wtquic_conn_t *c,
  * silently strand a failed resume. */
 static void resume_paused_streams(moq_wtquic_conn_t *c)
 {
-    for (uint32_t i = 0; i < MOQ_WTQ_MAX_STREAMS; i++) {
+    for (size_t i = 0; i < c->stream_capacity; i++) {
         struct moq_wtq_stream *ms = &c->streams[i];
         if (!ms->in_use || ms->held || !ms->paused || ms->st == NULL)
             continue;
@@ -648,7 +665,7 @@ static void stream_retire_if_idle(struct moq_wtq_stream *ms)
 
 static void cancel_held_input(moq_wtquic_conn_t *c)
 {
-    for (size_t i = 0; i < MOQ_WTQ_MAX_STREAMS; i++) {
+    for (size_t i = 0; i < c->stream_capacity; i++) {
         struct moq_wtq_stream *ms = &c->streams[i];
         ms->held = false;
         ms->held_len = 0;
@@ -658,7 +675,7 @@ static void cancel_held_input(moq_wtquic_conn_t *c)
 
 static void replay_held_input(moq_wtquic_conn_t *c)
 {
-    for (size_t i = 0; i < MOQ_WTQ_MAX_STREAMS; i++) {
+    for (size_t i = 0; i < c->stream_capacity; i++) {
         struct moq_wtq_stream *ms = &c->streams[i];
         if (!ms->in_use || !ms->held || ms->borrowed ||
             ms->replay_epoch == c->service_epoch ||
@@ -689,7 +706,7 @@ static void conn_service(moq_wtquic_conn_t *c)
     c->in_service = true;
     if (++c->service_epoch == 0) {
         c->service_epoch = 1;
-        for (size_t i = 0; i < MOQ_WTQ_MAX_STREAMS; i++)
+        for (size_t i = 0; i < c->stream_capacity; i++)
             c->streams[i].replay_epoch = 0;
     }
     do {
@@ -1080,6 +1097,34 @@ void moq_wtquic_conn_cfg_init_sized(moq_wtquic_conn_cfg_t *cfg,
     cfg->struct_size = (uint32_t)n;
 }
 
+/* Layout of one conn allocation holding `cap` stream entries: the conn,
+ * then the stream table at *streams_off, then the terminal queue (each entry
+ * contributes at most two queued outcomes) at *events_off. Every
+ * multiplication and addition is checked against `limit` (SIZE_MAX for a real
+ * allocation), so the arithmetic is the same for any size_t width. Returns
+ * false when the total exceeds `limit`, leaving the outputs untouched. */
+static bool conn_layout(size_t cap, size_t limit, size_t *streams_off,
+                        size_t *events_off, size_t *total)
+{
+    const size_t base = sizeof(moq_wtquic_conn_t);
+    const size_t entry = sizeof(struct moq_wtq_stream);
+    const size_t event = sizeof(struct moq_wtq_stream_event);
+
+    if (base > limit)
+        return false;
+    size_t room = limit - base;
+    if (cap > room / entry)
+        return false;
+    size_t table = cap * entry;
+    room -= table;
+    if (cap > room / 2u / event)
+        return false;
+    *streams_off = base;
+    *events_off = base + table;
+    *total = base + table + 2u * cap * event;
+    return true;
+}
+
 moq_result_t moq_wtquic_conn_create(const moq_wtquic_conn_cfg_t *cfg,
                                     moq_wtquic_conn_t **out)
 {
@@ -1106,11 +1151,40 @@ moq_result_t moq_wtquic_conn_create(const moq_wtquic_conn_cfg_t *cfg,
         quantum == 0 || quantum > MOQ_WTQ_RECEIVE_QUANTUM)
         return MOQ_ERR_UNSUPPORTED;
 
-    moq_wtquic_conn_t *c =
-        cfg->alloc->alloc(sizeof(*c), cfg->alloc->ctx);
+    wtq_stream_budget_t budget = WTQ_STREAM_BUDGET_INIT;
+    if (wtq_session_stream_budget(cfg->wt_session, &budget) != WTQ_OK ||
+        budget.struct_size != sizeof(budget))
+        return MOQ_ERR_UNSUPPORTED;
+    /* These are the public provider's accepted count bounds. Refuse an
+     * incoherent snapshot before allocating; never truncate its API capacity. */
+    uint64_t peers = (uint64_t)budget.peer_unidi_stream_count +
+                     budget.peer_bidi_stream_count;
+    if (budget.peer_unidi_stream_count < 3 ||
+        budget.peer_unidi_stream_count > MOQ_WTQ_MAX_PEER_STREAMS ||
+        budget.peer_bidi_stream_count < 1 ||
+        budget.peer_bidi_stream_count > MOQ_WTQ_MAX_PEER_STREAMS ||
+        peers > MOQ_WTQ_MAX_PEER_STREAMS || budget.max_local_streams < 1 ||
+        budget.max_local_streams > MOQ_WTQ_MAX_LOCAL_STREAMS ||
+        budget.api_capacity != peers + budget.max_local_streams)
+        return MOQ_ERR_UNSUPPORTED;
+    /* One allocation: the conn, then its stream table, then the terminal
+     * queue. A total this platform cannot represent is refused here, before
+     * allocation, bridge creation or any transport effect. */
+    size_t capacity = budget.api_capacity;
+    size_t streams_off, events_off, total;
+    if (!conn_layout(capacity, SIZE_MAX, &streams_off, &events_off, &total))
+        return MOQ_ERR_UNSUPPORTED;
+
+    moq_wtquic_conn_t *c = cfg->alloc->alloc(total, cfg->alloc->ctx);
     if (c == NULL)
         return MOQ_ERR_NOMEM;
-    memset(c, 0, sizeof(*c));
+    memset(c, 0, total);
+    c->alloc_size = total;
+    c->streams = (struct moq_wtq_stream *)(void *)((uint8_t *)c + streams_off);
+    c->stream_capacity = capacity;
+    c->term_events =
+        (struct moq_wtq_stream_event *)(void *)((uint8_t *)c + events_off);
+    c->term_capacity = 2u * capacity;
     c->next_stream_key = 1; /* 0 unused; UINT64_MAX reserved */
     c->alloc = *cfg->alloc;
     c->session = cfg->session;
@@ -1145,7 +1219,7 @@ moq_result_t moq_wtquic_conn_create(const moq_wtquic_conn_cfg_t *cfg,
     moq_result_t rc = moq_transport_bridge_create(&bcfg, cfg->session,
                                                   &c->ops, c, &c->bridge);
     if (rc != MOQ_OK) {
-        c->alloc.free(c, sizeof(*c), c->alloc.ctx);
+        c->alloc.free(c, c->alloc_size, c->alloc.ctx);
         return rc;
     }
     *out = c;
@@ -1157,14 +1231,15 @@ void moq_wtquic_conn_destroy(moq_wtquic_conn_t *c)
     if (c == NULL)
         return;
     moq_alloc_t alloc = c->alloc;
+    size_t alloc_size = c->alloc_size;
 
     moq_transport_bridge_destroy(c->bridge);
-    for (size_t i = 0; i < MOQ_WTQ_MAX_STREAMS; ++i) {
+    for (size_t i = 0; i < c->stream_capacity; ++i) {
         wtq_stream_t *lease = c->streams[i].lease;
         c->streams[i].lease = NULL;
         if (lease) wtq_stream_release(lease);
     }
-    alloc.free(c, sizeof(*c), alloc.ctx);
+    alloc.free(c, alloc_size, alloc.ctx);
 }
 
 moq_session_t *moq_wtquic_conn_session(moq_wtquic_conn_t *c)
@@ -1214,7 +1289,7 @@ moq_result_t moq_wtquic_conn_poll_flush(const moq_wtquic_conn_t *c)
         session_has_reliable_outbound_obligation(c->session) ||
         moq_transport_bridge_has_outbound_pending(c->bridge))
         return MOQ_DONE;
-    for (size_t i = 0; i < MOQ_WTQ_MAX_STREAMS; ++i)
+    for (size_t i = 0; i < c->stream_capacity; ++i)
         if (c->streams[i].fin_submitting) return MOQ_DONE;
     return MOQ_OK;
 }

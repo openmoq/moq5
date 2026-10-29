@@ -70,14 +70,31 @@ typedef struct moq_wtquic_conn_cfg {
     void *hook_user;
     /* Required qualified session, borrowed; create in its established callback
      * before forwarding events. Only FLOW_CONTROLLED receive contracts with
-     * a callback quantum <=65535 are supported. The session/callback domain
-     * must remain valid until provider quiescence and adapter destruction. */
+     * a callback quantum <=65535 and a qualified stream-budget query are
+     * supported. The session/callback domain must remain valid until provider
+     * quiescence and adapter destruction. */
     wtq_session_t *wt_session;
 } moq_wtquic_conn_cfg_t;
 
 MOQ_API void moq_wtquic_conn_cfg_init_sized(moq_wtquic_conn_cfg_t *cfg,
                                             size_t size);
 
+/* In the WT session's serialized domain, before forwarding stream callbacks:
+ * query its receive contract and stream budget, then preallocate, in one
+ * allocation, stable api_capacity stream records and twice that many
+ * terminal-event records. api_capacity is the provider's own count (native
+ * peer grants plus max_local_streams: 31 by default, at most 2048); the
+ * adapter has no separate capacity setting. Each stream record reserves 65535
+ * payload bytes, in addition to metadata; this adapter memory is separate
+ * from the provider's capacity_bytes budget, and neither budget bounds the
+ * whole connection's memory.
+ * No stream callback grows these tables. Retained input, callback borrows and
+ * queued terminal events delay reuse of a record and its retained WT handle.
+ * Invalid config returns MOQ_ERR_INVAL; missing/incoherent qualification or
+ * unrepresentable sizes return MOQ_ERR_UNSUPPORTED; allocation failure returns
+ * MOQ_ERR_NOMEM.
+ * Failure leaves *out NULL, releases all allocated adapter storage, and does
+ * not dispatch stream callbacks or open/close transport streams. */
 MOQ_API moq_result_t moq_wtquic_conn_create(
     const moq_wtquic_conn_cfg_t *cfg, moq_wtquic_conn_t **out);
 MOQ_API void moq_wtquic_conn_destroy(moq_wtquic_conn_t *conn);

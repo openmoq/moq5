@@ -75,7 +75,7 @@ run(arguments-nested pass "${CMAKE_COMMAND}" "-DMOQ_SOURCE=${MOQ_SOURCE}"
     "-DRECEIPT=${WORK}/arguments-nested-command.log"
     -P "${MOQ_SOURCE}/tests/cmake/wtquic_api_diagnostic.cmake")
 probe_context(C context)
-foreach(kind old query admission flush-mode flush-query new)
+foreach(kind old query admission flush-mode flush-query flush new)
     run("${kind}-configure" pass "${CMAKE_COMMAND}" -G "${GENERATOR}"
         -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_fixture" -B "${WORK}/${kind}"
         "-DAPI_KIND=${kind}" "-DPROBE_CONFIG=${CONFIG}" ${context})
@@ -84,8 +84,9 @@ foreach(kind old query admission flush-mode flush-query new)
 endforeach()
 foreach(lang C CXX)
     probe_context("${lang}" context)
-    foreach(kind old query admission flush-mode flush-query new mixed
-                 missing-flush-mode-library missing-flush-query-library)
+    foreach(kind old query admission flush-mode flush-query flush new mixed
+                 missing-flush-mode-library missing-flush-query-library
+                 missing-budget-library)
         set(headers "${kind}")
         set(library "${kind}")
         set(expected fail)
@@ -98,6 +99,9 @@ foreach(lang C CXX)
         elseif(kind STREQUAL "missing-flush-query-library")
             set(headers new)
             set(library flush-mode)
+        elseif(kind STREQUAL "missing-budget-library")
+            set(headers new)
+            set(library flush)
         elseif(kind STREQUAL "new")
             set(expected pass)
         endif()
@@ -115,6 +119,57 @@ foreach(lang C CXX)
         -B "${WORK}/${lang}-new" "-DFIXTURE_LIBRARY=${lib_new}")
     run("${lang}-stale-flush" fail "${CMAKE_COMMAND}" -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe"
         -B "${WORK}/${lang}-new" "-DFIXTURE_LIBRARY=${lib_admission}")
+    run("${lang}-restored-budget" pass "${CMAKE_COMMAND}" -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe"
+        -B "${WORK}/${lang}-new" "-DFIXTURE_LIBRARY=${lib_new}")
+    run("${lang}-stale-budget" fail "${CMAKE_COMMAND}" -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe"
+        -B "${WORK}/${lang}-new" "-DFIXTURE_LIBRARY=${lib_flush}")
+endforeach()
+# MsQuic managed component: header field/initializer and link refusals over
+# the complete current core fixture. Base and Network-only discovery above
+# never run this probe. A current header over an older backend library that
+# still defines every probed entry point links: that is availability, not
+# qualification (such a session's budget query is refused at attach).
+probe_context(C context)
+foreach(kind msquic-old msquic-new msquic-missing)
+    run("${kind}-configure" pass "${CMAKE_COMMAND}" -G "${GENERATOR}"
+        -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_fixture" -B "${WORK}/${kind}"
+        "-DAPI_KIND=${kind}" "-DPROBE_CONFIG=${CONFIG}"
+        "-DCORE_INCLUDE=${WORK}/new/include" ${context})
+    run("${kind}-build" pass "${CMAKE_COMMAND}" --build "${WORK}/${kind}" --config "${CONFIG}")
+    file(READ "${WORK}/${kind}/library-${CONFIG}.txt" lib_${kind})
+endforeach()
+foreach(lang C CXX)
+    probe_context("${lang}" context)
+    # row: msquic header kind, msquic library kind, core library kind, expected
+    foreach(row "new;new;new;pass" "old;new;new;fail" "new;old;new;pass"
+                "new;missing;new;fail" "new;new;flush;fail")
+        list(GET row 0 header)
+        list(GET row 1 library)
+        list(GET row 2 core)
+        list(GET row 3 expected)
+        set(name "${lang}-msquic-${header}-${library}-${core}")
+        run("${name}" "${expected}" "${CMAKE_COMMAND}" -G "${GENERATOR}"
+            -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe" -B "${WORK}/${name}"
+            "-DMOQ_SOURCE=${MOQ_SOURCE}" "-DPROBE_LANGUAGE=${lang}"
+            -DPROBE_COMPONENT=msquic
+            "-DCMAKE_TRY_COMPILE_CONFIGURATION=${CONFIG}"
+            "-DFIXTURE_INCLUDE=${WORK}/new/include"
+            "-DFIXTURE_LIBRARY=${lib_${core}}"
+            "-DFIXTURE_MSQUIC_INCLUDE=${WORK}/msquic-${header}/include"
+            "-DFIXTURE_MSQUIC_LIBRARY=${lib_msquic-${library}}" ${context})
+    endforeach()
+    # Repeat in the successful build dir, changing only one library input: a
+    # cached success must not survive replacement of either library.
+    set(good "${WORK}/${lang}-msquic-new-new-new")
+    run("${lang}-msquic-stale-entry" fail "${CMAKE_COMMAND}"
+        -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe" -B "${good}"
+        "-DFIXTURE_MSQUIC_LIBRARY=${lib_msquic-missing}")
+    run("${lang}-msquic-stale-core" fail "${CMAKE_COMMAND}"
+        -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe" -B "${good}"
+        "-DFIXTURE_MSQUIC_LIBRARY=${lib_msquic-new}" "-DFIXTURE_LIBRARY=${lib_flush}")
+    run("${lang}-msquic-restored" pass "${CMAKE_COMMAND}"
+        -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe" -B "${good}"
+        "-DFIXTURE_MSQUIC_LIBRARY=${lib_msquic-new}" "-DFIXTURE_LIBRARY=${lib_new}")
 endforeach()
 file(MAKE_DIRECTORY "${WORK}/warning/include/wtquic")
 file(READ "${WORK}/new/include/wtquic/session.h" warning_header)
@@ -173,4 +228,4 @@ foreach(diagnostic clean warning deprecation)
         message(FATAL_ERROR "nested ${diagnostic} escaped complete-output guard: ${out}${err}")
     endif()
 endforeach()
-message(STATUS "WT API discovery: C/C++ receive/admission/flush declaration and symbol refusals, stale-library refusals, API-only pass, warning/no-language diagnostics")
+message(STATUS "WT API discovery: C/C++ receive/admission/budget/flush declaration and symbol refusals, MsQuic component field/initializer/link refusals, stale-library refusals, API-only pass, warning/no-language diagnostics")

@@ -95,9 +95,10 @@ on one lane (`listener.lanes` above 1 is refused: several picoquic contexts on
 one port are routed by address, not connection ID); `listener.picoquic` sets
 its congestion controller and socket buffer size.
 
-The WTQuic recipe pins `644644727ed7ba853c3f14450dd42a9e8a40d7e4`, which includes
+The WTQuic recipe pins `1fdcf48230adffa70a0c5d2ba19ba8f933bf2f67`, which includes
 typed callback registration, the accounted receive/bounded stream admission
-APIs, and the reliable local-flush and send-commitment APIs. It applies no
+APIs, independent stream budgets, and the reliable local-flush and
+send-commitment APIs. It applies no
 WTQuic patches and keeps pedantic warnings enabled. Its MsQuic backend
 requires at least 2.5.9. `wtquic_DIR` is discovered from the actual
 installation, including `lib64` layouts. `WTQ_MSQUIC_ROOT` is an alternative
