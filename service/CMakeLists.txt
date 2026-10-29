@@ -913,6 +913,25 @@ if(MOQ_BUILD_TESTS)
                 ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_receiver_desc_copy
                 COMMAND test_media_receiver_desc_copy)
+            # Decoder observations: common spans, the coallocated CMAF
+            # record, its allocations and lifetime.
+            add_executable(test_media_receiver_cmaf_record
+                tests/test_media_receiver_cmaf_record.c
+                ${PROJECT_SOURCE_DIR}/tests/support/media_builders.c)
+            target_link_libraries(test_media_receiver_cmaf_record PRIVATE
+                moq-service-receiver-test-internals)
+            target_include_directories(test_media_receiver_cmaf_record PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit
+                ${PROJECT_SOURCE_DIR}/tests/support
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_cmaf_record PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_cmaf_record
+                COMMAND test_media_receiver_cmaf_record)
+            set_tests_properties(media_receiver_cmaf_record PROPERTIES TIMEOUT 60)
             add_executable(test_media_receiver_scripted
                 tests/test_media_receiver_scripted.c)
             target_link_libraries(test_media_receiver_scripted PRIVATE

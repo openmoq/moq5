@@ -38,6 +38,17 @@ static moq_bytes_t lit(const char *s)
     return (moq_bytes_t){ (const uint8_t *)s, strlen(s) };
 }
 
+/* The mapping into current-size records at draft 16: the rows that vary the
+ * catalog hold the ABI arguments constant. */
+static moq_result_t map(const moq_alloc_t *alloc, const moq_msf_track_t *track,
+                        moq_media_track_info_t *info,
+                        moq_cmaf_init_info_t *init, moq_rcbuf_t **init_buf)
+{
+    return moq_msf_track_to_media_info_sized(
+        alloc, track, info, sizeof(*info), MOQ_VERSION_DRAFT_16,
+        init, init ? sizeof(*init) : 0, init_buf);
+}
+
 /* -- Box builder helpers (from test_cmaf.c) --------------------------- */
 
 static void wr32(uint8_t *p, uint32_t v)
@@ -246,7 +257,7 @@ int main(void)
         moq_media_track_info_t info;
         moq_cmaf_init_info_t cinit;
         moq_rcbuf_t *init_buf = NULL;
-        moq_result_t rc = moq_msf_track_to_media_info(
+        moq_result_t rc = map(
             alloc, &t, &info, &cinit, &init_buf);
         CHECK(rc == MOQ_OK);
         CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_VIDEO);
@@ -288,7 +299,7 @@ int main(void)
         moq_media_track_info_t info;
         moq_cmaf_init_info_t cinit;
         moq_rcbuf_t *init_buf = NULL;
-        moq_result_t rc = moq_msf_track_to_media_info(
+        moq_result_t rc = map(
             alloc, &t, &info, &cinit, &init_buf);
         CHECK(rc == MOQ_OK);
         CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_AUDIO);
@@ -323,7 +334,7 @@ int main(void)
         t.init_data = b64.bytes;
 
         moq_media_track_info_t info;
-        moq_result_t rc = moq_msf_track_to_media_info(
+        moq_result_t rc = map(
             alloc, &t, &info, NULL, NULL);
         CHECK(rc == MOQ_OK);
         CHECK_EQ_U32(info.timescale, 90000);
@@ -352,7 +363,7 @@ int main(void)
 
         moq_media_track_info_t info;
         moq_cmaf_init_info_t cinit;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, &cinit, NULL) == MOQ_ERR_INVAL);
 
         moq_rcbuf_decref(b64.buf);
@@ -372,7 +383,7 @@ int main(void)
         t.timescale = 90000;
 
         moq_media_track_info_t info;
-        moq_result_t rc = moq_msf_track_to_media_info(
+        moq_result_t rc = map(
             alloc, &t, &info, NULL, NULL);
         CHECK(rc == MOQ_OK);
         CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_VIDEO);
@@ -392,7 +403,7 @@ int main(void)
         t.role = lit("audio");
 
         moq_media_track_info_t info;
-        moq_result_t rc = moq_msf_track_to_media_info(
+        moq_result_t rc = map(
             alloc, &t, &info, NULL, NULL);
         CHECK(rc == MOQ_OK);
         CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_AUDIO);
@@ -413,7 +424,7 @@ int main(void)
         t.timescale = 48000;
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_OK);
         CHECK_EQ_U32(info.timescale, 48000);
     }
@@ -434,7 +445,7 @@ int main(void)
         t.codec = lit("avc1.42e01e");
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_OK);
         CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_VIDEO);
         CHECK_EQ_INT(info.packaging, MOQ_MEDIA_PACKAGING_RAW);
@@ -453,7 +464,7 @@ int main(void)
         t.codec = lit("mp4a.40.2");
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_OK);
         CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_AUDIO);
         CHECK_EQ_INT(info.packaging, MOQ_MEDIA_PACKAGING_RAW);
@@ -472,7 +483,7 @@ int main(void)
         t.codec = lit("opus");
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_OK);
         CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_AUDIO);
     }
@@ -490,7 +501,7 @@ int main(void)
         t.codec = lit("application/mystery");
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_ERR_INVAL);
     }
 
@@ -510,7 +521,7 @@ int main(void)
         moq_media_track_info_t info;
         moq_cmaf_init_info_t cinit;
         moq_rcbuf_t *init_buf = (moq_rcbuf_t *)0xDEAD;
-        moq_result_t rc = moq_msf_track_to_media_info(
+        moq_result_t rc = map(
             alloc, &t, &info, &cinit, &init_buf);
         CHECK(rc == MOQ_OK);
         CHECK_EQ_U32(cinit.struct_size, sizeof(moq_cmaf_init_info_t));
@@ -546,7 +557,7 @@ int main(void)
         moq_media_track_info_t info;
         moq_cmaf_init_info_t cinit;
         moq_rcbuf_t *init_buf = NULL;
-        moq_result_t rc = moq_msf_track_to_media_info(
+        moq_result_t rc = map(
             alloc, &t, &info, &cinit, &init_buf);
         CHECK(rc == MOQ_OK);
         CHECK_EQ_INT(info.packaging, MOQ_MEDIA_PACKAGING_RAW);
@@ -581,7 +592,7 @@ int main(void)
         t.init_data = b64.bytes;
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(alloc, &t, &info, NULL, NULL) == MOQ_OK);
+        CHECK(map(alloc, &t, &info, NULL, NULL) == MOQ_OK);
         moq_rcbuf_decref(b64.buf);
     }
 
@@ -598,7 +609,7 @@ int main(void)
         /* no role, no codec */
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_ERR_INVAL);
     }
 
@@ -618,7 +629,7 @@ int main(void)
         t.codec = lit("avc1.42e01e");   /* a video codec must not override the role */
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_ERR_INVAL);
     }
 
@@ -637,7 +648,7 @@ int main(void)
         t.codec = lit("avc1.42e01e");
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_OK);
         CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_VIDEO);
     }
@@ -656,7 +667,7 @@ int main(void)
         t.codec = lit("mp4a.40.2");
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_OK);
         CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_AUDIO);
     }
@@ -675,7 +686,7 @@ int main(void)
         t.codec = lit("hvc1.1.6.L93.B0");
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_OK);
         CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_VIDEO);
     }
@@ -694,7 +705,7 @@ int main(void)
         t.codec = lit("application/mystery");
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_ERR_INVAL);
     }
 
@@ -710,14 +721,14 @@ int main(void)
         t.role = lit("video");
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_ERR_INVAL);
     }
 
     /* -- NULL track → INVAL ------------------------------------------- */
     {
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, NULL, &info, NULL, NULL) == MOQ_ERR_INVAL);
     }
 
@@ -732,7 +743,7 @@ int main(void)
         t.has_role = true;
         t.role = lit("video");
 
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, NULL, NULL, NULL) == MOQ_ERR_INVAL);
     }
 
@@ -752,7 +763,7 @@ int main(void)
         moq_media_track_info_t info;
         moq_cmaf_init_info_t cinit;
         moq_rcbuf_t *init_buf = NULL;
-        moq_result_t rc = moq_msf_track_to_media_info(
+        moq_result_t rc = map(
             alloc, &t, &info, &cinit, &init_buf);
         CHECK(rc == MOQ_ERR_PROTO);
         CHECK(init_buf == NULL);
@@ -772,7 +783,7 @@ int main(void)
         t.timescale = 90000;
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_OK);
         CHECK_EQ_U32(info.timescale, 90000);
     }
@@ -789,7 +800,7 @@ int main(void)
         t.role = lit("video");
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, NULL, NULL) == MOQ_ERR_INVAL);
     }
 
@@ -809,7 +820,7 @@ int main(void)
         moq_media_track_info_t info;
         moq_cmaf_init_info_t cinit;
         moq_rcbuf_t *init_buf = NULL;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             alloc, &t, &info, &cinit, &init_buf) == MOQ_ERR_INVAL);
     }
 
@@ -833,7 +844,7 @@ int main(void)
         t.init_data = b64.bytes;
 
         moq_media_track_info_t info;
-        CHECK(moq_msf_track_to_media_info(
+        CHECK(map(
             NULL, &t, &info, NULL, NULL) == MOQ_ERR_INVAL);
 
         moq_rcbuf_decref(b64.buf);
@@ -864,7 +875,7 @@ int main(void)
         moq_media_track_info_t info;
         moq_cmaf_init_info_t cinit;
         moq_rcbuf_t *init_buf = NULL;
-        moq_result_t rc = moq_msf_track_to_media_info(
+        moq_result_t rc = map(
             &fa, &t, &info, &cinit, &init_buf);
         CHECK(rc == MOQ_OK);
         CHECK(init_buf != NULL);
@@ -898,7 +909,7 @@ int main(void)
         moq_alloc_t fa = oom_allocator(&oom);
 
         moq_media_track_info_t info;
-        moq_result_t rc = moq_msf_track_to_media_info(
+        moq_result_t rc = map(
             &fa, &t, &info, NULL, NULL);
         CHECK(rc == MOQ_OK);
         CHECK_EQ_U32(info.timescale, 90000);
@@ -907,12 +918,10 @@ int main(void)
         moq_rcbuf_decref(b64.buf);
     }
 
-    /* -- The sized companion ------------------------------------------
+    /* -- The sized track info --------------------------------------------
      *
-     * The legacy entry point cannot express a version, which means anything
-     * parsed with its output takes the legacy draft-16 contract. These cases
-     * pin the sized companion's contract: same mapping, a real version, and
-     * refusal rather than a silent downgrade. */
+     * The output must carry the session's real version: these cases pin the
+     * stamp, and refusal rather than a silent draft-16 downgrade. */
     {
         const moq_alloc_t *alloc = moq_alloc_default();
 
@@ -936,32 +945,13 @@ int main(void)
                 moq_media_track_info_t info;
                 memset(&info, 0xAB, sizeof(info));
                 CHECK(moq_msf_track_to_media_info_sized(
-                          alloc, &t, &info, sizeof(info), vs[i], NULL, NULL)
+                          alloc, &t, &info, sizeof(info), vs[i], NULL, 0, NULL)
                       == MOQ_OK);
                 CHECK_EQ_U32(info.struct_size, (uint32_t)sizeof(info));
                 CHECK_EQ_INT(info.transport_version, vs[i]);
                 /* The catalog mapping is unchanged by the new entry point. */
                 CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_VIDEO);
                 CHECK_EQ_INT(info.packaging, MOQ_MEDIA_PACKAGING_RAW);
-            }
-        }
-
-        /* -- the legacy entry point still behaves as before ------------- */
-        {
-            moq_media_track_info_t info;
-            memset(&info, 0xAB, sizeof(info));
-            CHECK(moq_msf_track_to_media_info(alloc, &t, &info, NULL, NULL)
-                  == MOQ_OK);
-            CHECK_EQ_U32(info.struct_size,
-                         (uint32_t)MOQ_MEDIA_TRACK_INFO_V0_SIZE);
-            /* OLD-BUFFER CANARY: the sentinel past the frozen prefix is
-             * untouched, which is the actual out-of-bounds proof rather
-             * than merely the struct_size value. */
-            {
-                const unsigned char *raw = (const unsigned char *)&info;
-                for (size_t i = MOQ_MEDIA_TRACK_INFO_V0_SIZE;
-                     i < sizeof(info); i++)
-                    CHECK(raw[i] == 0xAB);
             }
         }
 
@@ -974,7 +964,7 @@ int main(void)
             memset(&info, 0xAB, sizeof(info));
             CHECK(moq_msf_track_to_media_info_sized(
                       alloc, &t, &info, MOQ_MEDIA_TRACK_INFO_V0_SIZE,
-                      MOQ_VERSION_DRAFT_18, NULL, NULL) == MOQ_ERR_INVAL);
+                      MOQ_VERSION_DRAFT_18, NULL, 0, NULL) == MOQ_ERR_INVAL);
             /* Nothing was written on the refusal path. */
             {
                 const unsigned char *raw = (const unsigned char *)&info;
@@ -988,7 +978,7 @@ int main(void)
                       alloc, &t, &info,
                       offsetof(moq_media_track_info_t, transport_version)
                           + sizeof(info.transport_version) - 1,
-                      MOQ_VERSION_DRAFT_16, NULL, NULL) == MOQ_ERR_INVAL);
+                      MOQ_VERSION_DRAFT_16, NULL, 0, NULL) == MOQ_ERR_INVAL);
             CHECK(((const unsigned char *)&info)[0] == 0xAB);
         }
 
@@ -1002,7 +992,7 @@ int main(void)
                 moq_media_track_info_t info;
                 memset(&info, 0xAB, sizeof(info));
                 CHECK(moq_msf_track_to_media_info_sized(
-                          alloc, &t, &info, sizeof(info), bad[i], NULL, NULL)
+                          alloc, &t, &info, sizeof(info), bad[i], NULL, 0, NULL)
                       == MOQ_ERR_INVAL);
                 CHECK(((const unsigned char *)&info)[0] == 0xAB);
             }
@@ -1014,7 +1004,7 @@ int main(void)
             memset(&info, 0xAB, sizeof(info));
             CHECK(moq_msf_track_to_media_info_sized(
                       alloc, &t, &info, sizeof(info) + 64,
-                      MOQ_VERSION_DRAFT_18, NULL, NULL) == MOQ_OK);
+                      MOQ_VERSION_DRAFT_18, NULL, 0, NULL) == MOQ_OK);
             CHECK_EQ_U32(info.struct_size, (uint32_t)sizeof(info));
             CHECK_EQ_INT(info.transport_version, MOQ_VERSION_DRAFT_18);
         }
@@ -1046,7 +1036,7 @@ int main(void)
                 moq_media_track_info_t d18;
                 CHECK(moq_msf_track_to_media_info_sized(
                           alloc, &t, &d18, sizeof(d18),
-                          MOQ_VERSION_DRAFT_18, NULL, NULL) == MOQ_OK);
+                          MOQ_VERSION_DRAFT_18, NULL, 0, NULL) == MOQ_OK);
                 moq_media_parsed_object_t out;
                 CHECK(moq_media_object_parse(&d18, &in, NULL, 0, &out, NULL)
                       == MOQ_OK);
@@ -1058,7 +1048,7 @@ int main(void)
                 moq_media_track_info_t d16;
                 CHECK(moq_msf_track_to_media_info_sized(
                           alloc, &t, &d16, sizeof(d16),
-                          MOQ_VERSION_DRAFT_16, NULL, NULL) == MOQ_OK);
+                          MOQ_VERSION_DRAFT_16, NULL, 0, NULL) == MOQ_OK);
                 moq_media_parsed_object_t other;
                 moq_media_drop_reason_t why = 0;
                 moq_result_t prc = moq_media_object_parse(
@@ -1066,20 +1056,84 @@ int main(void)
                 CHECK(!(prc == MOQ_OK && other.has_capture_time &&
                         other.capture_time_us == 33333u));
 
-                /* And the LEGACY entry's output takes the draft-16 contract,
-                 * which is exactly why a current caller must not use it. */
-                moq_media_track_info_t legacy;
-                CHECK(moq_msf_track_to_media_info(alloc, &t, &legacy, NULL,
-                                                  NULL) == MOQ_OK);
-                moq_media_parsed_object_t leg;
-                moq_result_t lrc = moq_media_object_parse(
-                    &legacy, &in, NULL, 0, &leg, &why);
-                CHECK(!(lrc == MOQ_OK && leg.has_capture_time &&
-                        leg.capture_time_us == 33333u));
             }
             if (props) moq_rcbuf_decref(props);
             if (payload) moq_rcbuf_decref(payload);
         }
+    }
+
+    /* -- The parsed header record is a sized output -------------------
+     *
+     * The caller's record may be smaller than this build's (any size from
+     * the v0 floor up): only its prefix is written and stamped, a size below
+     * the floor is refused before anything is written, and bytes past the
+     * written prefix are never touched -- for CMAF (a parsed header) and for
+     * LOC (codec_config only) alike. */
+    {
+        uint8_t avcc[] = { 0x01, 0x64, 0x00, 0x1E };
+        uint8_t init_raw[512];
+        size_t init_len = build_avc_init(init_raw, 90000, 1920, 1080,
+                                          avcc, sizeof(avcc));
+        b64_result_t b64 = encode_b64(alloc, init_raw, init_len);
+        CHECK(b64.buf != NULL);
+        const char *const packagings[2] = { "cmaf", "loc" };
+        for (size_t pk = 0; pk < 2 && b64.buf; pk++) {
+            bool cmaf = pk == 0;
+            moq_msf_track_t t;
+            memset(&t, 0, sizeof(t));
+            t.struct_size = sizeof(t);
+            t.name = lit("video");
+            t.packaging = lit(packagings[pk]);
+            t.has_role = true;
+            t.role = lit("video");
+            t.has_codec = true;
+            t.codec = lit("avc1.64001e");
+            t.has_init_data = true;
+            t.init_data = b64.bytes;
+            const size_t full = sizeof(moq_cmaf_init_info_t);
+            const size_t sizes[] = {
+                MOQ_CMAF_INIT_INFO_V0_SIZE - 1, MOQ_CMAF_INIT_INFO_V0_SIZE,
+                offsetof(moq_cmaf_init_info_t, sample_entry) + 3, full,
+                full + 24,
+            };
+            for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+                union {
+                    moq_cmaf_init_info_t rec;
+                    unsigned char raw[sizeof(moq_cmaf_init_info_t) + 32];
+                } out;
+                memset(out.raw, 0xAB, sizeof(out.raw));
+                moq_media_track_info_t info;
+                memset(&info, 0xAB, sizeof(info));
+                moq_rcbuf_t *init_buf = NULL;
+                moq_result_t rc = moq_msf_track_to_media_info_sized(
+                    alloc, &t, &info, sizeof(info), MOQ_VERSION_DRAFT_22,
+                    &out.rec, sizes[k], &init_buf);
+                size_t written = sizes[k] < full ? sizes[k] : full;
+                if (sizes[k] < MOQ_CMAF_INIT_INFO_V0_SIZE) {
+                    /* Refused: neither output is touched. */
+                    CHECK(rc == MOQ_ERR_INVAL);
+                    CHECK(init_buf == NULL);
+                    written = 0;
+                    CHECK(((const unsigned char *)&info)[0] == 0xAB);
+                } else {
+                    CHECK(rc == MOQ_OK);
+                    CHECK(init_buf != NULL);
+                    CHECK_EQ_U32(out.rec.struct_size, (uint32_t)written);
+                    CHECK(out.rec.codec_config.len ==
+                          (cmaf ? sizeof(avcc) : init_len));
+                    CHECK_EQ_INT(out.rec.codec_kind,
+                                 cmaf ? MOQ_CMAF_CODEC_AVC : MOQ_CMAF_CODEC_UNKNOWN);
+                    if (written >= offsetof(moq_cmaf_init_info_t, sample_entry) +
+                                   sizeof(uint32_t))
+                        CHECK(out.rec.sample_entry ==
+                              (cmaf ? UINT32_C(0x61766331) : 0u)); /* 'avc1' */
+                }
+                for (size_t i = written; i < sizeof(out.raw); i++)
+                    CHECK(out.raw[i] == 0xAB);
+                if (init_buf) moq_rcbuf_decref(init_buf);
+            }
+        }
+        if (b64.buf) moq_rcbuf_decref(b64.buf);
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

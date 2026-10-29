@@ -83,13 +83,16 @@ struct moq_media_track {
      * sized copy reports (may differ from the borrowed scalars), and the
      * stamps the copy writes. */
     moq_media_track_desc_t desc;
+    /* The parsed CMAF record desc.cmaf points at, kept apart from the
+     * description like the service's handle-owned record. */
+    moq_cmaf_init_info_t cmaf;
     text_t name, role, codec, lang, label, packaging_text, event_type, mime_type,
-           channel_config, init_data, codec_config, scheme, kid;
+           channel_config, init_data, codec_config, record_config, scheme, kid;
     text_t depends_text[FIXTURE_ARRAY], cp_text[FIXTURE_ARRAY];
     moq_bytes_t depends[FIXTURE_ARRAY], cp[FIXTURE_ARRAY];
     bool current_is_live, current_has_duration;
     uint64_t current_duration;
-    uint32_t desc_stamp, info_stamp, init_stamp;
+    uint32_t desc_stamp, info_stamp, cmaf_stamp;
 };
 
 typedef struct {
@@ -1300,12 +1303,13 @@ PyObject *test_new_track(PyObject *module, PyObject *capsule)
     track->ended = false;
     track->removed = false;
     memset(&track->desc, 0, sizeof(track->desc));
+    memset(&track->cmaf, 0, sizeof(track->cmaf));
     track->desc.struct_size = sizeof(track->desc);
     track->desc.info.struct_size = sizeof(track->desc.info);
-    track->desc.init.struct_size = sizeof(track->desc.init);
+    track->cmaf.struct_size = sizeof(track->cmaf);
     track->desc_stamp = sizeof(track->desc);
     track->info_stamp = sizeof(track->desc.info);
-    track->init_stamp = sizeof(track->desc.init);
+    track->cmaf_stamp = sizeof(track->cmaf);
     pthread_mutex_unlock(&mutex);
     return moq5_test_track_capsule(capsule, track);
 }
@@ -1505,13 +1509,11 @@ moq_result_t moq_media_receiver_track_desc_copy(const moq_media_receiver_t *r,
     current.track_duration_ms = track->current_duration;
     current.struct_size = track->desc_stamp;
     current.info.struct_size = track->info_stamp;
-    current.init.struct_size = track->init_stamp;
-    /* Poison the nested bodies beyond their stamped prefixes: a reader that
-     * ignores a nested stamp observes garbage, not the scripted values. */
+    /* Poison the nested body beyond its stamped prefix: a reader that
+     * ignores a nested stamp observes garbage, not the scripted values. The
+     * borrowed cmaf record is stamped and poisoned in place by the fixture. */
     if (track->info_stamp < sizeof(current.info))
         memset((uint8_t *)&current.info + track->info_stamp, 0xEE, sizeof(current.info) - track->info_stamp);
-    if (track->init_stamp < sizeof(current.init))
-        memset((uint8_t *)&current.init + track->init_stamp, 0xEE, sizeof(current.init) - track->init_stamp);
     size_t n = out_size < sizeof(current) ? out_size : sizeof(current);
     if (track->desc_stamp < n) n = track->desc_stamp;
     memcpy(out, &current, n);
@@ -1609,6 +1611,7 @@ PyObject *test_track_desc(PyObject *module, PyObject *args)
         take_text(dict, "event_type", &t->event_type, &d->event_type) < 0 ||
         take_text(dict, "mime_type", &t->mime_type, &d->mime_type) < 0 ||
         take_text(dict, "channel_config", &t->channel_config, &d->channel_config) < 0 ||
+        take_text(dict, "codec_config", &t->codec_config, &d->codec_config) < 0 ||
         take_text(dict, "init_data", &t->init_data, &d->init_data) < 0 ||
         take_array(dict, "depends", t->depends_text, t->depends, &d->depends_count) < 0 ||
         take_array(dict, "content_protection_ref_ids", t->cp_text, t->cp, &d->content_protection_ref_id_count) < 0)
@@ -1625,41 +1628,53 @@ PyObject *test_track_desc(PyObject *module, PyObject *args)
     d->info.transport_version = (moq_version_t)v;
     d->info.struct_size = sizeof(d->info);
     t->info_stamp = has ? (uint32_t)sizeof(d->info) : (uint32_t)MOQ_MEDIA_TRACK_INFO_V0_SIZE;
-    PyObject *init = field(dict, "init");
-    d->has_init = init != NULL;
-    d->init.struct_size = sizeof(d->init);
-    t->init_stamp = sizeof(d->init);
+    PyObject *init = field(dict, "cmaf");
+    memset(&t->cmaf, 0, sizeof(t->cmaf));
+    t->cmaf.struct_size = sizeof(t->cmaf);
+    t->cmaf_stamp = sizeof(t->cmaf);
+    d->cmaf = init ? &t->cmaf : NULL;
     if (init) {
-        if (!PyDict_Check(init)) { PyErr_SetString(PyExc_TypeError, "fixture init must be a dict"); goto fail; }
+        if (!PyDict_Check(init)) { PyErr_SetString(PyExc_TypeError, "fixture cmaf must be a dict"); goto fail; }
         if (take_u64(init, "codec_kind", &has, &v) < 0) goto fail;
-        d->init.codec_kind = (moq_cmaf_codec_kind_t)v;
+        t->cmaf.codec_kind = (moq_cmaf_codec_kind_t)v;
         if (take_u64(init, "timescale", &has, &v) < 0) goto fail;
-        d->init.timescale = (uint32_t)v;
+        t->cmaf.timescale = (uint32_t)v;
         if (take_u64(init, "width", &has, &v) < 0) goto fail;
-        d->init.width = (uint32_t)v;
+        t->cmaf.width = (uint32_t)v;
         if (take_u64(init, "height", &has, &v) < 0) goto fail;
-        d->init.height = (uint32_t)v;
+        t->cmaf.height = (uint32_t)v;
         if (take_u64(init, "samplerate", &has, &v) < 0) goto fail;
-        d->init.samplerate = (uint32_t)v;
+        t->cmaf.samplerate = (uint32_t)v;
         if (take_u64(init, "channel_count", &has, &v) < 0) goto fail;
-        d->init.channel_count = (uint32_t)v;
+        t->cmaf.channel_count = (uint32_t)v;
         if (take_u64(init, "track_id", &has, &v) < 0) goto fail;
-        d->init.track_id = (uint32_t)v;
-        if (take_text(init, "codec_config", &t->codec_config, &d->init.codec_config) < 0) goto fail;
+        t->cmaf.track_id = (uint32_t)v;
+        if (take_text(init, "codec_config", &t->record_config, &t->cmaf.codec_config) < 0) goto fail;
+        PyObject *entry = field(init, "sample_entry");
+        if (entry) {
+            Py_ssize_t n = 0;
+            char *b = NULL;
+            if (PyBytes_AsStringAndSize(entry, &b, &n) < 0 || n != 4) {
+                if (!PyErr_Occurred()) PyErr_SetString(PyExc_ValueError, "sample_entry must be 4 bytes");
+                goto fail;
+            }
+            t->cmaf.sample_entry = ((uint32_t)(uint8_t)b[0] << 24) | ((uint32_t)(uint8_t)b[1] << 16) |
+                                   ((uint32_t)(uint8_t)b[2] << 8) | (uint32_t)(uint8_t)b[3];
+        }
         PyObject *cenc = field(init, "cenc");
-        d->init.has_cenc = cenc != NULL;
+        t->cmaf.has_cenc = cenc != NULL;
         if (cenc) {
             PyObject *scheme, *kid;
             int protected_, iv;
             if (!PyArg_ParseTuple(cenc, "OiiO", &scheme, &protected_, &iv, &kid)) goto fail;
             PyObject *one = Py_BuildValue("{s:O,s:O}", "scheme", scheme, "kid", kid);
             if (!one) goto fail;
-            int rc = take_text(one, "scheme", &t->scheme, &d->init.scheme);
-            if (rc == 0) rc = take_text(one, "kid", &t->kid, &d->init.default_kid);
+            int rc = take_text(one, "scheme", &t->scheme, &t->cmaf.scheme);
+            if (rc == 0) rc = take_text(one, "kid", &t->kid, &t->cmaf.default_kid);
             Py_DECREF(one);
             if (rc < 0) goto fail;
-            d->init.default_is_protected = (uint8_t)protected_;
-            d->init.default_per_sample_iv_size = (uint8_t)iv;
+            t->cmaf.default_is_protected = (uint8_t)protected_;
+            t->cmaf.default_per_sample_iv_size = (uint8_t)iv;
         }
     }
     if (take_u64(dict, "width", &d->has_width, &v) < 0) goto fail;
@@ -1697,8 +1712,16 @@ PyObject *test_track_desc(PyObject *module, PyObject *args)
     t->desc_stamp = has ? (uint32_t)v : (uint32_t)sizeof(*d);
     if (take_u64(dict, "info_stamp", &has, &v) < 0) goto fail;
     if (has) t->info_stamp = (uint32_t)v;
-    if (take_u64(dict, "init_stamp", &has, &v) < 0) goto fail;
-    if (has) t->init_stamp = (uint32_t)v;
+    if (take_u64(dict, "cmaf_stamp", &has, &v) < 0) goto fail;
+    if (has) t->cmaf_stamp = (uint32_t)v;
+    /* The record is the service's: stamp it in place and poison what the
+     * stamp does not cover. */
+    t->cmaf.struct_size = t->cmaf_stamp;
+    if (t->cmaf_stamp < sizeof(t->cmaf)) {
+        size_t from = t->cmaf_stamp > sizeof(t->cmaf.struct_size) ? t->cmaf_stamp
+                                                                   : sizeof(t->cmaf.struct_size);
+        memset((uint8_t *)&t->cmaf + from, 0xEE, sizeof(t->cmaf) - from);
+    }
     {
         PyObject *null_span = field(dict, "null_span");
         if (null_span) {
@@ -1707,8 +1730,9 @@ PyObject *test_track_desc(PyObject *module, PyObject *args)
             if (strcmp(which, "name") == 0) d->name.data = NULL;
             else if (strcmp(which, "depends") == 0) d->depends = NULL;
             else if (strcmp(which, "content_protection_ref_ids") == 0) d->content_protection_ref_ids = NULL;
-            else if (strcmp(which, "codec_config") == 0) d->init.codec_config.data = NULL;
+            else if (strcmp(which, "codec_config") == 0) d->codec_config.data = NULL;
             else if (strcmp(which, "init_data") == 0) d->init_data.data = NULL;
+            else if (strcmp(which, "cmaf.codec_config") == 0) t->cmaf.codec_config.data = NULL;
             else { PyErr_SetString(PyExc_ValueError, "unknown null_span"); goto fail; }
         }
         /* Malformed COUNTS and LENGTHS with valid pointers, never backed by
@@ -1729,7 +1753,8 @@ PyObject *test_track_desc(PyObject *module, PyObject *args)
             if (!which) goto fail;
             size_t too_long = (size_t)PY_SSIZE_T_MAX + 1u;
             if (strcmp(which, "name") == 0) d->name.len = too_long;
-            else if (strcmp(which, "codec_config") == 0) d->init.codec_config.len = too_long;
+            else if (strcmp(which, "codec_config") == 0) d->codec_config.len = too_long;
+            else if (strcmp(which, "cmaf.codec_config") == 0) t->cmaf.codec_config.len = too_long;
             else if (strcmp(which, "depends") == 0) { d->depends = t->depends; d->depends_count = 1; t->depends[0].len = too_long; }
             else { PyErr_SetString(PyExc_ValueError, "unknown oversized_len"); goto fail; }
         }
@@ -1870,13 +1895,15 @@ PyObject *test_scramble_track(PyObject *module, PyObject *capsule)
     pthread_mutex_lock(&mutex);
     text_t *texts[] = { &t->name, &t->role, &t->codec, &t->lang, &t->label, &t->packaging_text,
                         &t->event_type, &t->mime_type, &t->channel_config, &t->init_data,
-                        &t->codec_config, &t->scheme, &t->kid };
+                        &t->codec_config, &t->record_config, &t->scheme, &t->kid };
     for (size_t i = 0; i < sizeof(texts) / sizeof(texts[0]); ++i) memset(texts[i]->data, 0xAA, sizeof(texts[i]->data));
     for (int i = 0; i < FIXTURE_ARRAY; ++i) {
         memset(t->depends_text[i].data, 0xAA, sizeof(t->depends_text[i].data));
         memset(t->cp_text[i].data, 0xAA, sizeof(t->cp_text[i].data));
     }
     t->desc.width = 0xAAAAAAAAu;
+    t->cmaf.width = 0xAAAAAAAAu;
+    t->cmaf.sample_entry = 0xAAAAAAAAu;
     t->desc.template_.start_media_ms = 0xAAAAAAAAAAAAAAAAull;
     pthread_mutex_unlock(&mutex);
     Py_RETURN_NONE;
@@ -1887,7 +1914,7 @@ PyObject *test_scramble_track(PyObject *module, PyObject *capsule)
 PyObject *test_layout(PyObject *module, PyObject *args)
 {
     (void)module; (void)args;
-    PyObject *d = Py_BuildValue("{s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n}",
+    PyObject *d = Py_BuildValue("{s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n,s:n}",
         "event_v0", (Py_ssize_t)(offsetof(moq_media_track_event_t, config_generation) + sizeof(uint32_t)),
         "event_has_largest_end", (Py_ssize_t)END(moq_media_track_event_t, has_largest),
         "event_largest_object_end", (Py_ssize_t)END(moq_media_track_event_t, largest_object),
@@ -1902,20 +1929,22 @@ PyObject *test_layout(PyObject *module, PyObject *args)
         "info_v0", (Py_ssize_t)MOQ_MEDIA_TRACK_INFO_V0_SIZE,
         "info_transport_version_end", (Py_ssize_t)END(moq_media_track_info_t, transport_version),
         "info_sizeof", (Py_ssize_t)sizeof(moq_media_track_info_t),
-        "init_codec_kind_end", (Py_ssize_t)END(moq_cmaf_init_info_t, codec_kind),
-        "init_timescale_end", (Py_ssize_t)END(moq_cmaf_init_info_t, timescale),
-        "init_width_end", (Py_ssize_t)END(moq_cmaf_init_info_t, width),
-        "init_height_end", (Py_ssize_t)END(moq_cmaf_init_info_t, height),
-        "init_samplerate_end", (Py_ssize_t)END(moq_cmaf_init_info_t, samplerate),
-        "init_channel_count_end", (Py_ssize_t)END(moq_cmaf_init_info_t, channel_count),
-        "init_codec_config_end", (Py_ssize_t)END(moq_cmaf_init_info_t, codec_config),
-        "init_track_id_end", (Py_ssize_t)END(moq_cmaf_init_info_t, track_id),
-        "init_has_cenc_end", (Py_ssize_t)END(moq_cmaf_init_info_t, has_cenc),
-        "init_scheme_end", (Py_ssize_t)END(moq_cmaf_init_info_t, scheme),
-        "init_default_is_protected_end", (Py_ssize_t)END(moq_cmaf_init_info_t, default_is_protected),
-        "init_default_per_sample_iv_size_end", (Py_ssize_t)END(moq_cmaf_init_info_t, default_per_sample_iv_size),
-        "init_default_kid_end", (Py_ssize_t)END(moq_cmaf_init_info_t, default_kid),
-        "init_sizeof", (Py_ssize_t)sizeof(moq_cmaf_init_info_t),
+        "cmaf_codec_kind_end", (Py_ssize_t)END(moq_cmaf_init_info_t, codec_kind),
+        "cmaf_timescale_end", (Py_ssize_t)END(moq_cmaf_init_info_t, timescale),
+        "cmaf_width_end", (Py_ssize_t)END(moq_cmaf_init_info_t, width),
+        "cmaf_height_end", (Py_ssize_t)END(moq_cmaf_init_info_t, height),
+        "cmaf_samplerate_end", (Py_ssize_t)END(moq_cmaf_init_info_t, samplerate),
+        "cmaf_channel_count_end", (Py_ssize_t)END(moq_cmaf_init_info_t, channel_count),
+        "cmaf_codec_config_end", (Py_ssize_t)END(moq_cmaf_init_info_t, codec_config),
+        "cmaf_track_id_end", (Py_ssize_t)END(moq_cmaf_init_info_t, track_id),
+        "cmaf_has_cenc_end", (Py_ssize_t)END(moq_cmaf_init_info_t, has_cenc),
+        "cmaf_scheme_end", (Py_ssize_t)END(moq_cmaf_init_info_t, scheme),
+        "cmaf_default_is_protected_end", (Py_ssize_t)END(moq_cmaf_init_info_t, default_is_protected),
+        "cmaf_default_per_sample_iv_size_end", (Py_ssize_t)END(moq_cmaf_init_info_t, default_per_sample_iv_size),
+        "cmaf_default_kid_end", (Py_ssize_t)END(moq_cmaf_init_info_t, default_kid),
+        "cmaf_v0", (Py_ssize_t)MOQ_CMAF_INIT_INFO_V0_SIZE,
+        "cmaf_sample_entry_end", (Py_ssize_t)END(moq_cmaf_init_info_t, sample_entry),
+        "cmaf_sizeof", (Py_ssize_t)sizeof(moq_cmaf_init_info_t),
         "stats_sizeof", (Py_ssize_t)sizeof(moq_media_receiver_stats_t),
         "object_v0", (Py_ssize_t)(offsetof(moq_media_object_t, samples_owned) + sizeof(moq_cmaf_sample_t *)),
         "object_sizeof", (Py_ssize_t)sizeof(moq_media_object_t),

@@ -425,7 +425,7 @@ static moq_result_t track_supported(const moq_media_player_t *p,
         /* AAC-LC needs its AudioSpecificConfig: from the catalog, or in
          * band, which only draft 22's LOC-04 can carry. */
         *requires_config = true;
-        bool catalog = d->init.codec_config.len > 0 || d->init_data.len > 0;
+        bool catalog = d->codec_config.len > 0 || d->init_data.len > 0;
         if (!catalog && p->transport_version != MOQ_VERSION_DRAFT_22)
             return MOQ_ERR_UNSUPPORTED;
         return MOQ_OK;
@@ -548,7 +548,7 @@ static moq_result_t player_select(moq_media_player_t *p, moq_media_track_t *trac
     tc.media_type = video ? MOQ_PLAYBACK_MEDIA_VIDEO : MOQ_PLAYBACK_MEDIA_AUDIO;
     tc.packaging = MOQ_PLAYBACK_PACKAGING_RAW;
     tc.codec = d.codec;
-    tc.init_data = d.init.codec_config.len ? d.init.codec_config : d.init_data;
+    tc.init_data = d.codec_config.len ? d.codec_config : d.init_data;
     tc.timescale = d.info.timescale;
     tc.width = d.has_width ? d.width : 0;
     tc.height = d.has_height ? d.height : 0;

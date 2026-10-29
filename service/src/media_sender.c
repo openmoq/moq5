@@ -5852,7 +5852,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     moq_cmaf_init_info_t ii;
     moq_cmaf_init_info_init(&ii);
     if (t->packaging == MOQ_MEDIA_PACKAGING_CMAF && t->init_data.len > 0) {
-        cmaf_init_parsed = (moq_cmaf_parse_init(t->init_data, &ii) == MOQ_OK);
+        cmaf_init_parsed = (moq_cmaf_parse_init_sized(t->init_data, &ii, sizeof(ii)) == MOQ_OK);
         if (cmaf_init_parsed && ii.track_id != 0) {
             t->has_cmaf_init_track_id = true;
             t->cmaf_init_track_id = ii.track_id;

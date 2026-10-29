@@ -175,19 +175,15 @@ moq_rcbuf_t           *init_buf = NULL;
 moq_result_t rc = moq_msf_track_to_media_info_sized(
     alloc, msf_track, &track, sizeof(track),
     moq_session_version(session),        /* the live session is the authority */
-    &cmaf_init, &init_buf);
+    &cmaf_init, sizeof(cmaf_init), &init_buf);
 /* track.media_type, .packaging, .timescale, .transport_version are filled.
- * cmaf_init.codec_config borrows from init_buf (decref when done).
- * For LOC tracks, init_buf is NULL and cmaf_init is zeroed.
+ * cmaf_init is the parsed CMAF header (sample entry, codec kind, CENC, ...);
+ * its spans borrow from init_buf (decref when done). For a LOC track with
+ * initData, cmaf_init.codec_config is that extradata and every other field
+ * stays zero; without initData init_buf is NULL and cmaf_init is zeroed.
  *
  * An unobserved (0) or unsupported version is MOQ_ERR_INVAL here rather
- * than a silent draft-16 result -- fail closed, do not guess a codec.
- *
- * moq_msf_track_to_media_info() (no _sized) remains for callers compiled
- * against the pre-version ABI. It fills only the frozen v0 prefix and
- * expresses no version, so anything parsed with its output takes the
- * legacy draft-16 contract. Do NOT call it and then assign struct_size
- * and transport_version by hand. */
+ * than a silent draft-16 result -- fail closed, do not guess a codec. */
 
 /* Or set up manually from app config: */
 moq_media_track_info_init_sized(&track, sizeof(track));
@@ -215,6 +211,12 @@ The output (`moq_media_parsed_object_t`) contains:
 
 Codec configuration comes from MSF catalog `initData` or the
 playback pipeline's CONFIGURE commands, not from the normalizer.
+
+The sized mapping above, the sized CMAF parser and the receiver's
+`desc.cmaf` pointer replace the unsized exports and the embedded init record
+of earlier builds. That change breaks both source and ABI: rebuild the
+library, its bindings and the application together (see "Track metadata: a
+deliberate source and ABI break" in the top-level README).
 
 ### MPEG-2 TS packaging (`mpeg2ts`)
 
@@ -341,8 +343,7 @@ and for a video track takes the keyframe flag and timing from the program's
 video stream. `moq_msf_track_to_media_info_sized` maps an `"mpeg2ts"` track
 that passes `moq_msf_track_mpeg2ts_check()` (packaging, packet size, the
 catalog PSI as the init buffer, video unless the role says audio; PSI/SI
-table roles are not media); the legacy `moq_msf_track_to_media_info` cannot
-carry the packet size and refuses such a track.
+table roles are not media).
 
 Service tier or helpers? `moq_media_sender` / `moq_media_receiver` carry the
 packaging like LOC and CMAF: a TS track is added with packaging `MPEG2TS` and

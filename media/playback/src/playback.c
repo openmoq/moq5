@@ -996,7 +996,7 @@ moq_result_t moq_playback_add_track(moq_playback_t *pb,
     /* Enforce the documented per-track codec+init cap on the RAW init_data
      * for ALL packaging, BEFORE any parsing. For CMAF the init_data is the
      * init segment, so an untrusted oversized segment must be rejected here
-     * rather than handed to moq_cmaf_parse_init() — otherwise the cap is
+     * rather than handed to moq_cmaf_parse_init_sized() — otherwise the cap is
      * bypassed and parse work scales with the attacker-controlled length.
      * (codec.len <= max is checked just above, so the subtraction is safe.) */
     if (tc.init_data.len >
@@ -1039,7 +1039,7 @@ moq_result_t moq_playback_add_track(moq_playback_t *pb,
         tc.init_data.len > 0) {
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        moq_result_t ir = moq_cmaf_parse_init(tc.init_data, &info);
+        moq_result_t ir = moq_cmaf_parse_init_sized(tc.init_data, &info, sizeof(info));
         if (ir != MOQ_OK) return MOQ_ERR_PROTO;
         if (info.timescale != 0) eff_timescale = info.timescale;
         if (info.width != 0) eff_width = info.width;

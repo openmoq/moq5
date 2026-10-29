@@ -28,6 +28,11 @@ struct init_info {
     uint32_t   samplerate  = 0;
     uint32_t   channel_count = 0;
     bytes_view codec_config;
+    // The sample entry's format, (a<<24)|(b<<16)|(c<<8)|d: a clear entry's
+    // own type, an encrypted entry's frma original format. Any value,
+    // including zero, is reported as read; nullopt when the library did not
+    // report it.
+    std::optional<uint32_t> sample_entry;
 };
 
 using sample = moq_cmaf_sample_t;
@@ -45,7 +50,7 @@ inline result<init_info> parse_init(bytes_view data)
 {
     moq_cmaf_init_info_t ci;
     moq_cmaf_init_info_init(&ci);
-    moq_result_t rc = moq_cmaf_parse_init(data.raw(), &ci);
+    moq_result_t rc = moq_cmaf_parse_init_sized(data.raw(), &ci, sizeof(ci));
     if (rc < 0)
         return errc_from_result(rc);
 
@@ -57,6 +62,9 @@ inline result<init_info> parse_init(bytes_view data)
     out.samplerate    = ci.samplerate;
     out.channel_count = ci.channel_count;
     out.codec_config  = bytes_view(ci.codec_config);
+    if (ci.struct_size >= offsetof(moq_cmaf_init_info_t, sample_entry) +
+                              sizeof(ci.sample_entry))
+        out.sample_entry = ci.sample_entry;
     return out;
 }
 

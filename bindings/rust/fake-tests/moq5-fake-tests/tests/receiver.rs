@@ -92,6 +92,67 @@ static DEPS: Spans<1> = Spans([sys::moq_bytes_t {
     data: DEP.as_ptr(),
     len: 5,
 }]);
+/// A parsed CMAF record the provider retains by pointer, stamped as given.
+struct Record(sys::moq_cmaf_init_info_t);
+// SAFETY: the record and its span point at immutable statics.
+unsafe impl Sync for Record {}
+
+const fn cmaf_record(stamp: usize) -> Record {
+    // SAFETY: the record is plain data; all-zero is its initialized state.
+    let mut record: sys::moq_cmaf_init_info_t = unsafe { std::mem::zeroed() };
+    record.struct_size = stamp as u32;
+    record.codec_kind = sys::MOQ_CMAF_CODEC_AVC;
+    record.timescale = 90000;
+    record.codec_config = sys::moq_bytes_t {
+        data: CONFIG.as_ptr(),
+        len: CONFIG.len(),
+    };
+    record.sample_entry = u32::from_be_bytes(*b"avc3");
+    Record(record)
+}
+static CMAF_RECORD: Record = cmaf_record(std::mem::size_of::<sys::moq_cmaf_init_info_t>());
+
+/// A parsed record in an allocation of exactly its stamped size, so a read
+/// past the stamp leaves the allocation: the provider's sanitizer run checks
+/// the binding's copy against it. A stamp larger than this crate's record
+/// (a newer library's) is backed by 0xEE past the record's bytes.
+struct StampedRecord {
+    bytes: *mut u8,
+    layout: std::alloc::Layout,
+}
+
+impl StampedRecord {
+    fn new(mut record: sys::moq_cmaf_init_info_t, stamp: usize) -> StampedRecord {
+        let layout = std::alloc::Layout::from_size_align(
+            stamp,
+            std::mem::align_of::<sys::moq_cmaf_init_info_t>(),
+        )
+        .expect("a record layout");
+        record.struct_size = u32::try_from(stamp).expect("a record size fits u32");
+        // SAFETY: every stamp used here is nonzero.
+        let bytes = unsafe { std::alloc::alloc(layout) };
+        assert!(!bytes.is_null(), "the record allocation succeeds");
+        let n = stamp.min(std::mem::size_of_val(&record));
+        // SAFETY: `bytes` holds `stamp` bytes and `record` at least `n`; the
+        // two are disjoint and n <= stamp.
+        unsafe {
+            std::ptr::copy_nonoverlapping(std::ptr::addr_of!(record).cast::<u8>(), bytes, n);
+            bytes.add(n).write_bytes(0xEE, stamp - n);
+        }
+        StampedRecord { bytes, layout }
+    }
+
+    fn as_ptr(&self) -> *const sys::moq_cmaf_init_info_t {
+        self.bytes.cast()
+    }
+}
+
+impl Drop for StampedRecord {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this layout.
+        unsafe { std::alloc::dealloc(self.bytes, self.layout) }
+    }
+}
 
 fn raw_description(is_live: bool) -> sys::moq_media_track_desc_t {
     let mut description = sys::moq_media_track_desc_t {
@@ -106,8 +167,9 @@ fn raw_description(is_live: bool) -> sys::moq_media_track_desc_t {
             timescale: 90000,
             transport_version: 22,
         },
-        has_init: true,
+        codec_config: fake::span(CONFIG),
         init_data: fake::span(INIT),
+        cmaf: &CMAF_RECORD.0,
         has_width: true,
         width: 1920,
         has_height: true,
@@ -132,9 +194,6 @@ fn raw_description(is_live: bool) -> sys::moq_media_track_desc_t {
         has_label: true,
         ..Default::default()
     };
-    description.init.struct_size = std::mem::size_of::<sys::moq_cmaf_init_info_t>() as u32;
-    description.init.codec_kind = sys::MOQ_CMAF_CODEC_AVC;
-    description.init.codec_config = fake::span(CONFIG);
     description.template_.start_media_ms = 10;
     description.template_.delta_group = 1;
     if !is_live {
@@ -473,12 +532,18 @@ fn descriptions_are_current_snapshots() {
     assert_eq!(description.packaging_name(), b"cmaf");
     assert_eq!(description.timescale(), 90000);
     assert_eq!(description.transport_version(), Some(Version::DRAFT_22));
-    assert!(description.has_init());
+    assert_eq!(description.codec_config(), CONFIG);
+    let info = description
+        .init_info()
+        .expect("a CMAF track carries its parsed record");
+    assert_eq!(info.codec_kind(), moq5::cmaf::CodecKind::Avc);
+    assert_eq!(info.codec_config(), CONFIG);
     assert_eq!(
-        description.init_info().codec_kind(),
-        moq5::cmaf::CodecKind::Avc
+        info.codec_config().as_ptr(),
+        description.codec_config().as_ptr(),
+        "the record and the description share one extradata span"
     );
-    assert_eq!(description.init_info().codec_config(), &[1, 2, 3]);
+    assert_eq!(info.sample_entry(), Some(*b"avc3"));
     assert_eq!(description.init_data(), INIT);
     assert_eq!(description.width(), Some(1920));
     assert_eq!(description.height(), Some(1080));
@@ -529,6 +594,17 @@ fn descriptions_are_current_snapshots() {
         .expect("an Updated event carries a description")
         .is_live());
 
+    // A LOC track: extradata without a parsed CMAF record.
+    let mut loc = raw_description(true);
+    loc.info.packaging = sys::MOQ_MEDIA_PACKAGING_RAW;
+    loc.cmaf = std::ptr::null();
+    set_description(&receiver, 0, &loc);
+    let description = receiver
+        .track_description(track)
+        .expect("the description of a discovered track copies");
+    assert!(description.init_info().is_none());
+    assert_eq!(description.codec_config(), CONFIG);
+
     let mut bare = raw_description(true);
     bare.has_label = false;
     bare.has_alt_group = false;
@@ -568,6 +644,66 @@ fn descriptions_are_current_snapshots() {
     s.set("desc_stamp", 0);
     s.set("desc_result", i64::from(sys::MOQ_ERR_INVAL));
     assert_eq!(receiver.track_description(track).err(), Some(Error::INVAL));
+}
+
+/// The receiver's record is the library's, at the library's size: it is read
+/// no further than its stamp (each record below is allocated at exactly that
+/// size), a larger record is clamped to this crate's, and the sample entry is
+/// reported only when its whole field is covered -- zero and unknown entries
+/// included. Below its floor the record is an ABI mismatch.
+#[test]
+fn cmaf_records_are_read_within_their_stamp() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    set_description(&receiver, 0, &raw_description(true));
+    let track = track(&receiver, 0);
+    let floor = sys::MOQ_CMAF_INIT_INFO_V0_SIZE;
+    let entry_end =
+        std::mem::offset_of!(sys::moq_cmaf_init_info_t, sample_entry) + std::mem::size_of::<u32>();
+    let full = std::mem::size_of::<sys::moq_cmaf_init_info_t>();
+    let with_entry = |entry: [u8; 4]| {
+        let mut record = CMAF_RECORD.0;
+        record.sample_entry = u32::from_be_bytes(entry);
+        record
+    };
+    let rows = [
+        (with_entry(*b"avc3"), floor, None),
+        (with_entry(*b"avc3"), entry_end - 2, None),
+        (with_entry(*b"avc3"), entry_end, Some(*b"avc3")),
+        (with_entry([0; 4]), full, Some([0; 4])),
+        (with_entry(*b"zzzz"), full, Some(*b"zzzz")),
+        (with_entry([0xff; 4]), full, Some([0xff; 4])),
+        (with_entry(*b"avc3"), full + 16, Some(*b"avc3")),
+    ];
+    for (record, stamp, reported) in rows {
+        let stamped = StampedRecord::new(record, stamp);
+        let mut description = raw_description(true);
+        description.cmaf = stamped.as_ptr();
+        set_description(&receiver, 0, &description);
+        let copied = receiver
+            .track_description(track)
+            .expect("a record at or above its floor copies");
+        let info = copied.init_info().expect("the record is reported");
+        assert_eq!(info.sample_entry(), reported, "stamp {stamp}");
+        assert_eq!(info.codec_kind(), moq5::cmaf::CodecKind::Avc);
+        assert_eq!(
+            info.codec_config().as_ptr(),
+            copied.codec_config().as_ptr(),
+            "stamp {stamp}"
+        );
+        set_description(&receiver, 0, &raw_description(true));
+    }
+
+    let stamped = StampedRecord::new(CMAF_RECORD.0, floor - 1);
+    let mut description = raw_description(true);
+    description.cmaf = stamped.as_ptr();
+    set_description(&receiver, 0, &description);
+    assert_eq!(
+        receiver.track_description(track).err(),
+        Some(Error::ABI_MISMATCH)
+    );
+    set_description(&receiver, 0, &raw_description(true));
 }
 
 #[test]

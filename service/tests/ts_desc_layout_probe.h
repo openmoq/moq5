@@ -10,9 +10,9 @@ typedef struct ts_old_desc {
     moq_bytes_t lang;
     moq_bytes_t label;
     ts_old_track_t info;
-    bool                   has_init;
-    moq_cmaf_init_info_t   init;
+    moq_bytes_t codec_config;
     moq_bytes_t init_data;
+    const moq_cmaf_init_info_t *cmaf;
     bool        has_width;
     uint32_t    width;
     bool        has_height;
@@ -41,7 +41,8 @@ typedef struct ts_old_desc {
     uint64_t                 track_duration_ms;
     bool                     is_live;
 } ts_old_desc_t;
-_Static_assert(offsetof(ts_old_desc_t, has_init) == offsetof(moq_media_track_desc_t, has_init), "embedded info moved has_init");
+_Static_assert(offsetof(ts_old_desc_t, codec_config) == offsetof(moq_media_track_desc_t, codec_config), "embedded info moved codec_config");
+_Static_assert(offsetof(ts_old_desc_t, cmaf) == offsetof(moq_media_track_desc_t, cmaf), "descriptor moved the cmaf record pointer");
 _Static_assert(offsetof(ts_old_desc_t, is_live) == offsetof(moq_media_track_desc_t, is_live), "descriptor prefix moved");
 _Static_assert(MOQ_MEDIA_TRACK_DESC_V0_SIZE == offsetof(ts_old_desc_t, is_live) + sizeof(bool), "descriptor V0 floor moved");
 _Static_assert(offsetof(moq_media_track_desc_t, extensions) >= sizeof(ts_old_desc_t), "extensions overlap original descriptor");
@@ -50,10 +51,11 @@ _Static_assert(offsetof(moq_media_track_desc_t, extensions) >= sizeof(ts_old_des
  * above, not a claim that old short-enum binaries retain their layout. */
 _Static_assert(sizeof(void *) != 8 || sizeof(moq_media_type_t) != 4 ||
                (sizeof(ts_old_track_t) == 20 &&
-                offsetof(moq_media_track_desc_t, has_init) == 108 &&
-                offsetof(moq_media_track_desc_t, is_live) == 480 &&
-                MOQ_MEDIA_TRACK_DESC_V0_SIZE == 481 &&
-                sizeof(ts_old_desc_t) == 488), "original LP64 descriptor ABI");
+                offsetof(moq_media_track_desc_t, codec_config) == 112 &&
+                offsetof(moq_media_track_desc_t, cmaf) == 144 &&
+                offsetof(moq_media_track_desc_t, is_live) == 408 &&
+                MOQ_MEDIA_TRACK_DESC_V0_SIZE == 409 &&
+                sizeof(ts_old_desc_t) == 416), "LP64 descriptor ABI");
 /* Independent pre-TS layouts: do not derive the old sizeof from new tails. */
 typedef struct {
     uint32_t struct_size;

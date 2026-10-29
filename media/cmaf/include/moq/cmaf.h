@@ -10,6 +10,7 @@
  *
  * All string/byte fields in parsed output borrow from the input
  * buffer. The input must remain valid while the output is in use.
+ * Parsing never allocates.
  *
  * Link against moq::cmaf (depends only on moq::core).
  */
@@ -33,6 +34,13 @@ typedef enum moq_cmaf_codec_kind {
 
 /* -- Init segment info ----------------------------------------------- */
 
+/*
+ * The record parsed from a CMAF header (ftyp + moov): its first trak. A sized
+ * output record: fields are appended at the tail, and a reader uses a field
+ * only when the stamped struct_size covers all of it. The same record is the
+ * standalone parser's output and the receiver's handle-owned observation
+ * (moq_media_track_desc_t.cmaf).
+ */
 typedef struct moq_cmaf_init_info {
     uint32_t              struct_size;
     moq_cmaf_codec_kind_t codec_kind;
@@ -57,19 +65,49 @@ typedef struct moq_cmaf_init_info {
     uint8_t               default_is_protected;       /* tenc default_isProtected */
     uint8_t               default_per_sample_iv_size;  /* tenc default_Per_Sample_IV_Size */
     moq_bytes_t           default_kid;  /* tenc default_KID, 16 bytes, BORROWED */
+
+    /* Appended after default_kid. The sample entry's format as its four
+     * bytes read big-endian, (a<<24)|(b<<16)|(c<<8)|d: the entry type of a
+     * clear entry ('avc1', 'avc3', 'hvc1', 'hev1', ...), or the sinf frma
+     * original format of an encrypted one ('encv'/'enca' are never reported).
+     * A value the parser does not recognize, including zero, is reported
+     * exactly as read: whether it was reported is the stamp's coverage, never
+     * the value. */
+    uint32_t              sample_entry;
 } moq_cmaf_init_info_t;
 
-MOQ_API void moq_cmaf_init_info_init(moq_cmaf_init_info_t *info);
+/* Frozen v0 prefix: everything through default_kid. A caller's record must
+ * hold at least this much; fields past it are written only when the
+ * caller's size covers them. */
+#define MOQ_CMAF_INIT_INFO_V0_SIZE \
+    (offsetof(moq_cmaf_init_info_t, default_kid) + sizeof(moq_bytes_t))
 
 /*
- * Parse the first trak from a CMAF init segment.
- *
- * Returns MOQ_OK on success.
- * Returns MOQ_ERR_INVAL if init_segment.data is NULL or out is NULL.
- * Returns MOQ_ERR_PROTO on malformed boxes or missing required data.
+ * Clear and stamp min(info_size, sizeof(current)) bytes. Writes nothing when
+ * info_size cannot hold struct_size. The macro passes the caller's own size.
  */
-MOQ_API moq_result_t moq_cmaf_parse_init(moq_bytes_t init_segment,
-                                          moq_cmaf_init_info_t *out);
+MOQ_API void moq_cmaf_init_info_init_sized(moq_cmaf_init_info_t *info,
+                                           size_t info_size);
+#define moq_cmaf_init_info_init(info) \
+    moq_cmaf_init_info_init_sized((info), sizeof(*(info)))
+
+/*
+ * Parse the first trak from a CMAF init segment into the caller's record of
+ * out_size bytes (sizeof the caller's record).
+ *
+ * On MOQ_OK, min(out_size, sizeof(current)) bytes are written and that count
+ * is stamped in out->struct_size; bytes past it are never touched. Only the
+ * first sample entry of the first trak is read.
+ *
+ * Returns MOQ_ERR_INVAL, writing nothing, if init_segment.data or out is
+ * NULL, or out_size is below MOQ_CMAF_INIT_INFO_V0_SIZE.
+ * Returns MOQ_ERR_PROTO on malformed boxes or missing required data; the
+ * record is then left as moq_cmaf_init_info_init_sized(out, out_size) leaves
+ * it, carrying no partial observation.
+ */
+MOQ_API moq_result_t moq_cmaf_parse_init_sized(moq_bytes_t init_segment,
+                                               moq_cmaf_init_info_t *out,
+                                               size_t out_size);
 
 /* -- Stream Access Point (SAP) type ---------------------------------- */
 
@@ -198,7 +236,7 @@ MOQ_API void moq_cmaf_object_report_init(moq_cmaf_object_report_t *r);
  *     internal cap (512) cannot be fully parsed/validated and is rejected
  *     (MOQ_CMAF_ERR_NO_SAMPLES), not accepted on an incomplete parse;
  *   - when init is non-NULL with a known track_id, the object's track_ID
- *     matches it.
+ *     matches it. Only track_id, inside the v0 prefix, is read from init.
  * The report is filled best-effort in all cases (chunk_count/track_id/SAP).
  *
  * Returns MOQ_OK when the object is valid (out->valid = true).

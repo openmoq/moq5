@@ -265,12 +265,14 @@ struct moq_media_track {
     bool auth_forward;
     bool auth_failed;
     moq_media_track_desc_t desc;
-    moq_rcbuf_t           *init_buf;   /* owned; desc.init/init_data borrow */
+    moq_rcbuf_t           *init_buf;   /* owned; desc.init_data, desc.codec_config
+                                          and the cmaf record's spans borrow */
 
     /* Handle-owned desc backing (so a handle outlives the effective catalog it
      * was built from -- catalogs are replaced on each update). desc string
      * spans point into desc_strings; desc.depends / .content_protection_ref_ids
-     * point into the owned arrays. */
+     * point into the owned arrays. When the track's init data is a CMAF
+     * header, desc_strings begins with the parsed record desc.cmaf points to. */
     uint8_t          *desc_strings;
     size_t            desc_strings_size;
     moq_bytes_t      *desc_depends_arr;
@@ -1690,6 +1692,30 @@ static uint32_t receiver_ts_packet_size(const moq_media_track_desc_t *desc)
     return ts ? ts->packet_size : 0;
 }
 
+/* A catalog track's init data as a handle build resolves it: inline initData
+ * wins, else its initRef in src's initDataList. Empty when it has neither. */
+static moq_bytes_t receiver_resolved_init(const moq_msf_track_t *mt,
+                                          const moq_msf_catalog_t *src)
+{
+    if (mt->has_init_data && mt->init_data.len > 0) return mt->init_data;
+    if (mt->has_init_ref && src) {
+        const moq_msf_init_data_entry_t *e =
+            moq_msf_catalog_find_init_data(src, mt->init_ref);
+        if (e) return e->data;
+    }
+    return (moq_bytes_t){ NULL, 0 };
+}
+
+/* Whether a handle built from `mt` holds a parsed CMAF header record: a
+ * "cmaf" track with init data to parse. Every other packaging keeps a NULL
+ * desc.cmaf and pays nothing for it. */
+static bool receiver_track_holds_cmaf(const moq_msf_track_t *mt,
+                                      const moq_msf_catalog_t *src)
+{
+    return span_eq_lit(mt->packaging, "cmaf", 4) &&
+           receiver_resolved_init(mt, src).len > 0;
+}
+
 static bool receiver_parse_probe(const moq_media_receiver_t *r,
                                  const moq_media_track_desc_t *desc)
 {
@@ -1720,8 +1746,14 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
     moq_media_track_desc_t *d = &t->desc;
     d->struct_size = (uint32_t)sizeof(*d);
 
-    /* One owned buffer for all string spans + the depends/cp-ref bytes + the
-     * tuple-key namespace. */
+    /* One owned buffer for the parsed CMAF header record (first, when the
+     * track has one) then all string spans + the depends/cp-ref bytes + the
+     * tuple-key namespace. The record sits at the start of the allocation, so
+     * the allocator's alignment for any object -- which every typed block in
+     * this file relies on -- is the record's alignment; the strings after it
+     * are bytes. */
+    bool holds_cmaf = receiver_track_holds_cmaf(mt, src);
+    size_t strings_at = holds_cmaf ? sizeof(moq_cmaf_init_info_t) : 0;
     size_t need = mt->name.len + mt->packaging.len;
     if (mt->has_namespace) need += mt->namespace_.len;
     if (mt->has_role) need += mt->role.len;
@@ -1733,6 +1765,8 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
     if (mt->has_mime_type) need += mt->mime_type.len;
     for (size_t i = 0; i < mt->depends_count; i++) need += mt->depends[i].len;
     for (size_t i = 0; i < mt->cp_ref_id_count; i++) need += mt->cp_ref_ids[i].len;
+    if (need > SIZE_MAX - strings_at) { receiver_track_free(r, t); return NULL; }
+    need += strings_at;
 
     if (need > 0) {
         t->desc_strings = (uint8_t *)r->alloc.alloc(need, r->alloc.ctx);
@@ -1761,7 +1795,7 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
         }
     }
 
-    size_t off = 0;
+    size_t off = strings_at;
 #define COPY_DESC_SPAN(dst, src_span) do { \
         if ((src_span).len) { \
             memcpy(t->desc_strings + off, (src_span).data, (src_span).len); \
@@ -1818,17 +1852,13 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
         mt->has_mime_type && span_eq_lit(d->mime_type, "application/json", 16);
 
     moq_media_track_info_init(&d->info);
-    moq_cmaf_init_info_init(&d->init);
 
     /* Resolve init: inline initData wins, else follow initRef into src's
-     * initDataList. The decoded bytes are owned via init_buf, so init/init_data
-     * stay valid after src is freed. */
+     * initDataList. The decoded bytes are owned via init_buf, so the spans
+     * that borrow them stay valid after src is freed. */
     moq_msf_track_t rt = *mt;
-    if (!(rt.has_init_data && rt.init_data.len > 0) && rt.has_init_ref) {
-        const moq_msf_init_data_entry_t *e =
-            moq_msf_catalog_find_init_data(src, rt.init_ref);
-        if (e && e->data.len > 0) { rt.has_init_data = true; rt.init_data = e->data; }
-    }
+    moq_bytes_t resolved = receiver_resolved_init(mt, src);
+    if (resolved.len > 0) { rt.has_init_data = true; rt.init_data = resolved; }
     /* The SIZED companion, not the legacy entry plus a hand-widened
      * struct_size: this descriptor is a current-size struct we own, and the
      * negotiated draft is the authority for the object-property codec. The
@@ -1837,23 +1867,33 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
      * session's real draft or is not built at all. */
     moq_result_t irc;
     if (rt.has_init_data && rt.init_data.len > 0) {
+        moq_cmaf_init_info_t parsed;
         irc = moq_msf_track_to_media_info_sized(
             &r->alloc, &rt, &d->info, sizeof(d->info), r->transport_version,
-            &d->init, &t->init_buf);
+            &parsed, sizeof(parsed), &t->init_buf);
         if (irc == MOQ_OK && t->init_buf) {
-            d->has_init = true;
             d->init_data = (moq_bytes_t){ moq_rcbuf_data(t->init_buf),
                                           moq_rcbuf_len(t->init_buf) };
+            /* The mapping reports decoder extradata in codec_config for every
+             * packaging; only a CMAF header is a parsed record. */
+            d->codec_config = parsed.codec_config;
+            if (holds_cmaf && d->info.packaging == MOQ_MEDIA_PACKAGING_CMAF) {
+                moq_cmaf_init_info_t *rec =
+                    (moq_cmaf_init_info_t *)(void *)t->desc_strings;
+                memcpy(rec, &parsed, sizeof(*rec));
+                d->cmaf = rec;
+            }
         }
     } else {
         irc = moq_msf_track_to_media_info_sized(
             &r->alloc, &rt, &d->info, sizeof(d->info), r->transport_version,
-            NULL, NULL);
+            NULL, 0, NULL);
     }
     if (irc != MOQ_OK) {
         moq_media_track_info_init(&d->info);
-        moq_cmaf_init_info_init(&d->init);
-        d->has_init = false;
+        d->codec_config = (moq_bytes_t){ NULL, 0 };
+        d->init_data = (moq_bytes_t){ NULL, 0 };
+        d->cmaf = NULL;
     }
 
     /* The delivery path. A namespace-override track has none (see
@@ -2087,13 +2127,10 @@ static uint64_t est_track_retained_bytes(const moq_msf_track_t *mt,
     /* The handle-owned extension block (records, SI PIDs, names). */
     b = sat_add(b, (uint64_t)ext_copy_size(mt));
     /* Init: inline wins; else resolve initRef against src (mirrors build). */
-    if (mt->has_init_data && mt->init_data.len > 0) {
-        b = sat_add(b, mt->init_data.len);
-    } else if (mt->has_init_ref && src) {
-        const moq_msf_init_data_entry_t *e =
-            moq_msf_catalog_find_init_data(src, mt->init_ref);
-        if (e) b = sat_add(b, e->data.len);
-    }
+    b = sat_add(b, receiver_resolved_init(mt, src).len);
+    /* The parsed header record, which shares desc_strings. */
+    if (receiver_track_holds_cmaf(mt, src))
+        b = sat_add(b, sizeof(moq_cmaf_init_info_t));
     return b;
 }
 

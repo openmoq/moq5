@@ -106,7 +106,7 @@ fn rust_side() -> BTreeMap<String, Entry> {
         moq_cmaf_init_info_t {
             struct_size, codec_kind, timescale, width, height, samplerate, channel_count,
             codec_config, track_id, has_cenc, scheme, default_is_protected,
-            default_per_sample_iv_size, default_kid,
+            default_per_sample_iv_size, default_kid, sample_entry,
         }
         moq_cmaf_sample_t { duration, size, flags, composition_offset }
         moq_msf_media_template_t {
@@ -114,7 +114,7 @@ fn rust_side() -> BTreeMap<String, Entry> {
             start_wallclock_ms, delta_wallclock_ms,
         }
         moq_media_track_desc_t {
-            struct_size, name, role, codec, lang, label, info, has_init, init, init_data,
+            struct_size, name, role, codec, lang, label, info, codec_config, init_data, cmaf,
             has_width, width, has_height, height, has_samplerate, samplerate, channel_config,
             has_framerate, framerate_millis, has_bitrate, bitrate, has_max_grp_sap, max_grp_sap,
             has_max_obj_sap, max_obj_sap, content_protection_ref_ids,

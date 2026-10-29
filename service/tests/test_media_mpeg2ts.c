@@ -161,7 +161,8 @@ static void test_eligibility(void)
     MOQ_TEST_CHECK(d->has_alt_group && d->alt_group == 3);
     MOQ_TEST_CHECK(d->init_data.len == psi_len &&
                    memcmp(d->init_data.data, psi, psi_len) == 0);
-    MOQ_TEST_CHECK_EQ_U64(d->init.codec_config.len, 0);
+    MOQ_TEST_CHECK_EQ_U64(d->codec_config.len, 0);
+    MOQ_TEST_CHECK(d->cmaf == NULL);
     const moq_msf_mpeg2ts_t *m =
         moq_msf_ext_mpeg2ts(d->extensions, d->extension_count);
     MOQ_TEST_CHECK(m != NULL);

@@ -587,13 +587,136 @@ static size_t build_avc_init_tkhd(uint8_t *buf, uint32_t timescale,
     return p;
 }
 
+/* A fourcc as moq_cmaf_init_info_t.sample_entry reports it. */
+static uint32_t fourcc(const char t[4])
+{
+    return ((uint32_t)(uint8_t)t[0] << 24) | ((uint32_t)(uint8_t)t[1] << 16) |
+           ((uint32_t)(uint8_t)t[2] << 8) | (uint32_t)(uint8_t)t[3];
+}
+
+/* The body of an esds box carrying an AudioSpecificConfig (as in
+ * build_aac_init). Returns its length. */
+static size_t esds_body(uint8_t *p, const uint8_t *asc, size_t asc_len)
+{
+    size_t dec_spec_len = 2 + asc_len;
+    size_t dec_cfg_len = 2 + 13 + dec_spec_len;
+    size_t es_desc_len = 2 + 3 + dec_cfg_len;
+    size_t n = 0;
+    wr32(p + n, 0); n += 4;
+    p[n++] = 0x03; p[n++] = (uint8_t)(es_desc_len - 2);
+    wr16(p + n, 0); n += 2;
+    p[n++] = 0;
+    p[n++] = 0x04; p[n++] = (uint8_t)(dec_cfg_len - 2);
+    p[n++] = 0x40; p[n++] = 0x15;
+    p[n++] = 0; p[n++] = 0; p[n++] = 0;
+    wr32(p + n, 0); n += 4;
+    wr32(p + n, 0); n += 4;
+    p[n++] = 0x05; p[n++] = (uint8_t)asc_len;
+    memcpy(p + n, asc, asc_len); n += asc_len;
+    return n;
+}
+
+/* How build_entry_init lays out an encrypted entry's original format. */
+enum { FRMA_PRESENT, FRMA_OMITTED, FRMA_SHORT };
+
+/*
+ * ftyp + moov(trak(tkhd mdia(mdhd minf(stbl(stsd(<entry>)))))) with one
+ * sample entry of type `entry`: a VisualSampleEntry (78-byte fixed part,
+ * 1280x720), an AudioSampleEntry (28-byte fixed part, 2 ch, 48 kHz) or, for
+ * neither, a 16-byte opaque body. A config box `cfg_type` with `cfg` follows
+ * the fixed part. An encrypted entry also carries sinf(frma schm schi(tenc))
+ * whose frma names `original`; frma_mode omits it or writes a 2-byte body.
+ * Returns bytes written.
+ */
+static size_t build_entry_init(uint8_t *buf, size_t cap, uint32_t entry,
+                               int kind /* 1 visual, 2 audio, 0 other */,
+                               const char *cfg_type,
+                               const uint8_t *cfg, size_t cfg_len,
+                               bool encrypted, uint32_t original, int frma_mode)
+{
+    size_t fixed = kind == 1 ? 78 : kind == 2 ? 28 : 16;
+    size_t cfg_box = cfg_type ? 8 + cfg_len : 0;
+    size_t frma_box = !encrypted || frma_mode == FRMA_OMITTED ? 0
+                    : frma_mode == FRMA_SHORT ? 10 : 12;
+    size_t schm_box = encrypted ? 20 : 0;
+    size_t tenc_box = encrypted ? 32 : 0;
+    size_t schi_box = encrypted ? 8 + tenc_box : 0;
+    size_t sinf_box = encrypted ? 8 + frma_box + schm_box + schi_box : 0;
+    size_t entry_box = 8 + fixed + cfg_box + sinf_box;
+    size_t stsd_box = 8 + 8 + entry_box;
+    size_t stbl_box = 8 + stsd_box;
+    size_t minf_box = 8 + stbl_box;
+    size_t mdhd_box = 8 + 4 + 12;
+    size_t mdia_box = 8 + mdhd_box + minf_box;
+    size_t tkhd_box = 8 + 4 + 12;
+    size_t trak_box = 8 + tkhd_box + mdia_box;
+    size_t moov_box = 8 + trak_box;
+    if (20 + moov_box > cap) return 0;
+
+    size_t p = 0;
+    p += box_hdr(buf + p, 20, "ftyp");
+    memcpy(buf + p, "isom", 4); p += 4;
+    wr32(buf + p, 0); p += 4;
+    memcpy(buf + p, "isom", 4); p += 4;
+    p += box_hdr(buf + p, (uint32_t)moov_box, "moov");
+    p += box_hdr(buf + p, (uint32_t)trak_box, "trak");
+    p += box_hdr(buf + p, (uint32_t)tkhd_box, "tkhd");
+    wr32(buf + p, 0); p += 4;                 /* version + flags */
+    wr32(buf + p, 0); p += 4;                 /* creation_time */
+    wr32(buf + p, 0); p += 4;                 /* modification_time */
+    wr32(buf + p, 7); p += 4;                 /* track_ID */
+    p += box_hdr(buf + p, (uint32_t)mdia_box, "mdia");
+    p += box_hdr(buf + p, (uint32_t)mdhd_box, "mdhd");
+    wr32(buf + p, 0); p += 4;
+    wr32(buf + p, 0); p += 4;
+    wr32(buf + p, 0); p += 4;
+    wr32(buf + p, 90000); p += 4;             /* timescale */
+    p += box_hdr(buf + p, (uint32_t)minf_box, "minf");
+    p += box_hdr(buf + p, (uint32_t)stbl_box, "stbl");
+    p += box_hdr(buf + p, (uint32_t)stsd_box, "stsd");
+    wr32(buf + p, 0); p += 4;
+    wr32(buf + p, 1); p += 4;                 /* entry_count */
+    wr32(buf + p, (uint32_t)entry_box);
+    wr32(buf + p + 4, entry); p += 8;
+    memset(buf + p, 0, fixed);
+    if (kind == 1) { wr16(buf + p + 24, 1280); wr16(buf + p + 26, 720); }
+    if (kind == 2) { wr16(buf + p + 16, 2); wr16(buf + p + 24, 48000); }
+    p += fixed;
+    if (cfg_type) {
+        p += box_hdr(buf + p, (uint32_t)cfg_box, cfg_type);
+        memcpy(buf + p, cfg, cfg_len); p += cfg_len;
+    }
+    if (encrypted) {
+        p += box_hdr(buf + p, (uint32_t)sinf_box, "sinf");
+        if (frma_box == 12) {
+            p += box_hdr(buf + p, 12, "frma");
+            wr32(buf + p, original); p += 4;
+        } else if (frma_box == 10) {
+            p += box_hdr(buf + p, 10, "frma");
+            buf[p++] = 0x61; buf[p++] = 0x76;
+        }
+        p += box_hdr(buf + p, (uint32_t)schm_box, "schm");
+        wr32(buf + p, 0); p += 4;
+        memcpy(buf + p, "cbcs", 4); p += 4;
+        wr32(buf + p, 0x00010000); p += 4;
+        p += box_hdr(buf + p, (uint32_t)schi_box, "schi");
+        p += box_hdr(buf + p, (uint32_t)tenc_box, "tenc");
+        memset(buf + p, 0, 24);
+        buf[p + 6] = 1;                       /* default_isProtected */
+        buf[p + 7] = 0;                       /* constant IV */
+        for (int i = 0; i < 16; i++) buf[p + 8 + i] = (uint8_t)(0x30 + i);
+        p += 24;
+    }
+    return p;
+}
+
 /* ================================================================== */
 
 int main(void)
 {
     /* -- 1. init functions null-safe ---------------------------------- */
     {
-        moq_cmaf_init_info_init(NULL);
+        moq_cmaf_init_info_init_sized(NULL, sizeof(moq_cmaf_init_info_t));
         moq_cmaf_fragment_info_init(NULL, NULL, 0);
     }
 
@@ -606,8 +729,8 @@ int main(void)
 
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        moq_result_t rc = moq_cmaf_parse_init(
-            (moq_bytes_t){ buf, len }, &info);
+        moq_result_t rc = moq_cmaf_parse_init_sized(
+            (moq_bytes_t){ buf, len }, &info, sizeof(info));
         CHECK(rc == MOQ_OK);
         CHECK(info.codec_kind == MOQ_CMAF_CODEC_AVC);
         CHECK(info.timescale == 90000);
@@ -629,8 +752,8 @@ int main(void)
 
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        moq_result_t rc = moq_cmaf_parse_init(
-            (moq_bytes_t){ buf, len }, &info);
+        moq_result_t rc = moq_cmaf_parse_init_sized(
+            (moq_bytes_t){ buf, len }, &info, sizeof(info));
         CHECK(rc == MOQ_OK);
         CHECK(info.codec_kind == MOQ_CMAF_CODEC_AAC);
         CHECK(info.timescale == 48000);
@@ -645,10 +768,10 @@ int main(void)
         static const uint8_t asc[] = { 0x11, 0x90, 0x56, 0xe5, 0x00 };
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        moq_result_t rc = moq_cmaf_parse_init(
+        moq_result_t rc = moq_cmaf_parse_init_sized(
             (moq_bytes_t){ k_ffmpeg_aac_stereo_init,
                            sizeof(k_ffmpeg_aac_stereo_init) },
-            &info);
+            &info, sizeof(info));
         CHECK(rc == MOQ_OK);
         CHECK(info.codec_kind == MOQ_CMAF_CODEC_AAC);
         CHECK(info.timescale == 48000);
@@ -801,8 +924,8 @@ int main(void)
 
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init(
-            (moq_bytes_t){ buf2, unk + len }, &info) == MOQ_OK);
+        CHECK(moq_cmaf_parse_init_sized(
+            (moq_bytes_t){ buf2, unk + len }, &info, sizeof(info)) == MOQ_OK);
         CHECK(info.timescale == 30000);
     }
 
@@ -811,8 +934,8 @@ int main(void)
         uint8_t buf[] = { 0x00, 0x00, 0x00, 0x04, 'm', 'o', 'o', 'v' };
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init(
-            (moq_bytes_t){ buf, sizeof(buf) }, &info) == MOQ_ERR_PROTO);
+        CHECK(moq_cmaf_parse_init_sized(
+            (moq_bytes_t){ buf, sizeof(buf) }, &info, sizeof(info)) == MOQ_ERR_PROTO);
     }
 
     /* -- 11. box size > remaining -> PROTO --------------------------- */
@@ -820,8 +943,8 @@ int main(void)
         uint8_t buf[] = { 0x00, 0x00, 0x01, 0x00, 'm', 'o', 'o', 'v' };
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init(
-            (moq_bytes_t){ buf, sizeof(buf) }, &info) == MOQ_ERR_PROTO);
+        CHECK(moq_cmaf_parse_init_sized(
+            (moq_bytes_t){ buf, sizeof(buf) }, &info, sizeof(info)) == MOQ_ERR_PROTO);
     }
 
     /* -- 12. truncated mdhd -> PROTO --------------------------------- */
@@ -836,8 +959,8 @@ int main(void)
 
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init(
-            (moq_bytes_t){ buf, p }, &info) == MOQ_ERR_PROTO);
+        CHECK(moq_cmaf_parse_init_sized(
+            (moq_bytes_t){ buf, p }, &info, sizeof(info)) == MOQ_ERR_PROTO);
     }
 
     /* -- 13. truncated trun -> PROTO --------------------------------- */
@@ -880,9 +1003,9 @@ int main(void)
     {
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init((moq_bytes_t){ NULL, 0 }, &info)
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ NULL, 0 }, &info, sizeof(info))
             == MOQ_ERR_INVAL);
-        CHECK(moq_cmaf_parse_init((moq_bytes_t){ (uint8_t*)"x", 1 }, NULL)
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ (uint8_t*)"x", 1 }, NULL, sizeof(moq_cmaf_init_info_t))
             == MOQ_ERR_INVAL);
 
         moq_cmaf_sample_t out[4];
@@ -1015,8 +1138,8 @@ int main(void)
 
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init(
-            (moq_bytes_t){ buf, p }, &info) == MOQ_ERR_PROTO);
+        CHECK(moq_cmaf_parse_init_sized(
+            (moq_bytes_t){ buf, p }, &info, sizeof(info)) == MOQ_ERR_PROTO);
     }
 
     /* -- 20. malformed box inside moof -> PROTO ----------------------- */
@@ -1109,7 +1232,7 @@ int main(void)
         size_t len = build_avc_init_tkhd(buf, 90000, 7, avcc, sizeof(avcc));
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init((moq_bytes_t){ buf, len }, &info) == MOQ_OK);
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info)) == MOQ_OK);
         CHECK(info.track_id == 7);
         CHECK(info.timescale == 90000);
         CHECK(info.codec_kind == MOQ_CMAF_CODEC_AVC);
@@ -1428,7 +1551,7 @@ int main(void)
             "cenc", 1, 8, kid, 0, MOQ_TEST_CENC_OK);
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init((moq_bytes_t){ buf, len }, &info) == MOQ_OK);
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info)) == MOQ_OK);
         /* Original codec recovered via frma -> first-class protected track. */
         CHECK(info.codec_kind == MOQ_CMAF_CODEC_AVC);
         CHECK(info.timescale == 90000);
@@ -1474,7 +1597,7 @@ int main(void)
         if (tenc_body != 0) buf[tenc_body + 5] = 0x19;
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init((moq_bytes_t){ buf, len }, &info) == MOQ_OK);
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info)) == MOQ_OK);
         CHECK(info.has_cenc == true);
         CHECK(memcmp(info.scheme.data, "cbcs", 4) == 0);
         CHECK(info.default_is_protected == 1);
@@ -1503,7 +1626,7 @@ int main(void)
                 "cenc", 1, 8, kid, 0, bad[i]);
             moq_cmaf_init_info_t info;
             moq_cmaf_init_info_init(&info);
-            CHECK(moq_cmaf_parse_init((moq_bytes_t){ buf, len }, &info)
+            CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info))
                   == MOQ_ERR_PROTO);
         }
     }
@@ -1516,7 +1639,7 @@ int main(void)
                                     avcc, sizeof(avcc));
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init((moq_bytes_t){ buf, len }, &info) == MOQ_OK);
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info)) == MOQ_OK);
         CHECK(info.codec_kind == MOQ_CMAF_CODEC_AVC);
         CHECK(info.has_cenc == false);
         CHECK(info.scheme.len == 0);
@@ -1538,7 +1661,7 @@ int main(void)
             avcc, sizeof(avcc), "cenc", 1, 8, kid, 0,
             MOQ_TEST_CENC_SHORT_SCHM);
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init((moq_bytes_t){ buf, len }, &info)
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info))
               == MOQ_ERR_PROTO);
 
         /* (b) trailing tenc (body 28 > 24) -> OK, same fields extracted. */
@@ -1546,7 +1669,7 @@ int main(void)
             avcc, sizeof(avcc), "cenc", 1, 8, kid, 0,
             MOQ_TEST_CENC_TRAILING_TENC);
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init((moq_bytes_t){ buf, len }, &info) == MOQ_OK);
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info)) == MOQ_OK);
         CHECK(info.has_cenc == true);
         CHECK(info.default_is_protected == 1);
         CHECK(info.default_per_sample_iv_size == 8);
@@ -1559,7 +1682,7 @@ int main(void)
             avcc, sizeof(avcc), "cenc", 1, 8, kid, 0,
             MOQ_TEST_CENC_FRMA_UNKNOWN);
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init((moq_bytes_t){ buf, len }, &info) == MOQ_OK);
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info)) == MOQ_OK);
         CHECK(info.has_cenc == true);
         CHECK(info.codec_kind == MOQ_CMAF_CODEC_UNKNOWN);
         CHECK(info.codec_config.len == 0);
@@ -1569,7 +1692,7 @@ int main(void)
             avcc, sizeof(avcc), "cenc", 1, 8, kid, 0,
             MOQ_TEST_CENC_OMIT_AVCC);
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init((moq_bytes_t){ buf, len }, &info)
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info))
               == MOQ_ERR_PROTO);
     }
 
@@ -1788,6 +1911,204 @@ int main(void)
         CHECK(rep.valid == true);
         CHECK(rep.starts_with_sync == true);  /* fsf drives it */
         CHECK(rep.sap_type == MOQ_SAP_UNKNOWN);
+    }
+
+    /* ============ sample entry and the sized record ================ */
+
+    const size_t entry_end = offsetof(moq_cmaf_init_info_t, sample_entry) +
+                             sizeof(uint32_t);
+    const uint8_t avcc[] = { 0x01, 0x64, 0x00, 0x1f, 0xff };
+    const uint8_t hvcc[] = { 0x01, 0x01, 0x60, 0x00, 0x00 };
+    const uint8_t asc[] = { 0x11, 0x90 };
+    uint8_t esds[64];
+    const size_t esds_len = esds_body(esds, asc, sizeof(asc));
+
+    /* -- 1. clear entries report their own type, codec config unchanged */
+    {
+        static const struct {
+            const char *entry, *cfg_type;
+            int kind;
+            moq_cmaf_codec_kind_t codec;
+        } rows[] = {
+            { "avc1", "avcC", 1, MOQ_CMAF_CODEC_AVC },
+            { "avc3", "avcC", 1, MOQ_CMAF_CODEC_AVC },
+            { "hvc1", "hvcC", 1, MOQ_CMAF_CODEC_HEVC },
+            { "hev1", "hvcC", 1, MOQ_CMAF_CODEC_HEVC },
+            { "mp4a", "esds", 2, MOQ_CMAF_CODEC_AAC },
+        };
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+            bool audio = rows[i].kind == 2;
+            const uint8_t *cfg = audio ? esds :
+                rows[i].codec == MOQ_CMAF_CODEC_HEVC ? hvcc : avcc;
+            size_t cfg_len = audio ? esds_len : sizeof(avcc);
+            uint8_t buf[512];
+            size_t len = build_entry_init(buf, sizeof(buf), fourcc(rows[i].entry),
+                rows[i].kind, rows[i].cfg_type, cfg, cfg_len, false, 0,
+                FRMA_PRESENT);
+            moq_cmaf_init_info_t info;
+            CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info)) == MOQ_OK);
+            CHECK(info.struct_size == sizeof(info));
+            CHECK(info.sample_entry == fourcc(rows[i].entry));
+            CHECK(info.codec_kind == rows[i].codec);
+            CHECK(info.track_id == 7 && info.timescale == 90000);
+            CHECK(!info.has_cenc);
+            if (audio) {
+                CHECK(info.codec_config.len == sizeof(asc) &&
+                      memcmp(info.codec_config.data, asc, sizeof(asc)) == 0);
+                CHECK(info.samplerate == 48000 && info.channel_count == 2);
+            } else {
+                CHECK(info.codec_config.len == cfg_len &&
+                      memcmp(info.codec_config.data, cfg, cfg_len) == 0);
+                CHECK(info.width == 1280 && info.height == 720);
+            }
+        }
+    }
+
+    /* -- 2. an encrypted entry reports its frma original format ------- */
+    {
+        static const struct {
+            const char *entry, *original, *cfg_type;
+            int kind;
+            moq_cmaf_codec_kind_t codec;
+        } rows[] = {
+            { "encv", "avc3", "avcC", 1, MOQ_CMAF_CODEC_AVC },
+            { "encv", "hev1", "hvcC", 1, MOQ_CMAF_CODEC_HEVC },
+            { "enca", "mp4a", "esds", 2, MOQ_CMAF_CODEC_AAC },
+            { "encv", "zzzz", "avcC", 1, MOQ_CMAF_CODEC_UNKNOWN },
+        };
+        for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+            bool audio = rows[i].kind == 2;
+            const uint8_t *cfg = audio ? esds :
+                rows[i].codec == MOQ_CMAF_CODEC_HEVC ? hvcc : avcc;
+            size_t cfg_len = audio ? esds_len : sizeof(avcc);
+            uint8_t buf[512];
+            size_t len = build_entry_init(buf, sizeof(buf), fourcc(rows[i].entry),
+                rows[i].kind, rows[i].cfg_type, cfg, cfg_len, true,
+                fourcc(rows[i].original), FRMA_PRESENT);
+            moq_cmaf_init_info_t info;
+            CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info)) == MOQ_OK);
+            CHECK(info.sample_entry == fourcc(rows[i].original));
+            CHECK(info.sample_entry != fourcc(rows[i].entry));
+            CHECK(info.codec_kind == rows[i].codec);
+            CHECK(info.has_cenc && info.scheme.len == 4 &&
+                  memcmp(info.scheme.data, "cbcs", 4) == 0);
+            CHECK(info.default_is_protected == 1 && info.default_kid.len == 16);
+        }
+        /* The shared CENC builder's encv carries frma 'avc1'. */
+        const uint8_t kid[16] = { 0 };
+        uint8_t buf[1024];
+        size_t len = moq_test_build_cmaf_init_cenc(buf, 1, 90000, 64, 64,
+            avcc, sizeof(avcc), "cenc", 1, 8, kid, 0, MOQ_TEST_CENC_OK);
+        moq_cmaf_init_info_t info;
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info)) == MOQ_OK);
+        CHECK(info.sample_entry == fourcc("avc1"));
+    }
+
+    /* -- 3. unknown and zero entries are reported exactly as read ----- */
+    {
+        static const uint32_t entries[] = { 0x7a7a7a7au /* zzzz */, 0u,
+                                            0xffffffffu, 0x76703039u /* vp09 */ };
+        for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+            uint8_t buf[512];
+            size_t len = build_entry_init(buf, sizeof(buf), entries[i], 0,
+                NULL, NULL, 0, false, 0, FRMA_PRESENT);
+            moq_cmaf_init_info_t info;
+            memset(&info, 0xEE, sizeof(info));
+            CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &info, sizeof(info)) == MOQ_OK);
+            CHECK(info.struct_size >= entry_end);   /* reported, even zero */
+            CHECK(info.sample_entry == entries[i]);
+            CHECK(info.codec_kind == MOQ_CMAF_CODEC_UNKNOWN);
+            CHECK(info.codec_config.len == 0 && !info.has_cenc);
+        }
+    }
+
+    /* -- 4. a missing or short frma fails, leaving no partial record -- */
+    {
+        for (int mode = FRMA_OMITTED; mode <= FRMA_SHORT; mode++) {
+            uint8_t buf[512];
+            size_t len = build_entry_init(buf, sizeof(buf), fourcc("encv"), 1,
+                "avcC", avcc, sizeof(avcc), true, fourcc("avc3"), mode);
+            union {
+                moq_cmaf_init_info_t rec;
+                unsigned char raw[sizeof(moq_cmaf_init_info_t) + 16];
+            } out;
+            memset(out.raw, 0xEE, sizeof(out.raw));
+            CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &out.rec,
+                      sizeof(out.rec)) == MOQ_ERR_PROTO);
+            /* track_id, timescale and the dimensions were read before the
+             * failure; none of them survives it. */
+            CHECK(out.rec.struct_size == sizeof(out.rec));
+            for (size_t b = sizeof(out.rec.struct_size); b < sizeof(out.rec); b++)
+                CHECK(out.raw[b] == 0);
+            for (size_t b = sizeof(out.rec); b < sizeof(out.raw); b++)
+                CHECK(out.raw[b] == 0xEE);
+        }
+    }
+
+    /* -- 5. sized parse: short, exact floor, partial tail, current and
+     *        oversized records ------------------------------------------ */
+    {
+        uint8_t buf[512];
+        size_t len = build_entry_init(buf, sizeof(buf), fourcc("avc3"), 1,
+            "avcC", avcc, sizeof(avcc), false, 0, FRMA_PRESENT);
+        const size_t full = sizeof(moq_cmaf_init_info_t);
+        const size_t sizes[] = { 0, MOQ_CMAF_INIT_INFO_V0_SIZE - 1,
+                                 MOQ_CMAF_INIT_INFO_V0_SIZE, entry_end - 1,
+                                 entry_end, full, full + 16 };
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+            union {
+                moq_cmaf_init_info_t rec;
+                unsigned char raw[sizeof(moq_cmaf_init_info_t) + 32];
+            } out;
+            memset(out.raw, 0xEE, sizeof(out.raw));
+            moq_result_t rc = moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len },
+                                                        &out.rec, sizes[k]);
+            size_t written = sizes[k] < full ? sizes[k] : full;
+            if (sizes[k] < MOQ_CMAF_INIT_INFO_V0_SIZE) {
+                CHECK(rc == MOQ_ERR_INVAL);
+                written = 0;
+            } else {
+                CHECK(rc == MOQ_OK);
+                CHECK(out.rec.struct_size == written);
+                CHECK(out.rec.codec_kind == MOQ_CMAF_CODEC_AVC &&
+                      out.rec.track_id == 7 && out.rec.width == 1280);
+                if (written >= entry_end)
+                    CHECK(out.rec.sample_entry == fourcc("avc3"));
+            }
+            for (size_t b = written; b < sizeof(out.raw); b++)
+                CHECK(out.raw[b] == 0xEE);
+        }
+        /* Arguments are refused before anything is written. */
+        moq_cmaf_init_info_t info;
+        memset(&info, 0xEE, sizeof(info));
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ NULL, len }, &info,
+                                        sizeof(info)) == MOQ_ERR_INVAL);
+        CHECK(info.struct_size == 0xEEEEEEEEu);
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, NULL,
+                                        sizeof(info)) == MOQ_ERR_INVAL);
+    }
+
+    /* -- 6. sized initializer: never past the caller's size ----------- */
+    {
+        const size_t full = sizeof(moq_cmaf_init_info_t);
+        const size_t sizes[] = { 0, sizeof(uint32_t) - 1, sizeof(uint32_t),
+                                 MOQ_CMAF_INIT_INFO_V0_SIZE, full, full + 16 };
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+            union {
+                moq_cmaf_init_info_t rec;
+                unsigned char raw[sizeof(moq_cmaf_init_info_t) + 32];
+            } out;
+            memset(out.raw, 0xEE, sizeof(out.raw));
+            moq_cmaf_init_info_init_sized(&out.rec, sizes[k]);
+            size_t written = sizes[k] < sizeof(uint32_t) ? 0 :
+                             sizes[k] < full ? sizes[k] : full;
+            if (written)
+                CHECK(out.rec.struct_size == written);
+            for (size_t b = sizeof(uint32_t); b < written; b++)
+                CHECK(out.raw[b] == 0);
+            for (size_t b = written; b < sizeof(out.raw); b++)
+                CHECK(out.raw[b] == 0xEE);
+        }
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

@@ -3638,7 +3638,7 @@ int main(void)
     }
 
     /* -- Oversized MALFORMED CMAF init: cap fires BEFORE the parser ---- */
-    /* The size cap must reject before moq_cmaf_parse_init() runs, so an
+    /* The size cap must reject before moq_cmaf_parse_init_sized() runs, so an
      * oversized buffer is INVAL (cap) — not PROTO (parser verdict on the bytes). */
     {
         moq_playback_cfg_t cfg;

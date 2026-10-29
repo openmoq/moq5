@@ -123,6 +123,74 @@ static size_t build_aac_init(uint8_t *buf, uint32_t timescale,
     return p;
 }
 
+/* ftyp + moov(trak(tkhd mdia(mdhd minf(stbl(stsd(<entry>)))))) with one
+ * sample entry of type `entry` and a zeroed `fixed`-byte body, an optional
+ * avcC box and, when `original` is nonzero, sinf(frma schm schi(tenc))
+ * whose frma names it. Returns bytes written. */
+static size_t build_entry_init(uint8_t *buf, uint32_t entry, size_t fixed,
+                               const uint8_t *avcc, size_t avcc_len,
+                               uint32_t original)
+{
+    size_t cfg_box = avcc ? 8 + avcc_len : 0;
+    size_t sinf_box = original ? 8 + 12 + 20 + 8 + 32 : 0;
+    size_t entry_box = 8 + fixed + cfg_box + sinf_box;
+    size_t stsd_box = 8 + 8 + entry_box;
+    size_t stbl_box = 8 + stsd_box;
+    size_t minf_box = 8 + stbl_box;
+    size_t mdhd_box = 8 + 4 + 12;
+    size_t mdia_box = 8 + mdhd_box + minf_box;
+    size_t tkhd_box = 8 + 4 + 12;
+    size_t trak_box = 8 + tkhd_box + mdia_box;
+    size_t moov_box = 8 + trak_box;
+
+    size_t p = 0;
+    p += box_hdr(buf + p, 20, "ftyp");
+    std::memcpy(buf + p, "isom", 4); p += 4;
+    wr32(buf + p, 0); p += 4;
+    std::memcpy(buf + p, "isom", 4); p += 4;
+    p += box_hdr(buf + p, (uint32_t)moov_box, "moov");
+    p += box_hdr(buf + p, (uint32_t)trak_box, "trak");
+    p += box_hdr(buf + p, (uint32_t)tkhd_box, "tkhd");
+    wr32(buf + p, 0); p += 4;
+    wr32(buf + p, 0); p += 4;
+    wr32(buf + p, 0); p += 4;
+    wr32(buf + p, 7); p += 4;                 /* track_ID */
+    p += box_hdr(buf + p, (uint32_t)mdia_box, "mdia");
+    p += box_hdr(buf + p, (uint32_t)mdhd_box, "mdhd");
+    wr32(buf + p, 0); p += 4;
+    wr32(buf + p, 0); p += 4;
+    wr32(buf + p, 0); p += 4;
+    wr32(buf + p, 90000); p += 4;             /* timescale */
+    p += box_hdr(buf + p, (uint32_t)minf_box, "minf");
+    p += box_hdr(buf + p, (uint32_t)stbl_box, "stbl");
+    p += box_hdr(buf + p, (uint32_t)stsd_box, "stsd");
+    wr32(buf + p, 0); p += 4;
+    wr32(buf + p, 1); p += 4;                 /* entry_count */
+    wr32(buf + p, (uint32_t)entry_box);
+    wr32(buf + p + 4, entry); p += 8;
+    std::memset(buf + p, 0, fixed); p += fixed;
+    if (avcc) {
+        p += box_hdr(buf + p, (uint32_t)cfg_box, "avcC");
+        std::memcpy(buf + p, avcc, avcc_len); p += avcc_len;
+    }
+    if (original) {
+        p += box_hdr(buf + p, (uint32_t)sinf_box, "sinf");
+        p += box_hdr(buf + p, 12, "frma");
+        wr32(buf + p, original); p += 4;
+        p += box_hdr(buf + p, 20, "schm");
+        wr32(buf + p, 0); p += 4;
+        std::memcpy(buf + p, "cbcs", 4); p += 4;
+        wr32(buf + p, 0x00010000); p += 4;
+        p += box_hdr(buf + p, 8 + 32, "schi");
+        p += box_hdr(buf + p, 32, "tenc");
+        std::memset(buf + p, 0, 24);
+        buf[p + 6] = 1;                       /* default_isProtected */
+        for (int i = 0; i < 16; i++) buf[p + 8 + i] = (uint8_t)(0x30 + i);
+        p += 24;
+    }
+    return p;
+}
+
 static size_t build_fragment(uint8_t *buf, size_t cap, uint64_t base_time,
                               uint32_t trun_flags,
                               const moq::cmaf::sample *samples,
@@ -216,6 +284,7 @@ int main()
         // Borrowed: pointer into input
         MOQ_CHECK(r->codec_config.data() >= buf);
         MOQ_CHECK(r->codec_config.data() < buf + len);
+        MOQ_CHECK(r->sample_entry == std::optional<uint32_t>(0x61766331u));  // 'avc1'
     }
 
     // Parse AAC init
@@ -231,6 +300,37 @@ int main()
         MOQ_CHECK(r->samplerate == 48000);
         MOQ_CHECK(r->channel_count == 2);
         MOQ_CHECK(r->codec_config.size() == sizeof(asc));
+        MOQ_CHECK(r->sample_entry == std::optional<uint32_t>(0x6d703461u));  // 'mp4a'
+    }
+
+    // An encrypted entry reports its frma original format, never encv
+    {
+        uint8_t avcc[] = {0x01, 0x64, 0x00, 0x1F, 0xFF};
+        uint8_t buf[512];
+        size_t len = build_entry_init(buf, 0x656e6376u /* encv */, 78,
+                                      avcc, sizeof(avcc), 0x61766333u /* avc3 */);
+
+        auto r = moq::cmaf::parse_init(moq::bytes_view(buf, len));
+        MOQ_CHECK(r.ok());
+        MOQ_CHECK(r->codec == moq::cmaf::codec_kind::avc);
+        MOQ_CHECK(r->sample_entry == std::optional<uint32_t>(0x61766333u));
+        MOQ_CHECK(r->codec_config.size() == sizeof(avcc));
+    }
+
+    // Unknown and zero entries are reported exactly as read: zero is a value
+    {
+        const uint32_t entries[] = {0x7a7a7a7au /* zzzz */, 0u, 0xffffffffu};
+        for (uint32_t entry : entries) {
+            uint8_t buf[512];
+            size_t len = build_entry_init(buf, entry, 16, nullptr, 0, 0);
+
+            auto r = moq::cmaf::parse_init(moq::bytes_view(buf, len));
+            MOQ_CHECK(r.ok());
+            MOQ_CHECK(r->codec == moq::cmaf::codec_kind::unknown);
+            MOQ_CHECK(r->sample_entry.has_value());
+            MOQ_CHECK(r->sample_entry == std::optional<uint32_t>(entry));
+            MOQ_CHECK(r->codec_config.empty());
+        }
     }
 
     // Parse fragment with 1 sample

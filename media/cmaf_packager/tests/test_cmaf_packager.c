@@ -110,7 +110,7 @@ static void five_codecs(void)
         moq_bytes_t init = moq_cmaf_packager_init_segment(p);
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init(init, &info) == MOQ_OK);
+        CHECK(moq_cmaf_parse_init_sized(init, &info, sizeof(info)) == MOQ_OK);
         CHECK(info.codec_kind == codecs[i].parser_kind);
         CHECK(info.track_id == 1);
         CHECK(info.timescale == moq_cmaf_packager_timescale(p));

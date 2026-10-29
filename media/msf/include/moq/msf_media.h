@@ -13,7 +13,7 @@
  * track's initData when out_init_buf is supplied -- the caller
  * supplies an allocator for the base64-decoded buffer, which is
  * returned via out_init_buf so the caller controls its lifetime
- * (out_init->codec_config borrows from it).
+ * (out_init's spans borrow from it).
  *
  * For non-CMAF tracks no allocation is performed unless the
  * catalog carries initData and out_init_buf is non-NULL.
@@ -35,8 +35,16 @@ extern "C" {
 /*
  * Derive media track info from an MSF catalog track.
  *
- * On success, fills out_info with media type, packaging, and
- * timescale derived from the catalog entry.
+ * On success, fills out_info with media type, packaging, timescale and the
+ * negotiated transport draft. Both outputs are sized: at most out_info_size
+ * and out_init_size bytes are cleared and written, never more, and each
+ * record's struct_size records what was actually written.
+ *
+ * `transport_version` is the draft the LIVE SESSION negotiated. It is the
+ * authority for the object-property integer codec; a catalog describes the
+ * track and never the session carrying it, so it cannot be derived here.
+ * Read it from the session (moq_session_version()), not from endpoint
+ * configuration or an offered preference.
  *
  * Media type: the `role` field is OPTIONAL (MSF-01 §5.2.6) and custom roles are
  * allowed, so it cannot solely gate classification:
@@ -54,11 +62,11 @@ extern "C" {
  *   Always decodes and parses the CMAF init segment to derive
  *   timescale, regardless of whether out_init is NULL.
  *
- *   If out_init is non-NULL, it is filled with codec kind,
- *   dimensions, sample rate, channel count, and codec config.
+ *   If out_init is non-NULL, it receives the parsed header record
+ *   (moq_cmaf_parse_init_sized() into out_init_size bytes).
  *   out_init_buf must also be non-NULL in this case (returns
- *   MOQ_ERR_INVAL otherwise), because out_init->codec_config
- *   borrows from the decoded buffer. The caller must call
+ *   MOQ_ERR_INVAL otherwise), because out_init's spans borrow from
+ *   the decoded buffer. The caller must call
  *   moq_rcbuf_decref(*out_init_buf) when done.
  *
  *   If out_init is NULL, the decoded buffer is released
@@ -82,12 +90,12 @@ extern "C" {
  *   callers read decoder extradata from codec_config uniformly
  *   across packagings. The caller owns *out_init_buf
  *   (moq_rcbuf_decref when done); the other out_init fields stay
- *   zeroed. When the track has no initData, or out_init_buf is
- *   NULL, *out_init_buf stays NULL and out_init stays zeroed.
+ *   zeroed: there is no parsed header. When the track has no
+ *   initData, or out_init_buf is NULL, *out_init_buf stays NULL and
+ *   out_init stays zeroed.
  *
  * MPEG-2 TS ("mpeg2ts", draft-gregoire-moq-msfts):
- *   Mapped only by moq_msf_track_to_media_info_sized(); the legacy entry returns
- *   MOQ_ERR_INVAL for such a track. The track must pass
+ *   The track must pass
  *   moq_msf_track_mpeg2ts_check() (otherwise MOQ_ERR_INVAL: a subscriber
  *   MUST reject it). Packaging MOQ_MEDIA_PACKAGING_MPEG2TS and timescale from
  *   the catalog or 0. Packet size stays in the typed catalog extension: pass
@@ -101,6 +109,15 @@ extern "C" {
  *
  * alloc is required to decode initData (CMAF, or RAW/LOC or MPEG2TS with
  * out_init_buf). If NULL for such tracks, returns MOQ_ERR_INVAL.
+ *
+ * Refuses rather than downgrading, writing nothing:
+ *   - out_info_size too small to cover `transport_version` is MOQ_ERR_INVAL,
+ *     NOT a v0 result: a caller that cannot hold the version would silently
+ *     take the legacy draft-16 contract at parse time;
+ *   - a transport_version of 0, or any version this build does not support,
+ *     is MOQ_ERR_INVAL;
+ *   - out_init != NULL with out_init_size below MOQ_CMAF_INIT_INFO_V0_SIZE
+ *     is MOQ_ERR_INVAL.
  *
  * Returns MOQ_OK on success.
  * Returns MOQ_ERR_INVAL if:
@@ -117,59 +134,6 @@ extern "C" {
  * Returns MOQ_ERR_PROTO if CMAF initData is malformed.
  * Returns MOQ_ERR_NOMEM if base64 decode allocation fails.
  */
-/*
- * NARROWED OUTPUT, and why: this entry point takes only a pointer, so it
- * cannot know how large the caller's moq_media_track_info_t is. It therefore
- * initializes and fills ONLY THE FROZEN v0 PREFIX (through `timescale`) and
- * leaves `struct_size` at MOQ_MEDIA_TRACK_INFO_V0_SIZE. That is what keeps it
- * safe for a caller compiled against the pre-version ABI.
- *
- * The consequence for a CURRENT caller: the result expresses NO transport
- * version, so moq_media_object_parse() applies the legacy standalone
- * contract -- draft-16 -- to every object parsed with it. On a draft-18
- * session that silently decodes draft-18 property bytes with the draft-16
- * integer codec, which is wrong at any value at or above 64 and invisible
- * below it.
- *
- * A current caller must therefore use moq_msf_track_to_media_info_sized()
- * and pass the version its LIVE SESSION negotiated. Assigning `struct_size`
- * and `transport_version` by hand after calling this function is NOT a
- * supported integration pattern.
- */
-MOQ_API moq_result_t moq_msf_track_to_media_info(
-    const moq_alloc_t *alloc,
-    const moq_msf_track_t *track,
-    moq_media_track_info_t *out_info,
-    moq_cmaf_init_info_t *out_init,
-    moq_rcbuf_t **out_init_buf);
-
-/*
- * Sized companion: the entry point for a caller that knows its own struct
- * size and its session's negotiated transport draft.
- *
- * Identical catalog mapping to moq_msf_track_to_media_info() -- both are
- * shells over one implementation -- but out_info is prepared for a CURRENT
- * caller: at most `out_info_size` bytes are cleared and written, never more,
- * `struct_size` records what was actually written, and `transport_version`
- * is stamped with `transport_version`.
- *
- * `transport_version` is the draft the LIVE SESSION negotiated. It is the
- * authority for the object-property integer codec; a catalog describes the
- * track and never the session carrying it, so it cannot be derived here.
- * Read it from the session (moq_session_version()), not from endpoint
- * configuration or an offered preference.
- *
- * Refuses rather than downgrading:
- *   - out_info_size too small to cover `transport_version` is MOQ_ERR_INVAL,
- *     NOT a v0 result. A caller that asked for a version and cannot hold one
- *     is a caller bug, and answering it with a silent draft-16 output is the
- *     exact trap this function exists to remove;
- *   - a transport_version of 0, or any version this build does not support,
- *     is MOQ_ERR_INVAL.
- *
- * All other arguments, results and ownership rules are those of
- * moq_msf_track_to_media_info() above.
- */
 MOQ_API moq_result_t moq_msf_track_to_media_info_sized(
     const moq_alloc_t *alloc,
     const moq_msf_track_t *track,
@@ -177,6 +141,7 @@ MOQ_API moq_result_t moq_msf_track_to_media_info_sized(
     size_t out_info_size,
     moq_version_t transport_version,
     moq_cmaf_init_info_t *out_init,
+    size_t out_init_size,
     moq_rcbuf_t **out_init_buf);
 
 #ifdef __cplusplus

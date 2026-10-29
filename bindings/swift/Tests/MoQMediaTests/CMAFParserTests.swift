@@ -148,6 +148,50 @@ private func buildAACInit(
     return buf
 }
 
+/// One box: its size, its type and `body`.
+private func box(_ type: String, _ body: Data) -> Data {
+    var out = Data()
+    boxHdr(&out, UInt32(8 + body.count), type)
+    out.append(body)
+    return out
+}
+
+/// ftyp + moov(trak(tkhd mdia(mdhd minf(stbl(stsd(<entry>)))))) with one
+/// sample entry of type `entry` and a zeroed `fixed`-byte body, an optional
+/// avcC box and, when `original` is given, sinf(frma schm schi(tenc)) whose
+/// frma names it.
+private func buildEntryInit(
+    entry: UInt32, fixed: Int, avccData: [UInt8]? = nil, original: String? = nil
+) -> Data {
+    var body = Data(repeating: 0, count: fixed)
+    if let avccData { body.append(box("avcC", Data(avccData))) }
+    if let original {
+        var frma = Data()
+        fourCC(&frma, original)
+        var schm = Data()
+        writeU32(&schm, 0); fourCC(&schm, "cbcs"); writeU32(&schm, 0x0001_0000)
+        var tenc = Data(repeating: 0, count: 24)
+        tenc[6] = 1 // default_isProtected
+        for i in 0..<16 { tenc[8 + i] = UInt8(0x30 + i) } // default_KID
+        body.append(box("sinf",
+                        box("frma", frma) + box("schm", schm) + box("schi", box("tenc", tenc))))
+    }
+    var entryBox = Data()
+    writeU32(&entryBox, UInt32(8 + body.count)); writeU32(&entryBox, entry)
+    entryBox.append(body)
+    var stsd = Data()
+    writeU32(&stsd, 0); writeU32(&stsd, 1) // version+flags, entry_count
+    stsd.append(entryBox)
+    var mdhd = Data()
+    writeU32(&mdhd, 0); writeU32(&mdhd, 0); writeU32(&mdhd, 0); writeU32(&mdhd, 90000)
+    var tkhd = Data()
+    writeU32(&tkhd, 0); writeU32(&tkhd, 0); writeU32(&tkhd, 0); writeU32(&tkhd, 7)
+    var ftyp = Data()
+    fourCC(&ftyp, "isom"); writeU32(&ftyp, 0); fourCC(&ftyp, "isom")
+    let mdia = box("mdia", box("mdhd", mdhd) + box("minf", box("stbl", box("stsd", stsd))))
+    return box("ftyp", ftyp) + box("moov", box("trak", box("tkhd", tkhd) + mdia))
+}
+
 // MARK: - Tests
 
 @Suite("CMAF Init Parser")
@@ -166,6 +210,7 @@ struct CMAFInitParserTests {
         #expect(info.width == 1920)
         #expect(info.height == 1080)
         #expect(info.codecConfig == Data(avcc))
+        #expect(info.sampleEntry == 0x6176_6331) // avc1
     }
 
     @Test("AAC init parses timescale, codec, samplerate, channels, config")
@@ -181,6 +226,30 @@ struct CMAFInitParserTests {
         #expect(info.samplerate == 48000)
         #expect(info.channelCount == 2)
         #expect(info.codecConfig == Data(asc))
+        #expect(info.sampleEntry == 0x6d70_3461) // mp4a
+    }
+
+    @Test("An encrypted entry reports its frma original format, never encv")
+    func encryptedSampleEntry() throws {
+        let avcc: [UInt8] = [0x01, 0x64, 0x00, 0x1F, 0xFF]
+        let data = buildEntryInit(
+            entry: 0x656e_6376, fixed: 78, avccData: avcc, original: "avc3") // encv
+
+        let info = try CMAFParser.parseInit(data)
+
+        #expect(info.codecKind == .avc)
+        #expect(info.sampleEntry == 0x6176_6333) // avc3
+        #expect(info.codecConfig == Data(avcc))
+    }
+
+    @Test("Unknown and zero sample entries are reported exactly as read",
+          arguments: [UInt32(0x7a7a_7a7a), 0, 0xffff_ffff]) // zzzz, zero, all ones
+    func unknownSampleEntry(entry: UInt32) throws {
+        let info = try CMAFParser.parseInit(buildEntryInit(entry: entry, fixed: 16))
+
+        #expect(info.codecKind == .unknown)
+        #expect(info.sampleEntry == entry, "zero is a value, not an absence")
+        #expect(info.codecConfig.isEmpty)
     }
 
     @Test("Malformed init throws malformed")

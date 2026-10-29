@@ -3,11 +3,14 @@
  * (media/cmaf/include/moq/cmaf.h).
  *
  * Invariants under test:
- *   1. moq_cmaf_parse_init():
+ *   1. moq_cmaf_parse_init_sized():
  *      - Returns only MOQ_OK or MOQ_ERR_PROTO for non-NULL arguments.
  *      - On MOQ_OK, codec_config (and scheme / default_kid when has_cenc)
  *        point within [buf, buf + size], and CENC fields are zeroed when
  *        !has_cenc or exact-width (4 and 16 bytes) when has_cenc.
+ *      - On MOQ_ERR_PROTO the record carries no partial observation.
+ *      - A record of only the v0 floor gets the same result, the same
+ *        prefix, and no byte written past the floor.
  *   2. moq_cmaf_parse_fragment() and resize-and-retry security contract:
  *      - Returns only MOQ_OK, MOQ_ERR_PROTO, or MOQ_ERR_BUFFER.
  *      - On MOQ_ERR_PROTO, out.sample_count is always 0 (never leaks an
@@ -67,7 +70,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     /* 1. Init segment parser. */
     {
         moq_cmaf_init_info_t init;
-        moq_result_t irc = moq_cmaf_parse_init(input, &init);
+        moq_result_t irc = moq_cmaf_parse_init_sized(input, &init, sizeof(init));
         if (irc != MOQ_OK && irc != MOQ_ERR_PROTO)
             __builtin_trap();
         if (irc == MOQ_OK) {
@@ -89,7 +92,32 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 check_slice_in(buf, size, init.scheme);
                 check_slice_in(buf, size, init.default_kid);
             }
+        } else {
+            const unsigned char *raw = (const unsigned char *)&init;
+            if (init.struct_size != sizeof(init))
+                __builtin_trap();
+            for (size_t i = sizeof(init.struct_size); i < sizeof(init); i++)
+                if (raw[i] != 0)
+                    __builtin_trap();
         }
+
+        union {
+            moq_cmaf_init_info_t rec;
+            unsigned char raw[sizeof(moq_cmaf_init_info_t)];
+        } floor_rec;
+        memset(floor_rec.raw, 0xEE, sizeof(floor_rec.raw));
+        moq_result_t frc = moq_cmaf_parse_init_sized(
+            input, &floor_rec.rec, MOQ_CMAF_INIT_INFO_V0_SIZE);
+        if (frc != irc ||
+            floor_rec.rec.struct_size != MOQ_CMAF_INIT_INFO_V0_SIZE)
+            __builtin_trap();
+        if (memcmp(floor_rec.raw + sizeof(init.struct_size),
+                   (const unsigned char *)&init + sizeof(init.struct_size),
+                   MOQ_CMAF_INIT_INFO_V0_SIZE - sizeof(init.struct_size)) != 0)
+            __builtin_trap();
+        for (size_t i = MOQ_CMAF_INIT_INFO_V0_SIZE; i < sizeof(floor_rec.raw); i++)
+            if (floor_rec.raw[i] != 0xEE)
+                __builtin_trap();
     }
 
     /* 2. Fragment parser + resize-and-retry contract. */

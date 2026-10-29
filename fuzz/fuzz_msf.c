@@ -640,7 +640,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 moq_rcbuf_t *init_buf = NULL;
                 moq_result_t mrc = moq_msf_track_to_media_info_sized(
                     &alloc, t, &info, sizeof(info), k_vers[v],
-                    &cinit, &init_buf);
+                    &cinit, sizeof(cinit), &init_buf);
                 if (mrc != MOQ_OK && mrc != MOQ_ERR_INVAL &&
                     mrc != MOQ_ERR_PROTO && mrc != MOQ_ERR_UNSUPPORTED &&
                     mrc != MOQ_ERR_NOMEM)

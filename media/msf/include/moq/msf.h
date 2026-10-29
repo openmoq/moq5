@@ -9,7 +9,7 @@
  *
  * Link against moq::msf (depends on moq::core; when built with
  * moq::media-object and moq::cmaf, also provides the
- * moq_msf_track_to_media_info() helper via <moq/msf_media.h>).
+ * moq_msf_track_to_media_info_sized() helper via <moq/msf_media.h>).
  *
  * Lifetime: string fields in the parsed catalog borrow from the
  * internal JSON DOM, which itself is allocated via the caller's

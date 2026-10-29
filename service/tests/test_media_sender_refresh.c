@@ -1206,7 +1206,7 @@ static void test_shared_init_ref_survives_removal(
     const moq_media_track_desc_t *da = moq_media_track_desc_get(ra);
     const moq_media_track_desc_t *db = moq_media_track_desc_get(rb);
     MOQ_TEST_CHECK(da && db);
-    MOQ_TEST_CHECK(da && db && da->has_init && db->has_init &&
+    MOQ_TEST_CHECK(da && db && da->init_data.len > 0 && db->init_data.len > 0 &&
         da->info.transport_version == version && db->info.transport_version == version);
     if (!da || !db) { moq_media_receiver_test_free(r); moq_media_sender_test_free(s); return; }
     const uint8_t *retained_a = da->init_data.data, *retained_b = db->init_data.data;
@@ -1217,6 +1217,26 @@ static void test_shared_init_ref_survives_removal(
     }
     MOQ_TEST_CHECK(retained_a && retained_b &&
         memcmp(retained_a, x, x_len) == 0 && memcmp(retained_b, x, x_len) == 0);
+    /* A CMAF header is a parsed record whose extradata is the common span;
+     * a RAW track's extradata is its init data and it has no record. */
+    const moq_cmaf_init_info_t *rec_a = da->cmaf;
+    const moq_bytes_t cc_a = da->codec_config;
+    moq_cmaf_init_info_t snap_a;
+    memset(&snap_a, 0, sizeof(snap_a));
+    if (cmaf) {
+        MOQ_TEST_CHECK(rec_a != NULL && db->cmaf != NULL && db->cmaf != rec_a);
+        if (rec_a) {
+            memcpy(&snap_a, rec_a, sizeof(snap_a));
+            MOQ_TEST_CHECK(rec_a->struct_size == sizeof(*rec_a));
+            MOQ_TEST_CHECK(cc_a.data == rec_a->codec_config.data &&
+                           cc_a.len == rec_a->codec_config.len && cc_a.len > 0);
+            MOQ_TEST_CHECK(cc_a.data >= retained_a &&
+                           cc_a.data + cc_a.len <= retained_a + x_len);
+        }
+    } else {
+        MOQ_TEST_CHECK(rec_a == NULL && db->cmaf == NULL);
+        MOQ_TEST_CHECK(cc_a.data == retained_a && cc_a.len == x_len);
+    }
 
     MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_remove_track(s, a),
                           (int)MOQ_OK);
@@ -1273,6 +1293,12 @@ static void test_shared_init_ref_survives_removal(
     MOQ_TEST_CHECK(da->init_data.data == retained_a && db->init_data.data == retained_b);
     MOQ_TEST_CHECK(da->init_data.len == x_len && db->init_data.len == x_len);
     MOQ_TEST_CHECK(memcmp(retained_a, x, x_len) == 0 && memcmp(retained_b, x, x_len) == 0);
+    /* The record and the common span outlive every catalog that described
+     * the track, unchanged and at the same address. */
+    MOQ_TEST_CHECK(da->cmaf == rec_a);
+    MOQ_TEST_CHECK(da->codec_config.data == cc_a.data && da->codec_config.len == cc_a.len);
+    if (cmaf && rec_a)
+        MOQ_TEST_CHECK(memcmp(rec_a, &snap_a, sizeof(snap_a)) == 0);
     moq_media_receiver_test_free(r);
     const char *draft = version == MOQ_VERSION_DRAFT_16 ? "d16" : d22 ? "d22" : "d18";
     char name[80];

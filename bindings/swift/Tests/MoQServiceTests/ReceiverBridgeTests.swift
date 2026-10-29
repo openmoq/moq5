@@ -112,6 +112,10 @@ struct TrackDescriptionCopyTests {
         desc.has_track_duration = true
         desc.track_duration_ms = 90_000
         desc.init_data = arena.bytes("INIT")
+        /* Decoder extradata is the common span: no parsed CMAF record is
+         * needed (a LOC track never has one). */
+        desc.codec_config = arena.bytes("CFG")
+        #expect(desc.cmaf == nil)
 
         let copy = withExtendedLifetime(arena) { copyTrackDescription(desc) }
         #expect(copy?.name == "video")
@@ -126,6 +130,7 @@ struct TrackDescriptionCopyTests {
         #expect(copy?.isLive == false)
         #expect(copy?.trackDuration == .seconds(90))
         #expect(copy?.initData == Data("INIT".utf8))
+        #expect(copy?.codecConfig == Data("CFG".utf8))
         #expect(copy?.samplerate == nil)        /* has_samplerate false */
         #expect(copy?.role == nil)              /* empty spans become nil */
     }

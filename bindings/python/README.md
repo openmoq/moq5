@@ -289,10 +289,19 @@ read through the service's sized current-description copy under the receiver
 mutex at poll time, so `description.vod` (`VodState.is_live`,
 `track_duration_ms`) is the track's CURRENT live/VOD state, not the state at
 the moment the event was queued. Optional values the catalog did not carry,
-or that the native stamped prefixes (event, description, nested `info` and
-`init`) do not cover, are `None`, never zero; unknown enum values are kept as
-integers. `TrackEvent.largest` / `expires_ms` are `UPDATE_OK` observations,
-`parse_drop` a coalesced `PARSE_DROP` snapshot.
+or that the native stamped prefixes (event, description, nested `info` and the
+`cmaf` record) do not cover, are `None`, never zero; unknown enum values are
+kept as integers. `TrackEvent.largest` / `expires_ms` are `UPDATE_OK`
+observations, `parse_drop` a coalesced `PARSE_DROP` snapshot.
+
+`description.codec_config` is the decoder extradata whatever the packaging
+(CMAF: the sample entry's configuration box; LOC: the catalog init data;
+empty for MPEG-TS), and `description.init_data` the resolved init bytes.
+`description.cmaf` is the record parsed from a CMAF header (`CmafInit`: codec
+kind, dimensions, CENC parameters, and `sample_entry`, the entry's four bytes
+such as `b"avc1"` or `b"avc3"`, the `frma` original format for an encrypted
+entry); it is `None` for LOC and MPEG-TS tracks and for a CMAF track whose
+header did not parse.
 
 `TrackEvent.kind_extended` adds `ExtendedTrackEventKind.LOCAL_FAILURE`,
 `UPDATE_LOCAL_FAILURE`, `DELIVERY_LOCAL_FAILURE` and `FILL_TERMINAL`.

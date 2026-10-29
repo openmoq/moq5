@@ -278,34 +278,42 @@ typedef struct moq_media_track_desc {
     moq_bytes_t label;
 
     /* Structured info derived via the MSF/media helpers. When derivation
-     * was not possible for this track (unknown packaging, missing init
+     * was not possible for this track (unknown packaging, malformed init
      * data, an mpeg2ts track that fails moq_msf_track_mpeg2ts_check), `info`
-     * holds zeroed/unknown values and has_init is false -- the track is
-     * still announced with its catalog strings, and has no delivery path.
-     * An mpeg2ts track derives packaging MPEG2TS; its packet size is in the
-     * typed extensions below. Its init_data (below) is the catalog's PSI
-     * source packets, and init.codec_config stays empty. An es-packets track
+     * holds zeroed/unknown values and codec_config, init_data and cmaf below
+     * are empty -- the track is still announced with its catalog strings,
+     * and has no delivery path. An mpeg2ts track derives packaging MPEG2TS;
+     * its packet size is in the typed extensions below. An es-packets track
      * carries the packets of one PID. */
     moq_media_track_info_t info;  /* media type, packaging, timescale */
-    bool                   has_init;
-    /* Parsed decoder config. init.codec_config is the DECODER EXTRADATA
-     * (H.264/HEVC SPS/PPS/VPS, AAC AudioSpecificConfig, ...) -- this is what a
-     * decoder usually wants to be configured with. Its bytes point into the
-     * handle-owned init buffer and stay valid for the handle's lifetime (until
-     * the receiver is destroyed), like the other desc fields. For a CENC
-     * protected CMAF track (CMSF §4.2) init.has_cenc is true and init.scheme /
-     * default_kid / default_is_protected / default_per_sample_iv_size carry the
-     * tenc parameters for license acquisition (libmoq does not decrypt). */
-    moq_cmaf_init_info_t   init;  /* codec kind, dimensions, sample rate,
-                                     channels, codec_config (decoder extradata),
-                                     CENC protection params */
-    /* The track's full container/init segment from the catalog, verbatim: for
+    /* The DECODER EXTRADATA (H.264/HEVC SPS/PPS/VPS, AAC AudioSpecificConfig,
+     * ...), whatever the packaging: for CMAF the sample entry's configuration
+     * box (the same span as cmaf->codec_config), for RAW/LOC the catalog's
+     * initData verbatim, for MPEG-2 TS empty. This is what a decoder usually
+     * wants to be configured with. Empty when the track carries none. */
+    moq_bytes_t codec_config;
+    /* The track's full init data from the catalog, resolved and verbatim: for
      * CMAF the initialization segment (ftyp + moov); for RAW/LOC whatever the
-     * sender supplied as init_data. Muxers/recorders that reproduce the
-     * container want this; decoders usually want init.codec_config above.
-     * Surfaced at TRACK_ADDED; empty when the track carries none. Points into
-     * the handle-owned init buffer and follows the handle lifetime. */
+     * sender supplied as initData; for MPEG-2 TS the PSI source packets.
+     * Muxers/recorders that reproduce the container want this; decoders
+     * usually want codec_config above. Empty when the track carries none. */
     moq_bytes_t init_data;
+    /* The record parsed from the track's CMAF header: its first trak's codec
+     * kind, dimensions, sample rate, channels, sample entry and, for a CENC
+     * protected track (CMSF §4.2), the tenc parameters for license
+     * acquisition (libmoq does not decrypt). NULL for every track whose init
+     * data is not a CMAF header that parsed: RAW/LOC, MPEG-2 TS, a CMAF track
+     * without init data or with a malformed one. Its fields are header
+     * observations; the catalog's own declarations (width, height,
+     * samplerate, ...) are separate fields below and may differ. A sized
+     * record: read a field only when cmaf->struct_size covers all of it.
+     *
+     * codec_config, init_data, the record and every span in it are
+     * handle-owned and immutable: they stay valid, unchanged, until the
+     * receiver is destroyed, including after a catalog update replaces the
+     * catalog the handle was built from. A copy of the description borrows
+     * the same record; it never owns it. */
+    const moq_cmaf_init_info_t *cmaf;
 
     /* Catalog passthroughs for fields the structured info may not carry
      * (zero / false when absent) -- the non-CMAF path needs these to build
@@ -663,8 +671,9 @@ MOQ_API const moq_media_track_desc_t *moq_media_track_desc_get(
  * Removed, ended and locally failed tracks, and a terminal (fatal/closed)
  * receiver, remain readable until moq_media_receiver_destroy(). Spans and arrays
  * in the copy stay BORROWED from the handle (handle lifetime), exactly as through
- * moq_media_track_desc_get(); nested struct_size stamps (info, init) are
- * carried verbatim and are meaningful only inside the outer prefix.
+ * moq_media_track_desc_get(): the cmaf record pointer is copied, not the
+ * record, which stays handle-owned. The nested info stamp is carried
+ * verbatim and is meaningful only inside the outer prefix.
  *
  * Writes min(out_size, sizeof(moq_media_track_desc_t)) bytes and stamps
  * out->struct_size with that size; bytes beyond it are untouched. Refusals

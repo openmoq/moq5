@@ -299,7 +299,36 @@ pub struct MediaTemplate {
 /// the same handle, and a later query shows the new values.
 pub struct TrackDescription<'receiver> {
     raw: sys::moq_media_track_desc_t,
+    cmaf: Option<sys::moq_cmaf_init_info_t>,
     _receiver: PhantomData<&'receiver Receiver>,
+}
+
+/// Copy the receiver's parsed CMAF record into this crate's size of it.
+/// The library's record may be smaller (an older library) or larger (a newer
+/// one) than this crate's, so only the bytes both its stamp and this crate's
+/// size cover are read, and the copy is stamped with that count. A record
+/// stamped below its frozen floor is an ABI mismatch.
+fn copy_cmaf_record(
+    record: *const sys::moq_cmaf_init_info_t,
+) -> Result<Option<sys::moq_cmaf_init_info_t>> {
+    if record.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: a non-null record is handle-owned and immutable until the
+    // receiver is destroyed, and begins with its struct_size.
+    let stamp = unsafe { ptr::addr_of!((*record).struct_size).read() } as usize;
+    if stamp < sys::MOQ_CMAF_INIT_INFO_V0_SIZE {
+        return Err(Error::ABI_MISMATCH);
+    }
+    let mut copy = sys::moq_cmaf_init_info_t::default();
+    let n = stamp.min(mem::size_of_val(&copy));
+    // SAFETY: the record holds `stamp` bytes and copy holds its own size;
+    // n is at most both, and the two never overlap.
+    unsafe {
+        ptr::copy_nonoverlapping(record.cast::<u8>(), ptr::addr_of_mut!(copy).cast::<u8>(), n);
+    }
+    copy.struct_size = n as u32;
+    Ok(Some(copy))
 }
 
 impl<'receiver> TrackDescription<'receiver> {
@@ -381,20 +410,32 @@ impl<'receiver> TrackDescription<'receiver> {
             None
         }
     }
-    /// The init data could be parsed into [`init_info`](TrackDescription::init_info).
+    /// The decoder extradata (SPS/PPS/VPS, AAC AudioSpecificConfig, ...),
+    /// whatever the packaging: for CMAF the sample entry's configuration box
+    /// (the same bytes as [`init_info`](TrackDescription::init_info)'s), for
+    /// RAW/LOC the catalog's init data verbatim; empty for MPEG-2 TS or
+    /// when the track carries none.
     #[must_use]
-    pub fn has_init(&self) -> bool {
-        self.raw.has_init
+    pub fn codec_config(&self) -> &'receiver [u8] {
+        // SAFETY: as for name.
+        unsafe { ffi::bytes(self.raw.codec_config) }
     }
-    /// The decoder config parsed from the init data; zeroed (unknown codec,
-    /// empty config) when [`has_init`](TrackDescription::has_init) is false.
+    /// The record parsed from the track's CMAF header: codec kind,
+    /// dimensions, sample entry, CENC parameters. `None` for every track
+    /// whose init data is not a CMAF header that parsed: RAW/LOC, MPEG-2 TS,
+    /// a CMAF track without init data or with a malformed one. Its fields
+    /// are header observations; the catalog's own declarations are
+    /// [`width`](TrackDescription::width) and its siblings.
     #[must_use]
-    pub fn init_info(&self) -> InitInfo<'_> {
-        // SAFETY: the spans are handle-owned, valid while the receiver lives.
-        unsafe { InitInfo::from_raw(&self.raw.init) }
+    pub fn init_info(&self) -> Option<InitInfo<'_>> {
+        // SAFETY: the record's spans are handle-owned, valid while the
+        // receiver lives, which outlives this description.
+        self.cmaf
+            .as_ref()
+            .map(|raw| unsafe { InitInfo::from_raw(raw) })
     }
-    /// The full init data from the catalog: a CMAF init segment, or whatever
-    /// a RAW sender supplied.
+    /// The full init data from the catalog, resolved: a CMAF init segment,
+    /// the MPEG-2 TS PSI source packets, or whatever a RAW sender supplied.
     #[must_use]
     pub fn init_data(&self) -> &'receiver [u8] {
         // SAFETY: as for name.
@@ -2063,6 +2104,7 @@ impl Receiver {
             size,
         )?;
         Ok(TrackDescription {
+            cmaf: copy_cmaf_record(description.cmaf)?,
             raw: description,
             _receiver: PhantomData,
         })

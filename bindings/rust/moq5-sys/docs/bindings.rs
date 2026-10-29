@@ -3,7 +3,7 @@
 // scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: f69966f5be5b (native headers modified in the worktree)
+// libmoq commit: 6c81977d4ff4 (native headers modified in the worktree)
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -9083,7 +9083,7 @@ pub const MOQ_CMAF_CODEC_OPUS: moq_cmaf_codec_kind = 5;
 pub type moq_cmaf_codec_kind = ::std::os::raw::c_uint;
 #[doc = " -- Codec kind ------------------------------------------------------"]
 pub use self::moq_cmaf_codec_kind as moq_cmaf_codec_kind_t;
-#[doc = " -- Init segment info -----------------------------------------------"]
+#[doc = " The record parsed from a CMAF header (ftyp + moov): its first trak. A sized\n output record: fields are appended at the tail, and a reader uses a field\n only when the stamped struct_size covers all of it. The same record is the\n standalone parser's output and the receiver's handle-owned observation\n (moq_media_track_desc_t.cmaf)."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct moq_cmaf_init_info {
@@ -9108,10 +9108,12 @@ pub struct moq_cmaf_init_info {
     pub default_per_sample_iv_size: u8,
     #[doc = " tenc default_KID, 16 bytes, BORROWED"]
     pub default_kid: moq_bytes_t,
+    #[doc = " Appended after default_kid. The sample entry's format as its four\n bytes read big-endian, (a<<24)|(b<<16)|(c<<8)|d: the entry type of a\n clear entry ('avc1', 'avc3', 'hvc1', 'hev1', ...), or the sinf frma\n original format of an encrypted one ('encv'/'enca' are never reported).\n A value the parser does not recognize, including zero, is reported\n exactly as read: whether it was reported is the stamp's coverage, never\n the value."]
+    pub sample_entry: u32,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_cmaf_init_info"][::std::mem::size_of::<moq_cmaf_init_info>() - 96usize];
+    ["Size of moq_cmaf_init_info"][::std::mem::size_of::<moq_cmaf_init_info>() - 104usize];
     ["Alignment of moq_cmaf_init_info"][::std::mem::align_of::<moq_cmaf_init_info>() - 8usize];
     ["Offset of field: moq_cmaf_init_info::struct_size"]
         [::std::mem::offset_of!(moq_cmaf_init_info, struct_size) - 0usize];
@@ -9141,6 +9143,8 @@ const _: () = {
         [::std::mem::offset_of!(moq_cmaf_init_info, default_per_sample_iv_size) - 73usize];
     ["Offset of field: moq_cmaf_init_info::default_kid"]
         [::std::mem::offset_of!(moq_cmaf_init_info, default_kid) - 80usize];
+    ["Offset of field: moq_cmaf_init_info::sample_entry"]
+        [::std::mem::offset_of!(moq_cmaf_init_info, sample_entry) - 96usize];
 };
 impl Default for moq_cmaf_init_info {
     fn default() -> Self {
@@ -9151,17 +9155,19 @@ impl Default for moq_cmaf_init_info {
         }
     }
 }
-#[doc = " -- Init segment info -----------------------------------------------"]
+#[doc = " The record parsed from a CMAF header (ftyp + moov): its first trak. A sized\n output record: fields are appended at the tail, and a reader uses a field\n only when the stamped struct_size covers all of it. The same record is the\n standalone parser's output and the receiver's handle-owned observation\n (moq_media_track_desc_t.cmaf)."]
 pub type moq_cmaf_init_info_t = moq_cmaf_init_info;
 unsafe extern "C" {
-    pub fn moq_cmaf_init_info_init(info: *mut moq_cmaf_init_info_t);
+    #[doc = " Clear and stamp min(info_size, sizeof(current)) bytes. Writes nothing when\n info_size cannot hold struct_size. The macro passes the caller's own size."]
+    pub fn moq_cmaf_init_info_init_sized(info: *mut moq_cmaf_init_info_t, info_size: usize);
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Parse the first trak from a CMAF init segment.\n\n Returns MOQ_OK on success.\n Returns MOQ_ERR_INVAL if init_segment.data is NULL or out is NULL.\n Returns MOQ_ERR_PROTO on malformed boxes or missing required data."]
-    pub fn moq_cmaf_parse_init(
+    #[doc = " Parse the first trak from a CMAF init segment into the caller's record of\n out_size bytes (sizeof the caller's record).\n\n On MOQ_OK, min(out_size, sizeof(current)) bytes are written and that count\n is stamped in out->struct_size; bytes past it are never touched. Only the\n first sample entry of the first trak is read.\n\n Returns MOQ_ERR_INVAL, writing nothing, if init_segment.data or out is\n NULL, or out_size is below MOQ_CMAF_INIT_INFO_V0_SIZE.\n Returns MOQ_ERR_PROTO on malformed boxes or missing required data; the\n record is then left as moq_cmaf_init_info_init_sized(out, out_size) leaves\n it, carrying no partial observation."]
+    pub fn moq_cmaf_parse_init_sized(
         init_segment: moq_bytes_t,
         out: *mut moq_cmaf_init_info_t,
+        out_size: usize,
     ) -> moq_result_t;
 }
 pub const MOQ_SAP_NONE: moq_sap_type = 0;
@@ -9345,7 +9351,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Validate one MoQ object payload against CMSF §3.3 object packaging:\n   - the object is one or more successive, ordered CMAF chunks, each a moof\n     immediately followed by an mdat (no other or out-of-order top-level\n     boxes -- e.g. moof/moof/mdat or mdat/moof are rejected);\n   - each moof has the mandatory mfhd;\n   - a single track (one traf per moof, consistent tfhd.track_ID);\n   - each moof carries a trun, and EVERY completed chunk's sample table fully\n     parses to >= 1 sample. A trun declaring more samples than the validator's\n     internal cap (512) cannot be fully parsed/validated and is rejected\n     (MOQ_CMAF_ERR_NO_SAMPLES), not accepted on an incomplete parse;\n   - when init is non-NULL with a known track_id, the object's track_ID\n     matches it.\n The report is filled best-effort in all cases (chunk_count/track_id/SAP).\n\n Returns MOQ_OK when the object is valid (out->valid = true).\n Returns MOQ_ERR_PROTO when it violates §3.3 (out->valid = false,\n   out->reason set to the first failure).\n Returns MOQ_ERR_INVAL if object.data or out is NULL.\n Pure: no allocation, no MSF, no retained refs."]
+    #[doc = " Validate one MoQ object payload against CMSF §3.3 object packaging:\n   - the object is one or more successive, ordered CMAF chunks, each a moof\n     immediately followed by an mdat (no other or out-of-order top-level\n     boxes -- e.g. moof/moof/mdat or mdat/moof are rejected);\n   - each moof has the mandatory mfhd;\n   - a single track (one traf per moof, consistent tfhd.track_ID);\n   - each moof carries a trun, and EVERY completed chunk's sample table fully\n     parses to >= 1 sample. A trun declaring more samples than the validator's\n     internal cap (512) cannot be fully parsed/validated and is rejected\n     (MOQ_CMAF_ERR_NO_SAMPLES), not accepted on an incomplete parse;\n   - when init is non-NULL with a known track_id, the object's track_ID\n     matches it. Only track_id, inside the v0 prefix, is read from init.\n The report is filled best-effort in all cases (chunk_count/track_id/SAP).\n\n Returns MOQ_OK when the object is valid (out->valid = true).\n Returns MOQ_ERR_PROTO when it violates §3.3 (out->valid = false,\n   out->reason set to the first failure).\n Returns MOQ_ERR_INVAL if object.data or out is NULL.\n Pure: no allocation, no MSF, no retained refs."]
     pub fn moq_cmaf_validate_object(
         init: *const moq_cmaf_init_info_t,
         object: moq_bytes_t,
@@ -12102,11 +12108,12 @@ pub struct moq_media_track_desc {
     pub label: moq_bytes_t,
     #[doc = " media type, packaging, timescale"]
     pub info: moq_media_track_info_t,
-    pub has_init: bool,
-    #[doc = " codec kind, dimensions, sample rate,\nchannels, codec_config (decoder extradata),\nCENC protection params"]
-    pub init: moq_cmaf_init_info_t,
-    #[doc = " The track's full container/init segment from the catalog, verbatim: for\n CMAF the initialization segment (ftyp + moov); for RAW/LOC whatever the\n sender supplied as init_data. Muxers/recorders that reproduce the\n container want this; decoders usually want init.codec_config above.\n Surfaced at TRACK_ADDED; empty when the track carries none. Points into\n the handle-owned init buffer and follows the handle lifetime."]
+    #[doc = " The DECODER EXTRADATA (H.264/HEVC SPS/PPS/VPS, AAC AudioSpecificConfig,\n ...), whatever the packaging: for CMAF the sample entry's configuration\n box (the same span as cmaf->codec_config), for RAW/LOC the catalog's\n initData verbatim, for MPEG-2 TS empty. This is what a decoder usually\n wants to be configured with. Empty when the track carries none."]
+    pub codec_config: moq_bytes_t,
+    #[doc = " The track's full init data from the catalog, resolved and verbatim: for\n CMAF the initialization segment (ftyp + moov); for RAW/LOC whatever the\n sender supplied as initData; for MPEG-2 TS the PSI source packets.\n Muxers/recorders that reproduce the container want this; decoders\n usually want codec_config above. Empty when the track carries none."]
     pub init_data: moq_bytes_t,
+    #[doc = " The record parsed from the track's CMAF header: its first trak's codec\n kind, dimensions, sample rate, channels, sample entry and, for a CENC\n protected track (CMSF §4.2), the tenc parameters for license\n acquisition (libmoq does not decrypt). NULL for every track whose init\n data is not a CMAF header that parsed: RAW/LOC, MPEG-2 TS, a CMAF track\n without init data or with a malformed one. Its fields are header\n observations; the catalog's own declarations (width, height,\n samplerate, ...) are separate fields below and may differ. A sized\n record: read a field only when cmaf->struct_size covers all of it.\n\n codec_config, init_data, the record and every span in it are\n handle-owned and immutable: they stay valid, unchanged, until the\n receiver is destroyed, including after a catalog update replaces the\n catalog the handle was built from. A copy of the description borrows\n the same record; it never owns it."]
+    pub cmaf: *const moq_cmaf_init_info_t,
     #[doc = " Catalog passthroughs for fields the structured info may not carry\n (zero / false when absent) -- the non-CMAF path needs these to build\n caps/stream parameters."]
     pub has_width: bool,
     pub width: u32,
@@ -12159,7 +12166,7 @@ pub struct moq_media_track_desc {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_media_track_desc"][::std::mem::size_of::<moq_media_track_desc>() - 528usize];
+    ["Size of moq_media_track_desc"][::std::mem::size_of::<moq_media_track_desc>() - 456usize];
     ["Alignment of moq_media_track_desc"][::std::mem::align_of::<moq_media_track_desc>() - 8usize];
     ["Offset of field: moq_media_track_desc::struct_size"]
         [::std::mem::offset_of!(moq_media_track_desc, struct_size) - 0usize];
@@ -12175,82 +12182,82 @@ const _: () = {
         [::std::mem::offset_of!(moq_media_track_desc, label) - 72usize];
     ["Offset of field: moq_media_track_desc::info"]
         [::std::mem::offset_of!(moq_media_track_desc, info) - 88usize];
-    ["Offset of field: moq_media_track_desc::has_init"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_init) - 108usize];
-    ["Offset of field: moq_media_track_desc::init"]
-        [::std::mem::offset_of!(moq_media_track_desc, init) - 112usize];
+    ["Offset of field: moq_media_track_desc::codec_config"]
+        [::std::mem::offset_of!(moq_media_track_desc, codec_config) - 112usize];
     ["Offset of field: moq_media_track_desc::init_data"]
-        [::std::mem::offset_of!(moq_media_track_desc, init_data) - 208usize];
+        [::std::mem::offset_of!(moq_media_track_desc, init_data) - 128usize];
+    ["Offset of field: moq_media_track_desc::cmaf"]
+        [::std::mem::offset_of!(moq_media_track_desc, cmaf) - 144usize];
     ["Offset of field: moq_media_track_desc::has_width"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_width) - 224usize];
+        [::std::mem::offset_of!(moq_media_track_desc, has_width) - 152usize];
     ["Offset of field: moq_media_track_desc::width"]
-        [::std::mem::offset_of!(moq_media_track_desc, width) - 228usize];
+        [::std::mem::offset_of!(moq_media_track_desc, width) - 156usize];
     ["Offset of field: moq_media_track_desc::has_height"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_height) - 232usize];
+        [::std::mem::offset_of!(moq_media_track_desc, has_height) - 160usize];
     ["Offset of field: moq_media_track_desc::height"]
-        [::std::mem::offset_of!(moq_media_track_desc, height) - 236usize];
+        [::std::mem::offset_of!(moq_media_track_desc, height) - 164usize];
     ["Offset of field: moq_media_track_desc::has_samplerate"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_samplerate) - 240usize];
+        [::std::mem::offset_of!(moq_media_track_desc, has_samplerate) - 168usize];
     ["Offset of field: moq_media_track_desc::samplerate"]
-        [::std::mem::offset_of!(moq_media_track_desc, samplerate) - 244usize];
+        [::std::mem::offset_of!(moq_media_track_desc, samplerate) - 172usize];
     ["Offset of field: moq_media_track_desc::channel_config"]
-        [::std::mem::offset_of!(moq_media_track_desc, channel_config) - 248usize];
+        [::std::mem::offset_of!(moq_media_track_desc, channel_config) - 176usize];
     ["Offset of field: moq_media_track_desc::has_framerate"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_framerate) - 264usize];
+        [::std::mem::offset_of!(moq_media_track_desc, has_framerate) - 192usize];
     ["Offset of field: moq_media_track_desc::framerate_millis"]
-        [::std::mem::offset_of!(moq_media_track_desc, framerate_millis) - 272usize];
+        [::std::mem::offset_of!(moq_media_track_desc, framerate_millis) - 200usize];
     ["Offset of field: moq_media_track_desc::has_bitrate"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_bitrate) - 280usize];
+        [::std::mem::offset_of!(moq_media_track_desc, has_bitrate) - 208usize];
     ["Offset of field: moq_media_track_desc::bitrate"]
-        [::std::mem::offset_of!(moq_media_track_desc, bitrate) - 288usize];
+        [::std::mem::offset_of!(moq_media_track_desc, bitrate) - 216usize];
     ["Offset of field: moq_media_track_desc::has_max_grp_sap"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_max_grp_sap) - 296usize];
+        [::std::mem::offset_of!(moq_media_track_desc, has_max_grp_sap) - 224usize];
     ["Offset of field: moq_media_track_desc::max_grp_sap"]
-        [::std::mem::offset_of!(moq_media_track_desc, max_grp_sap) - 300usize];
+        [::std::mem::offset_of!(moq_media_track_desc, max_grp_sap) - 228usize];
     ["Offset of field: moq_media_track_desc::has_max_obj_sap"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_max_obj_sap) - 304usize];
+        [::std::mem::offset_of!(moq_media_track_desc, has_max_obj_sap) - 232usize];
     ["Offset of field: moq_media_track_desc::max_obj_sap"]
-        [::std::mem::offset_of!(moq_media_track_desc, max_obj_sap) - 308usize];
+        [::std::mem::offset_of!(moq_media_track_desc, max_obj_sap) - 236usize];
     ["Offset of field: moq_media_track_desc::content_protection_ref_ids"]
-        [::std::mem::offset_of!(moq_media_track_desc, content_protection_ref_ids) - 312usize];
+        [::std::mem::offset_of!(moq_media_track_desc, content_protection_ref_ids) - 240usize];
     ["Offset of field: moq_media_track_desc::content_protection_ref_id_count"]
-        [::std::mem::offset_of!(moq_media_track_desc, content_protection_ref_id_count) - 320usize];
+        [::std::mem::offset_of!(moq_media_track_desc, content_protection_ref_id_count) - 248usize];
     ["Offset of field: moq_media_track_desc::packaging"]
-        [::std::mem::offset_of!(moq_media_track_desc, packaging) - 328usize];
+        [::std::mem::offset_of!(moq_media_track_desc, packaging) - 256usize];
     ["Offset of field: moq_media_track_desc::event_type"]
-        [::std::mem::offset_of!(moq_media_track_desc, event_type) - 344usize];
+        [::std::mem::offset_of!(moq_media_track_desc, event_type) - 272usize];
     ["Offset of field: moq_media_track_desc::mime_type"]
-        [::std::mem::offset_of!(moq_media_track_desc, mime_type) - 360usize];
+        [::std::mem::offset_of!(moq_media_track_desc, mime_type) - 288usize];
     ["Offset of field: moq_media_track_desc::depends"]
-        [::std::mem::offset_of!(moq_media_track_desc, depends) - 376usize];
+        [::std::mem::offset_of!(moq_media_track_desc, depends) - 304usize];
     ["Offset of field: moq_media_track_desc::depends_count"]
-        [::std::mem::offset_of!(moq_media_track_desc, depends_count) - 384usize];
+        [::std::mem::offset_of!(moq_media_track_desc, depends_count) - 312usize];
     ["Offset of field: moq_media_track_desc::has_template"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_template) - 392usize];
+        [::std::mem::offset_of!(moq_media_track_desc, has_template) - 320usize];
     ["Offset of field: moq_media_track_desc::template_"]
-        [::std::mem::offset_of!(moq_media_track_desc, template_) - 400usize];
+        [::std::mem::offset_of!(moq_media_track_desc, template_) - 328usize];
     ["Offset of field: moq_media_track_desc::has_track_duration"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_track_duration) - 464usize];
+        [::std::mem::offset_of!(moq_media_track_desc, has_track_duration) - 392usize];
     ["Offset of field: moq_media_track_desc::track_duration_ms"]
-        [::std::mem::offset_of!(moq_media_track_desc, track_duration_ms) - 472usize];
+        [::std::mem::offset_of!(moq_media_track_desc, track_duration_ms) - 400usize];
     ["Offset of field: moq_media_track_desc::is_live"]
-        [::std::mem::offset_of!(moq_media_track_desc, is_live) - 480usize];
+        [::std::mem::offset_of!(moq_media_track_desc, is_live) - 408usize];
     ["Offset of field: moq_media_track_desc::_reserved_desc"]
-        [::std::mem::offset_of!(moq_media_track_desc, _reserved_desc) - 484usize];
+        [::std::mem::offset_of!(moq_media_track_desc, _reserved_desc) - 412usize];
     ["Offset of field: moq_media_track_desc::extensions"]
-        [::std::mem::offset_of!(moq_media_track_desc, extensions) - 488usize];
+        [::std::mem::offset_of!(moq_media_track_desc, extensions) - 416usize];
     ["Offset of field: moq_media_track_desc::extension_count"]
-        [::std::mem::offset_of!(moq_media_track_desc, extension_count) - 496usize];
+        [::std::mem::offset_of!(moq_media_track_desc, extension_count) - 424usize];
     ["Offset of field: moq_media_track_desc::has_alt_group"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_alt_group) - 504usize];
+        [::std::mem::offset_of!(moq_media_track_desc, has_alt_group) - 432usize];
     ["Offset of field: moq_media_track_desc::alt_group"]
-        [::std::mem::offset_of!(moq_media_track_desc, alt_group) - 508usize];
+        [::std::mem::offset_of!(moq_media_track_desc, alt_group) - 436usize];
     ["Offset of field: moq_media_track_desc::has_render_group"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_render_group) - 512usize];
+        [::std::mem::offset_of!(moq_media_track_desc, has_render_group) - 440usize];
     ["Offset of field: moq_media_track_desc::render_group"]
-        [::std::mem::offset_of!(moq_media_track_desc, render_group) - 516usize];
+        [::std::mem::offset_of!(moq_media_track_desc, render_group) - 444usize];
     ["Offset of field: moq_media_track_desc::has_label"]
-        [::std::mem::offset_of!(moq_media_track_desc, has_label) - 520usize];
+        [::std::mem::offset_of!(moq_media_track_desc, has_label) - 448usize];
 };
 impl Default for moq_media_track_desc {
     fn default() -> Self {
@@ -12436,7 +12443,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Copy a track's CURRENT description into `out` under the receiver mutex --\n the same mutex the live-to-VOD writer holds -- so the mutable triple is\n read coherently. This is a snapshot of the present state, not the image\n the TRACK_ADDED/UPDATED event carried.\n\n `track` must be a handle of `r`: membership is checked against the\n receiver's own handle table without dereferencing an unowned pointer.\n Removed, ended and locally failed tracks, and a terminal (fatal/closed)\n receiver, remain readable until moq_media_receiver_destroy(). Spans and arrays\n in the copy stay BORROWED from the handle (handle lifetime), exactly as through\n moq_media_track_desc_get(); nested struct_size stamps (info, init) are\n carried verbatim and are meaningful only inside the outer prefix.\n\n Writes min(out_size, sizeof(moq_media_track_desc_t)) bytes and stamps\n out->struct_size with that size; bytes beyond it are untouched. Refusals\n write nothing: MOQ_ERR_INVAL for a NULL receiver/track/out, an out_size\n below MOQ_MEDIA_TRACK_DESC_V0_SIZE, or a handle `r` does not own. Never\n allocates. Callable from any thread."]
+    #[doc = " Copy a track's CURRENT description into `out` under the receiver mutex --\n the same mutex the live-to-VOD writer holds -- so the mutable triple is\n read coherently. This is a snapshot of the present state, not the image\n the TRACK_ADDED/UPDATED event carried.\n\n `track` must be a handle of `r`: membership is checked against the\n receiver's own handle table without dereferencing an unowned pointer.\n Removed, ended and locally failed tracks, and a terminal (fatal/closed)\n receiver, remain readable until moq_media_receiver_destroy(). Spans and arrays\n in the copy stay BORROWED from the handle (handle lifetime), exactly as through\n moq_media_track_desc_get(): the cmaf record pointer is copied, not the\n record, which stays handle-owned. The nested info stamp is carried\n verbatim and is meaningful only inside the outer prefix.\n\n Writes min(out_size, sizeof(moq_media_track_desc_t)) bytes and stamps\n out->struct_size with that size; bytes beyond it are untouched. Refusals\n write nothing: MOQ_ERR_INVAL for a NULL receiver/track/out, an out_size\n below MOQ_MEDIA_TRACK_DESC_V0_SIZE, or a handle `r` does not own. Never\n allocates. Callable from any thread."]
     pub fn moq_media_receiver_track_desc_copy(
         r: *const moq_media_receiver_t,
         track: *const moq_media_track_t,
@@ -13462,11 +13469,12 @@ pub const MOQ_MEDIA_AUTH_CFG_V0_SIZE: usize = 48;
 pub const MOQ_MEDIA_TRACK_CFG_V0_SIZE: usize = 200;
 pub const MOQ_MEDIA_SEND_OBJECT_V0_SIZE: usize = 72;
 pub const MOQ_MEDIA_RECEIVER_CFG_V0_SIZE: usize = 80;
-pub const MOQ_MEDIA_TRACK_DESC_V0_SIZE: usize = 481;
+pub const MOQ_MEDIA_TRACK_DESC_V0_SIZE: usize = 409;
 pub const MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_SIZE: usize = 12;
 pub const MOQ_MEDIA_STREAM_TERMINAL_V0_SIZE: usize = 88;
 pub const MOQ_MEDIA_RECEIVER_INFO_V0_SIZE: usize = 48;
 pub const MOQ_MEDIA_TRACK_INFO_V0_SIZE: usize = 16;
+pub const MOQ_CMAF_INIT_INFO_V0_SIZE: usize = 96;
 pub const MOQ_MEDIA_METADATA_V0_SIZE: usize = 88;
 pub const MOQ_LOC_METADATA_V0_SIZE: usize = 64;
 pub const MOQ_MSF_MPEG2TS_V0_SIZE: usize = 140;

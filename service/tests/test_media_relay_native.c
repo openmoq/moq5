@@ -118,14 +118,16 @@ static bool verify_cmaf_desc(const moq_media_track_desc_t *desc)
     REQUIRE(desc->info.media_type == MOQ_MEDIA_TYPE_AUDIO &&
             desc->info.packaging == MOQ_MEDIA_PACKAGING_CMAF &&
             desc->info.timescale == 48000);
-    REQUIRE(desc->has_init && desc->init.struct_size == sizeof(desc->init));
-    REQUIRE(desc->init.codec_kind == MOQ_CMAF_CODEC_AAC &&
-            desc->init.track_id == 1 && desc->init.timescale == 48000 &&
-            desc->init.samplerate == 48000 && desc->init.channel_count == 2 &&
-            !desc->init.has_cenc);
-    REQUIRE(desc->init.codec_config.len == sizeof(native_cmaf_asc) &&
-            desc->init.codec_config.data != NULL &&
-            memcmp(desc->init.codec_config.data, native_cmaf_asc,
+    const moq_cmaf_init_info_t *rec = desc->cmaf;
+    REQUIRE(rec && rec->struct_size == sizeof(*rec));
+    REQUIRE(rec->codec_kind == MOQ_CMAF_CODEC_AAC &&
+            rec->track_id == 1 && rec->timescale == 48000 &&
+            rec->samplerate == 48000 && rec->channel_count == 2 &&
+            !rec->has_cenc && rec->sample_entry == UINT32_C(0x6d703461));
+    REQUIRE(desc->codec_config.len == sizeof(native_cmaf_asc) &&
+            desc->codec_config.data == rec->codec_config.data &&
+            desc->codec_config.len == rec->codec_config.len &&
+            memcmp(desc->codec_config.data, native_cmaf_asc,
                    sizeof(native_cmaf_asc)) == 0);
     REQUIRE(desc->init_data.len == sizeof(k_ffmpeg_aac_stereo_init) &&
             desc->init_data.data != NULL &&

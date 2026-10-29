@@ -1124,14 +1124,31 @@ PIN_AFTER(moq_media_receiver_cfg_t, surface_stream_terminals, resource_auth);
 PIN_AT(moq_media_receiver_cfg_t, resource_auth,
        120, 88 - ABI_RECEIVER_ENUM_SHIFT, 96);
 PIN_SIZE(moq_media_receiver_cfg_t, 128, 92 - ABI_RECEIVER_ENUM_SHIFT, 104);
+/* The descriptor's prefix: the common decoder spans, then the borrowed
+ * pointer to the parsed CMAF record, through the is_live floor. */
+PIN_AT(moq_media_track_desc_t, codec_config, 112, 64, 64);
+PIN_AT(moq_media_track_desc_t, init_data, 128, 72, 72);
+PIN_AT(moq_media_track_desc_t, cmaf, 144, 80, 80);
+PIN_AT(moq_media_track_desc_t, is_live, 408, 276, 288);
+_Static_assert(MOQ_MEDIA_TRACK_DESC_V0_SIZE == ABI_PICK(409, 277, 289),
+               "moq_media_track_desc_t: v0 floor");
+PIN_AFTER(moq_media_track_desc_t, is_live, extensions);
 /* The descriptor's render-group block starts at the complete sizeof
  * through alt_group. */
-PIN_THROUGH(moq_media_track_desc_t, alt_group, 512, 356, 368, 8, 4, 8);
+PIN_THROUGH(moq_media_track_desc_t, alt_group, 440, 300, 312, 8, 4, 8);
 PIN_AFTER(moq_media_track_desc_t, alt_group, has_render_group);
-PIN_AT(moq_media_track_desc_t, has_render_group, 512, 356, 368);
-PIN_AT(moq_media_track_desc_t, render_group, 516, 360, 372);
-PIN_AT(moq_media_track_desc_t, has_label, 520, 364, 376);
-PIN_SIZE(moq_media_track_desc_t, 528, 368, 384);
+PIN_AT(moq_media_track_desc_t, has_render_group, 440, 300, 312);
+PIN_AT(moq_media_track_desc_t, render_group, 444, 304, 316);
+PIN_AT(moq_media_track_desc_t, has_label, 448, 308, 320);
+PIN_SIZE(moq_media_track_desc_t, 456, 312, 328);
+/* The parsed CMAF record grows on its own: sample_entry starts at the v0
+ * floor through default_kid, which leaves no tail padding behind. */
+PIN_THROUGH(moq_cmaf_init_info_t, default_kid, 96, 64, 64, 8, 4, 4);
+_Static_assert(MOQ_CMAF_INIT_INFO_V0_SIZE == ABI_PICK(96, 64, 64),
+               "moq_cmaf_init_info_t: v0 floor");
+PIN_AFTER(moq_cmaf_init_info_t, default_kid, sample_entry);
+PIN_AT(moq_cmaf_init_info_t, sample_entry, 96, 64, 64);
+PIN_SIZE(moq_cmaf_init_info_t, 104, 68, 68);
 PIN_AT(moq_media_receiver_info_t, max_bytes, 16, 16, 16);
 PIN_AT(moq_media_receiver_info_t, companion_profile, 28, 28, 28);
 PIN_AT(moq_media_receiver_info_t, track_events_polled, 40, 40, 40);

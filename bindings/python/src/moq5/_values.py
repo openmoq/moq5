@@ -605,8 +605,12 @@ class Cenc:
 
 @dataclass(frozen=True, slots=True)
 class CmafInit:
-    """Parsed decoder configuration, copied. Fields the native stamped prefix
-    does not cover are None; `codec_config` is the decoder extradata."""
+    """The record parsed from a CMAF header (its first trak), copied. Fields
+    the native stamped record does not cover are None. `sample_entry` is the
+    sample entry's format as its four bytes: a clear entry's own type
+    (b"avc1", b"avc3", b"hvc1", b"hev1", ...) or an encrypted entry's frma
+    original format; any value, including four zero bytes, is reported as
+    read."""
 
     codec_kind: CodecKind | int | None
     timescale: int | None
@@ -617,6 +621,7 @@ class CmafInit:
     codec_config: bytes | None
     track_id: int | None
     cenc: Cenc | None
+    sample_entry: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -648,7 +653,10 @@ class TrackDescription:
     """An owned copy of a track's description. Every span and array is Python
     bytes; nothing borrows native memory, so a copy outlives the receiver.
     Optional fields the catalog did not carry, or the native stamped prefixes
-    (outer, info, init) did not cover, are None -- never fabricated zeros."""
+    (outer, info, cmaf record) did not cover, are None -- never fabricated
+    zeros. `codec_config` is the decoder extradata whatever the packaging;
+    `cmaf` is the record parsed from a CMAF header, None for every other
+    track (LOC, MPEG-TS, a CMAF track whose header did not parse)."""
 
     name: bytes
     role: bytes | None
@@ -659,8 +667,9 @@ class TrackDescription:
     packaging: Packaging | int | None
     timescale: int | None
     transport_version: int | None
-    init: CmafInit | None
+    codec_config: bytes
     init_data: bytes
+    cmaf: CmafInit | None
     width: int | None
     height: int | None
     samplerate: int | None

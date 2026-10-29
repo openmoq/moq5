@@ -111,7 +111,7 @@ static void check_audio(bool opus)
     if (p) {
         moq_cmaf_init_info_t info;
         moq_cmaf_init_info_init(&info);
-        CHECK(moq_cmaf_parse_init(moq_cmaf_packager_init_segment(p), &info) == MOQ_OK);
+        CHECK(moq_cmaf_parse_init_sized(moq_cmaf_packager_init_segment(p), &info, sizeof(info)) == MOQ_OK);
         CHECK(info.samplerate == 48000 && info.channel_count == 2);
         moq_cmaf_packager_destroy(p);
     }

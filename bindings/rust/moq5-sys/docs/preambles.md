@@ -80,6 +80,7 @@ No muxer, no decoder, no session integration.
 
 All string/byte fields in parsed output borrow from the input
 buffer. The input must remain valid while the output is in use.
+Parsing never allocates.
 
 Link against moq::cmaf (depends only on moq::core).
 ```
@@ -94,7 +95,7 @@ No network, no sessions.
 
 Link against moq::msf (depends on moq::core; when built with
 moq::media-object and moq::cmaf, also provides the
-moq_msf_track_to_media_info() helper via <moq/msf_media.h>).
+moq_msf_track_to_media_info_sized() helper via <moq/msf_media.h>).
 
 Lifetime: string fields in the parsed catalog borrow from the
 internal JSON DOM, which itself is allocated via the caller's

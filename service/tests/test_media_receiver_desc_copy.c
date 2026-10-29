@@ -344,8 +344,6 @@ static bool span_is(moq_bytes_t s, const char *lit)
 static bool written_prefix_valid(const void *p, size_t n)
 {
     static const size_t bool_offsets[] = {
-        offsetof(moq_media_track_desc_t, has_init),
-        offsetof(moq_media_track_desc_t, init) + offsetof(moq_cmaf_init_info_t, has_cenc),
         offsetof(moq_media_track_desc_t, has_width),
         offsetof(moq_media_track_desc_t, has_height),
         offsetof(moq_media_track_desc_t, has_samplerate),
@@ -423,7 +421,8 @@ static void check_fixture_fields(oracle_t *o, const char *phase,
         PROW("info_packaging_carried", out->info.packaging == borrowed->info.packaging);
     }
     PROW("info_stamp_carried_verbatim", out->info.struct_size == borrowed->info.struct_size);
-    PROW("has_init_false", !out->has_init);
+    PROW("cmaf_record_absent", out->cmaf == NULL && out->cmaf == borrowed->cmaf);
+    PROW("codec_config_absent", out->codec_config.len == 0);
     PROW("init_data_absent", out->init_data.len == 0);
     PROW("width", out->has_width && out->width == FX_WIDTH);
     PROW("height", out->has_height && out->height == FX_HEIGHT);

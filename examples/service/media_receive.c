@@ -254,8 +254,8 @@ int main(int argc, char **argv)
             if (tev.kind == MOQ_MEDIA_TRACK_ADDED && tev.desc) {
                 /* Two distinct config bytes (both borrowed for the event --
                  * copy if retaining beyond this handler):
-                 *   - desc.init.codec_config: DECODER EXTRADATA (SPS/PPS/VPS,
-                 *     AAC ASC). Feed this to the decoder.
+                 *   - desc.codec_config: DECODER EXTRADATA (SPS/PPS/VPS,
+                 *     AAC ASC), for every packaging. Feed this to the decoder.
                  *   - desc.init_data: the full container/init segment (for CMAF
                  *     the ftyp+moov). Muxers/recorders want this, not decoders.
                  * desc.init_data is the *resolved* bytes regardless of how the
@@ -272,7 +272,7 @@ int main(int argc, char **argv)
                 moq_example_term_fprint(stdout, tev.desc->codec.data,
                                         tev.desc->codec.len);
                 printf(" codec_config(extradata)=%zu init_data(init segment)=%zu\n",
-                       tev.desc->init.codec_config.len,
+                       tev.desc->codec_config.len,
                        tev.desc->init_data.len);
 
                 /* CMSF metadata (all optional; absent on a plain MSF catalog).

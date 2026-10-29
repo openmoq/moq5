@@ -18,9 +18,10 @@ FULL = {
     "mime_type": b"video/mp4", "channel_config": None, "init_data": b"\x00\x00\x00\x08ftyp",
     "depends": (b"audio", b"cap\x00tions"), "content_protection_ref_ids": (b"kid-1",),
     "media_type": 1, "packaging": 2, "timescale": 90000, "transport_version": 16,
-    "init": {"codec_kind": 1, "timescale": 90000, "width": 1920, "height": 1080, "samplerate": 0,
+    "codec_config": b"\x01\x64\x00\x1f\xff",
+    "cmaf": {"codec_kind": 1, "timescale": 90000, "width": 1920, "height": 1080, "samplerate": 0,
              "channel_count": 0, "codec_config": b"\x01\x64\x00\x1f\xff", "track_id": 1,
-             "cenc": (b"cbcs", 1, 0, bytes(range(16)))},
+             "cenc": (b"cbcs", 1, 0, bytes(range(16))), "sample_entry": b"avc3"},
     "width": 1920, "height": 1080, "samplerate": None, "framerate_millis": 29970,
     "bitrate": 2**64 - 1, "max_grp_sap": 1, "max_obj_sap": 2,
     "template": (1, 2, 3, 4, 5, 6, 2**64 - 1, 0),
@@ -30,9 +31,10 @@ FULL = {
 FULL_EXPECTED = moq5.TrackDescription(
     name=b"video\x00main", role=b"video", codec=b"avc1.64001f", lang=b"en", label=b"Main camera",
     media_type=moq5.MediaType.VIDEO, packaging=moq5.Packaging.CMAF, timescale=90000, transport_version=16,
-    init=moq5.CmafInit(moq5.CodecKind.AVC, 90000, 1920, 1080, 0, 0, b"\x01\x64\x00\x1f\xff", 1,
-                       moq5.Cenc(b"cbcs", 1, 0, bytes(range(16)))),
-    init_data=b"\x00\x00\x00\x08ftyp", width=1920, height=1080, samplerate=None, channel_config=None,
+    codec_config=b"\x01\x64\x00\x1f\xff", init_data=b"\x00\x00\x00\x08ftyp",
+    cmaf=moq5.CmafInit(moq5.CodecKind.AVC, 90000, 1920, 1080, 0, 0, b"\x01\x64\x00\x1f\xff", 1,
+                       moq5.Cenc(b"cbcs", 1, 0, bytes(range(16))), b"avc3"),
+    width=1920, height=1080, samplerate=None, channel_config=None,
     framerate_millis=29970, bitrate=2**64 - 1, max_grp_sap=1, max_obj_sap=2,
     content_protection_ref_ids=(b"kid-1",), packaging_text=b"cmaf", event_type=None,
     mime_type=b"video/mp4", depends=(b"audio", b"cap\x00tions"),
@@ -211,7 +213,8 @@ class TrackEventTests(unittest.TestCase):
         self.receiver.close()
         self.assertEqual(description, FULL_EXPECTED)
         self.assertEqual(description.depends[1], b"cap\x00tions")
-        self.assertEqual(description.init.cenc.default_kid, bytes(range(16)))
+        self.assertEqual(description.cmaf.cenc.default_kid, bytes(range(16)))
+        self.assertEqual(description.cmaf.sample_entry, b"avc3")
         self.endpoint.close()
 
     # ---- 4. current vs borrowed ----------------------------------------------
@@ -286,61 +289,65 @@ class TrackEventTests(unittest.TestCase):
         d = self.receiver.poll_track().description
         self.assertIsNone(d.transport_version)
         self.assertEqual((d.media_type, d.packaging, d.timescale), (moq5.MediaType.VIDEO, moq5.Packaging.CMAF, 90000))
-        # init: stamps between fields
+        # cmaf record: everything through default_kid is its frozen floor;
+        # past it each field gates on its own end. A newer library's larger
+        # record is read up to this build's size.
+        floor = dict(width=1920, height=1080, samplerate=0, channel_count=0,
+                     codec_config=b"\x01\x64\x00\x1f\xff", track_id=1,
+                     cenc=moq5.Cenc(b"cbcs", 1, 0, bytes(range(16))))
         cases = [
-            (L["init_width_end"], dict(width=1920, height=None, samplerate=None, channel_count=None,
-                                       codec_config=None, track_id=None, cenc=None)),
-            (L["init_codec_config_end"], dict(width=1920, height=1080, samplerate=0, channel_count=0,
-                                              codec_config=b"\x01\x64\x00\x1f\xff", track_id=None, cenc=None)),
-            (L["init_has_cenc_end"] - 1, dict(width=1920, height=1080, samplerate=0, channel_count=0,
-                                              codec_config=b"\x01\x64\x00\x1f\xff", track_id=1, cenc=None)),
-            # has_cenc fits and is true: CENC is PRESENT, each field on its own end
-            (L["init_has_cenc_end"], dict(track_id=1, cenc=moq5.Cenc(None, None, None, None))),
-            (L["init_scheme_end"], dict(cenc=moq5.Cenc(b"cbcs", None, None, None))),
-            (L["init_default_is_protected_end"], dict(cenc=moq5.Cenc(b"cbcs", 1, None, None))),
-            (L["init_default_per_sample_iv_size_end"], dict(cenc=moq5.Cenc(b"cbcs", 1, 0, None))),
-            (L["init_default_kid_end"], dict(cenc=moq5.Cenc(b"cbcs", 1, 0, bytes(range(16))))),
-            (L["init_sizeof"], dict(cenc=moq5.Cenc(b"cbcs", 1, 0, bytes(range(16))))),
+            (L["cmaf_v0"], dict(floor, sample_entry=None)),
+            (L["cmaf_sample_entry_end"] - 1, dict(floor, sample_entry=None)),
+            (L["cmaf_sample_entry_end"], dict(floor, sample_entry=b"avc3")),
+            (L["cmaf_sizeof"], dict(floor, sample_entry=b"avc3")),
+            (L["cmaf_sizeof"] + 8, dict(floor, sample_entry=b"avc3")),
         ]
         for stamp, expect in cases:
-            with self.subTest(init_stamp=stamp):
-                b = self.track({**FULL, "init_stamp": stamp})
+            with self.subTest(cmaf_stamp=stamp):
+                b = self.track({**FULL, "cmaf_stamp": stamp})
                 self.push(K.ADDED, b)
-                init = self.receiver.poll_track().description.init
-                self.assertEqual(init.codec_kind, moq5.CodecKind.AVC)
+                record = self.receiver.poll_track().description.cmaf
+                self.assertEqual(record.codec_kind, moq5.CodecKind.AVC)
                 for key, value in expect.items():
-                    self.assertEqual(getattr(init, key), value, key)
-        # a present ZERO is distinct from absence: iv size 0 at its end vs None below it
-        zero = {**FULL, "init": {**FULL["init"], "cenc": (b"cenc", 0, 0, bytes(16))}}
-        for stamp, expect in ((L["init_default_per_sample_iv_size_end"] - 1, moq5.Cenc(b"cenc", 0, None, None)),
-                              (L["init_default_per_sample_iv_size_end"], moq5.Cenc(b"cenc", 0, 0, None)),
-                              (L["init_default_kid_end"], moq5.Cenc(b"cenc", 0, 0, bytes(16)))):
+                    self.assertEqual(getattr(record, key), value, key)
+        # a present ZERO is distinct from absence: a zero sample entry at its
+        # end vs None below it, and zero CENC values inside the floor
+        zero = {**FULL, "cmaf": {**FULL["cmaf"], "cenc": (b"cenc", 0, 0, bytes(16)), "sample_entry": bytes(4)}}
+        for stamp, entry in ((L["cmaf_sample_entry_end"] - 1, None), (L["cmaf_sample_entry_end"], bytes(4))):
             with self.subTest(zero_stamp=stamp):
-                z = self.track({**zero, "init_stamp": stamp})
+                z = self.track({**zero, "cmaf_stamp": stamp})
                 self.push(K.ADDED, z)
-                self.assertEqual(self.receiver.poll_track().description.init.cenc, expect)
+                record = self.receiver.poll_track().description.cmaf
+                self.assertEqual(record.cenc, moq5.Cenc(b"cenc", 0, 0, bytes(16)))
+                self.assertEqual(record.sample_entry, entry)
+        # no parsed record (a LOC track): the extradata is still the common span
+        loc = self.track({**FULL, "packaging": 1, "packaging_text": b"loc", "cmaf": None})
+        self.push(K.ADDED, loc)
+        d = self.receiver.poll_track().description
+        self.assertIsNone(d.cmaf)
+        self.assertEqual(d.codec_config, b"\x01\x64\x00\x1f\xff")
         # has_cenc false: absent regardless of the stamp
-        nocenc = self.track({**FULL, "init": {**FULL["init"], "cenc": None}})
+        nocenc = self.track({**FULL, "cmaf": {**FULL["cmaf"], "cenc": None}})
         self.push(K.ADDED, nocenc)
-        self.assertIsNone(self.receiver.poll_track().description.init.cenc)
+        self.assertIsNone(self.receiver.poll_track().description.cmaf.cenc)
         # absent optional fields are None, never zero
         c = self.track({"name": b"bare", "packaging_text": b"loc", "is_live": False})
         self.push(K.ADDED, c)
         d = self.receiver.poll_track().description
         self.assertEqual(d.name, b"bare")
         for key in ("role", "codec", "lang", "label", "media_type", "packaging", "timescale", "transport_version",
-                    "init", "width", "height", "samplerate", "channel_config", "framerate_millis", "bitrate",
+                    "cmaf", "width", "height", "samplerate", "channel_config", "framerate_millis", "bitrate",
                     "max_grp_sap", "max_obj_sap", "event_type", "mime_type", "template"):
             self.assertIsNone(getattr(d, key), key)
-        self.assertEqual((d.init_data, d.depends, d.content_protection_ref_ids), (b"", (), ()))
+        self.assertEqual((d.codec_config, d.init_data, d.depends, d.content_protection_ref_ids), (b"", b"", (), ()))
         self.assertEqual(d.vod, moq5.VodState(False, None))
         # invalid stamps are binding faults naming the boundary
         for stamp_key, value, stage in (("desc_stamp", L["desc_v0"] - 1, "description.struct_size"),
                                         ("desc_stamp", L["desc_sizeof"] + 1, "description.struct_size"),
                                         ("info_stamp", L["info_v0"] - 1, "description.info.struct_size"),
                                         ("info_stamp", L["info_sizeof"] + 1, "description.info.struct_size"),
-                                        ("init_stamp", 0, "description.init.struct_size"),
-                                        ("init_stamp", L["init_sizeof"] + 1, "description.init.struct_size")):
+                                        ("cmaf_stamp", 0, "description.cmaf.struct_size"),
+                                        ("cmaf_stamp", L["cmaf_v0"] - 1, "description.cmaf.struct_size")):
             with self.subTest(stamp_key=stamp_key, value=value):
                 e = self.track({**FULL, stamp_key: value})
                 self.push(K.ADDED, e)
@@ -352,7 +359,8 @@ class TrackEventTests(unittest.TestCase):
     def test_invalid_spans_counts_and_copy_refusal_are_event_lost(self):
         for which, stage in (("name", "description.name"), ("depends", "description.depends"),
                              ("content_protection_ref_ids", "description.content_protection_ref_ids"),
-                             ("codec_config", "description.init.codec_config"), ("init_data", "description.init_data")):
+                             ("codec_config", "description.codec_config"), ("init_data", "description.init_data"),
+                             ("cmaf.codec_config", "description.cmaf.codec_config")):
             with self.subTest(which=which):
                 a = self.track({**FULL, "null_span": which})
                 self.push(K.UPDATED, a)
@@ -382,7 +390,8 @@ class TrackEventTests(unittest.TestCase):
         cases = [({"oversized_count": "depends"}, "description.depends"),
                  ({"oversized_count": "content_protection_ref_ids"}, "description.content_protection_ref_ids"),
                  ({"oversized_len": "name"}, "description.name"),
-                 ({"oversized_len": "codec_config"}, "description.init.codec_config"),
+                 ({"oversized_len": "codec_config"}, "description.codec_config"),
+                 ({"oversized_len": "cmaf.codec_config"}, "description.cmaf.codec_config"),
                  ({"oversized_len": "depends"}, "description.depends")]
         for knob, stage in cases:
             with self.subTest(**knob):

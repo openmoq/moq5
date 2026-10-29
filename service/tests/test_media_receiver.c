@@ -1248,7 +1248,8 @@ static bool bytes_is(moq_bytes_t b, const char *s)
 
 /* Run a discovery-only receiver against a server serving catalog_json, and
  * capture the first track's resolved init bytes (desc.init_data). Returns
- * whether desc.has_init was set; *out_len/out hold the decoded init bytes. */
+ * whether the description carried init data; *out_len/out hold the decoded
+ * init bytes. */
 static bool discover_first_init(const char *cert, const char *key,
                                 const char *catalog_json,
                                 uint8_t *out, size_t cap, size_t *out_len)
@@ -1277,7 +1278,7 @@ static bool discover_first_init(const char *cert, const char *key,
             (void)moq_media_receiver_wait(r, 100000);
             while (moq_media_receiver_poll_track(r, &ev, sizeof(ev)) == MOQ_OK) {
                 if (ev.kind == MOQ_MEDIA_TRACK_ADDED && ev.desc) {
-                    has_init = ev.desc->has_init;
+                    has_init = ev.desc->init_data.len > 0;
                     size_t n = ev.desc->init_data.len;
                     if (n && n <= cap) {
                         memcpy(out, ev.desc->init_data.data, n);
@@ -1453,7 +1454,8 @@ int main(int argc, char **argv)
             MOQ_TEST_CHECK(d->has_framerate &&
                            d->framerate_millis == 30000);
             MOQ_TEST_CHECK(d->has_bitrate && d->bitrate == 2000000);
-            MOQ_TEST_CHECK(!d->has_init);
+            MOQ_TEST_CHECK(d->init_data.len == 0 && d->codec_config.len == 0 &&
+                           d->cmaf == NULL);
         }
         if (audio) {
             const moq_media_track_desc_t *d = moq_media_track_desc_get(audio);
@@ -1465,7 +1467,8 @@ int main(int argc, char **argv)
             MOQ_TEST_CHECK(d->has_samplerate && d->samplerate == 48000);
             MOQ_TEST_CHECK(bytes_is(d->channel_config, "2"));
             MOQ_TEST_CHECK(bytes_is(d->lang, "en"));
-            MOQ_TEST_CHECK(!d->has_init);
+            MOQ_TEST_CHECK(d->init_data.len == 0 && d->codec_config.len == 0 &&
+                           d->cmaf == NULL);
         }
 
         /* Queue drained, nothing terminal: DONE. */
@@ -2268,7 +2271,8 @@ int main(int argc, char **argv)
     /* == RAW/LOC catalog initData survives to TRACK_ADDED ================ *
      * Regression: a LOC track's catalog initData (the encoder's decoder
      * config) must reach the receiver as desc.init_data, and be exposed as
-     * desc.init.codec_config so consumers read extradata uniformly. */
+     * desc.codec_config so consumers read extradata uniformly; a LOC track
+     * has no parsed CMAF record. */
     {
         const moq_alloc_t *al = moq_alloc_default();
         static const uint8_t extradata[] = {
@@ -2308,22 +2312,23 @@ int main(int argc, char **argv)
             bool got = false;
             uint8_t init_copy[64] = {0}, cc_copy[64] = {0};
             size_t init_len = 0, cc_len = 0;
-            bool has_init = false, codec_ok = false;
+            bool has_init = false, codec_ok = false, no_record = false;
             uint32_t timescale = 0;
             moq_media_track_event_t ev;
             for (int i = 0; i < 300 && !got; i++) {
                 (void)moq_media_receiver_wait(r, 100000);
                 while (moq_media_receiver_poll_track(r, &ev, sizeof(ev)) == MOQ_OK) {
                     if (ev.kind == MOQ_MEDIA_TRACK_ADDED && ev.desc) {
-                        has_init = ev.desc->has_init;
+                        has_init = ev.desc->init_data.len > 0;
+                        no_record = ev.desc->cmaf == NULL;
                         timescale = ev.desc->info.timescale;
                         codec_ok = bytes_is(ev.desc->codec, "av01");
                         init_len = ev.desc->init_data.len;
                         if (init_len && init_len <= sizeof(init_copy))
                             memcpy(init_copy, ev.desc->init_data.data, init_len);
-                        cc_len = ev.desc->init.codec_config.len;
+                        cc_len = ev.desc->codec_config.len;
                         if (cc_len && cc_len <= sizeof(cc_copy))
-                            memcpy(cc_copy, ev.desc->init.codec_config.data, cc_len);
+                            memcpy(cc_copy, ev.desc->codec_config.data, cc_len);
                         got = true;
                     }
                 }
@@ -2335,10 +2340,11 @@ int main(int argc, char **argv)
             /* desc.init_data == the original extradata (decoded). */
             MOQ_TEST_CHECK_EQ_U64(init_len, sizeof(extradata));
             MOQ_TEST_CHECK(memcmp(init_copy, extradata, sizeof(extradata)) == 0);
-            /* desc.init.codec_config == the same bytes (uniform extradata). */
+            /* desc.codec_config == the same bytes (uniform extradata). */
             MOQ_TEST_CHECK_EQ_U64(cc_len, sizeof(extradata));
             MOQ_TEST_CHECK(memcmp(cc_copy, extradata, sizeof(extradata)) == 0);
             MOQ_TEST_CHECK(has_init);
+            MOQ_TEST_CHECK(no_record);
 
             moq_media_receiver_destroy(r);
             server_stop(srv);
@@ -2466,9 +2472,9 @@ int main(int argc, char **argv)
         server_stop(srv);
     }
 
-    /* == CMSF §4.2: protected CMAF init params surfaced via desc.init ==== *
+    /* == CMSF §4.2: protected CMAF init params surfaced via desc.cmaf ==== *
      * A CMAF track's CENC init segment (sinf/schm/schi/tenc) is parsed and the
-     * tenc parameters reach the app on desc.init (has_cenc + scheme + KID +
+     * tenc parameters reach the app on desc.cmaf (has_cenc + scheme + KID +
      * isProtected + IV size), while the original codec stays resolved. */
     {
         const moq_alloc_t *al = moq_alloc_default();
@@ -2514,20 +2520,26 @@ int main(int argc, char **argv)
                                   (int)MOQ_OK);
 
             bool got = false, cenc = false, sch = false, kidok = false;
+            bool entry_ok = false;
             uint8_t isprot = 0, ivsz = 0;
             moq_media_track_event_t ev;
             for (int i = 0; i < 300 && !got; i++) {
                 (void)moq_media_receiver_wait(r, 100000);
                 while (moq_media_receiver_poll_track(r, &ev, sizeof(ev)) == MOQ_OK) {
                     if (ev.kind == MOQ_MEDIA_TRACK_ADDED && ev.desc) {
-                        if (ev.desc->has_init && ev.desc->init.has_cenc) {
+                        const moq_cmaf_init_info_t *rec = ev.desc->cmaf;
+                        if (rec && rec->has_cenc) {
                             cenc = true;
-                            sch = bytes_is(ev.desc->init.scheme, "cbcs");
-                            isprot = ev.desc->init.default_is_protected;
-                            ivsz = ev.desc->init.default_per_sample_iv_size;
-                            kidok = (ev.desc->init.default_kid.len == 16) &&
-                                memcmp(ev.desc->init.default_kid.data,
-                                       kid, 16) == 0;
+                            sch = bytes_is(rec->scheme, "cbcs");
+                            isprot = rec->default_is_protected;
+                            ivsz = rec->default_per_sample_iv_size;
+                            kidok = (rec->default_kid.len == 16) &&
+                                memcmp(rec->default_kid.data, kid, 16) == 0;
+                            /* frma names the original entry; the common
+                             * extradata is the record's own span. */
+                            entry_ok = rec->sample_entry == UINT32_C(0x61766331) &&
+                                ev.desc->codec_config.data == rec->codec_config.data &&
+                                ev.desc->codec_config.len == rec->codec_config.len;
                         }
                         got = true;
                     }
@@ -2538,6 +2550,7 @@ int main(int argc, char **argv)
             MOQ_TEST_CHECK(cenc);
             MOQ_TEST_CHECK(sch);
             MOQ_TEST_CHECK(isprot == 1);
+            MOQ_TEST_CHECK(entry_ok);
             MOQ_TEST_CHECK(ivsz == 8);
             MOQ_TEST_CHECK(kidok);
             moq_media_receiver_destroy(r);

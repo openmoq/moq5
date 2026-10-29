@@ -106,11 +106,16 @@ static int find_box_nested_rc(const uint8_t *data, size_t len,
 
 /* -- Init functions -------------------------------------------------- */
 
-void moq_cmaf_init_info_init(moq_cmaf_init_info_t *info)
+_Static_assert(MOQ_CMAF_INIT_INFO_V0_SIZE ==
+               offsetof(moq_cmaf_init_info_t, sample_entry),
+               "sample_entry starts at the v0 floor, outside its tail padding");
+
+void moq_cmaf_init_info_init_sized(moq_cmaf_init_info_t *info, size_t info_size)
 {
-    if (!info) return;
-    memset(info, 0, sizeof(*info));
-    info->struct_size = sizeof(*info);
+    if (!info || info_size < sizeof(info->struct_size)) return;
+    size_t n = info_size < sizeof(*info) ? info_size : sizeof(*info);
+    memset(info, 0, n);
+    info->struct_size = (uint32_t)n;
 }
 
 void moq_cmaf_fragment_info_init(moq_cmaf_fragment_info_t *info,
@@ -342,6 +347,7 @@ static moq_result_t parse_stsd_entry(const uint8_t *stsd_box,
     /* Only the first sample entry is parsed (multiple entries are not
      * iterated -- the established behavior). */
     uint32_t etype = box_type(body);
+    out->sample_entry = etype;
 
     bool is_visual = etype == FOURCC('a','v','c','1') ||
                      etype == FOURCC('a','v','c','3') ||
@@ -386,17 +392,16 @@ static moq_result_t parse_stsd_entry(const uint8_t *stsd_box,
         moq_result_t crc = parse_cenc_sinf(eb, eb_len, out, &frma);
         if (crc < 0) return crc;
         effective = frma;
+        out->sample_entry = frma;
     }
 
     return extract_codec_config(effective, eb, eb_len, out);
 }
 
-moq_result_t moq_cmaf_parse_init(moq_bytes_t init_segment,
-                                  moq_cmaf_init_info_t *out)
+/* The one init parser: fills a complete, zeroed current-size record. */
+static moq_result_t parse_init_full(moq_bytes_t init_segment,
+                                    moq_cmaf_init_info_t *out)
 {
-    if (!init_segment.data || !out) return MOQ_ERR_INVAL;
-    moq_cmaf_init_info_init(out);
-
     const uint32_t trak_path[] = {
         FOURCC('m','o','o','v'), FOURCC('t','r','a','k'),
     };
@@ -478,6 +483,28 @@ moq_result_t moq_cmaf_parse_init(moq_bytes_t init_segment,
     return parse_stsd_entry(stsd,
         (stbl_box.size - stbl_box.hdr) - (size_t)(stsd - (stbl + stbl_box.hdr)),
         out);
+}
+
+moq_result_t moq_cmaf_parse_init_sized(moq_bytes_t init_segment,
+                                       moq_cmaf_init_info_t *out,
+                                       size_t out_size)
+{
+    if (!init_segment.data || !out || out_size < MOQ_CMAF_INIT_INFO_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    /* Parse into a private complete record, then hand over the caller's
+     * prefix: a smaller caller never has bytes past its size written, and a
+     * failed parse leaves no partial observation behind. */
+    moq_cmaf_init_info_t full;
+    moq_cmaf_init_info_init_sized(&full, sizeof(full));
+    moq_result_t rc = parse_init_full(init_segment, &full);
+    if (rc != MOQ_OK) {
+        moq_cmaf_init_info_init_sized(out, out_size);
+        return rc;
+    }
+    size_t n = out_size < sizeof(full) ? out_size : sizeof(full);
+    memcpy(out, &full, n);
+    out->struct_size = (uint32_t)n;
+    return MOQ_OK;
 }
 
 /* -- parse_fragment -------------------------------------------------- */

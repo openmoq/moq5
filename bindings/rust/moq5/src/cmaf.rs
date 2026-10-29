@@ -135,6 +135,15 @@ impl<'segment> InitInfo<'segment> {
             default_per_sample_iv_size: self.0.default_per_sample_iv_size,
         })
     }
+    /// The sample entry's format as its four bytes: a clear entry's own
+    /// type (`avc1`, `avc3`, `hvc1`, `hev1`, ...), or an encrypted entry's
+    /// `frma` original format, never `encv`/`enca`. Any value, including
+    /// zero, is reported as read; `None` when the library did not report it.
+    #[must_use]
+    pub fn sample_entry(&self) -> Option<[u8; 4]> {
+        let end = ffi::field_end!(sys::moq_cmaf_init_info_t, sample_entry, u32);
+        ffi::covers(self.0.struct_size, end).then(|| self.0.sample_entry.to_be_bytes())
+    }
     /// The raw struct.
     #[must_use]
     pub fn raw(&self) -> &'segment sys::moq_cmaf_init_info_t {
@@ -154,6 +163,7 @@ impl fmt::Debug for InitInfo<'_> {
             .field("channel_count", &self.channel_count())
             .field("track_id", &self.track_id())
             .field("cenc", &self.cenc())
+            .field("sample_entry", &self.sample_entry())
             .finish()
     }
 }
@@ -174,13 +184,12 @@ impl CmafInit {
     pub fn parse(data: impl Into<Box<[u8]>>) -> Result<CmafInit> {
         let data = data.into();
         let mut raw = sys::moq_cmaf_init_info_t::default();
-        // SAFETY: raw is writable; the span borrows `data` for the call and
-        // the parsed spans point into it, which the result keeps.
-        let code = unsafe {
-            sys::moq_cmaf_init_info_init(&mut raw);
-            sys::moq_cmaf_parse_init(ffi::span(&data), &mut raw)
-        };
-        ffi::check(code)?;
+        let size = mem::size_of_val(&raw);
+        // SAFETY: raw is a writable record of the size passed; the span
+        // borrows `data` for the call and the parsed spans point into it,
+        // which the result keeps.
+        ffi::check(unsafe { sys::moq_cmaf_parse_init_sized(ffi::span(&data), &mut raw, size) })?;
+        ffi::check_stamp(raw.struct_size, sys::MOQ_CMAF_INIT_INFO_V0_SIZE, size)?;
         Ok(CmafInit { data, raw })
     }
 
@@ -411,6 +420,117 @@ pub fn sap_from_sample_flags(flags: u32) -> SapType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = u32::try_from(8 + body.len())
+            .expect("a test box fits a 32-bit size")
+            .to_be_bytes()
+            .to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// ftyp + moov(trak(tkhd mdia(mdhd minf(stbl(stsd(<entry>)))))): one
+    /// sample entry of type `entry` with a zeroed `fixed`-byte body, an
+    /// optional configuration box and, when `original` is given, a
+    /// sinf(frma schm schi(tenc)) whose frma names it.
+    fn init_segment(
+        entry: &[u8; 4],
+        fixed: usize,
+        config: Option<(&[u8; 4], &[u8])>,
+        original: Option<&[u8; 4]>,
+    ) -> Vec<u8> {
+        let mut body = vec![0u8; fixed];
+        if let Some((kind, bytes)) = config {
+            body.extend(boxed(kind, bytes));
+        }
+        if let Some(original) = original {
+            let mut tenc = [0u8; 24];
+            tenc[6] = 1; // default_isProtected
+            for (byte, value) in tenc[8..].iter_mut().zip(0x30u8..) {
+                *byte = value; // default_KID
+            }
+            let sinf = [
+                boxed(b"frma", original),
+                boxed(b"schm", b"\0\0\0\0cbcs\0\x01\0\0"),
+                boxed(b"schi", &boxed(b"tenc", &tenc)),
+            ]
+            .concat();
+            body.extend(boxed(b"sinf", &sinf));
+        }
+        let stsd = boxed(
+            b"stsd",
+            &[&[0, 0, 0, 0, 0, 0, 0, 1][..], &boxed(entry, &body)[..]].concat(),
+        );
+        let mdhd = boxed(
+            b"mdhd",
+            &[&[0u8; 12][..], &90000u32.to_be_bytes()[..]].concat(),
+        );
+        let tkhd = boxed(b"tkhd", &[&[0u8; 12][..], &7u32.to_be_bytes()[..]].concat());
+        let mdia = boxed(
+            b"mdia",
+            &[mdhd, boxed(b"minf", &boxed(b"stbl", &stsd))].concat(),
+        );
+        let trak = boxed(b"trak", &[tkhd, mdia].concat());
+        [boxed(b"ftyp", b"isom\0\0\0\0isom"), boxed(b"moov", &trak)].concat()
+    }
+
+    #[test]
+    fn sample_entries() {
+        let avcc: &[u8] = &[0x01, 0x64, 0x00, 0x1f, 0xff];
+        let clear = CmafInit::parse(init_segment(b"avc1", 78, Some((b"avcC", avcc)), None))
+            .expect("a clear avc1 header parses");
+        assert_eq!(clear.info().codec_kind(), CodecKind::Avc);
+        assert_eq!(clear.info().sample_entry(), Some(*b"avc1"));
+        assert_eq!(clear.info().codec_config(), avcc);
+        assert!(clear.info().cenc().is_none());
+
+        let encrypted = CmafInit::parse(init_segment(
+            b"encv",
+            78,
+            Some((b"avcC", avcc)),
+            Some(b"avc3"),
+        ))
+        .expect("an encrypted avc3 header parses");
+        assert_eq!(
+            encrypted.info().sample_entry(),
+            Some(*b"avc3"),
+            "the frma original format, not encv"
+        );
+        assert_eq!(encrypted.info().codec_kind(), CodecKind::Avc);
+        assert_eq!(
+            encrypted.info().cenc().map(|cenc| cenc.scheme),
+            Some(&b"cbcs"[..])
+        );
+
+        for entry in [*b"zzzz", [0; 4], [0xff; 4]] {
+            let unknown = CmafInit::parse(init_segment(&entry, 16, None, None))
+                .expect("a header with an unknown sample entry parses");
+            assert_eq!(unknown.info().codec_kind(), CodecKind::Unknown);
+            assert_eq!(
+                unknown.info().sample_entry(),
+                Some(entry),
+                "reported as read, zero included"
+            );
+        }
+    }
+
+    #[test]
+    fn sample_entry_needs_its_whole_field() {
+        let end = ffi::field_end!(sys::moq_cmaf_init_info_t, sample_entry, u32);
+        let mut raw = sys::moq_cmaf_init_info_t::default();
+        for (stamp, reported) in [
+            (sys::MOQ_CMAF_INIT_INFO_V0_SIZE, None),
+            (end - 1, None),
+            (end, Some([0; 4])),
+        ] {
+            raw.struct_size = u32::try_from(stamp).expect("a record size fits u32");
+            // SAFETY: the record holds no spans.
+            let info = unsafe { InitInfo::from_raw(&raw) };
+            assert_eq!(info.sample_entry(), reported, "stamp {stamp}");
+        }
+    }
 
     #[test]
     fn rejects_garbage() {

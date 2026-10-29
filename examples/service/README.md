@@ -188,8 +188,11 @@ Codec init/decoder config travels in the **catalog**, not in the media objects:
   retry immediately. The service does not repeat track init in media objects.
 - The receiver gets two forms at `TRACK_ADDED` (both **borrowed** for the event
   — copy if you retain them):
-  - `desc.init.codec_config` — the **decoder extradata** (SPS/PPS/VPS, AAC ASC).
-    This is what you feed a decoder.
+  - `desc.codec_config` — the **decoder extradata** (SPS/PPS/VPS, AAC ASC), for
+    every packaging. This is what you feed a decoder. For a CMAF track whose
+    init segment parsed, `desc.cmaf` also points at the parsed header record
+    (codec kind, dimensions, sample entry such as `avc1` vs `avc3`, CENC
+    parameters); it is NULL for LOC and MPEG-TS tracks.
   - `desc.init_data` — the **full container/init segment** (for CMAF the
     `ftyp`+`moov`). Muxers/recorders that reproduce the container want this;
     decoders usually do **not**. This is the **resolved** segment whether the
@@ -219,7 +222,7 @@ Where a polled object's media bytes live depends on `obj.packaging`:
   slice; keep the whole `fragment` if you need the framing.
 - **RAW / LOC / simple** objects put the media in `obj.payload` (`obj.fragment`
   is empty).
-- For decoder setup, prefer `desc.init.codec_config` (extradata). Reach for
+- For decoder setup, prefer `desc.codec_config` (extradata). Reach for
   `desc.init_data` only when you need the full init segment (e.g. a muxer or
   recorder reproducing `ftyp`+`moov`).
 

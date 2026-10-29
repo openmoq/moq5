@@ -26,6 +26,11 @@ public struct CMAFInitInfo: Sendable, Equatable {
     public let channelCount: UInt32
     /// Codec-specific configuration bytes, copied from the init segment.
     public let codecConfig: Data
+    /// The sample entry's format, `(a<<24)|(b<<16)|(c<<8)|d`: a clear
+    /// entry's own type (`avc1`, `avc3`, `hvc1`, `hev1`, ...), an encrypted
+    /// entry's `frma` original format. Any value, including zero, is reported
+    /// as read; nil when the library did not report it.
+    public let sampleEntry: UInt32?
 }
 
 // MARK: - Parse Error
@@ -48,9 +53,10 @@ public enum CMAFParser {
             let bytes = moq_bytes_t(data: ptr, len: buf.count)
 
             var info = moq_cmaf_init_info_t()
-            moq_cmaf_init_info_init(&info)
+            let size = MemoryLayout<moq_cmaf_init_info_t>.size
+            moq_cmaf_init_info_init_sized(&info, size)
 
-            let rc = moq_cmaf_parse_init(bytes, &info)
+            let rc = moq_cmaf_parse_init_sized(bytes, &info, size)
             if rc == MOQ_ERR_INVAL { throw CMAFParseError.invalidArgument }
             if rc < 0 { throw CMAFParseError.malformed }
 
@@ -78,7 +84,10 @@ public enum CMAFParser {
                 height: info.height,
                 samplerate: info.samplerate,
                 channelCount: info.channel_count,
-                codecConfig: config
+                codecConfig: config,
+                sampleEntry: Int(info.struct_size) >= MemoryLayout<moq_cmaf_init_info_t>
+                    .offset(of: \.sample_entry)! + MemoryLayout<UInt32>.size
+                    ? info.sample_entry : nil
             )
         }
     }

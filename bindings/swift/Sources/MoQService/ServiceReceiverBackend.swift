@@ -103,8 +103,7 @@ func copyTrackDescription(_ desc: moq_media_track_desc_t) -> TrackDescription? {
     copy.trackDuration = desc.has_track_duration
         ? .milliseconds(desc.track_duration_ms) : nil
     copy.initData = optionalData(desc.init_data)
-    copy.codecConfig = desc.has_init
-        ? optionalData(desc.`init`.codec_config) : nil
+    copy.codecConfig = optionalData(desc.codec_config)
     return copy
 }
 

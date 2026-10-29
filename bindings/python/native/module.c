@@ -1019,13 +1019,21 @@ static PyObject *opt_enum(uint64_t value)
     return PyLong_FromUnsignedLongLong(value);
 }
 
-static PyObject *init_dict(PyObject *module, PyObject *kind, const moq_cmaf_init_info_t *init)
+static PyObject *cmaf_dict(PyObject *module, PyObject *kind, const moq_cmaf_init_info_t *record)
 {
-    /* No documented floor: the stamp must cover at least struct_size and no
-     * more than sizeof; every field is gated on its own compiled end. */
-    uint32_t stamp = init->struct_size;
-    if (stamp < sizeof(init->struct_size) || stamp > sizeof(*init))
-        return event_lost(module, kind, "description.init.struct_size");
+    /* The record is the library's, at the library's size, which may be larger
+     * than this build's (a newer library) or smaller (an older one). Read only
+     * the bytes its stamp and this build's size both cover, into a zeroed
+     * copy; every field past the frozen floor is gated on its own end. */
+    uint32_t stamp;
+    memcpy(&stamp, record, sizeof(stamp));
+    if (stamp < MOQ_CMAF_INIT_INFO_V0_SIZE)
+        return event_lost(module, kind, "description.cmaf.struct_size");
+    moq_cmaf_init_info_t copy;
+    memset(&copy, 0, sizeof(copy));
+    if (stamp > sizeof(copy)) stamp = (uint32_t)sizeof(copy);
+    memcpy(&copy, record, stamp);
+    const moq_cmaf_init_info_t *init = &copy;
     ALLOCATION_GATE();
     PyObject *d = PyDict_New();
     if (!d) return NULL;
@@ -1037,15 +1045,18 @@ static PyObject *init_dict(PyObject *module, PyObject *kind, const moq_cmaf_init
     INIT_FIELD("height", height, PyLong_FromUnsignedLong(init->height));
     INIT_FIELD("samplerate", samplerate, PyLong_FromUnsignedLong(init->samplerate));
     INIT_FIELD("channel_count", channel_count, PyLong_FromUnsignedLong(init->channel_count));
-    INIT_FIELD("codec_config", codec_config, span_copy(module, kind, "description.init.codec_config", init->codec_config, 0));
+    INIT_FIELD("codec_config", codec_config, span_copy(module, kind, "description.cmaf.codec_config", init->codec_config, 0));
     INIT_FIELD("track_id", track_id, PyLong_FromUnsignedLong(init->track_id));
+    uint8_t entry[4] = { (uint8_t)(init->sample_entry >> 24), (uint8_t)(init->sample_entry >> 16),
+                         (uint8_t)(init->sample_entry >> 8), (uint8_t)init->sample_entry };
+    INIT_FIELD("sample_entry", sample_entry, PyBytes_FromStringAndSize((const char *)entry, 4));
 #undef INIT_FIELD
     if (COVERS(stamp, moq_cmaf_init_info_t, has_cenc) && init->has_cenc) {
         /* CENC is PRESENT once has_cenc fits and is true; each of its fields
          * is gated on its own end, so a later absent field never discards an
          * earlier present one. */
         PyObject *scheme = COVERS(stamp, moq_cmaf_init_info_t, scheme)
-                               ? span_copy(module, kind, "description.init.scheme", init->scheme, 0)
+                               ? span_copy(module, kind, "description.cmaf.scheme", init->scheme, 0)
                                : Py_NewRef(Py_None);
         if (!scheme) goto fail;
         PyObject *protected_ = COVERS(stamp, moq_cmaf_init_info_t, default_is_protected)
@@ -1055,7 +1066,7 @@ static PyObject *init_dict(PyObject *module, PyObject *kind, const moq_cmaf_init
                            ? PyLong_FromLong((long)init->default_per_sample_iv_size) : Py_NewRef(Py_None);
         if (!iv) { Py_DECREF(scheme); Py_DECREF(protected_); goto fail; }
         PyObject *kid = COVERS(stamp, moq_cmaf_init_info_t, default_kid)
-                            ? span_copy(module, kind, "description.init.default_kid", init->default_kid, 0)
+                            ? span_copy(module, kind, "description.cmaf.default_kid", init->default_kid, 0)
                             : Py_NewRef(Py_None);
         if (!kid) { Py_DECREF(scheme); Py_DECREF(protected_); Py_DECREF(iv); goto fail; }
         PyObject *cenc = Py_BuildValue("(OOOO)", scheme, protected_, iv, kid);
@@ -1101,13 +1112,14 @@ static PyObject *description_dict(PyObject *module, PyObject *kind, const moq_me
     if (put(d, "transport_version",
             COVERS(info_stamp, moq_media_track_info_t, transport_version)
                 ? opt_enum(desc->info.transport_version) : Py_NewRef(Py_None)) < 0) goto fail;
-    if (desc->has_init) {
-        if (put(d, "init", init_dict(module, kind, &desc->init)) < 0) goto fail;
-    } else if (put(d, "init", Py_NewRef(Py_None)) < 0) {
-        goto fail;
-    }
+    SPAN("codec_config", codec_config, 0);
     if (site_fails("description.init_data")) goto fail;
     SPAN("init_data", init_data, 0);
+    if (desc->cmaf) {
+        if (put(d, "cmaf", cmaf_dict(module, kind, desc->cmaf)) < 0) goto fail;
+    } else if (put(d, "cmaf", Py_NewRef(Py_None)) < 0) {
+        goto fail;
+    }
     OPT("width", has_width, width);
     OPT("height", has_height, height);
     OPT("samplerate", has_samplerate, samplerate);

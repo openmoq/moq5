@@ -78,17 +78,17 @@ def _metadata(value: dict | None) -> MediaMetadata | None:
 
 def _description(d: dict) -> TrackDescription:
     """Build the owned, immutable description from the bridge's copied values."""
-    init = None
-    if d["init"] is not None:
-        i = d["init"]
+    cmaf = None
+    if d["cmaf"] is not None:
+        i = d["cmaf"]
         cenc = None
         if i["cenc"] is not None:
             scheme, protected, iv_size, kid = i["cenc"]
             cenc = Cenc(scheme, protected, iv_size, kid)
-        init = CmafInit(
+        cmaf = CmafInit(
             None if i["codec_kind"] is None else _known_or_int(CodecKind, i["codec_kind"]),
             i["timescale"], i["width"], i["height"], i["samplerate"], i["channel_count"],
-            i["codec_config"], i["track_id"], cenc,
+            i["codec_config"], i["track_id"], cenc, i["sample_entry"],
         )
     template = None if d["template"] is None else MediaTemplate(*d["template"])
     return TrackDescription(
@@ -101,8 +101,9 @@ def _description(d: dict) -> TrackDescription:
         packaging=None if d["packaging"] is None else _known_or_int(Packaging, d["packaging"]),
         timescale=d["timescale"],
         transport_version=d["transport_version"],
-        init=init,
+        codec_config=d["codec_config"],
         init_data=d["init_data"],
+        cmaf=cmaf,
         width=d["width"],
         height=d["height"],
         samplerate=d["samplerate"],

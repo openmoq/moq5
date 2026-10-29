@@ -111,8 +111,9 @@ below it.
   (release with `moq_media_object_cleanup` on the polling thread); `write` MOQ_OK
   transfers your payload to the service (on any non-OK you still own it).
 - **Decoder config & CMAF bytes (footguns):** codec init config travels in the
-  catalog, not in objects — `desc.init.codec_config` is the decoder extradata
-  (SPS/PPS/VPS, AAC ASC), `desc.init_data` is the full container/init segment.
+  catalog, not in objects — `desc.codec_config` is the decoder extradata
+  (SPS/PPS/VPS, AAC ASC), `desc.init_data` is the full container/init segment,
+  and `desc.cmaf` is the parsed CMAF header record (NULL for LOC and MPEG-TS).
   For CMAF objects the media bytes are the mdat slice of `obj.fragment`
   (`obj.payload` is empty); RAW/LOC objects use `obj.payload`.
 
@@ -305,6 +306,30 @@ conformance, specialized apps); treat the WebTransport adapters as experimental;
 never include the wire-codec or transport-bridge headers as application API.
 Adapter APIs are mature enough for integration pilots but may still change
 before 1.0.
+
+### Track metadata: a deliberate source and ABI break
+
+The parsed CMAF header record changed shape, and its previous forms were
+removed rather than kept beside the new ones:
+
+- `moq_media_track_desc_t` no longer embeds a `moq_cmaf_init_info_t init` or
+  carries `has_init`. The decoder extradata is `desc.codec_config` for every
+  packaging, the catalog's init bytes stay `desc.init_data`, and the parsed
+  CMAF header is `desc.cmaf`, a pointer that is NULL unless the track's init
+  data is a CMAF header that parsed.
+- `moq_cmaf_init_info_t` gains `sample_entry` and is a sized record:
+  `moq_cmaf_parse_init_sized` replaces `moq_cmaf_parse_init`, and
+  `moq_cmaf_init_info_init_sized` replaces the exported
+  `moq_cmaf_init_info_init` (which remains as a macro passing the caller's
+  size). A reader uses a field only when the record's `struct_size` covers
+  all of it.
+- `moq_msf_track_to_media_info_sized` takes the init record's size; the
+  unsized `moq_msf_track_to_media_info` is removed.
+
+The track description's layout changed with it, so a binary built against
+the previous headers is not compatible with this library. Rebuild libmoq, the
+C++, Rust, Swift and Python bindings, and every application against the same
+headers, together.
 
 ## Project structure
 
