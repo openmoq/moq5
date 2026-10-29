@@ -243,12 +243,17 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
     #   1. LINK CLOSURE comes from the installed pkg-config metadata alone.
     #      No -l/-L is injected, so a gap in Requires:/Libs.private surfaces
     #      as a link failure rather than being papered over.
-    #   2. RUNTIME DISCOVERY of a nonstandard relocated private prefix is the
-    #      consumer's own responsibility. This lane records consumer-owned
+    #   2. RUNTIME DISCOVERY of a nonstandard relocated private prefix is
+    #      deployment-owned, never installed metadata. The consumers record
     #      RPATHs naming exactly the relocated LibMoQ prefix, the accepted
-    #      WTQuic prefix and the selected MsQuic directory -- no ambient
-    #      fallback, no system loader change, and nothing added to any
-    #      installed .pc file.
+    #      WTQuic prefix and the selected MsQuic directory. On Darwin those
+    #      entries are the whole runtime setup. On glibc they become
+    #      DT_RUNPATH, which serves only the executable's own dependencies,
+    #      not the dependencies of a private shared library it loads; there
+    #      each positive run also gets a test-process LD_LIBRARY_PATH naming
+    #      exactly the directories of the selected shared artifacts -- never
+    #      ambient values, never a system loader change, and nothing added to
+    #      any installed .pc file or binary. Other Linux loaders are refused.
     #
     # `--static` asks pkg-config for the PRIVATE dependency closure. It is not
     # a linker mode and does not by itself select archives; which of a DSO or
@@ -350,6 +355,59 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
         endif()
         list(REMOVE_DUPLICATES _expect)
 
+        # The runtime setup for the positive runs. Darwin: the consumer's own
+        # recorded paths, with inherited loader overrides scrubbed only where
+        # the trace runs (unchanged). glibc: additionally this process's
+        # LD_LIBRARY_PATH, replaced (not appended) with exactly the
+        # directories that hold the selected shared images.
+        set(_loader none)
+        if(CMAKE_HOST_APPLE)
+            set(_loader dyld)
+        elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+            find_program(_getconf getconf)
+            if(_getconf)
+                moq_consumer_execute(COMMAND "${_getconf}" GNU_LIBC_VERSION
+                    TIMEOUT 10 RESULT_VARIABLE _libc_rc
+                    OUTPUT_VARIABLE _libc_out ERROR_VARIABLE _libc_err)
+                if(_libc_rc STREQUAL "0" AND _libc_out MATCHES "^glibc [0-9]+\\.")
+                    set(_loader glibc)
+                endif()
+            endif()
+            if(NOT _loader STREQUAL "glibc")
+                message(FATAL_ERROR
+                    "the installed-consumer runtime setup is defined for "
+                    "Darwin and glibc only; this Linux loader is not glibc "
+                    "(getconf GNU_LIBC_VERSION: '${_libc_out}${_libc_err}'); "
+                    "this gate does not skip")
+            endif()
+        endif()
+        set(_run_env "")
+        set(_neg_env "")
+        if(_loader STREQUAL "glibc")
+            set(_runtime_dirs "")
+            foreach(_f IN LISTS _expect)
+                get_filename_component(_d "${_f}" DIRECTORY)
+                list(APPEND _runtime_dirs "${_d}")
+            endforeach()
+            list(REMOVE_DUPLICATES _runtime_dirs)
+            string(REPLACE ";" ":" _runtime_path "${_runtime_dirs}")
+            set(_neg_env ${CMAKE_COMMAND} -E env
+                --unset=LD_LIBRARY_PATH --unset=LD_PRELOAD)
+            if(_runtime_path STREQUAL "")
+                # an all-archive closure has no image to find
+                set(_run_env ${_neg_env})
+                set(_trace_search --unset=LD_LIBRARY_PATH)
+            else()
+                message(STATUS
+                    "glibc test-process LD_LIBRARY_PATH=${_runtime_path}")
+                set(_run_env ${CMAKE_COMMAND} -E env --unset=LD_PRELOAD
+                    "LD_LIBRARY_PATH=${_runtime_path}")
+                set(_trace_search "LD_LIBRARY_PATH=${_runtime_path}")
+            endif()
+        else()
+            set(_trace_search --unset=LD_LIBRARY_PATH)
+        endif()
+
         # (a) THE DISCRIMINATOR, and it only means something when a LibMoQ or
         #     WTQuic layer comes from a private-prefix shared object: with no
         #     runtime path such a consumer must fail BEFORE main. If it ever
@@ -358,8 +416,10 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
         #     LibMoQ and WTQuic layers are archives has no private-prefix image
         #     to find, so it must run even when its external MsQuic dependency
         #     is shared but directly loadable (for example, by absolute Darwin
-        #     install name or the system loader cache).
-        moq_consumer_execute(COMMAND "${WORK}/msquic_pc_consumer"
+        #     install name or the system loader cache). On glibc it runs with
+        #     inherited loader search/preload overrides removed and without
+        #     the positive runs' LD_LIBRARY_PATH.
+        moq_consumer_execute(COMMAND ${_neg_env} "${WORK}/msquic_pc_consumer"
             RESULT_VARIABLE _rc OUTPUT_VARIABLE _o ERROR_VARIABLE _o)
         if(_private_prefix_shared)
             if(_rc EQUAL 0)
@@ -379,11 +439,14 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
                     "the no-runtime-path consumer failed for a reason that is "
                     "NOT the pre-main missing-library refusal (rc=${_rc}):\n${_o}")
             endif()
+            string(STRIP "${_o}" _o_line)
+            message(STATUS "no-runtime-path control refused before main "
+                           "(rc=${_rc}): ${_o_line}")
         else()
             if(NOT _rc EQUAL 0)
                 # Archive WT/LibMoQ can still depend on a private shared MsQuic
                 # with an @rpath install name. Require the exact loader failure;
-                # the consumer-owned RPATH check below must then make it run.
+                # the consumer's runtime setup below must then make it run.
                 loader_is_missing_library("${_rc}" "${_o}"
                     "${CMAKE_HOST_SYSTEM_NAME}" _is_missing)
                 if(NOT _msq_shared OR NOT _is_missing)
@@ -393,7 +456,8 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
                 endif()
             endif()
         endif()
-        # (b) the SAME link closure, plus consumer-owned RPATHs
+        # (b) the SAME link closure, plus consumer-owned RPATHs, run with the
+        #     runtime setup above
         moq_consumer_execute(
             COMMAND ${_cc} -std=c11 "${SRC}/main_msquic.c"
                 -o "${WORK}/msquic_pc_consumer_rpath"
@@ -408,7 +472,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
         if(NOT "${_out}" STREQUAL "")
             message(FATAL_ERROR "unexpected compiler/linker output:\n${_out}")
         endif()
-        moq_consumer_execute(COMMAND "${WORK}/msquic_pc_consumer_rpath"
+        moq_consumer_execute(COMMAND ${_run_env} "${WORK}/msquic_pc_consumer_rpath"
             RESULT_VARIABLE _rc OUTPUT_VARIABLE _o2 ERROR_VARIABLE _e2)
         if(NOT _rc EQUAL 0)
             message(FATAL_ERROR
@@ -455,7 +519,7 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
                 message(FATAL_ERROR
                     "unexpected output from the --libs link:\n${_out}")
             endif()
-            moq_consumer_execute(COMMAND "${WORK}/msquic_pc_consumer_pub"
+            moq_consumer_execute(COMMAND ${_run_env} "${WORK}/msquic_pc_consumer_pub"
                 RESULT_VARIABLE _rc OUTPUT_VARIABLE _o1 ERROR_VARIABLE _e1)
             if(NOT _rc EQUAL 0)
                 message(FATAL_ERROR
@@ -509,14 +573,15 @@ if(DEFINED MSQUIC_MANAGED AND MSQUIC_MANAGED)
                 message(FATAL_ERROR
                     "a required consumer executable is missing: ${_exe}")
             endif()
-            # inherited loader overrides are scrubbed: this run must stand on
-            # the consumer's own recorded paths
+            # inherited loader overrides are scrubbed: this run stands on the
+            # consumer's own recorded paths plus, on glibc, exactly the same
+            # test-process LD_LIBRARY_PATH as the positive runs above
             moq_consumer_execute(
                 COMMAND ${CMAKE_COMMAND} -E env
                     --unset=DYLD_LIBRARY_PATH
                     --unset=DYLD_FALLBACK_LIBRARY_PATH
                     --unset=DYLD_INSERT_LIBRARIES
-                    --unset=LD_LIBRARY_PATH --unset=LD_PRELOAD
+                    ${_trace_search} --unset=LD_PRELOAD
                     "${_trace_env}" "${WORK}/${_exe}"
                 RESULT_VARIABLE _rc OUTPUT_VARIABLE _out
                 ERROR_VARIABLE _loaded)

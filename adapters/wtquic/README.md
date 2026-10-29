@@ -240,7 +240,11 @@ cmake --build build-wtquic
 Consume `moq::adapter-wtquic-msquic-managed` (build tree) or
 `find_package(libmoq COMPONENTS adapter-wtquic-msquic-managed)`; a
 `libmoq-wtquic-msquic-managed.pc` is installed for pkg-config (its wtquic-msquic
-dependency carries the MsQuic search path). `test_wtquic_msquic_managed` /
+dependency supplies the MsQuic **link** metadata). The runtime search policy for
+MsQuic and for a custom or relocated prefix is deployment-owned: loader
+configuration, the process environment, or an intentional installed RPATH,
+which is then itself binary metadata chosen by the deployer.
+`test_wtquic_msquic_managed` /
 `_internal` are the black-box + white-box suites, `_loopback` is the real-MsQuic
 loopback, and `consumer/main_msquic.c[pp]` are the packaging smokes. Selecting
 it from the **service tier** is `MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC`
