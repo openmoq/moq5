@@ -173,8 +173,17 @@ wtq_result_t wtq_msquic_env_open(const wtq_msquic_env_cfg_t *c,
 }
 void wtq_msquic_env_close(wtq_msquic_env_t *e)
 { (void)e; forbidden_after_failed_barrier("env_close"); g_env_closes++; }
-void wtq_msquic_env_cfg_init(wtq_msquic_env_cfg_t *c)
-{ if (c) { memset(c, 0, sizeof(*c)); c->struct_size = (uint32_t)sizeof(*c); } }
+/* The provider's sized initializer, which the wtq_msquic_env_cfg_init source
+ * macro reaches, with its contract: nothing written below the size that holds
+ * struct_size, otherwise the clamped prefix of the current defaults, stamped. */
+void wtq_msquic_env_cfg_init_ex(wtq_msquic_env_cfg_t *c, size_t n)
+{
+    static const wtq_msquic_env_cfg_t def = WTQ_MSQUIC_ENV_CFG_INIT;
+    if (n > sizeof(def)) n = sizeof(def);
+    if (c == NULL || n < sizeof(c->struct_size)) return;
+    memcpy(c, &def, n);
+    c->struct_size = (uint32_t)n;
+}
 void wtq_msquic_client_cfg_init_ex(wtq_msquic_client_cfg_t *c, size_t n)
 { if (c) { memset(c, 0, n); c->struct_size = (uint32_t)n; } }
 void wtq_connect_config_init_ex(wtq_connect_config_t *c, size_t n)

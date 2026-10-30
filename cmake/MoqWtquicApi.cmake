@@ -58,20 +58,20 @@ int main(void) {
     set(${reason} "" PARENT_SCOPE)
 endfunction()
 
-# The MsQuic managed facade's stream-resource contract, checked only when that
-# component is required. The probe compiles against the installed MsQuic
-# header (the appended client/listener max_local_streams fields, at their
-# declared width, and the complete current initializers) AND links through
-# wtq::msquic the provider entry points the facade calls plus the core budget
-# query. It refuses an older header, a backend missing one of those entry
-# points and a core without the budget query. It cannot tell an older backend
-# library that exports the same entry points from a current one (the stream
-# plan adds no backend export): such a library links, and each WebTransport
-# session it creates is refused when the attach adapter's budget query returns
-# UNSUPPORTED, after establishment, not at managed create().
+# The MsQuic managed facade's stream-resource and keepalive contract, checked
+# only when that component is required. The probe compiles against the
+# installed MsQuic header (the appended client/listener max_local_streams
+# fields and the environment keep_alive_interval_ms, at their declared width,
+# and the complete current initializers) AND links through wtq::msquic the
+# provider entry points the facade calls, the sized environment initializer
+# and the core budget query. It refuses an older header, a backend missing one
+# of those entry points and a core without the budget query. The sized
+# environment initializer is exported only by backends that carry the
+# keepalive, so an older backend library is refused at link rather than
+# silently ignoring the facade's keepalive.
 function(moq_check_wtquic_msquic_api result reason)
     set(${result} FALSE PARENT_SCOPE)
-    set(_why "wtquic public API compile/link contract requires the MsQuic component's wtq_msquic_client_cfg_t/wtq_msquic_listener_cfg_t max_local_streams with wtq_msquic_client_cfg_init_ex, wtq_msquic_listener_cfg_init_ex, wtq_msquic_client_connect, wtq_msquic_listener_start and wtq_session_stream_budget (wtquic_DIR='${wtquic_DIR}').")
+    set(_why "wtquic public API compile/link contract requires the MsQuic component's wtq_msquic_client_cfg_t/wtq_msquic_listener_cfg_t max_local_streams and wtq_msquic_env_cfg_t keep_alive_interval_ms with wtq_msquic_client_cfg_init_ex, wtq_msquic_listener_cfg_init_ex, wtq_msquic_env_cfg_init_ex, wtq_msquic_client_connect, wtq_msquic_listener_start and wtq_session_stream_budget (wtquic_DIR='${wtquic_DIR}').")
     if(NOT TARGET wtq::msquic)
         set(${reason} "${_why} Imported target wtq::msquic is unavailable." PARENT_SCOPE)
         return()
@@ -95,6 +95,8 @@ static void (*volatile client_init)(wtq_msquic_client_cfg_t *, size_t) =
     wtq_msquic_client_cfg_init_ex;
 static void (*volatile listener_init)(wtq_msquic_listener_cfg_t *, size_t) =
     wtq_msquic_listener_cfg_init_ex;
+static void (*volatile env_init)(wtq_msquic_env_cfg_t *, size_t) =
+    wtq_msquic_env_cfg_init_ex;
 static wtq_result_t (*volatile client_connect)(wtq_msquic_env_t *,
     const wtq_msquic_client_cfg_t *, wtq_session_t **) =
     wtq_msquic_client_connect;
@@ -106,11 +108,13 @@ static wtq_result_t (*volatile stream_budget)(const wtq_session_t *,
 int main(void) {
     wtq_msquic_client_cfg_t client = WTQ_MSQUIC_CLIENT_CFG_INIT;
     wtq_msquic_listener_cfg_t listener = WTQ_MSQUIC_LISTENER_CFG_INIT;
+    wtq_msquic_env_cfg_t env = WTQ_MSQUIC_ENV_CFG_INIT;
     uint32_t *client_local = &client.max_local_streams;
     uint32_t *listener_local = &listener.max_local_streams;
-    return *client_local != 0 || *listener_local != 0 ||
-           client_init == 0 || listener_init == 0 || client_connect == 0 ||
-           listener_start == 0 || stream_budget == 0;
+    uint32_t *keep_alive = &env.keep_alive_interval_ms;
+    return *client_local != 0 || *listener_local != 0 || *keep_alive != 0 ||
+           client_init == 0 || listener_init == 0 || env_init == 0 ||
+           client_connect == 0 || listener_start == 0 || stream_budget == 0;
 }
 ]=])
     set(CMAKE_TRY_COMPILE_TARGET_TYPE EXECUTABLE)

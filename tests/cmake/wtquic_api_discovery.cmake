@@ -50,6 +50,18 @@ function(write_probe path)
     string(APPEND command " RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)\n")
     file(WRITE "${path}" "${command}")
 endfunction()
+# A refused MsQuic probe's own build output names the missing capability.
+function(keepalive_cause name text)
+    set(log "${WORK}/${name}/CMakeFiles/moq-wtquic-msquic-api/output.log")
+    if(NOT EXISTS "${log}")
+        message(FATAL_ERROR "${name}: no probe output at ${log}")
+    endif()
+    file(READ "${log}" probe)
+    string(FIND "${probe}" "${text}" at)
+    if(at EQUAL -1)
+        message(FATAL_ERROR "${name}: refusal does not name ${text}: ${probe}")
+    endif()
+endfunction()
 file(MAKE_DIRECTORY "${WORK}")
 # Exercise the same context builder/function boundary on every host without
 # requiring that host's compiler to support multiple target architectures.
@@ -130,7 +142,8 @@ endforeach()
 # still defines every probed entry point links: that is availability, not
 # qualification (such a session's budget query is refused at attach).
 probe_context(C context)
-foreach(kind msquic-old msquic-new msquic-missing)
+foreach(kind msquic-old msquic-new msquic-missing msquic-keepalive-old
+             msquic-keepalive-missing)
     run("${kind}-configure" pass "${CMAKE_COMMAND}" -G "${GENERATOR}"
         -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_fixture" -B "${WORK}/${kind}"
         "-DAPI_KIND=${kind}" "-DPROBE_CONFIG=${CONFIG}"
@@ -142,7 +155,8 @@ foreach(lang C CXX)
     probe_context("${lang}" context)
     # row: msquic header kind, msquic library kind, core library kind, expected
     foreach(row "new;new;new;pass" "old;new;new;fail" "new;old;new;pass"
-                "new;missing;new;fail" "new;new;flush;fail")
+                "new;missing;new;fail" "new;new;flush;fail"
+                "keepalive-old;new;new;fail" "new;keepalive-missing;new;fail")
         list(GET row 0 header)
         list(GET row 1 library)
         list(GET row 2 core)
@@ -158,6 +172,11 @@ foreach(lang C CXX)
             "-DFIXTURE_MSQUIC_INCLUDE=${WORK}/msquic-${header}/include"
             "-DFIXTURE_MSQUIC_LIBRARY=${lib_msquic-${library}}" ${context})
     endforeach()
+    # The keepalive refusals name what is missing: the header's field, then
+    # the library's sized initializer, not some unrelated dependency.
+    keepalive_cause("${lang}-msquic-keepalive-old-new-new" "keep_alive_interval_ms")
+    keepalive_cause("${lang}-msquic-new-keepalive-missing-new"
+                    "wtq_msquic_env_cfg_init_ex")
     # Repeat in the successful build dir, changing only one library input: a
     # cached success must not survive replacement of either library.
     set(good "${WORK}/${lang}-msquic-new-new-new")
@@ -170,6 +189,13 @@ foreach(lang C CXX)
     run("${lang}-msquic-restored" pass "${CMAKE_COMMAND}"
         -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe" -B "${good}"
         "-DFIXTURE_MSQUIC_LIBRARY=${lib_msquic-new}" "-DFIXTURE_LIBRARY=${lib_new}")
+    run("${lang}-msquic-stale-keepalive" fail "${CMAKE_COMMAND}"
+        -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe" -B "${good}"
+        "-DFIXTURE_MSQUIC_LIBRARY=${lib_msquic-keepalive-missing}")
+    keepalive_cause("${lang}-msquic-new-new-new" "wtq_msquic_env_cfg_init_ex")
+    run("${lang}-msquic-restored-keepalive" pass "${CMAKE_COMMAND}"
+        -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe" -B "${good}"
+        "-DFIXTURE_MSQUIC_LIBRARY=${lib_msquic-new}")
 endforeach()
 file(MAKE_DIRECTORY "${WORK}/warning/include/wtquic")
 file(READ "${WORK}/new/include/wtquic/session.h" warning_header)

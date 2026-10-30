@@ -23,6 +23,10 @@ int main()
     cfg.host = "127.0.0.1";
     cfg.port = 4433;
     cfg.on_lane_pump = pump;
+    /* the sized initializer covers keepalive with 0 (explicitly off) */
+    if (cfg.keep_alive_interval_ms != 0)
+        return 1;
+    cfg.keep_alive_interval_ms = 15000;
     moq_wtquic_msquic_managed_t *m = nullptr;
     if (moq_wtquic_msquic_managed_create(&cfg, &m) != MOQ_OK || m == nullptr)
         return 1;

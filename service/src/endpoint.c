@@ -1924,6 +1924,10 @@ static moq_result_t ep_create_wtquic_msquic(moq_endpoint_t *ep,
      * each lane pump's recomputed deadline. Sized init covered the block. */
     fc.app_deadline_us = moq_endpoint_app_deadline_us;
     fc.app_deadline_ctx = ep;
+    /* Same idle-publisher policy as the other QUIC backends: emit QUIC
+     * keepalive before common relay idle timers can reap a quiet publisher.
+     * Sized init covered the field. */
+    fc.keep_alive_interval_ms = 15000;
     /* WebTransport wire profile: map the service enum EXPLICITLY onto the
      * adapter enum. The two do NOT share numeric values -- the service enum
      * carries a BACKEND_DEFAULT sentinel the adapter has no notion of. The

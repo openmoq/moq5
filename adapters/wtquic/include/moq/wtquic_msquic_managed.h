@@ -388,6 +388,24 @@ typedef struct moq_wtquic_msquic_managed_cfg {
     MOQ_WTQUIC_MSQUIC_CFG_TAIL_ALIGNAS uint32_t max_local_streams;
     uint32_t peer_uni_streams;
     uint32_t peer_bidi_streams;
+
+    /* appended: QUIC keepalive. Like the blocks above, it starts at the
+     * aggregate's own alignment. Applies to every connection this facade
+     * owns -- the client connection and each accepted server connection --
+     * and is forwarded to wtquic's environment keep_alive_interval_ms: a QUIC
+     * PING once a connection has been idle this many milliseconds. Every
+     * value is accepted.
+     *
+     *   covered -- struct_size includes the whole field: the value is passed
+     *     on as set, so 0 explicitly DISABLES keepalive. 0 is what
+     *     moq_wtquic_msquic_managed_cfg_init_sized writes.
+     *   absent or partial -- no keepalive is configured, so MsQuic's own
+     *     setting applies (normally disabled), as before this field existed.
+     *
+     * An interval at or above the connection's effective idle timeout never
+     * fires. Transport keepalive only; it implies no MoQ or session
+     * deadline. */
+    MOQ_WTQUIC_MSQUIC_CFG_TAIL_ALIGNAS uint32_t keep_alive_interval_ms;
 } moq_wtquic_msquic_managed_cfg_t;
 
 /* How a server path authorizes the client's serialized Origin. Facade-owned:

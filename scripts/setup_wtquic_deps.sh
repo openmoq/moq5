@@ -100,7 +100,8 @@ WTQUIC_REPO="${WTQUIC_REPO:-https://github.com/rwl4/wtquic.git}"
 # registration for GCC pedantic WAE, and the accounted receive/bounded stream
 # admission APIs and independent stream budgets required by the adapter.
 # No downstream WTQuic patches apply.
-WTQUIC_REF="${WTQUIC_REF:-1fdcf48230adffa70a0c5d2ba19ba8f933bf2f67}"
+# Also supplies sized environment keepalive for the MsQuic managed facade.
+WTQUIC_REF="${WTQUIC_REF:-8ca279205edd9399c816a694a2d6e7e1dbc9b219}"
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)

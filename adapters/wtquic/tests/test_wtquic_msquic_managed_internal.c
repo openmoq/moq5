@@ -3048,6 +3048,107 @@ static void test_env_cfg_forwarding(void)
     }
 }
 
+/* --- env config keepalive: covered values pass through, absent stays absent
+ * A facade config covering keep_alive_interval_ms hands wtquic a config that
+ * covers it too, with the same value (0 included: explicitly off). One whose
+ * struct_size stops before or inside the field hands wtquic a config that
+ * stops before it, so MsQuic's own keepalive setting applies. Each facade
+ * config is an exact-size heap object, so a read past it trips ASan. */
+static moq_wtquic_msquic_managed_t *make_sized_client(const moq_alloc_t *alloc,
+                                                      size_t size,
+                                                      uint32_t keep_alive)
+{
+    moq_wtquic_msquic_managed_cfg_t tmpl;
+    moq_wtquic_msquic_managed_cfg_init_sized(&tmpl, sizeof(tmpl));
+    tmpl.alloc = alloc;
+    tmpl.perspective = MOQ_PERSPECTIVE_CLIENT;
+    tmpl.host = "127.0.0.1";
+    tmpl.port = 443;
+    tmpl.on_lane_pump = pump;
+    tmpl.keep_alive_interval_ms = keep_alive;
+    tmpl.struct_size = (uint32_t)size;
+    unsigned char *raw = malloc(size);
+    CHECK(raw != NULL);
+    if (raw == NULL)
+        return NULL;
+    memcpy(raw, &tmpl, size);
+    moq_wtquic_msquic_managed_t *m = NULL;
+    CHECK(moq_wtquic_msquic_managed_create(
+              (const moq_wtquic_msquic_managed_cfg_t *)(const void *)raw, &m) ==
+          MOQ_OK);
+    free(raw);
+    return m;
+}
+
+static void test_env_cfg_keep_alive(void)
+{
+    const size_t full = sizeof(moq_wtquic_msquic_managed_cfg_t);
+    const size_t ka = offsetof(moq_wtquic_msquic_managed_cfg_t,
+                               keep_alive_interval_ms);
+    const size_t wt_full = sizeof(wtq_msquic_env_cfg_t);
+    const size_t wt_absent = offsetof(wtq_msquic_env_cfg_t,
+                                      keep_alive_interval_ms);
+    /* covered rows use the full size; the others end `extra` bytes into
+     * the field (0: right before it) */
+    static const struct {
+        bool covered;
+        size_t extra;
+        uint32_t value;
+    } rows[] = {
+        { true, 0, 0 },            /* the initializer's 0: explicitly off */
+        { true, 0, 15000 },
+        { true, 0, UINT32_MAX },
+        { false, 0, 15000 },
+        { false, 1, 15000 },
+        { false, 2, 15000 },
+        { false, 3, 15000 },
+    };
+
+    /* The sized initializer covers the field with 0. */
+    moq_wtquic_msquic_managed_cfg_t init;
+    memset(&init, 0xA5, sizeof(init));
+    moq_wtquic_msquic_managed_cfg_init_sized(&init, sizeof(init));
+    CHECK(init.keep_alive_interval_ms == 0);
+
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i) {
+        size_t size = rows[i].covered ? full : ka + rows[i].extra;
+        acnt_t a;
+        acnt_init(&a);
+        moq_alloc_t alloc = { &a, acnt_alloc, acnt_realloc, acnt_free };
+        moq_wtquic_msquic_managed_t *m =
+            make_sized_client(&alloc, size, rows[i].value);
+        if (m != NULL) {
+            wtq_msquic_env_cfg_t ecfg;
+            wtq_msquic_tuning_t defaults;
+            wtq_msquic_tuning_init(&defaults);
+            memset(&ecfg, 0xC3, sizeof(ecfg));
+            moq_wtquic_msquic_managed_test_fill_env_cfg(m, &ecfg);
+            if (rows[i].covered) {
+                CHECK(ecfg.struct_size == wt_full);
+                CHECK(ecfg.keep_alive_interval_ms == rows[i].value);
+            } else {
+                CHECK(ecfg.struct_size == wt_absent);
+            }
+            /* everything else is forwarded exactly as before */
+            CHECK(ecfg.tuning.struct_size == sizeof(ecfg.tuning));
+            CHECK(ecfg.tuning.idle_timeout_ms == defaults.idle_timeout_ms);
+            CHECK(ecfg.tuning.peer_unidi_stream_count ==
+                  defaults.peer_unidi_stream_count);
+            CHECK(ecfg.tuning.peer_bidi_stream_count ==
+                  defaults.peer_bidi_stream_count);
+            CHECK(ecfg.tuning.datagram_receive_enabled ==
+                  defaults.datagram_receive_enabled);
+            CHECK(ecfg.alloc != NULL && ecfg.alloc->alloc == acnt_alloc);
+            CHECK(ecfg.existing_api == NULL &&
+                  ecfg.existing_registration == NULL);
+            moq_wtquic_msquic_managed_stop(m);
+            moq_wtquic_msquic_managed_destroy(m);
+        }
+        CHECK(acnt_live(&a) == 0);
+        acnt_destroy(&a);
+    }
+}
+
 /* --- create-unwind OOM: facade allocations + real env_open --------------- */
 /* The fake connect (installed globally) allocates nothing, so injected OOM
  * exercises the facade's own allocations and the real env_open — never
@@ -5297,6 +5398,7 @@ int main(int argc, char **argv)
     test_guard_held_publication();
     test_draining_null_callback();
     test_env_cfg_forwarding();
+    test_env_cfg_keep_alive();
     test_create_unwind();
     test_connect_result_mapping();
     test_wait_state_machine();

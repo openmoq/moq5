@@ -210,6 +210,13 @@ _Static_assert(offsetof(moq_wtquic_msquic_managed_cfg_t, max_local_streams) >=
                        _Alignof(moq_wtquic_msquic_cfg_tail_align_t) == 0,
                "the stream-resource block starts at the aggregate's alignment, "
                "past the per-lane deadline block");
+_Static_assert(offsetof(moq_wtquic_msquic_managed_cfg_t, keep_alive_interval_ms) >=
+                   offsetof(moq_wtquic_msquic_managed_cfg_t, peer_bidi_streams) +
+                       sizeof(uint32_t) &&
+               offsetof(moq_wtquic_msquic_managed_cfg_t, keep_alive_interval_ms) %
+                       _Alignof(moq_wtquic_msquic_cfg_tail_align_t) == 0,
+               "the keepalive field starts at the aggregate's alignment, past "
+               "the stream-resource block");
 
 /* wtquic's accepted stream plan (wtquic_msquic.h): 3 <= U, 1 <= B,
  * U + B <= 1024, and 1 <= L <= 1024 when set. Checked at create() so a bad
@@ -584,6 +591,10 @@ struct moq_wtquic_msquic_managed {
     uint32_t max_local_streams;
     uint32_t peer_uni_streams;
     uint32_t peer_bidi_streams;
+    /* QUIC keepalive, and whether the caller's cfg covered it: an absent one
+     * stays absent for the provider too. */
+    bool keep_alive_set;
+    uint32_t keep_alive_interval_ms;
     /* the Origin contract: owned copies, freed in destroy */
     char *origin;                   /* client only; NULL = none */
     uint32_t origin_policy;         /* server only; 0 = UNSET */
@@ -1610,10 +1621,10 @@ static moq_result_t mm_map_wtq_result(wtq_result_t r)
 }
 
 /* Fill the env config: the bridged allocator (stored in m->wt_alloc for the
- * env's lifetime), the app name, and — only when the caller set a nonzero
- * idle_timeout_ms — the tuning with wtquic defaults plus that one override. A
- * zero idle timeout leaves tuning.struct_size == 0, which wtquic reads as "use
- * defaults". */
+ * env's lifetime), the app name, wtquic's default tuning with the facade's
+ * idle-timeout override (when one is set) and its resolved stream credits,
+ * and the keepalive: passed as set, 0 included, when the facade config
+ * covered it, otherwise left absent so MsQuic's own setting applies. */
 static void mm_fill_env_cfg(moq_wtquic_msquic_managed_t *m,
                             wtq_msquic_env_cfg_t *ecfg)
 {
@@ -1622,14 +1633,20 @@ static void mm_fill_env_cfg(moq_wtquic_msquic_managed_t *m,
     m->wt_alloc.realloc = m->alloc.realloc;
     m->wt_alloc.free = m->alloc.free;
 
+    /* wtquic's current initializer, sized to stop before
+     * keep_alive_interval_ms when the facade's caller supplied none: wtquic
+     * then reads the keepalive as absent. The tuning is always materialized
+     * (wtquic's defaults plus the overrides below) so the facade knows,
+     * rather than assumes, the DATAGRAM receive advertisement its
+     * connections carry. */
     memset(ecfg, 0, sizeof(*ecfg));
-    ecfg->struct_size = (uint32_t)sizeof(*ecfg);
+    wtq_msquic_env_cfg_init_ex(ecfg, m->keep_alive_set
+        ? sizeof(*ecfg)
+        : offsetof(wtq_msquic_env_cfg_t, keep_alive_interval_ms));
     ecfg->alloc = &m->wt_alloc;
     ecfg->app_name = "libmoq";
-    /* The tuning is always materialized (wtquic's defaults, plus the idle
-     * override when one was configured) so the facade knows, rather than
-     * assumes, the DATAGRAM receive advertisement its connections carry. */
-    wtq_msquic_tuning_init(&ecfg->tuning);
+    if (m->keep_alive_set)
+        ecfg->keep_alive_interval_ms = m->keep_alive_interval_ms;
     if (m->idle_timeout_ms != 0)
         ecfg->tuning.idle_timeout_ms = m->idle_timeout_ms;
     /* create() resolved unset credits to the provider defaults and checked
@@ -2671,6 +2688,12 @@ moq_result_t moq_wtquic_msquic_managed_create(
     m->max_local_streams = pre_local;
     m->peer_uni_streams = pre_uni;
     m->peer_bidi_streams = pre_bidi;
+    /* Keepalive is present only when the whole field is covered; a partial
+     * one is absent, and presence never depends on the value. */
+    if (MM_CFG_HAS(keep_alive_interval_ms)) {
+        m->keep_alive_set = true;
+        m->keep_alive_interval_ms = cfg->keep_alive_interval_ms;
+    }
     /* app_deadline_us + app_deadline_ctx are ONE ABI block: gated on the LAST
      * field's fit, so the pair is read together or not at all — never the
      * callback with a context read past the caller's struct. */
@@ -3761,8 +3784,8 @@ void moq_wtquic_msquic_managed_test_deliver_draining(
     m->client->adapter = saved;
 }
 
-/* Build the env config the client would open with (allocator bridge + tuning),
- * so a test can assert the forwarded idle timeout and bridged allocator. */
+/* Build the env config the facade opens with (allocator bridge, tuning and
+ * keepalive), so a test can assert what is forwarded to wtquic. */
 void moq_wtquic_msquic_managed_test_fill_env_cfg(
     moq_wtquic_msquic_managed_t *m, wtq_msquic_env_cfg_t *out)
 {

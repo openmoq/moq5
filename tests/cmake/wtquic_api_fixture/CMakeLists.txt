@@ -10,17 +10,27 @@ elseif(NOT PROBE_CONFIG IN_LIST CMAKE_CONFIGURATION_TYPES)
 endif()
 # Deliberately tiny ABI fixtures, not provider implementations or qualification.
 set(_api_kinds old query admission flush-mode flush-query flush new)
-set(_msquic_kinds msquic-old msquic-new msquic-missing)
+set(_msquic_kinds msquic-old msquic-new msquic-missing msquic-keepalive-old
+    msquic-keepalive-missing)
 if(API_KIND IN_LIST _msquic_kinds)
     # An MsQuic component over a separately built core fixture: only the
     # MsQuic header and library. msquic-old's header predates
-    # max_local_streams while its library defines every probed entry point;
-    # msquic-missing declares every entry point but defines no listener_start.
+    # max_local_streams and keep_alive_interval_ms while its library defines
+    # every probed entry point; msquic-missing declares every entry point but
+    # defines no listener_start. msquic-keepalive-old differs from msquic-new
+    # only in a header without keep_alive_interval_ms; msquic-keepalive-missing
+    # only in a library without wtq_msquic_env_cfg_init_ex.
     set(local_field "")
     set(local_init "")
     if(NOT API_KIND STREQUAL "msquic-old")
         set(local_field " uint32_t max_local_streams;")
         set(local_init ", 0")
+    endif()
+    set(keep_alive_field "")
+    set(keep_alive_init "")
+    if(NOT API_KIND MATCHES "^msquic-(old|keepalive-old)$")
+        set(keep_alive_field " uint32_t _reserved_keep_alive; uint32_t keep_alive_interval_ms;")
+        set(keep_alive_init ", 0, 0")
     endif()
     file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/include/wtquic")
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/include/wtquic/wtquic_msquic.h"
@@ -30,8 +40,11 @@ if(API_KIND IN_LIST _msquic_kinds)
         "typedef struct { uint32_t struct_size;${local_field} } wtq_msquic_listener_cfg_t;\n"
         "#define WTQ_MSQUIC_CLIENT_CFG_INIT { (uint32_t)sizeof(wtq_msquic_client_cfg_t)${local_init} }\n"
         "#define WTQ_MSQUIC_LISTENER_CFG_INIT { (uint32_t)sizeof(wtq_msquic_listener_cfg_t)${local_init} }\n"
+        "typedef struct { uint32_t struct_size;${keep_alive_field} } wtq_msquic_env_cfg_t;\n"
+        "#define WTQ_MSQUIC_ENV_CFG_INIT { (uint32_t)sizeof(wtq_msquic_env_cfg_t)${keep_alive_init} }\n"
         "void wtq_msquic_client_cfg_init_ex(wtq_msquic_client_cfg_t *, size_t);\n"
         "void wtq_msquic_listener_cfg_init_ex(wtq_msquic_listener_cfg_t *, size_t);\n"
+        "void wtq_msquic_env_cfg_init_ex(wtq_msquic_env_cfg_t *, size_t);\n"
         "wtq_result_t wtq_msquic_client_connect(wtq_msquic_env_t *, const wtq_msquic_client_cfg_t *, wtq_session_t **);\n"
         "wtq_result_t wtq_msquic_listener_start(wtq_msquic_env_t *, const wtq_msquic_listener_cfg_t *, wtq_msquic_listener_t **);\n"
         "#ifdef __cplusplus\n}\n#endif\n")
@@ -41,6 +54,9 @@ if(API_KIND IN_LIST _msquic_kinds)
         "wtq_result_t wtq_msquic_client_connect(wtq_msquic_env_t *e, const wtq_msquic_client_cfg_t *c, wtq_session_t **s) { (void)e; (void)c; (void)s; return -1; }\n")
     if(NOT API_KIND STREQUAL "msquic-missing")
         string(APPEND source "wtq_result_t wtq_msquic_listener_start(wtq_msquic_env_t *e, const wtq_msquic_listener_cfg_t *c, wtq_msquic_listener_t **l) { (void)e; (void)c; (void)l; return -1; }\n")
+    endif()
+    if(NOT API_KIND STREQUAL "msquic-keepalive-missing")
+        string(APPEND source "void wtq_msquic_env_cfg_init_ex(wtq_msquic_env_cfg_t *c, size_t n) { (void)c; (void)n; }\n")
     endif()
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/fixture.c" "${source}")
     add_library(fixture STATIC "${CMAKE_CURRENT_BINARY_DIR}/fixture.c")
