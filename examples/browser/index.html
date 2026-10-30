@@ -1,0 +1,24 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>libmoq browser receive</title>
+<pre id="out">loading</pre>
+<script src="moq_example_browser_receive.js"></script>
+<script>
+// index.html?url=https://relay:4433/moq&ns=live/cam1[&draft=18][&seconds=15]
+const q = new URLSearchParams(location.search);
+const out = document.getElementById('out');
+const say = s => { out.textContent += '\n' + s; };
+(async () => {
+  const M = await MoqReceive({ log: say });
+  const rc = M.ccall('receive_start', 'number', ['string', 'string', 'number'],
+                     [q.get('url'), q.get('ns'), parseInt(q.get('draft') || '0')]);
+  say('receive_start -> ' + rc);
+  if (rc) return;
+  const poll = setInterval(() => M._receive_poll(), 20);
+  await new Promise(r => setTimeout(r, 1000 * parseInt(q.get('seconds') || '15')));
+  clearInterval(poll);
+  say('draft ' + M._receive_version() + ', catalog ' + M._receive_catalog_ready() +
+      ', ' + M._receive_objects() + ' objects, ' + M._receive_bytes() + ' media bytes');
+  M._receive_stop();
+})();
+</script>

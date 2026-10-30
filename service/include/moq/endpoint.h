@@ -110,7 +110,7 @@ typedef enum moq_transport_backend {
                                            rejected with MOQ_ERR_UNSUPPORTED
                                            at connect. Else
                                            MOQ_ERR_UNSUPPORTED. */
-    MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC /* WEBTRANSPORT only, when compiled in
+    MOQ_TRANSPORT_BACKEND_WTQUIC_MSQUIC, /* WEBTRANSPORT only, when compiled in
                                            (moq_wtquic_msquic_managed, lane pump
                                            API; cross-platform wherever wtquic's
                                            MsQuic component builds; client-only,
@@ -132,6 +132,20 @@ typedef enum moq_transport_backend {
                                            The reserved CLI spelling is
                                            "wtquic-msquic" (never bare
                                            "wtquic"). Else MOQ_ERR_UNSUPPORTED. */
+    MOQ_TRANSPORT_BACKEND_BROWSER       /* WEBTRANSPORT only, when compiled in
+                                           (moq_wasm_wt_managed, built with
+                                           Emscripten): the browser's own
+                                           WebTransport API on the page's one
+                                           thread. AUTO WEBTRANSPORT resolves
+                                           here in a build with no pico_wt.
+                                           No network thread, so connect()
+                                           returns before the connection is up
+                                           and wait() is MOQ_ERR_UNSUPPORTED.
+                                           TLS is the browser's: an insecure
+                                           mode, a ca_file, a certificate
+                                           callback or an SNI override are
+                                           MOQ_ERR_UNSUPPORTED. RAW_QUIC is
+                                           MOQ_ERR_UNSUPPORTED. */
 } moq_transport_backend_t;
 
 /* -- Version negotiation (§5.2) -------------------------------------- *

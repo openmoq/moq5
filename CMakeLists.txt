@@ -84,6 +84,7 @@ option(MOQ_BUILD_WTQUIC_MSQUIC_MANAGED
 option(MOQ_BUILD_MSQUIC_MANAGED    "Build managed MsQuic raw-QUIC helper" OFF)
 option(MOQ_PICO_WT_BUILD_LOOPBACK "Build pico_wt loopback test (needs picoquic-test)" OFF)
 option(MOQ_BUILD_PICO_WT_MANAGED  "Build managed picoquic WebTransport helper" OFF)
+option(MOQ_BUILD_WASM_WT_MANAGED  "Build the browser (Emscripten) WebTransport facade" OFF)
 option(MOQ_BUILD_FUZZ              "Build fuzz targets"             OFF)
 option(MOQ_REQUIRE_FUZZ            "Fail if fuzz targets cannot be built" OFF)
 # Black-box JSONL probe over the MSF/CMSF catalog parser (requires moq-msf).
@@ -347,6 +348,15 @@ if(MOQ_BUILD_ADAPTER_MSQUIC)
             "src/inc/msquic.h, library under build/bin/).")
     endif()
     add_subdirectory(adapters/msquic)
+endif()
+
+if(MOQ_BUILD_WASM_WT_MANAGED)
+    if(NOT EMSCRIPTEN)
+        message(FATAL_ERROR
+            "MOQ_BUILD_WASM_WT_MANAGED=ON requires an Emscripten toolchain "
+            "(emcmake cmake ...): it drives the browser's WebTransport API")
+    endif()
+    add_subdirectory(adapters/wasm_wt)
 endif()
 
 if(MOQ_BUILD_PICO_WT_MANAGED AND NOT MOQ_BUILD_ADAPTER_PICO_WT)
@@ -646,7 +656,14 @@ endif()
 # compile against public headers + moq::service only. No add_test -- running
 # them needs a relay -- but they are always compiled for coverage.
 if(MOQ_BUILD_SERVICE AND MOQ_BUILD_EXAMPLES)
-    add_subdirectory(examples/service)
+    if(EMSCRIPTEN)
+        # A browser build runs no command-line examples; it has one page.
+        if(MOQ_BUILD_WASM_WT_MANAGED)
+            add_subdirectory(examples/browser)
+        endif()
+    else()
+        add_subdirectory(examples/service)
+    endif()
 endif()
 
 if(UNIX AND MOQ_BUILD_EXAMPLES AND TARGET moq::relay AND TARGET moq::adapter-msquic-managed)

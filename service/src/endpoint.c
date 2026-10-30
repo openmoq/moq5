@@ -122,6 +122,9 @@ static bool ep_backend_hosts_version(moq_transport_backend_t backend,
 #ifdef MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED
 #include <moq/wtquic_network_managed.h>
 #endif
+#ifdef MOQ_SERVICE_HAVE_WASM_WT_MANAGED
+#include <moq/wasm_wt_managed.h>
+#endif
 #ifdef MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED
 #include <moq/wtquic_msquic_managed.h>
 /* The service profile enum is mapped EXPLICITLY onto the adapter enum in
@@ -334,9 +337,30 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
      * (each rejects the other protocol). */
     switch (cfg->backend) {
     case MOQ_TRANSPORT_BACKEND_AUTO:
+#if defined(MOQ_SERVICE_HAVE_WASM_WT_MANAGED) && \
+    !defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED)
+        /* A browser build has no picoquic: AUTO WebTransport is the browser's
+         * own (a RAW_QUIC AUTO still resolves to picoquic and is refused at
+         * connect, since a page has no UDP). */
+        if (out->protocol == MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT) {
+            out->backend = MOQ_TRANSPORT_BACKEND_BROWSER;
+            break;
+        }
+#endif
+        /* fall through */
     case MOQ_TRANSPORT_BACKEND_PICOQUIC:
         out->backend = MOQ_TRANSPORT_BACKEND_PICOQUIC;
         break;
+    case MOQ_TRANSPORT_BACKEND_BROWSER:
+#ifdef MOQ_SERVICE_HAVE_WASM_WT_MANAGED
+        /* The browser's WebTransport API is WebTransport only. */
+        if (out->protocol != MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT)
+            return MOQ_ERR_UNSUPPORTED;
+        out->backend = MOQ_TRANSPORT_BACKEND_BROWSER;
+        break;
+#else
+        return MOQ_ERR_UNSUPPORTED;
+#endif
     case MOQ_TRANSPORT_BACKEND_MVFST:
 #ifdef MOQ_SERVICE_HAVE_MVFST_MANAGED
         /* mvfst is native QUIC only -- it has no WebTransport facade. */
@@ -771,6 +795,7 @@ static ep_task_t *ep_pop_task(moq_endpoint_t *ep)
     defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WASM_WT_MANAGED) || \
     defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
 /* Re-queue a task node at the tail without re-allocating it. */
 static void ep_requeue_task(moq_endpoint_t *ep, ep_task_t *t)
@@ -824,6 +849,7 @@ static void ep_drain_posted(moq_endpoint_t *ep, moq_session_t *session,
     defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WASM_WT_MANAGED) || \
     defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
 static moq_version_t ep_facade_negotiated_version(const moq_endpoint_t *ep);
 /*
@@ -1084,7 +1110,8 @@ static int ep_configure_quic(picoquic_quic_t *quic, void *ctx)
     defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
+    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WASM_WT_MANAGED)
 static void ep_classify_generic(bool is_fatal, uint64_t fatal_code,
                                 bool clean_closed,
                                 moq_endpoint_terminal_reason_t *reason,
@@ -1427,6 +1454,7 @@ void moq_endpoint_wake(moq_endpoint_t *ep)
     defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WASM_WT_MANAGED) || \
     defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
 static moq_version_t ep_facade_negotiated_version(const moq_endpoint_t *ep)
 {
@@ -1486,7 +1514,8 @@ static bool ep_terminal(const moq_endpoint_t *ep)
     defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
+    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WASM_WT_MANAGED)
 static char *ep_strdup_bytes(const moq_alloc_t *a, moq_bytes_t b, size_t *len)
 {
     char *p = (char *)a->alloc(b.len + 1, a->ctx);
@@ -1544,7 +1573,8 @@ static void ep_free_strings(moq_endpoint_t *ep)
     defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) || \
     defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) || \
-    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
+    defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) || \
+    defined(MOQ_SERVICE_HAVE_WASM_WT_MANAGED)
 
 typedef moq_result_t (*ep_backend_create_fn)(moq_endpoint_t *ep,
                                              const moq_endpoint_resolved_t *r,
@@ -1951,6 +1981,76 @@ static moq_result_t ep_create_wtquic_msquic(moq_endpoint_t *ep,
 }
 #endif
 
+#ifdef MOQ_SERVICE_HAVE_WASM_WT_MANAGED
+/*
+ * Browser WebTransport facade. No network thread: the facade runs this pump from
+ * its JavaScript event callbacks on the page's one thread, with a NULL session
+ * until the connection is ready (ep_pump_cycle defers posted tasks until then).
+ * wait() cannot block, so it reports MOQ_ERR_UNSUPPORTED and callers poll.
+ */
+static int ep_browser_pump(moq_wasm_wt_managed_t *m, uint64_t now_us, void *ctx)
+{
+    ep_pump_cycle((moq_endpoint_t *)ctx, moq_wasm_wt_managed_session(m), now_us);
+    return 0;
+}
+static moq_result_t  browser_vt_wait(void *f, uint64_t t) { return moq_wasm_wt_managed_wait((moq_wasm_wt_managed_t *)f, t); }
+static void          browser_vt_wake(void *f) { (void)moq_wasm_wt_managed_wake((moq_wasm_wt_managed_t *)f); }
+static moq_version_t browser_vt_negver(void *f) { return moq_wasm_wt_managed_negotiated_version((moq_wasm_wt_managed_t *)f); }
+static bool          browser_vt_is_fatal(void *f) { return moq_wasm_wt_managed_is_fatal((moq_wasm_wt_managed_t *)f); }
+static uint64_t      browser_vt_fatal_code(void *f) { return moq_wasm_wt_managed_fatal_code((moq_wasm_wt_managed_t *)f); }
+static bool          browser_vt_clean_closed(void *f) { return moq_wasm_wt_managed_is_closed((moq_wasm_wt_managed_t *)f); }
+/* The facade cannot see the browser's outbound queues, so it cannot prove a drain. */
+static int           browser_vt_drain_state(void *f) { (void)f; return EP_DRAIN_UNSUPPORTED; }
+static moq_result_t  browser_vt_stop(void *f) { return moq_wasm_wt_managed_stop((moq_wasm_wt_managed_t *)f); }
+static void          browser_vt_destroy(void *f) { moq_wasm_wt_managed_destroy((moq_wasm_wt_managed_t *)f); }
+static void          browser_vt_terminal(void *f, moq_endpoint_terminal_reason_t *r, uint64_t *d) {
+    /* The browser reports a rejected certificate or a refused CONNECT as one
+     * opaque failure: PROTOCOL when the facade has a code, else transport. */
+    moq_wasm_wt_managed_t *m = (moq_wasm_wt_managed_t *)f;
+    ep_classify_generic(moq_wasm_wt_managed_is_fatal(m), moq_wasm_wt_managed_fatal_code(m),
+        moq_wasm_wt_managed_is_closed(m), r, d);
+}
+static const ep_backend_vtable_t BROWSER_VT = {
+    browser_vt_wait, browser_vt_wake, browser_vt_negver, browser_vt_is_fatal,
+    browser_vt_fatal_code, browser_vt_clean_closed, browser_vt_drain_state,
+    browser_vt_stop, browser_vt_destroy, browser_vt_terminal,
+};
+
+static moq_result_t ep_create_browser(moq_endpoint_t *ep,
+                                      const moq_endpoint_resolved_t *r,
+                                      const moq_endpoint_cfg_t *cfg)
+{
+    /* TLS is the browser's. A mode it cannot honour is refused, not ignored. */
+    if (cfg->insecure_skip_verify || ep->ca_file != NULL || ep->verify_certificate != NULL)
+        return MOQ_ERR_UNSUPPORTED;
+    if (ep->sni != NULL && ep->host != NULL && strcmp(ep->sni, ep->host) != 0)
+        return MOQ_ERR_UNSUPPORTED;
+
+    moq_wasm_wt_managed_cfg_t fc;
+    moq_wasm_wt_managed_cfg_init(&fc);
+    fc.alloc = &ep->alloc;
+    fc.host = ep->host;
+    fc.port = (int)r->url.port;
+    fc.path = ep->path;
+    fc.wt_protocols = ep->wt_offer;
+    fc.send_request_capacity = true;
+    fc.initial_request_capacity = 64;
+    fc.target = ep->target.target_present ? &ep->target : NULL;
+    fc.setup_auth_tokens = ep->setup_tokens.tokens;
+    fc.setup_auth_token_count = ep->setup_tokens.count;
+    fc.on_pump = ep_browser_pump;
+    fc.on_pump_ctx = ep;
+    fc.app_deadline_us = moq_endpoint_app_deadline_us;
+    fc.app_deadline_ctx = ep;
+    moq_wasm_wt_managed_t *fac = NULL;
+    moq_result_t crc = moq_wasm_wt_managed_create(&fc, &fac);
+    if (crc < 0) return crc;
+    ep->facade = fac;
+    ep->vt = &BROWSER_VT;
+    return MOQ_OK;
+}
+#endif
+
 typedef struct ep_backend_row {
     moq_transport_protocol_t protocol;
     moq_transport_backend_t  backend;
@@ -1987,6 +2087,10 @@ static const ep_backend_row_t EP_BACKENDS[] = {
      * built; the Network.framework client is reached only by an explicit
      * backend = WTQUIC_NETWORK. Lane pump API; Apple/client-only. */
     { MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT, MOQ_TRANSPORT_BACKEND_WTQUIC_NETWORK, ep_create_wtquic_network },
+#endif
+#ifdef MOQ_SERVICE_HAVE_WASM_WT_MANAGED
+    /* The browser build: AUTO WEBTRANSPORT resolves here when no pico_wt is built. */
+    { MOQ_TRANSPORT_PROTOCOL_WEBTRANSPORT, MOQ_TRANSPORT_BACKEND_BROWSER, ep_create_browser },
 #endif
 #ifdef MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED
     /* After pico_wt/proxygen/wtquic-Network: AUTO WEBTRANSPORT still picks
@@ -2073,7 +2177,8 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
     !defined(MOQ_SERVICE_HAVE_MSQUIC_MANAGED) && \
     !defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) && \
     !defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) && \
-    !defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
+    !defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) && \
+    !defined(MOQ_SERVICE_HAVE_WASM_WT_MANAGED)
     return MOQ_ERR_UNSUPPORTED;   /* no managed facade in this build */
 #else
     if (r.protocol == MOQ_TRANSPORT_PROTOCOL_RAW_QUIC) {
@@ -2086,7 +2191,8 @@ moq_result_t moq_endpoint_connect(const moq_endpoint_cfg_t *cfg,
 #if !defined(MOQ_SERVICE_HAVE_PICO_WT_MANAGED) && \
     !defined(MOQ_SERVICE_HAVE_PROXYGEN_WT_MANAGED) && \
     !defined(MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED) && \
-    !defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED)
+    !defined(MOQ_SERVICE_HAVE_WTQUIC_MSQUIC_MANAGED) && \
+    !defined(MOQ_SERVICE_HAVE_WASM_WT_MANAGED)
         return MOQ_ERR_UNSUPPORTED;   /* no WebTransport facade built */
 #endif
     }

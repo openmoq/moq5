@@ -51,6 +51,13 @@ if((MOQ_BUILD_PQ_THREADED OR MOQ_BUILD_PICO_WT_MANAGED) AND
     # _MOQ_SERVICE_FACADE_DEFS; not consumer configuration.
     list(APPEND _MOQ_SERVICE_FACADE_DEFS MOQ_SERVICE_HAVE_PICOQUIC_CERT_CALLBACK=1)
 endif()
+if(MOQ_BUILD_WASM_WT_MANAGED)
+    # WebTransport through the browser's own API (Emscripten builds only; see
+    # adapters/wasm_wt). AUTO WebTransport resolves here when no pico_wt is
+    # built. No pkg-config: a browser build is consumed as CMake targets.
+    list(APPEND _MOQ_SERVICE_FACADE_DEFS MOQ_SERVICE_HAVE_WASM_WT_MANAGED=1)
+    list(APPEND _MOQ_SERVICE_FACADE_LIBS moq::adapter-wasm-wt-managed)
+endif()
 if(MOQ_BUILD_ADAPTER_MVFST)
     # RAW_QUIC over Meta's mvfst (exact-version only; see src/endpoint.c). The
     # managed C facade lives in moq::adapter-mvfst -- there is no separate
