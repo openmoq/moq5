@@ -917,7 +917,12 @@ MOQ_API moq_result_t moq_media_sender_end_track(
  * then publishes a terminal independent catalog generation -- a new group at
  * object 0 carrying isComplete:true (MSF §5.1.3) and an empty tracks array --
  * live-written to active subscribers and retained (for a Joining FETCH) so a
- * later joiner still learns the broadcast completed. The namespace/endpoint stay up (this is
+ * later joiner still learns the broadcast completed. Every active catalog
+ * subscription then has its last subgroup closed and ends with Track Ended
+ * (0x2) -- one accepted once the live write began is first sent the same
+ * catalog in a new group -- and a catalog publication ends the same way; the
+ * catalog track and its retained generation stay, so a later subscribe and
+ * Joining FETCH still retrieve it. The namespace/endpoint stay up (this is
  * not destroy()): call moq_media_sender_destroy() when finished.
  *
  * The completion is asynchronous: complete() freezes new input and returns,
@@ -1041,7 +1046,7 @@ typedef struct moq_media_sender_stats {
     /* The first failure that stopped a graceful completion
      * (moq_media_sender_complete) before its terminal catalog was committed
      * -- an Object it owed that was lost, an end, or the terminal catalog
-     * that could not be built, written or retained -- exactly as it
+     * that could not be built, written, retained or finished -- exactly as it
      * occurred, and sticky:
      * nothing later -- a repeated complete(), a refused operation, a later
      * last_error -- changes it. Failure before terminal publication prevents

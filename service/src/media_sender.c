@@ -591,8 +591,9 @@ struct moq_media_sender {
      * could not be copied): the completion is not finalized -- no
      * END_OF_TRACK for that track and no terminal catalog. */
     bool              complete_failed;
-    /* The terminal catalog generation committed: the completion is done, and
-     * no later failure is the completion's (stats.completion_error). */
+    /* The terminal catalog generation committed -- written, retained and its
+     * live deliveries finished: the completion is done, and no later failure
+     * is the completion's (stats.completion_error). */
     bool              complete_terminal_committed;
 
     /* Network-thread-only. */
@@ -629,6 +630,22 @@ struct moq_media_sender {
     bool              pending_retained_set;
     moq_rcbuf_t      *pending_current;       /* new baseline (commit -> published) */
     bool              pending_terminal;      /* the staged generation is complete()'s */
+    /* A terminal generation's finish, after its retained install and before
+     * its commit: the catalog's subscriptions, then its publication. Each is
+     * set once that step succeeds, so a refusal retries only what is left. */
+    bool              pending_subs_finished;
+    bool              pending_pub_finished;
+    /* A catalog subscription was accepted once this terminal generation's
+     * live write had begun and before its subscriptions were finished: the
+     * write's destinations were fixed when it was admitted, so the newcomer
+     * is not among them. Once that write is complete the generation is
+     * written again as a new group, rather than end that subscription
+     * without it. */
+    bool              pending_rejoined;
+    /* The facade refused the live write of pending_objs[pending_obj_cursor]
+     * for room and holds it: only the identical call completes it, whatever
+     * the demand now is, and no other write may come first. */
+    bool              pending_write_open;
     uint64_t          pending_generated_at;  /* generatedAt of pending_current */
     /* Automatic independent catalog refresh: a late viewer joining through a
      * relay that resolves Joining FETCHes locally would otherwise never see the
@@ -2721,6 +2738,10 @@ static void sender_pending_clear(moq_media_sender_t *s)
     if (s->pending_current) { moq_rcbuf_decref(s->pending_current); s->pending_current = NULL; }
     s->pending_generated_at = 0;              /* cleared with its buffer */
     s->pending_terminal = false;
+    s->pending_subs_finished = false;
+    s->pending_pub_finished = false;
+    s->pending_rejoined = false;
+    s->pending_write_open = false;
 }
 
 /* Adopt the current resolved tuple set + metadata as the published baseline:
@@ -2975,8 +2996,9 @@ static void sender_recompute_wake_deadline(moq_media_sender_t *s)
  *     control message is owed regardless of Forward, so its held END stays
  *     owed and the drain stays pending rather than reporting completion;
  *   - a queued object of a track that has demand;
- *   - a catalog generation still being written, or a republish a post-ready
- *     catalog change has made owed (catalog_dirty);
+ *   - a catalog generation still being written, retained or, when terminal,
+ *     finished, or a republish a post-ready catalog change has made owed
+ *     (catalog_dirty);
  *   - a reset owed for an abandoned group (pending_reset), which also keeps
  *     a partially emitted object's obligation when its subscriber leaves;
  *   - a removed track not yet torn down: catalog_dirty covers the pump
@@ -3127,6 +3149,43 @@ static bool sender_stage_refresh(moq_media_sender_t *s)
     return true;
 }
 
+/* Finish the catalog's live deliveries after a terminal generation is written
+ * and retained (s->mu held). Each active subscription's last subgroup is
+ * closed and the request ended with Track Ended (moq_pub_finish_subscribers);
+ * then a catalog publication is ended the same way (moq_pub_unpublish_track),
+ * which fires no on_publish_finished. Neither ends the track: its namespace,
+ * registration and retained group stay, so a later subscribe and Joining FETCH
+ * still retrieve this generation. Nothing is sent where there is nothing to
+ * finish. A refusal returns false with the completed steps kept, and a retry
+ * resumes at the step left; the facade itself resumes inside a step. A
+ * request that joins after the subscription step is not finished by it. */
+static bool sender_finish_catalog(moq_media_sender_t *s, uint64_t now_us)
+{
+    moq_pub_track_t *pt = s->catalog_track->pub_track;
+    if (!s->pending_subs_finished) {
+        moq_result_t rc = moq_pub_finish_subscribers(s->pub, pt,
+                                                     MOQ_PUB_DONE_TRACK_ENDED, now_us);
+        if (rc == MOQ_ERR_WOULD_BLOCK || rc == MOQ_ERR_WRONG_STATE) return false;
+        if (rc != MOQ_OK) {
+            sender_note_completion_failure(s, rc);
+            sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+            return false;
+        }
+        s->pending_subs_finished = true;
+    }
+    if (!s->pending_pub_finished) {
+        moq_result_t rc = moq_pub_unpublish_track(s->pub, pt, now_us);
+        if (rc == MOQ_ERR_WOULD_BLOCK || rc == MOQ_ERR_WRONG_STATE) return false;
+        if (rc != MOQ_OK) {
+            sender_note_completion_failure(s, rc);
+            sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+            return false;
+        }
+        s->pending_pub_finished = true;
+    }
+    return true;
+}
+
 /* Post-ready catalog republish (network thread). Coalesces pending add/
  * remove mutations into ONE new generation in a NEW group: object 0 is the
  * prior committed catalog (independent base) and objects 1..N are deltaUpdate
@@ -3137,7 +3196,9 @@ static bool sender_stage_refresh(moq_media_sender_t *s)
  * ticks until every live object AND the retained-group install finish, so a
  * transport WOULD_BLOCK retries the unfinished step without re-writing an
  * already-written object or skipping a generation. complete() and the initial
- * generation stage a single independent object instead of deltas. */
+ * generation stage a single independent object instead of deltas, and a
+ * terminal generation finishes the catalog's live deliveries before it
+ * commits (sender_finish_catalog). */
 static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
 {
     pthread_mutex_lock(&s->mu);
@@ -3145,14 +3206,19 @@ static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
     /* Completion's END_OF_TRACK objects do not retire served pull slots.
      * Their Track Ended controls are queued by retirement on a later hook.
      * Keep the terminal catalog owed until every such publisher track is
-     * retired; a capacity refusal preserves its handle and pending output. */
+     * retired; a capacity refusal preserves its handle and pending output.
+     * A catalog PUBLISH still awaiting its answer holds it too, as a media
+     * track's end waits for its own: the terminal generation is then written
+     * to the publication the answer establishes, and ended there. */
     if (s->complete_finalized) {
-        for (size_t i = 0; i < s->track_count; i++) {
+        bool held = !sender_terminal_admitted(s, s->catalog_track);
+        for (size_t i = 0; i < s->track_count && !held; i++) {
             const moq_media_track_t *t = s->tracks[i];
-            if (!t->is_catalog && t->pub_track) {
-                pthread_mutex_unlock(&s->mu);
-                return;
-            }
+            held = !t->is_catalog && t->pub_track;
+        }
+        if (held) {
+            pthread_mutex_unlock(&s->mu);
+            return;
         }
     }
 
@@ -3187,46 +3253,76 @@ static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
      * the same sender_track_demand the initial catalog and the media drain
      * use. With no demand the live writes are skipped (the retained group
      * below serves any future joiner). A WOULD_BLOCK retries from the cursor
-     * (no duplicate / skipped object). */
-    if (sender_track_demand(s, s->catalog_track)) {
-        while (s->pending_obj_cursor < s->pending_obj_count) {
-            size_t k = s->pending_obj_cursor;
+     * (no duplicate / skipped object), and a write the facade holds is
+     * completed by the identical call even when its demand has gone.
+     *
+     * A terminal generation is then written again as the next group while a
+     * subscription has joined since its write began (pending_rejoined):
+     * finishing now would end that subscription with no catalog object and
+     * no request left for its Joining FETCH. The held write is completed
+     * first, with its original group and bytes; joins during the rewrite
+     * latch again. Each such join costs at most one rewrite. */
+    for (;;) {
+        if (s->pending_write_open ||
+            sender_track_demand(s, s->catalog_track)) {
+            while (s->pending_obj_cursor < s->pending_obj_count) {
+                size_t k = s->pending_obj_cursor;
 #ifdef MOQ_MEDIA_SENDER_TESTING
-            if (s->test_block_republish_obj >= 0 &&
-                (int64_t)k == s->test_block_republish_obj) {
-                /* Snapshot the exact mid-generation state, then return as a
-                 * WOULD_BLOCK would: cursor untouched, nothing committed. */
-                s->test_block_republish_obj = -1;   /* one-shot */
-                s->test_block_fired = true;
-                s->test_block_cursor = s->pending_obj_cursor;
-                s->test_block_count = s->pending_obj_count;
-                s->test_block_retained_set = s->pending_retained_set;
-                pthread_mutex_unlock(&s->mu);
-                return;
-            }
+                if (s->test_block_republish_obj >= 0 &&
+                    (int64_t)k == s->test_block_republish_obj) {
+                    /* Snapshot the exact mid-generation state, then return
+                     * as a WOULD_BLOCK would: cursor untouched, nothing
+                     * committed. */
+                    s->test_block_republish_obj = -1;   /* one-shot */
+                    s->test_block_fired = true;
+                    s->test_block_cursor = s->pending_obj_cursor;
+                    s->test_block_count = s->pending_obj_count;
+                    s->test_block_retained_set = s->pending_retained_set;
+                    pthread_mutex_unlock(&s->mu);
+                    return;
+                }
 #endif
-            moq_pub_object_cfg_t ocfg;
-            moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
-            ocfg.group_id = s->pending_group;
-            ocfg.object_id = k;
-            ocfg.payload = s->pending_objs[k];
-            /* One subgroup per generation group: end_of_group is a per-subgroup
-             * header flag, so every object in the group carries it (mirroring the
-             * media drain) -- the group ends after this single subgroup. */
-            ocfg.end_of_group = true;
-            moq_result_t wrc = moq_pub_write_object_ex(
-                s->pub, s->catalog_track->pub_track, &ocfg, now_us);
-            if (wrc == MOQ_ERR_WOULD_BLOCK) { pthread_mutex_unlock(&s->mu); return; }
-            if (wrc < 0) {
-                sender_note_completion_failure(s, wrc);
-                sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
-                pthread_mutex_unlock(&s->mu);
-                return;
+                moq_pub_object_cfg_t ocfg;
+                moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
+                ocfg.group_id = s->pending_group;
+                ocfg.object_id = k;
+                ocfg.payload = s->pending_objs[k];
+                /* One subgroup per generation group: end_of_group is a
+                 * per-subgroup header flag, so every object in the group
+                 * carries it (mirroring the media drain) -- the group ends
+                 * after this single subgroup. */
+                ocfg.end_of_group = true;
+                moq_result_t wrc = moq_pub_write_object_ex(
+                    s->pub, s->catalog_track->pub_track, &ocfg, now_us);
+                if (wrc == MOQ_ERR_WOULD_BLOCK) {
+                    s->pending_write_open = true;
+                    pthread_mutex_unlock(&s->mu);
+                    return;
+                }
+                if (wrc < 0) {
+                    sender_note_completion_failure(s, wrc);
+                    sender_set_fatal_locked(s,
+                                            MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+                    pthread_mutex_unlock(&s->mu);
+                    return;
+                }
+                s->pending_write_open = false;
+                s->pending_obj_cursor++;
             }
-            s->pending_obj_cursor++;
+        } else {
+            s->pending_obj_cursor = s->pending_obj_count;
         }
-    } else {
-        s->pending_obj_cursor = s->pending_obj_count;
+        if (!s->pending_rejoined || s->pending_subs_finished) break;
+        s->pending_rejoined = false;
+        if (s->pending_group >= MOQ_QUIC_VARINT_MAX) {
+            sender_note_completion_failure(s, MOQ_ERR_LIMIT);
+            sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+            pthread_mutex_unlock(&s->mu);
+            return;
+        }
+        s->pending_group++;
+        s->pending_obj_cursor = 0;
+        s->pending_retained_set = false;
     }
 
     /* Install the dense retained group (objects 0..N) after the live publish, so
@@ -3270,6 +3366,11 @@ static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
 #endif
     }
 
+    if (s->pending_terminal && !sender_finish_catalog(s, now_us)) {
+        pthread_mutex_unlock(&s->mu);
+        return;
+    }
+
     /* Commit the generation: advance the group and adopt the new baseline. Any
      * committed generation (mutation OR refresh) resets the refresh cadence, so
      * the next automatic refresh is one full interval away and a WOULD_BLOCK
@@ -3293,6 +3394,10 @@ static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
     s->pending_obj_count = 0;
     s->pending_obj_cursor = 0;
     s->pending_retained_set = false;
+    s->pending_subs_finished = false;
+    s->pending_pub_finished = false;
+    s->pending_rejoined = false;
+    s->pending_write_open = false;
     pthread_mutex_unlock(&s->mu);
 }
 
@@ -3463,11 +3568,31 @@ static void sender_pub_on_closed(void *ctx, uint64_t error_code)
     sender_fire_closed(s, false, 0);
 }
 
+/* A subscription was accepted (inside moq_pub_tick, which the hook runs
+ * without s->mu). Only a catalog join matters here, while a terminal
+ * generation's live write has begun -- written in part, or held by the facade
+ * with its destinations already fixed -- and before its subscriptions are
+ * finished: that subscription misses the generation
+ * (sender_republish_catalog). Repeated joins coalesce into one rewrite. */
+static void sender_pub_on_subscriber_joined(void *ctx, moq_pub_track_t *pt)
+{
+    moq_media_sender_t *s = (moq_media_sender_t *)ctx;
+    pthread_mutex_lock(&s->mu);
+    if (s->catalog_track && s->catalog_track->pub_track == pt &&
+        s->pending_terminal && s->pending_obj_count > 0 &&
+        (s->pending_obj_cursor > 0 || s->pending_write_open) &&
+        !s->pending_subs_finished)
+        s->pending_rejoined = true;
+    pthread_mutex_unlock(&s->mu);
+}
+
 static void sender_pub_on_publish_ok(void *ctx, moq_pub_track_t *pt, bool forward)
 {
     (void)forward;   /* Forward=0 resolves the handshake without demand. */
     moq_media_sender_t *s = (moq_media_sender_t *)ctx;
     pthread_mutex_lock(&s->mu);
+    if (s->catalog_track && s->catalog_track->pub_track == pt)
+        s->catalog_track->publish_resolved = true;
     for (size_t i = 0; i < s->track_count; i++) {
         if (s->tracks[i]->pub_track != pt) continue;
         s->tracks[i]->publish_resolved = true;
@@ -3482,8 +3607,12 @@ static void sender_pub_on_publish_finished(void *ctx, moq_pub_track_t *pt)
 
     pthread_mutex_lock(&s->mu);
 
-    /* The catalog track is private (not in s->tracks[]); check it first. */
+    /* The catalog track is private (not in s->tracks[]); check it first. Only
+     * the peer ends a publication here (a local unpublish reports nothing), so
+     * this is never the completion's own finish. Resolved, a completion
+     * waiting on the PUBLISH answer settles without a publication to end. */
     if (s->catalog_track && s->catalog_track->pub_track == pt) {
+        s->catalog_track->publish_resolved = true;
         pthread_mutex_unlock(&s->mu);
         sender_fire_closed(s, false, 0);   /* no catalog -> session is done */
         return;
@@ -3612,6 +3741,7 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         pcfg.accept_mode = MOQ_PUB_ACCEPT_ALL;
         pcfg.callbacks.ctx = s;
         pcfg.callbacks.on_closed = sender_pub_on_closed;
+        pcfg.callbacks.on_subscriber_joined = sender_pub_on_subscriber_joined;
         pcfg.callbacks.on_publish_ok = sender_pub_on_publish_ok;
         pcfg.callbacks.on_publish_finished = sender_pub_on_publish_finished;
         pcfg.callbacks.on_publish_error = sender_pub_on_publish_error;

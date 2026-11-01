@@ -627,6 +627,266 @@ cleanup:
                         : "track_timescale_capture_d22_video");
 }
 
+/* -- A completed broadcast on a receiver that joined the catalog -----------
+ * The sender's complete() writes the terminal catalog live, then ends the
+ * catalog subscription (Track Ended, Stream Count). The receiver subscribes
+ * to the catalog only, so that done is the only one in the completion, and
+ * the terminal object the only one carrying "isComplete". Each row requires
+ * the receiver to adopt the complete catalog and remove its track, with no
+ * fatal or bootstrap failure, and every allocation released:
+ *   CO_ORDINARY  - the completion as the pair delivers it;
+ *   CO_DONE_FIRST - delay faults, from a fixed seed range, until the
+ *                  receiver's session took the done before the terminal
+ *                  object (draft-18 section 10.11 lets the control overtake
+ *                  the data); the session holds the done until its counted
+ *                  streams are processed, so the object still comes first;
+ *   CO_JOIN_DURING - the receiver joins after the terminal object was written
+ *                  and before the sender ended the catalog subscriptions: it
+ *                  is sent the same catalog in a new group, then its own
+ *                  Track Ended, and bootstraps from it;
+ *   CO_JOIN_DONE_FIRST - that join under delay faults, from a fixed seed
+ *                  range, until the receiver's session took the done before
+ *                  any catalog object or fill data: the done arrives while
+ *                  the receiver has no effective catalog at all.
+ * DONE_FIRST rows check every seed they run, and use the first whose input
+ * trace shows the order as the proof; a seed is never skipped for failing. */
+void moq_media_sender_test_block_retained_install_once(moq_media_sender_t *s);
+void moq_media_sender_test_republish_live(moq_media_sender_t *s, size_t *cursor,
+                                          size_t *count, unsigned *retained_installs);
+bool moq_media_sender_test_has_pending_output(moq_media_sender_t *s);
+
+typedef enum { CO_ORDINARY, CO_DONE_FIRST, CO_JOIN_DURING, CO_JOIN_DONE_FIRST } co_mode_t;
+
+/* Data and request-stream inputs the receiver's session took, in order. */
+typedef struct {
+    int      phase;
+    unsigned n;
+    struct { int phase; bool bidi, fin, complete, catalog; } in[256];
+} co_trace_t;
+
+static void co_trace(void *ctx, const moq_sim_trace_record_t *r)
+{
+    co_trace_t *t = ctx;
+    if (r->kind != MOQ_SIM_TRACE_INPUT || r->to != MOQ_PERSPECTIVE_SERVER ||
+        (r->input_kind != MOQ_SIM_INPUT_DATA_BYTES &&
+         r->input_kind != MOQ_SIM_INPUT_BIDI_BYTES) ||
+        r->struct_size < offsetof(moq_sim_trace_record_t, fin) + sizeof(r->fin) ||
+        t->n >= sizeof(t->in) / sizeof(t->in[0]))
+        return;
+    static const char marker[] = "\"isComplete\"";
+    static const char json[] = "\"version\"";
+    bool complete = false, catalog = false;
+    for (size_t i = 0; r->bytes.data && i + sizeof(marker) - 1 <= r->bytes.len && !complete; i++)
+        complete = memcmp(r->bytes.data + i, marker, sizeof(marker) - 1) == 0;
+    for (size_t i = 0; r->bytes.data && i + sizeof(json) - 1 <= r->bytes.len && !catalog; i++)
+        catalog = memcmp(r->bytes.data + i, json, sizeof(json) - 1) == 0;
+    t->in[t->n].phase = t->phase;
+    t->in[t->n].bidi = r->input_kind == MOQ_SIM_INPUT_BIDI_BYTES;
+    t->in[t->n].fin = r->fin;
+    t->in[t->n].complete = complete;
+    t->in[t->n].catalog = catalog;
+    t->n++;
+}
+
+/* In the completion phase: did a request-stream FIN (the done) reach the
+ * receiver's session before the terminal object -- or, for a receiver that
+ * joined in that phase, before any catalog JSON at all? */
+static bool co_done_first(const co_trace_t *t, bool first_catalog)
+{
+    int done = -1, data = -1;
+    for (unsigned i = 0; i < t->n; i++) {
+        if (t->in[i].phase != 1) continue;
+        if (t->in[i].bidi && t->in[i].fin && done < 0) done = (int)i;
+        if (!t->in[i].bidi && data < 0 &&
+            (first_catalog ? t->in[i].catalog : t->in[i].complete))
+            data = (int)i;
+    }
+    return done >= 0 && data >= 0 && done < data;
+}
+
+/* One row with one seed; false when a CO_DONE_FIRST seed did not produce the
+ * order (the row is then retried with the next seed). */
+static bool completion_order_once(moq_version_t ver, co_mode_t mode, uint64_t seed,
+                                  bool *ran)
+{
+    *ran = false;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    co_trace_t tr;
+    memset(&tr, 0, sizeof(tr));
+    moq_simpair_cfg_t pc = MOQ_SIMPAIR_CFG_INIT;
+    pc.alloc = &alloc; pc.seed = seed; pc.initial_now_us = 1000;
+    pc.client_send_request_capacity = true;
+    pc.client_initial_request_capacity = 32;
+    pc.server_send_request_capacity = true;
+    pc.server_initial_request_capacity = 32;
+    pc.version = ver;
+    pc.trace_fn = co_trace;
+    pc.trace_ctx = &tr;
+    bool faults = mode == CO_DONE_FIRST || mode == CO_JOIN_DONE_FIRST;
+    bool join = mode == CO_JOIN_DURING || mode == CO_JOIN_DONE_FIRST;
+    if (faults) {
+        pc.fault_flags = MOQ_SIM_FAULT_DELAY;
+        pc.fault_per_mille = 1000;
+    }
+    moq_simpair_t *sp = NULL;
+    MOQ_TEST_CHECK(moq_simpair_create(&pc, &sp) == MOQ_OK);
+    if (!sp) return true;
+    MOQ_TEST_CHECK(moq_simpair_start(sp) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 8, NULL) == MOQ_OK);
+    moq_session_t *srv = moq_simpair_server(sp);
+    moq_event_t ev;
+    while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) moq_event_cleanup(&ev);
+    while (moq_session_poll_events(srv, &ev, 1) == 1) moq_event_cleanup(&ev);
+    uint64_t now = moq_simpair_now_us(sp);
+    moq_media_receiver_t *r = NULL;
+    bool order_seen = !faults;
+
+    g_ns_parts[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns_parts[1] = MOQ_BYTES_LITERAL("complete");
+    moq_media_sender_cfg_t cfg;
+    moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
+    cfg.namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
+    cfg.publish_tracks = false;
+    cfg.catalog_refresh_interval_us = UINT64_MAX;
+    moq_media_sender_t *s = moq_media_sender_test_new_cfg(&cfg);
+    MOQ_TEST_CHECK(s != NULL);
+    if (!s || !add_video(s)) goto co_cleanup;
+    for (int cycle = 0; cycle < 12 && !moq_media_sender_is_ready(s); cycle++) {
+        if (!pump_sender(s, sp, now)) goto co_cleanup;
+        while (moq_session_poll_events(srv, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_NAMESPACE_PUBLISHED) {
+                moq_accept_namespace_cfg_t ac; moq_accept_namespace_cfg_init(&ac);
+                MOQ_TEST_CHECK(moq_session_accept_namespace(srv,
+                    ev.u.namespace_published.ann, &ac, now) == MOQ_OK);
+            }
+            moq_event_cleanup(&ev);
+        }
+        if (!pump_sender(s, sp, now)) goto co_cleanup;
+    }
+    MOQ_TEST_CHECK(moq_media_sender_is_ready(s));
+    if (!moq_media_sender_is_ready(s)) goto co_cleanup;
+
+    moq_media_receiver_cfg_t rcfg;
+    moq_media_receiver_cfg_init_live(&rcfg);
+    rcfg.namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
+    rcfg.auto_subscribe = false;
+    bool catalog_ready = false, added = false, removed = false;
+    if (join) {
+        /* The terminal object goes out to nobody and its install waits a
+         * pump; the receiver's subscription reaches the sender in between. */
+        MOQ_TEST_CHECK(moq_media_sender_complete(s) == MOQ_OK);
+        moq_media_sender_test_block_retained_install_once(s);
+        size_t cursor = 0, count = 0;
+        unsigned installs = 0;
+        for (int i = 0; i < 8 && !(count == 1 && cursor == 1); i++) {
+            if (!pump_sender(s, sp, now)) goto co_cleanup;
+            moq_media_sender_test_republish_live(s, &cursor, &count, &installs);
+        }
+        MOQ_TEST_CHECK(count == 1 && cursor == 1);
+        if (faults) moq_simpair_enable_faults(sp);
+        tr.phase = 1;
+        r = moq_media_receiver_test_new_cfg(&rcfg);
+        MOQ_TEST_CHECK(r != NULL);
+        if (!r) goto co_cleanup;
+        moq_media_receiver_test_pump(r, srv, now);
+        MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 8, NULL) == MOQ_OK);
+        /* Under delay its subscription matures within a millisecond of
+         * virtual time; the sender is not pumped meanwhile, so the join
+         * still lands while the finish is owed. */
+        for (int i = 0; faults && i < 20; i++) {
+            now += 100;
+            MOQ_TEST_CHECK(moq_simpair_advance_to(sp, now) == MOQ_OK);
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(sp, 8, NULL) == MOQ_OK);
+        }
+        MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(s));
+    } else {
+        r = moq_media_receiver_test_new_cfg(&rcfg);
+        MOQ_TEST_CHECK(r != NULL);
+        if (!r) goto co_cleanup;
+        for (int cycle = 0; cycle < 16 && !(catalog_ready && added); cycle++) {
+            if (!pump_both(s, r, sp, now)) goto co_cleanup;
+            moq_media_track_event_t te;
+            while (moq_media_receiver_poll_track(r, &te, sizeof(te)) == MOQ_OK) {
+                if (te.kind == MOQ_MEDIA_CATALOG_READY) catalog_ready = true;
+                if (te.kind == MOQ_MEDIA_TRACK_ADDED) added = true;
+            }
+        }
+        MOQ_TEST_CHECK(catalog_ready && added);
+        if (!catalog_ready || !added) goto co_cleanup;
+        if (mode == CO_DONE_FIRST) moq_simpair_enable_faults(sp);
+        tr.phase = 1;
+        MOQ_TEST_CHECK(moq_media_sender_complete(s) == MOQ_OK);
+    }
+
+    /* Every delayed input matures within a millisecond of virtual time. */
+    moq_media_receiver_stats_t rs;
+    memset(&rs, 0, sizeof(rs));
+    for (int cycle = 0; cycle < 40; cycle++) {
+        now += 100;
+        MOQ_TEST_CHECK(moq_simpair_advance_to(sp, now) == MOQ_OK);
+        if (!pump_both(s, r, sp, now)) goto co_cleanup;
+        moq_media_track_event_t te;
+        while (moq_media_receiver_poll_track(r, &te, sizeof(te)) == MOQ_OK) {
+            if (te.kind == MOQ_MEDIA_CATALOG_READY) catalog_ready = true;
+            if (te.kind == MOQ_MEDIA_TRACK_ADDED) added = true;
+            if (te.kind == MOQ_MEDIA_TRACK_REMOVED) removed = true;
+        }
+    }
+    if (faults) order_seen = co_done_first(&tr, join);
+    *ran = true;
+    MOQ_TEST_CHECK(moq_media_receiver_get_stats(r, &rs, sizeof(rs)) == MOQ_OK);
+    MOQ_TEST_CHECK(rs.catalog_complete);
+    MOQ_TEST_CHECK_EQ_U64(rs.catalog_drops, 0);
+    MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
+    MOQ_TEST_CHECK(!moq_media_sender_is_fatal(s));
+    MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(s));
+    if (join) {
+        /* It bootstrapped, and ends on the complete catalog: whatever an
+         * earlier retained catalog added, the complete one removed. */
+        MOQ_TEST_CHECK(catalog_ready);
+        MOQ_TEST_CHECK(added == removed);
+    } else {
+        MOQ_TEST_CHECK(removed);
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(srv), (int)MOQ_SESS_ESTABLISHED);
+
+co_cleanup:
+    if (r) moq_media_receiver_test_destroy_with_session(r, srv, now);
+    moq_media_sender_test_free(s);
+    while (moq_session_poll_events(moq_simpair_client(sp), &ev, 1) == 1) moq_event_cleanup(&ev);
+    while (moq_session_poll_events(srv, &ev, 1) == 1) moq_event_cleanup(&ev);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    return order_seen;
+}
+
+static void test_completion_order(moq_version_t ver, co_mode_t mode)
+{
+    int before = failures;
+    bool ran = false;
+    uint64_t seed = 42;
+    if (mode == CO_DONE_FIRST || mode == CO_JOIN_DONE_FIRST) {
+        bool found = false;
+        for (seed = 1; seed <= 48 && !found; seed++)
+            found = completion_order_once(ver, mode, seed, &ran);
+        MOQ_TEST_CHECK(found && ran);
+        if (found) seed--;
+    } else {
+        (void)completion_order_once(ver, mode, seed, &ran);
+        MOQ_TEST_CHECK(ran);
+    }
+    char label[64];
+    snprintf(label, sizeof(label), "completion_order_d%u_%s", (unsigned)ver,
+             mode == CO_ORDINARY ? "ordinary"
+             : mode == CO_DONE_FIRST ? "done_first"
+             : mode == CO_JOIN_DURING ? "join_during" : "join_done_first");
+    if (failures == before) printf("PASS: %s (seed %llu)\n", label,
+                                   (unsigned long long)seed);
+    else printf("FAIL: %s (seed %llu, %d diagnostics)\n", label,
+                (unsigned long long)seed, failures - before);
+}
+
 int main(void)
 {
     test_late_joiner_fill_d22(false);
@@ -634,6 +894,16 @@ int main(void)
     test_late_joiner_fetch_d18();
     test_track_timescale_capture_d22(false);
     test_track_timescale_capture_d22(true);
+    static const moq_version_t co_versions[] = {
+        MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_22 };
+    for (size_t i = 0; i < sizeof(co_versions) / sizeof(co_versions[0]); i++) {
+        test_completion_order(co_versions[i], CO_ORDINARY);
+        test_completion_order(co_versions[i], CO_JOIN_DURING);
+        if (co_versions[i] != MOQ_VERSION_DRAFT_16) {
+            test_completion_order(co_versions[i], CO_DONE_FIRST);
+            test_completion_order(co_versions[i], CO_JOIN_DONE_FIRST);
+        }
+    }
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

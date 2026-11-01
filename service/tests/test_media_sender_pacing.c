@@ -4253,16 +4253,20 @@ static void test_wait_recheck(void)
  *  media track and (optionally) its timeline, and every delivery is logged
  *  in one arrival order, so ordering across tracks is compared directly.
  * ===================================================================== */
-enum { TLC_V = 0, TLC_SAP = 1, TLC_CAT = 2, TLC_A = 3, TLC_NSUB = 4, TLC_LOG = 64,
-       TLC_COPY = 192 };
+enum { TLC_V = 0, TLC_SAP = 1, TLC_CAT = 2, TLC_A = 3, TLC_J = 4, TLC_J2 = 5,
+       TLC_NSUB = 6, TLC_LOG = 64, TLC_COPY = 192 };
 
-typedef enum { TLC_OBJ, TLC_STATUS, TLC_DONE } tlc_kind_t;
+/* TLC_FIN is a catalog subgroup the peer saw end cleanly (FIN); TLC_FETCHED a
+ * FETCH object. A catalog subgroup reset is not a record: it is unexpected. */
+typedef enum { TLC_OBJ, TLC_STATUS, TLC_DONE, TLC_FIN, TLC_FETCHED } tlc_kind_t;
 
 typedef struct {
     tlc_kind_t kind;
-    int        track;          /* TLC_V / TLC_SAP / TLC_CAT / TLC_A, -1 = foreign */
+    int        track;          /* TLC_V / TLC_SAP / TLC_CAT / TLC_A / TLC_J /
+                                  TLC_J2, -1 = foreign */
     uint64_t   group, object;
     int        status;
+    uint64_t   count;          /* a done's Stream Count */
     int        pass;           /* the drive that delivered it */
     bool       cat_complete;   /* a catalog object that parsed isComplete */
     bool       cat_terminal;   /* independent, complete, empty tracks */
@@ -4284,6 +4288,12 @@ typedef struct {
     int                 n;
     bool                overflow, unexpected;
     int                 pass;
+    /* Publish mode: each PUBLISH is accepted with `forward`, except a held
+     * catalog PUBLISH, which stays unanswered in `held` until released. */
+    bool                push, forward, hold_catalog;
+    moq_publication_t   pub[TLC_NSUB];
+    moq_publication_t   held;
+    unsigned            publish_requests;
 } tlc_t;
 
 static int tlc_track_of(const tlc_t *x, uint64_t sub_opaque)
@@ -4291,6 +4301,46 @@ static int tlc_track_of(const tlc_t *x, uint64_t sub_opaque)
     for (int i = 0; i < TLC_NSUB; i++)
         if (x->sub[i]._opaque && x->sub[i]._opaque == sub_opaque) return i;
     return -1;
+}
+
+static bool tlc_is_catalog(int idx)
+{
+    return idx == TLC_CAT || idx == TLC_J || idx == TLC_J2;
+}
+
+static int tlc_pub_of(const tlc_t *x, uint64_t pub_opaque)
+{
+    for (int i = 0; i < TLC_NSUB; i++)
+        if (x->pub[i]._opaque && x->pub[i]._opaque == pub_opaque) return i;
+    return -1;
+}
+
+static int tlc_track_of_any(const tlc_t *x, moq_subscription_t sub,
+                            moq_publication_t pub)
+{
+    int i = tlc_track_of(x, sub._opaque);
+    return i >= 0 || !pub._opaque ? i : tlc_pub_of(x, pub._opaque);
+}
+
+/* Keep a delivered payload and, for a catalog, how it parsed. */
+static void tlc_note_payload(tlc_rec_t *r, const moq_rcbuf_t *payload,
+                             bool catalog)
+{
+    r->len = payload ? moq_rcbuf_len(payload) : 0;
+    if (r->len > TLC_COPY) r->truncated = true;
+    else if (r->len) memcpy(r->copy, moq_rcbuf_data(payload), r->len);
+    if (!catalog) return;
+    moq_msf_catalog_t cat;
+    memset(&cat, 0, sizeof(cat));
+    moq_bytes_t j = { payload ? moq_rcbuf_data(payload) : NULL, r->len };
+    if (moq_msf_catalog_parse(moq_alloc_default(), j, &cat) == MOQ_OK) {
+        r->cat_complete = cat.is_complete;
+        r->cat_terminal = cat.is_complete && cat.track_count == 0 &&
+                          cat.delta_update == NULL;
+        moq_msf_catalog_cleanup(moq_alloc_default(), &cat);
+    } else {
+        r->cat_bad = true;
+    }
 }
 
 static tlc_rec_t *tlc_push(tlc_t *x, tlc_kind_t k, int track)
@@ -4311,35 +4361,79 @@ static void tlc_collect(tlc_t *x, uint64_t now)
     while (moq_session_poll_events(srv, &ev, 1) == 1) {
         if (ev.kind == MOQ_EVENT_OBJECT_RECEIVED) {
             const moq_object_received_event_t *o = &ev.u.object_received;
-            int idx = tlc_track_of(x, o->sub._opaque);
+            int idx = tlc_track_of_any(x, o->sub, o->pub);
             tlc_rec_t *r = tlc_push(x, o->status == MOQ_OBJECT_NORMAL
                                            ? TLC_OBJ : TLC_STATUS, idx);
             if (r) {
                 r->group = o->group_id;
                 r->object = o->object_id;
                 r->status = (int)o->status;
-                r->len = o->payload ? moq_rcbuf_len(o->payload) : 0;
-                if (r->len > TLC_COPY) r->truncated = true;
-                else if (r->len) memcpy(r->copy, moq_rcbuf_data(o->payload), r->len);
-                if (idx == TLC_CAT && o->status == MOQ_OBJECT_NORMAL) {
-                    moq_msf_catalog_t cat;
-                    memset(&cat, 0, sizeof(cat));
-                    moq_bytes_t j = { moq_rcbuf_data(o->payload),
-                                      moq_rcbuf_len(o->payload) };
-                    if (moq_msf_catalog_parse(moq_alloc_default(), j, &cat) == MOQ_OK) {
-                        r->cat_complete = cat.is_complete;
-                        r->cat_terminal = cat.is_complete && cat.track_count == 0 &&
-                                          cat.delta_update == NULL;
-                        moq_msf_catalog_cleanup(moq_alloc_default(), &cat);
-                    } else {
-                        r->cat_bad = true;
-                    }
-                }
+                tlc_note_payload(r, o->payload,
+                                 tlc_is_catalog(idx) &&
+                                 o->status == MOQ_OBJECT_NORMAL);
             }
         } else if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE) {
             tlc_rec_t *r = tlc_push(x, TLC_DONE,
                                     tlc_track_of(x, ev.u.subscribe_done.sub._opaque));
-            if (r) r->status = (int)ev.u.subscribe_done.status_code;
+            if (r) {
+                r->status = (int)ev.u.subscribe_done.status_code;
+                r->count = ev.u.subscribe_done.stream_count;
+            }
+        } else if (ev.kind == MOQ_EVENT_PUBLISH_FINISHED && x->push) {
+            const moq_publish_finished_event_t *d = &ev.u.publish_finished;
+            tlc_rec_t *r = tlc_push(x, TLC_DONE, tlc_pub_of(x, d->pub._opaque));
+            if (r) {
+                r->status = d->cause ? -1 : (int)d->status_code;
+                r->count = d->stream_count;
+            }
+        } else if (ev.kind == MOQ_EVENT_SUBGROUP_FINISHED) {
+            const moq_subgroup_finished_event_t *f = &ev.u.subgroup_finished;
+            int idx = tlc_track_of_any(x, f->sub, f->pub);
+            tlc_rec_t *r = tlc_is_catalog(idx) ? tlc_push(x, TLC_FIN, idx) : NULL;
+            if (r) r->group = f->group_id;
+        } else if (ev.kind == MOQ_EVENT_PUBLISH_REQUEST && x->push) {
+            const moq_publish_request_event_t *p = &ev.u.publish_request;
+            bool catalog = p->track_name.len == strlen(MOQ_MSF_CATALOG_TRACK_NAME) &&
+                memcmp(p->track_name.data, MOQ_MSF_CATALOG_TRACK_NAME,
+                       p->track_name.len) == 0;
+            bool video = p->track_name.len == 1 && p->track_name.data[0] == 'v';
+            x->publish_requests++;
+            if (!catalog && !video) {
+                x->unexpected = true;
+            } else if (catalog && x->hold_catalog) {
+                x->held = p->pub;
+            } else {
+                moq_publication_t pub = p->pub;
+                moq_accept_publish_cfg_t ac;
+                moq_accept_publish_cfg_init(&ac);
+                ac.has_forward = true;
+                ac.forward = x->forward;
+                x->pub[catalog ? TLC_CAT : TLC_V] = pub;
+                if (moq_session_accept_publish(srv, pub, &ac, now) != MOQ_OK)
+                    x->unexpected = true;
+                /* Forward 0 from the start: the update reaches the publisher
+                 * with the acceptance, before it can send anything. */
+                moq_publication_update_cfg_t uc;
+                moq_publication_update_cfg_init(&uc);
+                uc.has_forward = true;
+                uc.forward = false;
+                if (!x->forward &&
+                    moq_session_update_publication(srv, pub, &uc, now) != MOQ_OK)
+                    x->unexpected = true;
+            }
+        } else if (ev.kind == MOQ_EVENT_PUBLICATION_UPDATE_OK && x->push) {
+            /* The Forward 0 update answered. */
+        } else if (ev.kind == MOQ_EVENT_FETCH_OBJECT) {
+            const moq_fetch_object_event_t *o = &ev.u.fetch_object;
+            tlc_rec_t *r = tlc_push(x, TLC_FETCHED, TLC_J);
+            if (r) {
+                r->group = o->group_id;
+                r->object = o->object_id;
+                tlc_note_payload(r, o->payload, true);
+            }
+        } else if (ev.kind == MOQ_EVENT_FETCH_OK ||
+                   ev.kind == MOQ_EVENT_FETCH_COMPLETE) {
+            /* The joiner's FETCH answered; its objects are the records. */
         } else if (ev.kind == MOQ_EVENT_SUBSCRIBE_OK) {
             x->sub_ok++;
         } else if (ev.kind == MOQ_EVENT_NAMESPACE_PUBLISHED) {
@@ -4757,18 +4851,26 @@ static void test_complete_timeline(tlc_mode_t mode, uint32_t max_actions,
     MOQ_TEST_CHECK_EQ_INT(ncomplete, 1);
 
     /* Each subscription ends once, TRACK_ENDED, no earlier than its track's
-     * END_OF_TRACK (the facade's end owes it); the catalog subscription
-     * itself stays. */
+     * END_OF_TRACK (the facade's end owes it); the catalog subscription ends
+     * the same way after the terminal catalog, its one subgroup closed. */
     MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_V), 1);
     MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_SAP), 1);
-    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT), 0);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT), 1);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_FIN, TLC_CAT), 1);
     MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_A), mode == OTHER_HELD);
     for (int i = 0; i < x.n; i++)
         if (x.log[i].kind == TLC_DONE) {
             MOQ_TEST_CHECK_EQ_INT(x.log[i].status, (int)MOQ_PUB_DONE_TRACK_ENDED);
-            int e = tlc_find(&x, TLC_STATUS, x.log[i].track, false);
+            int e = x.log[i].track == TLC_CAT ? term
+                : tlc_find(&x, TLC_STATUS, x.log[i].track, false);
             MOQ_TEST_CHECK(e >= 0 && x.log[i].pass >= x.log[e].pass);
         }
+    {
+        int cat_done = tlc_find(&x, TLC_DONE, TLC_CAT, false);
+        if (cat_done >= 0)
+            MOQ_TEST_CHECK_EQ_U64(x.log[cat_done].count,
+                                  (uint64_t)tlc_count(&x, TLC_FIN, TLC_CAT));
+    }
     MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
     expect_conserved(x.s, written, written, 0, 0, 0, label);
 
@@ -4996,8 +5098,18 @@ static void test_complete_control_order(bool pre_ended, bool capacity)
         MOQ_TEST_CHECK_EQ_U64(x.log[term].group, 1);
     }
     MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_CAT), 1);
-    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT), 0);
-    MOQ_TEST_CHECK(tlc_publisher_sub(&x, TLC_CAT) != NULL);
+    /* The catalog request ends after it, its one subgroup closed. */
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_FIN, TLC_CAT), 1);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT), 1);
+    {
+        int cat_done = tlc_find(&x, TLC_DONE, TLC_CAT, false);
+        if (cat_done >= 0) {
+            MOQ_TEST_CHECK_EQ_INT(x.log[cat_done].status,
+                                  (int)MOQ_PUB_DONE_TRACK_ENDED);
+            MOQ_TEST_CHECK_EQ_U64(x.log[cat_done].count, 1);
+        }
+    }
+    MOQ_TEST_CHECK(tlc_publisher_sub(&x, TLC_CAT) == NULL);
     MOQ_TEST_CHECK(tlc_publisher_sub(&x, TLC_V) == NULL);
     MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
     MOQ_TEST_CHECK(!moq_media_sender_is_fatal(x.s));
@@ -5019,6 +5131,630 @@ out:
     int nf = failures - before;
     if (nf == 0) printf("PASS: %s\n", label);
     else         printf("FAIL: %s (%d diagnostics)\n", label, nf);
+}
+
+/* ===================================================================== *
+ *  The terminal catalog finishes the catalog's own deliveries.
+ *
+ *  Once complete()'s terminal generation is written and retained, every
+ *  active catalog subscription has its last subgroup closed (FIN) and ends
+ *  with Track Ended, and a catalog publication ends the same way, before the
+ *  sender reports nothing owed. The track, its namespace and the retained
+ *  generation stay: a later subscribe and Joining FETCH retrieve the same
+ *  bytes, and the finished completion does not end that request.
+ *
+ *  A gated case holds the retained install for one pump, then fills the
+ *  publisher's real action ring so the finish meets no room for the FIN
+ *  (CF_GATE_FIN), or room for the FIN but not the done (CF_GATE_DONE). The
+ *  finish stays owed; once room returns it completes, exactly once.
+ * ===================================================================== */
+void moq_media_sender_test_block_retained_install_once(moq_media_sender_t *s);
+void moq_media_sender_test_block_republish_before(moq_media_sender_t *s,
+                                                  uint64_t object_id);
+bool moq_media_sender_test_block_republish_state(moq_media_sender_t *s,
+                                                 size_t *cursor, size_t *count,
+                                                 bool *retained_set);
+void moq_media_sender_test_republish_live(moq_media_sender_t *s, size_t *cursor,
+                                          size_t *count, unsigned *retained_installs);
+uint64_t moq_media_sender_test_catalog_group(const moq_media_sender_t *s);
+void moq_media_sender_test_set_callbacks(moq_media_sender_t *s,
+                                         const moq_media_sender_callbacks_t *cb);
+
+/* Where the terminal generation is held: inside its live write (the facade
+ * admits it, opens the subgroup and holds the object), or after its install,
+ * at the subscription step's FIN or done. */
+typedef enum { CF_GATE_NONE, CF_GATE_WRITE, CF_GATE_FIN, CF_GATE_DONE } cf_gate_t;
+
+/* A catalog subscription the publisher accepts while the subscription step
+ * is still owed: REPLACE unsubscribes the first and subscribes again (drafts
+ * 16 and 18 refuse a second one beside it); ADD subscribes a second beside
+ * it (draft 22 serves both); CANCEL only unsubscribes the first, so the held
+ * write loses its last destination. */
+typedef enum { CF_REJOIN_NONE, CF_REJOIN_REPLACE, CF_REJOIN_ADD,
+               CF_REJOIN_CANCEL } cf_rejoin_t;
+
+typedef struct {
+    const char   *label;
+    moq_version_t version;
+    bool          push;         /* the catalog and "v" are PUBLISHed */
+    bool          forward;      /* push: every PUBLISH is accepted at this Forward */
+    bool          catalog_sub;  /* a subscription to the catalog before complete() */
+    cf_gate_t     gate;
+    bool          join_blocked; /* a catalog joiner subscribes while the finish is owed */
+    cf_rejoin_t   rejoin;       /* gated: a subscription during the subscription step */
+    bool          replay_join;  /* ADD, write gate: a second joiner while the
+                                   rewrite's own write is held */
+    bool          refresh;      /* a periodic refresh falls due while it is owed */
+    bool          hold_publish; /* push: the catalog PUBLISH is answered only late */
+    bool          peer_cancel;  /* push: the peer cancels the catalog publication */
+    bool          transport_close; /* the transport closes while it is owed */
+    bool          late_join;    /* a joiner subscribes and Joining FETCHes after */
+} cf_case_t;
+
+typedef struct { int closed, fatal; unsigned dones; } cf_obs_t;
+
+static void cf_on_closed(void *ctx, moq_media_sender_t *s, bool is_fatal,
+                         uint64_t code)
+{
+    (void)s; (void)code;
+    cf_obs_t *o = ctx;
+    o->closed++;
+    o->fatal += is_fatal;
+}
+
+/* Every draft-18 PUBLISH_DONE the sender's session hands the transport. */
+static void cf_trace(void *ctx, const moq_sim_trace_record_t *r)
+{
+    cf_obs_t *o = ctx;
+    if (r->kind != MOQ_SIM_TRACE_ACTION || r->from != MOQ_PERSPECTIVE_CLIENT ||
+        r->struct_size < offsetof(moq_sim_trace_record_t, fin) + sizeof(r->fin) ||
+        r->action_kind != MOQ_ACTION_SEND_BIDI_STREAM || !r->fin ||
+        !r->detail_bytes.len) return;
+    moq_buf_reader_t br;
+    moq_buf_reader_init(&br, r->detail_bytes.data, r->detail_bytes.len);
+    moq_control_envelope_t env;
+    if (moq_d18_decode_envelope(&br, &env) == MOQ_OK &&
+        env.msg_type == MOQ_D18_PUBLISH_DONE)
+        o->dones++;
+}
+
+/* Leave exactly `room` free slots in the publisher's action ring, with
+ * namespace advertisements the peer then accepts. */
+static bool cf_fill(tlc_t *x, size_t room, uint64_t now)
+{
+    static unsigned seq;
+    moq_session_t *publisher = moq_simpair_client(x->sp);
+    for (int k = 0; k < 64 && moq_session_action_capacity(publisher) > room; k++) {
+        uint8_t suffix[2] = { (uint8_t)(seq >> 8), (uint8_t)seq };
+        seq++;
+        moq_bytes_t ns[] = { MOQ_BYTES_LITERAL("finish-pressure"), { suffix, 2 } };
+        moq_publish_namespace_cfg_t nc;
+        moq_publish_namespace_cfg_init(&nc);
+        nc.track_namespace = (moq_namespace_t){ ns, 2 };
+        moq_announcement_t ann;
+        if (moq_session_publish_namespace(publisher, &nc, now, &ann) != MOQ_OK)
+            return false;
+    }
+    return moq_session_action_capacity(publisher) == room;
+}
+
+static int cf_live_catalogs(const tlc_t *x)
+{
+    int n = 0;
+    for (int i = 0; i < x->n; i++)
+        n += x->log[i].kind == TLC_OBJ && x->log[i].cat_complete;
+    return n;
+}
+
+static void cf_subscribe_catalog(tlc_t *x, int idx, uint64_t now)
+{
+    moq_subscribe_cfg_t sc;
+    moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = (moq_namespace_t){ g_ns, 2 };
+    sc.track_name = MOQ_BYTES_LITERAL(MOQ_MSF_CATALOG_TRACK_NAME);
+    sc.filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+    sc.has_forward = true;
+    sc.forward = true;
+    MOQ_TEST_CHECK(moq_session_subscribe(moq_simpair_server(x->sp), &sc, now,
+                                         &x->sub[idx]) == MOQ_OK);
+}
+
+/* A Joining FETCH of the catalog from `group` on subscription TLC_J; the
+ * index of the one FETCH object it returned, or -1. */
+static int cf_joining_fetch(tlc_t *x, uint64_t group, uint64_t now)
+{
+    int before = tlc_count(x, TLC_FETCHED, TLC_J);
+    moq_fetch_cfg_t fc;
+    moq_fetch_cfg_init(&fc);
+    fc.is_joining = true;
+    fc.joining_relative = false;
+    fc.joining_sub = x->sub[TLC_J];
+    fc.joining_start = group;
+    moq_fetch_t fetch;
+    memset(&fetch, 0, sizeof(fetch));
+    MOQ_TEST_CHECK(moq_session_fetch(moq_simpair_server(x->sp), &fc, now,
+                                     &fetch) == MOQ_OK);
+    for (int i = 0; i < 8 && tlc_count(x, TLC_FETCHED, TLC_J) == before; i++)
+        tlc_drive(x, now);
+    for (int i = 0; i < 2; i++) tlc_drive(x, now);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(x, TLC_FETCHED, TLC_J), before + 1);
+    return tlc_find(x, TLC_FETCHED, TLC_J, true);
+}
+
+/* One catalog request the finish ended: `objects` terminal objects, each the
+ * same bytes as `ref`, each on its own subgroup closed cleanly, the last at
+ * the committed group, then one Track Ended counting those subgroups. */
+static void cf_check_ended(const tlc_t *x, int idx, int objects,
+                           uint64_t terminal_group, const tlc_rec_t *ref)
+{
+    int n = 0, last = -1;
+    for (int i = 0; i < x->n; i++) {
+        const tlc_rec_t *r = &x->log[i];
+        if (r->kind != TLC_OBJ || r->track != idx) continue;
+        MOQ_TEST_CHECK(r->cat_terminal && !r->truncated);
+        MOQ_TEST_CHECK_EQ_U64(r->object, 0);
+        if (ref)
+            MOQ_TEST_CHECK(r->len == ref->len && memcmp(r->copy, ref->copy, r->len) == 0);
+        n++;
+        last = i;
+    }
+    MOQ_TEST_CHECK_EQ_INT(n, objects);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(x, TLC_FIN, idx), objects);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(x, TLC_DONE, idx), 1);
+    if (last >= 0) MOQ_TEST_CHECK_EQ_U64(x->log[last].group, terminal_group);
+    int d = tlc_find(x, TLC_DONE, idx, false);
+    if (d >= 0) {
+        MOQ_TEST_CHECK_EQ_INT(x->log[d].status, (int)MOQ_PUB_DONE_TRACK_ENDED);
+        MOQ_TEST_CHECK_EQ_U64(x->log[d].count, (uint64_t)objects);
+        if (last >= 0) MOQ_TEST_CHECK(x->log[d].pass >= x->log[last].pass);
+    }
+}
+
+/* Drive until the armed one-shot hold stops the next live write before its
+ * object 0: the generation is staged and nothing of it is written. */
+static void cf_hold_write(tlc_t *x, uint64_t now)
+{
+    size_t cursor = 9, count = 0;
+    bool retained = true, fired = false;
+    for (int i = 0; i < 16 && !fired; i++) {
+        tlc_drive(x, now);
+        fired = moq_media_sender_test_block_republish_state(x->s, &cursor, &count,
+                                                            &retained);
+    }
+    MOQ_TEST_CHECK(fired && cursor == 0 && count == 1 && !retained);
+}
+
+static void test_catalog_finish(const cf_case_t *c)
+{
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    tlc_t x;
+    memset(&x, 0, sizeof(x));
+    cf_obs_t obs = {0};
+    uint64_t now = 1000;
+    size_t cursor = 0, count = 0;
+    unsigned installs0 = 0, installs = 0;
+    /* Whether the terminal generation has live demand when it is written. */
+    bool live = c->catalog_sub || (c->push && c->forward);
+    bool finishes = c->catalog_sub || c->push;   /* a catalog request to end */
+    bool media = !c->push || c->forward;         /* Forward 0 would retain it */
+
+    x.sp = tlc_pair_config(&alloc, c->gate ? 8 : 0, c->version, cf_trace, &obs);
+    if (!x.sp) { failures++; goto out; }
+    x.push = c->push;
+    x.forward = c->forward;
+    x.hold_catalog = c->hold_publish;
+    g_ns[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns[1] = MOQ_BYTES_LITERAL("catalog-finish");
+    moq_media_sender_cfg_t cfg;
+    moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
+    cfg.namespace_ = (moq_namespace_t){ g_ns, 2 };
+    cfg.publish_tracks = c->push;
+    cfg.catalog_refresh_interval_us = c->refresh ? 1000000 : UINT64_MAX;
+    x.s = moq_media_sender_test_new_cfg(&cfg);
+    if (!x.s) { failures++; goto out; }
+    {
+        moq_media_sender_callbacks_t cbs;
+        moq_media_sender_callbacks_init_sized(&cbs, sizeof(cbs));
+        cbs.ctx = &obs;
+        cbs.on_closed = cf_on_closed;
+        moq_media_sender_test_set_callbacks(x.s, &cbs);
+    }
+    x.v = add_track(x.s, "v", MOQ_MEDIA_TYPE_VIDEO);
+    if (!x.v) { failures++; goto out; }
+    for (int i = 0; i < 16 && !moq_media_sender_is_ready(x.s); i++) tlc_drive(&x, now);
+    MOQ_TEST_CHECK(moq_media_sender_is_ready(x.s));
+    if (c->catalog_sub)
+        MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_CAT, MOQ_MSF_CATALOG_TRACK_NAME, now));
+    if (!c->push) MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_V, "v", now));
+    if (media) {
+        MOQ_TEST_CHECK(tlc_write(&x, 0x60, true, MOQ_SAP_TYPE_1, 0) == MOQ_OK);
+        tlc_drive(&x, now);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_V), 1);
+    }
+    /* A publication at Forward 1 was sent the initial catalog live. */
+    int initial = c->push && c->forward && !c->hold_publish ? 1 : 0;
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_CAT), initial);
+    MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+    uint64_t group0 = moq_media_sender_test_catalog_group(x.s);
+    moq_media_sender_test_republish_live(x.s, &cursor, &count, &installs0);
+
+    MOQ_TEST_CHECK(moq_media_sender_complete(x.s) == MOQ_OK);
+    if (c->gate == CF_GATE_WRITE) moq_media_sender_test_block_republish_before(x.s, 0);
+    else if (c->gate) moq_media_sender_test_block_retained_install_once(x.s);
+
+    if (c->hold_publish) {
+        /* The media ends, and the terminal generation waits, unstaged and
+         * owed, for the catalog PUBLISH's answer. */
+        for (int i = 0; i < 8; i++) tlc_drive(&x, now);
+        moq_media_sender_test_republish_live(x.s, &cursor, &count, &installs);
+        MOQ_TEST_CHECK(tlc_find(&x, TLC_DONE, TLC_V, false) >= 0);
+        MOQ_TEST_CHECK_EQ_U64(count, 0);
+        MOQ_TEST_CHECK_EQ_U64(installs, installs0);
+        MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(x.s), group0);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_CAT), 0);
+        MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(x.s));
+        MOQ_TEST_CHECK(x.held._opaque != 0);
+        moq_accept_publish_cfg_t ac;
+        moq_accept_publish_cfg_init(&ac);
+        ac.has_forward = true;
+        ac.forward = true;
+        x.pub[TLC_CAT] = x.held;
+        MOQ_TEST_CHECK(moq_session_accept_publish(moq_simpair_server(x.sp),
+                                                  x.held, &ac, now) == MOQ_OK);
+    }
+
+    if (c->gate) {
+        moq_session_t *publisher = moq_simpair_client(x.sp);
+        int fins = 0;
+        if (c->gate == CF_GATE_WRITE) {
+            /* Staged, nothing written. One pump into a ring with room for one
+             * action: the facade admits the write with its destinations
+             * fixed, opens the subgroup and holds the object. */
+            cf_hold_write(&x, now);
+            MOQ_TEST_CHECK_EQ_INT(cf_live_catalogs(&x), 0);
+            MOQ_TEST_CHECK(cf_fill(&x, 1, now));
+            moq_media_sender_test_pump(x.s, publisher, now);
+            MOQ_TEST_CHECK_EQ_U64(moq_session_action_capacity(publisher), 0);
+            moq_media_sender_test_republish_live(x.s, &cursor, &count, &installs);
+            MOQ_TEST_CHECK(count == 1 && cursor == 0);
+            MOQ_TEST_CHECK_EQ_U64(installs, installs0);
+        } else {
+            /* The terminal object is written; the install waits one pump. */
+            for (int i = 0; i < 16 && !(count == 1 && cursor == 1); i++) {
+                tlc_drive(&x, now);
+                moq_media_sender_test_republish_live(x.s, &cursor, &count, &installs);
+            }
+            MOQ_TEST_CHECK(count == 1 && cursor == 1);
+            MOQ_TEST_CHECK_EQ_U64(installs, installs0);
+            MOQ_TEST_CHECK_EQ_INT(cf_live_catalogs(&x), live ? 1 : 0);
+            fins = tlc_count(&x, TLC_FIN, TLC_CAT);
+            MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT), 0);
+            MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(x.s));
+
+            /* One pump into a ring with no room for the FIN, or room for the
+             * FIN only: the install lands, the finish does not complete. */
+            MOQ_TEST_CHECK(cf_fill(&x, c->gate == CF_GATE_FIN ? 0 : 1, now));
+            moq_media_sender_test_pump(x.s, publisher, now);
+            MOQ_TEST_CHECK_EQ_U64(moq_session_action_capacity(publisher), 0);
+            moq_media_sender_test_republish_live(x.s, &cursor, &count, &installs);
+            MOQ_TEST_CHECK_EQ_U64(installs, installs0 + 1);
+            MOQ_TEST_CHECK_EQ_U64(count, 1);
+        }
+        MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(x.s), group0);
+        MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(x.s));
+        MOQ_TEST_CHECK(!moq_media_sender_is_fatal(x.s));
+
+        /* While it is owed: complete() again changes nothing, a refresh falls
+         * due, and the peer acts. Each peer request reaches the publisher
+         * with the release below, before the next service pass. */
+        MOQ_TEST_CHECK(moq_media_sender_complete(x.s) == MOQ_OK);
+        if (c->refresh) now += 2000000;
+        moq_session_t *peer = moq_simpair_server(x.sp);
+        if (c->peer_cancel)
+            MOQ_TEST_CHECK(moq_session_cancel_publication(peer, x.pub[TLC_CAT], 0,
+                                                          now) == MOQ_OK);
+        /* With no subscription of its own the joiner meets a finished
+         * subscription step: the publication's is the one owed. */
+        if (c->join_blocked) cf_subscribe_catalog(&x, TLC_J, now);
+
+        /* Release the ring without another service pass: what was refused
+         * is still owed, and nothing more went out. */
+        int oks = x.sub_ok;
+        MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(x.sp, 64, NULL) == MOQ_OK);
+        tlc_collect(&x, now);
+        if (!c->peer_cancel && c->gate != CF_GATE_WRITE)
+            MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_FIN, TLC_CAT),
+                                  fins + (c->gate == CF_GATE_DONE ? 1 : 0));
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT), 0);
+        MOQ_TEST_CHECK_EQ_INT(x.sub_ok, oks);
+        moq_media_sender_test_republish_live(x.s, &cursor, &count, &installs);
+        MOQ_TEST_CHECK_EQ_U64(count, 1);
+        MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(x.s));
+
+        /* A subscription accepted while the subscription step is owed. The
+         * peer's answers to the fillers go out first: they hold its action
+         * ring and, on draft 18, the send buffer its cancel needs. Both
+         * requests then reach the publisher before its next pass. */
+        if (c->rejoin) {
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(x.sp, 64, NULL) == MOQ_OK);
+            tlc_collect(&x, now);
+            if (c->rejoin != CF_REJOIN_ADD)
+                MOQ_TEST_CHECK(moq_session_unsubscribe(peer, x.sub[TLC_CAT], now) == MOQ_OK);
+            if (c->rejoin != CF_REJOIN_CANCEL) cf_subscribe_catalog(&x, TLC_J, now);
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(x.sp, 64, NULL) == MOQ_OK);
+            tlc_collect(&x, now);
+            MOQ_TEST_CHECK_EQ_INT(x.sub_ok, oks);
+            MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT), 0);
+        }
+
+        /* The held write completes and its rewrite is staged; the rewrite's
+         * own write is then held the same way, and a second joiner arrives
+         * before it completes. */
+        if (c->replay_join) {
+            moq_media_sender_test_block_republish_before(x.s, 0);
+            moq_media_sender_test_pump(x.s, publisher, now);
+            size_t bc = 9, bn = 0;
+            bool br = true;
+            MOQ_TEST_CHECK(moq_media_sender_test_block_republish_state(x.s, &bc, &bn, &br));
+            MOQ_TEST_CHECK(bc == 0 && bn == 1 && !br);
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(x.sp, 64, NULL) == MOQ_OK);
+            tlc_collect(&x, now);
+            MOQ_TEST_CHECK(cf_fill(&x, 1, now));
+            moq_media_sender_test_pump(x.s, publisher, now);
+            MOQ_TEST_CHECK_EQ_U64(moq_session_action_capacity(publisher), 0);
+            moq_media_sender_test_republish_live(x.s, &cursor, &count, &installs);
+            MOQ_TEST_CHECK(count == 1 && cursor == 0);
+            for (int i = 0; i < 2; i++) {
+                MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(x.sp, 64, NULL) == MOQ_OK);
+                tlc_collect(&x, now);
+            }
+            int oks2 = x.sub_ok;
+            cf_subscribe_catalog(&x, TLC_J2, now);
+            MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(x.sp, 64, NULL) == MOQ_OK);
+            tlc_collect(&x, now);
+            MOQ_TEST_CHECK_EQ_INT(x.sub_ok, oks2);
+            MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_J), 0);
+        }
+
+        /* The connection is lost before the next pass: the publisher sees
+         * its session closed, and the finish can no longer be sent. */
+        if (c->transport_close) {
+            MOQ_TEST_CHECK(moq_session_on_transport_close(publisher, 0, now) == MOQ_OK);
+            for (int i = 0; i < 4; i++) moq_media_sender_test_pump(x.s, publisher, now);
+        }
+    }
+
+    if (!c->transport_close) {
+        for (int i = 0; i < 16 && moq_media_sender_test_has_pending_output(x.s); i++)
+            tlc_drive(&x, now);
+        for (int i = 0; i < 2; i++) tlc_drive(&x, now);
+    }
+    moq_media_sender_test_republish_live(x.s, &cursor, &count, &installs);
+    moq_media_sender_stats_t st;
+    MOQ_TEST_CHECK(moq_media_sender_get_stats(x.s, &st, sizeof(st)) == MOQ_OK);
+
+    if (c->transport_close) {
+        /* The finish could not be sent: the completion's own failure, kept
+         * exactly. The terminal generation never commits. */
+        MOQ_TEST_CHECK(moq_media_sender_is_fatal(x.s));
+        MOQ_TEST_CHECK_EQ_INT((int)st.completion_error, (int)MOQ_ERR_CLOSED);
+        MOQ_TEST_CHECK_EQ_INT((int)st.last_error, (int)MOQ_ERR_CLOSED);
+        MOQ_TEST_CHECK_EQ_U64(count, 1);
+        MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(x.s), group0);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT), 0);
+        MOQ_TEST_CHECK_EQ_INT(obs.closed, 1);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(x.s), (int)MOQ_ERR_CLOSED);
+        moq_media_sender_stats_t st2;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(x.s, &st2, sizeof(st2)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)st2.completion_error, (int)MOQ_ERR_CLOSED);
+        goto checked;
+    }
+
+    /* Settled: the generation committed and nothing is owed or failed. */
+    MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+    MOQ_TEST_CHECK_EQ_U64(count, 0);
+    /* Each join once the live write began costs exactly one rewrite: the
+     * same catalog as the next group. Only a rewrite after the retained
+     * install retains it a second time. */
+    int rewrites = c->rejoin == CF_REJOIN_REPLACE || c->rejoin == CF_REJOIN_ADD
+                   ? 1 + (c->replay_join ? 1 : 0) : 0;
+    bool reinstalled = rewrites > 0 && c->gate != CF_GATE_WRITE;
+    MOQ_TEST_CHECK_EQ_U64(installs, installs0 + (reinstalled ? 2 : 1));
+    uint64_t terminal_group = moq_media_sender_test_catalog_group(x.s);
+    MOQ_TEST_CHECK_EQ_U64(terminal_group, group0 + 1 + (uint64_t)rewrites);
+    MOQ_TEST_CHECK(!moq_media_sender_is_fatal(x.s));
+    MOQ_TEST_CHECK_EQ_INT((int)st.completion_error, (int)MOQ_OK);
+    /* A local finish reports no close; the peer's cancellation still does. */
+    MOQ_TEST_CHECK_EQ_INT(obs.closed, c->peer_cancel ? 1 : 0);
+    MOQ_TEST_CHECK_EQ_INT(obs.fatal, 0);
+
+    /* Media first: its object, END_OF_TRACK and Track Ended. */
+    if (media) {
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_V), 1);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_V), 1);
+    }
+    int v_done = tlc_find(&x, TLC_DONE, TLC_V, false);
+    MOQ_TEST_CHECK(v_done >= 0 && tlc_count(&x, TLC_DONE, TLC_V) == 1);
+
+    /* The terminal catalog: one independent isComplete, empty-tracks object
+     * at Object 0 of the new group, wherever there was live demand. */
+    int term = tlc_first_complete_catalog(&x);
+    if (!c->rejoin) MOQ_TEST_CHECK_EQ_INT(cf_live_catalogs(&x), live ? 1 : 0);
+    if (live && !c->rejoin) {
+        MOQ_TEST_CHECK(term >= 0);
+        if (term >= 0) {
+            MOQ_TEST_CHECK(x.log[term].cat_terminal && !x.log[term].truncated);
+            MOQ_TEST_CHECK_EQ_U64(x.log[term].group, group0 + 1);
+            MOQ_TEST_CHECK_EQ_U64(x.log[term].object, 0);
+            if (v_done >= 0) MOQ_TEST_CHECK(x.log[term].pass >= x.log[v_done].pass);
+        }
+    }
+
+    /* The catalog request: every subgroup closed cleanly, then one Track
+     * Ended whose Stream Count is the subgroups the peer saw. Nothing is sent
+     * for a request that does not exist or that the peer cancelled. */
+    int fins = tlc_count(&x, TLC_FIN, TLC_CAT);
+    int cat_done = tlc_find(&x, TLC_DONE, TLC_CAT, false);
+    if (c->rejoin) {
+        /* Every request the finish ended had the complete catalog first, once
+         * per group written while it was subscribed, then its own Track
+         * Ended counting those subgroups. A cancelled request gets nothing
+         * more. */
+        const tlc_rec_t *ref = NULL;
+        for (int i = 0; i < x.n && !ref; i++)
+            if (x.log[i].kind == TLC_OBJ && tlc_is_catalog(x.log[i].track) &&
+                x.log[i].cat_complete)
+                ref = &x.log[i];
+        if (c->rejoin == CF_REJOIN_ADD)
+            cf_check_ended(&x, TLC_CAT, 1 + rewrites, terminal_group, ref);
+        else
+            MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT), 0);
+        if (c->rejoin != CF_REJOIN_CANCEL)
+            cf_check_ended(&x, TLC_J, rewrites, terminal_group, ref);
+        if (c->replay_join) cf_check_ended(&x, TLC_J2, 1, terminal_group, ref);
+        if (c->rejoin == CF_REJOIN_CANCEL)
+            MOQ_TEST_CHECK_EQ_INT(cf_live_catalogs(&x), 0);
+    } else {
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT),
+                              finishes && !c->peer_cancel ? 1 : 0);
+    }
+    if (!c->peer_cancel && !c->rejoin)
+        MOQ_TEST_CHECK_EQ_INT(fins, initial + (c->hold_publish ? 1 : 0) + (live ? 1 : 0));
+    if (cat_done >= 0) {
+        MOQ_TEST_CHECK_EQ_INT(x.log[cat_done].status, (int)MOQ_PUB_DONE_TRACK_ENDED);
+        MOQ_TEST_CHECK_EQ_U64(x.log[cat_done].count, (uint64_t)fins);
+        if (term >= 0) MOQ_TEST_CHECK(x.log[cat_done].pass >= x.log[term].pass);
+    }
+    if (c->catalog_sub) MOQ_TEST_CHECK(tlc_publisher_sub(&x, TLC_CAT) == NULL);
+    if (c->push && c->version == MOQ_VERSION_DRAFT_18)
+        MOQ_TEST_CHECK_EQ_U64(obs.dones, c->peer_cancel ? 1u : 2u);
+    MOQ_TEST_CHECK_EQ_INT(x.publish_requests, c->push ? 2 : 0);
+
+    /* A joiner that arrived while only the publication step was owed: the
+     * finished subscription step does not sweep it again, so it stays open,
+     * and its Joining FETCH returns the retained terminal bytes. */
+    if (c->join_blocked) {
+        MOQ_TEST_CHECK(c->push);
+        MOQ_TEST_CHECK_EQ_INT(x.sub_ok, (c->catalog_sub ? 1 : 0) + 1);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_J), 0);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_J), 0);
+        int f = cf_joining_fetch(&x, terminal_group, now);
+        if (f >= 0) {
+            MOQ_TEST_CHECK(x.log[f].cat_terminal && !x.log[f].truncated);
+            MOQ_TEST_CHECK_EQ_U64(x.log[f].group, terminal_group);
+            if (term >= 0)
+                MOQ_TEST_CHECK(x.log[f].len == x.log[term].len &&
+                               memcmp(x.log[f].copy, x.log[term].copy, x.log[f].len) == 0);
+        }
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_J), 0);
+        MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+    }
+
+    /* complete() again sends nothing more, nor does a refresh falling due
+     * once every catalog request has ended: no generation, no PUBLISH. */
+    {
+        int n0 = x.n;
+        MOQ_TEST_CHECK(moq_media_sender_complete(x.s) == MOQ_OK);
+        if (c->refresh) now += 2000000;
+        for (int i = 0; i < 4; i++) tlc_drive(&x, now);
+        MOQ_TEST_CHECK_EQ_INT(x.n, n0);
+        MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+        MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(x.s), terminal_group);
+        MOQ_TEST_CHECK_EQ_INT(x.publish_requests, c->push ? 2 : 0);
+    }
+
+    if (c->late_join) {
+        /* The namespace and retained generation stay: a joiner subscribes
+         * and its Joining FETCH returns the same terminal bytes. The
+         * finished completion does not end it, and nothing more is owed. */
+        int n0 = x.n;
+        MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_J, MOQ_MSF_CATALOG_TRACK_NAME, now));
+        moq_fetch_cfg_t fc;
+        moq_fetch_cfg_init(&fc);
+        fc.is_joining = true;
+        fc.joining_relative = false;
+        fc.joining_sub = x.sub[TLC_J];
+        fc.joining_start = terminal_group;
+        moq_fetch_t fetch;
+        memset(&fetch, 0, sizeof(fetch));
+        MOQ_TEST_CHECK(moq_session_fetch(moq_simpair_server(x.sp), &fc, now,
+                                         &fetch) == MOQ_OK);
+        for (int i = 0; i < 8 && tlc_count(&x, TLC_FETCHED, TLC_J) == 0; i++)
+            tlc_drive(&x, now);
+        for (int i = 0; i < 2; i++) tlc_drive(&x, now);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_FETCHED, TLC_J), 1);
+        int f = tlc_find(&x, TLC_FETCHED, TLC_J, false);
+        if (f >= 0) {
+            const tlc_rec_t *r = &x.log[f];
+            MOQ_TEST_CHECK(r->cat_terminal && !r->truncated);
+            MOQ_TEST_CHECK_EQ_U64(r->group, terminal_group);
+            MOQ_TEST_CHECK_EQ_U64(r->object, 0);
+            if (term >= 0)
+                MOQ_TEST_CHECK(r->len == x.log[term].len &&
+                               memcmp(r->copy, x.log[term].copy, r->len) == 0);
+        }
+        for (int i = n0; i < x.n; i++)
+            MOQ_TEST_CHECK(x.log[i].kind == TLC_FETCHED);
+        MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+        MOQ_TEST_CHECK_EQ_INT(obs.closed, c->peer_cancel ? 1 : 0);
+
+        if (c->refresh) {
+            /* A refresh falling due on that joiner's demand is a terminal
+             * generation too: the complete catalog again, in a new group,
+             * and then the joiner's request ends the same way. */
+            now += 2000000;
+            for (int i = 0; i < 6; i++) tlc_drive(&x, now);
+            MOQ_TEST_CHECK_EQ_U64(moq_media_sender_test_catalog_group(x.s),
+                                  terminal_group + 1);
+            int r = tlc_find(&x, TLC_OBJ, TLC_J, false);
+            MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_J), 1);
+            if (r >= 0) {
+                MOQ_TEST_CHECK(x.log[r].cat_terminal);
+                MOQ_TEST_CHECK_EQ_U64(x.log[r].group, terminal_group + 1);
+            }
+            MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_FIN, TLC_J), 1);
+            int j_done = tlc_find(&x, TLC_DONE, TLC_J, false);
+            MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_J), 1);
+            if (j_done >= 0) {
+                MOQ_TEST_CHECK_EQ_INT(x.log[j_done].status, (int)MOQ_PUB_DONE_TRACK_ENDED);
+                MOQ_TEST_CHECK_EQ_U64(x.log[j_done].count, 1);
+                if (r >= 0) MOQ_TEST_CHECK(x.log[j_done].pass >= x.log[r].pass);
+            }
+            MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+            MOQ_TEST_CHECK(!moq_media_sender_is_fatal(x.s));
+            MOQ_TEST_CHECK_EQ_INT(x.publish_requests, c->push ? 2 : 0);
+        }
+    }
+
+checked:
+    MOQ_TEST_CHECK(!x.overflow && !x.unexpected);
+    for (int i = 0; i < x.n; i++) {
+        MOQ_TEST_CHECK(x.log[i].track >= 0);
+        MOQ_TEST_CHECK(!x.log[i].cat_bad);
+    }
+    if (failures != before)
+        for (int i = 0; i < x.n; i++)
+            fprintf(stderr, "   [%d] pass=%d kind=%d track=%d %llu:%llu st=%d n=%llu cc=%d\n",
+                    i, x.log[i].pass, (int)x.log[i].kind, x.log[i].track,
+                    (unsigned long long)x.log[i].group,
+                    (unsigned long long)x.log[i].object, x.log[i].status,
+                    (unsigned long long)x.log[i].count, (int)x.log[i].cat_complete);
+out:
+    if (x.s) moq_media_sender_test_free(x.s);
+    if (x.sp) {
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_client(x.sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        while (moq_session_poll_events(moq_simpair_server(x.sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        moq_simpair_destroy(x.sp);
+    }
+    MOQ_TEST_CHECK(as.balance == 0);
+    int nf = failures - before;
+    if (nf == 0) printf("PASS: %s\n", c->label);
+    else         printf("FAIL: %s (%d diagnostics)\n", c->label, nf);
 }
 
 #ifdef MOQ_TEST_HAVE_MPEG2TS
@@ -5295,8 +6031,12 @@ static void test_terminal_catalog_failure(int mode)
         MOQ_TEST_CHECK_EQ_INT((int)st.completion_error, (int)MOQ_OK);
     }
     if (mode == 2) {
-        /* After the commit: a refresh is due, and its build is refused. */
-        int catalogs = tlc_count(&x, TLC_OBJ, TLC_CAT);
+        /* After the commit: the completion ended the catalog request, so a
+         * later joiner supplies the demand; a refresh is then due, and its
+         * build is refused. */
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT), 1);
+        MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_J, MOQ_MSF_CATALOG_TRACK_NAME, now));
+        int catalogs = tlc_count(&x, TLC_OBJ, TLC_CAT) + tlc_count(&x, TLC_OBJ, TLC_J);
         now += 3000000;
         moq_media_sender_test_refuse_catalog_build(x.s);
         tlc_drive(&x, now);
@@ -5305,7 +6045,8 @@ static void test_terminal_catalog_failure(int mode)
         MOQ_TEST_CHECK(moq_media_sender_is_fatal(x.s));
         MOQ_TEST_CHECK_EQ_U64(moq_media_sender_fatal_code(x.s),
                               MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE);
-        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_CAT), catalogs);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_CAT) +
+                              tlc_count(&x, TLC_OBJ, TLC_J), catalogs);
         moq_media_sender_stats_t st3;
         MOQ_TEST_CHECK(moq_media_sender_get_stats(x.s, &st3, sizeof(st3)) == MOQ_OK);
         MOQ_TEST_CHECK_EQ_INT((int)st3.completion_error, (int)MOQ_OK);
@@ -5730,6 +6471,76 @@ int main(void)
     test_complete_control_order(true, false);
     test_complete_control_order(false, false);
     test_complete_control_order(true, true);
+    static const cf_case_t finish_cases[] = {
+        { .label = "pacing_catalog_finish_pull_d18", .version = MOQ_VERSION_DRAFT_18,
+          .catalog_sub = true, .late_join = true },
+        { .label = "pacing_catalog_finish_pull_d16", .version = MOQ_VERSION_DRAFT_16,
+          .catalog_sub = true, .late_join = true },
+        { .label = "pacing_catalog_finish_pull_d22", .version = MOQ_VERSION_DRAFT_22,
+          .catalog_sub = true },
+        { .label = "pacing_catalog_finish_pull_d18_fin_gate",
+          .version = MOQ_VERSION_DRAFT_18, .catalog_sub = true, .gate = CF_GATE_FIN,
+          .refresh = true },
+        { .label = "pacing_catalog_finish_pull_d18_done_gate",
+          .version = MOQ_VERSION_DRAFT_18, .catalog_sub = true, .gate = CF_GATE_DONE,
+          .late_join = true },
+        { .label = "pacing_catalog_finish_pull_d18_fin_gate_rejoin",
+          .version = MOQ_VERSION_DRAFT_18, .catalog_sub = true, .gate = CF_GATE_FIN,
+          .rejoin = CF_REJOIN_REPLACE },
+        { .label = "pacing_catalog_finish_pull_d18_done_gate_rejoin",
+          .version = MOQ_VERSION_DRAFT_18, .catalog_sub = true, .gate = CF_GATE_DONE,
+          .rejoin = CF_REJOIN_REPLACE },
+        { .label = "pacing_catalog_finish_pull_d22_fin_gate_rejoin",
+          .version = MOQ_VERSION_DRAFT_22, .catalog_sub = true, .gate = CF_GATE_FIN,
+          .rejoin = CF_REJOIN_ADD },
+        { .label = "pacing_catalog_finish_pull_d22_done_gate_rejoin",
+          .version = MOQ_VERSION_DRAFT_22, .catalog_sub = true, .gate = CF_GATE_DONE,
+          .rejoin = CF_REJOIN_ADD },
+        { .label = "pacing_catalog_finish_pull_d18_write_gate_rejoin",
+          .version = MOQ_VERSION_DRAFT_18, .catalog_sub = true, .gate = CF_GATE_WRITE,
+          .rejoin = CF_REJOIN_REPLACE },
+        { .label = "pacing_catalog_finish_pull_d22_write_gate_rejoin",
+          .version = MOQ_VERSION_DRAFT_22, .catalog_sub = true, .gate = CF_GATE_WRITE,
+          .rejoin = CF_REJOIN_ADD },
+        { .label = "pacing_catalog_finish_pull_d22_write_gate_replay_rejoin",
+          .version = MOQ_VERSION_DRAFT_22, .catalog_sub = true, .gate = CF_GATE_WRITE,
+          .rejoin = CF_REJOIN_ADD, .replay_join = true },
+        { .label = "pacing_catalog_finish_pull_d18_write_gate_cancel",
+          .version = MOQ_VERSION_DRAFT_18, .catalog_sub = true, .gate = CF_GATE_WRITE,
+          .rejoin = CF_REJOIN_CANCEL, .late_join = true, .refresh = true },
+        { .label = "pacing_catalog_finish_pull_d18_no_demand",
+          .version = MOQ_VERSION_DRAFT_18, .late_join = true },
+        { .label = "pacing_catalog_finish_pull_d18_late_refresh",
+          .version = MOQ_VERSION_DRAFT_18, .catalog_sub = true, .late_join = true,
+          .refresh = true },
+        { .label = "pacing_catalog_finish_pull_d18_transport_close",
+          .version = MOQ_VERSION_DRAFT_18, .catalog_sub = true, .gate = CF_GATE_FIN,
+          .transport_close = true },
+        { .label = "pacing_catalog_finish_push_d18", .version = MOQ_VERSION_DRAFT_18,
+          .push = true, .forward = true, .late_join = true },
+        { .label = "pacing_catalog_finish_push_d16", .version = MOQ_VERSION_DRAFT_16,
+          .push = true, .forward = true, .late_join = true },
+        { .label = "pacing_catalog_finish_push_d18_fin_gate",
+          .version = MOQ_VERSION_DRAFT_18, .push = true, .forward = true,
+          .gate = CF_GATE_FIN, .join_blocked = true },
+        { .label = "pacing_catalog_finish_push_d18_done_gate",
+          .version = MOQ_VERSION_DRAFT_18, .push = true, .forward = true,
+          .gate = CF_GATE_DONE, .refresh = true },
+        { .label = "pacing_catalog_finish_push_d18_forward0",
+          .version = MOQ_VERSION_DRAFT_18, .push = true, .late_join = true },
+        { .label = "pacing_catalog_finish_push_d22", .version = MOQ_VERSION_DRAFT_22,
+          .push = true, .forward = true },
+        { .label = "pacing_catalog_finish_push_d22_forward0",
+          .version = MOQ_VERSION_DRAFT_22, .push = true },
+        { .label = "pacing_catalog_finish_push_d18_pending_publish",
+          .version = MOQ_VERSION_DRAFT_18, .push = true, .forward = true,
+          .hold_publish = true },
+        { .label = "pacing_catalog_finish_push_d18_peer_cancel",
+          .version = MOQ_VERSION_DRAFT_18, .push = true, .forward = true,
+          .gate = CF_GATE_DONE, .peer_cancel = true },
+    };
+    for (size_t i = 0; i < sizeof(finish_cases) / sizeof(finish_cases[0]); i++)
+        test_catalog_finish(&finish_cases[i]);
 #ifdef MOQ_TEST_HAVE_MPEG2TS
     for (size_t r = 0; r < sizeof(rings) / sizeof(rings[0]); r++)
         for (int e = 0; e < 2; e++) test_failed_ts_timeline(rings[r], e != 0);

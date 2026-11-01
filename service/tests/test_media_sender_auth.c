@@ -1229,7 +1229,7 @@ typedef struct pending_publication_fixture {
     moq_subscription_t healthy_sub;
     unsigned late_requests, late_finished;
     unsigned healthy_objects, healthy_ends, healthy_finished, subscribe_oks;
-    unsigned terminal_catalogs;
+    unsigned terminal_catalogs, catalog_finished;
     bool hold_late_ack, hold_timeline_ack, timeline_enabled;
     moq_publication_t timeline_pub;
     moq_subscription_t late_sub;
@@ -1352,6 +1352,10 @@ static void pending_flush(pending_publication_fixture_t *p)
                 if (p->a.old_media_pub._opaque &&
                     moq_publication_eq(ev.u.publish_finished.pub, p->a.old_media_pub))
                     p->healthy_finished++;
+                else if (p->a.catalog_pub._opaque &&
+                         moq_publication_eq(ev.u.publish_finished.pub, p->a.catalog_pub))
+                    /* The completion ends the catalog publication, once. */
+                    MOQ_TEST_CHECK(p->catalog_finished++ == 0);
                 else if (p->timeline_pub._opaque &&
                          moq_publication_eq(ev.u.publish_finished.pub, p->timeline_pub)) {
                     MOQ_TEST_CHECK(ev.u.publish_finished.stream_count == p->timeline_ends);
