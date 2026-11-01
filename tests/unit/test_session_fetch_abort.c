@@ -285,8 +285,9 @@ static int refusal_row(moq_version_t v)
  * The abort frees the publisher's slot, so a FETCH_CANCEL that crosses the
  * reset names an id the request registry no longer knows. The session keeps a
  * bounded cache of ids it ABORTED (fetch_abort_tombs, capacity = fetch pool):
- * a cancel naming a cached id is consumed once; every other unknown or
- * wrong-parity id still closes the session. Draft-18 cancels by resetting the
+ * a cancel naming a cached id consumes that entry. Retired ids remain harmless
+ * after cache consumption or eviction; future and wrong-parity ids still
+ * close the session. Draft-18 cancels by resetting the
  * request bidi, which the drain ring already absorbs, so no id is cached there.
  */
 
@@ -307,7 +308,7 @@ static moq_result_t feed_raw_cancel(moq_session_t *pub, uint64_t request_id, uin
 
 /* Refused aborts leave no cache entry; a committed abort records exactly the
  * aborted id (draft-16) or nothing (draft-18); the crossing cancel is absorbed
- * once, and the id is not honoured a second time. */
+ * once, and further cancellation cannot affect a reused slot. */
 static int tomb_row(moq_version_t v)
 {
     const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : "v18";
@@ -398,15 +399,15 @@ static int tomb_row(moq_version_t v)
     MOQ_TEST_CHECK_EQ_INT(r.fe.complete, 1);
 
     if (caches) {
-        /* the consumed id is not honoured twice: a duplicate FETCH_CANCEL for it
-         * is an unknown request and closes the session (protocol violation 0x4) */
+        /* A repeated terminal for the retired ID has no effect on the fresh
+         * handle, and needs no unbounded per-request history. */
         (void)feed_raw_cancel(r.pub, id_a, r.now);
         for (int i = 0; i < 6; i++) { cycle(&r); drain(r.pub, &r.pe, true); drain(r.fet, &r.fe, false); }
-        MOQ_TEST_CHECK_EQ_INT(r.tr.close_session, 1);
-        MOQ_TEST_CHECK_EQ_INT(r.pe.closed, 1);
+        MOQ_TEST_CHECK_EQ_INT(r.tr.close_session, 0);
+        MOQ_TEST_CHECK_EQ_INT(r.pe.closed, 0);
     }
     printf("MEASURED %s tomb: refused aborts cached=0, committed cached=%zu, late cancel absorbed, "
-           "duplicate cancel closes=%d\n", lbl, (size_t)(caches ? 1 : 0), r.tr.close_session);
+           "repeated retired cancel closes=%d\n", lbl, (size_t)(caches ? 1 : 0), r.tr.close_session);
     rig_down(&r);
     MOQ_TEST_CHECK_EQ_SIZE(r.alloc.live, 0);
     int f = failures;
@@ -454,7 +455,7 @@ static int negative_control_row(neg_t kind)
  * oldest. A raw pair whose publisher is fed FETCH messages directly (its
  * responses are discarded, so the fetcher's own pool never limits the count)
  * aborts pool+1 fetches; the newest id's late cancel is absorbed, the evicted
- * oldest id's late cancel closes the session. */
+ * oldest id's late cancel is also absorbed using the monotonic request sequence. */
 static int exhaustion_row(void)
 {
     int failures = 0;
@@ -519,10 +520,10 @@ static int exhaustion_row(void)
     (void)feed_raw_cancel(s, last_id, now);
     MOQ_TEST_CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
     MOQ_TEST_CHECK_EQ_SIZE(s->fetch_abort_tomb_count, cap - 1);
-    /* evicted oldest: unknown request, fails closed */
+    /* An evicted ID still denotes a previously issued, now retired request. */
     (void)feed_raw_cancel(s, 0, now);
-    MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_CLOSED);
-    printf("MEASURED v16 exhaustion: cap=%zu aborted=%zu newest absorbed, evicted oldest closes\n", cap, cap + 1);
+    MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+    printf("MEASURED v16 exhaustion: cap=%zu aborted=%zu newest and evicted oldest absorbed\n", cap, cap + 1);
     moq_session_destroy(s);
     moq_session_destroy(c);
     MOQ_TEST_CHECK_EQ_INT((int)ta.balance, 0);

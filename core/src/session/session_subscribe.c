@@ -3412,6 +3412,15 @@ moq_result_t session_core_on_unsubscribe(moq_session_t *s,
     moq_result_t rc;
     if (event_queue_full(s))
         return MOQ_ERR_WOULD_BLOCK;
+    if (e->state == MOQ_SUB_PENDING_PUBLISHER) {
+        /* Retire each held FETCH explicitly before its parent's identity goes
+         * away. Reserve the complete rejection batch before any effect. */
+        rc = session_core_pending_joins_can_resolve(s, e->request_id,
+            false, 0, 0, 0, 0);
+        if (rc < 0) return rc;
+        rc = session_core_reject_pending_joins(s, e->request_id);
+        if (rc < 0) return rc;
+    }
     /* Every subgroup stream still open is reset, or owes its reset when the
      * action queue has no room, so the cancel always completes. */
     if (e->state == MOQ_SUB_ESTABLISHED)
@@ -5505,7 +5514,11 @@ moq_result_t moq_session_reject_subscribe(
         for (size_t i = 0; i < err_args.redirect_namespace.count; i++)
             own_bound += err_args.redirect_namespace.parts[i].len + 9;
     }
-    uint8_t *probe = (uint8_t *)scratch_alloc_aligned(s, own_bound, 1);
+    /* A bare control-channel rejection is the escape guaranteed by D16
+     * pending-join admission, even with a small event-borrow arena. */
+    uint8_t bare_control[48];
+    uint8_t *probe = req_ref._v == 0 && own_bound <= sizeof(bare_control)
+        ? bare_control : (uint8_t *)scratch_alloc_aligned(s, own_bound, 1);
     if (!probe) { rc = MOQ_ERR_BUFFER; goto abort_pending; }
     moq_buf_writer_t pw;
     moq_buf_writer_init(&pw, probe, own_bound);

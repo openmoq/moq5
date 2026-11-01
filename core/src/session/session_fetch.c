@@ -408,7 +408,7 @@ static moq_result_t fetch_auto_reject_ex(moq_session_t *s,
     a.request_id = d->request_id;
     moq_result_t rc = s->profile->encode_request_error(s, &ew, &a);
     if (rc < 0) return rc;
-    return queue_send_control(s, err_buf, moq_buf_writer_offset(&ew));
+    return queue_send_cancel(s, err_buf, moq_buf_writer_offset(&ew));
 }
 
 static moq_result_t fetch_auto_reject(moq_session_t *s,
@@ -419,13 +419,61 @@ static moq_result_t fetch_auto_reject(moq_session_t *s,
         &(moq_request_error_encode_args_t){ .error_code = error_code });
 }
 
-/* Upper bound on a bare REQUEST_ERROR (no reason / no redirect) queued on a
- * request bidi -- matches queue_request_error_bidi's own scratch/encode bound. */
+/* Upper bound on a bare REQUEST_ERROR, including a draft16 request ID.
+ * Also matches queue_request_error_bidi's scratch/encode bound. */
 #define PENDING_JOIN_REJECT_BOUND 48
 
+/* A held control-channel join must leave a bare parent rejection possible.
+ * The caller cannot individually retire these not-yet-surfaced handles. */
+static moq_result_t pending_join_control_error_size(moq_session_t *s,
+    uint64_t request_id, uint64_t error_code, size_t *size)
+{
+    uint8_t buf[PENDING_JOIN_REJECT_BOUND];
+    moq_buf_writer_t w;
+    moq_buf_writer_init(&w, buf, sizeof(buf));
+    moq_request_error_encode_args_t args = {
+        .request_id = request_id, .error_code = error_code
+    };
+    moq_result_t rc = s->profile->encode_request_error(s, &w, &args);
+    if (rc < 0) return rc;
+    *size = moq_buf_writer_offset(&w);
+    return MOQ_OK;
+}
+
+static moq_result_t pending_join_admission_fits(moq_session_t *s,
+    uint64_t parent_id, uint64_t request_id, bool *fits)
+{
+    *fits = false;
+    size_t actions = 2; /* bare parent rejection and the candidate's error */
+    if (actions > s->action_cap) return MOQ_OK;
+    size_t send = 0, len = 0;
+    moq_result_t rc = pending_join_control_error_size(s, parent_id,
+        MOQ_REQUEST_ERROR_INTERNAL_ERROR, &send);
+    if (rc < 0) return rc;
+    if (send > s->send_cap) return MOQ_OK;
+    rc = pending_join_control_error_size(s, request_id,
+        MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID, &len);
+    if (rc < 0) return rc;
+    if (len > s->send_cap - send) return MOQ_OK;
+    send += len;
+    for (int32_t i = s->fetch_occ_head; i >= 0; i = s->fetches[i].occ_next) {
+        const moq_fetch_entry_t *e = &s->fetches[i];
+        if (e->state != MOQ_FETCH_PENDING_JOIN || e->join_request_id != parent_id)
+            continue;
+        if (++actions > s->action_cap) return MOQ_OK;
+        rc = pending_join_control_error_size(s, e->request_id,
+            MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID, &len);
+        if (rc < 0) return rc;
+        if (len > s->send_cap - send) return MOQ_OK;
+        send += len;
+    }
+    *fits = true;
+    return MOQ_OK;
+}
+
 /* Buffer a Joining FETCH whose associated subscription is still pending
- * (§10.12.2): create a PENDING_JOIN fetch entry holding the join parameters and
- * the resolved auth tokens, register the request bidi, and commit the inbound
+ * (draft16 §9.16.2, draft18 §10.12.2): create a PENDING_JOIN entry holding the
+ * join parameters and resolved auth tokens, register its identity and commit the inbound
  * request + auth now. No FETCH_REQUEST is surfaced until the subscription is
  * accepted (release) or rejected (reject). Sets *auth_committed so the caller's
  * cleanup neither double-commits nor frees the original staged token values.
@@ -442,11 +490,18 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
                                               bool *auth_committed)
 {
     int slot = fetch_find_free(s);
-    if (slot < 0) {
-        /* A full fetch pool is this side's capacity, not a peer error: the
-         * request is refused on its own stream, as a standalone FETCH is. */
-        moq_request_error_encode_args_t full =
-            session_capacity_request_error(s, 0, "fetch pool full", 15);
+    bool fits = slot >= 0;
+    if (fits && !d->endpoint.has_stream_ref) {
+        moq_result_t rc = pending_join_admission_fits(s, d->joining_request_id,
+                                                    d->request_id, &fits);
+        if (rc < 0) return rc;
+    }
+    if (!fits) {
+        /* Refuse only this request, before retaining its state. A bare D16
+         * error also fits small control buffers; bidi behavior is unchanged. */
+        const char *reason = d->endpoint.has_stream_ref ? "fetch pool full" : NULL;
+        moq_request_error_encode_args_t full = session_capacity_request_error(
+            s, 0, reason, reason ? 15 : 0);
         moq_result_t rrc = fetch_auto_reject_ex(s, d, &full);
         if (rrc < 0) return rrc;
         s->profile->commit_inbound_request(s, &d->endpoint);
@@ -533,20 +588,25 @@ static moq_result_t fetch_buffer_pending_join(moq_session_t *s,
             d->token_staged[i] = false;   /* ownership moved to the entry */
     }
     e->join_token_count = n;
-    /* Hand the request bidi off from staging to this fetch slot. */
+    /* Register the request by its profile's correlation identity. */
     d->endpoint.kind = MOQ_REQ_FETCH;
     d->endpoint.slot = slot;
-    request_registry_remove_by_streamref(s, d->endpoint.stream_ref);
-    request_registry_insert_by_streamref(s, d->endpoint.stream_ref, d->endpoint);
+    if (d->endpoint.has_stream_ref) {
+        request_registry_remove_by_streamref(s, d->endpoint.stream_ref);
+        request_registry_insert_by_streamref(s, d->endpoint.stream_ref,
+                                             d->endpoint);
+    } else {
+        request_registry_insert_by_id(s, d->endpoint.request_id, d->endpoint);
+    }
     s->profile->commit_inbound_request(s, &d->endpoint);
     *auth_committed = true;
     process_auth_tokens_commit_txn(s, &d->auth_txn);
     return MOQ_OK;
 }
 
-/* Terminally reject a buffered Joining FETCH: REQUEST_ERROR(error_code) + FIN on
- * its request bidi, drain it (absorb the fetcher's later FIN unless already seen),
- * then free the entry (which frees the held token values). Reserve-before-mutate:
+/* Terminally reject a buffered join on its request bidi (with FIN/drain) or
+ * draft16 control channel, then free its entry and held token values.
+ * Reserve-before-mutate:
  * on MOQ_ERR_WOULD_BLOCK / MOQ_ERR_BUFFER nothing is sent or freed and the entry
  * stays PENDING_JOIN for a retry. */
 static moq_result_t fetch_reject_pending_join(moq_session_t *s, int slot,
@@ -563,6 +623,18 @@ static moq_result_t fetch_reject_pending_join(moq_session_t *s, int slot,
         moq_request_error_encode_args_t err_args = { .error_code = error_code };
         moq_result_t rc = queue_request_error_bidi(s, ref, &err_args);
         if (rc < 0) return rc;   /* nothing mutated (reserve-before-mutate) */
+    } else {
+        /* Draft16 replies on the shared control channel with the FETCH ID. */
+        uint8_t buf[PENDING_JOIN_REJECT_BOUND];
+        moq_buf_writer_t w;
+        moq_buf_writer_init(&w, buf, sizeof(buf));
+        moq_request_error_encode_args_t args = {
+            .request_id = e->request_id, .error_code = error_code
+        };
+        moq_result_t rc = s->profile->encode_request_error(s, &w, &args);
+        if (rc < 0) return rc;
+        rc = queue_send_cancel(s, buf, moq_buf_writer_offset(&w));
+        if (rc < 0) return rc;
     }
     if (need_drain)
         (void)drain_ref_add(s, ref);   /* slot reserved above */
@@ -618,7 +690,7 @@ moq_result_t session_core_pending_joins_can_resolve(moq_session_t *s, uint64_t s
     size_t extra_actions, size_t extra_drains, size_t extra_send)
 {
     size_t n_event = 0, n_action = 0, n_drain = 0, send = 0, rel_scratch = 0;
-    bool any_reject = false;
+    bool bidi_reject = false;
     /* Only an allocated fetch can be a buffered join, and only allocated slots
      * are linked, so the preflight walks the live fetches, not `fetch_cap`. */
     for (int32_t i = s->fetch_occ_head; i >= 0; i = s->fetches[i].occ_next) {
@@ -632,11 +704,30 @@ moq_result_t session_core_pending_joins_can_resolve(moq_session_t *s, uint64_t s
         bool reject = !has_largest ||
             (e->join_fetch_type == 3 && e->join_start > largest_group);
         if (reject) {
-            any_reject = true;
             n_action++;
-            send += PENDING_JOIN_REJECT_BOUND;
-            if (e->rs.ref._v != 0 &&
-                !fetch_peer_fin_observed(e)) n_drain++;
+            if (e->rs.ref._v != 0) {
+                bidi_reject = true;
+                send += PENDING_JOIN_REJECT_BOUND;
+                if (!fetch_peer_fin_observed(e)) n_drain++;
+            } else {
+                /* Control-channel rejects use a stack buffer, not event
+                 * scratch. Reserve their encoded bytes, not that buffer's
+                 * upper bound. This preflight serves both empty acceptance
+                 * and parent termination, whose error codes can differ. */
+                const uint64_t codes[] = {
+                    MOQ_REQUEST_ERROR_INVALID_RANGE,
+                    MOQ_REQUEST_ERROR_INVALID_JOINING_REQUEST_ID
+                };
+                size_t bytes = 0;
+                for (size_t j = 0; j < sizeof(codes) / sizeof(codes[0]); j++) {
+                    size_t len = 0;
+                    moq_result_t rc = pending_join_control_error_size(s,
+                        e->request_id, codes[j], &len);
+                    if (rc < 0) return rc;
+                    if (len > bytes) bytes = len;
+                }
+                send += bytes;
+            }
         } else {
             n_event++;
             rel_scratch += pending_join_release_scratch(e);   /* scratch-copied tokens */
@@ -645,9 +736,9 @@ moq_result_t session_core_pending_joins_can_resolve(moq_session_t *s, uint64_t s
     size_t need_actions = n_action + extra_actions;
     size_t need_drains  = n_drain + extra_drains;
     size_t need_send    = send + extra_send;
-    /* A reject encodes its REQUEST_ERROR through scratch transiently (restored each
-     * time), so it needs one bound on top of the accumulated release copies. */
-    size_t need_scratch = rel_scratch + (any_reject ? PENDING_JOIN_REJECT_BOUND : 0);
+    /* Only bidi rejection uses transient scratch; control errors use the
+     * stack buffer above. Released token copies remain event-borrowed. */
+    size_t need_scratch = rel_scratch + (bidi_reject ? PENDING_JOIN_REJECT_BOUND : 0);
 
     /* Permanent shortfalls (retry can never make progress) => BUFFER. */
     if (n_event > s->event_cap) return MOQ_ERR_BUFFER;
@@ -1015,15 +1106,10 @@ moq_result_t session_core_on_fetch(moq_session_t *s,
             result = MOQ_OK;
             goto cleanup_all;
         }
-        /* §10.12.2 (stream-correlated profiles only): if the associated subscription
-         * is not yet established, buffer the Joining FETCH on its request bidi until
-         * the subscription is accepted (release) or rejected/torn down. No
-         * FETCH_REQUEST is surfaced yet. Buffering is a request-stream mechanism
-         * (the held bidi receives the eventual response), so draft-16 -- which has
-         * no request bidi to defer on -- keeps the eager INVALID_RANGE reject below
-         * for a pending subscription, leaving its joining behaviour unchanged. */
-        if (d->endpoint.has_stream_ref &&
-            jsub_e->state == MOQ_SUB_PENDING_PUBLISHER) {
+        /* Draft16 §9.16.2 and draft18 §10.12.2 permit a join before the
+         * subscription is accepted. Its range must use the eventual acceptance
+         * snapshot, not an absent pending snapshot or an earlier occupant. */
+        if (jsub_e->state == MOQ_SUB_PENDING_PUBLISHER) {
             result = fetch_buffer_pending_join(s, d, &auth_committed);
             goto cleanup_all;
         }
@@ -1378,6 +1464,12 @@ moq_result_t session_core_on_fetch_cancel(moq_session_t *s,
 {
     int slot = d->target_slot;
     moq_fetch_entry_t *e = &s->fetches[slot];
+
+    /* A held join has not surfaced a handle to the serving application. */
+    if (e->state == MOQ_FETCH_PENDING_JOIN) {
+        fetch_free_entry(s, slot);
+        return MOQ_OK;
+    }
 
     bool need_reset = (e->state == MOQ_FETCH_ACCEPTED &&
                        e->data_stream_started);
@@ -2706,8 +2798,8 @@ void fetch_abort_tomb_add(moq_session_t *s, uint64_t request_id)
     for (size_t i = 0; i < s->fetch_abort_tomb_count; i++)
         if (s->fetch_abort_tombs[i] == request_id) return;
     if (s->fetch_abort_tomb_count >= s->fetch_abort_tomb_cap) {
-        /* Full: drop the oldest. A grace window, not unbounded state: an
-         * evicted id's late cancel is an unknown request and fails closed. */
+        /* Full: drop the oldest. D16 can still absorb its late cancellation
+         * using the monotonic retired-request predicate. */
         memmove(&s->fetch_abort_tombs[0], &s->fetch_abort_tombs[1],
                 (s->fetch_abort_tomb_cap - 1) * sizeof(uint64_t));
         s->fetch_abort_tomb_count = s->fetch_abort_tomb_cap - 1;

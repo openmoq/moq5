@@ -299,9 +299,8 @@ int main(void)
     /* Regression for the stale largest-object state on a publisher-side
      * subscription slot reused while still pending app-accept. The freed slot's
      * largest fields are cleared (so the reused pending subscription has no
-     * current largest), and the D16 inbound joining-fetch path rejects a pending
-     * subscription with no largest via INVALID_RANGE -- it must never surface a
-     * FETCH_REQUEST built from a prior occupant's largest. */
+     * current largest). A pending join waits for acceptance and must never
+     * use the prior occupant's Largest to build its FETCH_REQUEST. */
     {
         test_alloc_state_t alloc_state = {0};
         moq_alloc_t alloc = test_allocator(&alloc_state);
@@ -342,12 +341,15 @@ int main(void)
               moq_event_cleanup(&e); }
 
         /* Subscription #2 (client request_id 2): reuses the server slot and
-         * stays PENDING (the app does not accept it). */
+         * stays PENDING. A different track distinguishes the old slot's
+         * snapshot from valid history retained for the old track. */
+        scfg.track_name = MOQ_BYTES_LITERAL("new-track");
         moq_subscription_t sub2;
         MOQ_TEST_CHECK(moq_session_subscribe(c, &scfg, 2000, &sub2) == MOQ_OK);
         pump_actions_to_peer(c, sv, 2000);
         MOQ_TEST_CHECK(moq_session_poll_events(sv, &ev, 1) == 1);
         MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST);
+        moq_subscription_t sv_sub2 = ev.u.subscribe_request.sub;
         moq_event_cleanup(&ev);
         { moq_action_t a; while (moq_session_poll_actions(sv, &a, 1) > 0)
               moq_action_cleanup(&a); }
@@ -371,19 +373,24 @@ int main(void)
         /* No FETCH_REQUEST may be surfaced for the unaccepted subscription. */
         MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(sv, &ev, 1), 0);
         MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
-        /* The fetch (request_id 4) is rejected with REQUEST_ERROR
-         * INVALID_RANGE, not surfaced. */
-        { moq_action_t acts[4]; size_t na = moq_session_poll_actions(sv, acts, 4);
-          bool saw_err = false;
-          for (size_t i = 0; i < na; i++) {
-              moq_d16_request_error_t err;
-              if (decode_action_request_error(&acts[i], &err) == MOQ_OK &&
-                  err.request_id == 4 &&
-                  err.error_code == MOQ_REQUEST_ERROR_INVALID_RANGE)
-                  saw_err = true;
-              moq_action_cleanup(&acts[i]);
-          }
-          MOQ_TEST_CHECK(saw_err); }
+        /* No premature error: the new acceptance supplies this join's basis. */
+        { moq_action_t act;
+          MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_actions(sv, &act, 1), 0); }
+        moq_accept_subscribe_cfg_init(&asub);
+        asub.has_largest = true;
+        asub.largest_group = 3;
+        asub.largest_object = 7;
+        MOQ_TEST_CHECK_EQ_INT(moq_session_accept_subscribe(sv, sv_sub2, &asub,
+                                                          3000), MOQ_OK);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(sv, &ev, 1), 1);
+        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_FETCH_REQUEST);
+        MOQ_TEST_CHECK(moq_subscription_eq(ev.u.fetch_request.joining_sub,
+                                          sv_sub2));
+        MOQ_TEST_CHECK_EQ_U64(ev.u.fetch_request.start_group, 0);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.fetch_request.start_object, 0);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.fetch_request.end_group, 3);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.fetch_request.end_object, 8);
+        moq_event_cleanup(&ev);
 
         moq_session_destroy(c);
         moq_session_destroy(sv);

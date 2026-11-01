@@ -453,6 +453,11 @@ add_executable(test_session_fetch unit/test_session_fetch.c)
 target_link_libraries(test_session_fetch PRIVATE moq-core-test-internals)
 add_test(NAME session_fetch COMMAND test_session_fetch)
 
+add_executable(test_d16_pending_join unit/test_d16_pending_join.c)
+target_link_libraries(test_d16_pending_join PRIVATE moq::core)
+add_test(NAME d16_pending_join COMMAND test_d16_pending_join)
+set_tests_properties(d16_pending_join PROPERTIES TIMEOUT 30)
+
 # These rows establish their peers through SimPair and exist only when the
 # sim harness is built.
 if(TARGET moq::sim)

@@ -2423,8 +2423,8 @@ struct moq_session {
      * Separate from fetch_cancel_tombs on purpose: that ring holds ids this
      * side originated as a FETCHER, this one holds peer-originated ids this
      * side answered as a PUBLISHER, so neither ring's lookups can alias the
-     * other's. Drop-oldest when full (capacity = fetch pool size): an evicted
-     * id's late cancel fails closed on the unknown-request path. */
+     * other's. Drop-oldest when full (capacity = fetch pool size); D16's
+     * monotonic retired-request predicate also covers evicted IDs. */
     uint64_t        *fetch_abort_tombs;
     size_t           fetch_abort_tomb_cap;
     size_t           fetch_abort_tomb_count;

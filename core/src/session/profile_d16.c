@@ -1928,6 +1928,9 @@ static moq_result_t d16_decode_fetch(moq_session_t *s,
 
 /* -- D16 inbound FETCH_CANCEL decode ------------------------------ */
 
+static bool d16_terminal_id_is_obsolete(const moq_session_t *s,
+                                        uint64_t request_id);
+
 static moq_result_t d16_decode_fetch_cancel(
     moq_session_t *s,
     const moq_control_envelope_t *env,
@@ -1961,11 +1964,13 @@ static moq_result_t d16_decode_fetch_cancel(
 
     moq_request_endpoint_t ep = request_registry_find_by_id(s, request_id);
     if (ep.kind != MOQ_REQ_FETCH) {
-        /* A cancel that crossed our own abort of that fetch: the id is no
-         * longer registered but is remembered in the bounded abort cache, so
-         * consume it (the reset already answered the request). Any other
-         * unknown id keeps failing closed. */
-        if (fetch_abort_tomb_consume(s, request_id)) {
+        /* An error or stream terminal can retire a FETCH before its peer's
+         * cancellation arrives (§5.2, §9.18). The monotonic request sequence
+         * proves prior issuance even after the bounded abort cache evicts an
+         * id. Never absorb an active owner or an outstanding obligation. */
+        if (ep.kind == MOQ_REQ_NONE &&
+            (fetch_abort_tomb_consume(s, request_id) ||
+             d16_terminal_id_is_obsolete(s, request_id))) {
             *out_consumed = true;
             return MOQ_OK;
         }
@@ -1979,7 +1984,8 @@ static moq_result_t d16_decode_fetch_cancel(
         return close_with_error(s, 0x4,
             "FETCH_CANCEL for non-publisher fetch");
     }
-    if (e->state != MOQ_FETCH_PENDING_PUBLISHER &&
+    if (e->state != MOQ_FETCH_PENDING_JOIN &&
+        e->state != MOQ_FETCH_PENDING_PUBLISHER &&
         e->state != MOQ_FETCH_ACCEPTED) {
         *out_consumed = true;
         return close_with_error(s, 0x4,
@@ -2339,18 +2345,20 @@ static moq_result_t d16_decode_publish_ok_inbound(
 
 /* -- D16 inbound PUBLISH_DONE decode ------------------------------ */
 
-/* A subscription terminal (PUBLISH_DONE or UNSUBSCRIBE) whose Request ID
+/* A terminal (PUBLISH_DONE, UNSUBSCRIBE or FETCH_CANCEL) whose Request ID
  * has no registry owner. The two terminals can lawfully cross: §5.1.1 lets
  * a subscriber dispose of its subscription state once it sends UNSUBSCRIBE,
  * and lets a publisher delete it after sending PUBLISH_DONE (§5.1.1, §9.15), while
  * §9.12 lets the subscriber send UNSUBSCRIBE without having seen that DONE.
  * So the peer's terminal can name a subscription this side already retired.
+ * Likewise, §5.2 permits immediate FETCH retirement after REQUEST_ERROR or
+ * data-stream closure, crossing the cancellation permitted by §9.18.
  * This side's interoperability policy absorbs such a terminal, with no
  * effect, when its id was committed earlier in its origin's sequence (§9.1:
  * each origin's ids are consecutive, committed in order) and is not an
  * outstanding obligation: a reply tombstone still awaiting its OK/ERROR, or
  * an inbound update still owed an answer. The test proves the id was
- * issued, not that it named a subscription or which side held which role;
+ * issued, not its historical request family or which side held which role;
  * an id at or past its origin's next id is never absorbed. */
 static bool d16_terminal_id_is_obsolete(const moq_session_t *s, uint64_t request_id)
 {
