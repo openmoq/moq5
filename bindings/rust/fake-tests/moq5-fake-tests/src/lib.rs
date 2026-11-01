@@ -22,6 +22,7 @@ extern "C" {
     fn moq5_fake_log_take(buf: *mut c_char, cap: usize) -> usize;
     fn moq5_fake_set(name: *const c_char, value: i64);
     fn moq5_fake_get(name: *const c_char) -> i64;
+    fn moq5_fake_pump(endpoint: *mut sys::moq_endpoint_t, terminal: bool);
     pub fn moq5_fake_set_goaway(uri: *const u8, len: usize, present: bool);
     pub fn moq5_fake_set_content_protection(cp: *const sys::moq_cmsf_content_protection_t);
     pub fn moq5_fake_push_track_event(ev: *const sys::moq_media_track_event_t);
@@ -98,6 +99,13 @@ pub fn suite() -> Suite {
 }
 
 impl Suite {
+    /// Execute queued endpoint tasks once, before the provider's pump marker.
+    pub fn pump(&self, endpoint: &moq5::Endpoint, terminal: bool) {
+        // SAFETY: the live endpoint belongs to the provider; self serializes
+        // its globals. The task sees NULL on the terminal path.
+        unsafe { moq5_fake_pump(endpoint.as_ptr(), terminal) }
+    }
+
     /// Set a provider knob.
     pub fn set(&self, name: &str, value: i64) {
         let name = CString::new(name).expect("a knob name has no NUL");

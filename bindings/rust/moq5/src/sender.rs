@@ -693,6 +693,22 @@ const TRACK_STATS_V0: usize = ffi::field_end!(
 );
 
 impl Sender {
+    /// Queue attachment and the complete initial track set in one managed
+    /// turn, before the sender can publish a catalog. Poll the returned
+    /// operation; dropping it cancels startup. See [`crate::SenderStartup`].
+    /// No application callback runs on the managed thread.
+    /// Configurations are owned copies; the input iterator runs on the
+    /// calling application thread. An empty track set is [`Error::INVAL`].
+    /// Executor refusal reports its native error immediately; attach/add
+    /// validation errors are returned by the operation's poll.
+    pub fn attach_with_tracks(
+        endpoint: &Endpoint,
+        config: &SenderConfig,
+        tracks: impl IntoIterator<Item = SendTrackConfig>,
+    ) -> Result<crate::SenderStartup> {
+        crate::SenderStartup::queue(endpoint, config.clone(), tracks.into_iter().collect())
+    }
+
     /// Attach a sender to `endpoint`. Add tracks after this; the catalog is
     /// published once the namespace is accepted, and a track added after
     /// readiness republishes it.

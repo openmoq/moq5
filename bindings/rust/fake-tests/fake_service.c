@@ -158,11 +158,51 @@ typedef struct fake_track {
     bool                  has_desc;
 } fake_track_t;
 
+typedef struct fake_task {
+    moq_endpoint_task_fn fn;
+    void *ctx;
+    struct fake_task *next;
+} fake_task_t;
+
 struct moq_endpoint {
     const moq_alloc_t *alloc;
     bool interrupted;
     int attachments;
+    bool stopped;
+    fake_task_t *tasks;
+    fake_task_t **task_tail;
 };
+
+void moq5_fake_pump(moq_endpoint_t *ep, bool terminal)
+{
+    if (!ep) abort();
+    while (ep->tasks) {
+        fake_task_t *task = ep->tasks;
+        ep->tasks = task->next;
+        if (!ep->tasks) ep->task_tail = &ep->tasks;
+        task->fn(ep, terminal ? NULL : (moq_session_t *)ep, 0, task->ctx);
+        fake_free(task, sizeof *task);
+    }
+    logf_("pump attachments=%d", ep->attachments);
+}
+
+moq_result_t moq_endpoint_post(moq_endpoint_t *ep, moq_endpoint_task_fn fn, void *ctx)
+{
+    if (!ep || !fn) return MOQ_ERR_INVAL;
+    bump("post");
+    moq_result_t rc = (moq_result_t)get("post_result");
+    if (rc != MOQ_OK) return rc;
+    if (ep->stopped) return MOQ_ERR_CLOSED;
+    fake_task_t *task = fake_alloc(sizeof *task);
+    if (!task) return MOQ_ERR_NOMEM;
+    task->fn = fn;
+    task->ctx = ctx;
+    if (!ep->task_tail) ep->task_tail = &ep->tasks;
+    *ep->task_tail = task;
+    ep->task_tail = &task->next;
+    if (get("post_immediate")) moq5_fake_pump(ep, false);
+    return MOQ_OK;
+}
 
 struct moq_media_sender {
     moq_endpoint_t *ep;
@@ -296,7 +336,12 @@ moq_result_t moq_endpoint_stop(moq_endpoint_t *ep)
     bump("stop");
     logf_("stop");
     if (ep->attachments > 0) return MOQ_ERR_WRONG_STATE;
-    return (moq_result_t)get("stop_result");
+    moq_result_t rc = (moq_result_t)get("stop_result");
+    if (rc == MOQ_OK) {
+        ep->stopped = true;
+        if (ep->tasks) moq5_fake_pump(ep, true);
+    }
+    return rc;
 }
 
 void moq_endpoint_destroy(moq_endpoint_t *ep)
@@ -582,6 +627,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s, const moq_media_t
           cfg->mpeg2ts_object_packets, cfg->mpeg2ts_min_group_ms,
           cfg->mpeg2ts_forward_before_random_access ? 1 : 0, props, cfg->struct_size);
     moq_result_t rc = (moq_result_t)get("add_track_result");
+    if (get("add_track_fail_at") == get("add_track")) rc = MOQ_ERR_NOMEM;
     if (rc != MOQ_OK) return rc;
     if (s->track_count == FAKE_TRACKS) return MOQ_ERR_NOMEM;
     fake_track_t *t = &s->tracks[s->track_count++];

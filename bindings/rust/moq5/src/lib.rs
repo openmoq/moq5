@@ -39,13 +39,16 @@
 //!   polling thread (an output borrows its player); buffers move.
 //!
 //! **No application code runs on the service's threads.** This crate
-//! installs no C callbacks, posts no tasks, and adopts no buffer whose
+//! installs no application callbacks and adopts no buffer whose
 //! release runs application code: a buffer release only deallocates. So the
 //! last [`Endpoint`] drop always happens on an application thread, and
 //! `stop()` never joins the thread it runs on. Anything that would run
 //! application code on a native thread (a raw endpoint from
 //! [`Endpoint::from_raw`], a release given to [`Buffer::wrap_raw`]) is
 //! `unsafe` and re-establishes that invariant itself.
+//! Initial sender registration uses one internal endpoint task. Its concrete
+//! configuration owns no application code or payloads, and its cancellation
+//! handshake keeps the last endpoint drop on the application thread.
 //!
 //! Demand is observed, not signalled: [`Sender::is_ready`] and the
 //! subscriber queries are point-in-time snapshots, and [`Sender::wait`] waits
@@ -105,6 +108,7 @@ mod namespace;
 pub mod player;
 mod receiver;
 mod sender;
+mod sender_startup;
 mod types;
 
 pub use buffer::{Buffer, SliceError};
@@ -130,6 +134,7 @@ pub use sender::{
     Backpressure, CmsfUrl, ContentProtection, DrmSystem, SendObject, SendTrack, SendTrackConfig,
     Sender, SenderConfig, SenderStats, TrackStats, WriteError,
 };
+pub use sender_startup::SenderStartup;
 pub use types::{
     libmoq_version, CompanionProfile, DeliveryOrigin, GroupOrder, Location, LocationFilter,
     MediaType, ObjectStatus, Packaging, SapType, TimeDomain, Version, WaitResult,

@@ -1185,6 +1185,14 @@ if(MOQ_BUILD_TESTS)
             add_test(NAME media_sender_auth COMMAND test_media_sender_auth)
             set_tests_properties(media_sender_auth PROPERTIES TIMEOUT 30)
 
+            add_executable(test_media_sender_startup tests/test_media_sender_startup.c)
+            target_link_libraries(test_media_sender_startup PRIVATE moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_startup PRIVATE ${PROJECT_SOURCE_DIR}/tests/unit)
+            target_compile_options(test_media_sender_startup PRIVATE
+                $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+            add_test(NAME media_sender_startup COMMAND test_media_sender_startup)
+            set_tests_properties(media_sender_startup PROPERTIES TIMEOUT 30)
+
             add_executable(test_media_sender_priority
                 tests/test_media_sender_priority.c)
             target_link_libraries(test_media_sender_priority PRIVATE

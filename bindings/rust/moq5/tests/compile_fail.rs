@@ -37,6 +37,11 @@ const CASES: &[(&str, Option<(&str, &str)>)] = &[
         Some(("E0277", "cannot be shared between threads safely")),
     ),
     (
+        "sender_startup_shared_across_threads",
+        Some(("E0277", "cannot be shared between threads safely")),
+    ),
+    ("sender_startup_moves_between_threads", None),
+    (
         "buffer_used_after_slice",
         Some(("E0382", "borrow of moved value: `buffer`")),
     ),

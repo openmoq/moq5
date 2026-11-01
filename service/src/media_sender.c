@@ -3523,6 +3523,20 @@ static void sender_resolve_companion_locked(moq_media_sender_t *s)
     }
 }
 
+#ifdef MOQ_MEDIA_SENDER_TESTING
+static atomic_size_t startup_hook_calls, startup_first_track_count;
+void moq_media_sender_test_startup_hook_reset(void);
+void moq_media_sender_test_startup_hook_reset(void)
+{
+    atomic_store(&startup_hook_calls, 0);
+    atomic_store(&startup_first_track_count, 0);
+}
+size_t moq_media_sender_test_startup_hook_calls(void);
+size_t moq_media_sender_test_startup_hook_calls(void) { return atomic_load(&startup_hook_calls); }
+size_t moq_media_sender_test_startup_first_tracks(void);
+size_t moq_media_sender_test_startup_first_tracks(void) { return atomic_load(&startup_first_track_count); }
+#endif
+
 static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
                         uint64_t now_us, void *ctx)
 {
@@ -3530,6 +3544,10 @@ static void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
     moq_media_sender_t *s = (moq_media_sender_t *)ctx;
 
     pthread_mutex_lock(&s->mu);
+#ifdef MOQ_MEDIA_SENDER_TESTING
+    if (atomic_fetch_add(&startup_hook_calls, 1) == 0)
+        atomic_store(&startup_first_track_count, s->track_count);
+#endif
     bool fatal = s->fatal;
     uint64_t fatal_code = s->fatal_code;
     pthread_mutex_unlock(&s->mu);

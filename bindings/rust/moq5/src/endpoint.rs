@@ -1,5 +1,5 @@
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use std::{mem, ptr};
 
@@ -291,11 +291,21 @@ impl EndpointConfig {
 /// (which is the point of the latch). When the last handle drops the
 /// endpoint is stopped (the network thread joined) and destroyed. That last
 /// drop always happens on an application thread: this crate runs no
-/// application code on the service's threads (no callbacks, no posted tasks,
-/// no buffer owners with destructors), so the thread `stop()` joins is never
-/// the one running the drop.
+/// application code on the service's threads. Internal sender startup tasks
+/// retain only a weak handle, with their application's strong handle held
+/// through cancellation, so the thread `stop()` joins never runs that drop.
 #[derive(Clone, Debug)]
 pub struct Endpoint(Arc<Inner>);
+
+/// A queued internal operation must not keep its executor alive.
+#[derive(Clone, Debug)]
+pub(crate) struct WeakEndpoint(Weak<Inner>);
+
+impl WeakEndpoint {
+    pub(crate) fn upgrade(&self) -> Option<Endpoint> {
+        self.0.upgrade().map(Endpoint)
+    }
+}
 
 #[derive(Debug)]
 struct Inner {
@@ -402,6 +412,10 @@ pub struct Terminal {
 }
 
 impl Endpoint {
+    pub(crate) fn downgrade(&self) -> WeakEndpoint {
+        WeakEndpoint(Arc::downgrade(&self.0))
+    }
+
     /// Validate `config` and start connecting. The handshake completes
     /// asynchronously; watch it with [`wait`](Endpoint::wait) and
     /// [`state`](Endpoint::state). Unless `insecure_skip_verify` is set,

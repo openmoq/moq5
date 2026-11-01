@@ -12,6 +12,17 @@ Two crates over libmoq's service tier:
 
 Both are `publish = false`; nothing is uploaded or reserved.
 
+## Initial sender catalogs
+
+`Sender::attach_with_tracks` queues attachment and the complete initial track
+set in one endpoint turn, before the sender's first pump. Poll its
+`SenderStartup` with `poll`, waiting on the endpoint between polls. The result
+contains the sender and track handles in input order; peer acceptance is still
+observed separately through `Sender::is_ready`. No application closure or media
+payload runs on the managed thread. Dropping startup cancels a queued task or
+settles a running registration, and drops an unclaimed result on the application
+thread. Failed registration detaches the partial sender before its first hook.
+
 ## Style
 
 Handwritten Rust follows the
