@@ -3062,7 +3062,8 @@ static bool sender_has_pending_output(void *ctx)
                        !sender_timeline_caught_up(t) &&
                        !sender_track_demand(s, t);
             else
-                held = t->complete_end_owed && t->tstats.objects_queued != 0;
+                held = t->end_requested && !t->end_sent &&
+                       t->tstats.objects_queued != 0;
         }
         if (!held) pending = true;
     }
@@ -3140,6 +3141,20 @@ static bool sender_stage_refresh(moq_media_sender_t *s)
 static void sender_republish_catalog(moq_media_sender_t *s, uint64_t now_us)
 {
     pthread_mutex_lock(&s->mu);
+
+    /* Completion's END_OF_TRACK objects do not retire served pull slots.
+     * Their Track Ended controls are queued by retirement on a later hook.
+     * Keep the terminal catalog owed until every such publisher track is
+     * retired; a capacity refusal preserves its handle and pending output. */
+    if (s->complete_finalized) {
+        for (size_t i = 0; i < s->track_count; i++) {
+            const moq_media_track_t *t = s->tracks[i];
+            if (!t->is_catalog && t->pub_track) {
+                pthread_mutex_unlock(&s->mu);
+                return;
+            }
+        }
+    }
 
     if (s->pending_obj_count == 0) {
         /* A real add/remove/conversion generation takes precedence. */

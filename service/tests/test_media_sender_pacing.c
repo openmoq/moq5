@@ -22,6 +22,7 @@
 #include <moq/session.h>
 #include <moq/publisher.h>   /* MOQ_PUB_DONE_TRACK_ENDED */
 #include <moq/msf.h>         /* MOQ_MSF_CATALOG_TRACK_NAME */
+#include <moq/control_d18.h> /* decode the actual terminal control */
 #include "test_support.h"
 #include "test_alloc_support.h"
 /* Expected handles/aliases require layout, not the private action helpers. */
@@ -86,6 +87,7 @@ bool moq_media_sender_test_complete_failed(moq_media_sender_t *s);
 bool moq_media_sender_test_timeline_held(moq_media_sender_t *s);
 void moq_media_sender_test_set_alloc(const moq_alloc_t *alloc);
 void moq_media_sender_test_refuse_catalog_build(moq_media_sender_t *s);
+void moq_media_sender_test_refuse_teardown_end(moq_media_sender_t *s, uint32_t n);
 
 /* -- Trace ------------------------------------------------------------- *
  * One record per object the PEER actually received, in arrival order, tagged
@@ -4263,6 +4265,7 @@ typedef struct {
     int        status;
     int        pass;           /* the drive that delivered it */
     bool       cat_complete;   /* a catalog object that parsed isComplete */
+    bool       cat_terminal;   /* independent, complete, empty tracks */
     bool       cat_bad;        /* a catalog object that did not parse */
     size_t     len;
     uint8_t    copy[TLC_COPY];
@@ -4276,6 +4279,7 @@ typedef struct {
     moq_media_track_t  *a;
     moq_subscription_t  sub[TLC_NSUB];
     int                 sub_ok;
+    unsigned            namespaces;
     tlc_rec_t           log[TLC_LOG];
     int                 n;
     bool                overflow, unexpected;
@@ -4324,6 +4328,8 @@ static void tlc_collect(tlc_t *x, uint64_t now)
                                       moq_rcbuf_len(o->payload) };
                     if (moq_msf_catalog_parse(moq_alloc_default(), j, &cat) == MOQ_OK) {
                         r->cat_complete = cat.is_complete;
+                        r->cat_terminal = cat.is_complete && cat.track_count == 0 &&
+                                          cat.delta_update == NULL;
                         moq_msf_catalog_cleanup(moq_alloc_default(), &cat);
                     } else {
                         r->cat_bad = true;
@@ -4337,6 +4343,7 @@ static void tlc_collect(tlc_t *x, uint64_t now)
         } else if (ev.kind == MOQ_EVENT_SUBSCRIBE_OK) {
             x->sub_ok++;
         } else if (ev.kind == MOQ_EVENT_NAMESPACE_PUBLISHED) {
+            x->namespaces++;
             moq_accept_namespace_cfg_t ac;
             moq_accept_namespace_cfg_init(&ac);
             (void)moq_session_accept_namespace(srv, ev.u.namespace_published.ann,
@@ -4351,7 +4358,9 @@ static void tlc_collect(tlc_t *x, uint64_t now)
 /* make_pair with a peer event queue deep enough for a whole pump, so every
  * delivery surfaces in the pump that issued it and arrival passes order the
  * sender's issues across streams. */
-static moq_simpair_t *tlc_pair(moq_alloc_t *alloc, uint32_t max_actions)
+static moq_simpair_t *tlc_pair_config(moq_alloc_t *alloc, uint32_t max_actions,
+                                      moq_version_t version,
+                                      moq_sim_trace_fn trace, void *ctx)
 {
     moq_simpair_cfg_t cfg = MOQ_SIMPAIR_CFG_INIT;
     cfg.alloc = alloc; cfg.seed = 42; cfg.initial_now_us = 1000;
@@ -4359,7 +4368,9 @@ static moq_simpair_t *tlc_pair(moq_alloc_t *alloc, uint32_t max_actions)
     cfg.client_initial_request_capacity = 32;
     cfg.server_send_request_capacity = true;
     cfg.server_initial_request_capacity = 32;
-    cfg.version = PACING_VERSION;
+    cfg.version = version;
+    cfg.trace_fn = trace;
+    cfg.trace_ctx = ctx;
     cfg.max_actions = max_actions;   /* 0 = library default */
     cfg.max_events = 256;
     moq_simpair_t *sp = NULL;
@@ -4372,6 +4383,11 @@ static moq_simpair_t *tlc_pair(moq_alloc_t *alloc, uint32_t max_actions)
     while (moq_session_poll_events(moq_simpair_server(sp), &ev, 1) == 1)
         moq_event_cleanup(&ev);
     return sp;
+}
+
+static moq_simpair_t *tlc_pair(moq_alloc_t *alloc, uint32_t max_actions)
+{
+    return tlc_pair_config(alloc, max_actions, PACING_VERSION, NULL, NULL);
 }
 
 static void tlc_drive(tlc_t *x, uint64_t now)
@@ -4471,11 +4487,13 @@ static const char TLC_SAP_ALL[] =
  *                  finalization, and the timeline's outstanding work is
  *                  reported as work on every pump until its end is sent.
  * `max_actions` bounds the session's action ring, so the media, the timeline
- * and both ends contend for room across several pumps. */
+ * and both ends contend for room across several pumps. `pre_ended` queues
+ * each media track's end before complete(), leaving that end behind any
+ * retained media instead of asking complete() to supply it. */
 typedef enum { TL_DEMANDED, TL_JOINER, MEDIA_JOINER, OTHER_HELD } tlc_mode_t;
 
 static void test_complete_timeline(tlc_mode_t mode, uint32_t max_actions,
-                                   bool mt)
+                                   bool mt, bool pre_ended)
 {
     int before = failures;
     test_alloc_state_t as = {0};
@@ -4485,12 +4503,12 @@ static void test_complete_timeline(tlc_mode_t mode, uint32_t max_actions,
     uint64_t now = 1000;
     char label[96];
     const char *tl_name = mt ? "v.timeline" : "v.sap";
-    snprintf(label, sizeof(label), "pacing_complete_%s_%s_act%u",
+    snprintf(label, sizeof(label), "pacing_complete_%s_%s_act%u%s",
              mt ? "media_timeline" : "timeline",
              mode == TL_DEMANDED ? "demanded"
              : mode == TL_JOINER ? "joiner"
              : mode == MEDIA_JOINER ? "media_joiner" : "other_held",
-             (unsigned)max_actions);
+             (unsigned)max_actions, pre_ended ? "_preended" : "");
 
     x.sp = tlc_pair(&alloc, max_actions);
     if (!x.sp) { failures++; goto out; }
@@ -4545,6 +4563,13 @@ static void test_complete_timeline(tlc_mode_t mode, uint32_t max_actions,
     if (mode == OTHER_HELD)
         MOQ_TEST_CHECK(tlc_write_to(&x, x.a, 0x70, true, false, MOQ_SAP_NONE,
                                     10000) == MOQ_OK);
+    if (pre_ended) {
+        MOQ_TEST_CHECK(moq_media_sender_end_track(x.s, x.v) == MOQ_OK);
+        if (x.a)
+            MOQ_TEST_CHECK(moq_media_sender_end_track(x.s, x.a) == MOQ_OK);
+    }
+    uint64_t written = mode == OTHER_HELD ? 5 : 4;
+    expect_conserved(x.s, written, 0, written, 0, written * PAYLOAD_LEN, label);
     MOQ_TEST_CHECK_EQ_INT((int)moq_media_sender_complete(x.s), (int)MOQ_OK);
     int from_pass = x.pass;
 
@@ -4564,6 +4589,23 @@ static void test_complete_timeline(tlc_mode_t mode, uint32_t max_actions,
                 fprintf(stderr, "  pump %d: pending=%d ends_out=%d\n",
                         x.pass, (int)pending, (int)ends_out);
         }
+    }
+
+    if (mode == MEDIA_JOINER || mode == OTHER_HELD) {
+        /* Retention owns every accepted byte without completing or failing.
+         * The held track has emitted neither its end nor its done. */
+        uint64_t held = mode == MEDIA_JOINER ? 4 : 1;
+        int held_track = mode == MEDIA_JOINER ? TLC_V : TLC_A;
+        expect_conserved(x.s, written, written - held, held, 0,
+                         held * PAYLOAD_LEN, label);
+        MOQ_TEST_CHECK_EQ_INT(tlc_first_complete_catalog(&x), -1);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, held_track), 0);
+        MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, held_track), 0);
+        MOQ_TEST_CHECK(!moq_media_sender_is_fatal(x.s));
+        MOQ_TEST_CHECK(!moq_media_sender_test_complete_failed(x.s));
+        moq_media_sender_stats_t st;
+        MOQ_TEST_CHECK(moq_media_sender_get_stats(x.s, &st, sizeof(st)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)st.completion_error, (int)MOQ_OK);
     }
 
     if (mode == TL_JOINER) {
@@ -4628,6 +4670,17 @@ static void test_complete_timeline(tlc_mode_t mode, uint32_t max_actions,
     /* Media: exactly the four Objects, then one END_OF_TRACK after them. */
     MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_V), 4);
     MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_V), 1);
+    unsigned v_object = 0;
+    for (int i = 0; i < x.n; i++) {
+        const tlc_rec_t *r = &x.log[i];
+        if (r->kind != TLC_OBJ ||
+            (r->track != TLC_V && r->track != TLC_A)) continue;
+        uint8_t payload[PAYLOAD_LEN];
+        memset(payload, r->track == TLC_V ? 0x60 + v_object++ : 0x70,
+               sizeof(payload));
+        MOQ_TEST_CHECK(!r->truncated && r->len == sizeof(payload) &&
+                       memcmp(r->copy, payload, sizeof(payload)) == 0);
+    }
     int v_last = tlc_find(&x, TLC_OBJ, TLC_V, true);
     int v_end = tlc_find(&x, TLC_STATUS, TLC_V, false);
     MOQ_TEST_CHECK(v_end > v_last && v_last >= 0);
@@ -4717,6 +4770,7 @@ static void test_complete_timeline(tlc_mode_t mode, uint32_t max_actions,
             MOQ_TEST_CHECK(e >= 0 && x.log[i].pass >= x.log[e].pass);
         }
     MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+    expect_conserved(x.s, written, written, 0, 0, 0, label);
 
     /* Non-vacuity of the pressure: under a bounded ring the completion took
      * several pumps; the media and the timeline did not all fit in the first. */
@@ -4741,6 +4795,216 @@ static void test_complete_timeline(tlc_mode_t mode, uint32_t max_actions,
                     (unsigned long long)x.log[i].group, (unsigned long long)x.log[i].object,
                     x.log[i].status, (int)x.log[i].cat_complete, x.log[i].len);
 
+out:
+    if (x.s) moq_media_sender_test_free(x.s);
+    if (x.sp) {
+        moq_event_t ev;
+        while (moq_session_poll_events(moq_simpair_client(x.sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        while (moq_session_poll_events(moq_simpair_server(x.sp), &ev, 1) == 1)
+            moq_event_cleanup(&ev);
+        moq_simpair_destroy(x.sp);
+    }
+    MOQ_TEST_CHECK(as.balance == 0);
+    int nf = failures - before;
+    if (nf == 0) printf("PASS: %s\n", label);
+    else         printf("FAIL: %s (%d diagnostics)\n", label, nf);
+}
+
+/* One served subscription's actual draft-18 terminal bytes and stream opens.
+ * This trace is not a cross-stream arrival-order oracle. */
+typedef struct {
+    moq_stream_ref_t request;
+    uint64_t alias;
+    moq_stream_ref_t streams[2];
+    size_t opened;
+    unsigned done;
+    uint64_t status, stream_count;
+    bool bad;
+} tlc_done_wire_t;
+
+static void tlc_done_wire(void *ctx, const moq_sim_trace_record_t *r)
+{
+    tlc_done_wire_t *w = ctx;
+    if (w->request._v == 0 || r->kind != MOQ_SIM_TRACE_ACTION ||
+        r->from != MOQ_PERSPECTIVE_CLIENT) return;
+    if (r->struct_size < offsetof(moq_sim_trace_record_t, fin) + sizeof(r->fin)) {
+        w->bad = true;
+        return;
+    }
+    /* The fixture's single media object has a payload. Its subgroup header
+     * and the fresh terminal's header are the only matching header-only
+     * SEND_DATA records; status-object headers start with delta zero. */
+    if (r->action_kind == MOQ_ACTION_SEND_DATA && r->count == 0 && !r->fin &&
+        r->bytes.len && (r->bytes.data[0] & 0x10)) {
+        moq_buf_reader_t br;
+        moq_buf_reader_init(&br, r->bytes.data, r->bytes.len);
+        moq_d18_subgroup_header_t h;
+        if (moq_d18_decode_subgroup_header(&br, &h) != MOQ_OK) {
+            w->bad = true;
+            return;
+        }
+        if (h.track_alias == w->alias) {
+            if (w->opened >= 2 || (w->opened &&
+                w->streams[0]._v == r->stream_ref._v)) w->bad = true;
+            else w->streams[w->opened++] = r->stream_ref;
+        }
+    }
+    if (r->action_kind != MOQ_ACTION_SEND_BIDI_STREAM ||
+        r->stream_ref._v != w->request._v || !r->detail_bytes.len) return;
+    moq_buf_reader_t br;
+    moq_buf_reader_init(&br, r->detail_bytes.data, r->detail_bytes.len);
+    moq_control_envelope_t env;
+    moq_d18_publish_done_t done;
+    if (moq_d18_decode_envelope(&br, &env) != MOQ_OK ||
+        moq_buf_reader_remaining(&br) != 0 || env.msg_type != MOQ_D18_PUBLISH_DONE ||
+        moq_d18_decode_publish_done(env.payload, env.payload_len, &done) != MOQ_OK ||
+        !r->fin) {
+        w->bad = true;
+        return;
+    }
+    w->done++;
+    w->status = done.status_code;
+    w->stream_count = done.stream_count;
+}
+
+/* Find the live publisher-side request through the peer's declared handle,
+ * without deriving a handle from an observed terminal message. */
+static const moq_sub_entry_t *tlc_publisher_sub(const tlc_t *x, int track)
+{
+    const moq_session_t *peer = moq_simpair_server(x->sp);
+    const moq_session_t *publisher = moq_simpair_client(x->sp);
+    for (size_t i = 0; i < peer->sub_cap; i++) {
+        const moq_sub_entry_t *p = &peer->subs[i];
+        if (p->state != MOQ_SUB_ESTABLISHED ||
+            p->handle._opaque != x->sub[track]._opaque) continue;
+        for (size_t j = 0; j < publisher->sub_cap; j++) {
+            const moq_sub_entry_t *s = &publisher->subs[j];
+            if (s->role == MOQ_SUB_ROLE_PUBLISHER &&
+                s->state == MOQ_SUB_ESTABLISHED && s->request_id == p->request_id)
+                return s;
+        }
+    }
+    return NULL;
+}
+
+/* A terminal catalog cannot escape while the served media request is still
+ * owed its terminal control. Refusing retirement supplies an observation
+ * BEFORE the retry, independent of transport priority within a pump. */
+static void test_complete_control_order(bool pre_ended, bool capacity)
+{
+    int before = failures;
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    tlc_t x;
+    memset(&x, 0, sizeof(x));
+    tlc_done_wire_t wire;
+    memset(&wire, 0, sizeof(wire));
+    uint64_t now = 1000;
+    const char *label = capacity ? "pacing_complete_control_d18_preended_capacity"
+        : pre_ended ? "pacing_complete_control_d18_preended_injected"
+                    : "pacing_complete_control_d18_direct_injected";
+    x.sp = tlc_pair_config(&alloc, capacity ? 8 : 0, MOQ_VERSION_DRAFT_18,
+                          tlc_done_wire, &wire);
+    if (!x.sp) { failures++; goto out; }
+    g_ns[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns[1] = MOQ_BYTES_LITERAL("control-order");
+    moq_media_sender_cfg_t cfg;
+    moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
+    cfg.namespace_ = (moq_namespace_t){ g_ns, 2 };
+    cfg.catalog_refresh_interval_us = UINT64_MAX;
+    x.s = moq_media_sender_test_new_cfg(&cfg);
+    if (!x.s) { failures++; goto out; }
+    x.v = add_track(x.s, "v", MOQ_MEDIA_TYPE_VIDEO);
+    if (!x.v) { failures++; goto out; }
+    for (int i = 0; i < 16 && !moq_media_sender_is_ready(x.s); i++) tlc_drive(&x, now);
+    MOQ_TEST_CHECK(moq_media_sender_is_ready(x.s));
+    MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_CAT, MOQ_MSF_CATALOG_TRACK_NAME, now));
+    MOQ_TEST_CHECK(tlc_subscribe(&x, TLC_V, "v", now));
+    const moq_sub_entry_t *sub = tlc_publisher_sub(&x, TLC_V);
+    MOQ_TEST_CHECK(sub != NULL);
+    if (!sub) goto out;
+    wire.request = sub->rs.ref;
+    wire.alias = sub->track_alias;
+    MOQ_TEST_CHECK(wire.request._v != 0);
+    MOQ_TEST_CHECK(tlc_write(&x, 0x60, true, MOQ_SAP_TYPE_1, 0) == MOQ_OK);
+    tlc_drive(&x, now);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_V), 1);
+    if (pre_ended) MOQ_TEST_CHECK(moq_media_sender_end_track(x.s, x.v) == MOQ_OK);
+    MOQ_TEST_CHECK(moq_media_sender_complete(x.s) == MOQ_OK);
+    tlc_drive(&x, now);   /* EOT admitted; retirement has not run yet. */
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_V), 1);
+    MOQ_TEST_CHECK(tlc_publisher_sub(&x, TLC_V) != NULL);
+    MOQ_TEST_CHECK_EQ_INT(wire.done, 0);
+    MOQ_TEST_CHECK_EQ_INT(tlc_first_complete_catalog(&x), -1);
+    MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(x.s));
+
+    if (capacity) {
+        /* Fill the real session action ring through a public operation,
+         * without polling away the evidence or changing its configured cap. */
+        moq_session_t *publisher = moq_simpair_client(x.sp);
+        size_t filled = 0;
+        unsigned namespaces = x.namespaces;
+        moq_result_t rc = MOQ_OK;
+        while (filled <= publisher->action_cap && rc == MOQ_OK) {
+            uint8_t suffix = (uint8_t)filled;
+            moq_bytes_t ns[] = { MOQ_BYTES_LITERAL("control-pressure"),
+                                { &suffix, 1 } };
+            moq_publish_namespace_cfg_t nc;
+            moq_publish_namespace_cfg_init(&nc);
+            nc.track_namespace = (moq_namespace_t){ ns, 2 };
+            moq_announcement_t ann;
+            rc = moq_session_publish_namespace(publisher, &nc, now, &ann);
+            if (rc == MOQ_OK) filled++;
+        }
+        MOQ_TEST_CHECK_EQ_INT(rc, MOQ_ERR_WOULD_BLOCK);
+        MOQ_TEST_CHECK_EQ_U64(filled, 8);
+        size_t tail = publisher->action_tail;
+        moq_media_sender_test_pump(x.s, publisher, now);
+        MOQ_TEST_CHECK_EQ_U64(publisher->action_tail, tail);
+        MOQ_TEST_CHECK(tlc_publisher_sub(&x, TLC_V) != NULL);
+        MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(x.s));
+        MOQ_TEST_CHECK(!moq_media_sender_is_fatal(x.s));
+        /* Release transport capacity without another service retirement pass. */
+        MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(x.sp, 64, NULL) == MOQ_OK);
+        tlc_collect(&x, now);
+        MOQ_TEST_CHECK_EQ_U64(x.namespaces - namespaces, filled);
+    } else {
+        moq_media_sender_test_refuse_teardown_end(x.s, 1);
+        tlc_drive(&x, now);
+    }
+    MOQ_TEST_CHECK(tlc_publisher_sub(&x, TLC_V) != NULL);
+    MOQ_TEST_CHECK_EQ_INT(wire.done, 0);
+    MOQ_TEST_CHECK_EQ_INT(tlc_first_complete_catalog(&x), -1);
+    MOQ_TEST_CHECK(moq_media_sender_test_has_pending_output(x.s));
+    for (int i = 0; i < 8; i++) tlc_drive(&x, now);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_V), 1);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_STATUS, TLC_V), 1);
+    int end = tlc_find(&x, TLC_STATUS, TLC_V, false);
+    if (end >= 0) MOQ_TEST_CHECK_EQ_INT(x.log[end].status, MOQ_OBJECT_END_OF_TRACK);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_V), 1);
+    MOQ_TEST_CHECK_EQ_INT(wire.done, 1);
+    MOQ_TEST_CHECK_EQ_U64(wire.status, MOQ_PUB_DONE_TRACK_ENDED);
+    MOQ_TEST_CHECK_EQ_U64(wire.opened, 2);
+    MOQ_TEST_CHECK_EQ_U64(wire.stream_count, wire.opened);
+    MOQ_TEST_CHECK(!wire.bad);
+    int term = tlc_first_complete_catalog(&x);
+    MOQ_TEST_CHECK(term >= 0);
+    if (term >= 0) {
+        MOQ_TEST_CHECK(x.log[term].cat_terminal);
+        MOQ_TEST_CHECK_EQ_U64(x.log[term].object, 0);
+        MOQ_TEST_CHECK_EQ_U64(x.log[term].group, 1);
+    }
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_OBJ, TLC_CAT), 1);
+    MOQ_TEST_CHECK_EQ_INT(tlc_count(&x, TLC_DONE, TLC_CAT), 0);
+    MOQ_TEST_CHECK(tlc_publisher_sub(&x, TLC_CAT) != NULL);
+    MOQ_TEST_CHECK(tlc_publisher_sub(&x, TLC_V) == NULL);
+    MOQ_TEST_CHECK(!moq_media_sender_test_has_pending_output(x.s));
+    MOQ_TEST_CHECK(!moq_media_sender_is_fatal(x.s));
+    MOQ_TEST_CHECK(!moq_media_sender_test_complete_failed(x.s));
+    MOQ_TEST_CHECK(moq_media_sender_end_track(x.s, x.v) == MOQ_ERR_WRONG_STATE);
+    expect_conserved(x.s, 1, 1, 0, 0, 0, label);
+    MOQ_TEST_CHECK(!x.overflow && !x.unexpected);
 out:
     if (x.s) moq_media_sender_test_free(x.s);
     if (x.sp) {
@@ -5451,11 +5715,21 @@ int main(void)
     static const uint32_t rings[] = { 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
     for (size_t r = 0; r < sizeof(rings) / sizeof(rings[0]); r++)
         for (int m = TL_DEMANDED; m <= OTHER_HELD; m++) {
-            test_complete_timeline((tlc_mode_t)m, rings[r], false);
+            test_complete_timeline((tlc_mode_t)m, rings[r], false, false);
             if (m == TL_DEMANDED)
-                test_complete_timeline((tlc_mode_t)m, rings[r], true);
+                test_complete_timeline((tlc_mode_t)m, rings[r], true, false);
         }
+    /* Pre-ended media, alone and beside a demanded sibling: default capacity
+     * and a ring that refuses output until later pumps make room. */
+    static const uint32_t pre_ended_rings[] = { 0, 4 };
+    for (size_t r = 0; r < sizeof(pre_ended_rings) / sizeof(pre_ended_rings[0]); r++) {
+        test_complete_timeline(MEDIA_JOINER, pre_ended_rings[r], false, true);
+        test_complete_timeline(OTHER_HELD, pre_ended_rings[r], false, true);
+    }
     for (int m = 0; m < 3; m++) test_terminal_catalog_failure(m);
+    test_complete_control_order(true, false);
+    test_complete_control_order(false, false);
+    test_complete_control_order(true, true);
 #ifdef MOQ_TEST_HAVE_MPEG2TS
     for (size_t r = 0; r < sizeof(rings) / sizeof(rings[0]); r++)
         for (int e = 0; e < 2; e++) test_failed_ts_timeline(rings[r], e != 0);
