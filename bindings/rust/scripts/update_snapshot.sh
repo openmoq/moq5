@@ -5,18 +5,29 @@
 # player. tests/snapshot.rs then holds them equal to a fresh generation on
 # every qualified target.
 #
-#   update_snapshot.sh <sdk-prefix>
+#   update_snapshot.sh <sdk-prefix> [--base-only]
+#
+# --base-only updates only bindings.rs and preambles.md, for an SDK without
+# the player. The player snapshots are left untouched; the default still
+# requires the player and updates both pairs.
 #
 # Environment: CARGO (default cargo), LIBCLANG_PATH as bindgen needs it.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 PREFIX=${1:?sdk prefix}
+features=(--features player)
+generated_name=bindings_player.rs
+case ${2:-} in
+    "") ;;
+    --base-only) features=(); generated_name=bindings.rs ;;
+    *) echo "usage: update_snapshot.sh <sdk-prefix> [--base-only]" >&2; exit 2 ;;
+esac
 CARGO=${CARGO:-cargo}
 export MOQ_PREFIX="$PREFIX"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HERE/target}
 
-"$CARGO" build --manifest-path "$HERE/Cargo.toml" -p moq5-sys --features player
-generated=$(ls -t "$CARGO_TARGET_DIR"/debug/build/moq5-sys-*/out/bindings_player.rs | head -1)
+"$CARGO" build --manifest-path "$HERE/Cargo.toml" -p moq5-sys ${features[@]+"${features[@]}"}
+generated=$(ls -t "$CARGO_TARGET_DIR"/debug/build/moq5-sys-*/out/"$generated_name" | head -1)
 out=$(dirname "$generated")
 
 commit=$(git -C "$HERE" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
@@ -51,7 +62,10 @@ snapshot() {   # snapshot <generated file> <snapshot file> <what it holds>
     } > "$2"
 }
 snapshot "$out/bindings.rs" "$HERE/moq5-sys/docs/bindings.rs" "bindings"
-snapshot "$out/bindings_player.rs" "$HERE/moq5-sys/docs/bindings_player.rs" "player bindings"
 cp "$out/preambles.md" "$HERE/moq5-sys/docs/preambles.md"
-cp "$out/preambles_player.md" "$HERE/moq5-sys/docs/preambles_player.md"
-echo "update_snapshot.sh: wrote $HERE/moq5-sys/docs/{bindings,bindings_player}.rs and docs/{preambles,preambles_player}.md from $out"
+echo "update_snapshot.sh: wrote $HERE/moq5-sys/docs/bindings.rs and docs/preambles.md from $out"
+if [ "$generated_name" = bindings_player.rs ]; then
+    snapshot "$out/bindings_player.rs" "$HERE/moq5-sys/docs/bindings_player.rs" "player bindings"
+    cp "$out/preambles_player.md" "$HERE/moq5-sys/docs/preambles_player.md"
+    echo "update_snapshot.sh: wrote $HERE/moq5-sys/docs/bindings_player.rs and docs/preambles_player.md from $out"
+fi

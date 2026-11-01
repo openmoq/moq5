@@ -1,4 +1,7 @@
-use moq5::{Endpoint, EndpointConfig, Error, MediaType, Namespace, Packaging, SendTrackConfig, Sender, SenderConfig};
+use moq5::{
+    Endpoint, EndpointConfig, Error, MediaType, Namespace, Packaging, SendTrackConfig, Sender,
+    SenderConfig,
+};
 use moq5_fake_tests as fake;
 
 fn config() -> SenderConfig {
@@ -6,10 +9,13 @@ fn config() -> SenderConfig {
 }
 
 fn tracks() -> Vec<SendTrackConfig> {
-    ["video", "audio"].into_iter().map(|name| {
-        SendTrackConfig::new(name, MediaType::Video, Packaging::Raw, "avc1.42c01e")
-            .bitrate(1_000_000)
-    }).collect()
+    ["video", "audio"]
+        .into_iter()
+        .map(|name| {
+            SendTrackConfig::new(name, MediaType::Video, Packaging::Raw, "avc1.42c01e")
+                .bitrate(1_000_000)
+        })
+        .collect()
 }
 
 fn endpoint() -> Endpoint {
@@ -21,18 +27,33 @@ fn endpoint() -> Endpoint {
 fn all_initial_tracks_precede_the_first_pump() {
     let suite = fake::suite();
     let endpoint = endpoint();
-    let mut startup = Sender::attach_with_tracks(&endpoint, &config(), tracks())
-        .expect("the task is accepted");
+    let mut startup =
+        Sender::attach_with_tracks(&endpoint, &config(), tracks()).expect("the task is accepted");
     assert!(startup.poll().expect("pending is not an error").is_none());
     assert_eq!(suite.get("sender_attach"), 0);
     suite.pump(&endpoint, false);
-    let (sender, handles) = startup.poll().expect("registration succeeds").expect("completed");
+    let (sender, handles) = startup
+        .poll()
+        .expect("registration succeeds")
+        .expect("completed");
     assert_eq!(handles.len(), 2);
     let log = suite.take_log();
-    let last_add = log.iter().rposition(|line| line.starts_with("add_track ")).expect("tracks added");
-    let pump = log.iter().position(|line| line.starts_with("pump ")).expect("the hook boundary");
-    assert!(last_add < pump, "no hook observes a partial initial set: {log:?}");
-    assert_eq!(startup.poll().expect_err("result taken once"), Error::WRONG_STATE);
+    let last_add = log
+        .iter()
+        .rposition(|line| line.starts_with("add_track "))
+        .expect("tracks added");
+    let pump = log
+        .iter()
+        .position(|line| line.starts_with("pump "))
+        .expect("the hook boundary");
+    assert!(
+        last_add < pump,
+        "no hook observes a partial initial set: {log:?}"
+    );
+    assert_eq!(
+        startup.poll().expect_err("result taken once"),
+        Error::WRONG_STATE
+    );
     drop(sender);
     drop(startup);
     drop(endpoint);
@@ -60,9 +81,18 @@ fn an_unpolled_result_is_destroyed_before_the_last_endpoint() {
     drop(endpoint);
     drop(startup);
     let log = suite.take_log();
-    let sender = log.iter().position(|line| line.starts_with("sender_destroy")).expect("sender destroyed");
-    let stop = log.iter().position(|line| line == "stop").expect("endpoint stopped");
-    assert!(sender < stop, "no attached sender at endpoint stop: {log:?}");
+    let sender = log
+        .iter()
+        .position(|line| line.starts_with("sender_destroy"))
+        .expect("sender destroyed");
+    let stop = log
+        .iter()
+        .position(|line| line == "stop")
+        .expect("endpoint stopped");
+    assert!(
+        sender < stop,
+        "no attached sender at endpoint stop: {log:?}"
+    );
     assert_eq!(suite.get("alloc_live"), 0);
 }
 
@@ -76,7 +106,10 @@ fn a_failed_add_discards_the_partial_sender_before_the_hook() {
     assert_eq!(startup.poll().expect_err("second add fails"), Error::NOMEM);
     assert_eq!(suite.get("add_track"), 2);
     let log = suite.take_log();
-    assert!(log.iter().any(|line| line == "pump attachments=0"), "partial sender never pumps: {log:?}");
+    assert!(
+        log.iter().any(|line| line == "pump attachments=0"),
+        "partial sender never pumps: {log:?}"
+    );
     drop(startup);
     drop(endpoint);
     assert_eq!(suite.get("alloc_live"), 0);
@@ -87,7 +120,10 @@ fn refusal_and_terminal_execution_preserve_errors() {
     let suite = fake::suite();
     let endpoint = endpoint();
     suite.set("post_result", i64::from(Error::CLOSED.code()));
-    assert_eq!(Sender::attach_with_tracks(&endpoint, &config(), tracks()).expect_err("refused"), Error::CLOSED);
+    assert_eq!(
+        Sender::attach_with_tracks(&endpoint, &config(), tracks()).expect_err("refused"),
+        Error::CLOSED
+    );
     suite.set("post_result", 0);
     let mut startup = Sender::attach_with_tracks(&endpoint, &config(), tracks()).expect("queued");
     suite.pump(&endpoint, true);
@@ -129,7 +165,8 @@ fn formatter_unwind_does_not_poison_execution_or_teardown() {
     let mut startup = Sender::attach_with_tracks(&endpoint, &config(), tracks()).expect("queued");
     assert!(catch_unwind(AssertUnwindSafe(|| {
         write!(PanickingWriter, "{startup:?}").expect("formatting succeeds");
-    })).is_err());
+    }))
+    .is_err());
     // This is the former poisoning path: Mutex::fmt calls its writer with
     // "data" while the state guard is held. An opaque Debug must not reach it.
     struct StateWriter;
@@ -141,7 +178,8 @@ fn formatter_unwind_does_not_poison_execution_or_teardown() {
     }
     assert!(catch_unwind(AssertUnwindSafe(|| {
         write!(StateWriter, "{startup:?}").expect("opaque formatting succeeds");
-    })).is_ok());
+    }))
+    .is_ok());
     assert_eq!(format!("{startup:?}"), "SenderStartup { .. }");
     assert!(startup.poll().expect("still pending").is_none());
     suite.pump(&endpoint, false);

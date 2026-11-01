@@ -137,6 +137,7 @@ jobs:
           brew install ninja pkg-config llvm openssl@3
           {
             echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib"
+            echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)"
             echo "CC=clang"
             echo "CXX=clang++"
           } >> "$GITHUB_ENV"
@@ -151,6 +152,10 @@ jobs:
       # installed with their pkg-config closure.
       - name: Build and install the picoquic service SDK
         run: |
+          openssl_args=()
+          if [[ -n "${OPENSSL_ROOT_DIR:-}" ]]; then
+            openssl_args+=("-DOPENSSL_ROOT_DIR=$OPENSSL_ROOT_DIR")
+          fi
           bash scripts/setup_picoquic_deps.sh -G Ninja
           source .deps/picoquic-ci/picoquic_deps.env
           cmake -S . -B build/rust-pq-sdk -G Ninja \
@@ -162,7 +167,8 @@ jobs:
             -DMOQ_BUILD_ADAPTER_PICOQUIC=ON -DMOQ_BUILD_PQ_THREADED=ON \
             -DMOQ_BUILD_ADAPTER_PICO_WT=ON -DMOQ_BUILD_PICO_WT_MANAGED=ON \
             "-DMOQ_PICOQUIC_SOURCE_DIR=$MOQ_PICOQUIC_SOURCE_DIR" \
-            "-DMOQ_PICOTLS_PREFIX=$MOQ_PICOTLS_PREFIX"
+            "-DMOQ_PICOTLS_PREFIX=$MOQ_PICOTLS_PREFIX" \
+            "${openssl_args[@]}"
           cmake --build build/rust-pq-sdk
           cmake --install build/rust-pq-sdk
           test -f "$RUNNER_TEMP/rust-pq-sdk/lib/pkgconfig/libmoq-service.pc"
@@ -174,6 +180,10 @@ jobs:
       # is the rows job's; here only the refusal row runs.
       - name: Build the relay tree with the Rust rows
         run: |
+          openssl_args=()
+          if [[ -n "${OPENSSL_ROOT_DIR:-}" ]]; then
+            openssl_args+=("-DOPENSSL_ROOT_DIR=$OPENSSL_ROOT_DIR")
+          fi
           bash scripts/setup_msquic_deps.sh -G Ninja
           source .deps/msquic-ci/msquic_deps.env
           msquic_DIR="$msquic_DIR" bash scripts/setup_wtquic_deps.sh -G Ninja
@@ -193,7 +203,8 @@ jobs:
             -Dmsquic_DIR="$msquic_DIR" -Dwtquic_DIR="$wtquic_DIR" \
             -DMOQ_BUILD_RUST_BINDING=ON -DMOQ_RUST_CROSS_BUILD=OFF \
             "-DMOQ_RUST_SDK_PREFIX=$RUNNER_TEMP/rust-pq-sdk" \
-            -DMOQ_RUST_PLAYER=ON -DMOQ_RUST_MPEG2TS=ON
+            -DMOQ_RUST_PLAYER=ON -DMOQ_RUST_MPEG2TS=ON \
+            "${openssl_args[@]}"
           cmake --build build/rust-relay --target moq5-relay
 
       - name: Rust rows against the picoquic SDK, with the relay rows
