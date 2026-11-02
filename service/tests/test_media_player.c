@@ -1442,26 +1442,36 @@ static void test_complete_broadcast(moq_version_t ver, bool catalog_first, bool 
     /* The track ends as a completing media sender ends it: END_OF_TRACK,
      * then its removal, which completes the subscription with TRACK_ENDED
      * and the exact Stream Count. */
+    moq_result_t remove_rc;
     if (catalog_first) {
         write_catalog(&f, 1, terminal);
         cycles(&f, 8);
         CHECK(moq_pub_end_track(f.pub, pf_pub(&f, "video"), f.now) == MOQ_OK);
-        CHECK(moq_pub_remove_track(f.pub, pf_pub(&f, "video"), f.now) == MOQ_OK);
+        remove_rc = moq_pub_remove_track(f.pub, pf_pub(&f, "video"), f.now);
     } else {
         /* The end, and the terminal catalog right behind it, as a publisher
          * completing the broadcast sends them: the removal reaches the
          * player while it is still settling the END_OF_TRACK. */
         CHECK(moq_pub_end_track(f.pub, pf_pub(&f, "video"), f.now) == MOQ_OK);
-        CHECK(moq_pub_remove_track(f.pub, pf_pub(&f, "video"), f.now) == MOQ_OK);
+        remove_rc = moq_pub_remove_track(f.pub, pf_pub(&f, "video"), f.now);
         write_catalog(&f, 1, terminal);
     }
+    CHECK(remove_rc == MOQ_OK || remove_rc == MOQ_ERR_WOULD_BLOCK);
     ev_log_t evl = {0};
     out_log_t log = {0};
     for (unsigned i = 0; i < 8 * (TAIL_US / 1000); i++) {
         (void)cycle(&f);
+        /* The terminal stream's OPEN must settle before its final Stream
+         * Count is known. Retry removal while driving the transport, without
+         * changing the terminal/catalog ordering above. */
+        if (remove_rc == MOQ_ERR_WOULD_BLOCK) {
+            remove_rc = moq_pub_remove_track(f.pub, pf_pub(&f, "video"), f.now);
+            CHECK(remove_rc == MOQ_OK || remove_rc == MOQ_ERR_WOULD_BLOCK);
+        }
         events(&f, &evl);
         outputs(&f, &log);
     }
+    CHECK(remove_rc == MOQ_OK);
     CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REMOVED) == 1);
     CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, NULL) == 1);
     if (gap) CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, NULL) >= 1);
