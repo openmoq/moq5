@@ -31,7 +31,7 @@ Native contracts pinned here, from the installed headers and source:
       a macro over moq_media_track_cfg_init_sized(cfg, sizeof *cfg): zeroes
       the whole struct, stamps struct_size, sets is_live true.
 
-MSF-01 rules these mirror, from /Users/jekyll/Projects/MoQ/Spec:
+MSF-01 rules these mirror (draft-ietf-moq-msf-01; line numbers in its .txt):
   5.2.18 codec required for audio and video (line 1110)
   5.2.22 maximum bitrate required for audio and video (1149)
   5.2.28 audio sample rate required for audio (1205)

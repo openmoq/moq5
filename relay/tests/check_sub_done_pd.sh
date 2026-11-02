@@ -9,8 +9,11 @@
 # The producer count is pinned exactly: a deleted producer is as much a defect
 # as a miswritten one, and would otherwise pass a "check what you find" scan.
 set -u
-relay_c="$1"
-expected_producers=10
+[ "$#" -gt 0 ] || { echo "FAIL: core source paths required" >&2; exit 2; }
+for relay_c in "$@"; do
+    [ -f "$relay_c" ] || { echo "FAIL: missing core source" >&2; exit 2; }
+done
+expected_producers=12
 fail=0
 
 # Executable code only, joined into one stream so a producer split across lines
@@ -28,7 +31,7 @@ BEGIN { inblk = 0 }
         out = out c; i++
     }
     print out
-}' "$relay_c" > "$code"
+}' "$@" > "$code"
 trap 'rm -f "$code"' EXIT
 
 # Count producer tokens without depending on line wrapping: collapse all

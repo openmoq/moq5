@@ -13,7 +13,7 @@
  * cursors never retain payloads, so retained memory is a function of log
  * budgets, never of consumer count.
  *
- * -- Spec anchors (verified against local Specs/, 2026-07-02) --
+ * -- Spec anchors --
  *
  *  - Payload opacity: a relay MUST treat object payloads as opaque and
  *    MUST NOT combine, split, or otherwise modify them; object fields are

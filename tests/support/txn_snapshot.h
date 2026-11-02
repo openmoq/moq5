@@ -48,7 +48,11 @@
 
 /* Set while a negative self-test asserts an EXPECTED divergence, so its
  * diagnostics do not read as failures in a passing run's output. */
+#if defined(MOQ_TEST_SHARED_FIXTURES)
+TXS_UNUSED extern int txs_quiet;
+#else
 TXS_UNUSED static int txs_quiet;
+#endif
 
 #define TXS_DIAG(...) do { if (!txs_quiet) fprintf(stderr, __VA_ARGS__); } while (0)
 

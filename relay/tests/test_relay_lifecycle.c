@@ -999,7 +999,7 @@ lc_op_close_reconnect(lc_t *lc)
  * deliberate RULING, NOT a temporary compromise: session-handle
  * cookies embed an ADDRESS-derived session tag (core/src/session/session.c:
  * 1666-1674) that the relay core folds into some trace records (e.g. the ns_sub
- * route_add in relay/src/core/relay.c). That tag is an internal cross-session
+ * route_add in relay/src/core/tracks.c). That tag is an internal cross-session
  * misuse-detection cookie with NO wire-visible/protocol meaning, so a byte-
  * identical trace hash would prove nothing the wire cares about — the projection
  * compares exactly the behavior required to be deterministic (failures, trace

@@ -1,5 +1,6 @@
 /*
- * Bind delivery-scheduler capacity oracle. White-box (includes moqr_bind.c):
+ * Bind delivery-scheduler capacity oracle.
+ * White-box (uses the private binding layout):
  * pins the 64-bit delivery-park structural delta with a baseline b_conn_t
  * replica (the park fields cost one size_t in that ABI's padding), the
  * widened bitset word arithmetic at the uint32_t
@@ -9,7 +10,14 @@
  * slope with leak-free destruction.
  */
 
-#include "moqr_bind.c"
+#include "bind_internal.h"
+#include "delivery_internal.h"
+#include "discovery_internal.h"
+#include "events_internal.h"
+#include "intents_internal.h"
+#include "request_answers_internal.h"
+#include "subscription_update_internal.h"
+#include "upstream_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>

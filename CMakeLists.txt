@@ -686,10 +686,6 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME profile_boundary
              COMMAND ${CMAKE_COMMAND} -E env bash
                      ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_profile_boundary.sh)
-    add_test(NAME process_labels
-             COMMAND ${CMAKE_COMMAND} -E env bash
-                     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_process_labels.sh)
-    set_tests_properties(process_labels PROPERTIES TIMEOUT 120)
 endif()
 
 # -- C++ Binding ----------------------------------------------------

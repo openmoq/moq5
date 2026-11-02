@@ -44,9 +44,10 @@ sticky interrupt latch, pump multiplexing for attached media services, and
 the post() executor that makes the full moq_session_* surface reachable
 without exposing the pump.
 
-Design: MEDIA_SERVICE_DESIGN.md §5. This tier is severable: lower tiers
-build and work without it (MOQ_BUILD_SERVICE), the core stays sans-I/O,
-and all threading lives here.
+This tier is severable: lower tiers build and work without it
+(MOQ_BUILD_SERVICE), and the core stays sans-I/O. The endpoint
+orchestrates the consumer side on the managed execution context its
+transport facade owns (a network thread, or a serial queue).
 
 Current status: lifecycle and version negotiation are live over the
 managed picoquic facades (RAW_QUIC via moq_pq_threaded with ALPN
@@ -124,11 +125,11 @@ moq::core, moq::loc, moq::cmaf).
 ## moq/media_sender.h
 
 ```text
-moq_media_sender_t — the send-side media facade over an endpoint
-(MEDIA_SERVICE_DESIGN.md §7). Owns a publisher on the endpoint's
-network thread: it advertises a namespace, derives and publishes a
-retained MSF catalog from the configured tracks, and reports readiness
-once the namespace is accepted and the catalog is published. The
+moq_media_sender_t — the send-side media facade over an endpoint.
+Owns a publisher on the endpoint's network thread: it advertises a
+namespace, derives and publishes a retained MSF catalog from the
+configured tracks, and reports readiness once the namespace is accepted
+and the catalog is published. The
 application adds tracks and submits media objects from its own thread.
 
 Current status: tracks, catalog, readiness, and the media write path are
@@ -144,11 +145,10 @@ explicit companion pins one and refuses the other drafts.
 ## moq/media_receiver.h
 
 ```text
-moq_media_receiver_t — the receive-side media facade over an endpoint
-(MEDIA_SERVICE_DESIGN.md §6). Owns the catalog track subscription on the
-endpoint's network thread, parses the MSF catalog, and surfaces track
-discovery as a bounded event queue the application drains from its own
-thread.
+moq_media_receiver_t — the receive-side media facade over an endpoint.
+Owns the catalog track subscription on the endpoint's network thread,
+parses the MSF catalog, and surfaces track discovery as a bounded event
+queue the application drains from its own thread.
 
 Current status: discovery, the object data path, and per-track
 subscription control are live. Discovery: catalog subscribe + parse,

@@ -2,11 +2,10 @@
 #define MOQ_MEDIA_RECEIVER_H
 
 /*
- * moq_media_receiver_t — the receive-side media facade over an endpoint
- * (MEDIA_SERVICE_DESIGN.md §6). Owns the catalog track subscription on the
- * endpoint's network thread, parses the MSF catalog, and surfaces track
- * discovery as a bounded event queue the application drains from its own
- * thread.
+ * moq_media_receiver_t — the receive-side media facade over an endpoint.
+ * Owns the catalog track subscription on the endpoint's network thread,
+ * parses the MSF catalog, and surfaces track discovery as a bounded event
+ * queue the application drains from its own thread.
  *
  * Current status: discovery, the object data path, and per-track
  * subscription control are live. Discovery: catalog subscribe + parse,

@@ -28,7 +28,8 @@ The contract this file encodes, from the sources and the local specs:
       (WRONG_STATE), the RAW LOC timestamp bound, then CMAF validation. None
       of those takes ownership.
 
-Spec authorities, read in /Users/jekyll/Projects/MoQ/Spec:
+Spec authorities (draft-ietf-moq-loc-01 and draft-ietf-moq-cmsf-00; line
+numbers in their .txt):
   LOC-01 2.3.1.1 (line 343): the Capture Timestamp is wall-clock microseconds
       since the Unix epoch, encoded as a varint.
   CMSF-00 3.4 (line 186): each group MUST begin with an object containing a

@@ -1,6 +1,6 @@
 /*
- * Per-track subscriber index oracle. White-box (includes relay.c): the
- * intrusive track_next/track_prev list on each track must hold EXACTLY the
+ * Per-track subscriber index oracle. White-box (uses the private core layout):
+ * the intrusive track_next/track_prev list on each track must hold EXACTLY the
  * subscriptions track_sub_count's historical exhaustive-scan predicate
  * accepts — live sub, bound to this track slot, generation-matched — with
  * bidirectional link integrity, no cycles, no duplicates, no stale or
@@ -13,7 +13,12 @@
  * exact sizeof terms the model advertises; every core destroys leak-free.
  */
 
-#include "relay.c"
+#include "relay_internal.h"
+#include "auth_internal.h"
+#include "delivery_internal.h"
+#include "fetch_internal.h"
+#include "subscribe_internal.h"
+#include "tracks_internal.h"
 
 #include <inttypes.h>
 #include <stdio.h>

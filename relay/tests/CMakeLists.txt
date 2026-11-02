@@ -16,14 +16,7 @@ endfunction()
 
 # The same core compiled with the private begun-ledger test seam.
 add_library(moq-relay-core-test-internals STATIC
-    ${MOQR_TEST_CORE_DIR}/wire_codes.c
-    ${MOQR_TEST_CORE_DIR}/capacity.c
-    ${MOQR_TEST_CORE_DIR}/log.c
-    ${MOQR_TEST_CORE_DIR}/relay.c
-    ${MOQR_TEST_CORE_DIR}/trace.c
-    ${MOQR_TEST_CORE_DIR}/types.c
-    ${MOQR_TEST_CORE_DIR}/stats.c
-    ${MOQR_TEST_CORE_DIR}/props_codec.c)
+    ${MOQR_CORE_SOURCES})
 target_compile_definitions(moq-relay-core-test-internals PRIVATE
     MOQR_CORE_TESTING MOQ_RELAY_CORE_STATIC)
 target_include_directories(moq-relay-core-test-internals PUBLIC
@@ -56,11 +49,8 @@ add_test(NAME relay_props_codec COMMAND test_relay_props_codec)
 target_include_directories(test_relay_log PRIVATE ${MOQR_TEST_CORE_DIR})
 
 add_executable(test_relay_track_index test_relay_track_index.c
-    ${MOQR_TEST_CORE_DIR}/wire_codes.c
-    ${MOQR_TEST_CORE_DIR}/capacity.c
-    ${MOQR_TEST_CORE_DIR}/log.c
-    ${MOQR_TEST_CORE_DIR}/trace.c
-    ${MOQR_TEST_CORE_DIR}/types.c)
+    ${MOQR_CORE_SOURCES})
+target_compile_definitions(test_relay_track_index PRIVATE MOQ_RELAY_CORE_STATIC)
 target_include_directories(test_relay_track_index PRIVATE
     ${MOQR_TEST_CORE_DIR} ${MOQ_RELAY_INCLUDE_DIR})
 target_link_libraries(test_relay_track_index PRIVATE moq::core)
@@ -79,18 +69,17 @@ target_link_libraries(test_relay_wire_codes PRIVATE moq::core)
 moqr_test_warnings(test_relay_wire_codes)
 
 add_executable(test_relay_ready_set test_relay_ready_set.c
-    ${MOQR_TEST_CORE_DIR}/wire_codes.c
-    ${MOQR_TEST_CORE_DIR}/capacity.c
-    ${MOQR_TEST_CORE_DIR}/log.c
-    ${MOQR_TEST_CORE_DIR}/trace.c
-    ${MOQR_TEST_CORE_DIR}/types.c)
+    ${MOQR_CORE_SOURCES})
+target_compile_definitions(test_relay_ready_set PRIVATE MOQ_RELAY_CORE_STATIC)
 target_include_directories(test_relay_ready_set PRIVATE
     ${MOQR_TEST_CORE_DIR} ${MOQ_RELAY_INCLUDE_DIR})
 target_link_libraries(test_relay_ready_set PRIVATE moq::core)
 moqr_test_warnings(test_relay_ready_set)
 
 if(MOQ_BUILD_RELAY_RUNTIME)
-add_executable(test_relay_bind_layout test_relay_bind_layout.c)
+add_executable(test_relay_bind_layout test_relay_bind_layout.c
+    ${MOQR_BIND_SOURCES})
+target_compile_definitions(test_relay_bind_layout PRIVATE MOQ_RELAY_STATIC)
 target_include_directories(test_relay_bind_layout PRIVATE
     ${MOQR_TEST_BIND_DIR} ${MOQ_RELAY_INCLUDE_DIR})
 target_link_libraries(test_relay_bind_layout PRIVATE moq::relay-core)
@@ -158,7 +147,7 @@ set_tests_properties(relay_shards_mt PROPERTIES TIMEOUT 60)
 if(TARGET moq::sim)
     # These private object targets are also consumed by CLI composition tests.
     add_library(moq-relay-shard-test-internals OBJECT
-        ${MOQR_TEST_SHARD_DIR}/moqr_shards.c)
+        ${MOQR_SHARD_SOURCES})
     target_compile_definitions(moq-relay-shard-test-internals PRIVATE
         MOQR_BIND_TESTING MOQ_RELAY_BUILDING)
     target_include_directories(moq-relay-shard-test-internals PRIVATE
@@ -168,7 +157,7 @@ if(TARGET moq::sim)
     moqr_test_warnings(moq-relay-shard-test-internals)
 
     add_library(moq-relay-bind-test-internals OBJECT
-        ${MOQR_TEST_BIND_DIR}/moqr_bind.c)
+        ${MOQR_BIND_SOURCES} ${MOQR_TEST_BIND_DIR}/testing.c)
     target_compile_definitions(moq-relay-bind-test-internals PRIVATE
         MOQR_BIND_TESTING MOQ_RELAY_BUILDING)
     target_link_libraries(moq-relay-bind-test-internals PRIVATE
@@ -441,11 +430,11 @@ find_program(MOQR_RELAY_TEST_BASH bash)
 if(MOQR_RELAY_TEST_BASH)
     add_test(NAME relay_sub_done_pd COMMAND ${MOQR_RELAY_TEST_BASH}
         ${CMAKE_CURRENT_SOURCE_DIR}/check_sub_done_pd.sh
-        ${MOQR_TEST_CORE_DIR}/relay.c)
+        ${MOQR_CORE_SOURCES} ${MOQR_TEST_CORE_DIR}/relay_internal.h)
     if(MOQ_BUILD_RELAY_RUNTIME)
     add_test(NAME relay_bind_pump_stack COMMAND ${MOQR_RELAY_TEST_BASH}
         ${CMAKE_CURRENT_SOURCE_DIR}/check_bind_pump_stack.sh
-        ${MOQR_TEST_BIND_DIR}/moqr_bind.c)
+        ${MOQR_BIND_SOURCES} ${MOQR_TEST_BIND_DIR}/bind_internal.h)
     add_test(NAME relay_metrics_const COMMAND ${MOQR_RELAY_TEST_BASH}
         ${CMAKE_CURRENT_SOURCE_DIR}/check_metrics_const.sh
         ${MOQR_TEST_OBS_DIR}/metrics.c)
@@ -454,8 +443,10 @@ if(MOQR_RELAY_TEST_BASH)
         ${CMAKE_CURRENT_SOURCE_DIR}/../bench/bench_relay_saturation.c)
     add_test(NAME relay_migration_codes COMMAND ${MOQR_RELAY_TEST_BASH}
         ${CMAKE_CURRENT_SOURCE_DIR}/check_migration_codes.sh
-        ${MOQR_TEST_BIND_DIR}/moqr_bind.c
-        ${MOQR_TEST_SHARD_DIR}/moqr_shards.c)
+        ${MOQR_TEST_BIND_DIR}/upstream.c
+        ${MOQR_TEST_BIND_DIR}/bind_internal.h
+        ${MOQR_TEST_SHARD_DIR}/demand.c
+        ${MOQR_TEST_SHARD_DIR}/shards_internal.h)
     set_tests_properties(relay_sub_done_pd relay_bind_pump_stack
         relay_metrics_const relay_wake_self_bit relay_migration_codes
         PROPERTIES TIMEOUT 30 LABELS "relay")
@@ -532,11 +523,8 @@ endif()
 
 # Inspect private counter exhaustion without exporting a production test seam.
 add_executable(test_relay_cluster test_relay_cluster.c
-    ${MOQR_TEST_CORE_DIR}/wire_codes.c
-    ${MOQR_TEST_CORE_DIR}/capacity.c
-    ${MOQR_TEST_CORE_DIR}/log.c
-    ${MOQR_TEST_CORE_DIR}/trace.c
-    ${MOQR_TEST_CORE_DIR}/types.c)
+    ${MOQR_CORE_SOURCES})
+target_compile_definitions(test_relay_cluster PRIVATE MOQ_RELAY_CORE_STATIC)
 target_include_directories(test_relay_cluster PRIVATE
     ${MOQR_TEST_CORE_DIR} ${MOQ_RELAY_INCLUDE_DIR})
 target_link_libraries(test_relay_cluster PRIVATE moq::core)

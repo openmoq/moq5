@@ -858,8 +858,6 @@ jobs:
         run: scripts/check_api_boundary.sh
       - name: Profile boundary
         run: scripts/check_profile_boundary.sh
-      - name: Process labels
-        run: scripts/check_process_labels.sh
       - name: ILP32 headers
         run: scripts/check_ilp32_headers.sh
 

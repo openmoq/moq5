@@ -1,12 +1,5 @@
 # MoQ Cluster draft-01 support: design specification
 
-Historical design provenance: the original 2026-10-22 work used branch
-`feature/moq-cluster-01` and baseline
-`2a305fc7158c47501391d6f59774b157e215df13`. Its original implementation results
-remain in [moq-cluster-01-plan.txt](moq-cluster-01-plan.txt); they do not describe
-the current composition or its qualification status. The contracts below
-include the subsequent API/adoption corrections.
-
 ## Purpose and scope
 
 Implement draft-lcurley-moq-cluster-01 across moq5's draft-22 session engine

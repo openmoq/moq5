@@ -351,7 +351,29 @@ target_compile_definitions(test_session_exact_work_controls PRIVATE
     MOQ_SESSION_SWEEP_TESTING EXACT_WORK_NO_COMPLEXITY)
 add_test(NAME session_exact_work_controls COMMAND test_session_exact_work_controls)
 
-add_executable(test_transport_bridge unit/test_transport_bridge.c)
+add_executable(test_transport_bridge
+    unit/test_transport_bridge.c
+    unit/transport_bridge/admission.c
+    unit/transport_bridge/allocation_failure.c
+    unit/transport_bridge/backpressure.c
+    unit/transport_bridge/basic.c
+    unit/transport_bridge/descriptor_checks.c
+    unit/transport_bridge/drain_capacity.c
+    unit/transport_bridge/head_of_line.c
+    unit/transport_bridge/held_input.c
+    unit/transport_bridge/local_fin.c
+    unit/transport_bridge/namespace_subscribe.c
+    unit/transport_bridge/namespace_teardown.c
+    unit/transport_bridge/priority.c
+    unit/transport_bridge/publish.c
+    unit/transport_bridge/request_cancellation.c
+    unit/transport_bridge/service_budget.c
+    unit/transport_bridge/stream_capacity.c
+    unit/transport_bridge/stream_placement.c
+    unit/transport_bridge/support.c
+    unit/transport_bridge/terminal_facts.c
+    unit/transport_bridge/track_status.c)
+target_compile_definitions(test_transport_bridge PRIVATE MOQ_TEST_SHARED_FIXTURES=1)
 target_link_libraries(test_transport_bridge PRIVATE moq-core-test-internals)
 target_compile_definitions(test_transport_bridge PRIVATE MOQ_SESSION_SWEEP_TESTING)
 target_include_directories(test_transport_bridge PRIVATE
@@ -1166,7 +1188,25 @@ if(TARGET moq::sim)
     target_link_libraries(test_scenario_object PRIVATE moq::sim)
     add_test(NAME scenario_object COMMAND test_scenario_object)
 
-    add_executable(test_publisher unit/test_publisher.c)
+    add_executable(test_publisher
+        unit/test_publisher.c
+        unit/publisher/authorization.c
+        unit/publisher/basic.c
+        unit/publisher/subscribe_callback.c
+        unit/publisher/completion.c
+        unit/publisher/event_forwarding.c
+        unit/publisher/fanout.c
+        unit/publisher/filter_window.c
+        unit/publisher/group_history.c
+        unit/publisher/monotonic_groups.c
+        unit/publisher/namespace.c
+        unit/publisher/publish.c
+        unit/publisher/streaming.c
+        unit/publisher/subgroups.c
+        unit/publisher/subscription_update.c
+        unit/publisher/support.c
+        unit/publisher/tick.c
+        unit/publisher/track_lifecycle.c)
     target_link_libraries(test_publisher PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME publisher COMMAND test_publisher)
 
@@ -1346,7 +1386,25 @@ if(TARGET moq::sim)
     target_link_libraries(test_session_pending_output PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME session_pending_output COMMAND test_session_pending_output)
 
-    add_executable(test_d18_fin_handoff unit/test_d18_fin_handoff.c)
+    add_executable(test_d18_fin_handoff
+        unit/test_d18_fin_handoff.c
+        unit/d18_fin_handoff/admission.c
+        unit/d18_fin_handoff/descriptor_checks.c
+        unit/d18_fin_handoff/fetch.c
+        unit/d18_fin_handoff/fetch_joining.c
+        unit/d18_fin_handoff/goaway.c
+        unit/d18_fin_handoff/namespace_rejection.c
+        unit/d18_fin_handoff/namespace_teardown.c
+        unit/d18_fin_handoff/publish.c
+        unit/d18_fin_handoff/publish_namespace.c
+        unit/d18_fin_handoff/request_rejection.c
+        unit/d18_fin_handoff/subscribe.c
+        unit/d18_fin_handoff/subscribe_namespace.c
+        unit/d18_fin_handoff/subscribe_tracks.c
+        unit/d18_fin_handoff/subscription_update.c
+        unit/d18_fin_handoff/support.c
+        unit/d18_fin_handoff/track_status.c)
+    target_compile_definitions(test_d18_fin_handoff PRIVATE MOQ_TEST_SHARED_FIXTURES=1)
     target_link_libraries(test_d18_fin_handoff PRIVATE moq-core-test-internals)
     add_test(NAME d18_fin_handoff COMMAND test_d18_fin_handoff)
 
@@ -1843,7 +1901,7 @@ if(TARGET moq::relay AND TARGET moq::sim)
     target_include_directories(test_relay_completion_stream_count PRIVATE
         ${PROJECT_SOURCE_DIR}/relay/private)
     target_link_libraries(test_relay_completion_stream_count PRIVATE
-        moq::sim moq-relay-policy)
+        moq::sim moq-relay-policy moq-relay-bind-test-internals)
     add_test(NAME relay_completion_stream_count
         COMMAND test_relay_completion_stream_count)
     set_tests_properties(relay_completion_stream_count PROPERTIES TIMEOUT 120)
@@ -1854,7 +1912,7 @@ if(TARGET moq::relay AND TARGET moq::sim)
     target_include_directories(test_relay_auto_update_terminal PRIVATE
         ${PROJECT_SOURCE_DIR}/relay/private)
     target_link_libraries(test_relay_auto_update_terminal PRIVATE
-        moq-core-test-internals moq::sim moq-relay-policy)
+        moq-core-test-internals moq::sim moq-relay-policy moq-relay-bind-test-internals)
     add_test(NAME relay_auto_update_terminal
         COMMAND test_relay_auto_update_terminal)
     set_tests_properties(relay_auto_update_terminal PROPERTIES TIMEOUT 120)

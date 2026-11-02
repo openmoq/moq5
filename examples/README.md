@@ -44,10 +44,6 @@ are writing or debugging an adapter, or need a backend the service tier does
 not yet expose. (These live in per-adapter directories today; a future
 consolidation under `adapters/` is possible.)
 
-### `_archive/` — reference only, not a starting point
-Older or narrowly-scoped examples kept for reference (`_archive/core`,
-`_archive/relay`, `_archive/simulation`). Do not begin here.
-
 ### lower-level facade demos (`local-media/`, `publisher/`, `cpp/`)
 Demos built on the publisher/subscriber facade (`moq_publisher_t` /
 `moq_subscriber_t`) over an adapter, predating the service tier. They remain

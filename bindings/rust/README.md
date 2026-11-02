@@ -27,7 +27,7 @@ thread. Failed registration detaches the partial sender before its first hook.
 
 Handwritten Rust follows the
 [Google Rust Style Guide](https://google.github.io/styleguide/rustguide.html),
-including its library API design rules (`API_STYLE_GUIDE.md` section 13.1):
+including its library API design rules:
 leaf modules named after their primary item, no glob imports, module-qualified
 calls to free functions, descriptive type lifetimes, `try_new` for a fallible
 constructor and standard traits (`FromStr`, `TryFrom`) beside the named

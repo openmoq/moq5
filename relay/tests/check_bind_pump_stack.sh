@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-src=${1:?moqr_bind.c path required}
+[ "$#" -gt 0 ] || { echo "FAIL: binding source paths required" >&2; exit 2; }
+for src in "$@"; do
+    [ -f "$src" ] || { echo "FAIL: missing binding source" >&2; exit 2; }
+done
+source_text=$(cat "$@")
 
 fail=0
-flat=$(tr '\n' ' ' < "$src")
+flat=$(printf '%s\n' "$source_text" | tr '\n' ' ')
 need() {
     local pattern=$1
     local label=$2
-    if ! grep -En -- "$pattern" "$src" >/dev/null; then
+    if ! printf '%s\n' "$source_text" | grep -En -- "$pattern" >/dev/null; then
         echo "FAIL: missing $label"
         fail=1
     fi
@@ -24,7 +28,7 @@ need_flat() {
 reject() {
     local pattern=$1
     local label=$2
-    if grep -En -- "$pattern" "$src" >/dev/null; then
+    if printf '%s\n' "$source_text" | grep -En -- "$pattern" >/dev/null; then
         echo "FAIL: found $label"
         fail=1
     fi

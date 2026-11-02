@@ -110,7 +110,7 @@ typedef struct fin_bridge_family {
 
 /* Only these (kind, pool) pairs are meaningful; an unknown kind, or a tag that
  * does not belong to it, is a descriptor error rather than a silent mismatch. */
-static int fin_bridge_kind_pool_ok(int kind, uint32_t tag)
+static inline int fin_bridge_kind_pool_ok(int kind, uint32_t tag)
 {
     switch (kind) {
     case MOQ_REQ_SUBSCRIPTION:     return tag == MOQ_HANDLE_POOL_SUBSCRIPTION;
@@ -141,7 +141,7 @@ typedef struct fin_bridge_case {
                              uint64_t transport_id);
 } fin_bridge_case_t;
 
-static int fin_bridge_problems(const fin_bridge_case_t *f)
+static inline int fin_bridge_problems(const fin_bridge_case_t *f)
 {
     int bad = 0;
     if (!f->name) bad++;

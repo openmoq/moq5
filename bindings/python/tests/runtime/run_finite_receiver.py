@@ -3,11 +3,15 @@
 examples/receive_loop.py. Synthetic carrier acceptance; no decoder.
 
     run_finite_receiver.py --package <installed moq5 dir> --relay <moq5-relay> \\
-        --publisher <moq5_runtime_publisher> [--negative] [--push]
+        --publisher <moq5_runtime_publisher> --msquic <libmsquic image> \\
+        --libssl <libssl image> --libcrypto <libcrypto image> \\
+        --openssl <openssl binary> [--negative] [--push]
     run_finite_receiver.py --oracle-selftest            comparator self-checks (no processes)
     run_finite_receiver.py --verdict-mutations RESULTS.json   verdict mutations of a receipt (offline)
     run_finite_receiver.py --child-controls             bounded offline ownership controls (stub children)
-    run_finite_receiver.py --control-selftests --publisher <bin>   the C control reader's classification
+    run_finite_receiver.py --input-controls             offline input-selection controls (placeholder files)
+    run_finite_receiver.py --control-selftests --publisher <bin> --msquic <libmsquic image>
+                                                        the C control reader's classification
 
 Ownership. The supervisor is the direct Popen owner of the relay, the
 publisher and the receiver client, and retains every handle through
@@ -27,7 +31,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import fixture                                              # noqa: E402
-from runtime_support import (Harness, MSQUIC_DIR, ControlProtocol, cmd, collect_diagnostics, free_udp_port,   # noqa: E402
+import runtime_support                                                                                       # noqa: E402
+from runtime_support import (Harness, ControlProtocol, cmd, collect_diagnostics, free_udp_port,   # noqa: E402
                              relay_checks, vmmap_inventory)
 import hashlib   # noqa: E402
 
@@ -37,8 +42,6 @@ NS_TEXT = "/".join(p.decode() for p in fixture.NAMESPACE)
 FIELDS = ("config_generation", "packaging", "status", "end_of_group", "datagram", "keyframe", "capture_time_us",
           "decode_time_us", "composition_offset_us", "presentation_time_us", "payload", "fragment", "mdat_offset", "mdat_len", "samples")
 EXPECTED_EVENTS = ["ADDED", "CATALOG_READY", "ENDED", "REMOVED"]      # the receiver emits CATALOG_READY once (first effective catalog)
-MSQUIC_IMAGE = MSQUIC_DIR + "/libmsquic.2.6.0.dylib"
-OPENSSL3_IMAGES = ("/opt/homebrew/Cellar/openssl@3/3.6.3/lib/libssl.3.dylib", "/opt/homebrew/Cellar/openssl@3/3.6.3/lib/libcrypto.3.dylib")
 # Observed non-project images, explicitly classified: the libSystem-side SSL images present in every process, and the
 # interpreter's own OpenSSL (the foundation venv is miniconda-based; hashlib loads it in the client). Nothing else is admitted.
 SYSTEM_SSL_IMAGES = ("/usr/lib/libssl.48.dylib", "/usr/lib/libcrypto.46.dylib",
@@ -593,7 +596,7 @@ def supervise(run, relay, publisher_bin, package, negative, transport_mode, chil
         creds = run / "creds"
         objects_file = run / "declared_objects.bin"
         fixture.write_objects_file(objects_file)
-        env = {"PATH": "/usr/bin:/bin", "DYLD_FALLBACK_LIBRARY_PATH": MSQUIC_DIR}
+        env = runtime_support.child_env()
         ready = threading.Event()
         pub_events = []
 
@@ -618,7 +621,7 @@ def supervise(run, relay, publisher_bin, package, negative, transport_mode, chil
             h.rec["publisher_vmmap"], h.rec["publisher_images"] = vmmap_inventory(pub.proc.pid, h.run_cmd)
             # the selected immutable images and their identities BEFORE the run
             selected = {"module": str(Path(package) / "moq5" / "_native.abi3.so"), "publisher": str(Path(publisher_bin).resolve()),
-                        "msquic": MSQUIC_IMAGE, "libssl": OPENSSL3_IMAGES[0], "libcrypto": OPENSSL3_IMAGES[1]}
+                        **runtime_support.selected_native_images()}
             h.rec["selected_images"] = {k: {"path": p, "sha256_before": sha256_file(p)} for k, p in selected.items()}
         forwarded = []
         protocol = ControlProtocol(CONTROLS_NEGATIVE if negative else CONTROLS_POSITIVE)
@@ -817,7 +820,7 @@ def child_controls():
 
 def control_selftests(publisher_bin):
     """The C control reader's classification with an outer timeout guard."""
-    env = {"PATH": "/usr/bin:/bin", "DYLD_FALLBACK_LIBRARY_PATH": MSQUIC_DIR}
+    env = runtime_support.child_env()
     def run_case(name, stdin_bytes, close_stdin):
         p = subprocess.Popen([publisher_bin, "--control-selftest"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, env=env)
@@ -856,18 +859,25 @@ def control_selftests(publisher_bin):
 def main(argv):
     if argv[1:2] == ["--oracle-selftest"]:
         return oracle_selftest()
+    if argv[1:2] == ["--input-controls"]:
+        return runtime_support.input_controls(Path(__file__).resolve())
     if argv[1:2] == ["--verdict-mutations"]:
         return verdict_mutations(argv[2])
     if argv[1:2] == ["--child-controls"]:
         return child_controls()
     if argv[1:2] == ["--control-selftests"]:
-        return control_selftests(argv[3])
+        args = dict(zip(argv[2::2], argv[3::2]))
+        runtime_support.select_msquic(args.get("--msquic"))
+        return control_selftests(args["--publisher"])
     if argv[1:2] == ["--client"]:
         return client_main(Path(argv[2]), int(argv[3]), argv[4], argv[5] == "negative")
     flags = [a for a in argv[1:] if a in ("--negative", "--push")]
     rest = [a for a in argv[1:] if a not in flags]
     args = dict(zip(rest[0::2], rest[1::2]))
     negative, transport_mode = "--negative" in flags, ("push" if "--push" in flags else "pull")
+    runtime_support.select_msquic(args.get("--msquic"))
+    runtime_support.select_tls_images(args.get("--libssl"), args.get("--libcrypto"))
+    runtime_support.select_openssl(args.get("--openssl"))
     root = Path(args.get("--runs", str(HERE.parent.parent.parent.parent / "build" / "py-runtime-fixture")))
     root.mkdir(parents=True, exist_ok=True)
     run = root / (("negative-" if negative else "positive-") + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))

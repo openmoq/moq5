@@ -1,9 +1,26 @@
 # Transport-independent engine and host-pumped session/shard runtime.
 set(MOQ_RELAY_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
 set(MOQR_CORE_SOURCES
-    src/core/wire_codes.c src/core/capacity.c src/core/log.c
-    src/core/relay.c src/core/trace.c src/core/types.c src/core/stats.c
-    src/core/props_codec.c)
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/auth.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/bindings.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/capacity.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/delivery.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/fetch.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/intents.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/log.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/namespace.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/props_codec.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/publish.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/relay.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/route_dump.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/stats.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/subscribe.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/trace.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/tracks.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/types.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/upstream.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/wire_codes.c"
+)
 add_library(moq-relay-core ${MOQR_CORE_SOURCES})
 add_library(moq::relay-core ALIAS moq-relay-core)
 target_link_libraries(moq-relay-core PUBLIC moq::core)
@@ -47,9 +64,37 @@ foreach(header IN LISTS MOQR_CORE_HEADERS)
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moq/relay)
 endforeach()
 
+set(MOQR_BIND_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/authorization.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/bind.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/delivery.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/discovery.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/events.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/fetch.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/fetch_fill.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/fetch_joining.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/intents.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/metadata.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/request_answers.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/stats.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/subscription_update.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bind/upstream.c"
+)
+
+set(MOQR_SHARD_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/shard/data.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/shard/demand.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/shard/fill.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/shard/journal.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/shard/mailbox.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/shard/observability.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/shard/placement.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/shard/shards.c"
+)
+
 if(MOQ_BUILD_RELAY_RUNTIME)
     find_package(Threads REQUIRED)
-    add_library(moq-relay src/bind/moqr_bind.c src/shard/moqr_shards.c
+    add_library(moq-relay ${MOQR_BIND_SOURCES} ${MOQR_SHARD_SOURCES}
         src/obs/metrics.c src/stats.c)
     add_library(moq::relay ALIAS moq-relay)
     target_link_libraries(moq-relay PUBLIC moq::relay-core PRIVATE Threads::Threads)
@@ -122,7 +167,7 @@ if(MOQ_BUILD_RELAY_RUNTIME AND
     # The inspected shard and binding form one private implementation boundary;
     # shared-library consumers cannot resolve their hidden metadata helpers.
     add_library(moq-relay-inspect OBJECT
-        src/shard/moqr_shards.c src/bind/moqr_bind.c)
+        ${MOQR_SHARD_SOURCES} ${MOQR_BIND_SOURCES})
     set_target_properties(moq-relay-inspect PROPERTIES
         C_VISIBILITY_PRESET hidden POSITION_INDEPENDENT_CODE ON)
     target_include_directories(moq-relay-inspect PUBLIC

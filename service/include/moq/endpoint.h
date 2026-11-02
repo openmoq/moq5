@@ -9,9 +9,10 @@
  * the post() executor that makes the full moq_session_* surface reachable
  * without exposing the pump.
  *
- * Design: MEDIA_SERVICE_DESIGN.md §5. This tier is severable: lower tiers
- * build and work without it (MOQ_BUILD_SERVICE), the core stays sans-I/O,
- * and all threading lives here.
+ * This tier is severable: lower tiers build and work without it
+ * (MOQ_BUILD_SERVICE), and the core stays sans-I/O. The endpoint
+ * orchestrates the consumer side on the managed execution context its
+ * transport facade owns (a network thread, or a serial queue).
  *
  * Current status: lifecycle and version negotiation are live over the
  * managed picoquic facades (RAW_QUIC via moq_pq_threaded with ALPN

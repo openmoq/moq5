@@ -4,12 +4,25 @@ include("${PROJECT_SOURCE_DIR}/cmake/MoqComponentExports.cmake")
 # Severable: lower tiers build and work without it; the core stays sans-I/O
 # and all threading lives here.
 
+set(MOQ_MEDIA_SENDER_SOURCES
+    src/media_sender.c
+    src/media_sender_catalog.c
+    src/media_sender_complete.c
+    src/media_sender_mpeg2ts.c
+    src/media_sender_pump.c
+    src/media_sender_timeline.c
+    src/media_sender_tracks.c
+    src/media_sender_write.c
+)
+set(MOQ_MEDIA_SENDER_TEST_SOURCES ${MOQ_MEDIA_SENDER_SOURCES}
+    src/media_sender_testing.c)
+
 add_library(moq-service
     src/endpoint.c
     src/endpoint_uri.c
     src/media_auth.c
     src/media_receiver.c
-    src/media_sender.c
+    ${MOQ_MEDIA_SENDER_SOURCES}
 )
 
 add_library(moq::service ALIAS moq-service)
@@ -1143,7 +1156,7 @@ if(MOQ_BUILD_TESTS)
         # the sender would publish after add/remove, to pin coalescing and the
         # no-op dedup deterministically.
         add_library(moq-service-sender-test-internals OBJECT
-            src/media_sender.c src/media_auth.c src/endpoint.c src/endpoint_uri.c)
+            ${MOQ_MEDIA_SENDER_TEST_SOURCES} src/media_auth.c src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-sender-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1424,12 +1437,12 @@ if(MOQ_BUILD_TESTS)
         # Automatic catalog-refresh test. Needs BOTH the sender and
         # receiver seams (a real sender publishes periodic catalogs; a real
         # receiver dedups them), so it links a combined internals object set
-        # compiling media_sender.c + media_receiver.c + endpoint.c ONCE with
+        # compiling the sender, receiver and endpoint sources ONCE with
         # both testing defines -- linking the two separate internals libs would
         # duplicate endpoint.c. Requires moq::msf and moq::sim.
         if(TARGET moq::sim)
             add_library(moq-service-refresh-test-internals OBJECT
-                src/media_sender.c src/media_receiver.c src/media_auth.c
+                ${MOQ_MEDIA_SENDER_TEST_SOURCES} src/media_receiver.c src/media_auth.c
                 src/endpoint.c src/endpoint_uri.c)
             target_include_directories(moq-service-refresh-test-internals
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1733,7 +1746,7 @@ if(MOQ_BUILD_TESTS)
             set(_stage_facade_libs ${_MOQ_SERVICE_FACADE_LIBS})
             list(REMOVE_ITEM _stage_facade_libs moq::adapter-picoquic-threaded)
             add_library(moq-service-sender-stage-test-internals OBJECT
-                src/media_sender.c src/media_auth.c src/endpoint.c src/endpoint_uri.c)
+                ${MOQ_MEDIA_SENDER_TEST_SOURCES} src/media_auth.c src/endpoint.c src/endpoint_uri.c)
             target_include_directories(moq-service-sender-stage-test-internals
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1822,7 +1835,7 @@ if(MOQ_BUILD_TESTS)
         set(_stage_wt_facade_libs ${_MOQ_SERVICE_FACADE_LIBS})
         list(REMOVE_ITEM _stage_wt_facade_libs moq::adapter-pico-wt-managed)
         add_library(moq-service-sender-stage-wt-test-internals OBJECT
-            src/media_sender.c src/media_auth.c src/endpoint.c src/endpoint_uri.c)
+            ${MOQ_MEDIA_SENDER_TEST_SOURCES} src/media_auth.c src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-sender-stage-wt-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

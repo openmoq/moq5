@@ -2,11 +2,11 @@
 #define MOQ_MEDIA_SENDER_H
 
 /*
- * moq_media_sender_t — the send-side media facade over an endpoint
- * (MEDIA_SERVICE_DESIGN.md §7). Owns a publisher on the endpoint's
- * network thread: it advertises a namespace, derives and publishes a
- * retained MSF catalog from the configured tracks, and reports readiness
- * once the namespace is accepted and the catalog is published. The
+ * moq_media_sender_t — the send-side media facade over an endpoint.
+ * Owns a publisher on the endpoint's network thread: it advertises a
+ * namespace, derives and publishes a retained MSF catalog from the
+ * configured tracks, and reports readiness once the namespace is accepted
+ * and the catalog is published. The
  * application adds tracks and submits media objects from its own thread.
  *
  * Current status: tracks, catalog, readiness, and the media write path are
@@ -32,8 +32,7 @@ extern "C" {
 
 typedef struct moq_media_sender moq_media_sender_t;
 
-/* The opaque media-track handle. Shared name with the receiver
- * (MEDIA_SERVICE_DESIGN.md uses moq_media_track_t on both sides); each
+/* The opaque media-track handle, shared by name with the receiver; each
  * facade completes the struct privately in its own translation unit, so
  * including both headers is safe -- the handle is only ever an opaque
  * pointer across the boundary. */

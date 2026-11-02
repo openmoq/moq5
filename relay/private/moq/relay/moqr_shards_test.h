@@ -163,7 +163,7 @@ void moqr_shards_debug_set_live_visibility(moqr_shards_t *s, bool live);
  * squeeze. No-op when the shard has no manager (K == 1). */
 void moqr_shards_debug_fail_stop(moqr_shards_t *s, uint16_t shard);
 
-/* Verify-only SG_SEAL ingest evidence (see moqr_shards.c seal_log): one
+/* Verify-only SG_SEAL ingest evidence (see observability.c seal_log): one
  * entry per seal this REQUESTER shard applied to its core, in ingest order. */
 typedef struct moqr_shards_seal_ev {
     uint64_t seq;        /* lifetime ingest order on this shard */

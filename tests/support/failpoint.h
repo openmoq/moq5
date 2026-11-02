@@ -52,7 +52,11 @@
 /* Negative self-tests exercise the comparison helpers on states that are
  * SUPPOSED to diverge; their diagnostics would read as failures in a
  * passing run's output. Set while asserting an expected divergence. */
+#if defined(MOQ_TEST_SHARED_FIXTURES)
+FP_UNUSED extern int fp_quiet;
+#else
 FP_UNUSED static int fp_quiet;
+#endif
 
 #define FP_DIAG(...) do { if (!fp_quiet) fprintf(stderr, __VA_ARGS__); } while (0)
 

@@ -15,11 +15,11 @@
  * until a fresh publication. Driver events are secondary evidence only.
  *
  * Spec authority (verified byte-for-byte, hashes recorded):
- *   /Users/jekyll/Projects/MoQ/Spec/draft-ietf-moq-transport-16.txt
+ *   draft-ietf-moq-transport-16.txt
  *     sha256 2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18
  *     §6.1/6.2, §9.21 NAMESPACE 0x8, §9.22 PUBLISH_NAMESPACE_DONE 0x9,
  *     §9.23 NAMESPACE_DONE 0xE, §9.24 PUBLISH_NAMESPACE_CANCEL 0xC
- *   /Users/jekyll/Projects/MoQ/Spec/draft-ietf-moq-transport-18.txt
+ *   draft-ietf-moq-transport-18.txt
  *     sha256 9e6b32cb7797c151e9e127374c1291af3ed546b2d453cd5bbb15946977eeeeb6
  *     §6.2 withdrawal = cancelling the request, §3.3.2 reset/STOP_SENDING,
  *     §3.3.2 rejection-without-processing = REQUEST_ERROR + FIN,

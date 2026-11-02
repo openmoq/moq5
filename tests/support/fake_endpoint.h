@@ -342,7 +342,7 @@ static inline void fake_endpoint_enable_reset_at(fake_endpoint_t *ep)
  * survive: a fixture that clears between phases must not thereby lose the
  * evidence that an earlier phase dropped something. Initialization clears
  * them, since it starts a new endpoint. */
-static void fake_endpoint_clear_ops(fake_endpoint_t *ep)
+static inline void fake_endpoint_clear_ops(fake_endpoint_t *ep)
 {
     ep->count = 0;
 }

@@ -71,7 +71,11 @@
 
 /* Set while a negative self-test asserts an EXPECTED divergence, so its
  * diagnostics do not read as failures in a passing run's output. */
+#if defined(MOQ_TEST_SHARED_FIXTURES)
+OG_UNUSED extern int og_quiet;
+#else
 OG_UNUSED static int og_quiet;
+#endif
 
 #define OG_DIAG(...) do { if (!og_quiet) fprintf(stderr, __VA_ARGS__); } while (0)
 

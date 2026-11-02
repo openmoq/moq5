@@ -49,8 +49,8 @@
  * Draft-22 sessions over the production binding and a real simulated
  * transport; white-box reads of the relay's session state only observe.
  */
-#define COMPLETION_BIND_SOURCE "../../relay/src/bind/moqr_bind.c"
-#include COMPLETION_BIND_SOURCE
+#include "../../relay/src/bind/bind_internal.h"
+#include "../../relay/src/bind/testing_internal.h"
 #include "../../relay/tests/relay_session_binding_harness.c"
 #define main relay_session_binding_d22_main
 #include "../../relay/tests/test_relay_session_binding_d22.c"

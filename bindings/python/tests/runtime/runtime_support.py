@@ -8,14 +8,158 @@ stderr and timeout; one diagnostic rule applies to all of them (any
 exceptions and close their pipes; settlement records exit, how, and whether
 the readers settled. Stdlib only.
 """
-import json, os, re, signal, socket, stat, subprocess, threading, time
+import json, os, re, signal, socket, stat, subprocess, sys, threading, time
 from pathlib import Path
 
-OPENSSL = "/opt/homebrew/Caskroom/miniconda/base/bin/openssl"
-MSQUIC_DIR = "/Users/jekyll/Projects/MoQ/LibMoQ/msquic/build-b632469/bin/Release"
+# The explicit inputs of a live run, set from the driver's --msquic,
+# --libssl, --libcrypto and --openssl arguments: the exact MsQuic, libssl and
+# libcrypto images the children load (the MsQuic image's directory is their
+# library search path) and the openssl binary that makes the run's
+# credentials. Nothing searches for a substitute; a run that needs one and
+# was not given it stops before it starts anything.
+MSQUIC_IMAGE = None
+MSQUIC_DIR = None
+LIBSSL_IMAGE = None
+LIBCRYPTO_IMAGE = None
+OPENSSL = None
 EXPECTED_ALPN = "moqt-18+moqt-16"
 READY_S, STOP_S, JOIN_S, CMD_S = 10.0, 5.0, 3.0, 30.0
 CONTROL_MAX, CONTROL_LIMIT = 16, 4        # the finite control protocol: <= 4 lines of <= 16 bytes
+
+
+def _required_file(flag, path):
+    if not path:
+        raise SystemExit(f"{flag} <path> is required for this run")
+    if not os.path.isabs(path) or not os.path.isfile(path):
+        raise SystemExit(f"{flag} {path}: not an absolute path to an existing file")
+    return os.path.realpath(path)
+
+
+def select_msquic(path):
+    """Select the exact MsQuic image (the file the loader maps) from --msquic.
+    The search directory is the selected image's own, so an alias in another
+    directory cannot send the loader somewhere the image is not."""
+    global MSQUIC_IMAGE, MSQUIC_DIR
+    MSQUIC_IMAGE = _required_file("--msquic", path)
+    MSQUIC_DIR = os.path.dirname(MSQUIC_IMAGE)
+
+
+def select_tls_images(libssl, libcrypto):
+    """Select the exact libssl and libcrypto images from --libssl/--libcrypto."""
+    global LIBSSL_IMAGE, LIBCRYPTO_IMAGE
+    LIBSSL_IMAGE = _required_file("--libssl", libssl)
+    LIBCRYPTO_IMAGE = _required_file("--libcrypto", libcrypto)
+
+
+def selected_native_images():
+    """The selected native images every live run's receipt records with their
+    digests and requires among the loaded images."""
+    return {"msquic": MSQUIC_IMAGE, "libssl": LIBSSL_IMAGE, "libcrypto": LIBCRYPTO_IMAGE}
+
+
+def child_env():
+    """The environment of every child: a fixed PATH and, once an MsQuic image
+    is selected, its directory as the library search path. The offline
+    controls run stub children that load no MsQuic and select none."""
+    env = {"PATH": "/usr/bin:/bin"}
+    if MSQUIC_DIR is not None:
+        env["DYLD_FALLBACK_LIBRARY_PATH"] = MSQUIC_DIR
+    return env
+
+
+def select_openssl(path):
+    """Select the openssl binary that makes the run's credentials from --openssl."""
+    global OPENSSL
+    OPENSSL = _required_file("--openssl", path)
+
+
+def input_controls(driver):
+    """Offline input-selection controls: the selected paths are the ones
+    used, an alias resolves to its target's directory, a missing or bad
+    input is refused, the driver keeps no built-in image paths, and its live
+    mode refuses before creating a run. No SDK, library or relay is used:
+    the images are placeholder files."""
+    import importlib, tempfile
+    global MSQUIC_IMAGE, MSQUIC_DIR, LIBSSL_IMAGE, LIBCRYPTO_IMAGE, OPENSSL
+    results, saved = {}, (MSQUIC_IMAGE, MSQUIC_DIR, LIBSSL_IMAGE, LIBCRYPTO_IMAGE, OPENSSL)
+
+    def check(name, cond, detail=""):
+        results[name] = {"ok": bool(cond), "detail": detail}
+
+    def refused(fn, *a):
+        try:
+            fn(*a)
+        except SystemExit as e:
+            return str(e)
+        return None
+
+    try:
+        with tempfile.TemporaryDirectory() as t:
+            t = os.path.realpath(t)
+            actual, alias, tls = Path(t, "actual"), Path(t, "alias"), Path(t, "tls")
+            for d in (actual, alias, tls):
+                d.mkdir()
+            image = actual / "libmsquic.2.dylib"
+            image.write_bytes(b"placeholder")
+            (alias / "custom.dylib").symlink_to(image)
+            ssl, crypto = tls / "libssl.3.dylib", tls / "libcrypto.3.dylib"
+            ssl.write_bytes(b"placeholder")
+            crypto.write_bytes(b"placeholder")
+            tool = Path(t, "openssl")
+            tool.write_bytes(b"placeholder")
+
+            select_msquic(str(image))
+            check("msquic_file_selected", MSQUIC_IMAGE == str(image) and MSQUIC_DIR == str(actual)
+                  and child_env().get("DYLD_FALLBACK_LIBRARY_PATH") == str(actual), (MSQUIC_IMAGE, MSQUIC_DIR))
+            select_msquic(str(alias / "custom.dylib"))
+            check("msquic_alias_resolves_to_target_directory",
+                  MSQUIC_IMAGE == str(image) and MSQUIC_DIR == str(actual)
+                  and child_env().get("DYLD_FALLBACK_LIBRARY_PATH") == str(actual), (MSQUIC_IMAGE, MSQUIC_DIR))
+            select_tls_images(str(ssl), str(crypto))
+            select_openssl(str(tool))
+            check("selected_images_are_the_inputs",
+                  selected_native_images() == {"msquic": str(image), "libssl": str(ssl), "libcrypto": str(crypto)}
+                  and OPENSSL == str(tool), selected_native_images())
+            for name, fn, args in (
+                    ("msquic_missing", select_msquic, (None,)),
+                    ("msquic_relative", select_msquic, ("libmsquic.2.dylib",)),
+                    ("msquic_absent", select_msquic, (str(actual / "absent.dylib"),)),
+                    ("msquic_directory", select_msquic, (str(actual),)),
+                    ("libssl_missing", select_tls_images, (None, str(crypto))),
+                    ("libcrypto_missing", select_tls_images, (str(ssl), None)),
+                    ("libssl_absent", select_tls_images, (str(tls / "absent.dylib"), str(crypto))),
+                    ("openssl_missing", select_openssl, (None,)),
+                    ("openssl_relative", select_openssl, ("openssl",))):
+                why = refused(fn, *args)
+                check("refuses_" + name, why is not None, why)
+
+            mod = importlib.import_module(Path(driver).stem)
+            check("driver_keeps_no_image_constants",
+                  not any(hasattr(mod, k) for k in ("OPENSSL3_IMAGES", "MSQUIC_IMAGE", "MSQUIC_DIR", "OPENSSL")),
+                  [k for k in ("OPENSSL3_IMAGES", "MSQUIC_IMAGE", "MSQUIC_DIR", "OPENSSL") if hasattr(mod, k)])
+            text = Path(driver).read_text()
+            check("driver_has_no_pinned_tls_paths",
+                  "Cellar/openssl" not in text and "/opt/homebrew/opt/openssl@3/lib" not in text)
+
+            # Live mode with every input but --libssl refuses before it makes a
+            # run: no new entry under the run roots either driver uses.
+            repo = Path(__file__).resolve().parents[4]
+            roots = [Path(t, "runs"), repo / "build" / "py-runtime-fixture", repo / "build" / "py-publisher-fixture"]
+            before = {r: set(r.iterdir()) if r.is_dir() else set() for r in roots}
+            argv = [sys.executable, "-I", str(driver), "--package", t, "--relay", str(tool),
+                    "--msquic", str(image), "--libcrypto", str(crypto), "--openssl", str(tool)]
+            if Path(driver).stem == "run_finite_receiver":
+                argv += ["--publisher", str(tool), "--runs", str(roots[0])]
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=CMD_S, env=child_env())
+            new = {str(r): sorted(str(x) for x in (set(r.iterdir()) if r.is_dir() else set()) - before[r]) for r in roots}
+            check("live_refuses_before_any_run",
+                  p.returncode != 0 and "--libssl" in p.stderr and not any(new.values()),
+                  {"rc": p.returncode, "stderr": p.stderr.strip()[-200:], "new_entries": new})
+    finally:
+        MSQUIC_IMAGE, MSQUIC_DIR, LIBSSL_IMAGE, LIBCRYPTO_IMAGE, OPENSSL = saved
+    all_ok = all(r["ok"] for r in results.values())
+    print(json.dumps({"input_controls": results, "all_ok": all_ok}, indent=1, default=str))
+    return 0 if all_ok else 1
 
 
 class ControlProtocol:
@@ -265,7 +409,7 @@ class Harness:
                "logging": {"format": "json"}, "auth": {"mode": "allow_all"}}
         cfg_path = self.run / "relay.json"
         cfg_path.write_text(json.dumps(cfg, indent=1))
-        env = {"PATH": "/usr/bin:/bin", "DYLD_FALLBACK_LIBRARY_PATH": MSQUIC_DIR}
+        env = child_env()
         ready = threading.Event()
         info = {"binary": str(self.relay_binary), "port": port, "config": cfg, "ready_record": None}
 

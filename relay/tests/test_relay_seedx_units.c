@@ -12,7 +12,7 @@
  *  - the reference ledger's credit identities across the exact
  *    full/hold/consume/retry/abandon sequence, every term exercised.
  *
- * Specs cited by the scripts: /Users/jekyll/Projects/MoQ/Spec/
+ * Specs cited by the scripts:
  * draft-ietf-moq-transport-16.txt
  *   sha256 2174e50090f20801df4d21e16b9ec21abe593e6ba2a84e43142aabdeb47b2c18
  * draft-ietf-moq-transport-18.txt

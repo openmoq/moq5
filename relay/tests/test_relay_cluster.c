@@ -1,4 +1,5 @@
-#include "../src/core/relay.c"
+#include "../src/core/relay_internal.h"
+#include "../src/core/namespace_internal.h"
 #include "../src/core/retrieve_internal.h"
 #include <moq/moq.h>
 #include <stdio.h>

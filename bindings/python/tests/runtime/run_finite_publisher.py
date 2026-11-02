@@ -30,9 +30,12 @@ the observations are done.
 
     python -I bindings/python/tests/runtime/run_finite_publisher.py --oracle-selftest
     python -I bindings/python/tests/runtime/run_finite_publisher.py --child-controls
+    python -I bindings/python/tests/runtime/run_finite_publisher.py --input-controls
     env -i PATH=/usr/bin:/bin DYLD_FALLBACK_LIBRARY_PATH=<msquic dylib dir> \
       python -I bindings/python/tests/runtime/run_finite_publisher.py \
-        --package <installed moq5 dir> --relay <moq5-relay> [--negative]
+        --package <installed moq5 dir> --relay <moq5-relay> \
+        --msquic <libmsquic image> --libssl <libssl image> \
+        --libcrypto <libcrypto image> --openssl <openssl binary> [--negative]
     python -I bindings/python/tests/runtime/run_finite_publisher.py --verdict-mutations <run dir>
 """
 
@@ -42,15 +45,13 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import fixture                                              # noqa: E402
-from runtime_support import (EXPECTED_ALPN, Harness, MSQUIC_DIR, ControlProtocol,  # noqa: E402
+import runtime_support                                      # noqa: E402
+from runtime_support import (EXPECTED_ALPN, Harness, ControlProtocol,  # noqa: E402
                              collect_diagnostics, free_udp_port, relay_checks)
 import hashlib                                              # noqa: E402
 
 EXAMPLE = HERE.parent.parent / "examples" / "publish_loop.py"
 NS_TEXT = "/".join(p.decode() for p in fixture.NAMESPACE)
-MSQUIC_IMAGE = MSQUIC_DIR + "/libmsquic.2.6.0.dylib"
-OPENSSL3_IMAGES = ("/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib",
-                   "/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib")
 DROP_FIELDS = ("objects_dropped", "groups_dropped", "keyframes_dropped", "groups_abandoned")
 
 # The receiver emits these, and nothing else, in a positive run.
@@ -1425,7 +1426,7 @@ def supervise(run, relay, package, negative, publisher_argv=None,
             h.start_relay(port)
         else:
             port = 0
-        env = {"PATH": "/usr/bin:/bin", "DYLD_FALLBACK_LIBRARY_PATH": MSQUIC_DIR}
+        env = runtime_support.child_env()
         ready = threading.Event()
         pub_events = []
 
@@ -1452,8 +1453,7 @@ def supervise(run, relay, package, negative, publisher_argv=None,
         if relay is not None:
             selected = {"module": str(Path(package) / "moq5" / "_native.abi3.so"),
                         "example": str(EXAMPLE), "relay": str(Path(relay).resolve()),
-                        "msquic": MSQUIC_IMAGE, "libssl": OPENSSL3_IMAGES[0],
-                        "libcrypto": OPENSSL3_IMAGES[1]}
+                        **runtime_support.selected_native_images()}
             h.rec["selected_images"] = {k: {"path": p, "sha256_before": sha256_file(p)}
                                         for k, p in selected.items()}
         forwarded = []
@@ -1909,6 +1909,8 @@ def verdict_mutations(run_dir):
 def main(argv):
     if "--oracle-selftest" in argv:
         return oracle_selftest()
+    if "--input-controls" in argv:
+        return runtime_support.input_controls(Path(__file__).resolve())
     if "--child-controls" in argv:
         return child_controls()
     if "--reader-controls" in argv:
@@ -1930,6 +1932,10 @@ def main(argv):
     package = argv[argv.index("--package") + 1]
     relay = argv[argv.index("--relay") + 1]
     negative = "--negative" in argv
+    runtime_support.select_msquic(argv[argv.index("--msquic") + 1] if "--msquic" in argv else None)
+    runtime_support.select_tls_images(argv[argv.index("--libssl") + 1] if "--libssl" in argv else None,
+                                      argv[argv.index("--libcrypto") + 1] if "--libcrypto" in argv else None)
+    runtime_support.select_openssl(argv[argv.index("--openssl") + 1] if "--openssl" in argv else None)
     root = HERE.parent.parent.parent.parent / "build" / "py-publisher-fixture"
     root.mkdir(parents=True, exist_ok=True)
     run = root / (("negative-" if negative else "positive-") +

@@ -9,14 +9,19 @@
 #include <stdlib.h>
 
 /* Explicit test transport, not a capability change to the common fake.
- * Slots are per translation unit and bounded independently of product memory.
+ * Slots are file-local by default, or shared when selected by the test target.
+ * Their storage is bounded independently of product memory.
  * Each queued call preserves its bytes/FIN separately from later deliveries.
  * Deliberate direct bridge-result tests should keep calling the raw API. */
 typedef struct {
     moq_transport_bridge_t *bridge;
     test_held_input_t input;
 } held_bridge_driver_t;
+#if defined(MOQ_TEST_SHARED_FIXTURES)
+extern held_bridge_driver_t held_bridge_drivers[16];
+#else
 static held_bridge_driver_t held_bridge_drivers[16];
+#endif
 
 #define HELD_REQUIRE(expr) do { \
     if (!(expr)) { \

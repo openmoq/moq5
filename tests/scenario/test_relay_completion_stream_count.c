@@ -2,12 +2,11 @@
  * existing rig and the delivery and draft-22 suites unchanged; their renamed
  * entry points keep the retained controls available without copying a second
  * simulator harness. No core TU is included.
- * The binding TU is local so saturation can be checked as pure arithmetic,
- * without manufacturing a live subscription with billions of streams. */
-#ifndef COMPLETION_BIND_SOURCE
-#define COMPLETION_BIND_SOURCE "../../relay/src/bind/moqr_bind.c"
-#endif
-#include COMPLETION_BIND_SOURCE
+ * Private binding accounting is linked locally so saturation is checked
+ * as arithmetic, without manufacturing a live subscription with billions of
+ * streams. */
+#include "../../relay/src/bind/bind_internal.h"
+#include "../../relay/src/bind/intents_internal.h"
 #include "../../relay/tests/relay_session_binding_harness.c"
 #define main relay_session_binding_delivery_main
 #include "../../relay/tests/test_relay_session_binding_delivery.c"

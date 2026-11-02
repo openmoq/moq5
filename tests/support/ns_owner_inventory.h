@@ -68,7 +68,11 @@ NF_UNUSED static size_t nf_encode_ns(uint8_t *buf, size_t cap, uint64_t type,
 
 /* Set while a self-check drives an expected mismatch, so the negative cases
  * prove the comparator without printing diagnostics on a passing run. */
+#if defined(MOQ_TEST_SHARED_FIXTURES)
+NF_UNUSED extern int nf_quiet;
+#else
 NF_UNUSED static int nf_quiet;
+#endif
 
 #define NF_DIAG(...) do { if (!nf_quiet) fprintf(stderr, __VA_ARGS__); } while (0)
 

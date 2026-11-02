@@ -43,7 +43,7 @@
 #include <time.h>
 #include <unistd.h>
 
-/* The core test-internals close hold (relay/src/core/relay.c). */
+/* The core test-internals close hold (relay/src/core/bindings.c). */
 extern void moqr_core_debug_hold_binding_close(moqr_core_t *c,
                                                uint32_t attempts);
 extern uint32_t moqr_core_debug_binding_close_held(const moqr_core_t *c,

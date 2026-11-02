@@ -1,6 +1,7 @@
 /*
- * Binding-ready set oracle. White-box (includes relay.c): the core must mark
- * exactly the bindings whose deliverable state can have changed — activation
+ * Binding-ready set oracle. White-box (uses the private core layout):
+ * the core must mark exactly the bindings whose deliverable state can have
+ * changed — activation
  * (parked resolve + immediate accept), the whole ingest family (whole/OPEN/
  * chunk/completion/abandon), seal, eviction pending-skip, an upstream
  * eviction watermark that changed something, an eviction made to admit a
@@ -15,7 +16,11 @@
  * marks make possible, and white-box set internals.
  */
 
-#include "relay.c"
+#include "relay_internal.h"
+#include "bindings_internal.h"
+#include "delivery_internal.h"
+#include "subscribe_internal.h"
+#include "tracks_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>

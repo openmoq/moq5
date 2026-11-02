@@ -519,13 +519,9 @@ negotiation and catalog/media delivery in native QUIC and WebTransport
 TLS/packet simulations. The private loopback variant excludes that cluster
 flow. These are not live socket mesh evidence.
 
-The [original implementation plan](moq-cluster-01-plan.txt) retains historical
-candidate results; those totals and baseline failures are not qualification
-results or accepted exceptions for the composed tree. Final qualification is
-reported separately against its exact source. Live socket mesh testing and
-the absent `../moq-pub` application remain unverified. Peer discovery, dialing
-and reconnect policy belong to the host; the relay command does not expose
-cluster-peer configuration.
+Live socket mesh testing and the absent `../moq-pub` application remain
+unverified. Peer discovery, dialing and reconnect policy belong to the host;
+the relay command does not expose cluster-peer configuration.
 
 ## Known limitations
 
@@ -648,8 +644,8 @@ Each of these is a stated limit or open decision a user can run into.
 The relay core and binding carry all six semantic Location Filter forms,
 including object-granular inclusive ends (Absolute Range, type 0x04) on
 SUBSCRIBE and replacement UPDATE. The bounded range stays established when
-exhausted on draft-22. Source: `relay/src/core/relay.c` and
-`relay/src/bind/moqr_bind.c`; `relay_control` includes object-end and full-width
+exhausted on draft-22. Source: `relay/src/core/subscribe.c` and
+`relay/src/bind/subscription_update.c`; `relay_control` includes object-end and full-width
 location controls. This does not establish current-provider relay acceptance.
 
 - Cross-shard retrieval serves draft-22 fills only; a standalone FETCH

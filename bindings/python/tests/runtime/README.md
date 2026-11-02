@@ -27,13 +27,17 @@ sends exactly those bytes; its receipts are extra evidence, never the oracle.
     # the C control reader's classification, and (after a run) verdict mutations
     python -I bindings/python/tests/runtime/run_finite_receiver.py --oracle-selftest
     python -I bindings/python/tests/runtime/run_finite_receiver.py --child-controls
+    python -I bindings/python/tests/runtime/run_finite_receiver.py --input-controls
     python -I bindings/python/tests/runtime/run_finite_receiver.py --control-selftests \
-        --publisher build/py-runtime-fixture/publisher/moq5_runtime_publisher
+        --publisher build/py-runtime-fixture/publisher/moq5_runtime_publisher \
+        --msquic <libmsquic image>
     # one positive run (and --negative for the zero-object control); pull mode by default
     env -i PATH=/usr/bin:/bin DYLD_FALLBACK_LIBRARY_PATH=<msquic dylib dir> \
       python -I bindings/python/tests/runtime/run_finite_receiver.py \
         --package <installed moq5 dir> --relay <moq5-relay> \
-        --publisher build/py-runtime-fixture/publisher/moq5_runtime_publisher [--negative] [--push]
+        --publisher build/py-runtime-fixture/publisher/moq5_runtime_publisher \
+        --msquic <libmsquic image> --libssl <libssl image> --libcrypto <libcrypto image> \
+        --openssl <openssl binary> [--negative] [--push]
     python -I bindings/python/tests/runtime/run_finite_receiver.py --verdict-mutations <run dir>/results.json
 
 The supervisor is the direct owner of the relay, the publisher and the
@@ -43,9 +47,12 @@ images before and after close, every process status and the loaded native
 images of the client and publisher.
 
 Runs, credentials, logs and receipts land under `build/py-runtime-fixture/`
-(git-ignored). The loader override names the external MsQuic directory the
-installed relay and module were linked against; it is recorded in the
-receipt.
+(git-ignored). `--msquic`, `--libssl` and `--libcrypto` name the exact
+MsQuic and OpenSSL images the installed relay and module were linked
+against, and the loader override names the MsQuic image's directory;
+`--openssl` names the openssl binary that makes the run's credentials. A
+live run refuses to start without them, and the receipt records each
+selected image and its digest.
 
 ## The finite PUBLISHING run (run_finite_publisher.py)
 
@@ -60,10 +67,13 @@ not produce, and it never requests completion to satisfy that policy.
     # offline first: the verdict comparator self-checks and the ownership controls
     python -I bindings/python/tests/runtime/run_finite_publisher.py --oracle-selftest
     python -I bindings/python/tests/runtime/run_finite_publisher.py --child-controls
+    python -I bindings/python/tests/runtime/run_finite_publisher.py --input-controls
     # one positive campaign, and the deliberate zero-object negative
     env -i PATH=/usr/bin:/bin DYLD_FALLBACK_LIBRARY_PATH=<msquic dylib dir> \
       python -I bindings/python/tests/runtime/run_finite_publisher.py \
-        --package <installed moq5 dir> --relay <moq5-relay> [--negative]
+        --package <installed moq5 dir> --relay <moq5-relay> \
+        --msquic <libmsquic image> --libssl <libssl image> --libcrypto <libcrypto image> \
+        --openssl <openssl binary> [--negative]
     python -I bindings/python/tests/runtime/run_finite_publisher.py --verdict-mutations <run dir>
 
 The publisher keeps its sender and endpoint alive until the receiver reports

@@ -9,10 +9,11 @@
  * the hot path: the ingest rcbuf slabs are popped from / pushed back to the
  * pool free-list, and fan-out is N cheap increfs of one buffer.
  *
- * This is a BENCHMARK-ONLY proof of RELAY_ZEROALLOC_DESIGN.md. There is no
- * relay in core: the relay loop is benchmark-local wiring over M+1 SimPairs,
- * and the pool is a benchmark support allocator, not a core type. The core is
- * unchanged; the allocator vtable (moq_alloc_t) is the only seam used.
+ * This is a BENCHMARK-ONLY proof of a zero-allocation relay fan-out. There
+ * is no relay in core: the relay loop is benchmark-local wiring over M+1
+ * SimPairs, and the pool is a benchmark support allocator, not a core type.
+ * The core is unchanged; the allocator vtable (moq_alloc_t) is the only
+ * seam used.
  *
  * The relay is single-shard: ingest, fan-out, and every decref happen on one
  * (simulated) executor-affinity domain, so the non-atomic rcbuf refcounts and

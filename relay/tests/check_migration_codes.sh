@@ -11,14 +11,16 @@
 # test binding — the shard's own bind pump consumes the reject intent inside
 # the same step — so the mapping is pinned here at the source.
 #
-# Argument 1 is relay/src/bind/moqr_bind.c, argument 2 is
-# relay/src/shard/moqr_shards.c.
+# Arguments are the binding upstream implementation, its private layout header
+# the shard demand implementation and its private layout header.
 set -u
 
 bind_c="${1:-}"
-shard_c="${2:-}"
-if [ ! -f "$bind_c" ] || [ ! -f "$shard_c" ]; then
-    echo "FAIL: usage: $0 <moqr_bind.c> <moqr_shards.c>" >&2
+bind_h="${2:-}"
+shard_c="${3:-}"
+shard_h="${4:-}"
+if [ ! -f "$bind_c" ] || [ ! -f "$bind_h" ] || [ ! -f "$shard_c" ] || [ ! -f "$shard_h" ]; then
+    echo "FAIL: usage: $0 <upstream.c> <bind_internal.h> <demand.c> <shards_internal.h>" >&2
     exit 2
 fi
 
@@ -32,8 +34,8 @@ strip() {
     sed -e 's|//.*||' -e 's|"[^"]*"||g'
 }
 
-bind_src=$(strip "$bind_c")
-shard_src=$(strip "$shard_c")
+bind_src=$(strip "$bind_c"; strip "$bind_h")
+shard_src=$(strip "$shard_c"; strip "$shard_h")
 
 # 1. The two causes exist as distinct tags.
 for tag in BIND_UP_END_GOAWAY BIND_UP_END_REDIRECT; do

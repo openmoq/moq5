@@ -19,7 +19,7 @@
  * binding drains intents and retries. Pool exhaustion is
  * MOQR_ERR_CAPACITY (admission refusal, wired to the reject vocabulary).
  *
- * -- Spec anchors (verified against local Specs/, 2026-07-02) --
+ * -- Spec anchors --
  *
  *  - Subscription filters are Location predicates
  *    (draft-ietf-moq-transport-18 :2040-2100): Largest Object (0x2)

@@ -43,15 +43,13 @@ done < <(cd "$ROOT" && find docs -type f -name '*.md' -print | sort)
 STABLE_EXAMPLES=()
 while IFS= read -r file; do
     STABLE_EXAMPLES+=( "$file" )
-done < <(cd "$ROOT" && find examples -path 'examples/_archive' -prune \
-    -o -path 'examples/picoquic' -prune \
+done < <(cd "$ROOT" && find examples -path 'examples/picoquic' -prune \
     -o -path 'examples/pico_wt' -prune \
     -o -type f \( -name '*.c' -o -name '*.h' \) -print | sort)
 
 while IFS= read -r file; do
     STABLE_DOCS+=( "$file" )
-done < <(cd "$ROOT" && find examples -path 'examples/_archive' -prune \
-    -o -path 'examples/picoquic' -prune \
+done < <(cd "$ROOT" && find examples -path 'examples/picoquic' -prune \
     -o -path 'examples/pico_wt' -prune \
     -o -type f \( -name '*.md' -o -name '*.txt' \) -print | sort)
 
