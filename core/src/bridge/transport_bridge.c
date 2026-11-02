@@ -13,6 +13,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef MOQ_BRIDGE_SCAN_COUNTERS
+#define MOQ_SCAN_TICK(x) ((x)++)
+#else
+#define MOQ_SCAN_TICK(x) ((void)0)
+#endif
+
 #ifdef MOQ_SESSION_SWEEP_TESTING
 uint64_t bridge_work_expiry_slots;
 uint64_t bridge_work_expiry_items;
@@ -433,6 +439,7 @@ bridge_stream_entry_t *bridge_alloc_stream(moq_transport_bridge_t *b)
 bridge_stream_entry_t *bridge_find_by_ref(
     moq_transport_bridge_t *b, moq_stream_ref_t ref)
 {
+    MOQ_SCAN_TICK(moq_bridge_map_lookups);
     for (uint32_t i = 0; i < b->max_streams; i++) {
         if (b->streams[i].active && b->streams[i].ref._v == ref._v)
             return &b->streams[i];
@@ -443,6 +450,7 @@ bridge_stream_entry_t *bridge_find_by_ref(
 const bridge_stream_entry_t *bridge_find_by_id_const(
     const moq_transport_bridge_t *b, uint64_t transport_id)
 {
+    MOQ_SCAN_TICK(moq_bridge_map_lookups);
     for (uint32_t i = 0; i < b->max_streams; i++) {
         if (b->streams[i].active && b->streams[i].transport_id == transport_id)
             return &b->streams[i];
@@ -453,6 +461,7 @@ const bridge_stream_entry_t *bridge_find_by_id_const(
 bridge_stream_entry_t *bridge_find_by_id(
     moq_transport_bridge_t *b, uint64_t transport_id)
 {
+    MOQ_SCAN_TICK(moq_bridge_map_lookups);
     for (uint32_t i = 0; i < b->max_streams; i++) {
         if (b->streams[i].active && b->streams[i].transport_id == transport_id)
             return &b->streams[i];
@@ -1940,6 +1949,12 @@ void moq_bridge_test_fail_retain_after(unsigned n)
     g_retain_fail_armed = true;
 }
 
+void moq_bridge_test_clear_retain_failure(void)
+{
+    g_retain_fail_after = 0;
+    g_retain_fail_armed = false;
+}
+
 #endif
 
 static bool bridge_enqueue_pending(moq_transport_bridge_t *b,
@@ -2907,13 +2922,11 @@ static bool bridge_candidate_unresolvable(moq_transport_bridge_t *b,
 /* Test-only operation counters for the conflict scan. Not present in any
  * default build: no symbol, no storage, nothing to export. */
 unsigned long long moq_bridge_scan_items;
-unsigned long long moq_bridge_scan_lookups;
+unsigned long long moq_bridge_scan_candidates;
+unsigned long long moq_bridge_map_lookups;
 /* Largest number of pending slots a single drained action has ever consumed.
  * The capacity guard's one-slot margin is only sound while this is 1. */
 uint32_t moq_bridge_max_retain_delta;
-#define MOQ_SCAN_TICK(x) ((x)++)
-#else
-#define MOQ_SCAN_TICK(x) ((void)0)
 #endif
 
 static bool bridge_domain_blocked(moq_transport_bridge_t *b,
@@ -2924,7 +2937,7 @@ static bool bridge_domain_blocked(moq_transport_bridge_t *b,
     uint64_t csid = sid;
     bool chave = have_sid;
 
-    MOQ_SCAN_TICK(moq_bridge_scan_lookups);
+    MOQ_SCAN_TICK(moq_bridge_scan_candidates);
     /* Fail closed on a shape no dispatcher produces. */
     if (bridge_candidate_unresolvable(b, ref, have_sid))
         return true;
@@ -2932,9 +2945,7 @@ static bool bridge_domain_blocked(moq_transport_bridge_t *b,
     for (uint32_t i = 0; i < b->pending_count; i++) {
         const bridge_pending_item_t *p = &b->pending[i];
 
-        /* Counted, and deliberately NOT paired with a lookup tick: the whole
-         * point of normalising at enqueue is that no map lookup happens in
-         * here, and the counters are what prove it. */
+        /* Canonical identities need field comparisons, not map queries. */
         MOQ_SCAN_TICK(moq_bridge_scan_items);
 
         /* Connection-wide backlog and a pending transport close both order
@@ -2962,6 +2973,30 @@ static bool bridge_domain_blocked(moq_transport_bridge_t *b,
  * production canonicalisation boundary and the structural maximum applies --
  * an injected depth is a real depth.
  */
+/* Exercise FIFO retention independently of the mapped-data pump's reserved
+ * head. A valid SEND_DATA on a mapped stream transfers its owned action to
+ * this boundary, including cleanup if fault injection rejects the enqueue. */
+moq_result_t moq_bridge_test_retain_data_action(moq_transport_bridge_t *b,
+                                               moq_action_t *action)
+{
+    if (!b || !action || action->kind != MOQ_ACTION_SEND_DATA)
+        return MOQ_ERR_INVAL;
+    bridge_stream_entry_t *e = bridge_find_by_ref(b,
+                                                 action->u.send_data.stream_ref);
+    if (!e) return MOQ_ERR_INVAL;
+    bridge_pending_item_t p;
+    memset(&p, 0, sizeof(p));
+    p.kind = PENDING_HEADER_PAYLOAD;
+    p.stream_ref = action->u.send_data.stream_ref;
+    bridge_item_set_sid(&p, e->transport_id);
+    bridge_dstream_t *d = bridge_dstream_find(b, p.stream_ref);
+    if (d) p.meta = d->meta;
+    bridge_pending_take_action(&p, action);
+    if (!bridge_enqueue_pending(b, &p))
+        return bridge_retention_failed(b, &p);
+    return MOQ_OK;
+}
+
 bool moq_bridge_test_inject_pending_ex(moq_transport_bridge_t *b, int kind,
                                        uint64_t ref, uint64_t sid,
                                        bool have_sid)

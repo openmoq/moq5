@@ -56,103 +56,79 @@ int test_hol_drain_budget_is_a_real_backstop(void)
 #ifdef MOQ_BRIDGE_TEST_INJECT
 
 
-/* A retained item that OWNS a heap payload, carried through repeated
- * re-enqueues and then terminal cleanup, on a counting allocator. */
 /*
  * A failed retention releases the item's owned payload exactly once, on both
  * the initial-retain and retry-retain paths.
  *
- * The fixture keeps its own reference to the object buffer, so the buffer
- * stays valid for inspection and the discriminator is direct: the session
- * hands its reference to the polled action, so a correct cleanup returns the
- * count to the fixture's one reference, while omitting the cleanup leaves it
- * one too high.
+ * The fixture keeps one reference to the buffer and gives the action another.
+ * Cleanup must return the count to one while the fixture's reference keeps
+ * the buffer valid for inspection.
  */
 int test_hol_retention_releases_owned_payload_once(void)
 {
     int failures = 0;
     hol_acct_t acct;
     moq_alloc_t al = hol_acct_allocator(&acct);
-    hol_fix_t f;
-    moq_subgroup_handle_t a;
-    moq_rcbuf_t *held = NULL;
-    uint32_t rc_before, rc_after;
-    int phase;
-
-    /* phase 0: the FIRST retention of a freshly polled action fails.
-     * phase 1: the action is retained, then its RE-retention fails. */
-    for (phase = 0; phase < 2; phase++) {
-        memset(&f, 0, sizeof(f));
+    for (int phase = 0; phase < 2; phase++) {
+        hol_fix_t f;
+        moq_subgroup_handle_t sg;
+        moq_rcbuf_t *held = NULL;
+        moq_action_t action = {0};
+        moq_bridge_test_clear_retain_failure();
         g_server_alloc_override = &al;
         if (hol_init(&f) < 0) { g_server_alloc_override = NULL; return 1; }
         g_server_alloc_override = NULL;
         held_bridge_destroy(f.tp.server_bridge);
-        {
-            moq_transport_bridge_cfg_t bcfg;
-            moq_transport_bridge_cfg_init(&bcfg, &al);
-            HELD_REQUIRE(held_bridge_create(&bcfg, f.tp.server,
-                               &f.tp.server_ep.vtable, &f.tp.server_ep,
-                               &f.tp.server_bridge) == MOQ_OK);
-        }
-
-        /* open the stream first, so the retained item is the one that owns
-         * the object payload rather than the stream-opening action */
-        MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
-        MOQ_TEST_CHECK(hol_write(&f, a, 0, 32) == MOQ_OK);
+        moq_transport_bridge_cfg_t cfg;
+        moq_transport_bridge_cfg_init(&cfg, &al);
+        HELD_REQUIRE(held_bridge_create(&cfg, f.tp.server,
+            &f.tp.server_ep.vtable, &f.tp.server_ep, &f.tp.server_bridge) == MOQ_OK);
+        MOQ_TEST_CHECK(hol_open_sg(&f, 0, &sg) == MOQ_OK);
+        MOQ_TEST_CHECK(hol_write(&f, sg, 0, 32) == MOQ_OK);
         hol_service(&f, 4);
         MOQ_TEST_CHECK(hol_pending(&f) == 0);
-
-        held = NULL;
-        MOQ_TEST_CHECK(hol_write_keep(&f, a, 1, 96, &held) == MOQ_OK);
-        MOQ_TEST_CHECK(held != NULL);
-        f.tp.server_ep.block_write = true;
-
-        if (phase == 1) {
-            /* let it retain normally, so the failure below is a RE-retention */
-            hol_service(&f, 1);
-            MOQ_TEST_CHECK(hol_pending(&f) >= 1);
+        const uint8_t bytes[96] = {0};
+        moq_result_t rc = moq_rcbuf_create(&al, bytes, sizeof(bytes), &held);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        if (held) {
+            action.kind = MOQ_ACTION_SEND_DATA;
+            action.detail_size = sizeof(action.u.send_data);
+            action.u.send_data.stream_ref = moq_transport_bridge_find_ref(
+                f.tp.server_bridge, hol_nth_open(&f, 0));
+            action.u.send_data.payload = held;
+            moq_rcbuf_incref(held);    /* fixture ref plus the action's owned ref */
+            MOQ_TEST_CHECK(action.u.send_data.stream_ref._v != 0);
+            f.tp.server_ep.block_write = true;
+            if (phase == 1) {
+                /* Queue one owned action at the actual FIFO boundary. The
+                 * ordinary mapped-data pump uses a reserved head instead. */
+                MOQ_TEST_CHECK(moq_bridge_test_retain_data_action(
+                    f.tp.server_bridge, &action) == MOQ_OK);
+                MOQ_TEST_CHECK(hol_pending(&f) == 1);
+                MOQ_TEST_CHECK(action.u.send_data.payload == NULL);
+            }
+            uint32_t before = moq_rcbuf_refcount(held);
+            MOQ_TEST_CHECK(before == 2);
+            moq_bridge_test_fail_retain_after(0);
+            rc = phase == 0
+                ? moq_bridge_test_retain_data_action(f.tp.server_bridge, &action)
+                : held_bridge_service(f.tp.server_bridge, 0);
+            MOQ_TEST_CHECK(rc == MOQ_ERR_INTERNAL);
+            MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(f.tp.server_bridge));
+            MOQ_TEST_CHECK(f.tp.server_bridge->fatal_code == 0x5);
+            MOQ_TEST_CHECK(moq_rcbuf_refcount(held) == before - 1);
+            MOQ_TEST_CHECK(action.u.send_data.payload == NULL);
         }
-
-        rc_before = moq_rcbuf_refcount(held);
-        if (rc_before < 2) {
-            fprintf(stderr, "RCONCE[%d]: precondition refcount was %u; the "
-                    "action does not hold a reference to inspect\n",
-                    phase, rc_before);
-            failures++;
-        }
-
-        moq_bridge_test_fail_retain_after(0);
-        (void)held_bridge_service(f.tp.server_bridge, 0);
-        MOQ_TEST_CHECK(moq_transport_bridge_is_fatal(f.tp.server_bridge));
-
-        rc_after = moq_rcbuf_refcount(held);
-        if (rc_after != rc_before - 1) {
-            fprintf(stderr, "RCONCE[%d]: refcount went %u -> %u; a failed "
-                    "retention did not release the payload exactly once\n",
-                    phase, rc_before, rc_after);
-            failures++;
-        }
-
+        moq_bridge_test_clear_retain_failure();
+        moq_action_cleanup(&action);
         moq_rcbuf_decref(held);
-        held_bridge_destroy(f.tp.server_bridge);
-        f.tp.server_bridge = NULL;
-        /* Bridges first: each session outlives its bridge. */
-        held_bridge_destroy(f.tp.client_bridge);
-        f.tp.client_bridge = NULL;
-        moq_session_destroy(f.tp.client);
-        moq_session_destroy(f.tp.server);
-
-        if (acct.live_blocks != 0 || acct.live_bytes != 0 || acct.negative) {
-            fprintf(stderr, "RCONCE[%d]: live=%lld blocks %lld bytes "
-                    "negative=%d\n", phase, (long long)acct.live_blocks,
-                    (long long)acct.live_bytes, (int)acct.negative);
-            failures++;
-        }
-        memset(&acct, 0, sizeof(acct));
+        test_pair_destroy(&f.tp);
+        MOQ_TEST_CHECK(acct.live_blocks == 0);
+        MOQ_TEST_CHECK(acct.live_bytes == 0);
+        MOQ_TEST_CHECK(!acct.negative);
     }
     return failures;
 }
-
 
 /*
  * The first retention of a newly polled action follows the same policy. The
@@ -285,14 +261,20 @@ int test_hol_retention_failure_is_fatal_not_silent(void)
                            &f.tp.server_bridge) == MOQ_OK);
     }
 
-    /* several heap-owning items on one stream, then block it so they retain */
+    moq_bridge_test_clear_retain_failure();
+    /* Data stays in its reserved stream queue. Two blocked FIFO control
+     * items exercise the first-survivor/second-failure retry boundary. */
     MOQ_TEST_CHECK(hol_open_sg(&f, 0, &a) == MOQ_OK);
     for (i = 0; i < 4; i++)
         MOQ_TEST_CHECK(hol_write(&f, a, (uint64_t)i, 96) == MOQ_OK);
     f.tp.server_ep.block_write = true;
     hol_service(&f, 6);
-    MOQ_TEST_CHECK(hol_pending(&f) >= 2);
-    writes_before = f.tp.server_ep.write_calls;
+    f.tp.server_ep.block_stop = true;
+    MOQ_TEST_CHECK(moq_bridge_test_inject_pending(f.tp.server_bridge,
+        PENDING_STOP_SENDING, 0, 70000));
+    MOQ_TEST_CHECK(moq_bridge_test_inject_pending(f.tp.server_bridge,
+        PENDING_STOP_SENDING, 0, 70001));
+    MOQ_TEST_CHECK(hol_pending(&f) == 2);
 
     /* let the blocked head re-retain, then fail the next survivor */
     moq_bridge_test_fail_retain_after(1);
@@ -315,7 +297,9 @@ int test_hol_retention_failure_is_fatal_not_silent(void)
         failures++;
     }
 
-    /* and no further work is delivered once the invariant is broken */
+    /* No endpoint operation after the error, even when data becomes writable. */
+    writes_before = f.tp.server_ep.write_calls;
+    moq_bridge_test_clear_retain_failure();
     f.tp.server_ep.block_write = false;
     (void)held_bridge_service(f.tp.server_bridge, 0);
     if (f.tp.server_ep.write_calls != writes_before) {

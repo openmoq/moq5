@@ -11,6 +11,18 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef MOQ_BRIDGE_TEST_INJECT
+void moq_bridge_test_clear_retain_failure(void);
+moq_result_t moq_bridge_test_retain_data_action(moq_transport_bridge_t *b,
+                                               moq_action_t *action);
+#endif
+
+#ifdef MOQ_BRIDGE_SCAN_COUNTERS
+extern unsigned long long moq_bridge_scan_items;
+extern unsigned long long moq_bridge_scan_candidates;
+extern unsigned long long moq_bridge_map_lookups;
+#endif
+
 /* -- Defaults ------------------------------------------------------- */
 
 #define BRIDGE_DEFAULT_MAX_STREAMS    128

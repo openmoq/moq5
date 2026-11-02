@@ -265,9 +265,6 @@ extern bool moq_bridge_test_inject_pending(moq_transport_bridge_t *b, int kind,
 
 #endif
 
-extern unsigned long long moq_bridge_scan_items;
-
-extern unsigned long long moq_bridge_scan_lookups;
 
 #endif
 
@@ -459,14 +456,6 @@ moq_result_t hol_open_sg(hol_fix_t *f, uint64_t group,
 
 moq_result_t hol_write(hol_fix_t *f, moq_subgroup_handle_t sg,
                        uint64_t obj, size_t len);
-
-#ifdef MOQ_BRIDGE_TEST_INJECT
-
-moq_result_t hol_write_keep(hol_fix_t *f, moq_subgroup_handle_t sg,
-                            uint64_t obj, size_t len,
-                            moq_rcbuf_t **out);
-
-#endif
 
 void hol_service(hol_fix_t *f, int passes);
 

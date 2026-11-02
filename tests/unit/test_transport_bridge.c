@@ -119,8 +119,10 @@ int main(void)
     failures += test_hol_mixed_identity_canonicalises();
     failures += test_hol_depth_and_structural_bound();
 #endif
-#ifdef MOQ_BRIDGE_SCAN_COUNTERS
+
+#if defined(MOQ_BRIDGE_SCAN_COUNTERS) && defined(MOQ_BRIDGE_TEST_INJECT)
     failures += test_hol_scan_operation_counts();
+    failures += test_hol_full_fifo_mapped_progress();
 #endif
 
     /* terminal facts */

@@ -163,9 +163,11 @@ int test_hol_refless_domains_are_distinct(void);
 
 int test_hol_conservation_through_retry(void);
 
-#ifdef MOQ_BRIDGE_SCAN_COUNTERS
+
+#if defined(MOQ_BRIDGE_SCAN_COUNTERS) && defined(MOQ_BRIDGE_TEST_INJECT)
 
 int test_hol_scan_operation_counts(void);
+int test_hol_full_fifo_mapped_progress(void);
 
 #endif
 

@@ -140,31 +140,6 @@ moq_result_t hol_write(hol_fix_t *f, moq_subgroup_handle_t sg,
     return rc;
 }
 
-#ifdef MOQ_BRIDGE_TEST_INJECT
-
-
-/* hol_write that keeps the caller's reference, so a fixture can watch the
- * buffer's refcount across a failure and still hold it alive afterwards. The
- * caller decrefs. */
-moq_result_t hol_write_keep(hol_fix_t *f, moq_subgroup_handle_t sg,
-                            uint64_t obj, size_t len,
-                            moq_rcbuf_t **out)
-{
-    uint8_t buf[128];
-    moq_rcbuf_t *p = NULL;
-    if (len > sizeof(buf)) return MOQ_ERR_INVAL;
-    memset(buf, 'Z', len);
-    if (moq_rcbuf_create(moq_alloc_default(), buf, len, &p) != MOQ_OK)
-        return MOQ_ERR_NOMEM;
-    moq_result_t rc = moq_session_write_object(f->tp.server, sg, obj, p, 0);
-    if (rc != MOQ_OK) { moq_rcbuf_decref(p); return rc; }
-    *out = p;
-    return MOQ_OK;
-}
-
-#endif
-
-
 /* Service the publisher bridge only. The peer is not needed: the block is on
  * the fake endpoint, so nothing here depends on inbound traffic. */
 void hol_service(hol_fix_t *f, int passes)
@@ -1167,141 +1142,133 @@ int test_hol_conservation_through_retry(void)
     return failures;
 }
 
-#ifdef MOQ_BRIDGE_SCAN_COUNTERS
-
+#if defined(MOQ_BRIDGE_SCAN_COUNTERS) && defined(MOQ_BRIDGE_TEST_INJECT)
 
 int test_hol_scan_operation_counts(void)
 {
     int failures = 0;
     hol_fix_t f;
-    moq_subgroup_handle_t sg[40];
+    moq_subgroup_handle_t sg;
     enum { SCAN_CANDIDATES = 8 };
-    unsigned long long i0, l0, i1, l1, iN, lN;
-    uint32_t depth_n, want_n;
-    int n;
-
-    /* depth 0: no pending work at all */
     if (hol_init(&f) < 0) return 1;
-    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &sg[0]) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &sg) == MOQ_OK);
+    MOQ_TEST_CHECK(hol_write(&f, sg, 0, 32) == MOQ_OK);
     hol_service(&f, 4);
-    moq_bridge_scan_items = 0; moq_bridge_scan_lookups = 0;
-    for (uint64_t k = 1; k <= SCAN_CANDIDATES; k++)
-        (void)hol_write(&f, sg[0], k, 32);
-    hol_service(&f, 4);
-    i0 = moq_bridge_scan_items; l0 = moq_bridge_scan_lookups;
-    test_pair_destroy(&f.tp);
+    const uint64_t sid = hol_nth_open(&f, 0);
+    const uint64_t ref = moq_bridge_test_ref_for_id(f.tp.server_bridge, sid);
+    MOQ_TEST_CHECK(sid != UINT64_MAX && ref != 0);
+    const uint32_t depths[] = { 0, 1, BRIDGE_DEFAULT_MAX_PENDING - 1,
+                                BRIDGE_DEFAULT_MAX_PENDING };
 
-    /* depth 1 */
-    if (hol_init(&f) < 0) return 1;
-    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &sg[0]) == MOQ_OK);
-    MOQ_TEST_CHECK(hol_write(&f, sg[0], 0, 32) == MOQ_OK);
-    hol_service(&f, 4);
-    f.tp.server_ep.block_open_uni = true;
-    MOQ_TEST_CHECK(hol_open_sg(&f, 1, &sg[1]) == MOQ_OK);
-    (void)hol_write(&f, sg[1], 0, 32);
-    hol_service(&f, 4);
-    moq_bridge_scan_items = 0; moq_bridge_scan_lookups = 0;
-    for (uint64_t k = 1; k <= SCAN_CANDIDATES; k++)
-        (void)hol_write(&f, sg[0], k, 32);
-    hol_service(&f, 4);
-    i1 = moq_bridge_scan_items; l1 = moq_bridge_scan_lookups;
-    test_pair_destroy(&f.tp);
-
-    /* The deepest depth the scan can actually execute at is max_pending - 1:
-     * at max_pending the capacity guard stops the drain before a candidate is
-     * polled, so that depth measures the gate, not the scan. Built through the
-     * REAL enqueue/canonicalisation boundary -- the session cannot produce
-     * this depth, because it serialises parked openers. */
-    if (hol_init(&f) < 0) return 1;
-    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &sg[0]) == MOQ_OK);
-    MOQ_TEST_CHECK(hol_write(&f, sg[0], 0, 32) == MOQ_OK);
-    hol_service(&f, 4);
-    /* the retry must not be able to consume them, or the depth is gone by
-     * the time the candidate actions are dispatched */
-    f.tp.server_ep.block_stop = true;
-    want_n = f.tp.server_bridge->max_pending - 1u;
-#ifdef MOQ_BRIDGE_TEST_INJECT
-    for (n = 0; n < (int)want_n; n++)
-        if (!moq_bridge_test_inject_pending(f.tp.server_bridge,
-                PENDING_STOP_SENDING, 0, 30000 + (uint64_t)n))
-            break;
-#endif
-    depth_n = hol_pending(&f);
-    moq_bridge_scan_items = 0; moq_bridge_scan_lookups = 0;
-    for (uint64_t k = 1; k <= SCAN_CANDIDATES; k++)
-        (void)hol_write(&f, sg[0], k, 32);
-    hol_service(&f, 4);
-    iN = moq_bridge_scan_items; lN = moq_bridge_scan_lookups;
-
-    printf("SCAN depth=0  items=%llu lookups=%llu\n", i0, l0);
-    printf("SCAN depth=1  items=%llu lookups=%llu\n", i1, l1);
-    printf("SCAN depth=%u items=%llu lookups=%llu (deepest executable)\n",
-           depth_n, iN, lN);
-
-    /* the measured depth must be the one asked for, or the row is vacuous */
-    if (depth_n != want_n) {
-        fprintf(stderr, "SCAN: asked for depth %u, got %u; the complexity row "
-                "measures nothing\n", want_n, depth_n);
-        failures++;
+    /* Measure the classifier itself. A service pass may classify the same
+     * candidate again while retrying or filling an emptied mapped head. */
+    for (size_t row = 0; row < sizeof(depths) / sizeof(depths[0]); ++row) {
+        const uint32_t depth = depths[row];
+        while (hol_pending(&f) < depth) {
+            uint64_t other = 30000 + hol_pending(&f);
+            if (!moq_bridge_test_inject_pending(f.tp.server_bridge,
+                    PENDING_STOP_SENDING, 0, other)) break;
+        }
+        MOQ_TEST_CHECK(hol_pending(&f) == depth);
+        moq_bridge_scan_items = 0;
+        moq_bridge_scan_candidates = 0;
+        moq_bridge_map_lookups = 0;
+        for (unsigned n = 0; n < SCAN_CANDIDATES; ++n)
+            MOQ_TEST_CHECK(!moq_bridge_test_domain_blocked(
+                f.tp.server_bridge, ref, sid, true));
+        MOQ_TEST_CHECK(moq_bridge_scan_candidates == SCAN_CANDIDATES);
+        MOQ_TEST_CHECK(moq_bridge_scan_items ==
+                       (unsigned long long)depth * SCAN_CANDIDATES);
+        MOQ_TEST_CHECK(moq_bridge_map_lookups == 0);
+        MOQ_TEST_CHECK(hol_pending(&f) == depth);
+        printf("SCAN depth=%u candidates=%llu items=%llu map_lookups=%llu\n",
+               depth, moq_bridge_scan_candidates, moq_bridge_scan_items,
+               moq_bridge_map_lookups);
     }
-    /* every candidate must actually have executed: one map lookup each, and
-     * that count must not grow with pending depth */
-    if (lN != SCAN_CANDIDATES || lN != l0 || lN != l1) {
-        fprintf(stderr, "SCAN: lookups %llu at depth %u (expected one per "
-                "candidate, %d) vs %llu at depth 0 and %llu at depth 1\n",
-                lN, depth_n, (int)SCAN_CANDIDATES, l0, l1);
-        failures++;
-    }
-    /* Exactly one comparison per pending item per classified candidate, and
-     * nothing more: this fixture classifies SCAN_CANDIDATES of them at this
-     * depth, so the total is depth * SCAN_CANDIDATES with no quadratic term
-     * and no per-item map lookup hidden inside the loop. */
-    if (iN != (unsigned long long)depth_n * SCAN_CANDIDATES) {
-        fprintf(stderr, "SCAN: items %llu at depth %u; one comparison per "
-                "pending item per candidate would be %llu\n", iN, depth_n,
-                (unsigned long long)depth_n * SCAN_CANDIDATES);
-        failures++;
-    }
-    test_pair_destroy(&f.tp);
-
-    /* The capacity gate, not a complexity measurement: at exactly max_pending
-     * the drain stops before polling, so no candidate is classified at all. */
-    if (hol_init(&f) < 0) return 1;
-    MOQ_TEST_CHECK(hol_open_sg(&f, 0, &sg[0]) == MOQ_OK);
-    MOQ_TEST_CHECK(hol_write(&f, sg[0], 0, 32) == MOQ_OK);
-    hol_service(&f, 4);
-    f.tp.server_ep.block_stop = true;
-    want_n = f.tp.server_bridge->max_pending;
-#ifdef MOQ_BRIDGE_TEST_INJECT
-    for (n = 0; n < (int)want_n; n++)
-        if (!moq_bridge_test_inject_pending(f.tp.server_bridge,
-                PENDING_STOP_SENDING, 0, 30000 + (uint64_t)n))
-            break;
-#endif
-    depth_n = hol_pending(&f);
-    moq_bridge_scan_items = 0; moq_bridge_scan_lookups = 0;
-    for (uint64_t k = 1; k <= SCAN_CANDIDATES; k++)
-        (void)hol_write(&f, sg[0], k, 32);
-    hol_service(&f, 4);
-    printf("CAPGATE depth=%u items=%llu lookups=%llu (no candidate polled)\n",
-           depth_n, moq_bridge_scan_items, moq_bridge_scan_lookups);
-    if (depth_n != want_n) {
-        fprintf(stderr, "CAPGATE: asked for depth %u, got %u\n",
-                want_n, depth_n);
-        failures++;
-    }
-    if (moq_bridge_scan_items != 0 || moq_bridge_scan_lookups != 0) {
-        fprintf(stderr, "CAPGATE: %llu item(s) and %llu lookup(s) at "
-                "saturation; the drain polled past the capacity guard\n",
-                moq_bridge_scan_items, moq_bridge_scan_lookups);
-        failures++;
-    }
-    MOQ_TEST_CHECK(hol_pending(&f) <= f.tp.server_bridge->max_pending);
     test_pair_destroy(&f.tp);
     return failures;
 }
 
-#endif /* MOQ_BRIDGE_SCAN_COUNTERS */
+/* Each object has its own marker: a duplicate cannot hide a missing object. */
+static int hol_payload_set(const hol_fix_t *f, unsigned expected)
+{
+    unsigned counts[8] = {0};
+    int failures = 0;
+    for (size_t i = 0; i < f->tp.server_ep.count; ++i) {
+        const fake_op_t *op = &f->tp.server_ep.ops[i];
+        if (op->kind != FAKE_OP_WRITE || op->data_len != 32 ||
+            op->data[0] < 0xa0 || op->data[0] >= 0xa8) continue;
+        const unsigned index = op->data[0] - 0xa0;
+        uint8_t payload[32];
+        memset(payload, (int)(0xa0 + index), sizeof(payload));
+        MOQ_TEST_CHECK(memcmp(op->data, payload, sizeof(payload)) == 0);
+        ++counts[index];
+    }
+    for (unsigned i = 0; i < 8; ++i)
+        MOQ_TEST_CHECK(counts[i] == expected);
+    MOQ_TEST_CHECK(!f->tp.server_ep.overflowed && !f->tp.server_ep.truncated);
+    return failures;
+}
+
+int test_hol_full_fifo_mapped_progress(void)
+{
+    int failures = 0;
+    hol_fix_t f;
+    /* At saturation, an existing mapped stream reserves one queue head;
+     * an unmapped stream waits for FIFO capacity before opening. */
+    for (unsigned mapped = 0; mapped < 2; ++mapped) {
+        moq_subgroup_handle_t sg, target;
+        if (hol_init(&f) < 0) return failures + 1;
+        MOQ_TEST_CHECK(hol_open_sg(&f, 0, &sg) == MOQ_OK);
+        MOQ_TEST_CHECK(hol_write(&f, sg, 0, 32) == MOQ_OK);
+        hol_service(&f, 4);
+        MOQ_TEST_CHECK(hol_pending(&f) == 0);
+        MOQ_TEST_CHECK(f.tp.server_bridge->dq_items == 0);
+        const uint64_t opens = f.tp.server_ep.open_uni_calls;
+        fake_endpoint_clear_ops(&f.tp.server_ep);
+        f.tp.server_ep.block_stop = true;
+        f.tp.server_ep.block_write = true;
+        const uint32_t capacity = f.tp.server_bridge->max_pending;
+        for (uint32_t n = 0; n < capacity; ++n)
+            MOQ_TEST_CHECK(moq_bridge_test_inject_pending(f.tp.server_bridge,
+                PENDING_STOP_SENDING, 0, 30000 + n));
+        target = sg;
+        if (!mapped) MOQ_TEST_CHECK(hol_open_sg(&f, 1, &target) == MOQ_OK);
+        for (unsigned n = 0; n < 8; ++n) {
+            uint8_t bytes[32];
+            moq_rcbuf_t *payload = NULL;
+            memset(bytes, (int)(0xa0 + n), sizeof(bytes));
+            moq_result_t rc = moq_rcbuf_create(moq_alloc_default(), bytes,
+                                               sizeof(bytes), &payload);
+            MOQ_TEST_CHECK(rc == MOQ_OK);
+            if (rc != MOQ_OK) continue;
+            MOQ_TEST_CHECK(moq_session_write_object(f.tp.server, target,
+                n + mapped, payload, 0) == MOQ_OK);
+            moq_rcbuf_decref(payload);
+        }
+        hol_service(&f, 4);
+        MOQ_TEST_CHECK(hol_pending(&f) == capacity);
+        MOQ_TEST_CHECK(f.tp.server_bridge->dq_items == mapped);
+        MOQ_TEST_CHECK(f.tp.server_ep.open_uni_calls == opens);
+        failures += hol_payload_set(&f, 0);
+        f.tp.server_ep.block_write = false;
+        hol_service(&f, 16);
+        MOQ_TEST_CHECK(hol_pending(&f) == capacity);
+        MOQ_TEST_CHECK(f.tp.server_ep.open_uni_calls == opens);
+        failures += hol_payload_set(&f, mapped);
+        f.tp.server_ep.block_stop = false;
+        hol_service(&f, 16);
+        MOQ_TEST_CHECK(hol_pending(&f) == 0);
+        MOQ_TEST_CHECK(f.tp.server_bridge->dq_items == 0);
+        MOQ_TEST_CHECK(f.tp.server_ep.open_uni_calls == opens + !mapped);
+        MOQ_TEST_CHECK(!f.tp.server_bridge->fatal);
+        failures += hol_payload_set(&f, 1);
+        test_pair_destroy(&f.tp);
+    }
+    return failures;
+}
+
+#endif /* MOQ_BRIDGE_SCAN_COUNTERS && MOQ_BRIDGE_TEST_INJECT */
 
 #ifdef MOQ_BRIDGE_TEST_INJECT
 
@@ -1363,6 +1330,7 @@ static const dom_row_t k_dom_table[] = {
 int test_hol_action_domain_table(void)
 {
     int failures = 0;
+    moq_bridge_test_clear_retain_failure();
     size_t n = sizeof(k_dom_table) / sizeof(k_dom_table[0]);
 
     /* PENDING_COPIED_DATAGRAM must have no production enqueue site. */

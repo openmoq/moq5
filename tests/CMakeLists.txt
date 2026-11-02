@@ -380,6 +380,37 @@ target_include_directories(test_transport_bridge PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME transport_bridge COMMAND test_transport_bridge)
 
+# The same bridge contracts with private fault injection and work counters.
+# This archive is never installed and does not change either existing core.
+get_target_property(_bridge_probe_core_sources moq-core-test-internals SOURCES)
+get_target_property(_bridge_probe_core_dir moq-core-test-internals SOURCE_DIR)
+set(_bridge_probe_sources)
+foreach(source IN LISTS _bridge_probe_core_sources)
+    if(IS_ABSOLUTE "${source}")
+        list(APPEND _bridge_probe_sources "${source}")
+    else()
+        list(APPEND _bridge_probe_sources "${_bridge_probe_core_dir}/${source}")
+    endif()
+endforeach()
+add_library(moq-core-bridge-test-internals STATIC ${_bridge_probe_sources})
+target_include_directories(moq-core-bridge-test-internals PUBLIC
+    "${PROJECT_SOURCE_DIR}/core/include")
+target_compile_features(moq-core-bridge-test-internals PUBLIC c_std_11)
+target_compile_definitions(moq-core-bridge-test-internals PRIVATE
+    MOQ_PUB_TESTING MOQ_SESSION_SWEEP_TESTING
+    MOQ_BRIDGE_TEST_INJECT MOQ_BRIDGE_SCAN_COUNTERS)
+get_target_property(_bridge_test_sources test_transport_bridge SOURCES)
+add_executable(test_transport_bridge_probes ${_bridge_test_sources})
+target_compile_definitions(test_transport_bridge_probes PRIVATE
+    MOQ_TEST_SHARED_FIXTURES=1 MOQ_SESSION_SWEEP_TESTING
+    MOQ_BRIDGE_TEST_INJECT MOQ_BRIDGE_SCAN_COUNTERS)
+target_include_directories(test_transport_bridge_probes PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/unit")
+target_link_libraries(test_transport_bridge_probes PRIVATE moq-core-bridge-test-internals)
+add_test(NAME transport_bridge_probes COMMAND test_transport_bridge_probes)
+set_tests_properties(transport_bridge_probes PROPERTIES
+    TIMEOUT 90 LABELS "unit;bridge")
+
 add_executable(test_scheduling unit/test_scheduling.c)
 target_link_libraries(test_scheduling PRIVATE moq-core)
 target_include_directories(test_scheduling PRIVATE
