@@ -79,5 +79,9 @@ if(MOQ_PYTHON_BUILD_TESTS)
     add_test(NAME python_foundation COMMAND Python3::Interpreter -I -B -W error
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tests.py"
         "${CMAKE_CURRENT_BINARY_DIR}/test-package/$<CONFIG>")
-    set_tests_properties(python_foundation PROPERTIES TIMEOUT 30)
+    # The suite's children carry their own watchdogs, the longest 180 s (the
+    # driver run in test_sender.py). This bound leaves room for that deadline
+    # plus the suite's own running time, so one hung child is reported by its
+    # own watchdog; it remains the final limit on the whole suite.
+    set_tests_properties(python_foundation PROPERTIES TIMEOUT 300)
 endif()
