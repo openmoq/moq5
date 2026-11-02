@@ -20,3 +20,7 @@ __attribute__((visibility("hidden"), common)) unsigned long ___asan_globals_regi
 #ifdef PUBLIC_SUPPORT
 PUBLIC __attribute__((common)) unsigned long ___asan_globals_registered;
 #endif
+
+#if defined(ALT_ENTRY) && defined(__APPLE__)
+__asm__(".alt_entry _moq_cmaf_packager_create");
+#endif

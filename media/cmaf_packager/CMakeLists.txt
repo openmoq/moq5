@@ -80,6 +80,16 @@ if(MOQ_BUILD_TESTS)
             -DCHECK_DIR=${CMAKE_CURRENT_BINARY_DIR}/symbol-fixtures
             -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_symbols_oracle.cmake)
+    elseif(APPLE)
+        add_test(NAME cmaf_packager_export_oracle COMMAND ${CMAKE_COMMAND}
+            -DCC=${CMAKE_C_COMPILER} -DNM=${CMAKE_NM} -DAR=${CMAKE_AR}
+            -DCHECK_DIR=${CMAKE_CURRENT_BINARY_DIR}/symbol-fixtures
+            -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_symbols_macho_oracle.cmake)
+    endif()
+    if(TEST cmaf_packager_export_oracle)
+        set_tests_properties(cmaf_packager_export_oracle PROPERTIES
+            TIMEOUT 90 LABELS "media;packager")
     endif()
     include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
     set(packager_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
