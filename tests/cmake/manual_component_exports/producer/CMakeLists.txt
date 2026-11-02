@@ -42,6 +42,11 @@ if(MOQ_MODE STREQUAL "pico-wt")
     set(MOQ_BUILD_ADAPTER_PICO_WT ON CACHE BOOL "Real WT adapter" FORCE)
     set(MOQ_BUILD_PICO_WT_MANAGED ON CACHE BOOL "Real WT managed facade" FORCE)
 endif()
+# These rows qualify the package, which an embedded LibMoQ leaves OFF by
+# default; the embedding row passes its own choice through instead.
+if(NOT MOQ_MODE STREQUAL "embedding")
+    set(MOQ_BUILD_PACKAGE_EXPORTS ON CACHE BOOL "Qualify native packages" FORCE)
+endif()
 add_subdirectory("${MOQ_SOURCE}" libmoq)
 set(components "")
 set(targets moq::core moq::msf)
