@@ -1,0 +1,304 @@
+Serialize loading, unloading and resetting the crypto providers
+
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
+0010.
+
+picoquic_create() loads the crypto providers on first use through
+picoquic_tls_api_init(), which tests tls_api_is_init without synchronization,
+then clears the provider tables (picoquic_tls_api_zero) and registers each
+provider into them. Two contexts created at the same time on different threads
+both pass that test: one thread clears the cipher-suite and key-exchange tables
+and the provider function pointers while the other is registering into them or
+already reading them. ThreadSanitizer reports those pairs between
+picoquic_tls_api_zero(), picoquic_register_ciphersuite(),
+picoquic_register_key_exchange_algorithm() and picoquic_create_ptls_context(),
+and a context can be left without a cipher suite or with a NULL crypto random
+provider. picoquic_init_openssl() has the same shape: it sets openssl_is_init
+before the default OpenSSL provider is loaded.
+
+One statically initialized lock (a pthread mutex, or an SRW lock on Windows)
+now makes picoquic_tls_api_init(), picoquic_tls_api_unload() and
+picoquic_tls_api_reset() each atomic, so concurrent first use loads the
+providers once and every context sees them complete; the OpenSSL provider load
+runs inside it. Provider selection, the registered tables and every API are
+unchanged. The lock does not make an unload or a reset safe while a context
+exists or is being created: those still require that no other picoquic call is
+in progress.
+
+Upstream: the 2026-11-02 release (v2026.11.02.b9893f2) still loads the
+providers without synchronization.
+
+Test: tls_api_concurrent_init (tls_api_test.c) unloads the providers and
+creates contexts on eight threads released together; each must create its
+context and see exactly the tables a serial initialization produces. After a
+reset that selects other providers (no OpenSSL), made while no context exists,
+contexts created concurrently must see that selection rather than a reload.
+The test leaves the default providers loaded. Without the lock it fails, and
+under ThreadSanitizer it reports the races; with the lock it passes and
+ThreadSanitizer reports none.
+
+diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
+index e17d6bb..c87a8ee 100644
+--- a/UnitTest1/unittest1.cpp
++++ b/UnitTest1/unittest1.cpp
+@@ -1294,6 +1294,13 @@ namespace UnitTest1
+             Assert::AreEqual(ret, 0);
+         }
+ 
++        TEST_METHOD(tls_api_concurrent_init)
++        {
++            int ret = tls_api_concurrent_init_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
+         TEST_METHOD(tls_api_remove_ticket)
+         {
+             int ret = tls_api_remove_ticket_test();
+diff --git a/picoquic/tls_api.c b/picoquic/tls_api.c
+index 754a5c2..2fae2b2 100644
+--- a/picoquic/tls_api.c
++++ b/picoquic/tls_api.c
+@@ -178,6 +178,23 @@ void picoquic_ptls_minicrypto_load(int unload);
+ static uint64_t tls_api_init_flags = 0;
+ static int tls_api_is_init = 0;
+ 
++/* Loading, unloading and resetting the providers rewrite the tables above and
++ * the provider function pointers that every context reads. One lock makes each
++ * of those transitions atomic, so contexts created concurrently on different
++ * threads load the providers once and each sees them complete. It does not make
++ * an unload or a reset safe while a context exists or is being created: those
++ * still require that no other picoquic call is in progress. */
++#ifdef _WINDOWS
++static SRWLOCK tls_api_lock = SRWLOCK_INIT;
++#define TLS_API_LOCK() AcquireSRWLockExclusive(&tls_api_lock)
++#define TLS_API_UNLOCK() ReleaseSRWLockExclusive(&tls_api_lock)
++#else
++#include <pthread.h>
++static pthread_mutex_t tls_api_lock = PTHREAD_MUTEX_INITIALIZER;
++#define TLS_API_LOCK() (void)pthread_mutex_lock(&tls_api_lock)
++#define TLS_API_UNLOCK() (void)pthread_mutex_unlock(&tls_api_lock)
++#endif
++
+ /* Initialization of providers. The latest registration wins.
+ * This implies an initialization order from least desirable
+ * to most desirable.
+@@ -266,26 +283,31 @@ void picoquic_tls_api_log_versions(picoquic_cnx_t * cnx)
+ 
+ void picoquic_tls_api_init(void)
+ {
++    TLS_API_LOCK();
+     if (!tls_api_is_init) {
+         picoquic_tls_api_zero();
+         picoquic_tls_api_init_providers(0);
+         tls_api_is_init = 1;
+-        
++
+         picoquic_sort_key_exchange_algorithms(picoquic_key_exchanges_default_order, nb_picoquic_key_exchanges_default_order);
+     }
++    TLS_API_UNLOCK();
+ }
+ 
+ void picoquic_tls_api_unload(void)
+ {
++    TLS_API_LOCK();
+     if (tls_api_is_init) {
+         picoquic_tls_api_init_providers(1);
+         picoquic_tls_api_zero();
+         tls_api_is_init = 0;
+     }
++    TLS_API_UNLOCK();
+ }
+ 
+ void picoquic_tls_api_reset(uint64_t init_flags)
+ {
++    TLS_API_LOCK();
+     if (tls_api_is_init) {
+         tls_api_is_init = 0;
+         picoquic_tls_api_init_providers(2);
+@@ -294,6 +316,7 @@ void picoquic_tls_api_reset(uint64_t init_flags)
+     tls_api_init_flags = init_flags;
+     picoquic_tls_api_init_providers(0);
+     tls_api_is_init = 1;
++    TLS_API_UNLOCK();
+ }
+ /* Registration of ciphersuites.
+  * This API is called by crypto providers to register available cipher suites.
+diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
+index 2ba7a0b..93e94f2 100644
+--- a/picoquic_t/picoquic_t.c
++++ b/picoquic_t/picoquic_t.c
+@@ -304,6 +304,7 @@ static const picoquic_test_def_t test_table[] = {
+     { "tls_x25519", tls_x25519_test },
+     { "tls_x25519mlkem", tls_x25519mlkem_test },
+     { "tls_api_dispose_certificate_verifier", tls_api_dispose_certificate_verifier_test },
++    { "tls_api_concurrent_init", tls_api_concurrent_init_test },
+     { "tls_api_remove_ticket", tls_api_remove_ticket_test },
+     { "tls_api_null_arg_checks", tls_api_null_arg_checks_test },
+     { "tls_api_server_decrypt_short_token", tls_api_server_decrypt_short_token_test },
+diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
+index c97f105..d252294 100644
+--- a/picoquictest/picoquictest.h
++++ b/picoquictest/picoquictest.h
+@@ -100,6 +100,7 @@ int tls_api_alpn_test(void);
+ int tls_x25519_test(void);
+ int tls_x25519mlkem_test(void);
+ int tls_api_dispose_certificate_verifier_test(void);
++int tls_api_concurrent_init_test(void);
+ int tls_api_remove_ticket_test(void);
+ int tls_api_null_arg_checks_test(void);
+ int tls_api_server_decrypt_short_token_test(void);
+diff --git a/picoquictest/tls_api_test.c b/picoquictest/tls_api_test.c
+index f7524fd..338ec90 100644
+--- a/picoquictest/tls_api_test.c
++++ b/picoquictest/tls_api_test.c
+@@ -32,6 +32,7 @@
+ #include <stddef.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <stdatomic.h>
+ #include "picoquic_binlog.h"
+ #include "csv.h"
+ #include "qlog.h"
+@@ -17050,4 +17051,139 @@ int tls_api_verify_retry_protection_short_test(void)
+     }
+ 
+     return ret;
+-}
+\ No newline at end of file
++}
++
++/* Concurrent first use of the crypto providers.
++ *
++ * Contexts created on several threads at once all run the provider
++ * initialization. Each must see the providers completely loaded: the same
++ * tables a serial initialization produces. A reset that selects other
++ * providers, made while no context exists, must still hold for contexts
++ * created concurrently afterwards; their creation does not reload. */
++
++#define TLS_API_CONCURRENT_THREADS 8
++
++typedef struct st_tls_api_providers_t {
++    struct st_picoquic_cipher_suites_t cipher_suites[PICOQUIC_CIPHER_SUITES_NB_MAX + 1];
++    ptls_key_exchange_algorithm_t* key_exchanges[PICOQUIC_KEY_EXCHANGES_NB_MAX + 1];
++    picoquic_crypto_random_provider_t random_provider;
++} tls_api_providers_t;
++
++static void tls_api_providers_read(tls_api_providers_t* p)
++{
++    memcpy(p->cipher_suites, picoquic_cipher_suites, sizeof(p->cipher_suites));
++    memcpy(p->key_exchanges, (void*)picoquic_key_exchanges, sizeof(p->key_exchanges));
++    p->random_provider = picoquic_crypto_random_provider_fn;
++}
++
++static int tls_api_providers_equal(const tls_api_providers_t* a, const tls_api_providers_t* b)
++{
++    return memcmp(a->cipher_suites, b->cipher_suites, sizeof(a->cipher_suites)) == 0 &&
++        memcmp(a->key_exchanges, b->key_exchanges, sizeof(a->key_exchanges)) == 0 &&
++        a->random_provider == b->random_provider;
++}
++
++typedef struct st_tls_api_concurrent_ctx_t {
++    atomic_int* arrived;
++    int created;
++    tls_api_providers_t seen;
++} tls_api_concurrent_ctx_t;
++
++static picoquic_thread_return_t tls_api_concurrent_worker(void* vctx)
++{
++    tls_api_concurrent_ctx_t* ctx = (tls_api_concurrent_ctx_t*)vctx;
++    picoquic_quic_t* quic;
++
++    /* Start together, so the first contexts are created concurrently. */
++    atomic_fetch_add(ctx->arrived, 1);
++    while (atomic_load(ctx->arrived) < TLS_API_CONCURRENT_THREADS) {
++    }
++    quic = picoquic_create(1, NULL, NULL, NULL, PICOQUIC_TEST_ALPN, NULL, NULL,
++        NULL, NULL, NULL, picoquic_current_time(), NULL, NULL, NULL, 0);
++    if (quic != NULL) {
++        ctx->created = 1;
++        tls_api_providers_read(&ctx->seen);
++        picoquic_free(quic);
++    }
++    picoquic_thread_do_return;
++}
++
++static int tls_api_concurrent_round(const tls_api_providers_t* expected, const char* label)
++{
++    picoquic_thread_t threads[TLS_API_CONCURRENT_THREADS];
++    tls_api_concurrent_ctx_t ctx[TLS_API_CONCURRENT_THREADS];
++    atomic_int arrived;
++    int started = 0;
++    int ret = 0;
++
++    atomic_init(&arrived, 0);
++    memset(ctx, 0, sizeof(ctx));
++    for (int i = 0; i < TLS_API_CONCURRENT_THREADS; i++) {
++        ctx[i].arrived = &arrived;
++        if (picoquic_create_thread(&threads[i], tls_api_concurrent_worker, &ctx[i]) != 0) {
++            DBG_PRINTF("%s: cannot start worker %d", label, i);
++            ret = -1;
++            /* Release the workers already waiting for the full set. */
++            atomic_store(&arrived, TLS_API_CONCURRENT_THREADS);
++            break;
++        }
++        started++;
++    }
++    for (int i = 0; i < started; i++) {
++        /* A worker that cannot be joined may still write its context on this
++         * stack, so the run fails closed rather than returning. */
++        if (picoquic_wait_thread(threads[i]) != 0) {
++            fprintf(stderr, "tls_api_concurrent_init: cannot join a worker; aborting\n");
++            abort();
++        }
++#ifdef _WINDOWS
++        CloseHandle(threads[i]);
++#endif
++    }
++    for (int i = 0; ret == 0 && i < started; i++) {
++        if (!ctx[i].created) {
++            DBG_PRINTF("%s: worker %d could not create a context", label, i);
++            ret = -1;
++        }
++        else if (!tls_api_providers_equal(&ctx[i].seen, expected)) {
++            DBG_PRINTF("%s: worker %d saw incompletely loaded providers", label, i);
++            ret = -1;
++        }
++    }
++    return ret;
++}
++
++int tls_api_concurrent_init_test(void)
++{
++    tls_api_providers_t reference;
++    tls_api_providers_t selected;
++    tls_api_providers_t now;
++    int ret = 0;
++
++    /* The serial reference: default providers loaded by one initialization. */
++    picoquic_tls_api_reset(0);
++    picoquic_tls_api_unload();
++    picoquic_tls_api_init();
++    tls_api_providers_read(&reference);
++
++    /* First use: nothing loaded, contexts created concurrently. */
++    picoquic_tls_api_unload();
++    ret = tls_api_concurrent_round(&reference, "first use");
++
++    if (ret == 0) {
++        picoquic_tls_api_reset(TLS_API_INIT_FLAGS_NO_OPENSSL);
++        tls_api_providers_read(&selected);
++        ret = tls_api_concurrent_round(&selected, "after reset");
++    }
++
++    /* Leave the default providers loaded, as a serial initialization does. */
++    picoquic_tls_api_reset(0);
++    picoquic_tls_api_unload();
++    picoquic_tls_api_init();
++    tls_api_providers_read(&now);
++    if (ret == 0 && !tls_api_providers_equal(&now, &reference)) {
++        DBG_PRINTF("%s", "the default providers are not restored");
++        ret = -1;
++    }
++    return ret;
++}
