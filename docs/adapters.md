@@ -168,6 +168,7 @@ in transport, integration mode and how the MoQ version is chosen.
 | MsQuic | raw QUIC | `moq_msquic_conn_*` (`<moq/msquic.h>`) | `moq_msquic_managed_t` (`<moq/msquic_managed.h>`), client and multi-connection server with lanes | Client exact-version; a server offers one ALPN or an ordered `versions` list and selects per connection | yes, in both modes, at CONNECTED from `cfg.target` | plain reset after the header is acknowledged |
 | wtquic | WebTransport over HTTP/3 (MsQuic; Network.framework currently refused) | `moq_wtquic_conn_*` (`<moq/wtquic.h>`), requires a qualified receive contract | `moq_wtquic_msquic_managed_t`, client and server with lanes; `moq_wtquic_network_managed_t`, refuses at create | WebTransport protocol token, in preference order | managed MsQuic: yes (a server uses the accepted CONNECT target); Network: unavailable; attach: the caller | plain resets |
 | proxygen | WebTransport | `moq::wt::Adapter` (`<moq/proxygen_wt.hpp>`) | `moq_proxygen_wt_managed_t` (`<moq/proxygen_wt_managed.h>`), client only | WebTransport protocol token | managed: yes; attach: the caller | plain resets |
+| browser (`wasm_wt`, Emscripten) | WebTransport through the browser's own API | none | `moq_wasm_wt_managed_t` (`<moq/wasm_wt_managed.h>`), client only, no network thread | WebTransport protocol token (`moqt-22`, `moqt-18`); a relay that names none is refused | managed: yes | no |
 
 The wtquic MsQuic server reads the accepted CONNECT's authority and path with
 `wtq_session_connect_request_metadata()`, which the linked wtquic build must
@@ -355,3 +356,40 @@ To build an adapter for another QUIC stack:
 
 7. **Thread safety.** The session is not thread-safe. All session
    and adapter calls must be serialized.
+
+## Browser (Emscripten) backend
+
+`adapters/wasm_wt` carries a session over the browser's WebTransport API, so the
+service tier (`moq_endpoint_connect`, `moq_media_receiver_*`) runs in a web
+page unchanged. Build with `emcmake cmake ... -DMOQ_BUILD_SERVICE=ON
+-DMOQ_BUILD_MSF=ON -DMOQ_BUILD_MEDIA_OBJECT=ON -DMOQ_BUILD_WASM_WT_MANAGED=ON`; AUTO WebTransport then resolves to
+`MOQ_TRANSPORT_BACKEND_BROWSER`. `examples/browser` is a runnable page.
+
+What a one-threaded, non-blocking host changes:
+
+- No network thread. The WebTransport callbacks (`wasm_wt_browser.js`) feed the
+  transport bridge and then run one pump cycle: bridge service, the endpoint's
+  `on_pump`, bridge service, then a timer for the earliest of the session and
+  application deadlines. libmoq runs only inside those callbacks and the calls
+  the page makes between them.
+- `moq_endpoint_connect` returns before the connection is up. The session exists
+  once the relay has answered the CONNECT and named the subprotocol (`moqt-22`
+  or `moqt-18`); until then the pump runs with no session, as it does for the
+  threaded facades. A relay that names no subprotocol is refused: a browser has
+  no in-band version negotiation to fall back on.
+- `moq_endpoint_wait`, and so `moq_media_receiver_wait`, return
+  `MOQ_ERR_UNSUPPORTED`; the page polls from a timer or its own events.
+  `moq_endpoint_wake` schedules a pump from the event loop.
+- TLS belongs to the browser: `insecure_skip_verify`, `ca_file`, a certificate
+  callback and an SNI override are `MOQ_ERR_UNSUPPORTED`, and a certificate the
+  browser rejects fails the connection (a local relay needs a trusted
+  certificate, or a short-lived self-signed one pinned by hash: the page sets
+  `Module.moqWasmWtCertHashes` to a list of `{algorithm: 'sha-256', value}` before
+  connecting, which is passed as WebTransport's `serverCertificateHashes`). RAW_QUIC is unavailable: a page has no UDP.
+- Draft-22 binding facts: handshake complete, plus the datagram facts when the
+  browser reports a datagram size.
+- Peer streams are redelivered under the bridge's `WOULD_BLOCK` and
+  `INPUT_NOT_CONSUMED` contract by waiting until `moq_transport_bridge_stream_has_pending`
+  clears; writes are queued in JavaScript per stream and never block the bridge.
+- `moq_endpoint_drain` is unsupported (the facade cannot see the browser's
+  outbound queues).
