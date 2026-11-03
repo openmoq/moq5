@@ -154,46 +154,42 @@ endif()
 # resolves the adapter via find_package(libmoq COMPONENTS
 # adapter-pico-wt) against the build tree, includes ONLY
 # <moq/pico_wt.h>, and links ONLY moq::adapter-pico-wt. Proves the
-# build-tree package is consumable end to end. Needs picoquic source
-# (the consumer's FindPicoquic re-resolves it) and
-# MOQ_BUILD_ADAPTER_PICO_WT=ON so BUILD_HTTP defines picohttp-core.
-# Nested consumer builds configure picoquic again: give them this tree's C++
-# compiler too (see tests/cmake/NestedToolchain.cmake).
+# build-tree package is consumable end to end. Registered when this build
+# has picoquic source (with MOQ_BUILD_ADAPTER_PICO_WT=ON, BUILD_HTTP defines
+# picohttp-core). The build-tree package imports this build's picoquic targets,
+# so these C-only consumers take only the C toolchain, the ABI and OpenSSL
+# contexts and the prefix path. The install-tree tests below build picoquic
+# again and get this tree's C++ compiler too (see
+# tests/cmake/NestedToolchain.cmake).
 include("${PROJECT_SOURCE_DIR}/tests/cmake/NestedToolchain.cmake")
-moq_nested_cxx_args(_picowt_nested_cxx FLAGS)
 moq_nested_cxx_env(_picowt_nested_cxx_env)
 
 if(MOQ_BUILD_TESTS AND MOQ_BUILD_PACKAGE_EXPORTS AND MOQ_PICOQUIC_SOURCE_DIR)
     set(_picowt_consumer_src "${CMAKE_CURRENT_SOURCE_DIR}/tests/consumer")
     set(_picowt_consumer_bld "${CMAKE_CURRENT_BINARY_DIR}/consumer-test-build")
-    set(_picowt_consumer_deps "")
-    foreach(_dep IN ITEMS PTLS_INCLUDE_DIR MOQ_PTLS_LIB_DIR OPENSSL_INCLUDE_DIR
-                          OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
-        if(${_dep})
-            string(APPEND _picowt_consumer_deps " -D${_dep}='${${_dep}}'")
-        endif()
-    endforeach()
     # Forward the parent's compile/link flags and build type so an
     # ASAN parent build produces an ASAN-consistent consumer (it links
     # the parent's instrumented .a files; mismatched instrumentation
-    # would fail to link).
+    # would fail to link). Its OpenSSL selection comes with the parent's
+    # OpenSSL context, as for the managed consumers, and the SDK sysroot
+    # is passed only when targeting Apple.
+    set(_picowt_consumer_sysroot "")
+    if(APPLE)
+        set(_picowt_consumer_sysroot " -DCMAKE_OSX_SYSROOT='${CMAKE_OSX_SYSROOT}'")
+    endif()
     add_test(NAME pico_wt_adapter_consumer
         COMMAND ${CMAKE_COMMAND} -E env bash -c
             "set -e; \
              '${CMAKE_COMMAND}' -E rm -rf '${_picowt_consumer_bld}'; \
-             '${CMAKE_COMMAND}' -C '${_picowt_abi_context}' -S '${_picowt_consumer_src}' \
+             '${CMAKE_COMMAND}' -C '${_picowt_abi_context}' \
+                 -C '${_picowt_openssl_context}' -S '${_picowt_consumer_src}' \
                  -B '${_picowt_consumer_bld}' \
                  -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
-                 -DMOQ_BUILD_ADAPTER_PICO_WT=ON \
-                 -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
-                 -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                  -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_picowt_nested_cxx} \
+                 -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
                  -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
-                 -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' \
-                 -DCMAKE_OSX_SYSROOT='${CMAKE_OSX_SYSROOT}' \
-                 -DMOQ_CONSUMER_WARNINGS_AS_ERRORS='${MOQ_WARNINGS_AS_ERRORS}' \
-                 ${_picowt_consumer_deps} && \
+                 -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}'${_picowt_consumer_sysroot} \
+                 -DMOQ_CONSUMER_WARNINGS_AS_ERRORS='${MOQ_WARNINGS_AS_ERRORS}' && \
              '${CMAKE_COMMAND}' --build '${_picowt_consumer_bld}' && \
              '${_picowt_consumer_bld}/moq_pico_wt_adapter_consumer_test'")
     set_tests_properties(pico_wt_adapter_consumer PROPERTIES TIMEOUT 180)
@@ -845,11 +841,8 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
                      -C '${_picowt_openssl_context}' -S '${_picowtm_consumer_src}' \
                      -B '${_picowtm_consumer_bld}' \
                      -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
-                     -DMOQ_BUILD_ADAPTER_PICO_WT=ON \
-                     -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
-                     -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                      -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_picowt_nested_cxx} \
+                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
                      -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
                      -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
                  '${CMAKE_COMMAND}' --build '${_picowtm_consumer_bld}' && \
@@ -938,11 +931,8 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
                      -C '${_picowt_openssl_context}' -S '${_picowtmv_consumer_src}' \
                      -B '${_picowtmv_consumer_bld}' \
                      -DCMAKE_PREFIX_PATH='${PROJECT_BINARY_DIR}' \
-                     -DMOQ_BUILD_ADAPTER_PICO_WT=ON \
-                     -DMOQ_PICOQUIC_SOURCE_DIR='${MOQ_PICOQUIC_SOURCE_DIR}' \
-                     -DMOQ_PICOTLS_PREFIX='${MOQ_PICOTLS_PREFIX}' \
                      -DCMAKE_C_COMPILER='${CMAKE_C_COMPILER}' \
-                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}'${_picowt_nested_cxx} \
+                     -DCMAKE_C_FLAGS='${CMAKE_C_FLAGS}' \
                      -DCMAKE_EXE_LINKER_FLAGS='${CMAKE_EXE_LINKER_FLAGS}' \
                      -DCMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}' && \
                  '${CMAKE_COMMAND}' --build '${_picowtmv_consumer_bld}' && \
