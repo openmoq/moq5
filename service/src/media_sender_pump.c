@@ -560,7 +560,9 @@ static void sender_resolve_companion_locked(moq_media_sender_t *s)
             s->companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
         } else if (v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18) {
             s->companion_profile = MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
-            uint64_t base = s->group_base;
+            /* A configured initial Group ID is the application's, for either
+             * companion: nothing moves down by it. */
+            uint64_t base = s->group_base_explicit ? 0 : s->group_base;
             for (size_t i = 0; i < s->track_count; i++) {
                 moq_media_track_t *t = s->tracks[i];
                 if (t->group_started) t->group_seq -= base;
@@ -570,7 +572,7 @@ static void sender_resolve_companion_locked(moq_media_sender_t *s)
                 sender_preq_entry_t *e = &s->preq[i % s->ring_cap];
                 if (e->track && e->track->group_started) e->group_seq -= base;
             }
-            s->group_base = 0;
+            if (!s->group_base_explicit) s->group_base = 0;
         }
     }
 }

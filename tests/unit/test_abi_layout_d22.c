@@ -1179,7 +1179,10 @@ PIN_AFTER(moq_media_receiver_stats_t, reorder_refused, tracks_malformed);
 PIN_THROUGH(moq_media_sender_cfg_t, companion_profile, 184, 108, 120, 8, 4, 8);
 PIN_AFTER(moq_media_sender_cfg_t, companion_profile, resource_auth);
 PIN_AT(moq_media_sender_cfg_t, resource_auth, 184, 112, 120);
-PIN_SIZE(moq_media_sender_cfg_t, 192, 116, 128);
+PIN_AFTER(moq_media_sender_cfg_t, resource_auth, initial_group_id);
+PIN_AT(moq_media_sender_cfg_t, initial_group_id, 192, 116, 128);
+PIN_AT(moq_media_sender_cfg_t, has_initial_group_id, 200, 124, 136);
+PIN_SIZE(moq_media_sender_cfg_t, 208, 128, 144);
 /* The media track's Track Properties start exactly at the sizeof of the
  * layout that ends at the MPEG2TS block (its enum members change that sizeof
  * under short enums, so the pin is relational), never in its tail padding.
