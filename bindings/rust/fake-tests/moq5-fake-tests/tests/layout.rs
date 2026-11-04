@@ -59,7 +59,8 @@ fn rust_side() -> BTreeMap<String, Entry> {
             queue_max_objects, queue_max_bytes, pre_ready_max_objects, pre_ready_max_bytes,
             validate_cmaf, content_protections, content_protection_count, callbacks,
             publish_tracks, drop_without_demand, catalog_refresh_interval_us, companion_profile,
-            resource_auth,
+            resource_auth, initial_group_id,
+            has_initial_group_id,
         }
         moq_media_track_cfg_t {
             struct_size, name, media_type, packaging, codec, timescale, init_data, role, lang,
