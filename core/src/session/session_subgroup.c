@@ -1126,7 +1126,8 @@ moq_result_t moq_session_write_object(
     /* Incref AFTER all validation succeeds. */
     moq_rcbuf_incref(payload);
 
-    rc = push_action_ex(s, &a, NULL, sg_object_deadline_us(s, entry, now_us));
+    rc = session_push_subgroup_data(s, entry, &a,
+                                    sg_object_deadline_us(s, entry, now_us));
     if (rc < 0) {
         moq_rcbuf_decref(payload);
         return rc;
@@ -1200,7 +1201,8 @@ moq_result_t moq_session_write_status_object(
     a.u.send_data.payload = NULL;   /* zero-length status object */
     a.u.send_data.fin = false;
 
-    rc = push_action_ex(s, &a, NULL, sg_object_deadline_us(s, entry, now_us));
+    rc = session_push_subgroup_data(s, entry, &a,
+                                    sg_object_deadline_us(s, entry, now_us));
     if (rc < 0) return rc;
 
     entry->prev_object_id = object_id;
@@ -1399,13 +1401,13 @@ static moq_result_t write_object_ex_impl(moq_session_t *s,
         moq_rcbuf_incref(cfg->properties);
         if (cfg->payload) moq_rcbuf_incref(cfg->payload);
 
-        rc = push_action_ex(s, &a1, NULL, deadline);
+        rc = session_push_subgroup_data(s, entry, &a1, deadline);
         if (rc < 0) {
             moq_rcbuf_decref(cfg->properties);
             if (cfg->payload) moq_rcbuf_decref(cfg->payload);
             return rc;
         }
-        rc = push_action_ex(s, &a2, NULL, deadline);
+        rc = session_push_subgroup_data(s, entry, &a2, deadline);
         if (rc < 0) {
             if (cfg->payload) moq_rcbuf_decref(cfg->payload);
             return rc;
@@ -1437,7 +1439,7 @@ static moq_result_t write_object_ex_impl(moq_session_t *s,
 
         if (cfg->payload) moq_rcbuf_incref(cfg->payload);
 
-        rc = push_action_ex(s, &a, NULL, deadline);
+        rc = session_push_subgroup_data(s, entry, &a, deadline);
         if (rc < 0) {
             if (cfg->payload) moq_rcbuf_decref(cfg->payload);
             return rc;
@@ -1482,7 +1484,8 @@ moq_result_t moq_session_close_subgroup(
     a.u.send_data.payload = NULL;
     a.u.send_data.fin = true;
 
-    moq_result_t rc = push_action(s, &a);
+    moq_result_t rc = session_push_subgroup_data(s, &s->subgroups[slot], &a,
+                                                 UINT64_MAX);
     if (rc < 0) return rc;
 
     s->subgroups[slot].state = MOQ_SG_CLOSING;
@@ -1599,7 +1602,7 @@ moq_result_t moq_session_begin_object(
     a.u.send_data.fin = false;
 
     uint64_t deadline = sg_streaming_header_deadline(s, entry, payload_length, now_us);
-    rc = push_action_ex(s, &a, NULL, deadline);
+    rc = session_push_subgroup_data(s, entry, &a, deadline);
     if (rc < 0) return rc;
 
     entry->prev_object_id = object_id;
@@ -1706,12 +1709,12 @@ moq_result_t moq_session_begin_object_ex(
 
         moq_rcbuf_incref(cfg->properties);
 
-        rc = push_action_ex(s, &a1, NULL, deadline);
+        rc = session_push_subgroup_data(s, entry, &a1, deadline);
         if (rc < 0) {
             moq_rcbuf_decref(cfg->properties);
             return rc;
         }
-        rc = push_action_ex(s, &a2, NULL, deadline);
+        rc = session_push_subgroup_data(s, entry, &a2, deadline);
         if (rc < 0) return rc;
     } else {
         moq_object_header_encode_args_t obj_args = {
@@ -1737,7 +1740,7 @@ moq_result_t moq_session_begin_object_ex(
         a.u.send_data.payload = NULL;
         a.u.send_data.fin = false;
 
-        rc = push_action_ex(s, &a, NULL, deadline);
+        rc = session_push_subgroup_data(s, entry, &a, deadline);
         if (rc < 0) return rc;
     }
 
@@ -1796,7 +1799,7 @@ moq_result_t moq_session_write_object_data(
     if (deadline == UINT64_MAX && entry->streaming_bytes_written == 0)
         deadline = sg_object_deadline_us(s, entry, now_us);
 
-    moq_result_t rc = push_action_ex(s, &a, NULL, deadline);
+    moq_result_t rc = session_push_subgroup_data(s, entry, &a, deadline);
     if (rc < 0) {
         moq_rcbuf_decref(data);
         return rc;

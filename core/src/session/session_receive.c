@@ -1634,15 +1634,16 @@ static moq_result_t rx_emit_chunk(moq_session_t *s, int slot,
             const uint8_t *rcbuf_start = moq_rcbuf_data(input_rcbuf);
             size_t rcbuf_len = moq_rcbuf_len(input_rcbuf);
             size_t offset = SIZE_MAX;
-            /* Continuation chunks: data points directly into rcbuf. */
+            /* Data points directly into the rcbuf: a continuation chunk, or
+             * a begin chunk parsed in place from the rcbuf's own bytes. */
             uintptr_t dp = (uintptr_t)data;
             uintptr_t rs = (uintptr_t)rcbuf_start;
             if (rcbuf_start && dp >= rs &&
                 len <= rcbuf_len && dp - rs <= rcbuf_len - len)
                 offset = (size_t)(dp - rs);
-            /* Begin chunks via input_src_rcbuf: data is in input_buf,
-             * which is a copy of the rcbuf. Cursor offset maps
-             * directly because hdr_len was 0 at entry. */
+            /* Begin chunks via input_src_rcbuf parsed from a staged copy:
+             * data is in input_buf, which is a copy of the rcbuf. Cursor
+             * offset maps directly because hdr_len was 0 at entry. */
             else if (data_in_input_buf && rx->input_buf) {
                 uintptr_t ib = (uintptr_t)rx->input_buf;
                 if (dp >= ib && dp - ib < rx->input_len) {
@@ -1824,19 +1825,20 @@ static moq_result_t rx_emit_object(moq_session_t *s, int slot)
     return MOQ_OK;
 }
 
-/* Append caller bytes to the rx-owned input_buf for `slot`, enforcing the shared
- * receive budget (max_recv_buf covers retained payload + buffered input). On
- * success sets *out_appended = true and returns MOQ_OK. If the budget is
- * exceeded it issues a STOP (rx_try_stop, which may free the entry) and returns
- * that result with *out_appended = false; on allocation failure returns NOMEM
- * with *out_appended = false. In either failure case the caller must return the
- * value immediately -- the entry may already be gone. */
-static moq_result_t rx_append_input(moq_session_t *s, int slot,
-                                    const uint8_t *data, size_t len,
-                                    bool *out_appended)
+/* Reserve room in the rx-owned input_buf for `len` more bytes on `slot`,
+ * enforcing the shared receive budget (max_recv_buf covers retained payload +
+ * buffered input) and growing the buffer exactly as an append grows it. Writes
+ * no bytes and leaves input_len unchanged. On success sets *out_reserved = true
+ * and returns MOQ_OK. If the budget is exceeded it issues a STOP (rx_try_stop,
+ * which may free the entry) and returns that result with *out_reserved =
+ * false; on allocation failure returns NOMEM with *out_reserved = false. In
+ * either failure case the caller must return the value immediately -- the
+ * entry may already be gone. */
+static moq_result_t rx_reserve_input(moq_session_t *s, int slot, size_t len,
+                                     bool *out_reserved)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
-    *out_appended = false;
+    *out_reserved = false;
 
     size_t budget = s->max_recv_buf;
     if (len > SIZE_MAX - rx->input_len)
@@ -1885,9 +1887,21 @@ static moq_result_t rx_append_input(moq_session_t *s, int slot,
         rx->input_cap = new_cap;
         s->recv_input_bytes += new_cap - old_cap;
     }
+    *out_reserved = true;
+    return MOQ_OK;
+}
+
+/* Append caller bytes to the rx-owned input_buf for `slot`: rx_reserve_input,
+ * then the copy. Results and failure rules are rx_reserve_input's. */
+static moq_result_t rx_append_input(moq_session_t *s, int slot,
+                                    const uint8_t *data, size_t len,
+                                    bool *out_appended)
+{
+    moq_result_t rc = rx_reserve_input(s, slot, len, out_appended);
+    if (!*out_appended) return rc;
+    moq_rx_stream_t *rx = &s->rx_streams[slot];
     memcpy(rx->input_buf + rx->input_len, data, len);
     rx->input_len += len;
-    *out_appended = true;
     return MOQ_OK;
 }
 
@@ -1947,13 +1961,73 @@ static int rx_get_or_create_stream(moq_session_t *s, moq_stream_ref_t stream_ref
     return slot;                          /* new stream: proceed */
 }
 
+/* -- In-place parse of a delivery ----------------------------------- *
+ * A delivery that arrives with nothing staged ahead of it is parsed from the
+ * caller's bytes rather than from a staged copy of them. Its staging is still
+ * reserved exactly as an append reserves it (rx_reserve_input: same growth,
+ * clamp, budget charge and refusal), and input_len covers it as an append
+ * would, so every length, cursor and FIN decision in the parse loop sees the
+ * same state as a staged parse. Only the reads of the bytes themselves come
+ * from the caller (rx_in). Before the call returns, exactly the bytes a staged
+ * parse would have left in input_buf are copied into the reserved storage: the
+ * unconsumed tail at compact, or the whole delivery when the call ends with
+ * the entry still holding it uncompacted. That copy allocates nothing and
+ * re-checks no budget. The context lives on the stack of one call; no caller
+ * pointer outlives it. */
+typedef struct rx_in_place {
+    const uint8_t *data;    /* the delivery, borrowed for this call only */
+    size_t         len;
+    uint64_t       ref;     /* the stream the delivery belongs to */
+    int            slot;
+    bool           armed;   /* the delivery is being parsed in place */
+    bool           settled; /* input_buf holds what a staged parse would */
+} rx_in_place_t;
+
+#ifdef MOQ_SESSION_SWEEP_TESTING
+/* White-box reference for the in-place parse: when set, every delivery is
+ * appended to staging and parsed from the copy. Present only in the
+ * test-internals archive; the shipped library has no such switch. */
+bool session_rx_stage_reference;
+#define RX_STAGE_REFERENCE() (session_rx_stage_reference)
+#else
+#define RX_STAGE_REFERENCE() false
+#endif
+
+/* The bytes input_buf logically holds: the caller's delivery while it is
+ * parsed in place and its staging is still owned, otherwise input_buf. */
+static inline const uint8_t *rx_in(const moq_rx_stream_t *rx,
+                                   const rx_in_place_t *ip)
+{
+    if (ip->armed && !ip->settled && rx->input_buf) return ip->data;
+    return rx->input_buf;
+}
+
+/* The call ended without compacting an in-place delivery: a staged parse would
+ * have left the whole delivery in input_buf. Copy it there if the entry still
+ * owns that staging; a STOP, a finished stream or a session close released it
+ * along with the bytes a staged parse would have held. */
+static void rx_in_place_settle(moq_session_t *s, rx_in_place_t *ip)
+{
+    if (!ip->armed || ip->settled) return;
+    ip->settled = true;
+    moq_rx_stream_t *rx = &s->rx_streams[ip->slot];
+    if (!rx->active || rx->stream_ref._v != ip->ref || !rx->input_buf)
+        return;
+    /* Inside the parse loop only compact and a release write input_len, so an
+     * entry that was not compacted and still owns its staging covers exactly
+     * the delivery, within the capacity reserved for it. */
+    if (rx->input_len == ip->len && ip->len <= rx->input_cap)
+        memcpy(rx->input_buf, ip->data, ip->len);
+}
+
 /* -- Data bytes handler -------------------------------------------- */
 
-static moq_result_t handle_data_bytes_impl(moq_session_t *s,
-                                            moq_stream_ref_t stream_ref,
-                                            const uint8_t *data, size_t len,
-                                            bool fin,
-                                            moq_rcbuf_t *input_rcbuf)
+static moq_result_t rx_drive_data(moq_session_t *s,
+                                  moq_stream_ref_t stream_ref,
+                                  const uint8_t *data, size_t len,
+                                  bool fin,
+                                  moq_rcbuf_t *input_rcbuf,
+                                  rx_in_place_t *ip)
 {
     moq_result_t acquire_rc;
     int slot = rx_get_or_create_stream(s, stream_ref, len, fin, &acquire_rc);
@@ -2182,11 +2256,26 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
         input_src_rcbuf = input_rcbuf;
     input_rcbuf = NULL;
 
-    /* Append caller bytes to rx-owned input_buf before parsing. */
+    /* Stage caller bytes before parsing. With nothing staged ahead of them
+     * they are parsed in place (rx_in_place_t): the staging is reserved as an
+     * append would reserve it and input_len covers them, but the bytes are
+     * read from the caller and only what parsing leaves behind is copied. A
+     * staged prefix is appended to and parsed from the staged copy. */
     if (len > 0) {
-        bool appended;
-        moq_result_t arc = rx_append_input(s, slot, data, len, &appended);
-        if (!appended) return arc;
+        bool staged;
+        if (rx->input_len == 0 && !RX_STAGE_REFERENCE()) {
+            moq_result_t rrc = rx_reserve_input(s, slot, len, &staged);
+            if (!staged) return rrc;
+            rx->input_len = len;
+            ip->data = data;
+            ip->len = len;
+            ip->ref = stream_ref._v;
+            ip->slot = slot;
+            ip->armed = true;
+        } else {
+            moq_result_t arc = rx_append_input(s, slot, data, len, &staged);
+            if (!staged) return arc;
+        }
     }
 
     size_t cursor = 0;
@@ -2206,7 +2295,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
             size_t space = MOQ_RX_HDR_BUF - rx->hdr_len;
             size_t copy = avail < space ? avail : space;
             if (copy > 0) {
-                memcpy(rx->hdr_buf + rx->hdr_len, rx->input_buf + cursor, copy);
+                memcpy(rx->hdr_buf + rx->hdr_len, rx_in(rx, ip) + cursor, copy);
                 rx->hdr_len += (uint8_t)copy;
                 cursor += copy;
             }
@@ -2459,7 +2548,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                  * decoding until that control freezes the effective order. */
                 if (!rx->fetch_order_known) goto compact;
                 moq_buf_reader_t fr;
-                moq_buf_reader_init(&fr, rx->input_buf + cursor, avail);
+                moq_buf_reader_init(&fr, rx_in(rx, ip) + cursor, avail);
                 moq_decoded_fetch_object_t fobj;
                 moq_result_t forc = s->profile->decode_fetch_object(
                     s, &fr, rx->effective_fetch_group_order, &rx->fetch_prior, &fobj);
@@ -2598,7 +2687,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                 if (avail == 0) goto compact;
 
                 moq_buf_reader_t fr;
-                moq_buf_reader_init(&fr, rx->input_buf + cursor, avail);
+                moq_buf_reader_init(&fr, rx_in(rx, ip) + cursor, avail);
 
                 moq_decoded_fetch_object_t fobj;
                 moq_result_t forc = s->profile->decode_fetch_object(
@@ -2766,7 +2855,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
 
             moq_buf_reader_t r;
             moq_buf_reader_init(&r,
-                avail > 0 ? rx->input_buf + cursor : NULL, avail);
+                avail > 0 ? rx_in(rx, ip) + cursor : NULL, avail);
 
             moq_decoded_object_header_t obj;
             moq_result_t orc = s->profile->decode_object_header(s, &r,
@@ -2876,6 +2965,26 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                 }
             }
 
+            /* A whole object's payload buffer is allocated before the object
+             * is committed. If that fails, nothing of the object is consumed
+             * or held: its properties buffer and charge are released and the
+             * parser stays at this object's header, exactly as when the
+             * properties allocation above fails. */
+            moq_rcbuf_t *payload_rcbuf = NULL;
+            uint8_t *payload_buf = NULL;
+            if (!s->streaming_objects && payload_len > 0) {
+                moq_result_t arc = moq_rcbuf_alloc_uninit(
+                    &s->alloc, (size_t)payload_len, &payload_rcbuf, &payload_buf);
+                if (arc < 0) {
+                    if (ext_rcbuf) {
+                        s->recv_payload_bytes -= moq_rcbuf_len(ext_rcbuf);
+                        moq_rcbuf_decref(ext_rcbuf);
+                    }
+                    loop_rc = arc;
+                    goto compact;
+                }
+            }
+
             rx->cur_object_id = object_id;
             rx->cur_status = semantic;
             /* FIRST_OBJECT speaks for the stream's first object only. */
@@ -2934,7 +3043,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                     begin_rcbuf = input_src_rcbuf;
 
                 moq_result_t erc = rx_emit_chunk(s, slot,
-                    chunk_len > 0 ? rx->input_buf + cursor : NULL,
+                    chunk_len > 0 ? rx_in(rx, ip) + cursor : NULL,
                     chunk_len, true, is_begin_end, begin_rcbuf, true);
                 if (erc < 0) { loop_rc = erc; goto compact; }
 
@@ -2952,14 +3061,12 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                 continue;
             }
 
-            /* Allocate the delivered payload rcbuf up front and stream the
-             * object's bytes directly into its inline storage, so rx_emit_object
+            /* The payload rcbuf allocated before the commit receives the
+             * object's bytes directly in its inline storage, so rx_emit_object
              * can hand it to the event without a copy. payload_buf is the
              * writable cursor into that rcbuf. */
-            moq_result_t arc = moq_rcbuf_alloc_uninit(
-                &s->alloc, (size_t)payload_len,
-                &rx->payload_rcbuf, &rx->payload_buf);
-            if (arc < 0) { loop_rc = arc; goto compact; }
+            rx->payload_rcbuf = payload_rcbuf;
+            rx->payload_buf = payload_buf;
             s->recv_payload_bytes += (size_t)payload_len;
 
             if (rx->payload_written >= (size_t)payload_len) {
@@ -2977,7 +3084,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
             size_t need = (size_t)rx->payload_expected - rx->payload_written;
             size_t copy = avail < need ? avail : need;
             if (copy > 0) {
-                memcpy(rx->payload_buf + rx->payload_written, rx->input_buf + cursor, copy);
+                memcpy(rx->payload_buf + rx->payload_written, rx_in(rx, ip) + cursor, copy);
                 rx->payload_written += copy;
                 cursor += copy;
             }
@@ -3008,7 +3115,7 @@ static moq_result_t handle_data_bytes_impl(moq_session_t *s,
                 return close_with_error(s, 0x3, "truncated payload at FIN");
 
             moq_result_t erc = rx_emit_chunk(s, slot,
-                chunk_len > 0 ? rx->input_buf + cursor : NULL,
+                chunk_len > 0 ? rx_in(rx, ip) + cursor : NULL,
                 chunk_len, false, final, input_rcbuf, true);
             if (erc < 0) { loop_rc = erc; goto compact; }
 
@@ -3035,8 +3142,15 @@ compact:
     if (rx->active && rx->input_buf && rx->parse_state != MOQ_RX_STOPPED &&
         cursor > 0) {
         size_t remaining = rx->input_len - cursor;
-        if (remaining > 0)
+        if (ip->armed && !ip->settled) {
+            /* Parsed in place: the staged copy was never made, so copy just
+             * the unconsumed tail into the staging reserved for it. */
+            if (remaining > 0)
+                memcpy(rx->input_buf, ip->data + cursor, remaining);
+            ip->settled = true;
+        } else if (remaining > 0) {
             memmove(rx->input_buf, rx->input_buf + cursor, remaining);
+        }
         /* When the buffer fully drains, retain its capacity for the next
          * object on this stream instead of freeing it. A transport that
          * delivers each object as its own read (or splits header from
@@ -3047,12 +3161,25 @@ compact:
          * receive budget still accounts for it exactly once -- which means a
          * retained buffer may reduce tight-buffer headroom for other consumers
          * (honest accounting: it is real allocated memory until the stream is
-         * freed). rx_append_input charges only growth beyond input_cap, so
+         * freed). rx_reserve_input charges only growth beyond input_cap, so
          * reusing this capacity for the next object adds no new budget. */
         rx->input_len = remaining;
     }
 
     return loop_rc;
+}
+
+static moq_result_t handle_data_bytes_impl(moq_session_t *s,
+                                            moq_stream_ref_t stream_ref,
+                                            const uint8_t *data, size_t len,
+                                            bool fin,
+                                            moq_rcbuf_t *input_rcbuf)
+{
+    rx_in_place_t ip = { 0 };
+    moq_result_t rc = rx_drive_data(s, stream_ref, data, len, fin,
+                                    input_rcbuf, &ip);
+    rx_in_place_settle(s, &ip);
+    return rc;
 }
 
 moq_result_t handle_data_bytes(moq_session_t *s,

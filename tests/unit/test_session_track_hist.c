@@ -22,19 +22,31 @@ static moq_namespace_t ns_of(moq_bytes_t *part, const char *s)
 }
 
 /* -- Fail-injecting allocator (counts allocs, fails the Nth onward) --- */
+enum { TH_REC_MAX = 32 };
 typedef struct {
     int64_t balance;
     int     alloc_calls;
     int     fail_at;      /* 0 = never fail; else fail on call index >= fail_at */
+    /* The size asked for and the block returned (NULL when refused) by each
+     * of the first TH_REC_MAX calls, so a row can name an allocation by what
+     * it is rather than by when it happens. */
+    size_t  sizes[TH_REC_MAX];
+    void   *ptrs[TH_REC_MAX];
 } th_fail_state_t;
 
 static void *fail_alloc(size_t size, void *ctx)
 {
     th_fail_state_t *st = (th_fail_state_t *)ctx;
     st->alloc_calls++;
-    if (st->fail_at && st->alloc_calls >= st->fail_at) return NULL;
-    void *p = malloc(size);
-    if (p) st->balance++;
+    void *p = NULL;
+    if (!st->fail_at || st->alloc_calls < st->fail_at) {
+        p = malloc(size);
+        if (p) st->balance++;
+    }
+    if (st->alloc_calls <= TH_REC_MAX) {
+        st->sizes[st->alloc_calls - 1] = size;
+        st->ptrs[st->alloc_calls - 1] = p;
+    }
     return p;
 }
 static void *fail_realloc(void *ptr, size_t o, size_t n, void *ctx)
@@ -474,9 +486,10 @@ int main(void)
 
     /* == allocation-failure at session create: registry pool =========== */
     {
-        /* Count allocations of a successful create, then fail the last one
-         * (the registry pool is allocated last), and confirm create fails
-         * NOMEM with *out reset to NULL and the arena fully freed. */
+        /* Find the registry pool's allocation in a successful create -- the
+         * one call that asked for th_cap records and returned the session's
+         * live track_hist -- then fail that call, and confirm create fails
+         * NOMEM with *out reset to NULL and everything freed. */
         th_fail_state_t probe = {0};
         moq_alloc_t palloc = th_fail_allocator(&probe);
         moq_session_cfg_t cfg = MOQ_SESSION_CFG_INIT;
@@ -484,21 +497,42 @@ int main(void)
         cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
         moq_session_t *s = NULL;
         MOQ_TEST_CHECK(moq_session_create(&cfg, 0, &s) == MOQ_OK);
-        int total_allocs = probe.alloc_calls;
-        moq_session_destroy(s);
+        int registry_call = 0, matches = 0;
+        if (s) {
+            const size_t pool_bytes = s->th_cap * sizeof(moq_track_hist_t);
+            MOQ_TEST_CHECK(s->th_cap > 0 && s->track_hist != NULL);
+            MOQ_TEST_CHECK(probe.alloc_calls <= TH_REC_MAX);
+            for (int i = 0; i < probe.alloc_calls && i < TH_REC_MAX; i++) {
+                if (probe.sizes[i] != pool_bytes) continue;
+                matches++;
+                registry_call = i + 1;
+            }
+            /* Exactly one call of that size, and it is the live pool: a
+             * same-sized allocation is never taken for the registry. */
+            MOQ_TEST_CHECK(matches == 1);
+            MOQ_TEST_CHECK(matches == 1 &&
+                           probe.ptrs[registry_call - 1] == (void *)s->track_hist);
+            moq_session_destroy(s);
+        }
         MOQ_TEST_CHECK(probe.balance == 0);
 
-        th_fail_state_t fs = {0};
-        moq_alloc_t alloc = th_fail_allocator(&fs);
-        fs.fail_at = total_allocs;      /* fail the last create-time alloc */
-        moq_session_cfg_t cfg2 = MOQ_SESSION_CFG_INIT;
-        cfg2.alloc = &alloc;
-        cfg2.perspective = MOQ_PERSPECTIVE_CLIENT;
-        moq_session_t *s2 = (moq_session_t *)0x1;   /* poison: must be reset */
-        moq_result_t rc = moq_session_create(&cfg2, 0, &s2);
-        MOQ_TEST_CHECK(rc == MOQ_ERR_NOMEM);
-        MOQ_TEST_CHECK(s2 == NULL);        /* create resets *out to NULL */
-        MOQ_TEST_CHECK(fs.balance == 0);   /* arena fully unwound */
+        if (matches == 1) {
+            th_fail_state_t fs = {0};
+            moq_alloc_t alloc = th_fail_allocator(&fs);
+            fs.fail_at = registry_call;     /* the registry pool's call */
+            moq_session_cfg_t cfg2 = MOQ_SESSION_CFG_INIT;
+            cfg2.alloc = &alloc;
+            cfg2.perspective = MOQ_PERSPECTIVE_CLIENT;
+            moq_session_t *s2 = (moq_session_t *)0x1;   /* poison: must be reset */
+            moq_result_t rc = moq_session_create(&cfg2, 0, &s2);
+            MOQ_TEST_CHECK(fs.alloc_calls == registry_call);  /* it was reached, */
+            MOQ_TEST_CHECK(fs.sizes[registry_call - 1] ==     /* and refused */
+                           probe.sizes[registry_call - 1] &&
+                           fs.ptrs[registry_call - 1] == NULL);
+            MOQ_TEST_CHECK(rc == MOQ_ERR_NOMEM);
+            MOQ_TEST_CHECK(s2 == NULL);        /* create resets *out to NULL */
+            MOQ_TEST_CHECK(fs.balance == 0);   /* arena fully unwound */
+        }
 
         /* Retry with injection off succeeds. */
         th_fail_state_t fs2 = {0};

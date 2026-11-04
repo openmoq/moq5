@@ -2136,6 +2136,26 @@ void moq_index_insert(moq_index_entry_t *tbl, size_t mask,
                        uint64_t key, int slot);
 void moq_index_remove(moq_index_entry_t *tbl, size_t mask, uint64_t key);
 
+/* -- Seen-stream scratch set --------------------------------------- *
+ * The stream refs one scheduling pass has visited, so the pass can ask
+ * whether an earlier queued action acts on a stream with one lookup instead
+ * of rescanning the queue. Open addressing with linear probing over a
+ * power-of-two table of at least twice action_cap slots, keyed by the whole
+ * stream ref. A slot holds a ref only while its stamp equals the set's
+ * epoch, so starting a pass is one increment, never a clear. The set is an
+ * optional speed-up: a session without one (slots NULL) selects by the
+ * reference rescan. */
+typedef struct moq_seen_slot {
+    uint64_t ref;
+    uint32_t stamp;
+} moq_seen_slot_t;
+
+typedef struct moq_seen_set {
+    moq_seen_slot_t *slots;   /* mask + 1 entries outside the session block, or NULL */
+    size_t           mask;
+    uint32_t         epoch;   /* the current pass; 0 is never a live epoch */
+} moq_seen_set_t;
+
 /* -- Session struct ------------------------------------------------ */
 
 typedef struct moq_state_location_cell {
@@ -2227,6 +2247,9 @@ struct moq_session {
      * wholesale zeroes both. */
     size_t        action_timed;
     size_t        action_nondata;
+    /* Scratch of the scheduler's selection passes. A pass is handed this
+     * set explicitly; nothing else reads or writes it. */
+    moq_seen_set_t action_seen;
 
     moq_event_t  *events;
     size_t        event_cap;
@@ -3025,6 +3048,13 @@ uint64_t sg_subgroup_timeout_us(moq_session_t *s, const moq_sg_entry_t *e);
 /* Fill the scheduling record of an action on a subgroup stream. */
 void sg_stream_meta(moq_session_t *s, const moq_sg_entry_t *e,
                     moq_action_meta_t *out);
+/* Queue a SEND_DATA on the stream of the live subgroup `e` (a->u.send_data.
+ * stream_ref is e->stream_ref) with the record push_action_ex would derive
+ * for it from a NULL record, without searching the subgroup list. Like that
+ * derivation it stamps a->u.send_data.scheduling_priority from the record
+ * when the producer left it zero. */
+moq_result_t session_push_subgroup_data(moq_session_t *s, const moq_sg_entry_t *e,
+                                        moq_action_t *a, uint64_t deadline_us);
 /* Fill the scheduling record of an action on a fill fetch stream (no
  * location; the object writer adds group and object). */
 void fill_stream_meta(const moq_session_t *s, const moq_fill_entry_t *f,
@@ -4312,6 +4342,11 @@ extern uint64_t session_work_rx_rescan_passes;   /* bound-stream scan rescan pas
  * a stop that action capacity refuses is still one charged transition -- which
  * is what the budget itself charges. */
 extern uint64_t session_work_rx_charged;
+
+/* When set, every data delivery is appended to staging and parsed from the
+ * staged copy instead of in place: the reference a differential test compares
+ * the in-place parse against (session_receive.c, rx_in_place_t). */
+extern bool session_rx_stage_reference;
 #endif
 moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
                                                   moq_subscription_t sub,

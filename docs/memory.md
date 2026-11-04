@@ -39,6 +39,21 @@ total size is bounded by a 64 MB hard cap and checked for overflow. Resource
 limits (queue sizes, buffer sizes, pool sizes, scratch size) are configurable
 through `moq_session_cfg_t`; zero means use the library default.
 
+### Scheduler scratch
+
+The last allocation `moq_session_create` makes, after everything the session
+requires, is a lookup table the action scheduler uses while choosing the next
+action to hand out. It comes from the session's allocator, holds the smallest
+power of two of at least `2 × max_actions` slots (16 bytes each on 64-bit
+targets; 2 KiB at the default of 64 actions), and is freed by
+`moq_session_destroy`.
+
+The table is optional. If the allocator refuses it, creation still succeeds
+and the scheduler rescans the action queue instead; actions are handed out in
+the same order either way. The table is not part of the session allocation
+and does not count toward its 64 MB cap; the small descriptor that refers to
+it is a field of the session struct and does.
+
 ### Dynamic per-stream allocations
 
 Beyond the single session allocation, the receive path makes per-stream

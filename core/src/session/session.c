@@ -1321,6 +1321,77 @@ moq_result_t push_action(moq_session_t *s, const moq_action_t *a)
     return push_action_ex(s, a, NULL, UINT64_MAX);
 }
 
+#ifdef MOQ_SESSION_SWEEP_TESTING
+/* Field by field: the record has padding, which memcmp would read. */
+static bool action_meta_same(const moq_action_meta_t *x, const moq_action_meta_t *y)
+{
+    return x->terminal_owner == y->terminal_owner &&
+           x->subgroup_header == y->subgroup_header &&
+           x->opens_data == y->opens_data &&
+           x->terminal_barrier == y->terminal_barrier &&
+           x->outgoing_terminal == y->outgoing_terminal &&
+           x->deadline_us == y->deadline_us &&
+           x->owner == y->owner &&
+           x->group_id == y->group_id &&
+           x->subgroup_id == y->subgroup_id &&
+           x->object_id == y->object_id &&
+           x->subscriber_priority == y->subscriber_priority &&
+           x->publisher_priority == y->publisher_priority &&
+           x->mode == y->mode &&
+           x->group_order == y->group_order &&
+           x->fill_group_order == y->fill_group_order &&
+           x->has_location == y->has_location;
+}
+
+/* Test builds hold the subgroup record to the derivation a NULL record gets:
+ * the same record from the same walk, and the same stamped snapshot. Only
+ * locals are written. */
+static void subgroup_data_meta_check(moq_session_t *s, const moq_sg_entry_t *e,
+                                     const moq_action_t *a, uint64_t producer,
+                                     const moq_action_meta_t *meta)
+{
+    if (a->kind != MOQ_ACTION_SEND_DATA || !e->occ_linked ||
+        e->state == MOQ_SG_FREE ||
+        a->u.send_data.stream_ref._v != e->stream_ref._v)
+        abort();
+    moq_action_t probe;
+    memset(&probe, 0, sizeof(probe));
+    probe.kind = MOQ_ACTION_SEND_DATA;
+    probe.u.send_data.stream_ref = a->u.send_data.stream_ref;
+    probe.u.send_data.scheduling_priority = producer;
+    moq_action_meta_t want;
+    memset(&want, 0, sizeof(want));
+    want.deadline_us = UINT64_MAX;
+    derive_stream_meta(s, &probe, &want);
+    if (!action_meta_same(&want, meta) ||
+        probe.u.send_data.scheduling_priority != a->u.send_data.scheduling_priority)
+        abort();
+}
+#endif
+
+/* derive_stream_meta takes the first linked subgroup whose stream_ref is
+ * the action's. A live entry is linked, and every subgroup takes a fresh
+ * next_stream_ref when it opens, so that first match is `e` itself and its
+ * record is sg_stream_meta(e). push_action_ex keeps a given record as is,
+ * applies the stamped snapshot to the priorities it already holds, and
+ * stores the deadline either way. */
+moq_result_t session_push_subgroup_data(moq_session_t *s, const moq_sg_entry_t *e,
+                                        moq_action_t *a, uint64_t deadline_us)
+{
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    const uint64_t producer = a->u.send_data.scheduling_priority;
+#endif
+    moq_action_meta_t meta;
+    sg_stream_meta(s, e, &meta);
+    if (!a->u.send_data.scheduling_priority)
+        a->u.send_data.scheduling_priority = UINT64_C(0x10000) |
+            ((uint64_t)meta.subscriber_priority << 8) | meta.publisher_priority;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    subgroup_data_meta_check(s, e, a, producer, &meta);
+#endif
+    return push_action_ex(s, a, &meta, deadline_us);
+}
+
 void session_tag_owner_done(moq_session_t *s, uint64_t owner)
 {
     assert(s->action_tail > s->action_head && owner != 0);
@@ -1429,8 +1500,53 @@ static int sched_compare(const moq_action_meta_t *x, const moq_action_meta_t *y)
     return 0;
 }
 
-/* The queue index (head <= idx < tail) of the action the next poll takes. */
-static size_t action_select_from(const moq_session_t *s, size_t head)
+/* -- Seen-stream scratch set (see moq_seen_set_t) ------------------ */
+
+typedef enum {
+    SEEN_NEW,       /* added: no earlier action of this pass is on the stream */
+    SEEN_PRESENT,   /* an earlier action of this pass is on the stream */
+    SEEN_FULL,      /* no free slot: the caller takes the reference rescan */
+} seen_result_t;
+
+/* Start a pass over an empty set. False when the session has no table, and
+ * the caller then takes the reference rescan. */
+static bool seen_begin(moq_seen_set_t *set)
+{
+    if (!set->slots) return false;
+    if (++set->epoch == 0) {
+        /* Once every 2^32 passes: no stale stamp may equal the epoch the
+         * set restarts at. */
+        for (size_t i = 0; i <= set->mask; i++) set->slots[i].stamp = 0;
+        set->epoch = 1;
+    }
+    return true;
+}
+
+/* Add `ref` to this pass, reporting whether the pass already held it. The
+ * probe starts at the ref's index hash and visits each slot at most once.
+ * A pass adds at most one ref per queued action and the table has at least
+ * twice action_cap slots, so it is never more than half full and SEEN_FULL
+ * does not occur; it is still a defined answer, not a truncation. */
+static seen_result_t seen_add(moq_seen_set_t *set, uint64_t ref)
+{
+    size_t i = (size_t)(idx_hash(ref) & set->mask);
+    for (size_t n = 0; n <= set->mask; n++) {
+        moq_seen_slot_t *slot = &set->slots[i];
+        if (slot->stamp != set->epoch) {
+            slot->ref = ref;
+            slot->stamp = set->epoch;
+            return SEEN_NEW;
+        }
+        if (slot->ref == ref) return SEEN_PRESENT;
+        i = (i + 1) & set->mask;
+    }
+    return SEEN_FULL;
+}
+
+/* The queue index (head <= idx < tail) of the action the next poll takes,
+ * by the defining rescan: a stream action is a candidate only when no action
+ * in [head, idx) is on its stream. */
+static size_t action_select_reference(const moq_session_t *s, size_t head)
 {
     size_t tail = s->action_tail, cap = s->action_cap;
     if (!action_is_data(&s->actions[head % cap])) return head;
@@ -1456,9 +1572,52 @@ static size_t action_select_from(const moq_session_t *s, size_t head)
     return best;
 }
 
-static size_t action_select(const moq_session_t *s)
+/* The same choice in one pass. Every visited stream action enters `seen`,
+ * candidate or not and the head included, before the pass moves on, so when
+ * the pass reaches idx the set holds exactly the streams of [head, idx):
+ * adding a stream that is already there is the rescan's match. Expected
+ * O(1) per visited action at the table's load of at most one half. */
+static size_t action_select_once(const moq_session_t *s, moq_seen_set_t *seen,
+                                 size_t head)
 {
-    return action_select_from(s, s->action_head);
+    size_t tail = s->action_tail, cap = s->action_cap;
+    const moq_action_t *first = &s->actions[head % cap];
+    if (!action_is_data(first)) return head;
+    if (!seen_begin(seen)) return action_select_reference(s, head);
+    moq_stream_ref_t ref;
+    if (action_data_stream(first, &ref) && seen_add(seen, ref._v) == SEEN_FULL)
+        return action_select_reference(s, head);
+    size_t best = head;
+    for (size_t i = head + 1; i < tail; i++) {
+        const moq_action_t *a = &s->actions[i % cap];
+        if (!action_is_data(a)) break;
+        if (action_data_stream(a, &ref)) {
+            const seen_result_t r = seen_add(seen, ref._v);
+            if (r == SEEN_FULL) return action_select_reference(s, head);
+            if (r == SEEN_PRESENT) continue;
+        }
+        if (sched_compare(&s->action_meta[i % cap], &s->action_meta[best % cap]) < 0)
+            best = i;
+    }
+    return best;
+}
+
+/* The queue index (head <= idx < tail) of the action the next poll takes.
+ * The scratch is the caller's to lend; the session itself is only read. */
+static size_t action_select_from(const moq_session_t *s, moq_seen_set_t *seen,
+                                 size_t head)
+{
+    const size_t best = action_select_once(s, seen, head);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    /* Test builds hold every one-pass choice to the defining rescan. */
+    if (action_select_reference(s, head) != best) abort();
+#endif
+    return best;
+}
+
+static size_t action_select(moq_session_t *s)
+{
+    return action_select_from(s, &s->action_seen, s->action_head);
 }
 
 static bool action_waits_for_terminal(const moq_session_t *s, size_t idx)
@@ -3607,6 +3766,33 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
         }
     }
 
+    /* The scheduler's seen-stream scratch: at least twice action_cap slots,
+     * so a selection pass never fills it. It only speeds selection up, so it
+     * is acquired after every allocation and check the session requires:
+     * no required failure follows it, and when its size does not check or
+     * the allocation is refused, the session goes on without it and every
+     * pick takes the reference rescan. Its slots are allocated outside the
+     * block, so their bytes are not counted against the block's size cap;
+     * the descriptor itself is part of the session header, which is. The
+     * block already bounds action_cap far below the point where this size
+     * could wrap; the check keeps that local. */
+    {
+        size_t seen_cap = moq_index_cap_for(action_cap);
+        size_t seen_bytes = seen_cap * sizeof(moq_seen_slot_t);
+        moq_seen_slot_t *slots = NULL;
+        if (seen_bytes / sizeof(moq_seen_slot_t) == seen_cap)
+            slots = (moq_seen_slot_t *)s->alloc.alloc(seen_bytes, s->alloc.ctx);
+        if (slots) {
+            memset(slots, 0, seen_bytes);
+            s->action_seen.slots = slots;
+            s->action_seen.mask = seen_cap - 1;
+        } else {
+            s->action_seen.slots = NULL;
+            s->action_seen.mask = 0;
+        }
+        s->action_seen.epoch = 0;
+    }
+
     *out = s;
     return MOQ_OK;
 }
@@ -3630,6 +3816,11 @@ void moq_session_destroy(moq_session_t *s)
     track_hist_destroy(s);
     mt_destroy_all(s);
     fill_pool_destroy(s);
+    if (s->action_seen.slots)
+        s->alloc.free(s->action_seen.slots,
+                      (s->action_seen.mask + 1) * sizeof(*s->action_seen.slots),
+                      s->alloc.ctx);
+    s->action_seen.slots = NULL;
     moq_token_cache_free(&s->peer_token_cache);
     for (size_t i = 0; i < s->sub_cap; i++) {
         if (s->subs[i].track_id_buf)
@@ -4597,7 +4788,7 @@ bool bridge_session_poll_ready_action(moq_session_t *s, moq_action_t *out,
             }
         }
         if (blocked) continue;
-        const size_t selected = action_select_from(s, i);
+        const size_t selected = action_select_from(s, &s->action_seen, i);
         if (s->action_meta[selected % s->action_cap].terminal_barrier)
             return false;
         *meta = s->action_meta[selected % s->action_cap];
@@ -4612,9 +4803,10 @@ bool bridge_session_poll_ready_action(moq_session_t *s, moq_action_t *out,
 }
 
 /* The queue index of the action a mapped poll takes from the actions in
- * [head, end), or the tail when none qualifies. The gate only inspects. */
-static size_t mapped_select(const moq_session_t *s, size_t end,
-                            bridge_action_gate_fn gate, void *ctx)
+ * [head, end), or the tail when none qualifies, by the defining rescan. The
+ * gate only inspects. */
+static size_t mapped_select_reference(const moq_session_t *s, size_t end,
+                                      bridge_action_gate_fn gate, void *ctx)
 {
     size_t best = s->action_tail;
     for (size_t i = s->action_head; i < end; ++i) {
@@ -4672,6 +4864,84 @@ static size_t mapped_select(const moq_session_t *s, size_t end,
     return best;
 }
 
+/* The same choice in one pass. The loop leaves an action only by moving to
+ * the next one or by ending, so every action in [head, idx) was visited when
+ * it reaches idx. Each visited data action on a stream enters `seen` before
+ * anything can pass over it -- a stream's key, a SEND_DATA behind its own
+ * stream, and one the gate does not admit alike -- and a non-data action is
+ * on no data stream, so the set holds exactly the streams the rescan would
+ * match. The gate sees the same inspecting calls in the same order. */
+static size_t mapped_select_once(const moq_session_t *s, moq_seen_set_t *seen,
+                                 size_t end, bridge_action_gate_fn gate,
+                                 void *ctx)
+{
+    if (!seen_begin(seen)) return mapped_select_reference(s, end, gate, ctx);
+    size_t best = s->action_tail;
+    for (size_t i = s->action_head; i < end; ++i) {
+        const size_t at = i % s->action_cap;
+        const moq_action_t *a = &s->actions[at];
+        const moq_action_meta_t *m = &s->action_meta[at];
+        if (m->terminal_barrier || m->terminal_owner ||
+            action_waits_for_terminal(s, i)) break;
+        if (a->kind == MOQ_ACTION_CLOSE_SESSION) {
+            /* close_with_error discards the core backlog before queuing this.
+             * Supersede bridge storage, not an intervening core barrier. */
+            if (i == s->action_head) best = i;
+            break;
+        }
+        if (!action_is_data(a)) {
+            if (gate(ctx, a, m, false) == BRIDGE_ACTION_SKIP) continue;
+            /* A request's open can still be core-owned. Its following bytes
+             * and FIN have the same map dependency; no other bidi terminal
+             * or connection action is allowed through this exception. */
+            moq_stream_ref_t ref = moq_stream_ref_from_u64(0);
+            if (a->kind == MOQ_ACTION_SEND_BIDI_STREAM)
+                ref = a->u.send_bidi_stream.stream_ref;
+            else if (a->kind == MOQ_ACTION_CLOSE_BIDI_STREAM)
+                ref = a->u.close_bidi_stream.stream_ref;
+            bool blocked_open = false;
+            for (size_t j = s->action_head; ref._v && j < i; ++j) {
+                const size_t prior = j % s->action_cap;
+                const moq_action_t *open = &s->actions[prior];
+                if (open->kind == MOQ_ACTION_OPEN_BIDI_STREAM &&
+                    open->u.open_bidi_stream.stream_ref._v == ref._v &&
+                    gate(ctx, open, &s->action_meta[prior], false) ==
+                        BRIDGE_ACTION_SKIP) {
+                    blocked_open = true;
+                    break;
+                }
+            }
+            if (blocked_open) continue;
+            break;
+        }
+        seen_result_t r = SEEN_NEW;
+        moq_stream_ref_t ref;
+        if (action_data_stream(a, &ref)) {
+            r = seen_add(seen, ref._v);
+            if (r == SEEN_FULL) return mapped_select_reference(s, end, gate, ctx);
+        }
+        if (a->kind != MOQ_ACTION_SEND_DATA) continue;
+        if (r == SEEN_PRESENT || gate(ctx, a, m, false) != BRIDGE_ACTION_READY)
+            continue;
+        if (best == s->action_tail ||
+            sched_compare(m, &s->action_meta[best % s->action_cap]) < 0)
+            best = i;
+    }
+    return best;
+}
+
+static size_t mapped_select(const moq_session_t *s, moq_seen_set_t *seen,
+                            size_t end, bridge_action_gate_fn gate, void *ctx)
+{
+    const size_t best = mapped_select_once(s, seen, end, gate, ctx);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    /* Test builds hold every one-pass choice to the defining rescan. As in
+     * the head-only check below, the gate's inspecting calls change nothing. */
+    if (mapped_select_reference(s, end, gate, ctx) != best) abort();
+#endif
+    return best;
+}
+
 bool bridge_session_poll_mapped_action(moq_session_t *s, moq_action_t *out,
     moq_action_meta_t *meta, bool data_open, bridge_action_gate_fn gate,
     void *ctx)
@@ -4681,11 +4951,11 @@ bool bridge_session_poll_mapped_action(moq_session_t *s, moq_action_t *out,
      * the gate's inspecting calls change nothing, so the head decides. */
     const size_t end = data_open || s->action_head == s->action_tail
         ? s->action_tail : s->action_head + 1;
-    const size_t best = mapped_select(s, end, gate, ctx);
+    const size_t best = mapped_select(s, &s->action_seen, end, gate, ctx);
 #ifdef MOQ_SESSION_SWEEP_TESTING
     /* Test builds hold the head-only selection to the full scan. */
     if (end != s->action_tail &&
-        mapped_select(s, s->action_tail, gate, ctx) != best)
+        mapped_select(s, &s->action_seen, s->action_tail, gate, ctx) != best)
         abort();
 #endif
     if (best == s->action_tail) return false;

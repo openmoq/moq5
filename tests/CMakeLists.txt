@@ -351,6 +351,29 @@ target_compile_definitions(test_session_exact_work_controls PRIVATE
     MOQ_SESSION_SWEEP_TESTING EXACT_WORK_NO_COMPLEXITY)
 add_test(NAME session_exact_work_controls COMMAND test_session_exact_work_controls)
 
+# One-pass scheduling selection and held-subgroup records, against the
+# test-internals core that holds each to the search it replaces.
+add_executable(test_scheduling_one_pass unit/test_scheduling_one_pass.c)
+target_link_libraries(test_scheduling_one_pass PRIVATE moq-core-test-internals)
+target_compile_definitions(test_scheduling_one_pass PRIVATE MOQ_SESSION_SWEEP_TESTING)
+add_test(NAME scheduling_one_pass COMMAND test_scheduling_one_pass)
+
+# The in-place receive parse against its staged reference
+# (session_rx_stage_reference, an internals-only switch).
+add_executable(test_session_rx_in_place unit/test_session_rx_in_place.c)
+target_link_libraries(test_session_rx_in_place PRIVATE moq-core-test-internals)
+target_compile_definitions(test_session_rx_in_place PRIVATE MOQ_SESSION_SWEEP_TESTING)
+add_test(NAME session_rx_in_place COMMAND test_session_rx_in_place)
+# A bounded sweep (tens of thousands of short pair runs); a run that
+# outlives this is a hang, not a slow pass.
+set_tests_properties(session_rx_in_place PROPERTIES TIMEOUT 900)
+# The same binary on its controls, known answers and allocator-refusal cases
+# only. It fails while a refused whole-object payload allocation still leaves
+# the object's properties block behind.
+add_test(NAME session_rx_in_place_known_alloc_failure
+         COMMAND test_session_rx_in_place --known-alloc-failure)
+set_tests_properties(session_rx_in_place_known_alloc_failure PROPERTIES TIMEOUT 300)
+
 add_executable(test_transport_bridge
     unit/test_transport_bridge.c
     unit/transport_bridge/admission.c
@@ -726,6 +749,13 @@ add_test(NAME session_subgroup COMMAND test_session_subgroup)
 add_executable(test_session_receive unit/test_session_receive.c)
 target_link_libraries(test_session_receive PRIVATE moq-core-test-internals)
 add_test(NAME session_receive COMMAND test_session_receive)
+
+# One refused whole-object payload allocation: the stream stays consistent
+# for an empty advance, a reset and a destroy.
+add_executable(test_session_rx_alloc_fail unit/test_session_rx_alloc_fail.c)
+target_link_libraries(test_session_rx_alloc_fail PRIVATE moq-core-test-internals)
+add_test(NAME session_rx_alloc_fail COMMAND test_session_rx_alloc_fail)
+set_tests_properties(session_rx_alloc_fail PROPERTIES TIMEOUT 60)
 add_executable(test_subgroup_terminal_last_object unit/test_subgroup_terminal_last_object.c)
 target_link_libraries(test_subgroup_terminal_last_object PRIVATE moq-core-test-internals)
 add_test(NAME subgroup_terminal_last_object COMMAND test_subgroup_terminal_last_object)
