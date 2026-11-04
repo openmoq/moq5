@@ -75,6 +75,8 @@ static const moq5_layout_entry_t entries[] = {
     F(moq_media_sender_cfg_t, catalog_refresh_interval_us),
     F(moq_media_sender_cfg_t, companion_profile),
     F(moq_media_sender_cfg_t, resource_auth),
+    F(moq_media_sender_cfg_t, initial_group_id),
+    F(moq_media_sender_cfg_t, has_initial_group_id),
     S(moq_media_track_cfg_t), F(moq_media_track_cfg_t, struct_size), F(moq_media_track_cfg_t, name),
     F(moq_media_track_cfg_t, media_type), F(moq_media_track_cfg_t, packaging),
     F(moq_media_track_cfg_t, codec), F(moq_media_track_cfg_t, timescale),
