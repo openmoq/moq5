@@ -97,6 +97,12 @@ int main(void)
         }
         if (task.sender) moq_media_sender_destroy(task.sender);
         MOQ_TEST_CHECK_EQ_INT(moq_endpoint_test_attachments(ep), 0);
+        /* Destroying the attached sender (row 0) posts its publisher's cleanup
+         * to the endpoint; complete that posted cleanup before releasing the
+         * fixture endpoint. */
+        MOQ_TEST_CHECK_EQ_SIZE(moq_endpoint_test_task_count(ep), row == 0 ? 1u : 0u);
+        moq_endpoint_test_drain_terminal(ep);
+        MOQ_TEST_CHECK_EQ_SIZE(moq_endpoint_test_task_count(ep), 0);
         moq_endpoint_test_free_bare(ep);
     }
     moq_simpair_destroy(pair);
