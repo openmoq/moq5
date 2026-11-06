@@ -618,6 +618,19 @@ MOQ_API moq_result_t moq_session_on_data_bytes(moq_session_t *s,
  * instead of copies. The adapter's transport buffer is released when
  * the last slice is decreffed via moq_event_cleanup.
  *
+ * In whole-object mode, when an object's header arrives without any of
+ * its payload and the next call delivers, with nothing buffered ahead of
+ * it, an input that is exactly that payload and is a created rcbuf
+ * (moq_rcbuf_create: neither a slice nor wrapped) allocated with this
+ * session's allocator (the same alloc, realloc, free and ctx it was created
+ * with), the OBJECT_RECEIVED payload is that input rcbuf itself, with a
+ * reference added. It keeps alive exactly what the copy it replaces would
+ * (the payload's bytes and one rcbuf header, from the same allocator). Any
+ * other payload, including every one from a slice, a wrapped input or
+ * another allocator, is a copy. The caller keeps its own reference and may
+ * feed one input more than once; every reference, the caller's and the
+ * events', stays under the rcbuf shard rule (rcbuf.h).
+ *
  * data may be NULL for zero-length or retry calls.
  *
  * Advancing call: invalidates borrows, takes now_us.

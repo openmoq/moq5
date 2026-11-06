@@ -59,6 +59,7 @@ set(BASE_SYMBOLS
     moq_core_internal_virtual_finish
     moq_core_internal_track_max_cache_duration
     moq_core_internal_track_properties_validate
+    moq_core_internal_rcbuf_transferable
 )
 set(FAMILY_PREFIX "moq_core_internal_")
 

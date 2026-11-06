@@ -70,10 +70,12 @@ set(virtual_names
     moq_core_internal_virtual_poll
     moq_core_internal_virtual_resolve
     moq_core_internal_virtual_finish)
+set(rcbuf_names
+    moq_core_internal_rcbuf_transferable)
 set(macho "0000000000001000 T _${want}\n0000000000001800 T _${want2}\n0000000000001c00 T _${want3}\n")
 set(elf "0000000000001000 T ${want}\n0000000000001800 T ${want2}\n0000000000001c00 T ${want3}\n")
 set(versioned "0000000000001000 T ${want}@@MOQ_1\n0000000000001800 T ${want2}@@MOQ_1\n0000000000001c00 T ${want3}@@MOQ_1\n")
-foreach(symbol IN LISTS virtual_names)
+foreach(symbol IN LISTS virtual_names rcbuf_names)
     string(APPEND macho "0000000000002000 T _${symbol}\n")
     string(APPEND elf "0000000000002000 T ${symbol}\n")
     string(APPEND versioned "0000000000002000 T ${symbol}@@MOQ_1\n")
@@ -92,6 +94,9 @@ run_row(missing_reset elf fail "MISSING" "${missing_reset}" "" 0)
 string(REPLACE "0000000000002000 T moq_core_internal_virtual_finish\n" ""
     missing_virtual "${elf}")
 run_row(missing_virtual elf fail "MISSING" "${missing_virtual}" "" 0)
+string(REPLACE "0000000000002000 T moq_core_internal_rcbuf_transferable\n" ""
+    missing_rcbuf "${elf}")
+run_row(missing_rcbuf elf fail "MISSING" "${missing_rcbuf}" "" 0)
 run_row(extra macho fail "UNEXPECTED"
     "${macho}0000000000003000 T _moq_core_internal_other\n" "" 0)
 # Names that merely contain the expected one do not satisfy it.

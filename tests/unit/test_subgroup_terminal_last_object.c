@@ -295,7 +295,8 @@ int main(void)
     }
 
     /* The payload of the first Object cannot be allocated after its header
-     * parsed, then the stream is reset: no Object completed. After a
+     * parsed (its storage is settled when its bytes arrive, so they are
+     * delivered), then the stream is reset: no Object completed. After a
      * completed Object 0, the same failure on Object 1 leaves Object 0 the
      * last. */
     for (int predecessor = 0; predecessor < 2; predecessor++) {
@@ -322,7 +323,7 @@ int main(void)
         MOQ_TEST_CHECK(moq_session_write_object(sv, sg, 1, p, 0) == MOQ_OK);
         moq_rcbuf_decref(p);
         st.fail_size = payload_size;
-        feed(sv, c, ref, true);
+        feed(sv, c, ref, false);
         MOQ_TEST_CHECK(st.failed == 1);
         MOQ_TEST_CHECK(moq_session_reset_subgroup(sv, sg, 0, 0) == MOQ_OK);
         drain_publisher(sv);

@@ -1942,13 +1942,23 @@ typedef struct moq_rx_stream {
 
     uint64_t               payload_expected;
     size_t                 payload_written;
-    /* payload_rcbuf is the delivered object payload, allocated up front (once
-     * payload_len is known) via moq_rcbuf_alloc_uninit and filled in place;
-     * payload_buf is the writable cursor into its inline storage. On emit the
-     * rcbuf is handed to the event without a copy. Both are cleared when
-     * ownership transfers to the event; a torn-down stream decrefs the rcbuf. */
+    /* payload_rcbuf is the delivered object payload. It is either allocated
+     * (moq_rcbuf_alloc_uninit) and filled in place, payload_buf being the
+     * writable cursor into its inline storage, or, when the whole payload
+     * arrives as one caller rcbuf that may be shared (rx_payload_shareable),
+     * that rcbuf itself (payload_buf NULL, nothing left to write). On emit
+     * the rcbuf is handed to the event without a copy. Both are cleared when
+     * ownership transfers to the event; a torn-down stream decrefs the rcbuf.
+     *
+     * payload_deferred: the object is admitted and its payload charged to the
+     * receive budget, but none of its bytes has arrived yet, so no storage
+     * exists (payload_rcbuf NULL). Its first payload bytes settle it: the
+     * caller's rcbuf when that is exactly the payload and may be shared, an
+     * allocation otherwise. Teardown releases the charge exactly as for an
+     * allocated payload. */
     moq_rcbuf_t           *payload_rcbuf;
     uint8_t               *payload_buf;
+    bool                   payload_deferred;
     uint64_t               cur_object_id;
     uint8_t                cur_status;
     moq_rcbuf_t           *cur_extensions;
@@ -3061,7 +3071,26 @@ void fill_stream_meta(const moq_session_t *s, const moq_fill_entry_t *f,
                       moq_action_meta_t *out);
 moq_subgroup_handle_t sg_make_handle(moq_session_t *s, size_t slot);
 
-int sub_resolve_handle(const moq_session_t *s, moq_subscription_t h);
+/* Handle field extraction in the layout moq_handle_pack writes (types.c),
+ * inline so the per-object resolvers make no calls. The exported
+ * moq_handle_* accessors stay the public form of the same fields. */
+static inline uint32_t handle_pool_tag(uint64_t h)    { return (uint32_t)(h >> 60) & 0xFu; }
+static inline uint16_t handle_session_tag(uint64_t h) { return (uint16_t)(h >> 44); }
+static inline uint32_t handle_generation(uint64_t h)  { return (uint32_t)(h >> 16) & 0xFFFFFFFu; }
+static inline uint32_t handle_slot(uint64_t h)        { return (uint32_t)(h) & 0xFFFFu; }
+
+/* The slot of a live subscription named by `h`, or -1. */
+static inline int sub_resolve_handle(const moq_session_t *s, moq_subscription_t h)
+{
+    uint64_t v = h._opaque;
+    uint32_t slot = handle_slot(v);
+    if (handle_pool_tag(v) != MOQ_HANDLE_POOL_SUBSCRIPTION) return -1;
+    if (handle_session_tag(v) != s->session_tag) return -1;
+    if (slot >= s->sub_cap) return -1;
+    if (s->subs[slot].generation != handle_generation(v)) return -1;
+    if (s->subs[slot].state == MOQ_SUB_FREE) return -1;
+    return (int)slot;
+}
 /* Whether `h` resolves to a subscription whose peer cancellation is pending
  * (moq_sub_entry_t.cancel_pending). */
 bool sub_cancel_pending(moq_session_t *s, moq_subscription_t h);
@@ -4347,6 +4376,29 @@ extern uint64_t session_work_rx_charged;
  * staged copy instead of in place: the reference a differential test compares
  * the in-place parse against (session_receive.c, rx_in_place_t). */
 extern bool session_rx_stage_reference;
+
+/*
+ * The batched poll's selections (session_poll_actions). Observational only,
+ * like the counters above. A selection is counted when it is decided; the
+ * caller may still refuse the action it names (a barrier, a terminal wait, a
+ * too-small element), and a retained terminal reset is not a selection. So:
+ *   builds   == certified + every refused_* counter
+ *   served   == certified + reused
+ *   data selections == served + fallback
+ */
+extern uint64_t session_sched_select_nondata;      /* selections of a non-data head */
+extern uint64_t session_sched_select_fallback;     /* data selections made by action_select */
+extern uint64_t session_sched_cert_builds;         /* certificate walks started */
+extern uint64_t session_sched_cert_certified;      /* walks that certified their window */
+extern uint64_t session_sched_cert_refused_priority;  /* a priority better than the action before it */
+extern uint64_t session_sched_cert_refused_key;       /* an owner's location order going back */
+extern uint64_t session_sched_cert_refused_mode;      /* a located owner action that is not subgroup or datagram */
+extern uint64_t session_sched_cert_refused_direction; /* an owner's group order changing */
+extern uint64_t session_sched_cert_refused_owners;    /* more located owners than the walk tracks */
+extern uint64_t session_sched_cert_visits;         /* actions the walks examined */
+extern uint64_t session_sched_cert_served;         /* data selections the certificate decided */
+extern uint64_t session_sched_cert_reused;         /* served selections that needed no walk */
+extern uint64_t session_sched_cert_invalidated;    /* certificates dropped before a reset retry or at a retained reset */
 #endif
 moq_result_t session_stop_bound_streams_resumable(moq_session_t *s,
                                                   moq_subscription_t sub,

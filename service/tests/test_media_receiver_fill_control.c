@@ -105,6 +105,8 @@ static bool fill_attach(origin_fixture_t *f)
 {
     f->receiver->ep = moq_endpoint_test_make_bare();
     ORIGIN_REQUIRE(f->receiver->ep);
+    /* As receiver_new does for a receiver built on an endpoint. */
+    ORIGIN_REQUIRE(receiver_reserve_teardown(f->receiver));
     moq_endpoint_hook_ops_t ops = { .pump = receiver_hook };
     ORIGIN_REQUIRE(moq_endpoint_attach_hook(f->receiver->ep, MOQ_ENDPOINT_HOOK_RECEIVER,
         &ops, f->receiver) == MOQ_OK);

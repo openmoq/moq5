@@ -1,5 +1,6 @@
 #include "moq/rcbuf.h"
 #include "rcbuf_internal.h"
+#include "../spi/core_spi.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -239,6 +240,44 @@ const uint8_t *moq_rcbuf_data(const moq_rcbuf_t *buf)
 size_t moq_rcbuf_len(const moq_rcbuf_t *buf)
 {
     return buf ? buf->len : 0;
+}
+
+static bool rcbuf_alloc_equal(const moq_alloc_t *a, const moq_alloc_t *b)
+{
+    return a && b && a->ctx == b->ctx && a->alloc == b->alloc &&
+           a->realloc == b->realloc && a->free == b->free;
+}
+
+static bool rcbuf_alloc_trusted(const moq_alloc_t *a,
+                                const moq_alloc_t *const *trusted, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        if (rcbuf_alloc_equal(trusted[i], a)) return true;
+    return false;
+}
+
+bool moq_core_internal_rcbuf_transferable(const moq_rcbuf_t *buf,
+    const moq_alloc_t *const *trusted, size_t n)
+{
+    if (!buf || buf->refcount != 1) return false;
+    const moq_rcbuf_t *root = buf;
+    if (buf->sliced) {
+        root = buf->parent;
+        if (root->len != buf->len) return false;   /* keeps more than its bytes */
+        if (!rcbuf_alloc_trusted(&buf->alloc, trusted, n)) return false;
+    }
+    if (root->refcount != 1 || root->wrapped) return false;
+    return rcbuf_alloc_trusted(&root->alloc, trusted, n);
+}
+
+bool moq_rcbuf_is_created_root(const moq_rcbuf_t *buf)
+{
+    return buf && !buf->sliced && !buf->wrapped;
+}
+
+bool moq_rcbuf_allocated_by(const moq_rcbuf_t *buf, const moq_alloc_t *alloc)
+{
+    return buf && rcbuf_alloc_equal(&buf->alloc, alloc);
 }
 
 uint32_t moq_rcbuf_refcount(const moq_rcbuf_t *buf)

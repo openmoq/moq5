@@ -232,20 +232,6 @@ static moq_subscription_t sub_make_handle(moq_session_t *s, size_t slot)
     return h;
 }
 
-int sub_resolve_handle(const moq_session_t *s, moq_subscription_t h)
-{
-    uint32_t pool = moq_handle_pool_tag(h._opaque);
-    uint16_t tag  = moq_handle_session_tag(h._opaque);
-    uint32_t slot = moq_handle_slot(h._opaque);
-    uint32_t gen  = moq_handle_generation(h._opaque);
-    if (pool != MOQ_HANDLE_POOL_SUBSCRIPTION) return -1;
-    if (tag != s->session_tag) return -1;
-    if (slot >= s->sub_cap) return -1;
-    if (s->subs[slot].generation != gen) return -1;
-    if (s->subs[slot].state == MOQ_SUB_FREE) return -1;
-    return (int)slot;
-}
-
 bool sub_cancel_pending(moq_session_t *s, moq_subscription_t h)
 {
     int slot = sub_resolve_handle(s, h);

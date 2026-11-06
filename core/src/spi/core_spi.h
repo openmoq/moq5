@@ -24,6 +24,26 @@
 extern "C" {
 #endif
 
+/* Whether `buf` may move whole to another thread: it is the only reference
+ * to everything it keeps alive, it keeps alive no data beyond its own bytes
+ * (so a charge of moq_rcbuf_len(buf) covers its retained data), and
+ * everything its final release frees is rcbuf-owned storage released through
+ * an allocator the caller vouches for on the destination thread. Precisely,
+ * all of:
+ *   - buf's reference count is 1;
+ *   - for a slice, its root's reference count is 1 (slices are flattened,
+ *     so the graph is exactly the slice and its root) and the slice covers
+ *     its whole root;
+ *   - the root's storage is its own allocation, not wrapped (a wrapped
+ *     root's external storage and release callback carry thread and
+ *     lifetime rules an rcbuf does not describe);
+ *   - every allocator the final release calls (the root's, and a slice's
+ *     own) equals, field for field, one of trusted[0..n).
+ * The counts are not atomic: call this on the shard that owns every
+ * reference to `buf`, before the transfer is published. False for NULL. */
+MOQ_API bool moq_core_internal_rcbuf_transferable(const moq_rcbuf_t *buf,
+    const moq_alloc_t *const *trusted, size_t n);
+
 /* The MAX_CACHE_DURATION Track Property (0x04: draft-22 §10.3, draft-18
  * §12.3, draft-16 §11.1.1) in a Track Property set encoded for `version`.
  * Draft-18 and draft-22 search Immutable Properties as well, as their text

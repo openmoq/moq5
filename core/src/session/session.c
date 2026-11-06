@@ -417,6 +417,19 @@ uint64_t session_work_reset_offer;
 uint64_t session_work_sg_stream_find;
 uint64_t session_work_catchup_passes;
 uint64_t session_work_rx_rescan_passes;
+uint64_t session_sched_select_nondata;
+uint64_t session_sched_select_fallback;
+uint64_t session_sched_cert_builds;
+uint64_t session_sched_cert_certified;
+uint64_t session_sched_cert_refused_priority;
+uint64_t session_sched_cert_refused_key;
+uint64_t session_sched_cert_refused_mode;
+uint64_t session_sched_cert_refused_direction;
+uint64_t session_sched_cert_refused_owners;
+uint64_t session_sched_cert_visits;
+uint64_t session_sched_cert_served;
+uint64_t session_sched_cert_reused;
+uint64_t session_sched_cert_invalidated;
 #endif
 
 uint32_t session_budget_remaining(const moq_session_t *s)
@@ -719,10 +732,12 @@ void free_rx_stream_bufs(moq_session_t *s)
         if (rx->active) {
             moq_index_remove(s->idx_rx_by_ref, s->idx_rx_mask,
                               rx->stream_ref._v);
-            if (rx->payload_rcbuf) {
-                /* Payload assembled into an rcbuf but not yet emitted;
-                 * payload_buf points into it, so decref instead of freeing. */
+            if (rx->payload_rcbuf || rx->payload_deferred) {
+                /* Payload assembled into an rcbuf but not yet emitted (or
+                 * admitted with its storage still deferred); payload_buf
+                 * points into it, so decref instead of freeing. */
                 moq_rcbuf_decref(rx->payload_rcbuf);
+                rx->payload_deferred = false;
                 if ((size_t)rx->payload_expected <= s->recv_payload_bytes)
                     s->recv_payload_bytes -= (size_t)rx->payload_expected;
                 else
@@ -1618,6 +1633,280 @@ static size_t action_select_from(const moq_session_t *s, moq_seen_set_t *seen,
 static size_t action_select(moq_session_t *s)
 {
     return action_select_from(s, &s->action_seen, s->action_head);
+}
+
+/* -- Certified selection for the batched poll ---------------------- *
+ * A batched poll takes many actions in a row, and between two of its picks
+ * the ring changes only by the pick itself and by a reset retry run while
+ * subgroup reset debt is outstanding. One walk of the leading data window can
+ * show that no action in it is placed before an action queued earlier in it:
+ * priorities never improve along the window, and within each owner whose
+ * actions carry a location, at one priority, the location order never goes
+ * back. Then no candidate is placed before the head, so the defining scan,
+ * which replaces its best only on a strict improvement, keeps the head; and
+ * taking the head leaves a window with the same property, so the next pick
+ * is its new head without another walk. Every data action is checked, not
+ * only the current candidates, because taking an action makes the next one
+ * on its stream a candidate.
+ *
+ * In such a window sched_compare is nonzero only for a priority difference
+ * or for two actions of one owner that both carry a location. For those the
+ * walk admits only subgroup and datagram actions under one group order, where
+ * sched_compare is the order of (group, datagram before subgroup, subgroup or
+ * object ID). Any other located mode, a change of group order within an
+ * owner, or more located owners than the walk tracks does not certify, and
+ * the pick takes action_select. The certificate lives for one poll call. */
+
+enum { SCHED_CERT_OWNERS = 8 };
+
+typedef enum {
+    SCHED_CERT_UNKNOWN,     /* no certificate: the next data pick walks */
+    SCHED_CERT_CERTIFIED,   /* [head, end) holds the property */
+    SCHED_CERT_FAILED,      /* the window did not certify: its picks take action_select */
+} sched_cert_state_t;
+
+typedef enum {
+    SCHED_CERT_OK,
+    SCHED_CERT_REFUSED_PRIORITY,
+    SCHED_CERT_REFUSED_KEY,
+    SCHED_CERT_REFUSED_MODE,
+    SCHED_CERT_REFUSED_DIRECTION,
+    SCHED_CERT_REFUSED_OWNERS,
+} sched_cert_verdict_t;
+
+typedef struct {
+    sched_cert_state_t state;
+    size_t head;            /* the head the next certified pick expects */
+    size_t tail;            /* the tail the walk saw */
+    size_t end;             /* the window's end: the tail or a non-data action */
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    uint64_t print;         /* sum of the slot prints of [head, tail) */
+    uint64_t head_print;    /* print of the action the last certified pick named */
+#endif
+} sched_cert_t;
+
+/* Where sched_compare places a located action among its owner's actions of
+ * the same priority. */
+typedef struct {
+    uint64_t group;         /* group ID, inverted under descending group order */
+    uint64_t id;            /* subgroup ID of a subgroup action, object ID of a datagram */
+    uint8_t  rank;          /* 0 for a datagram, which precedes a subgroup of its group */
+} sched_cert_loc_t;
+
+typedef struct {
+    uint64_t         owner;
+    sched_cert_loc_t loc;   /* of the owner's latest action in the window */
+    uint8_t          subscriber_priority;
+    uint8_t          publisher_priority;
+    bool             descending;
+} sched_cert_owner_t;
+
+static bool sched_cert_loc_before(const sched_cert_loc_t *x, const sched_cert_loc_t *y)
+{
+    if (x->group != y->group) return x->group < y->group;
+    if (x->rank != y->rank) return x->rank < y->rank;
+    return x->id < y->id;
+}
+
+/* Walk the data window at the head, which holds a data action. On success
+ * the certificate covers [head, end). */
+static sched_cert_verdict_t sched_cert_build(const moq_session_t *s, sched_cert_t *cert)
+{
+    const size_t head = s->action_head, tail = s->action_tail, cap = s->action_cap;
+    sched_cert_owner_t owners[SCHED_CERT_OWNERS] = {0};
+    size_t n_owners = 0, at = 0;
+    uint8_t sp = 0, pp = 0;
+    size_t i = head;
+    for (; i < tail; i++) {
+        if (!action_is_data(&s->actions[i % cap])) break;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_sched_cert_visits++;
+#endif
+        const moq_action_meta_t *m = &s->action_meta[i % cap];
+        if (i != head && (m->subscriber_priority < sp ||
+                          (m->subscriber_priority == sp && m->publisher_priority < pp)))
+            return SCHED_CERT_REFUSED_PRIORITY;
+        sp = m->subscriber_priority;
+        pp = m->publisher_priority;
+        /* Without an owner or a location, sched_compare stops at the
+         * priorities, which the check above already orders. */
+        if (m->owner == 0 || !m->has_location) continue;
+        if (m->mode != MOQ_SCHED_MODE_SUBGROUP && m->mode != MOQ_SCHED_MODE_DATAGRAM)
+            return SCHED_CERT_REFUSED_MODE;
+        const bool descending = m->group_order == MOQ_GROUP_ORDER_DESCENDING;
+        const bool datagram = m->mode == MOQ_SCHED_MODE_DATAGRAM;
+        const sched_cert_loc_t loc = {
+            .group = descending ? ~m->group_id : m->group_id,
+            .id = datagram ? m->object_id : m->subgroup_id,
+            .rank = (uint8_t)(datagram ? 0 : 1),
+        };
+        if (at >= n_owners || owners[at].owner != m->owner)
+            for (at = 0; at < n_owners && owners[at].owner != m->owner; at++) {}
+        if (at == n_owners) {
+            if (n_owners == SCHED_CERT_OWNERS) return SCHED_CERT_REFUSED_OWNERS;
+            owners[n_owners++] = (sched_cert_owner_t){
+                .owner = m->owner, .loc = loc,
+                .subscriber_priority = sp, .publisher_priority = pp,
+                .descending = descending,
+            };
+            continue;
+        }
+        sched_cert_owner_t *o = &owners[at];
+        if (o->descending != descending) return SCHED_CERT_REFUSED_DIRECTION;
+        /* The priority check keeps an owner's priorities from improving; at
+         * a worse priority any location follows. */
+        if (o->subscriber_priority == sp && o->publisher_priority == pp &&
+            sched_cert_loc_before(&loc, &o->loc))
+            return SCHED_CERT_REFUSED_KEY;
+        o->loc = loc;
+        o->subscriber_priority = sp;
+        o->publisher_priority = pp;
+    }
+    cert->state = SCHED_CERT_CERTIFIED;
+    cert->head = head;
+    cert->tail = tail;
+    cert->end = i;
+    return SCHED_CERT_OK;
+}
+
+#ifdef MOQ_SESSION_SWEEP_TESTING
+/* The kind, data stream and every sched_compare input of the action at
+ * queue index i, mixed with the index. */
+static uint64_t sched_cert_slot_print(const moq_session_t *s, size_t i)
+{
+    const moq_action_t *a = &s->actions[i % s->action_cap];
+    const moq_action_meta_t *m = &s->action_meta[i % s->action_cap];
+    moq_stream_ref_t ref = moq_stream_ref_from_u64(0);
+    const uint64_t stream = action_data_stream(a, &ref) ? 1u : 0u;
+    uint64_t h = idx_hash((uint64_t)i);
+    h = idx_hash(h ^ ((uint64_t)a->kind | (stream << 32)));
+    h = idx_hash(h ^ ref._v);
+    h = idx_hash(h ^ m->owner);
+    h = idx_hash(h ^ m->group_id);
+    h = idx_hash(h ^ m->subgroup_id);
+    h = idx_hash(h ^ m->object_id);
+    h = idx_hash(h ^ ((uint64_t)m->subscriber_priority |
+                      (uint64_t)m->publisher_priority << 8 |
+                      (uint64_t)m->mode << 16 |
+                      (uint64_t)m->group_order << 24 |
+                      (uint64_t)m->fill_group_order << 32 |
+                      (uint64_t)(m->has_location ? 1u : 0u) << 40));
+    return h;
+}
+
+static uint64_t sched_cert_ring_print(const moq_session_t *s)
+{
+    uint64_t sum = 0;
+    for (size_t i = s->action_head; i < s->action_tail; i++)
+        sum += sched_cert_slot_print(s, i);
+    return sum;
+}
+
+/* Test builds hold a new certificate to its property over every pair of its
+ * window, each reuse to the ring the certificate was built on (the slot
+ * prints above, less the actions certified picks have taken), and every
+ * certified pick to the defining rescan. */
+static void sched_cert_check(const moq_session_t *s, sched_cert_t *cert, bool built)
+{
+    const size_t head = s->action_head, cap = s->action_cap;
+    if (built) {
+        for (size_t j = head + 1; j < cert->end; j++)
+            for (size_t i = head; i < j; i++)
+                if (sched_compare(&s->action_meta[j % cap], &s->action_meta[i % cap]) < 0)
+                    abort();
+        cert->print = sched_cert_ring_print(s);
+    } else if (sched_cert_ring_print(s) != cert->print) {
+        abort();
+    }
+    cert->head_print = sched_cert_slot_print(s, head);
+    if (action_select_reference(s, head) != head) abort();
+}
+#endif
+
+/* The queue index of the action the batched poll takes next: always the
+ * index action_select would give. */
+static size_t action_select_batched(moq_session_t *s, sched_cert_t *cert)
+{
+    const size_t head = s->action_head;
+    if (!action_is_data(&s->actions[head % s->action_cap])) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_sched_select_nondata++;
+#endif
+        return head;
+    }
+    if (cert->state == SCHED_CERT_CERTIFIED) {
+        if (head == cert->head && s->action_tail == cert->tail && head < cert->end) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+            session_sched_cert_served++;
+            session_sched_cert_reused++;
+            sched_cert_check(s, cert, false);
+#endif
+            return head;
+        }
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        /* Only the poll's own takes move the ring under a certificate. */
+        abort();
+#endif
+        cert->state = SCHED_CERT_UNKNOWN;
+    }
+    if (cert->state == SCHED_CERT_UNKNOWN) {
+        const sched_cert_verdict_t verdict = sched_cert_build(s, cert);
+#ifdef MOQ_SESSION_SWEEP_TESTING
+        session_sched_cert_builds++;
+        switch (verdict) {
+        case SCHED_CERT_OK:                session_sched_cert_certified++; break;
+        case SCHED_CERT_REFUSED_PRIORITY:  session_sched_cert_refused_priority++; break;
+        case SCHED_CERT_REFUSED_KEY:       session_sched_cert_refused_key++; break;
+        case SCHED_CERT_REFUSED_MODE:      session_sched_cert_refused_mode++; break;
+        case SCHED_CERT_REFUSED_DIRECTION: session_sched_cert_refused_direction++; break;
+        case SCHED_CERT_REFUSED_OWNERS:    session_sched_cert_refused_owners++; break;
+        }
+#endif
+        if (verdict == SCHED_CERT_OK) {
+#ifdef MOQ_SESSION_SWEEP_TESTING
+            session_sched_cert_served++;
+            sched_cert_check(s, cert, true);
+#endif
+            return head;
+        }
+        cert->state = SCHED_CERT_FAILED;
+    }
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    session_sched_select_fallback++;
+#endif
+    return action_select(s);
+}
+
+/* The poll took the action at idx, chosen with `head` at the head; `data`
+ * says whether that action was data. */
+static void sched_cert_taken(sched_cert_t *cert, size_t head, size_t idx, bool data)
+{
+    if (!data) {
+        /* A new data window begins behind a non-data action. */
+        cert->state = SCHED_CERT_UNKNOWN;
+        return;
+    }
+    if (cert->state != SCHED_CERT_CERTIFIED) return;
+    if (idx != head) {
+        cert->state = SCHED_CERT_UNKNOWN;
+        return;
+    }
+    /* Taking the head moves no other action: the rest of the window keeps
+     * its slots and the property. */
+    cert->head = head + 1;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    cert->print -= cert->head_print;
+#endif
+}
+
+/* Give up a standing certificate. A window that did not certify stays so. */
+static void sched_cert_drop(sched_cert_t *cert)
+{
+    if (cert->state != SCHED_CERT_CERTIFIED) return;
+#ifdef MOQ_SESSION_SWEEP_TESTING
+    session_sched_cert_invalidated++;
+#endif
+    cert->state = SCHED_CERT_UNKNOWN;
 }
 
 static bool action_waits_for_terminal(const moq_session_t *s, size_t idx)
@@ -4993,11 +5282,15 @@ static moq_result_t session_poll_actions(moq_session_t *s,
      * object whose OBJECT_DELIVERY_TIMEOUT has elapsed must not cross it. */
     session_action_poll_prepare(s);
 
+    /* The selections of this call share one certificate (see
+     * action_select_batched); it never outlives the call. */
+    sched_cert_t cert = { .state = SCHED_CERT_UNKNOWN };
     while (n < cap && s->action_head < s->action_tail) {
         moq_action_t taken;
         moq_core_observed_open_t observed = {0};
         if (!session_is_active(s) || !sg_take_terminal_action(s, &taken)) {
-            size_t idx = action_select(s);
+            const size_t head_at = s->action_head;
+            size_t idx = action_select_batched(s, &cert);
             const moq_action_t *head = &s->actions[idx % s->action_cap];
             if (s->action_meta[idx % s->action_cap].terminal_barrier ||
                 action_waits_for_terminal(s, idx)) {
@@ -5024,6 +5317,17 @@ static moq_result_t session_poll_actions(moq_session_t *s,
                 }
             }
             action_take(s, idx, &taken);
+            sched_cert_taken(&cert, head_at, idx, action_is_data(&taken));
+        } else {
+            /* A retained terminal reset leaves the ring as it was. It is
+             * offered only while sg_reset_owed is set. A certificate stands
+             * only after a pick, and the check before that pick's reset retry
+             * already saw the flag set (the retry can clear it, never set it)
+             * and dropped the certificate. */
+#ifdef MOQ_SESSION_SWEEP_TESTING
+            if (cert.state == SCHED_CERT_CERTIFIED) abort();
+#endif
+            sched_cert_drop(&cert);
         }
         /* A terminal can replace a never-polled header. Raw RESET handoff
          * remains unobservable, but must release its bounded pending credit. */
@@ -5053,7 +5357,13 @@ static moq_result_t session_poll_actions(moq_session_t *s,
         if (opens) opens[n] = observed;
         dst += element_size;
         n++;
-        if (session_is_active(s)) sg_retry_owed_resets(s);
+        if (session_is_active(s)) {
+            /* With reset debt outstanding the retry can add, move or rewrite
+             * queued actions, a rewrite in place moving neither the head nor
+             * the tail. Without it the retry returns at once. */
+            if (s->sg_reset_owed) sched_cert_drop(&cert);
+            sg_retry_owed_resets(s);
+        }
     }
 
     if (n == 0 && terminal_blocked)

@@ -1408,6 +1408,11 @@ static void ep_facade_wake(moq_endpoint_t *ep)
     if (ep->vt && ep->facade) ep->vt->wake(ep->facade);
 }
 
+const moq_alloc_t *moq_endpoint_internal_alloc(const moq_endpoint_t *ep)
+{
+    return ep ? &ep->alloc : NULL;
+}
+
 /* Public (<moq/endpoint.h>): best-effort, non-allocating pump nudge. A bare
  * facade wake runs another pump cycle -- and thus every attached hook --
  * without queuing a task; blocked waiters return because the cycle marks
@@ -2671,6 +2676,47 @@ moq_result_t moq_endpoint_post_retryable(moq_endpoint_t *ep,
     return ep_post_impl(ep, fn, ctx, /*retryable=*/true);
 }
 
+moq_endpoint_task_slot_t *moq_endpoint_internal_reserve_task(moq_endpoint_t *ep)
+{
+    if (!ep) return NULL;
+    ep_task_t *t = (ep_task_t *)ep->alloc.alloc(sizeof(*t), ep->alloc.ctx);
+    if (t) memset(t, 0, sizeof(*t));
+    return t;
+}
+
+void moq_endpoint_internal_release_task(moq_endpoint_t *ep,
+                                        moq_endpoint_task_slot_t *slot)
+{
+    if (ep && slot) ep->alloc.free(slot, sizeof(*slot), ep->alloc.ctx);
+}
+
+moq_result_t moq_endpoint_internal_post_reserved(moq_endpoint_t *ep,
+                                                 moq_endpoint_task_slot_t *slot,
+                                                 moq_endpoint_task_fn fn, void *ctx)
+{
+    if (!ep || !slot || !fn) return MOQ_ERR_INVAL;
+    ep_task_t *t = slot;
+    t->next = NULL;
+    t->fn = fn;
+    t->ctx = ctx;
+    t->retryable = true;
+    pthread_mutex_lock(&ep->mu);
+    if (ep->stopped) {
+        /* stop() sets stopped after quiescing the managed context and before
+         * its terminal drain: nothing queued from here on would run. */
+        pthread_mutex_unlock(&ep->mu);
+        return MOQ_ERR_CLOSED;
+    }
+    /* Accepted even when terminal: a task queued before stopped is set runs
+     * on a later pump cycle or in stop()'s terminal drain. */
+    if (ep->q_tail) ep->q_tail->next = t;
+    else            ep->q_head = t;
+    ep->q_tail = t;
+    pthread_mutex_unlock(&ep->mu);
+    ep_facade_wake(ep);
+    return MOQ_OK;
+}
+
 #if defined(MOQ_MEDIA_SENDER_TESTING) || defined(MOQ_MEDIA_RECEIVER_TESTING)
 /* -- Bare-endpoint test seam (not built into the shipping library) ------ *
  * A "bare" endpoint carries only the mutex + atomics + post() queue, with NULL
@@ -2682,9 +2728,15 @@ moq_result_t moq_endpoint_post_retryable(moq_endpoint_t *ep,
  *    WOULD_BLOCK. ep_drain_posted touches only the queue + the task fn (never
  *    vt/facade), so it is safe on a bare endpoint even with a live session. */
 
+moq_endpoint_t *moq_endpoint_test_make_bare_alloc(const moq_alloc_t *alloc);
 moq_endpoint_t *moq_endpoint_test_make_bare(void)
 {
-    const moq_alloc_t *alloc = moq_alloc_default();
+    return moq_endpoint_test_make_bare_alloc(moq_alloc_default());
+}
+
+/* A bare endpoint whose allocator (its task nodes included) is `alloc`. */
+moq_endpoint_t *moq_endpoint_test_make_bare_alloc(const moq_alloc_t *alloc)
+{
     moq_endpoint_t *ep = (moq_endpoint_t *)alloc->alloc(sizeof(*ep), alloc->ctx);
     if (!ep) return NULL;
     memset(ep, 0, sizeof(*ep));
@@ -2790,6 +2842,34 @@ void moq_endpoint_test_set_facade_version(moq_endpoint_t *ep, moq_version_t v)
 {
     test_facade_version = v;
     ep->vt = &test_facade_vt;
+    ep->facade = ep;
+}
+
+/* A facade stand-in whose stop() runs stop_fn(ctx), where a test joins the
+ * thread it runs as the managed context: moq_endpoint_stop then takes its
+ * real path, the join and then the terminal drain on its own caller. */
+static moq_result_t (*test_join_stop_fn)(void *ctx);
+static void *test_join_ctx;
+static moq_result_t test_join_facade_stop(void *facade)
+{
+    (void)facade;
+    return test_join_stop_fn ? test_join_stop_fn(test_join_ctx) : MOQ_OK;
+}
+static const ep_backend_vtable_t test_join_facade_vt = {
+    .wake = test_facade_wake,
+    .negotiated_version = test_facade_negotiated,
+    .is_fatal = test_facade_false,
+    .clean_closed = test_facade_false,
+    .stop = test_join_facade_stop,
+};
+void moq_endpoint_test_set_join_facade(moq_endpoint_t *ep,
+                                       moq_result_t (*stop_fn)(void *), void *ctx);
+void moq_endpoint_test_set_join_facade(moq_endpoint_t *ep,
+                                       moq_result_t (*stop_fn)(void *), void *ctx)
+{
+    test_join_stop_fn = stop_fn;
+    test_join_ctx = ctx;
+    ep->vt = &test_join_facade_vt;
     ep->facade = ep;
 }
 

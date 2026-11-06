@@ -24,11 +24,13 @@ static int rx_find_free(moq_session_t *s)
 static void rx_release_resources(moq_session_t *s, size_t slot)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
-    if (rx->payload_rcbuf) {
-        /* An object assembled but not yet emitted: the payload lives inside
-         * this rcbuf (payload_buf points into it), so decref rather than free
-         * the cursor. */
+    if (rx->payload_rcbuf || rx->payload_deferred) {
+        /* An object assembled but not yet emitted (or admitted with its
+         * storage still deferred, charged all the same): the payload lives
+         * inside this rcbuf (payload_buf points into it), so decref rather
+         * than free the cursor. */
         moq_rcbuf_decref(rx->payload_rcbuf);
+        rx->payload_deferred = false;
         if ((size_t)rx->payload_expected <= s->recv_payload_bytes)
             s->recv_payload_bytes -= (size_t)rx->payload_expected;
         else
@@ -1716,6 +1718,8 @@ static moq_result_t rx_emit_chunk(moq_session_t *s, int slot,
 static moq_result_t rx_emit_object(moq_session_t *s, int slot)
 {
     moq_rx_stream_t *rx = &s->rx_streams[slot];
+    /* Emitted only once every payload byte arrived, so storage is settled. */
+    assert(!rx->payload_deferred);
     rx_gate_on_verdict(s, rx);
 
     /* Prohibited object (frozen at header admission): consume without
@@ -2020,6 +2024,28 @@ static void rx_in_place_settle(moq_session_t *s, rx_in_place_t *ip)
         memcpy(rx->input_buf, ip->data, ip->len);
 }
 
+/* Whether an object's payload can be the caller's input itself instead of a
+ * copy: the input is a created rcbuf (its own single allocation, neither a
+ * slice nor wrapped), is exactly the payload, and was allocated through this
+ * session's own allocator (equal field for field, ctx included). The payload
+ * is then that rcbuf with one more reference, so it keeps alive exactly the
+ * payload's bytes and one rcbuf header, from the allocator its copy would
+ * have used: every byte charge on it (receive budget, consumer charges) stays
+ * exact, and releasing it is valid wherever releasing the session's own
+ * payload would be. A slice would keep its root's other bytes and two
+ * headers alive, a wrapped buffer's retained storage and release context are
+ * unknown here, and another allocator's release may be valid only where that
+ * allocator says, so all of these are copied. The caller keeps its own
+ * reference, and may feed the same rcbuf more than once: each payload is
+ * charged in full, which over-counts what one root retains, never
+ * under-counts. */
+static bool rx_payload_shareable(const moq_session_t *s, const moq_rcbuf_t *src,
+                                 size_t len)
+{
+    return src && len > 0 && moq_rcbuf_is_created_root(src) &&
+           moq_rcbuf_len(src) == len && moq_rcbuf_allocated_by(src, &s->alloc);
+}
+
 /* -- Data bytes handler -------------------------------------------- */
 
 static moq_result_t rx_drive_data(moq_session_t *s,
@@ -2206,6 +2232,24 @@ static moq_result_t rx_drive_data(moq_session_t *s,
     }
 
     if (fin) rx->pending_fin = true;
+
+    /* Whole-object zero-copy path: an rcbuf delivery that is exactly the
+     * payload of an admitted object with no storage yet (its header came
+     * without any of it) becomes that payload, when it may be shared
+     * (rx_payload_shareable), and is emitted. Every byte of the delivery is
+     * then held by the payload and none is left for staging, so none is
+     * reserved; nothing is allocated. A parked emit keeps the payload for the
+     * retry and a latched FIN finishes after it, exactly as when the payload
+     * is filled by the parse loop below, which takes every other delivery. */
+    if (input_rcbuf && len > 0 && rx->input_len == 0 && rx->hdr_len == 0 &&
+        rx->parse_state == MOQ_RX_READING_PAYLOAD && rx->payload_deferred &&
+        len == rx->payload_expected && rx_payload_shareable(s, input_rcbuf, len)) {
+        rx->payload_rcbuf = moq_rcbuf_incref(input_rcbuf);
+        rx->payload_buf = NULL;
+        rx->payload_deferred = false;
+        rx->payload_written = len;
+        return rx_emit_object(s, slot);
+    }
 
     /* Zero-copy fast path: emit a single continuation chunk directly
      * from the caller's rcbuf when the entire buffer fits in one chunk
@@ -2966,15 +3010,24 @@ static moq_result_t rx_drive_data(moq_session_t *s,
             }
 
             /* A whole object's payload buffer is allocated before the object
-             * is committed. If that fails, nothing of the object is consumed
-             * or held: its properties buffer and charge are released and the
-             * parser stays at this object's header, exactly as when the
-             * properties allocation above fails. */
+             * is committed, unless none of its bytes is in this call: then
+             * its storage is deferred to its first payload bytes
+             * (MOQ_RX_READING_PAYLOAD), so a payload that arrives as its own
+             * created rcbuf can be that rcbuf instead of a copy. If the
+             * allocation fails, nothing of the object is consumed or held:
+             * its properties buffer and charge are released and the parser
+             * stays at this object's header, exactly as when the properties
+             * allocation above fails. */
             moq_rcbuf_t *payload_rcbuf = NULL;
             uint8_t *payload_buf = NULL;
+            bool payload_deferred = false;
             if (!s->streaming_objects && payload_len > 0) {
-                moq_result_t arc = moq_rcbuf_alloc_uninit(
-                    &s->alloc, (size_t)payload_len, &payload_rcbuf, &payload_buf);
+                moq_result_t arc = MOQ_OK;
+                if (cursor + r.pos >= rx->input_len)
+                    payload_deferred = true;
+                else
+                    arc = moq_rcbuf_alloc_uninit(&s->alloc, (size_t)payload_len,
+                                                 &payload_rcbuf, &payload_buf);
                 if (arc < 0) {
                     if (ext_rcbuf) {
                         s->recv_payload_bytes -= moq_rcbuf_len(ext_rcbuf);
@@ -3064,9 +3117,11 @@ static moq_result_t rx_drive_data(moq_session_t *s,
             /* The payload rcbuf allocated before the commit receives the
              * object's bytes directly in its inline storage, so rx_emit_object
              * can hand it to the event without a copy. payload_buf is the
-             * writable cursor into that rcbuf. */
+             * writable cursor into that rcbuf. A deferred payload has no
+             * storage yet; its charge is the same. */
             rx->payload_rcbuf = payload_rcbuf;
             rx->payload_buf = payload_buf;
+            rx->payload_deferred = payload_deferred;
             s->recv_payload_bytes += (size_t)payload_len;
 
             if (rx->payload_written >= (size_t)payload_len) {
@@ -3082,6 +3137,20 @@ static moq_result_t rx_drive_data(moq_session_t *s,
         case MOQ_RX_READING_PAYLOAD: {
             size_t avail = rx->input_len - cursor;
             size_t need = (size_t)rx->payload_expected - rx->payload_written;
+            if (rx->payload_deferred && avail > 0) {
+                /* The object's first payload bytes, not taken whole above:
+                 * its buffer is allocated now and filled below. On failure
+                 * the object stays admitted and deferred, and the bytes are
+                 * kept for the retry like any unparsed input. */
+                moq_rcbuf_t *buf = NULL;
+                uint8_t *wr = NULL;
+                moq_result_t arc = moq_rcbuf_alloc_uninit(&s->alloc,
+                    (size_t)rx->payload_expected, &buf, &wr);
+                if (arc < 0) { loop_rc = arc; goto compact; }
+                rx->payload_rcbuf = buf;
+                rx->payload_buf = wr;
+                rx->payload_deferred = false;
+            }
             size_t copy = avail < need ? avail : need;
             if (copy > 0) {
                 memcpy(rx->payload_buf + rx->payload_written, rx_in(rx, ip) + cursor, copy);

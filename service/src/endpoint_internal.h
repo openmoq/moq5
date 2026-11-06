@@ -13,6 +13,11 @@
 /* The largest version-offer set: every version this build supports. */
 #define MOQ_ENDPOINT_MAX_VERSIONS 8
 
+/* The allocator every session and adapter of this endpoint was given: the
+ * endpoint's own copy of its configured allocator, which the endpoint
+ * contract requires to be thread-safe. */
+const moq_alloc_t *moq_endpoint_internal_alloc(const moq_endpoint_t *ep);
+
 /*
  * The pure result of configuration resolution: everything connect needs,
  * derived with no I/O. Byte fields BORROW from the caller's cfg (url bytes)
@@ -214,6 +219,29 @@ uint64_t moq_endpoint_fatal_code_internal(const moq_endpoint_t *ep);
  * stays internal precisely so public callers keep exactly-once semantics. */
 moq_result_t moq_endpoint_post_retryable(moq_endpoint_t *ep,
                                          moq_endpoint_task_fn fn, void *ctx);
+
+/* A task node reserved ahead of time, so that posting it later cannot fail
+ * for want of memory: for work that must run on the managed context and is
+ * posted from a path that cannot report failure (media receiver teardown).
+ *
+ *   reserve:  allocates the node from the endpoint's allocator; NULL on
+ *             allocation failure. Nothing is queued.
+ *   post:     queues fn/ctx on the reserved node, retryable exactly as
+ *             moq_endpoint_post_retryable, without allocating. It is refused
+ *             (MOQ_ERR_CLOSED) only once stop() has quiesced the managed
+ *             context; the caller then keeps the node and ctx. An endpoint
+ *             that is terminal but not yet stopped accepts it: the task runs
+ *             on a later pump cycle or in stop()'s terminal drain, never on
+ *             the caller. On MOQ_OK the node belongs to the endpoint, which
+ *             frees it once the task completes.
+ *   release:  frees a node that was never posted, or whose post was refused. */
+typedef struct ep_task moq_endpoint_task_slot_t;
+moq_endpoint_task_slot_t *moq_endpoint_internal_reserve_task(moq_endpoint_t *ep);
+moq_result_t moq_endpoint_internal_post_reserved(moq_endpoint_t *ep,
+                                                 moq_endpoint_task_slot_t *slot,
+                                                 moq_endpoint_task_fn fn, void *ctx);
+void moq_endpoint_internal_release_task(moq_endpoint_t *ep,
+                                        moq_endpoint_task_slot_t *slot);
 
 /* moq_endpoint_wake() is PUBLIC (declared in <moq/endpoint.h>, included above):
  * the non-allocating pump nudge attached services use to schedule

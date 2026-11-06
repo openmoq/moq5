@@ -23,6 +23,7 @@
 
 #include "media_receiver_internal.h"
 #include "endpoint_internal.h"
+#include "../../core/src/spi/core_spi.h"
 
 #ifdef MOQ_SERVICE_HAVE_MPEG2TS
 #include <moq/mpeg2ts.h>
@@ -601,6 +602,11 @@ struct moq_media_receiver {
 
     /* Network-thread state. */
     moq_subscriber_t  *sub;
+    /* Reserved when the receiver is built on an endpoint, so destroy never
+     * allocates: the subscriber's teardown context and the endpoint task
+     * node that carries it to the network thread (receiver_teardown_t). */
+    struct receiver_teardown *teardown;
+    moq_endpoint_task_slot_t *teardown_slot;
     moq_sub_track_t   *catalog_sub;
     moq_sub_fetch_req_t *catalog_fetch;   /* joining FETCH(offset=0); MSF-01 §5 */
     bool               catalog_fetch_issued;  /* issued exactly once */
@@ -2748,6 +2754,75 @@ static void receiver_bootstrap_fail(moq_media_receiver_t *r)
     moq_endpoint_wake(r->ep);
 }
 
+/* -- Handoff of retained buffers --------------------------------------- *
+ * A buffer the receiver keeps for the application (a queued object's payload
+ * and properties, staged catalog JSON, a TS window's held Object or parked
+ * status) may be released on the application's thread, or on whichever
+ * thread destroys the receiver. It is kept as is only when that is provably
+ * safe: the buffer is the only reference to everything it keeps alive, it
+ * keeps no data beyond its own bytes, and all of it is rcbuf-owned storage
+ * released through the receiver's allocator (the thread-safe default) or the
+ * endpoint's, which the endpoint contract requires to be thread-safe
+ * (moq_core_internal_rcbuf_transferable). The check runs on the network
+ * thread, which owns every reference, before anything retains the buffer.
+ * Otherwise the buffer is replaced by an independent copy from the receiver's
+ * allocator, and the shared one is released here, on its own thread. */
+#ifdef MOQ_MEDIA_RECEIVER_TESTING
+static uint64_t g_handoff_copies;
+uint64_t moq_media_receiver_test_handoff_copies(void);
+uint64_t moq_media_receiver_test_handoff_copies(void) { return g_handoff_copies; }
+#define RECEIVER_NOTE_HANDOFF_COPY() (g_handoff_copies++)
+/* Test-only interleaving hook, invoked with no locks held at the named
+ * site so a test can change the application's intent at that instant:
+ * 0, an object about to be admitted to the queue; 1, the window where a
+ * reserved object's copies are made; 2, the window where a staged catalog
+ * Object's copy is made. Never compiled into the shipping library. */
+static void (*g_handoff_hook)(void *ctx, int site);
+static void *g_handoff_hook_ctx;
+void moq_media_receiver_test_set_handoff_hook(void (*fn)(void *, int), void *ctx);
+void moq_media_receiver_test_set_handoff_hook(void (*fn)(void *, int), void *ctx)
+{
+    g_handoff_hook = fn;
+    g_handoff_hook_ctx = ctx;
+}
+#define HANDOFF_HOOK(site) \
+    do { if (g_handoff_hook) g_handoff_hook(g_handoff_hook_ctx, (site)); } while (0)
+#else
+#define RECEIVER_NOTE_HANDOFF_COPY() ((void)0)
+#define HANDOFF_HOOK(site) ((void)0)
+#endif
+
+static bool receiver_transferable(const moq_media_receiver_t *r, const moq_rcbuf_t *b)
+{
+    if (!b) return true;
+    const moq_alloc_t *trusted[2] = { &r->alloc, moq_endpoint_internal_alloc(r->ep) };
+    return moq_core_internal_rcbuf_transferable(b, trusted, trusted[1] ? 2 : 1);
+}
+
+/* Replace *slot by an independent copy and release the shared buffer here.
+ * On failure *slot is unchanged. */
+static moq_result_t receiver_isolate(moq_media_receiver_t *r, moq_rcbuf_t **slot)
+{
+    moq_rcbuf_t *copy = NULL;
+    moq_result_t rc = moq_rcbuf_clone(&r->alloc, *slot, &copy);
+    if (rc != MOQ_OK) return rc;
+    moq_rcbuf_decref(*slot);
+    *slot = copy;
+    RECEIVER_NOTE_HANDOFF_COPY();
+    return MOQ_OK;
+}
+
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+/* Keep *slot as is when transferable, else isolate it. False when the copy
+ * cannot be allocated (*slot unchanged). The TS window's retention points
+ * use it; queued objects and staged catalog JSON isolate inside their own
+ * reservations. */
+static bool receiver_own_for_handoff(moq_media_receiver_t *r, moq_rcbuf_t **slot)
+{
+    return receiver_transferable(r, *slot) || receiver_isolate(r, slot) == MOQ_OK;
+}
+#endif
+
 /* Retain only the JSON payload in the existing object ring. These entries
  * share its physical count/byte ceiling, but are not app-pollable media. */
 static void receiver_bootstrap_stage_live(moq_media_receiver_t *r,
@@ -2771,6 +2846,21 @@ static void receiver_bootstrap_stage_live(moq_media_receiver_t *r,
         ceiling += ceiling / 2; /* construction checked this sum */
     bool fits = r->obj_tail - r->obj_head < r->ring_cap &&
         obj_bytes_fit(r, bytes, ceiling);
+    if (fits && object->payload && !receiver_transferable(r, object->payload)) {
+        /* The staged JSON stays in the ring, which a destroying thread may
+         * release, so a shared payload is replaced by a copy first. Its bytes
+         * are reserved before the copy is made outside the lock; only this
+         * (network) thread adds ring entries, so the slot stays free, and
+         * an unusable copy returns the reservation and fails the bootstrap
+         * as an entry that does not fit does. */
+        r->obj_budget_total += bytes;
+        pthread_mutex_unlock(&r->mu);
+        moq_result_t crc = receiver_isolate(r, &object->payload);
+        HANDOFF_HOOK(2);
+        pthread_mutex_lock(&r->mu);
+        r->obj_budget_total -= bytes;
+        fits = crc == MOQ_OK && r->obj_tail - r->obj_head < r->ring_cap;
+    }
     if (fits && object->payload) {
         receiver_obj_entry_t *e = &r->objs[r->obj_tail++ % r->ring_cap];
         memset(e, 0, sizeof(*e));
@@ -3733,6 +3823,21 @@ static void receiver_loss_dropped_locked(moq_media_receiver_t *r,
  * `delivery_origin` and `initiating_request_id` name the source of the whole
  * object: LIVE, or a FILL child and its initiating request. `dom` is the
  * fill record of a fill Object of an MPEG2TS track, else NULL. */
+/* SHARED_EPOCH: report the queued object's times against the receiver-wide
+ * anchor, saturating at zero for a time before it; payload bytes are never
+ * modified. RAW leaves them as parsed. Applied once, to the final record. */
+static void receiver_rebase_times(const moq_media_receiver_t *r,
+                                  moq_media_object_t *o)
+{
+    if (r->time_mode != MOQ_MEDIA_TIME_SHARED_EPOCH || !r->epoch_set) return;
+    uint64_t e = r->epoch_us;
+    o->decode_time_us = o->decode_time_us > e ? o->decode_time_us - e : 0;
+    o->presentation_time_us =
+        o->presentation_time_us > e ? o->presentation_time_us - e : 0;
+    if (o->has_capture_time)
+        o->capture_time_us = o->capture_time_us > e ? o->capture_time_us - e : 0;
+}
+
 static void receiver_deliver_object(moq_media_receiver_t *r,
                                     moq_media_track_t *track,
                                     moq_sub_object_t *so,
@@ -3825,23 +3930,14 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
         return;
     }
 
-    /* SHARED_EPOCH: rebase the reported timestamp fields against one
-     * receiver-wide anchor (the first parsed object's decode time);
-     * payload bytes are never modified. */
-    if (r->time_mode == MOQ_MEDIA_TIME_SHARED_EPOCH) {
-        if (!r->epoch_set) {
-            r->epoch_set = true;
-            r->epoch_us = parsed.decode_time_us;
-        }
-        uint64_t e = r->epoch_us;
-        parsed.decode_time_us =
-            parsed.decode_time_us > e ? parsed.decode_time_us - e : 0;
-        parsed.presentation_time_us =
-            parsed.presentation_time_us > e ? parsed.presentation_time_us - e
-                                            : 0;
-        if (parsed.has_capture_time)
-            parsed.capture_time_us =
-                parsed.capture_time_us > e ? parsed.capture_time_us - e : 0;
+    /* SHARED_EPOCH: the receiver-wide anchor is the first parsed object's
+     * decode time, latched here whether or not the object is then queued.
+     * The rebase itself is applied once, to the record that is queued
+     * (receiver_rebase_times): a reparse in the reservation window below
+     * produces a fresh, raw record. */
+    if (r->time_mode == MOQ_MEDIA_TIME_SHARED_EPOCH && !r->epoch_set) {
+        r->epoch_set = true;
+        r->epoch_us = parsed.decode_time_us;
     }
 
     /* Per-object owned sample table (the parse wrote into stack/heap
@@ -3878,6 +3974,7 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
     bool budget_valid = track_properties.len <= UINT64_MAX - (uint64_t)need;
     if (budget_valid) budget = (uint64_t)need + track_properties.len;
 
+    HANDOFF_HOOK(0);
     pthread_mutex_lock(&r->mu);
     /* Every successfully parsed object is "received" (the stat counts parsed
      * objects whether they end up queued or dropped); the drop counters below
@@ -3930,20 +4027,37 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
      * intervene before commit/rollback; no session callbacks or waits. */
     r->obj_budget_total += budget;
     moq_rcbuf_t *track_copy = NULL;
-    if (track_properties.len) {
+    /* What crosses to the application besides the track properties: the
+     * replacement payload when there is one (created here, so transferable;
+     * the facade's own payload is then released here after publication), else
+     * the facade's payload; and the properties. Each that cannot be shown
+     * transferable is copied in the same reserved window, and the object is
+     * reparsed from what is queued. */
+    bool iso_payload = !deliver && !receiver_transferable(r, so->payload);
+    bool iso_props = !receiver_transferable(r, so->properties);
+    if (track_properties.len || iso_payload || iso_props) {
         uint64_t app_gen = track->app_gen;
         size_t owned_count = parsed.sample_count;
         pthread_mutex_unlock(&r->mu);
-        rc = moq_rcbuf_create(&r->alloc, track_properties.data,
-                              track_properties.len, &track_copy);
+        rc = MOQ_OK;
+        if (iso_payload) rc = receiver_isolate(r, &so->payload);
+        if (rc == MOQ_OK && iso_props) rc = receiver_isolate(r, &so->properties);
+        if (rc == MOQ_OK && track_properties.len)
+            rc = moq_rcbuf_create(&r->alloc, track_properties.data,
+                                  track_properties.len, &track_copy);
+        if (rc == MOQ_OK && (iso_payload || iso_props))
+            rc = moq_media_object_input_from_sub_object(so, &in);
         if (rc == MOQ_OK) {
             moq_media_parsed_object_t copied;
-            moq_bytes_t bytes = {moq_rcbuf_data(track_copy), moq_rcbuf_len(track_copy)};
+            moq_bytes_t bytes = { NULL, 0 };
+            if (track_copy)
+                bytes = (moq_bytes_t){ moq_rcbuf_data(track_copy), moq_rcbuf_len(track_copy) };
             rc = receiver_parse_media_object(r, track, &in, bytes,
                 owned ? owned : stack_samples, owned ? owned_count : RECEIVER_PARSE_STACK_SAMPLES,
                 &copied, &why);
             if (rc == MOQ_OK) parsed = copied;
         }
+        HANDOFF_HOOK(1);
         pthread_mutex_lock(&r->mu);
         if (rc != MOQ_OK || !track->desired_subscribed || track->app_gen != app_gen) {
             obj_uncharge_locked(r, budget);
@@ -3980,6 +4094,7 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
     o->decode_time_us = parsed.decode_time_us;
     o->composition_offset_us = parsed.composition_offset_us;
     o->presentation_time_us = parsed.presentation_time_us;
+    receiver_rebase_times(r, o);
     o->payload = parsed.payload;
     o->fragment = parsed.fragment;
     o->mdat_offset = parsed.mdat_offset;
@@ -4698,8 +4813,18 @@ static void receiver_on_ts_object(moq_media_receiver_t *r,
             moq_mpeg2ts_receiver_end_group_at(&ts->rx, so->group_id,
                                               so->object_id);
         /* It goes out after what is due now, as its own admission. Intake
-         * waits while a window waits, so no status is parked here yet. */
+         * waits while a window waits, so no status is parked here yet. A
+         * parked status may be released by a destroying thread, so its
+         * buffers are made transferable first; one that cannot be is lost
+         * as a parse drop. */
         assert(!ts->has_status);
+        if (!receiver_own_for_handoff(r, &so->payload) ||
+            !receiver_own_for_handoff(r, &so->properties)) {
+            receiver_note_parse_drop(r, t, MOQ_MEDIA_PARSE_DROP_MEDIA);
+            moq_sub_object_cleanup(so);
+            receiver_ts_drain(r, t, now_us);
+            return;
+        }
         ts->has_status = true;
         ts->status = *so;
         pthread_mutex_lock(&r->mu);
@@ -4716,6 +4841,15 @@ static void receiver_on_ts_object(moq_media_receiver_t *r,
 
     receiver_ts_held_t *h = (receiver_ts_held_t *)r->alloc.alloc(
         sizeof(*h), r->alloc.ctx);
+    /* The window keeps the holder, and spans into its payload, until the
+     * Object is released or the receiver is destroyed, possibly on another
+     * thread: its buffers are made transferable before the window sees them.
+     * One that cannot be is lost exactly as when the holder is refused. */
+    if (h && (!receiver_own_for_handoff(r, &so->payload) ||
+              !receiver_own_for_handoff(r, &so->properties))) {
+        r->alloc.free(h, sizeof(*h), r->alloc.ctx);
+        h = NULL;
+    }
     if (!h) {
         /* The Object is lost at its own Location: the window takes an
          * empty placeholder there (no holder, so ctx NULL), which it
@@ -6211,25 +6345,73 @@ static uint64_t receiver_next_deadline_us(void *ctx)
 }
 
 /* Subscriber teardown must happen where session calls are legal: posted to the
- * network thread. The context is independent of the receiver (which may be freed
- * before a queued task drains): it owns the subscriber plus a snapshot of its
- * live (PENDING/ACTIVE) subscription handles -- the catalog subscription and
- * every still-subscribed media/timeline track. The handles live inside the
- * subscriber, not the receiver, so they stay valid until moq_sub_destroy. */
+ * network thread. Its object queue, pending slot and fill/fetch items hold
+ * payloads taken before intake. Each was allocated through the session's
+ * allocator -- the session's own copy, or a transport input the session
+ * shared because it came from that same allocator -- and a service session's
+ * allocator is the endpoint's, which the endpoint contract requires to be
+ * valid on any thread. A shared input may still be referenced by the
+ * transport, so while the network thread runs the subscriber is destroyed
+ * there, never on the destroying thread. Once stop() has joined that thread
+ * the teardown runs on stop()'s caller (its terminal drain), or on the
+ * destroying thread when the endpoint was stopped before the post: no other
+ * thread then holds those references, and their allocator is valid there.
+ *
+ * The context is independent of the receiver (which may be freed before a
+ * queued task drains): it owns the subscriber plus a snapshot of its live
+ * (PENDING/ACTIVE) subscription handles -- the catalog subscription and every
+ * still-subscribed media/timeline track. The handles live inside the
+ * subscriber, not the receiver, so they stay valid until moq_sub_destroy; they
+ * are distinct slots of a subscriber built with RECEIVER_SUB_MAX_TRACKS, so the
+ * context holds them inline. A receiver built on an endpoint reserves the
+ * context and its task node at construction (receiver_reserve_teardown), so
+ * destroy allocates nothing and cannot be refused for want of memory. */
 typedef struct receiver_teardown {
-    moq_alloc_t        alloc;
+    moq_alloc_t        alloc;     /* the context's own allocator */
     moq_subscriber_t  *sub;
-    moq_sub_track_t  **handles;   /* live handles to cancel; owned (or NULL) */
+    moq_sub_track_t   *handles[RECEIVER_SUB_MAX_TRACKS];  /* live handles to cancel */
     size_t             count;
     size_t             cursor;    /* next handle to cancel (resume after retry) */
 } receiver_teardown_t;
 
+static receiver_teardown_t *receiver_teardown_new(const moq_alloc_t *alloc)
+{
+    receiver_teardown_t *td =
+        (receiver_teardown_t *)alloc->alloc(sizeof(*td), alloc->ctx);
+    if (!td) return NULL;
+    memset(td, 0, sizeof(*td));
+    td->alloc = *alloc;
+    return td;
+}
+
 static void receiver_teardown_free(receiver_teardown_t *td)
 {
     moq_alloc_t alloc = td->alloc;
-    if (td->handles)
-        alloc.free(td->handles, td->count * sizeof(*td->handles), alloc.ctx);
     alloc.free(td, sizeof(*td), alloc.ctx);
+}
+
+/* Reserve the teardown context and its endpoint task node (both from the
+ * endpoint's allocator, which the endpoint contract requires to be
+ * thread-safe: the network thread frees them after the task). False on
+ * allocation failure; anything reserved stays for receiver_release_teardown. */
+static bool receiver_reserve_teardown(moq_media_receiver_t *r)
+{
+    const moq_alloc_t *alloc = moq_endpoint_internal_alloc(r->ep);
+    if (!alloc) return false;
+    if (!r->teardown) r->teardown = receiver_teardown_new(alloc);
+    if (!r->teardown) return false;
+    if (!r->teardown_slot) r->teardown_slot = moq_endpoint_internal_reserve_task(r->ep);
+    return r->teardown_slot != NULL;
+}
+
+/* Free whatever of the reservation was not handed to the endpoint. Runs
+ * while r->ep is still valid. */
+static void receiver_release_teardown(moq_media_receiver_t *r)
+{
+    if (r->teardown) receiver_teardown_free(r->teardown);
+    r->teardown = NULL;
+    if (r->teardown_slot) moq_endpoint_internal_release_task(r->ep, r->teardown_slot);
+    r->teardown_slot = NULL;
 }
 
 /* Subscriber teardown on the network thread (an endpoint post() task).
@@ -6279,46 +6461,32 @@ static moq_result_t receiver_destroy_sub_task(moq_endpoint_t *ep,
     return MOQ_OK;
 }
 
-/* Snapshot the receiver's subscriber + its live subscription handles into an
- * owned teardown context, moving ownership of r->sub to it (caller nulls r->sub).
- * Returns NULL with r->sub untouched if there is no subscriber or on allocation
- * failure (the caller then destroys r->sub locally, forgoing cancellation -- an
- * OOM-only degradation). A subscriber with no live handles yields a valid
- * zero-handle context (the task just destroys the facade). Runs on the app
- * thread after the hook is detached, so r is no longer touched by the network
- * thread and this read is single-threaded. */
+static void teardown_add_handle(receiver_teardown_t *td, moq_sub_track_t *h)
+{
+    if (!h) return;
+    for (size_t i = 0; i < td->count; i++)
+        if (td->handles[i] == h) return;
+    /* Distinct handles are distinct slots of the subscriber's track array. */
+    assert(td->count < RECEIVER_SUB_MAX_TRACKS);
+    if (td->count < RECEIVER_SUB_MAX_TRACKS) td->handles[td->count++] = h;
+}
+
+/* Move r->sub and a snapshot of its live subscription handles into the
+ * reserved teardown context (r->teardown, taken; the caller nulls r->sub). A
+ * subscriber with no live handles yields a zero-handle context (the task just
+ * destroys the facade). Runs on the app thread after the hook is detached, so
+ * r is no longer touched by the network thread and this read is
+ * single-threaded. */
 static receiver_teardown_t *receiver_take_teardown(moq_media_receiver_t *r)
 {
-    if (!r->sub) return NULL;
-
-    size_t n = 0;
-    if (r->catalog_sub) n++;
-    for (size_t i = 0; i < r->track_count; i++)
-        if (r->tracks[i]->sub_track) n++;
-
-    receiver_teardown_t *td =
-        (receiver_teardown_t *)r->alloc.alloc(sizeof(*td), r->alloc.ctx);
-    if (!td) return NULL;
-    moq_sub_track_t **handles = NULL;
-    if (n) {
-        handles = (moq_sub_track_t **)r->alloc.alloc(
-            n * sizeof(*handles), r->alloc.ctx);
-        if (!handles) {
-            r->alloc.free(td, sizeof(*td), r->alloc.ctx);
-            return NULL;
-        }
-    }
-
-    td->alloc  = r->alloc;
-    td->sub    = r->sub;
-    td->handles = handles;
-    td->count  = n;
+    receiver_teardown_t *td = r->teardown;
+    r->teardown = NULL;
+    td->sub = r->sub;
+    td->count = 0;
     td->cursor = 0;
-
-    size_t k = 0;
-    if (r->catalog_sub) handles[k++] = r->catalog_sub;
+    teardown_add_handle(td, r->catalog_sub);
     for (size_t i = 0; i < r->track_count; i++)
-        if (r->tracks[i]->sub_track) handles[k++] = r->tracks[i]->sub_track;
+        teardown_add_handle(td, r->tracks[i]->sub_track);
     return td;
 }
 
@@ -6566,6 +6734,7 @@ static moq_result_t receiver_validate_cfg(const moq_media_receiver_cfg_t *cfg)
 
 static void receiver_free(moq_media_receiver_t *r)
 {
+    receiver_release_teardown(r);
     moq_media_auth_operation_clear(&r->catalog_auth, &r->alloc);
     moq_media_auth_operation_clear(&r->fetch_auth, &r->alloc);
     moq_media_auth_source_clear(&r->auth_source, &r->alloc);
@@ -6841,6 +7010,10 @@ static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
      * initialized receiver with no endpoint, so the scripted-peer harness can
      * drive receiver_hook against a session it controls. The guard is a no-op
      * in shipping builds (ep is never NULL there). */
+    if (ep && !receiver_reserve_teardown(r)) {
+        receiver_free(r);
+        return MOQ_ERR_NOMEM;
+    }
     if (ep) {
         /* The receiver's only time-based deadline is the MPEG2TS reorder
          * window's; otherwise it wakes on transport/event activity. */
@@ -6920,29 +7093,32 @@ void moq_media_receiver_destroy(moq_media_receiver_t *r)
 
     moq_endpoint_detach_hook(r->ep, MOQ_ENDPOINT_HOOK_RECEIVER, r);
 
-    /* Tear the subscriber down where session calls are legal: snapshot its live
-     * subscription handles and post a task that cancels each (UNSUBSCRIBE) before
-     * destroying the facade. A refused post is almost always the terminal case
-     * (MOQ_ERR_CLOSED): the network thread can no longer touch the subscriber and
-     * the session is gone, so the inline NULL-session teardown is single-threaded
-     * and has nothing live to cancel. The only other refusal is MOQ_ERR_NOMEM
-     * (cannot allocate the task node) while the endpoint is still live; session
-     * calls are illegal off the network thread, so the best we can do is the same
-     * local destroy -- an OOM-only degradation that forgoes cancellation. */
+    /* Tear the subscriber down on the network thread (receiver_teardown_t):
+     * the reserved context takes it and a snapshot of its live handles, and
+     * the reserved node carries the task that cancels each (UNSUBSCRIBE)
+     * before destroying the facade. Nothing here allocates, so nothing can be
+     * refused for want of memory. The post is refused only once stop() has
+     * joined the network thread (MOQ_ERR_CLOSED): no thread then runs the
+     * session, the transport or this subscriber, and every buffer the
+     * subscriber holds is from the endpoint's allocator (receiver_teardown_t),
+     * so the NULL-session teardown runs here, with nothing live to cancel. A
+     * receiver with no endpoint (test builds only) has no network thread at
+     * all. */
     if (r->sub) {
-        receiver_teardown_t *td = receiver_take_teardown(r);
-        if (td) {
-            if (moq_endpoint_post_retryable(r->ep, receiver_destroy_sub_task, td)
-                    != MOQ_OK)
-                (void)receiver_destroy_sub_task(r->ep, NULL, 0, td);
-        } else {
-            /* No subscriber went missing here (checked above); a NULL means
-             * the handle snapshot could not be allocated. Degrade to a local
-             * facade destroy without cancellation (OOM-only path). */
+        if (!r->ep) {
             moq_sub_destroy(r->sub);
+        } else {
+            assert(r->teardown && r->teardown_slot);  /* receiver_new reserved them */
+            receiver_teardown_t *td = receiver_take_teardown(r);
+            if (moq_endpoint_internal_post_reserved(r->ep, r->teardown_slot,
+                                                    receiver_destroy_sub_task, td) == MOQ_OK)
+                r->teardown_slot = NULL;      /* the endpoint's now */
+            else
+                (void)receiver_destroy_sub_task(r->ep, NULL, 0, td);
         }
         r->sub = NULL;
     }
+    receiver_release_teardown(r);
 
     if (r->owns_endpoint) {
         (void)moq_endpoint_stop(r->ep);
@@ -8112,6 +8288,29 @@ void moq_media_receiver_test_free(moq_media_receiver_t *r)
     if (r) receiver_free(r);
 }
 
+/* Stage one live catalog Object exactly as the bootstrap's live intake does
+ * (receiver_bootstrap_stage_live), on the calling thread acting as the
+ * network side. `payload` is borrowed; the Object takes its own reference.
+ * Returns the count of catalog Objects staged so far. */
+uint64_t moq_media_receiver_test_stage_catalog(moq_media_receiver_t *r, uint64_t group,
+                                               uint64_t object, moq_rcbuf_t *payload);
+uint64_t moq_media_receiver_test_stage_catalog(moq_media_receiver_t *r, uint64_t group,
+                                               uint64_t object, moq_rcbuf_t *payload)
+{
+    moq_sub_object_t so;
+    memset(&so, 0, sizeof(so));
+    so.group_id = group;
+    so.object_id = object;
+    so.status = MOQ_OBJECT_NORMAL;
+    so.payload = payload ? moq_rcbuf_incref(payload) : NULL;
+    receiver_bootstrap_stage_live(r, &so);
+    moq_sub_object_cleanup(&so);
+    pthread_mutex_lock(&r->mu);
+    uint64_t n = r->catalog_objects_queued;
+    pthread_mutex_unlock(&r->mu);
+    return n;
+}
+
 void moq_media_receiver_test_ingest(moq_media_receiver_t *r, uint64_t group,
                                     uint64_t object, const char *json,
                                     size_t len)
@@ -8393,11 +8592,15 @@ void moq_media_receiver_test_destroy_with_session(moq_media_receiver_t *r,
                                                   uint64_t now_us)
 {
     if (r->sub) {
-        receiver_teardown_t *td = receiver_take_teardown(r);
-        if (td)
+        /* A receiver built without an endpoint has no reservation; this
+         * single-threaded harness makes its context here. */
+        if (!r->teardown) r->teardown = receiver_teardown_new(&r->alloc);
+        if (r->teardown) {
+            receiver_teardown_t *td = receiver_take_teardown(r);
             (void)receiver_destroy_sub_task(NULL, session, now_us, td);
-        else
+        } else {
             moq_sub_destroy(r->sub);
+        }
         r->sub = NULL;
     }
     receiver_free(r);
@@ -8413,14 +8616,26 @@ moq_result_t moq_media_receiver_test_post_teardown(moq_media_receiver_t *r,
 {
     moq_result_t rc = MOQ_OK;
     if (r->sub) {
-        receiver_teardown_t *td = receiver_take_teardown(r);
-        if (td) {
-            rc = moq_endpoint_post_retryable(ep, receiver_destroy_sub_task, td);
-            if (rc != MOQ_OK)
-                (void)receiver_destroy_sub_task(ep, NULL, 0, td);
-        } else {
+        /* Reserve on `ep` as receiver_new does, then post as destroy does. */
+        moq_endpoint_t *own = r->ep;
+        r->ep = ep;
+        if (!receiver_reserve_teardown(r)) {
+            receiver_release_teardown(r);
+            r->ep = own;
             moq_sub_destroy(r->sub);
+            r->sub = NULL;
+            receiver_free(r);
+            return MOQ_ERR_NOMEM;
         }
+        receiver_teardown_t *td = receiver_take_teardown(r);
+        rc = moq_endpoint_internal_post_reserved(ep, r->teardown_slot,
+                                                 receiver_destroy_sub_task, td);
+        if (rc == MOQ_OK)
+            r->teardown_slot = NULL;
+        else
+            (void)receiver_destroy_sub_task(ep, NULL, 0, td);
+        receiver_release_teardown(r);
+        r->ep = own;
         r->sub = NULL;
     }
     receiver_free(r);

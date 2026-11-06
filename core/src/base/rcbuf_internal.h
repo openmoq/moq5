@@ -9,6 +9,7 @@
 #include "moq/rcbuf.h"
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <stddef.h>
 
 /*
@@ -37,5 +38,22 @@
  */
 moq_result_t moq_rcbuf_alloc_uninit(const moq_alloc_t *alloc, size_t len,
                                     moq_rcbuf_t **out, uint8_t **data_out);
+
+/*
+ * Whether `buf` is a created rcbuf: its storage is its own single allocation
+ * (moq_rcbuf_create / moq_rcbuf_alloc_uninit), of exactly
+ * moq_rcbuf_allocation_size(moq_rcbuf_len(buf)) bytes. False for a slice
+ * (which keeps its root's whole allocation alive) and for a wrapped buffer
+ * (whose external storage and release context are not described here), and
+ * for NULL.
+ */
+bool moq_rcbuf_is_created_root(const moq_rcbuf_t *buf);
+
+/*
+ * Whether `buf`'s own storage is released through an allocator equal, field
+ * for field (ctx included), to `alloc`. For a created root that is the
+ * allocator of its whole allocation. False for NULL.
+ */
+bool moq_rcbuf_allocated_by(const moq_rcbuf_t *buf, const moq_alloc_t *alloc);
 
 #endif /* MOQ_BASE_RCBUF_INTERNAL_H */

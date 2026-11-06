@@ -50,14 +50,22 @@ int main(void)
     /* moq_handle_pack rejects even generation, so construct manually. */
 
     {
-        /* Manually build: pool=1, session=0xABCD, gen=0x12346(even), slot=0x678 */
+        /* Manually build: pool=1, session=0xABCD, gen=0x12346(even), slot=0x678,
+         * in the layout moq_handle_pack writes (generation at bit 16). */
         uint64_t h_even = ((uint64_t)1u << 60)
                         | ((uint64_t)0xABCDu << 44)
-                        | ((uint64_t)0x12346u << 24)
+                        | ((uint64_t)0x12346u << 16)
                         | (uint64_t)0x678u;
+        MOQ_TEST_CHECK(moq_handle_generation(h_even) == 0x12346u);
         moq_subscription_t even_gen;
         even_gen._opaque = h_even;
         MOQ_TEST_CHECK(!moq_subscription_is_valid(even_gen));
+        /* The same probe with an odd generation, nothing else changed, is
+         * valid: the even generation alone made it invalid. */
+        moq_subscription_t odd_gen;
+        odd_gen._opaque = h_even | ((uint64_t)1u << 16);
+        MOQ_TEST_CHECK(moq_handle_generation(odd_gen._opaque) == 0x12347u);
+        MOQ_TEST_CHECK(moq_subscription_is_valid(odd_gen));
     }
 
     /* -- Zero session tag is invalid ------------------------------- */
@@ -66,11 +74,20 @@ int main(void)
     {
         uint64_t h_zero_sess = ((uint64_t)1u << 60)
                              | ((uint64_t)0u << 44)
-                             | ((uint64_t)0x12345u << 24)
+                             | ((uint64_t)0x12345u << 16)
                              | (uint64_t)0x678u;
+        /* Otherwise valid: pool 1 and an odd generation. */
+        MOQ_TEST_CHECK(moq_handle_pool_tag(h_zero_sess) == 1u);
+        MOQ_TEST_CHECK(moq_handle_generation(h_zero_sess) == 0x12345u);
+        MOQ_TEST_CHECK(moq_handle_slot(h_zero_sess) == 0x678u);
         moq_subscription_t zero_sess;
         zero_sess._opaque = h_zero_sess;
         MOQ_TEST_CHECK(!moq_subscription_is_valid(zero_sess));
+        /* The same probe with a nonzero session tag, nothing else changed,
+         * is valid: the zero tag alone made it invalid. */
+        moq_subscription_t some_sess;
+        some_sess._opaque = h_zero_sess | ((uint64_t)0xABCDu << 44);
+        MOQ_TEST_CHECK(moq_subscription_is_valid(some_sess));
     }
 
     /* -- moq_handle_pack rejects semantic invalids ----------------- */

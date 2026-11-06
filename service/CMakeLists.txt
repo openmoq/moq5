@@ -1083,6 +1083,67 @@ if(MOQ_BUILD_TESTS)
             add_test(NAME media_receiver_largeobj
                 COMMAND test_media_receiver_largeobj)
 
+            # Retained-buffer handoff: a buffer the receiver keeps crosses as
+            # is only when the move is provably exclusive, else as a copy made
+            # after admission; the second run overlaps application release
+            # with production.
+            add_executable(test_media_receiver_payload_handoff
+                tests/test_media_receiver_payload_handoff.c)
+            target_link_libraries(test_media_receiver_payload_handoff PRIVATE
+                moq-service-receiver-test-internals moq::sim)
+            target_include_directories(test_media_receiver_payload_handoff PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit
+                ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
+            if(TARGET moq::mpeg2ts)
+                target_compile_definitions(test_media_receiver_payload_handoff PRIVATE
+                    MOQ_TEST_HAVE_MPEG2TS)
+            endif()
+            add_test(NAME media_receiver_payload_handoff
+                COMMAND test_media_receiver_payload_handoff)
+            add_test(NAME media_receiver_payload_handoff_concurrent
+                COMMAND test_media_receiver_payload_handoff --concurrent)
+            set_tests_properties(media_receiver_payload_handoff
+                media_receiver_payload_handoff_concurrent PROPERTIES TIMEOUT 60)
+
+            # The subscriber's queued payloads are released on the network
+            # thread when the receiver is destroyed elsewhere, also when every
+            # allocation destroy could make is refused (white-box).
+            add_executable(test_media_receiver_facade_teardown
+                tests/test_media_receiver_facade_teardown.c)
+            target_link_libraries(test_media_receiver_facade_teardown PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_facade_teardown PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_facade_teardown PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_facade_teardown
+                COMMAND test_media_receiver_facade_teardown)
+            set_tests_properties(media_receiver_facade_teardown PROPERTIES TIMEOUT 60)
+
+            # Reported times do not depend on whether a queued object's
+            # buffers were copied; a parked TS status keeps its own copy of
+            # shared properties (white-box).
+            add_executable(test_media_receiver_epoch_handoff
+                tests/test_media_receiver_epoch_handoff.c)
+            target_link_libraries(test_media_receiver_epoch_handoff PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::loc ${_MOQ_SERVICE_TS_LIBS})
+            target_include_directories(test_media_receiver_epoch_handoff PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit
+                ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
+            target_compile_definitions(test_media_receiver_epoch_handoff PRIVATE
+                ${_MOQ_SERVICE_TS_DEFS})
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_epoch_handoff PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_epoch_handoff
+                COMMAND test_media_receiver_epoch_handoff)
+            set_tests_properties(media_receiver_epoch_handoff PROPERTIES TIMEOUT 60)
+
             # Regression: catalog delivered via a FETCH object
             # stream (object arrives before FETCH_OK).
             add_executable(test_media_receiver_fetch_catalog

@@ -374,6 +374,29 @@ add_test(NAME session_rx_in_place_known_alloc_failure
          COMMAND test_session_rx_in_place --known-alloc-failure)
 set_tests_properties(session_rx_in_place_known_alloc_failure PROPERTIES TIMEOUT 300)
 
+# Whole-object payloads over rcbuf ingest: when the payload is the caller's
+# created rcbuf itself, when it is a copy, and the charge of a deferred
+# payload, on every supported draft.
+add_executable(test_session_rx_whole_object_rcbuf unit/test_session_rx_whole_object_rcbuf.c)
+target_link_libraries(test_session_rx_whole_object_rcbuf PRIVATE moq-core-test-internals)
+add_test(NAME session_rx_whole_object_rcbuf COMMAND test_session_rx_whole_object_rcbuf)
+
+# The rcbuf ownership predicates behind it: a created root (shareable in place
+# of a copy) and the core SPI's whole-graph transfer proof.
+add_executable(test_rcbuf_transferable unit/test_rcbuf_transferable.c)
+target_link_libraries(test_rcbuf_transferable PRIVATE moq-core-test-internals)
+add_test(NAME rcbuf_transferable COMMAND test_rcbuf_transferable)
+
+# Certified selection in the batched poll, against the test-internals core
+# that holds each certified pick to the defining rescan.
+if(TARGET moq::sim)
+    add_executable(test_scheduling_certified unit/test_scheduling_certified.c)
+    target_link_libraries(test_scheduling_certified PRIVATE moq-core-test-internals moq::sim)
+    target_compile_definitions(test_scheduling_certified PRIVATE MOQ_SESSION_SWEEP_TESTING)
+    add_test(NAME scheduling_certified COMMAND test_scheduling_certified)
+    set_tests_properties(scheduling_certified PROPERTIES TIMEOUT 60)
+endif()
+
 add_executable(test_transport_bridge
     unit/test_transport_bridge.c
     unit/transport_bridge/admission.c
