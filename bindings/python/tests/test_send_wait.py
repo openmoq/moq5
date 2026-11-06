@@ -1520,10 +1520,7 @@ class WaitSubstrateBoundaryTests(WaitFixtureBase):
                 status = 29
             finally:
                 endpoint.set_interrupted(False)
-                try:
-                    self.settle_background(worker)
-                except HarnessFailure:
-                    return 10
+                self.settle_background(worker)
                 sender.close()
                 endpoint.close()
             return status
@@ -1560,10 +1557,7 @@ class WaitSubstrateBoundaryTests(WaitFixtureBase):
             except BaseException:
                 status = 29
             finally:
-                try:
-                    self.settle_background(worker)
-                except HarnessFailure:
-                    return 10
+                self.settle_background(worker)
                 sender.close()
                 endpoint.close()
             return status
