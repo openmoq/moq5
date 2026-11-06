@@ -4271,8 +4271,8 @@ static moq_result_t receiver_ts_payload(moq_media_receiver_t *r,
     size_t len = psi.len + obj.len;
     uint8_t *buf = (uint8_t *)r->alloc.alloc(len, r->alloc.ctx);
     if (!buf) return MOQ_ERR_NOMEM;
-    memcpy(buf, psi.data, psi.len);
-    memcpy(buf + psi.len, obj.data, obj.len);
+    if (psi.len > 0) memcpy(buf, psi.data, psi.len);
+    if (obj.len > 0) memcpy(buf + psi.len, obj.data, obj.len);
     size_t psi_in = psi.len;
     if (psi.len > 0 &&
         moq_mpeg2ts_align_join_psi(buf, psi.len, ps, obj) != MOQ_OK) {
