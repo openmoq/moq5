@@ -90,6 +90,9 @@ package struct ReceiverPolledEvent: Sendable {
         case localFailure(localResult: Int32?)
         case updateLocalFailure(localResult: Int32?)
         case deliveryLocalFailure(localResult: Int32?, origin: UInt32?, initiatingRequestID: UInt64?)
+        /// A fill_track command was admitted; nil when the sized output
+        /// omitted the complete ID.
+        case fillCreated(initiatingRequestID: UInt64?)
     }
     package var kind: Kind
     package var handleID: UInt64
@@ -191,6 +194,8 @@ package enum ReceiverCommandResult: Sendable {
     case wrongState                     /* track already ended */
     case closed
     case unsupported                    /* MSF namespace-override tracks */
+    case wouldBlock                     /* fill: the previous command's receipt
+                                         * is not yet observed */
     case nativeFailure(Int32)           /* unmodeled refusal, lossless */
 }
 
@@ -211,7 +216,7 @@ package protocol ReceiverBackendFactory {
 /// own fatal codes with the endpoint's), `isTerminal` (closed OR fatal --
 /// the object waiter's level term), `hasQueuedObjects` (stats under the C
 /// receiver lock). Service-thread only: `pollTrackEvent`, `pollObject`,
-/// `subscribe`, `unsubscribe`, `cancelFill`, `trackState`, and `detach` (the C receiver destroy, called
+/// `subscribe`, `unsubscribe`, `cancelFill`, `fillTrack`, `trackState`, and `detach` (the C receiver destroy, called
 /// exactly once, after which NO method may be called; queued undelivered
 /// objects die with it, like the C destroy).
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
@@ -226,6 +231,7 @@ package protocol ReceiverBackend: AnyObject, Sendable {
                    priority: UInt8?, options: MediaTrackSubscriptionOptions) -> ReceiverCommandResult
     func unsubscribe(handleID: UInt64) -> ReceiverCommandResult
     func cancelFill(handleID: UInt64, initiatingRequestID: UInt64) -> ReceiverCommandResult
+    func fillTrack(handleID: UInt64, options: MediaFillOptions) -> ReceiverCommandResult
     func trackState(handleID: UInt64) -> Result<ExtendedTrackSubscriptionState, MoQServiceError>
     func detach()
 }

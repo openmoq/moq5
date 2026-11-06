@@ -10,8 +10,11 @@ func fillConsumer(_ receiver: MediaReceiver, _ track: MediaTrack) async throws {
                                                     endGroup: .max, endObject: .max)))
     let subscribe: (MediaTrack, StartMode, UInt8?, MediaTrackSubscriptionOptions) async throws -> Void = receiver.subscribe
     let cancel: (MediaTrack, UInt64) async throws -> Void = receiver.cancelFill
+    let fill: (MediaTrack, MediaFillOptions) async throws -> Void = receiver.fill
     try await subscribe(track, .current, nil, options)
     try await receiver.subscribe(track, options: options)
+    try await fill(track, MediaFillOptions())
+    try await receiver.fill(track, options: MediaFillOptions(location: .relativeGroup(offset: 1)))
     try await cancel(track, .max)
     var iterator = receiver.trackEventsExtended.makeAsyncIterator()
     switch try await iterator.next() {
@@ -19,6 +22,10 @@ func fillConsumer(_ receiver: MediaReceiver, _ track: MediaTrack) async throws {
         switch legacy {
         case .added, .updated, .removed, .ended, .catalogReady, .parseDrop: break
         }
+    case .fillCreated(let parent, let initiatingID):
+        let requestID: UInt64? = initiatingID
+        _ = parent === track
+        if let requestID { try await cancel(parent, requestID) }
     case .fillTerminal(let parent, let terminal):
         let copy: MediaFillTerminal = terminal
         _ = parent === track

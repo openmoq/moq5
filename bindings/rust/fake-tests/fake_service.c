@@ -1085,6 +1085,22 @@ moq_result_t moq_media_receiver_subscribe_track(moq_media_receiver_t *r, moq_med
     return (moq_result_t)get("subscribe_result");
 }
 
+moq_result_t moq_media_receiver_fill_track(moq_media_receiver_t *r, moq_media_track_t *track,
+                                          const moq_fill_cfg_t *f)
+{
+    if (!r || !track || !f) return MOQ_ERR_INVAL;
+    int i = receiver_track(r, track);
+    if (i < 0) return MOQ_ERR_INVAL;
+    char loc[120], fprio[8] = "-", order[8] = "-", timeout[24] = "-";
+    log_location(loc, sizeof loc, f->location);
+    if (f->has_subscriber_priority) snprintf(fprio, sizeof fprio, "%u", f->subscriber_priority);
+    if (f->has_group_order) snprintf(order, sizeof order, "%u", f->group_order);
+    if (f->has_fill_timeout) snprintf(timeout, sizeof timeout, "%" PRIu64, f->fill_timeout_ms);
+    logf_("fill_track track=%d fill_cfg=%s/%s/%s/%s/struct=%u", i, fprio, order, timeout, loc,
+          f->struct_size);
+    return (moq_result_t)get("fill_track_result");
+}
+
 moq_result_t moq_media_receiver_unsubscribe_track(moq_media_receiver_t *r,
                                                   moq_media_track_t *track)
 {

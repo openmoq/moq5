@@ -471,11 +471,23 @@ typedef enum moq_media_track_event_kind {
                                     LIVE permanently fails this generation;
                                     FILL fails only the identified child.
                                     Accepted objects retain ownership. */
-    MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE = 11 /* a local UPDATE admission
+    MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE = 11, /* a local UPDATE admission
                                     failed permanently. Exactly once per failed
                                     track generation; read the sized local_result.
                                     Not a peer UPDATE error or END_OF_TRACK.
                                     Unrelated tracks and the endpoint continue. */
+    MOQ_MEDIA_TRACK_FILL_CREATED = 12 /* the fill recorded by
+                                    moq_media_receiver_fill_track() was admitted
+                                    locally: its UPDATE was sent and the child
+                                    exists. Read its initiating_request_id below
+                                    (zero is valid) and cancel the child with
+                                    moq_media_receiver_cancel_fill(). Local
+                                    admission only: not the peer's acceptance,
+                                    an opened stream or a live child at poll
+                                    time. Queued before that child's
+                                    FILL_TERMINAL. Fills requested by
+                                    subscribe_track options and the catalog's
+                                    fills never produce it. */
 } moq_media_track_event_kind_t;
 
 /* Which receive path a coalesced MOQ_MEDIA_TRACK_PARSE_DROP came from. */
@@ -558,9 +570,12 @@ typedef struct moq_media_track_event {
     /* Appended after the complete LOCAL_FAILURE allocation. Valid only for
      * FILL_TERMINAL, with the exact initiating SUBSCRIBE/UPDATE ID (zero is
      * valid), MOQ_FILL_* reason and MOQ_FILL_ERROR_* domain from session.h.
-     * A STREAM code of zero is still a failure, not COMPLETE. Each field is
-     * observable only when wholly covered by struct_size. Short/old outputs
-     * consume the event's supported prefix; an absent tail is unobserved.
+     * A STREAM code of zero is still a failure, not COMPLETE. FILL_CREATED
+     * uses initiating_request_id alone, for the UPDATE that requested the
+     * fill (zero is valid); its reason, domain and code are zero. Each field
+     * is observable only when wholly covered by struct_size. Short/old outputs
+     * consume the event's supported prefix; an absent tail is unobserved, and
+     * a FILL_CREATED polled that way still releases its command slot.
      * These are plain values, with no cleanup and no borrowed child handle. */
     uint64_t initiating_request_id;
     uint32_t fill_reason;
@@ -855,6 +870,55 @@ MOQ_API moq_result_t moq_media_receiver_subscribe_track(
  * again. */
 MOQ_API moq_result_t moq_media_receiver_unsubscribe_track(
     moq_media_receiver_t *r, moq_media_track_t *track);
+
+/* Request a D22 fill on `track`'s existing subscription: an UPDATE carrying
+ * `fill` (draft-22 sections 3.4 and 9.5). The subscription, its filter and
+ * the track's other fills are unchanged; a new fill never cancels one. `fill`
+ * is required (moq_fill_cfg_init gives the defaults); it and fill->location
+ * borrow only for this call, and their selected values are copied before
+ * returning.
+ *
+ * Nonblocking and callable from any thread: it records one command and wakes
+ * the endpoint executor, which sends the UPDATE. MOQ_OK means recorded, not
+ * sent or accepted by the peer. The interrupt latch of wait() neither refuses
+ * nor withdraws it. The executor sends it only while the track is wanted, its
+ * subscription is established and delivering (not paused by FLOW_CONTROL),
+ * and no other UPDATE of the track awaits its response: a resume is sent and
+ * acknowledged first, and a pause takes precedence over a queued fill.
+ *
+ * Once the UPDATE is admitted the track gets MOQ_MEDIA_TRACK_FILL_CREATED,
+ * with the request ID the fill is identified by; cancel it with
+ * moq_media_receiver_cancel_fill(). Its objects carry that ID, and its
+ * FILL_TERMINAL ends it. A track holds one unobserved command: until its
+ * FILL_CREATED is polled (by any output size), a second call returns
+ * MOQ_ERR_WOULD_BLOCK with no effect. Several admitted fills may coexist.
+ *
+ * unsubscribe_track withdraws a command not yet taken by the executor, and
+ * no FILL_CREATED follows. Once taken, its admission may still win: it keeps
+ * the slot until its FILL_CREATED is polled, and the admitted fill is then
+ * cancelled only by its ID. A disable never cancels admitted fills. A command
+ * is also withdrawn, with no event, when its track ends, fails or is removed,
+ * when the receiver closes, and when a live-to-VOD re-subscription replaces
+ * the subscription it was recorded for. A permanent local UPDATE failure is
+ * reported as MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE, as for subscribe_track.
+ *
+ * Returns:
+ *   MOQ_OK            recorded and scheduled
+ *   MOQ_ERR_INVAL     NULL r/track/fill, a foreign track, or a malformed
+ *                     selected value (an unknown group order or location kind,
+ *                     or a location ending before its start)
+ *   MOQ_ERR_ABI_MISMATCH  fill or fill->location below its frozen floor
+ *   MOQ_ERR_UNSUPPORTED   not draft-22 with the D22 companion profile (drafts
+ *                     16 and 18 have no fills); nothing is recorded or sent
+ *   MOQ_ERR_WRONG_STATE   the track is not subscribed (never subscribed, or
+ *                     disabled by unsubscribe_track), has ended, failed
+ *                     locally or been removed
+ *   MOQ_ERR_WOULD_BLOCK   the track's previous command is not yet observed
+ *   MOQ_ERR_LIMIT     the receiver's command identities are exhausted
+ *   MOQ_ERR_CLOSED    the receiver or its endpoint is terminal */
+MOQ_API moq_result_t moq_media_receiver_fill_track(
+    moq_media_receiver_t *r, moq_media_track_t *track,
+    const moq_fill_cfg_t *fill);
 
 /* Cancel one owned D22 fill, selected by its initiating SUBSCRIBE/UPDATE ID.
  * Zero is a valid ID. Records bounded intent and wakes the endpoint executor;

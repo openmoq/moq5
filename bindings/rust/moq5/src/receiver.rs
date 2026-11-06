@@ -634,6 +634,9 @@ pub enum TrackEventKind {
     /// A local UPDATE admission (pause/resume) failed permanently; that
     /// track generation has failed (not a peer rejection).
     UpdateLocalFailure,
+    /// The fill [`Receiver::fill_track`] requested was admitted locally; its
+    /// ID is [`TrackEvent::fill_created_id`]. Not the peer's acceptance.
+    FillCreated,
     /// A kind this crate does not know.
     Other(u32),
 }
@@ -652,6 +655,7 @@ impl TrackEventKind {
             sys::MOQ_MEDIA_TRACK_FILL_TERMINAL => TrackEventKind::FillTerminal,
             sys::MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE => TrackEventKind::DeliveryLocalFailure,
             sys::MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE => TrackEventKind::UpdateLocalFailure,
+            sys::MOQ_MEDIA_TRACK_FILL_CREATED => TrackEventKind::FillCreated,
             kind => TrackEventKind::Other(kind),
         }
     }
@@ -671,6 +675,7 @@ impl TrackEventKind {
             TrackEventKind::FillTerminal => sys::MOQ_MEDIA_TRACK_FILL_TERMINAL,
             TrackEventKind::DeliveryLocalFailure => sys::MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE,
             TrackEventKind::UpdateLocalFailure => sys::MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE,
+            TrackEventKind::FillCreated => sys::MOQ_MEDIA_TRACK_FILL_CREATED,
             TrackEventKind::Other(kind) => kind,
         }
     }
@@ -929,7 +934,10 @@ impl<'receiver> TrackEvent<'receiver> {
             None
         }
     }
-    /// For [`TrackEventKind::FillTerminal`]: how the fill ended.
+    /// For [`TrackEventKind::FillTerminal`]: how the fill ended. `None` for
+    /// any other kind, including [`TrackEventKind::FillCreated`], which
+    /// carries the same ID field, or when the library did not report every
+    /// terminal field.
     #[must_use]
     pub fn fill_terminal(&self) -> Option<FillTerminal> {
         let reported = self.covers(ffi::field_end!(
@@ -937,11 +945,25 @@ impl<'receiver> TrackEvent<'receiver> {
             fill_error_code,
             u64
         ));
-        reported.then_some(FillTerminal {
+        (reported && self.raw.kind == sys::MOQ_MEDIA_TRACK_FILL_TERMINAL).then_some(FillTerminal {
             initiating_request_id: self.raw.initiating_request_id,
             reason: FillReason::from_raw(self.raw.fill_reason),
             error: FillError::from_raw(self.raw.fill_error_domain, self.raw.fill_error_code),
         })
+    }
+    /// For [`TrackEventKind::FillCreated`]: the initiating request ID of the
+    /// fill [`Receiver::fill_track`] requested (zero is valid), for
+    /// [`Receiver::cancel_fill`]. `None` for any other kind, or when the
+    /// library did not report the field.
+    #[must_use]
+    pub fn fill_created_id(&self) -> Option<u64> {
+        let reported = self.covers(ffi::field_end!(
+            sys::moq_media_track_event_t,
+            initiating_request_id,
+            u64
+        ));
+        (reported && self.raw.kind == sys::MOQ_MEDIA_TRACK_FILL_CREATED)
+            .then_some(self.raw.initiating_request_id)
     }
     /// For [`TrackEventKind::DeliveryLocalFailure`]: which delivery was
     /// refused.
@@ -2045,6 +2067,33 @@ impl Receiver {
         ffi::check(unsafe {
             sys::moq_media_receiver_subscribe_track(self.as_ptr(), track, options_ptr)
         })
+    }
+
+    /// Request a fill on `track`'s existing subscription (draft 22): one
+    /// UPDATE carrying `fill`. The subscription, its filter and the track's
+    /// other fills are unchanged. The options are copied before returning.
+    ///
+    /// Nonblocking: success means the request is recorded, not sent or
+    /// accepted. It goes out once the track is delivering and no other
+    /// UPDATE of it awaits a response; a resume is answered first. Its
+    /// admission reports [`TrackEventKind::FillCreated`] with the ID
+    /// [`Receiver::cancel_fill`] takes. Until that event is polled, a second
+    /// call returns [`Error::WOULD_BLOCK`]; several admitted fills may
+    /// coexist. Unsubscribing withdraws a request the executor has not
+    /// taken; it never cancels admitted fills. Accepted while the interrupt
+    /// latch is set.
+    ///
+    /// [`Error::WRONG_STATE`] when the track is not subscribed (or was
+    /// disabled), has ended, failed or been removed; [`Error::UNSUPPORTED`]
+    /// outside the draft-22 companion; [`Error::INVAL`] for a malformed
+    /// option; [`Error::CLOSED`] for a terminal receiver or endpoint.
+    pub fn fill_track(&self, track: Track, fill: FillOptions) -> Result<()> {
+        let track = self.own(track)?;
+        let location = fill.location.map(LocationFilter::raw);
+        let raw = raw_fill(&fill, location.as_ref())?;
+        // SAFETY: a live receiver and one of its handles; the fill and its
+        // location are borrowed for the call and copied by the service.
+        ffi::check(unsafe { sys::moq_media_receiver_fill_track(self.as_ptr(), track, &raw) })
     }
 
     /// Cancel one fill of `track`, named by its initiating request ID (zero

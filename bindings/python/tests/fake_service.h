@@ -33,6 +33,7 @@ PyObject *test_subscribe_result(PyObject *, PyObject *);
 PyObject *test_subscriptions(PyObject *, PyObject *);
 PyObject *test_receiver_options(PyObject *, PyObject *);
 PyObject *test_receiver_cancellations(PyObject *, PyObject *);
+PyObject *test_receiver_fill_commands(PyObject *, PyObject *);
 PyObject *test_stats_result(PyObject *, PyObject *);
 PyObject *test_terminal_result(PyObject *, PyObject *);
 PyObject *test_track_desc(PyObject *, PyObject *);
@@ -179,6 +180,7 @@ PyObject *moq5_test_track_capsule(PyObject *receiver_capsule, struct moq_media_t
     {"_test_subscriptions", test_subscriptions, METH_NOARGS, NULL}, \
     {"_test_receiver_options", test_receiver_options, METH_NOARGS, NULL}, \
     {"_test_receiver_cancellations", test_receiver_cancellations, METH_NOARGS, NULL}, \
+    {"_test_receiver_fill_commands", test_receiver_fill_commands, METH_NOARGS, NULL}, \
     {"_test_stats_result", test_stats_result, METH_O, NULL}, \
     {"_test_terminal_result", test_terminal_result, METH_O, NULL}, \
     {"_test_track_desc", test_track_desc, METH_VARARGS, NULL}, \

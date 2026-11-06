@@ -93,6 +93,12 @@ public enum ExtendedTrackEvent: Sendable {
     /// only FILL carries an initiating ID. Nil denotes an absent complete field.
     /// LIVE fails this generation; FILL leaves its parent active.
     case deliveryLocalFailure(MediaTrack, localResult: Int32?, origin: UInt32?, initiatingRequestID: UInt64?)
+    /// The fill ``MediaReceiver/fill(_:options:)`` requested was admitted
+    /// locally: its UPDATE was sent and the child exists. The ID (zero is
+    /// valid) is what ``MediaReceiver/cancelFill(_:initiatingRequestID:)``
+    /// takes. Nil denotes an absent complete field. Not the peer's
+    /// acceptance or a live child at the time it is read.
+    case fillCreated(MediaTrack, initiatingRequestID: UInt64?)
 }
 
 /// A point-in-time native delivery state, queried separately from events.

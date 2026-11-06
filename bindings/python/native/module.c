@@ -802,6 +802,22 @@ static PyObject *receiver_subscribe_py(PyObject *module, PyObject *args)
     Py_RETURN_NONE;
 }
 
+static PyObject *receiver_fill_track_py(PyObject *module, PyObject *args)
+{
+    PyObject *capsule, *track_capsule, *fill;
+    if (!PyArg_ParseTuple(args, "OOO:receiver_fill_track", &capsule, &track_capsule, &fill)) return NULL;
+    moq_location_filter_cfg_t fill_loc;
+    moq_fill_cfg_t fill_cfg;
+    if (receiver_fill(fill, &fill_cfg, &fill_loc) < 0) return NULL;
+    receiver_handle_t *handle = receiver_get(capsule, 1, 1);
+    if (!handle) return NULL;
+    track_handle_t *track = track_get(track_capsule, handle, capsule);
+    if (!track) return NULL;
+    moq_result_t rc = moq_media_receiver_fill_track(handle->receiver, track->track, &fill_cfg);
+    if (rc != MOQ_OK) return native_error(module, rc, "fill_track");
+    Py_RETURN_NONE;
+}
+
 static PyObject *receiver_cancel_fill_py(PyObject *module, PyObject *args)
 {
     PyObject *capsule, *track_capsule, *initiating;
@@ -1172,6 +1188,7 @@ static PyObject *receiver_poll_track_py(PyObject *module, PyObject *capsule)
     if (!kind) return NULL;
     PyObject *track = NULL, *desc = NULL, *largest = NULL, *expires = NULL, *drop = NULL, *result = NULL;
     PyObject *local_result = NULL, *fill = NULL, *origin = NULL, *delivery_id = NULL;
+    PyObject *created_id = NULL;
 
     /* Shape by KNOWN kind: CATALOG_READY carries no handle; the known
      * track-scoped kinds require one; an unknown kind is preserved either
@@ -1182,6 +1199,7 @@ static PyObject *receiver_poll_track_py(PyObject *module, PyObject *capsule)
     case MOQ_MEDIA_TRACK_ENDED: case MOQ_MEDIA_TRACK_UPDATE_OK: case MOQ_MEDIA_TRACK_PARSE_DROP:
     case MOQ_MEDIA_TRACK_LOCAL_FAILURE: case MOQ_MEDIA_TRACK_FILL_TERMINAL:
     case MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE: case MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE:
+    case MOQ_MEDIA_TRACK_FILL_CREATED:
         track_scoped = true; global = false; break;
     case MOQ_MEDIA_CATALOG_READY:
         track_scoped = false; global = true; break;
@@ -1281,8 +1299,13 @@ static PyObject *receiver_poll_track_py(PyObject *module, PyObject *capsule)
         COVERS(ev.struct_size, moq_media_track_event_t, delivery_initiating_request_id)
             ? PyLong_FromUnsignedLongLong(ev.delivery_initiating_request_id) : Py_NewRef(Py_None);
     if (!delivery_id) goto out;
-    result = Py_BuildValue("(OOOOOOOOOO)", kind, track, desc, largest, expires, drop, local_result, fill,
-                          origin, delivery_id);
+    /* The receipt of a fill_track command: its ID only when wholly stamped. */
+    created_id = ev.kind == MOQ_MEDIA_TRACK_FILL_CREATED &&
+        COVERS(ev.struct_size, moq_media_track_event_t, initiating_request_id)
+            ? PyLong_FromUnsignedLongLong(ev.initiating_request_id) : Py_NewRef(Py_None);
+    if (!created_id) goto out;
+    result = Py_BuildValue("(OOOOOOOOOOO)", kind, track, desc, largest, expires, drop, local_result, fill,
+                          origin, delivery_id, created_id);
 out:
     Py_XDECREF(kind);
     Py_XDECREF(track);
@@ -1294,6 +1317,7 @@ out:
     Py_XDECREF(fill);
     Py_XDECREF(origin);
     Py_XDECREF(delivery_id);
+    Py_XDECREF(created_id);
     return result;
 }
 
@@ -2708,6 +2732,7 @@ static PyMethodDef methods[] = {
     {"receiver_stats", receiver_stats_py, METH_O, "Copy the sized stats snapshot."},
     {"receiver_terminal", receiver_terminal_py, METH_O, "Read closed/fatal/fatal_code and the endpoint terminal."},
     {"receiver_subscribe", receiver_subscribe_py, METH_VARARGS, "Record subscribe intent for a track."},
+    {"receiver_fill_track", receiver_fill_track_py, METH_VARARGS, "Record a running fill command."},
     {"receiver_cancel_fill", receiver_cancel_fill_py, METH_VARARGS, "Cancel only the named fill child."},
     {"receiver_unsubscribe", receiver_unsubscribe_py, METH_VARARGS, "Record unsubscribe intent for a track."},
     {"receiver_track_state", receiver_track_state_py, METH_VARARGS, "Read a track's delivery state."},
@@ -2791,6 +2816,7 @@ PyMODINIT_FUNC PyInit__native(void)
     ADD(ERR_CLOSED); ADD(ERR_WRONG_STATE); ADD(ERR_STALE_HANDLE); ADD(ERR_WRONG_SESSION);
     ADD(ERR_WOULD_BLOCK); ADD(ERR_BUFFER); ADD(ERR_REQUEST_BLOCKED); ADD(ERR_ABI_MISMATCH);
     ADD(ERR_GOAWAY); ADD(ERR_INTERRUPTED); ADD(ERR_UNSUPPORTED); ADD(ERR_CAPACITY); ADD(ERR_INTERNAL);
+    ADD(ERR_LIMIT);
     ADD(TRANSPORT_PROTOCOL_AUTO); ADD(TRANSPORT_PROTOCOL_RAW_QUIC); ADD(TRANSPORT_PROTOCOL_WEBTRANSPORT);
     ADD(TRANSPORT_BACKEND_AUTO); ADD(TRANSPORT_BACKEND_PICOQUIC); ADD(TRANSPORT_BACKEND_MVFST);
     ADD(TRANSPORT_BACKEND_PROXYGEN); ADD(TRANSPORT_BACKEND_MSQUIC);
@@ -2821,6 +2847,7 @@ PyMODINIT_FUNC PyInit__native(void)
     ADD(FILL_ERROR_NONE); ADD(FILL_ERROR_STREAM); ADD(FILL_ERROR_PARENT_REQUEST); ADD(FILL_ERROR_PARENT_DONE);
     ADD(MEDIA_TRACK_LOCAL_FAILURE); ADD(MEDIA_TRACK_FILL_TERMINAL); ADD(MEDIA_TRACK_STATE_FAILED);
     ADD(MEDIA_TRACK_DELIVERY_LOCAL_FAILURE); ADD(MEDIA_TRACK_UPDATE_LOCAL_FAILURE);
+    ADD(MEDIA_TRACK_FILL_CREATED);
     ADD(MEDIA_TRACK_ADDED); ADD(MEDIA_TRACK_UPDATED); ADD(MEDIA_TRACK_REMOVED); ADD(MEDIA_TRACK_ENDED);
     ADD(MEDIA_CATALOG_READY); ADD(MEDIA_TRACK_UPDATE_OK); ADD(MEDIA_TRACK_PARSE_DROP);
     ADD(MEDIA_TRACK_STATE_DISCOVERED); ADD(MEDIA_TRACK_STATE_PENDING); ADD(MEDIA_TRACK_STATE_ACTIVE);

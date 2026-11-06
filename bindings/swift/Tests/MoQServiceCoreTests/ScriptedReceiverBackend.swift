@@ -18,6 +18,11 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
         var options: MediaTrackSubscriptionOptions = .init()
     }
 
+    struct FillTrackCall: Equatable, Sendable {
+        var handleID: UInt64
+        var options: MediaFillOptions
+    }
+
     struct CancelFillCall: Equatable, Sendable {
         var handleID: UInt64
         var initiatingRequestID: UInt64
@@ -46,6 +51,7 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
         var subscribeCalls: [SubscribeCall] = []
         var unsubscribeCalls: [UInt64] = []
         var cancelFillCalls: [CancelFillCall] = []
+        var fillTrackCalls: [FillTrackCall] = []
         var trackStateCalls: [UInt64] = []
         var violations: [String] = []
         var serviceThread: Thread?
@@ -57,6 +63,7 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
     private var objectQueue: [ReceiverPolledObject] = []
     private var subscribeResults: [ReceiverCommandResult] = []
     private var cancelFillResults: [ReceiverCommandResult] = []
+    private var fillTrackResults: [ReceiverCommandResult] = []
     private let cancelFillGate: TestGate?
     private let trackStateGate: TestGate?
     private var trackStates: [UInt64: Result<ExtendedTrackSubscriptionState, MoQServiceError>] = [:]
@@ -170,6 +177,16 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
         return result
     }
 
+    func fillTrack(handleID: UInt64, options: MediaFillOptions) -> ReceiverCommandResult {
+        cond.lock()
+        defer { cond.unlock() }
+        tripwireLocked("fillTrack")
+        noteServiceThreadLocked("fillTrack")
+        r.fillTrackCalls.append(.init(handleID: handleID, options: options))
+        cond.broadcast()
+        return fillTrackResults.isEmpty ? .ok : fillTrackResults.removeFirst()
+    }
+
     func detach() {
         cond.lock()
         tripwireLocked("detach")
@@ -225,6 +242,12 @@ final class ScriptedReceiverBackend: ReceiverBackend, @unchecked Sendable {
     func scriptSubscribeResults(_ results: [ReceiverCommandResult]) {
         cond.lock()
         subscribeResults = results
+        cond.unlock()
+    }
+
+    func scriptFillTrackResults(_ results: [ReceiverCommandResult]) {
+        cond.lock()
+        fillTrackResults = results
         cond.unlock()
     }
 
@@ -320,6 +343,10 @@ extension ReceiverPolledEvent {
         ReceiverPolledEvent(kind: .fillTerminal(.init(
             initiatingRequestID: requestID, reason: reason, errorDomain: domain, errorCode: code)),
             handleID: id, trackDescription: nil)
+    }
+    static func created(_ id: UInt64, requestID: UInt64?) -> ReceiverPolledEvent {
+        ReceiverPolledEvent(kind: .fillCreated(initiatingRequestID: requestID),
+                            handleID: id, trackDescription: nil)
     }
     static func added(_ id: UInt64, name: String,
                       mediaType: MediaType = .video) -> ReceiverPolledEvent {

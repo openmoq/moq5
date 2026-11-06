@@ -426,6 +426,36 @@ struct moq_media_track {
      * re-enable stays ACTIVE rather than going back to PENDING. */
     bool             requested;
     bool             established;
+    /* Advanced (under mu) each time a finished subscription is torn down, so
+     * a fill command recorded for one never goes out on its replacement. */
+    uint64_t         parent_gen;
+
+    /* The explicit fill command of moq_media_receiver_fill_track (under mu):
+     *   NONE     the slot is free;
+     *   QUEUED   recorded, not yet taken by the executor;
+     *   CLAIMED  taken: the executor is admitting it without the mutex, so
+     *            a disable only marks it withdrawn and admission may win;
+     *   ADMITTED its UPDATE was admitted; cmd_token names the facade child
+     *            whose CREATED item becomes the receipt;
+     *   RECEIPT  its FILL_CREATED is queued; polling it frees the slot.
+     * cmd_seq is the command's receiver-wide, never-reused identity, so a
+     * stale step can neither send nor settle a newer command. */
+    uint8_t          cmd_state;
+    bool             cmd_withdrawn;
+    uint64_t         cmd_seq;
+    uint64_t         cmd_parent_gen;
+    moq_fill_cfg_t   cmd_fill;          /* location borrowed per admission */
+    moq_location_filter_cfg_t cmd_location;
+    bool             cmd_has_location;
+    moq_sub_fill_t   cmd_token;
+    /* Executor-owned: the REQUEST_UPDATE credential selected for command
+     * `cmd_auth_seq`, NULL when none. It is the command's own, apart from the
+     * Forward operation's, and survives that command's transient admission
+     * retries. Allocated when a command is first taken and freed once it is
+     * admitted, refused or gone, so a track pays for one only while a
+     * command holds a selection. */
+    moq_media_auth_operation_t *cmd_auth;
+    uint64_t         cmd_auth_seq;
 
     /* Timeline classification (network thread). is_event_timeline is any
      * packaging=="eventtimeline" track; is_media_timeline is any
@@ -469,6 +499,7 @@ typedef struct receiver_event {
     uint64_t delivery_initiating_request_id;
     bool     has_done_status;              /* TRACK_ENDED from a done */
     uint64_t done_status;
+    uint64_t fill_cmd_seq;                 /* FILL_CREATED: its command */
 } receiver_event_t;
 
 /* Identity/intent only, not a second item queue. The facade keeps each child
@@ -482,6 +513,10 @@ typedef struct receiver_fill {
     bool terminal_seen;
     bool delivery_failed;
 } receiver_fill_t;
+
+/* moq_media_track.cmd_state */
+enum { FILL_CMD_NONE = 0, FILL_CMD_QUEUED, FILL_CMD_CLAIMED, FILL_CMD_ADMITTED,
+       FILL_CMD_RECEIPT };
 
 typedef struct receiver_catalog_bootstrap {
     bool active, ack_seen, has_largest, have_base, terminal_seen;
@@ -651,6 +686,7 @@ struct moq_media_receiver {
     receiver_event_t *events;
     uint32_t         ev_cap, ev_head, ev_tail;
     receiver_fill_t fills[RECEIVER_SUB_MAX_FILLS]; /* mu-protected */
+    uint64_t        fill_cmd_next;    /* last fill command identity issued */
     bool            fill_blocked; /* app event drain must wake the hook */
     receiver_fill_dom_t fill_doms[RECEIVER_FILL_DOMS]; /* mu-protected */
     uint32_t        fill_ready_count;  /* READY records */
@@ -1580,10 +1616,23 @@ static bool span_eq_lit(moq_bytes_t a, const char *lit, size_t len)
 
 static void receiver_ts_free(moq_media_receiver_t *r, moq_media_track_t *t);
 
+/* Release the selection a fill command holds, if any. */
+static void receiver_cmd_auth_release(moq_media_receiver_t *r,
+                                      moq_media_track_t *t)
+{
+    if (t->cmd_auth) {
+        moq_media_auth_operation_clear(t->cmd_auth, &r->alloc);
+        r->alloc.free(t->cmd_auth, sizeof(*t->cmd_auth), r->alloc.ctx);
+        t->cmd_auth = NULL;
+    }
+    t->cmd_auth_seq = 0;
+}
+
 static void receiver_track_free(moq_media_receiver_t *r, moq_media_track_t *t)
 {
     if (!t) return;
     moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
+    receiver_cmd_auth_release(r, t);
     receiver_ts_free(r, t);
     if (t->desc_ext)
         r->alloc.free(t->desc_ext, t->desc_ext_size, r->alloc.ctx);
@@ -2999,6 +3048,15 @@ static void receiver_fill_observe(moq_media_receiver_t *r,
     }
     if (item->kind == MOQ_SUB_FILL_CREATED) {
         moq_media_track_t *track = track_for_sub(r, item->track);
+        /* The child of an admitted fill_track command, found by its token:
+         * its subscription may already be released (a done), and the
+         * receipt still belongs to the command. */
+        moq_media_track_t *cmd = NULL;
+        for (size_t i = 0; i < r->track_count && !cmd; i++)
+            if (r->tracks[i]->cmd_state == FILL_CMD_ADMITTED &&
+                moq_sub_fill_eq(r->tracks[i]->cmd_token, item->request))
+                cmd = r->tracks[i];
+        if (!track) track = cmd;
         if (track && !child) {
             /* No facade child slot can be reused before we consume its terminal. */
             assert(free_slot);
@@ -3023,6 +3081,17 @@ static void receiver_fill_observe(moq_media_receiver_t *r,
                 d->initiating_request_id = item->initiating_request_id;
                 d->ts = track_is_ts(track);
             }
+        }
+        /* The receipt goes ahead of anything later of this child: its
+         * terminal is queued, or made READY, behind it. */
+        if (cmd) {
+            assert(r->ev_tail - r->ev_head < r->ev_cap);
+            receiver_event_t *event = &r->events[r->ev_tail++ % r->ev_cap];
+            *event = (receiver_event_t){ .kind = MOQ_MEDIA_TRACK_FILL_CREATED,
+                .track = cmd, .initiating_request_id = item->initiating_request_id,
+                .fill_cmd_seq = cmd->cmd_seq };
+            cmd->cmd_state = FILL_CMD_RECEIPT;
+            cmd->cmd_token = (moq_sub_fill_t){0};
         }
     } else {
         moq_media_track_t *track = child ? child->track : track_for_sub(r, item->track);
@@ -3174,8 +3243,10 @@ static void receiver_auth_clear_pending(moq_media_receiver_t *r)
 {
     moq_media_auth_operation_clear(&r->catalog_auth, &r->alloc);
     moq_media_auth_operation_clear(&r->fetch_auth, &r->alloc);
-    for (size_t i = 0; i < r->track_count; i++)
+    for (size_t i = 0; i < r->track_count; i++) {
         moq_media_auth_operation_clear(&r->tracks[i]->auth_operation, &r->alloc);
+        receiver_cmd_auth_release(r, r->tracks[i]);
+    }
 }
 
 /* Native INVAL can describe identity conflicts, not just token encoding.
@@ -5218,6 +5289,7 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
         t->upd_notify_app = false;
         t->update_inflight = false;
         t->upd_sent_app_gen = 0;
+        t->parent_gen++;
         pthread_mutex_unlock(&r->mu);
 
         if (status == RECEIVER_DONE_TRACK_ENDED && t->was_live && !t->vod_rearmed &&
@@ -5362,6 +5434,132 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
     }
 }
 
+/* A command that can no longer be admitted is withdrawn, with no event: its
+ * track ended, failed or was removed, or the subscription it was recorded
+ * for was replaced. A taken one is settled by the executor step itself. */
+static void receiver_cmd_withdraw_dead_locked(moq_media_track_t *t)
+{
+    if (t->cmd_state == FILL_CMD_QUEUED &&
+        (t->ended || t->removed || t->local_result != MOQ_OK || t->auth_failed ||
+         t->parent_gen != t->cmd_parent_gen))
+        t->cmd_state = FILL_CMD_NONE;
+}
+
+/* Settle a taken command that was not admitted: back in the queue for a
+ * transient refusal, otherwise -- or once a disable withdrew it -- the slot is
+ * freed. Only the command `seq` still holding the claim is touched. */
+static void receiver_cmd_unclaim_locked(moq_media_track_t *t, uint64_t seq,
+                                        bool retry)
+{
+    if (t->cmd_state != FILL_CMD_CLAIMED || t->cmd_seq != seq) return;
+    t->cmd_state = retry && !t->cmd_withdrawn ? FILL_CMD_QUEUED : FILL_CMD_NONE;
+    t->cmd_withdrawn = false;
+}
+
+/* Admit the track's queued fill command as a fill-only UPDATE on its own
+ * subscription. Called only from a delivery pass that found Forward already
+ * at a forwarding target, with no UPDATE awaiting its response, so a pause or
+ * resume always goes first and a resume is acknowledged before the fill
+ * (draft-22 section 3.4.1: a paused subscription opens no fill). The claim is
+ * taken under mu and held, without the mutex, across credential selection and
+ * the facade call; a disable meanwhile only marks it withdrawn. */
+static void receiver_admit_fill_command(moq_media_receiver_t *r,
+                                        moq_media_track_t *t, uint64_t now_us)
+{
+    if (t->update_inflight || !moq_sub_track_is_active(t->sub_track)) return;
+    pthread_mutex_lock(&r->mu);
+    if (t->cmd_state != FILL_CMD_QUEUED || !t->desired_subscribed) {
+        pthread_mutex_unlock(&r->mu);
+        return;
+    }
+    t->cmd_state = FILL_CMD_CLAIMED;
+    t->cmd_withdrawn = false;
+    uint64_t seq = t->cmd_seq;
+    uint64_t parent = t->cmd_parent_gen;
+    moq_fill_cfg_t fill = t->cmd_fill;
+    moq_location_filter_cfg_t location = t->cmd_location;
+    fill.location = t->cmd_has_location ? &location : NULL;
+    pthread_mutex_unlock(&r->mu);
+
+    /* The command's selection is made once and reused by its retries; a
+     * different command never inherits it. */
+    if (t->cmd_auth_seq != seq) receiver_cmd_auth_release(r, t);
+    if (!t->cmd_auth) {
+        t->cmd_auth = (moq_media_auth_operation_t *)r->alloc.alloc(
+            sizeof(*t->cmd_auth), r->alloc.ctx);
+        if (!t->cmd_auth) {
+            /* No storage for a selection now: the command waits its turn. */
+            pthread_mutex_lock(&r->mu);
+            receiver_cmd_unclaim_locked(t, seq, true);
+            pthread_mutex_unlock(&r->mu);
+            return;
+        }
+        memset(t->cmd_auth, 0, sizeof(*t->cmd_auth));
+        t->cmd_auth_seq = seq;
+    }
+    moq_media_auth_request_t request =
+        receiver_auth_request(r, MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE, t);
+    moq_result_t rc = moq_media_auth_operation_prepare(t->cmd_auth,
+        &r->auth_source, &request, r->transport_version, &r->alloc);
+    AUTH_PRE_ADMIT(r, t);
+    pthread_mutex_lock(&r->mu);
+    bool current = !r->fatal && !t->removed && !t->ended && !t->auth_failed &&
+                   t->local_result == MOQ_OK && t->desired_subscribed &&
+                   !t->cmd_withdrawn && t->cmd_state == FILL_CMD_CLAIMED &&
+                   t->cmd_seq == seq && t->parent_gen == parent;
+    if (!current) receiver_cmd_unclaim_locked(t, seq, true);
+    else if (rc != MOQ_OK) receiver_cmd_unclaim_locked(t, seq, false);
+    pthread_mutex_unlock(&r->mu);
+    /* A command put back in the queue keeps its selection; a withdrawn one
+     * is released by the next delivery pass. */
+    if (!current) return;
+    if (rc != MOQ_OK) {
+        receiver_auth_fail(r, t->cmd_auth, &request,
+            MOQ_MEDIA_AUTH_SCOPE_TRACK, t);
+        receiver_cmd_auth_release(r, t);
+        return;
+    }
+    moq_sub_update_cfg_t ucfg;
+    moq_sub_update_cfg_init_sized(&ucfg, sizeof(ucfg));
+    ucfg.fill = &fill;
+    ucfg.auth_tokens = t->cmd_auth->list.tokens;
+    ucfg.auth_token_count = t->cmd_auth->list.count;
+    rc = moq_sub_update_subscription(r->sub, t->sub_track, &ucfg, now_us);
+    if (rc == MOQ_OK) {
+        /* The newest child of the track is the one just admitted. */
+        moq_sub_fill_t token = moq_sub_track_fill(t->sub_track);
+        receiver_cmd_auth_release(r, t);
+        pthread_mutex_lock(&r->mu);
+        /* Admission won, even over a disable that came during the call. */
+        t->cmd_state = FILL_CMD_ADMITTED;
+        t->cmd_withdrawn = false;
+        t->cmd_token = token;
+        /* A fill-only UPDATE carries no app pause/resume: its response is
+         * never an UPDATE_OK, and it holds off the next UPDATE until then. */
+        t->upd_notify_app = false;
+        t->update_inflight = true;
+        t->upd_sent_app_gen = 0;
+        pthread_mutex_unlock(&r->mu);
+        /* The child's CREATED is taken by the fill drain of a later pass,
+         * not by any packet: run one. */
+        moq_endpoint_wake(r->ep);
+        return;
+    }
+    bool retry = receiver_admission_retry(rc);
+    pthread_mutex_lock(&r->mu);
+    receiver_cmd_unclaim_locked(t, seq, retry);
+    pthread_mutex_unlock(&r->mu);
+    if (receiver_auth_encoding_error(r, t->cmd_auth, rc)) {
+        receiver_auth_fail(r, t->cmd_auth, &request,
+            MOQ_MEDIA_AUTH_SCOPE_TRACK, t);
+        receiver_cmd_auth_release(r, t);
+    } else if (!retry) {
+        receiver_cmd_auth_release(r, t);
+        receiver_mark_track_local_failure(r, t, rc,
+                                           MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE);
+    }
+}
+
 /* Reconcile per-track delivery (the subscription's Forward State) with the two
  * things that can suppress it: an app unsubscribe (desired_subscribed=false) and
  * FLOW_CONTROL backpressure. A disabled track keeps its handle but pauses with
@@ -5390,6 +5588,11 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
 
     for (size_t i = 0; i < r->track_count; i++) {
         moq_media_track_t *t = r->tracks[i];
+        pthread_mutex_lock(&r->mu);
+        receiver_cmd_withdraw_dead_locked(t);
+        bool cmd_live = t->cmd_state != FILL_CMD_NONE && t->cmd_seq == t->cmd_auth_seq;
+        pthread_mutex_unlock(&r->mu);
+        if (t->cmd_auth && !cmd_live) receiver_cmd_auth_release(r, t);
         if (!t->sub_track || t->ended || t->removed || t->local_result != MOQ_OK ||
             t->auth_failed) continue;
 
@@ -5424,6 +5627,9 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
             attribution_classify(gen_snap, t->reconciled_app_gen,
                                  &dummy_notify, &t->reconciled_app_gen);
             pthread_mutex_unlock(&r->mu);
+            /* Forward is settled: a forwarding subscription may take its
+             * queued fill command. */
+            if (target) receiver_admit_fill_command(r, t, now_us);
             continue;
         }
         /* The initial response must establish the track before UPDATE is
@@ -6903,6 +7109,11 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
     if (r->ev_tail != r->ev_head) {
         receiver_event_t e = r->events[r->ev_head % r->ev_cap];
         r->ev_head++;
+        /* Polled at any output size: the command's receipt is consumed. */
+        if (e.kind == MOQ_MEDIA_TRACK_FILL_CREATED && e.track &&
+            e.track->cmd_state == FILL_CMD_RECEIPT &&
+            e.track->cmd_seq == e.fill_cmd_seq)
+            e.track->cmd_state = FILL_CMD_NONE;
         bool wake_fill = r->fill_blocked;
         pthread_mutex_unlock(&r->mu);
         if (wake_fill) moq_endpoint_wake(r->ep);
@@ -7333,6 +7544,11 @@ moq_result_t moq_media_receiver_unsubscribe_track(
     if (track->desired_subscribed)
         track->app_gen++;          /* state-changing app intent */
     track->desired_subscribed = false;
+    /* A fill command the executor has not taken never goes out. A taken one
+     * may still be admitted; it keeps its slot until its receipt is polled.
+     * Admitted fills are not cancelled. */
+    if (track->cmd_state == FILL_CMD_QUEUED) track->cmd_state = FILL_CMD_NONE;
+    else if (track->cmd_state == FILL_CMD_CLAIMED) track->cmd_withdrawn = true;
     /* Purge the track's queued objects now, under the same lock that guards the
      * queue (a pure data operation -- no session calls -- so it is safe off the
      * network thread). Doing it here rather than in the delivery reconcile makes
@@ -7345,6 +7561,43 @@ moq_result_t moq_media_receiver_unsubscribe_track(
 
     moq_endpoint_wake(r->ep);
     return MOQ_OK;
+}
+
+moq_result_t moq_media_receiver_fill_track(
+    moq_media_receiver_t *r, moq_media_track_t *track,
+    const moq_fill_cfg_t *fill)
+{
+    if (!r || !track || !fill) return MOQ_ERR_INVAL;
+    if (r->ep && moq_endpoint_is_closed(r->ep)) return MOQ_ERR_CLOSED;
+    receiver_track_options_t options = {0};
+    moq_result_t rc = receiver_copy_fill(fill, &options);
+    if (rc != MOQ_OK) return rc;
+
+    pthread_mutex_lock(&r->mu);
+    if (r->fatal) rc = MOQ_ERR_CLOSED;
+    else if (!receiver_owns_track(r, track)) rc = MOQ_ERR_INVAL;
+    else if (r->transport_version != MOQ_VERSION_DRAFT_22 ||
+             r->companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+        rc = MOQ_ERR_UNSUPPORTED;
+    else if (track->ended || track->removed || track->local_result != MOQ_OK ||
+             track->auth_failed || !track->desired_subscribed)
+        rc = MOQ_ERR_WRONG_STATE;
+    else if (track->cmd_state != FILL_CMD_NONE) rc = MOQ_ERR_WOULD_BLOCK;
+    else if (r->fill_cmd_next == UINT64_MAX) rc = MOQ_ERR_LIMIT;
+    else {
+        track->cmd_state = FILL_CMD_QUEUED;
+        track->cmd_withdrawn = false;
+        track->cmd_seq = ++r->fill_cmd_next;
+        track->cmd_parent_gen = track->parent_gen;
+        track->cmd_fill = options.fill;
+        track->cmd_fill.location = NULL;
+        track->cmd_location = options.fill_location;
+        track->cmd_has_location = options.has_fill_location;
+        track->cmd_token = (moq_sub_fill_t){0};
+    }
+    pthread_mutex_unlock(&r->mu);
+    if (rc == MOQ_OK) moq_endpoint_wake(r->ep);
+    return rc;
 }
 
 moq_result_t moq_media_receiver_cancel_fill(

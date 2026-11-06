@@ -198,7 +198,7 @@ struct ReceiverLocalFailureTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-    @Test("Legacy cancellation between queued failures stops filtering and releases the shared claim")
+    @Test("A cancelled legacy call consumes no queued failure and releases the shared claim")
     func cancellationBetweenSkips() async throws {
         let rig = try LocalFailureRig()
         _ = try await rig.discover()
@@ -210,11 +210,11 @@ struct ReceiverLocalFailureTests {
             _ = try await iterator.next()
         }
         await #expect(throws: CancellationError.self) { try await consumer.value }
-        #expect(rig.receiver.attachment.stagedTrackEventCount == 32)
+        #expect(rig.receiver.attachment.stagedTrackEventCount == 33)
         var extended = rig.receiver.trackEventsExtended.makeAsyncIterator()
         if case .localFailure(_, let result)? = try await extended.next() {
-            #expect(result == 1)
-        } else { Issue.record("claim remained busy or filtering overran cancellation") }
+            #expect(result == 0)
+        } else { Issue.record("claim remained busy or the cancelled call consumed a record") }
         var legacy = rig.receiver.trackEvents.makeAsyncIterator()
         if case .catalogReady? = try await legacy.next() {} else { Issue.record("missing tail") }
         #expect(try await extended.next() == nil)

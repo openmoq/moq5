@@ -40,6 +40,9 @@ Draft-16 token types fit 62 bits; draft-18 and draft-22 types fit `uint64_t`.
 A configured source on an unsupported profile reports `UNSUPPORTED_PROFILE`.
 Tokens use direct values, not cross-stream aliases. Draft-22's combined
 SUBSCRIBE/fill is one SUBSCRIBE selection; it does not select FETCH credentials.
+A running fill (`moq_media_receiver_fill_track`) makes a selection of its own
+for its update when the service takes the command, and keeps it across that
+command's transient admission retries.
 
 `MOQ_OK` plus DENY refuses the operation. Selector `MOQ_ERR_WOULD_BLOCK` is an
 invalid selection, not an asynchronous refresh request. Obtain or refresh

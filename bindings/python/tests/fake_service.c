@@ -208,6 +208,15 @@ static uint32_t stats_size = sizeof(moq_media_receiver_stats_t);
 static subscription_t subscriptions[FIXTURE_MAX_SUBSCRIPTIONS];
 static int subscription_count;
 static struct { int track; uint64_t id; moq_result_t result; } cancellations[FIXTURE_MAX_SUBSCRIPTIONS];
+/* Every fill_track call, with the copy of what crossed the boundary. */
+static struct {
+    int track;
+    moq_fill_cfg_t fill;
+    bool has_location;
+    moq_location_filter_cfg_t location;
+    moq_result_t result;
+} fill_commands[FIXTURE_MAX_SUBSCRIPTIONS];
+static int fill_command_count;
 static int cancellation_count;
 /* The last attach configuration, copied byte-exact (parts may contain NUL). */
 static uint8_t rcfg_parts[FIXTURE_MAX_PARTS][256];
@@ -613,6 +622,7 @@ PyObject *test_reset(PyObject *module, PyObject *args)
     stats_size = sizeof(moq_media_receiver_stats_t);
     subscription_count = 0;
     cancellation_count = 0;
+    fill_command_count = 0;
     rcfg_part_count = 0;
     rcfg_catalog_len = 0;
     created = stopped = destroyed = 0;
@@ -1158,6 +1168,27 @@ moq_result_t moq_media_receiver_cancel_fill(moq_media_receiver_t *r, moq_media_t
     return rc;
 }
 
+moq_result_t moq_media_receiver_fill_track(moq_media_receiver_t *r, moq_media_track_t *track,
+                                          const moq_fill_cfg_t *fill)
+{
+    if (!r || !track || !fill) return MOQ_ERR_INVAL;
+    pthread_mutex_lock(&mutex);
+    moq_result_t rc = subscribe_result;
+    if (!owns(r, track)) rc = MOQ_ERR_INVAL;
+    else if (receiver_terminal(r)) rc = MOQ_ERR_CLOSED;
+    if (fill_command_count >= FIXTURE_MAX_SUBSCRIPTIONS) {
+        pthread_mutex_unlock(&mutex);
+        return MOQ_ERR_NOMEM;
+    }
+    fill_commands[fill_command_count].track = track->index;
+    fill_commands[fill_command_count].fill = *fill;
+    fill_commands[fill_command_count].has_location = fill->location != NULL;
+    if (fill->location) fill_commands[fill_command_count].location = *fill->location;
+    fill_commands[fill_command_count++].result = rc;
+    pthread_mutex_unlock(&mutex);
+    return rc;
+}
+
 moq_result_t moq_media_receiver_track_state(const moq_media_receiver_t *r, const moq_media_track_t *track,
                                             moq_media_track_state_t *out)
 {
@@ -1399,6 +1430,37 @@ PyObject *test_receiver_cancellations(PyObject *module, PyObject *args)
         PyObject *v = Py_BuildValue("(iKi)", cancellations[i].track,
             (unsigned long long)cancellations[i].id, (int)cancellations[i].result);
         if (!v || PyList_SetItem(list, i, v) < 0) { Py_DECREF(list); return NULL; }
+    }
+    return list;
+}
+
+/* (track, struct_size, priority|None, order|None, timeout|None,
+ *  (kind, start_group, start_object, end_group, end_object)|None, result) */
+PyObject *test_receiver_fill_commands(PyObject *module, PyObject *args)
+{
+    (void)module; (void)args;
+    PyObject *list = PyList_New(fill_command_count);
+    if (!list) return NULL;
+    for (int i = 0; i < fill_command_count; ++i) {
+        const moq_fill_cfg_t *f = &fill_commands[i].fill;
+        const moq_location_filter_cfg_t *l = &fill_commands[i].location;
+        PyObject *loc = fill_commands[i].has_location
+            ? Py_BuildValue("(IKKKK)", (unsigned)l->kind, (unsigned long long)l->start_group,
+                            (unsigned long long)l->start_object, (unsigned long long)l->end_group,
+                            (unsigned long long)l->end_object)
+            : Py_NewRef(Py_None);
+        PyObject *prio = f->has_subscriber_priority ? PyLong_FromLong(f->subscriber_priority)
+                                                    : Py_NewRef(Py_None);
+        PyObject *order = f->has_group_order ? PyLong_FromUnsignedLong(f->group_order)
+                                             : Py_NewRef(Py_None);
+        PyObject *timeout = f->has_fill_timeout ? PyLong_FromUnsignedLongLong(f->fill_timeout_ms)
+                                                : Py_NewRef(Py_None);
+        PyObject *v = (loc && prio && order && timeout)
+            ? Py_BuildValue("(iIOOOOi)", fill_commands[i].track, (unsigned)f->struct_size, prio,
+                            order, timeout, loc, (int)fill_commands[i].result)
+            : NULL;
+        Py_XDECREF(loc); Py_XDECREF(prio); Py_XDECREF(order); Py_XDECREF(timeout);
+        if (!v || PyList_SetItem(list, i, v) < 0) { Py_XDECREF(v); Py_DECREF(list); return NULL; }
     }
     return list;
 }

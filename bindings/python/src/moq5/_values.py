@@ -380,6 +380,7 @@ class ExtendedTrackEventKind(IntEnum):
     FILL_TERMINAL = _constants["MEDIA_TRACK_FILL_TERMINAL"]
     DELIVERY_LOCAL_FAILURE = _constants["MEDIA_TRACK_DELIVERY_LOCAL_FAILURE"]
     UPDATE_LOCAL_FAILURE = _constants["MEDIA_TRACK_UPDATE_LOCAL_FAILURE"]
+    FILL_CREATED = _constants["MEDIA_TRACK_FILL_CREATED"]
 
 
 class ExtendedTrackState(IntEnum):
@@ -852,8 +853,10 @@ class TrackEvent:
     for PARSE_DROP only. UPDATE_LOCAL_FAILURE carries the local UPDATE
     admission result, not a peer error. DELIVERY_LOCAL_FAILURE carries local_result and
     delivery_origin; only FILL has a delivery_initiating_request_id (zero is
-    valid). Absent complete fields remain None. The keyword-only views
-    preserve legacy equality/hash and positional construction/patterns."""
+    valid). FILL_CREATED carries fill_created_id, the initiating request ID of
+    the fill Receiver.fill_track requested (zero is valid); it is None for
+    every other kind. Absent complete fields remain None. The keyword-only
+    views preserve legacy equality/hash and positional construction/patterns."""
 
     kind: TrackEventKind | int
     track: Track | None
@@ -865,6 +868,7 @@ class TrackEvent:
     fill_terminal: FillTerminal | None = field(default=None, compare=False, kw_only=True)
     delivery_origin: DeliveryOrigin | int | None = field(default=None, compare=False, kw_only=True)
     delivery_initiating_request_id: int | None = field(default=None, compare=False, kw_only=True)
+    fill_created_id: int | None = field(default=None, compare=False, kw_only=True)
 
     @property
     def kind_extended(self) -> ExtendedTrackEventKind | int:

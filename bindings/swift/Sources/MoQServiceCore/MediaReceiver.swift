@@ -185,7 +185,9 @@ public final class MediaReceiver: @unchecked Sendable {
     /// failed; throws ``MoQServiceError/interrupted`` only when it would
     /// have to WAIT while the endpoint latch is set (queued events deliver
     /// through the latch, like the C track-event poll). Extended-only records are
-    /// consumed and skipped. Both event views share this consumer claim.
+    /// consumed and skipped. Both event views share this consumer claim. A
+    /// `next()` whose task is cancelled throws `CancellationError` before it
+    /// takes any record, including between skipped records and after a wait.
     public var trackEvents: TrackEvents { TrackEvents(receiver: self) }
 
     /// Legacy events, fill terminals and local failures from one FIFO, without replay.
@@ -250,6 +252,44 @@ public final class MediaReceiver: @unchecked Sendable {
         }
     }
 
+    /// Request a draft-22 fill on the track's existing subscription: one
+    /// UPDATE carrying `options`. The subscription, its filter and the
+    /// track's other fills are unchanged. An ASYNCHRONOUS command, like C:
+    /// success means recorded, not sent or accepted; it goes out once the
+    /// track is delivering and no other UPDATE of it awaits a response.
+    ///
+    /// Its admission is an ``ExtendedTrackEvent/fillCreated(_:initiatingRequestID:)``
+    /// on ``trackEventsExtended``, carrying the ID ``cancelFill(_:initiatingRequestID:)``
+    /// takes. One command per track stays unobserved: until that event is
+    /// dequeued by this receiver's event consumer -- not merely staged, and
+    /// not by a cancelled wait -- a second call throws
+    /// ``MoQServiceError/wouldBlock`` with no effect. ``trackEvents`` consumes
+    /// and skips it, so the ID is lost there, exactly as for a short C poll;
+    /// use ``trackEventsExtended`` to observe it. Several admitted fills may
+    /// coexist. ``unsubscribe(_:)`` withdraws a command not yet taken by the
+    /// service and never cancels admitted fills. Accepted through the
+    /// endpoint interrupt latch. ``MoQServiceError/wrongState`` for a track
+    /// not subscribed, disabled, ended, failed or removed;
+    /// ``MoQServiceError/unsupported`` outside the draft-22 companion.
+    public func fill(_ track: MediaTrack, options: MediaFillOptions) async throws {
+        guard let handleID = attachment.handleID(for: track) else {
+            throw MoQServiceError.invalidArgument(
+                "fill: the track does not belong to this receiver")
+        }
+        let attachment = self.attachment
+        try await endpoint.engine.perform {
+            guard !attachment.state.isDetached else { throw MoQServiceError.closed }
+            /* The native slot frees when the receipt is staged; this one
+             * holds until the receipt is dequeued. */
+            guard attachment.state.fillMayIssue(handleID) else {
+                throw MoQServiceError.wouldBlock
+            }
+            try Self.check(attachment.backend.fillTrack(handleID: handleID, options: options),
+                           name: "fill")
+            attachment.state.noteFillIssued(handleID)
+        }
+    }
+
     /// Pause delivery and purge this track's queued objects; a later
     /// ``subscribe(_:start:priority:)`` resumes cheaply.
     public func unsubscribe(_ track: MediaTrack) async throws {
@@ -286,20 +326,26 @@ public final class MediaReceiver: @unchecked Sendable {
             guard !attachment.state.isDetached else {
                 throw MoQServiceError.closed
             }
-            switch body(attachment.backend, handleID) {
-            case .ok:
-                return
-            case .invalidArgument:
-                throw MoQServiceError.invalidArgument("\(name): invalid track")
-            case .wrongState:
-                throw MoQServiceError.wrongState
-            case .closed:
-                throw MoQServiceError.closed
-            case .unsupported:
-                throw MoQServiceError.unsupported
-            case .nativeFailure(let code):
-                throw MoQServiceError.internalError(code)
-            }
+            try Self.check(body(attachment.backend, handleID), name: name)
+        }
+    }
+
+    private static func check(_ result: ReceiverCommandResult, name: String) throws {
+        switch result {
+        case .ok:
+            return
+        case .invalidArgument:
+            throw MoQServiceError.invalidArgument("\(name): invalid track")
+        case .wrongState:
+            throw MoQServiceError.wrongState
+        case .closed:
+            throw MoQServiceError.closed
+        case .unsupported:
+            throw MoQServiceError.unsupported
+        case .wouldBlock:
+            throw MoQServiceError.wouldBlock
+        case .nativeFailure(let code):
+            throw MoQServiceError.internalError(code)
         }
     }
 
@@ -321,6 +367,10 @@ public final class MediaReceiver: @unchecked Sendable {
         }
         defer { state.releaseConsumer() }
         while true {
+            /* Decided before anything is dequeued, on entry and after every
+             * wake: a cancelled call consumes nothing, so it can neither
+             * lose a record nor release a fill receipt's command. */
+            try Task.checkCancellation()
             switch state.takeNext() {
             case .item(let event, let freedCapacity):
                 /* Consuming this event dropped the FIFO below its cap, so a
@@ -331,7 +381,6 @@ public final class MediaReceiver: @unchecked Sendable {
                 if includeExtended { return event }
                 if case .legacy = event { return event }
                 // Keep the same consumer claim across filtered records and waits.
-                try Task.checkCancellation()
                 continue
             case .terminalClean:
                 return nil
@@ -639,8 +688,25 @@ private final class ReceiverState: @unchecked Sendable {
         case terminalFatal(code: UInt64)
     }
 
+    /// A staged event; a fill receipt also names the command it answers.
+    private struct Staged {
+        let event: ExtendedTrackEvent
+        let receipt: (handleID: UInt64, generation: UInt64)?
+    }
+
+    /// A fill command's binding-private occupancy, per track handle: issued
+    /// (no receipt staged yet), or its receipt staged but not dequeued. The
+    /// native slot frees when the eager drain polls the receipt; this one
+    /// holds until the application's consumer takes it.
+    private enum FillOccupancy: Equatable {
+        case issued(UInt64)
+        case staged(UInt64)
+    }
+
     private let lock = NSLock()
-    private var fifo: [ExtendedTrackEvent] = []
+    private var fifo: [Staged] = []
+    private var fillOccupancy: [UInt64: FillOccupancy] = [:]
+    private var fillGeneration: UInt64 = 0
     private var tracksByID: [UInt64: MediaTrack] = [:]
     private var idsByTrack: [ObjectIdentifier: UInt64] = [:]
     private var ordered: [MediaTrack] = []
@@ -664,44 +730,69 @@ private final class ReceiverState: @unchecked Sendable {
             tracksByID[polled.handleID] = track
             idsByTrack[ObjectIdentifier(track)] = polled.handleID
             ordered.append(track)
-            fifo.append(.legacy(.added(track)))
+            fifo.append(Staged(event: .legacy(.added(track)), receipt: nil))
         case .updated:
             guard let track = tracksByID[polled.handleID] else { return }
             if let description = polled.trackDescription {
                 track.updateDescription(description)
             }
-            fifo.append(.legacy(.updated(track)))
+            fifo.append(Staged(event: .legacy(.updated(track)), receipt: nil))
         case .removed:
             guard let track = tracksByID[polled.handleID] else { return }
-            fifo.append(.legacy(.removed(track)))
+            fifo.append(Staged(event: .legacy(.removed(track)), receipt: nil))
         case .ended:
             guard let track = tracksByID[polled.handleID] else { return }
-            fifo.append(.legacy(.ended(track)))
+            fifo.append(Staged(event: .legacy(.ended(track)), receipt: nil))
         case .parseDrop:
             /* Non-fatal diagnostic for a known track; never a track end. The
              * class is part of the diagnostic -- a missing class is dropped,
              * never defaulted to .media. */
             guard let track = tracksByID[polled.handleID],
                   let cls = polled.parseDropClass else { return }
-            fifo.append(.legacy(.parseDrop(track, class: cls,
+            fifo.append(Staged(event: .legacy(.parseDrop(track, class: cls,
                                    total: polled.parseDropTotal,
-                                   delta: polled.parseDropDelta)))
+                                   delta: polled.parseDropDelta)), receipt: nil))
         case .catalogReady:
-            fifo.append(.legacy(.catalogReady))
+            fifo.append(Staged(event: .legacy(.catalogReady), receipt: nil))
         case .fillTerminal(let terminal):
             guard let track = tracksByID[polled.handleID] else { return }
-            fifo.append(.fillTerminal(track, terminal))
+            fifo.append(Staged(event: .fillTerminal(track, terminal), receipt: nil))
         case .localFailure(let localResult):
             guard let track = tracksByID[polled.handleID] else { return }
-            fifo.append(.localFailure(track, localResult: localResult))
+            fifo.append(Staged(event: .localFailure(track, localResult: localResult), receipt: nil))
         case .updateLocalFailure(let localResult):
             guard let track = tracksByID[polled.handleID] else { return }
-            fifo.append(.updateLocalFailure(track, localResult: localResult))
+            fifo.append(Staged(event: .updateLocalFailure(track, localResult: localResult), receipt: nil))
         case .deliveryLocalFailure(let localResult, let origin, let initiatingRequestID):
             guard let track = tracksByID[polled.handleID] else { return }
-            fifo.append(.deliveryLocalFailure(track, localResult: localResult,
-                                               origin: origin, initiatingRequestID: initiatingRequestID))
+            fifo.append(Staged(event: .deliveryLocalFailure(track, localResult: localResult,
+                                               origin: origin, initiatingRequestID: initiatingRequestID), receipt: nil))
+        case .fillCreated(let initiatingRequestID):
+            guard let track = tracksByID[polled.handleID] else { return }
+            var receipt: (handleID: UInt64, generation: UInt64)?
+            if case .issued(let generation)? = fillOccupancy[polled.handleID] {
+                fillOccupancy[polled.handleID] = .staged(generation)
+                receipt = (polled.handleID, generation)
+            }
+            fifo.append(Staged(event: .fillCreated(track, initiatingRequestID: initiatingRequestID),
+                               receipt: receipt))
         }
+    }
+
+    /// Whether `fill` may ask the backend: not while a receipt is staged
+    /// but not yet dequeued. An issued command without a staged receipt is
+    /// the backend's to refuse (or, withdrawn, to accept a successor).
+    func fillMayIssue(_ handleID: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if case .staged? = fillOccupancy[handleID] { return false }
+        return true
+    }
+
+    /// A new command was recorded: it takes a new private generation.
+    func noteFillIssued(_ handleID: UInt64) {
+        lock.lock(); defer { lock.unlock() }
+        fillGeneration += 1
+        fillOccupancy[handleID] = .issued(fillGeneration)
     }
 
     func markTerminal(fatal isFatal: Bool, code: UInt64) {
@@ -759,7 +850,13 @@ private final class ReceiverState: @unchecked Sendable {
         defer { lock.unlock() }
         if !fifo.isEmpty {
             let wasFull = fifo.count >= Self.stagingCapacity
-            return .item(fifo.removeFirst(), freedCapacity: wasFull)
+            let staged = fifo.removeFirst()
+            /* Dequeuing a receipt frees only the command it answers. */
+            if let receipt = staged.receipt,
+               fillOccupancy[receipt.handleID] == .staged(receipt.generation) {
+                fillOccupancy[receipt.handleID] = nil
+            }
+            return .item(staged.event, freedCapacity: wasFull)
         }
         if terminal {
             return fatal ? .terminalFatal(code: fatalCode) : .terminalClean

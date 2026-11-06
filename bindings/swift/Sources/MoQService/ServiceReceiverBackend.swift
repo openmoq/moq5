@@ -345,6 +345,10 @@ final class ServiceReceiverBackend: ReceiverBackend, @unchecked Sendable {
             moq_media_receiver_unsubscribe_track(receiver, track))
     }
 
+    func fillTrack(handleID: UInt64, options: MediaFillOptions) -> ReceiverCommandResult {
+        fillReceiverTrack(receiver: receiver, handleID: handleID, options: options)
+    }
+
     func cancelFill(handleID: UInt64, initiatingRequestID: UInt64) -> ReceiverCommandResult {
         cancelReceiverFill(receiver: receiver, handleID: handleID,
                            initiatingRequestID: initiatingRequestID)
@@ -421,6 +425,11 @@ func copyReceiverTrackEvent(_ event: moq_media_track_event_t) -> ReceiverPolledE
             ? event.delivery_initiating_request_id : nil
         return ReceiverPolledEvent(kind: .deliveryLocalFailure(localResult: localResult,
             origin: origin, initiatingRequestID: initiatingID), handleID: handleID, trackDescription: nil)
+    case MOQ_MEDIA_TRACK_FILL_CREATED:
+        let initiatingID = receivedFieldIsPresent(event.struct_size, \moq_media_track_event_t.initiating_request_id)
+            ? event.initiating_request_id : nil
+        return ReceiverPolledEvent(kind: .fillCreated(initiatingRequestID: initiatingID),
+                                   handleID: handleID, trackDescription: nil)
     default:
         // Unmodeled kinds are not false track ends.
         return nil
@@ -545,6 +554,21 @@ private func withReceiverFill<T>(
 }
 
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+func fillReceiverTrack(
+    receiver: OpaquePointer, handleID: UInt64, options: MediaFillOptions,
+    call: (OpaquePointer?, OpaquePointer?, UnsafePointer<moq_fill_cfg_t>?) -> moq_result_t
+        = moq_media_receiver_fill_track
+) -> ReceiverCommandResult {
+    guard let track = OpaquePointer(bitPattern: UInt(handleID)) else { return .invalidArgument }
+    do {
+        return try withReceiverFill(options) { receiverCommandResult(call(receiver, track, $0)) }
+    } catch {
+        // The nonthrowing body leaves only the marshaller's size refusal.
+        return .nativeFailure(Int32(MOQ_ERR_ABI_MISMATCH))
+    }
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 func cancelReceiverFill(
     receiver: OpaquePointer, handleID: UInt64, initiatingRequestID: UInt64,
     call: (OpaquePointer?, OpaquePointer?, UInt64) -> moq_result_t = moq_media_receiver_cancel_fill
@@ -561,6 +585,7 @@ func receiverCommandResult(_ rc: moq_result_t) -> ReceiverCommandResult {
     case moq_result_t(MOQ_ERR_WRONG_STATE): .wrongState
     case moq_result_t(MOQ_ERR_CLOSED): .closed
     case moq_result_t(MOQ_ERR_UNSUPPORTED): .unsupported
+    case moq_result_t(MOQ_ERR_WOULD_BLOCK): .wouldBlock
     default: .nativeFailure(rc)
     }
 }
@@ -595,6 +620,7 @@ func queryReceiverTrackState(
     case .wrongState: return .failure(.wrongState)
     case .closed: return .failure(.closed)
     case .unsupported: return .failure(.unsupported)
+    case .wouldBlock: return .failure(.wouldBlock)
     case .nativeFailure(let code): return .failure(.internalError(code))
     }
 }

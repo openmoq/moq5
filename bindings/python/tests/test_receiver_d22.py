@@ -57,6 +57,72 @@ class ReceiverD22Tests(unittest.TestCase):
         self.assertEqual(_native._test_subscriptions(), [])
         self.assertEqual(_native._test_receiver_cancellations(), [(0, 0, 0)])
 
+    def test_fill_track_forwards_values_and_exact_refusals(self):
+        fill = moq5.FillConfig(priority=77, group_order=moq5.FillGroupOrder.DESCENDING,
+                               timeout_ms=1234,
+                               location=moq5.LocationFilter(kind=moq5.LocationFilterKind.OBJECT_END,
+                                                            start_group=9, start_object=1,
+                                                            end_group=9, end_object=MAX))
+        self.receiver.fill_track(self.track, fill)
+        self.receiver.fill_track(self.track, moq5.FillConfig())
+        commands = _native._test_receiver_fill_commands()
+        self.assertEqual([c[0] for c in commands], [0, 0])
+        self.assertGreater(commands[0][1], 0)
+        self.assertEqual(commands[0][2:], (77, moq5.FillGroupOrder.DESCENDING, 1234,
+                                           (moq5.LocationFilterKind.OBJECT_END, 9, 1, 9, MAX), 0))
+        self.assertEqual(commands[1][2:], (None, None, None, None, 0), "empty inherits")
+        self.assertEqual(_native._test_subscriptions(), [], "a fill is not a subscribe")
+        for code in (C["ERR_WOULD_BLOCK"], C["ERR_WRONG_STATE"], C["ERR_UNSUPPORTED"],
+                     C["ERR_LIMIT"], C["ERR_CLOSED"], -993):
+            _native._test_subscribe_result(code)
+            with self.assertRaises(moq5.MoqError) as caught:
+                self.receiver.fill_track(self.track, moq5.FillConfig())
+            self.assertEqual((caught.exception.code, caught.exception.operation), (code, "fill_track"))
+            self.assertEqual(_native._test_receiver_fill_commands()[-1][-1], code)
+        _native._test_subscribe_result(0)
+        before = len(_native._test_receiver_fill_commands())
+        for call in (lambda: self.receiver.fill_track(self.track, None),
+                     lambda: self.receiver.fill_track(self.track, {}),
+                     lambda: self.receiver.fill_track(object(), moq5.FillConfig())):
+            with self.assertRaises(TypeError):
+                call()
+        self.assertEqual(len(_native._test_receiver_fill_commands()), before)
+
+    def test_fill_track_keeps_the_creating_thread_guard(self):
+        refused = []
+
+        def foreign_thread():
+            try:
+                self.receiver.fill_track(self.track, moq5.FillConfig())
+            except RuntimeError as exc:
+                refused.append(str(exc))
+
+        worker = threading.Thread(target=foreign_thread)
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(refused, ["receiver operation requires its creating thread"])
+        self.assertEqual(_native._test_receiver_fill_commands(), [])
+
+    def test_fill_created_carries_its_id_only_when_stamped(self):
+        created = moq5.ExtendedTrackEventKind.FILL_CREATED
+        self.assertEqual(int(created), C["MEDIA_TRACK_FILL_CREATED"])
+        event = self.event(created, fill=(0, 0, 0, 0))
+        self.assertIs(event.kind_extended, created)
+        self.assertEqual(event.fill_created_id, 0, "zero is a valid ID")
+        self.assertIsNone(event.fill_terminal, "a receipt is not a terminal")
+        event = self.event(created, fill=(MAX, 0, 0, 0))
+        self.assertEqual(event.fill_created_id, MAX)
+        terminal = self.event(moq5.ExtendedTrackEventKind.FILL_TERMINAL, fill=(5, 1, 0, 0))
+        self.assertIsNone(terminal.fill_created_id)
+        short = self.layout["event_initiating_request_id_end"] - 4
+        event = self.event(created, stamp=short, fill=(3, 0, 0, 0))
+        self.assertIs(event.kind_extended, created)
+        self.assertIsNone(event.fill_created_id, "a partial ID is unobserved")
+        legacy = moq5.TrackEvent(int(created), self.track, None, None, None, None)
+        self.assertEqual(legacy, dataclasses.replace(legacy, fill_created_id=7),
+                         "the ID does not change legacy equality")
+
     def test_object_has_additive_identity(self):
         _native._test_push_object(self.capsule, {"payload": b"data", "packaging": 1})
         obj = self.receiver.poll_object()

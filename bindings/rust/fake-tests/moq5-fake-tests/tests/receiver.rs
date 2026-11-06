@@ -1454,6 +1454,148 @@ fn subscriptions_carry_locations_and_fills() {
 }
 
 #[test]
+fn running_fill_reaches_the_service() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    let track = track(&receiver, 0);
+    s.take_log();
+    let filter_size = std::mem::size_of::<sys::moq_location_filter_cfg_t>();
+    let fill_size = std::mem::size_of::<sys::moq_fill_cfg_t>();
+    let fill = FillOptions {
+        subscriber_priority: Some(77),
+        group_order: Some(GroupOrder::Descending),
+        timeout: Some(Duration::from_millis(1234)),
+        location: Some(LocationFilter::ObjectEnd {
+            start: at(9, 1),
+            end: at(9, 4),
+        }),
+    };
+    assert_eq!(receiver.fill_track(track, fill), Ok(()));
+    let line_text = fake::line(&s.take_log(), "fill_track ");
+    assert_eq!(fake::field(&line_text, "track"), "0");
+    assert_eq!(
+        fake::field(&line_text, "fill_cfg"),
+        format!(
+            "77/{}/1234/{}:0:9.1:9.4:struct={filter_size}/struct={fill_size}",
+            sys::MOQ_GROUP_ORDER_DESCENDING,
+            sys::MOQ_LOCATION_FILTER_OBJECT_END
+        )
+    );
+    // A bare fill inherits everything.
+    assert_eq!(receiver.fill_track(track, FillOptions::default()), Ok(()));
+    assert_eq!(
+        fake::field(&fake::line(&s.take_log(), "fill_track "), "fill_cfg"),
+        format!("-/-/-/none/struct={fill_size}")
+    );
+    // The service's refusals come back as they are; an unobserved earlier
+    // command is the transient WOULD_BLOCK.
+    for code in [
+        sys::MOQ_ERR_WOULD_BLOCK,
+        sys::MOQ_ERR_WRONG_STATE,
+        sys::MOQ_ERR_UNSUPPORTED,
+        sys::MOQ_ERR_LIMIT,
+        sys::MOQ_ERR_CLOSED,
+    ] {
+        s.set("fill_track_result", i64::from(code));
+        assert_eq!(
+            receiver.fill_track(track, FillOptions::default()),
+            Err(Error::from_code(code))
+        );
+    }
+    s.set("fill_track_result", i64::from(sys::MOQ_OK));
+    s.take_log();
+    // A timeout finer than a millisecond never reaches the service.
+    assert_eq!(
+        receiver.fill_track(
+            track,
+            FillOptions {
+                timeout: Some(Duration::from_micros(1500)),
+                ..FillOptions::default()
+            }
+        ),
+        Err(Error::INVAL)
+    );
+    assert!(s.take_log().is_empty());
+    // A track of another receiver never reaches the service.
+    drop(receiver);
+    let second = attach(&s, &endpoint);
+    s.take_log();
+    assert_eq!(
+        second.fill_track(track, FillOptions::default()),
+        Err(Error::INVAL)
+    );
+    assert!(s.take_log().is_empty());
+}
+
+#[test]
+fn fill_created_reports_its_id_only_when_stamped() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    let mut created = raw_event(&receiver, sys::MOQ_MEDIA_TRACK_FILL_CREATED, 0);
+    created.initiating_request_id = 0;
+    push_event(created);
+    let event = receiver
+        .poll_track()
+        .expect("poll_track on a live receiver")
+        .expect("the pushed event is pollable");
+    assert_eq!(event.kind(), TrackEventKind::FillCreated);
+    assert_eq!(event.kind().code(), sys::MOQ_MEDIA_TRACK_FILL_CREATED);
+    assert_eq!(event.fill_created_id(), Some(0), "zero is a valid ID");
+    assert_eq!(
+        event.fill_terminal(),
+        None,
+        "admission does not end the fill"
+    );
+    created.initiating_request_id = u64::MAX;
+    push_event(created);
+    let event = receiver
+        .poll_track()
+        .expect("poll_track on a live receiver")
+        .expect("the pushed event is pollable");
+    assert_eq!(event.fill_created_id(), Some(u64::MAX));
+    assert_eq!(
+        event.fill_terminal(),
+        None,
+        "admission does not end the fill"
+    );
+    // An unknown kind with the whole fill tail populated is neither.
+    let mut unknown = raw_event(&receiver, 0x7fff_fffe, 0);
+    unknown.initiating_request_id = 9;
+    unknown.fill_reason = sys::MOQ_FILL_COMPLETE;
+    unknown.fill_error_domain = 1;
+    unknown.fill_error_code = 2;
+    push_event(unknown);
+    let event = receiver
+        .poll_track()
+        .expect("poll_track on a live receiver")
+        .expect("the pushed event is pollable");
+    assert_eq!(event.fill_created_id(), None);
+    assert_eq!(event.fill_terminal(), None);
+    // Another kind carrying the same field is not a receipt.
+    let mut terminal = raw_event(&receiver, sys::MOQ_MEDIA_TRACK_FILL_TERMINAL, 0);
+    terminal.initiating_request_id = 5;
+    push_event(terminal);
+    let event = receiver
+        .poll_track()
+        .expect("poll_track on a live receiver")
+        .expect("the pushed event is pollable");
+    assert_eq!(event.fill_created_id(), None);
+    // A stamp short of the ID leaves it unobserved.
+    let short = std::mem::offset_of!(sys::moq_media_track_event_t, initiating_request_id) + 4;
+    s.set("poll_track_stamp", short as i64);
+    created.initiating_request_id = 3;
+    push_event(created);
+    let event = receiver
+        .poll_track()
+        .expect("poll_track on a live receiver")
+        .expect("the pushed event is pollable");
+    assert_eq!(event.kind(), TrackEventKind::FillCreated);
+    assert_eq!(event.fill_created_id(), None);
+}
+
+#[test]
 fn fill_cancellation_reaches_the_service() {
     let s = fake::suite();
     let endpoint = connect(&s);

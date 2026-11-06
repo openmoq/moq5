@@ -267,6 +267,16 @@ timer. Either explicit subscribe option suppresses the service's implicit
 current-group fill. Nested inputs are copied during the native call. Native
 validation resolves ranges and profile support without Python reinterpretation.
 
+`fill_track(track, fill)` records one fill on the track's existing
+subscription, sent as an UPDATE once the track is delivering and no other
+UPDATE of it awaits a response; returning means recorded, not sent. Its
+admission is a `FILL_CREATED` event whose `fill_created_id` is the ID
+`cancel_fill` takes. Until that event is polled, a second call raises the
+native `WOULD_BLOCK`; several admitted fills may coexist. `unsubscribe`
+withdraws a command the service has not yet taken, and never cancels admitted
+fills. Once taken, the command may still be admitted: its `FILL_CREATED` then
+arrives as usual, and its ID cancels that child.
+
 `cancel_fill(track, initiating_request_id)` schedules only the identified child
 through the service, never unsubscribes its parent, and does not wait for its
 terminal. IDs are exact uint64 including zero. Every refusal raises `MoqError`
@@ -304,7 +314,8 @@ entry); it is `None` for LOC and MPEG-TS tracks and for a CMAF track whose
 header did not parse.
 
 `TrackEvent.kind_extended` adds `ExtendedTrackEventKind.LOCAL_FAILURE`,
-`UPDATE_LOCAL_FAILURE`, `DELIVERY_LOCAL_FAILURE` and `FILL_TERMINAL`.
+`UPDATE_LOCAL_FAILURE`, `DELIVERY_LOCAL_FAILURE`, `FILL_TERMINAL` and
+`FILL_CREATED`.
 `UPDATE_LOCAL_FAILURE` reports a permanent local UPDATE admission refusal;
 ordinary capacity pressure and outstanding responses are retried instead.
 The original `TrackEventKind` members and `kind` enum/int
@@ -424,7 +435,7 @@ loopback has been run, with an independent C publisher and declared synthetic
 RAW/LOC payloads; acceptance against real media has not been run.
 
 The package requires a LibMoQ service SDK with the sized receiver/subscribe
-initializers, `moq_media_receiver_cancel_fill`, the metadata/terminal output
+initializers, `moq_media_receiver_fill_track`, `moq_media_receiver_cancel_fill`, the metadata/terminal output
 tails, and `moq_media_receiver_track_desc_copy`. Building against an older SDK
 fails rather than falling back to a borrowed descriptor or invented metadata.
 The fake-service tests exercise mapping, prefix gates, and copy ownership, not

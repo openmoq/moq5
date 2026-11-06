@@ -233,6 +233,22 @@ class Receiver:
             fill_value = (fill.priority, fill.group_order, fill.timeout_ms, _location(fill.location))
         _call(_native.receiver_subscribe, self.__handle, capsule, int(start), priority, loc, fill_value)
 
+    def fill_track(self, track: Track, fill: FillConfig) -> None:
+        """Record one draft-22 fill on `track`'s existing subscription: an
+        UPDATE carrying `fill`, sent once the track is delivering and no other
+        UPDATE of it awaits a response. Nonblocking; returning means recorded,
+        not sent or accepted. Its admission is an event of kind
+        ExtendedTrackEventKind.FILL_CREATED whose fill_created_id cancel_fill
+        takes. Until that event is polled, a second call raises the native
+        WOULD_BLOCK; several admitted fills may coexist. unsubscribe withdraws
+        a command not yet taken and never cancels admitted fills. Refusals keep
+        the native code, with operation 'fill_track'."""
+        capsule = self._own(track)
+        if not isinstance(fill, FillConfig):
+            raise TypeError("fill must be FillConfig")
+        fill_value = (fill.priority, fill.group_order, fill.timeout_ms, _location(fill.location))
+        _call(_native.receiver_fill_track, self.__handle, capsule, fill_value)
+
     def cancel_fill(self, track: Track, initiating_request_id: int) -> None:
         """Schedule cancellation of one child, never unsubscribe its parent.
         The SUBSCRIBE/UPDATE correlation ID is full uint64, including zero;
@@ -281,7 +297,8 @@ class Receiver:
             if outcome is PollOutcome.CLOSED:
                 self.__closed[0] = True
             return outcome
-        kind, capsule, desc, largest, expires_ms, drop, local_result, fill, origin, delivery_id = result
+        (kind, capsule, desc, largest, expires_ms, drop, local_result, fill, origin, delivery_id,
+         created_id) = result
         # Convert everything BEFORE publishing anything: no half-updated
         # Track or cache survives a failure below.
         description = None if desc is None else _description(desc)
@@ -308,7 +325,8 @@ class Receiver:
                            None if largest is None else (largest[0], largest[1]), expires_ms, parse_drop,
                            local_result=local_result, fill_terminal=fill_terminal,
                            delivery_origin=None if origin is None else _known_or_int(DeliveryOrigin, origin),
-                           delivery_initiating_request_id=delivery_id)
+                           delivery_initiating_request_id=delivery_id,
+                           fill_created_id=created_id)
         if publish is not None:
             self.__tracks[publish] = track
         if track is not None:

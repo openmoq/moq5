@@ -240,6 +240,76 @@ struct ReceiverFillBridgeTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A running fill forwards one sized config; WOULD_BLOCK is named, other refusals stay raw")
+    func fillForwarding() {
+        let receiver = OpaquePointer(bitPattern: 0x1000)!
+        let options = MediaFillOptions(subscriberPriority: 0, groupOrder: .descending,
+                                       timeoutMilliseconds: .max, location: .relativeGroup(offset: .max))
+        var calls = 0
+        let ok = fillReceiverTrack(receiver: receiver, handleID: 0x2000, options: options) { r, track, cfg in
+            calls += 1
+            #expect(r == receiver && track == OpaquePointer(bitPattern: 0x2000))
+            guard let fill = cfg?.pointee else { Issue.record("fill config missing"); return MOQ_ERR_INVAL }
+            #expect(fill.struct_size == MemoryLayout<moq_fill_cfg_t>.size)
+            #expect(fill.has_subscriber_priority && fill.subscriber_priority == 0)
+            #expect(fill.has_group_order && fill.group_order == MOQ_GROUP_ORDER_DESCENDING)
+            #expect(fill.has_fill_timeout && fill.fill_timeout_ms == .max)
+            #expect(fill.location != nil)
+            return moq_result_t(MOQ_OK)
+        }
+        if case .ok = ok {} else { Issue.record("fill success lost") }
+        _ = fillReceiverTrack(receiver: receiver, handleID: 0x2000, options: .init()) { _, _, cfg in
+            calls += 1
+            guard let fill = cfg?.pointee else { Issue.record("empty fill is not omission"); return MOQ_OK }
+            #expect(!fill.has_subscriber_priority && !fill.has_group_order && !fill.has_fill_timeout)
+            #expect(fill.location == nil)
+            return moq_result_t(MOQ_OK)
+        }
+        #expect(calls == 2)
+        let invalid = fillReceiverTrack(receiver: receiver, handleID: 0, options: options) { _, _, _ in
+            Issue.record("null track must not call native"); return moq_result_t(MOQ_OK)
+        }
+        if case .invalidArgument = invalid {} else { Issue.record("missing invalid-argument mapping") }
+        let blocked = fillReceiverTrack(receiver: receiver, handleID: 0x2000, options: options) { _, _, _ in
+            moq_result_t(MOQ_ERR_WOULD_BLOCK)
+        }
+        if case .wouldBlock = blocked {} else { Issue.record("WOULD_BLOCK was not named") }
+        for raw in [MOQ_ERR_LIMIT, MOQ_ERR_ABI_MISMATCH, -12345] as [Int32] {
+            let result = fillReceiverTrack(receiver: receiver, handleID: 0x2000, options: options) { _, _, _ in raw }
+            guard case .nativeFailure(let code) = result else { Issue.record("raw refusal lost: \(raw)"); continue }
+            #expect(code == raw)
+        }
+        let state = queryReceiverTrackState(receiver: receiver, handleID: 0x2000) { _, _, _ in
+            moq_result_t(MOQ_ERR_WOULD_BLOCK)
+        }
+        if case .failure(.wouldBlock) = state {} else { Issue.record("track-state WOULD_BLOCK was not named") }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A fill receipt carries its ID only when the whole field is stamped, including zero")
+    func fillCreatedExtents() throws {
+        let idOffset = MemoryLayout<moq_media_track_event_t>.offset(of: \.initiating_request_id)!
+        let idEnd = UInt32(idOffset + MemoryLayout<UInt64>.size)
+        let stamps = [UInt32(idOffset), idEnd - 1, idEnd,
+                      UInt32(MemoryLayout<moq_media_track_event_t>.size), .max]
+        for stamp in stamps {
+            for value in [UInt64(0), .max] {
+                var event = moq_media_track_event_t()
+                event.struct_size = stamp
+                event.kind = MOQ_MEDIA_TRACK_FILL_CREATED
+                event.track = OpaquePointer(bitPattern: 0xABCD)
+                event.initiating_request_id = value
+                let copy = try #require(copyReceiverTrackEvent(event))
+                #expect(copy.handleID == 0xABCD && copy.trackDescription == nil)
+                guard case .fillCreated(let id) = copy.kind else {
+                    Issue.record("known kind12 was not a receipt"); return
+                }
+                #expect(id == (stamp >= idEnd ? value : nil))
+            }
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Local failure is extended; UPDATE_OK and unknown events remain unmodeled")
     func unrelatedKinds() {
         var event = moq_media_track_event_t()

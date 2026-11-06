@@ -3,7 +3,7 @@
 // scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: b8a4d22720f2 (native headers modified in the worktree)
+// libmoq commit: 9f2d3c8c48f8 (native headers modified in the worktree)
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -12292,6 +12292,8 @@ pub const MOQ_MEDIA_TRACK_FILL_TERMINAL: moq_media_track_event_kind = 9;
 pub const MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE: moq_media_track_event_kind = 10;
 #[doc = " a local UPDATE admission\nfailed permanently. Exactly once per failed\ntrack generation; read the sized local_result.\nNot a peer UPDATE error or END_OF_TRACK.\nUnrelated tracks and the endpoint continue."]
 pub const MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE: moq_media_track_event_kind = 11;
+#[doc = " the fill recorded by\nmoq_media_receiver_fill_track() was admitted\nlocally: its UPDATE was sent and the child\nexists. Read its initiating_request_id below\n(zero is valid) and cancel the child with\nmoq_media_receiver_cancel_fill(). Local\nadmission only: not the peer's acceptance,\nan opened stream or a live child at poll\ntime. Queued before that child's\nFILL_TERMINAL. Fills requested by\nsubscribe_track options and the catalog's\nfills never produce it."]
+pub const MOQ_MEDIA_TRACK_FILL_CREATED: moq_media_track_event_kind = 12;
 #[doc = " -- Track discovery events (§6.2) ------------------------------------"]
 pub type moq_media_track_event_kind = ::std::os::raw::c_uint;
 #[doc = " -- Track discovery events (§6.2) ------------------------------------"]
@@ -12337,7 +12339,7 @@ pub struct moq_media_track_event {
     pub local_result: i32,
     #[doc = " zero; never read"]
     pub _reserved_local_failure: u32,
-    #[doc = " Appended after the complete LOCAL_FAILURE allocation. Valid only for\n FILL_TERMINAL, with the exact initiating SUBSCRIBE/UPDATE ID (zero is\n valid), MOQ_FILL_* reason and MOQ_FILL_ERROR_* domain from session.h.\n A STREAM code of zero is still a failure, not COMPLETE. Each field is\n observable only when wholly covered by struct_size. Short/old outputs\n consume the event's supported prefix; an absent tail is unobserved.\n These are plain values, with no cleanup and no borrowed child handle."]
+    #[doc = " Appended after the complete LOCAL_FAILURE allocation. Valid only for\n FILL_TERMINAL, with the exact initiating SUBSCRIBE/UPDATE ID (zero is\n valid), MOQ_FILL_* reason and MOQ_FILL_ERROR_* domain from session.h.\n A STREAM code of zero is still a failure, not COMPLETE. FILL_CREATED\n uses initiating_request_id alone, for the UPDATE that requested the\n fill (zero is valid); its reason, domain and code are zero. Each field\n is observable only when wholly covered by struct_size. Short/old outputs\n consume the event's supported prefix; an absent tail is unobserved, and\n a FILL_CREATED polled that way still releases its command slot.\n These are plain values, with no cleanup and no borrowed child handle."]
     pub initiating_request_id: u64,
     pub fill_reason: u32,
     pub fill_error_domain: u32,
@@ -12548,6 +12550,15 @@ unsafe extern "C" {
     pub fn moq_media_receiver_unsubscribe_track(
         r: *mut moq_media_receiver_t,
         track: *mut moq_media_track_t,
+    ) -> moq_result_t;
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " Request a D22 fill on `track`'s existing subscription: an UPDATE carrying\n `fill` (draft-22 sections 3.4 and 9.5). The subscription, its filter and\n the track's other fills are unchanged; a new fill never cancels one. `fill`\n is required (moq_fill_cfg_init gives the defaults); it and fill->location\n borrow only for this call, and their selected values are copied before\n returning.\n\n Nonblocking and callable from any thread: it records one command and wakes\n the endpoint executor, which sends the UPDATE. MOQ_OK means recorded, not\n sent or accepted by the peer. The interrupt latch of wait() neither refuses\n nor withdraws it. The executor sends it only while the track is wanted, its\n subscription is established and delivering (not paused by FLOW_CONTROL),\n and no other UPDATE of the track awaits its response: a resume is sent and\n acknowledged first, and a pause takes precedence over a queued fill.\n\n Once the UPDATE is admitted the track gets MOQ_MEDIA_TRACK_FILL_CREATED,\n with the request ID the fill is identified by; cancel it with\n moq_media_receiver_cancel_fill(). Its objects carry that ID, and its\n FILL_TERMINAL ends it. A track holds one unobserved command: until its\n FILL_CREATED is polled (by any output size), a second call returns\n MOQ_ERR_WOULD_BLOCK with no effect. Several admitted fills may coexist.\n\n unsubscribe_track withdraws a command not yet taken by the executor, and\n no FILL_CREATED follows. Once taken, its admission may still win: it keeps\n the slot until its FILL_CREATED is polled, and the admitted fill is then\n cancelled only by its ID. A disable never cancels admitted fills. A command\n is also withdrawn, with no event, when its track ends, fails or is removed,\n when the receiver closes, and when a live-to-VOD re-subscription replaces\n the subscription it was recorded for. A permanent local UPDATE failure is\n reported as MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE, as for subscribe_track.\n\n Returns:\n   MOQ_OK            recorded and scheduled\n   MOQ_ERR_INVAL     NULL r/track/fill, a foreign track, or a malformed\n                     selected value (an unknown group order or location kind,\n                     or a location ending before its start)\n   MOQ_ERR_ABI_MISMATCH  fill or fill->location below its frozen floor\n   MOQ_ERR_UNSUPPORTED   not draft-22 with the D22 companion profile (drafts\n                     16 and 18 have no fills); nothing is recorded or sent\n   MOQ_ERR_WRONG_STATE   the track is not subscribed (never subscribed, or\n                     disabled by unsubscribe_track), has ended, failed\n                     locally or been removed\n   MOQ_ERR_WOULD_BLOCK   the track's previous command is not yet observed\n   MOQ_ERR_LIMIT     the receiver's command identities are exhausted\n   MOQ_ERR_CLOSED    the receiver or its endpoint is terminal"]
+    pub fn moq_media_receiver_fill_track(
+        r: *mut moq_media_receiver_t,
+        track: *mut moq_media_track_t,
+        fill: *const moq_fill_cfg_t,
     ) -> moq_result_t;
 }
 unsafe extern "C" {

@@ -285,7 +285,7 @@ struct ReceiverFillTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-    @Test("Legacy filtering checks cancellation between queued fill records")
+    @Test("A cancelled legacy call consumes no queued record")
     func cancellationBetweenFilteredRecords() async throws {
         let rig = try FillRig()
         _ = try await rig.discover()
@@ -297,15 +297,193 @@ struct ReceiverFillTests {
             _ = try await iterator.next()
         }
         await #expect(throws: CancellationError.self) { try await task.value }
-        #expect(rig.receiver.attachment.stagedTrackEventCount == 32)
+        #expect(rig.receiver.attachment.stagedTrackEventCount == 33)
         var extended = rig.receiver.trackEventsExtended.makeAsyncIterator()
         if case .fillTerminal(_, let terminal)? = try await extended.next() {
-            #expect(terminal.initiatingRequestID == 1)
+            #expect(terminal.initiatingRequestID == 0)
         } else { Issue.record("filtered cancellation failed to release the claim") }
         var legacy = rig.receiver.trackEvents.makeAsyncIterator()
         if case .catalogReady? = try await legacy.next() {} else { Issue.record("legacy tail lost") }
         #expect(try await extended.next() == nil)
         await rig.endpoint.close()
+        #expect(rig.backend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A running fill reaches the service unchanged; refusals map without staging anything")
+    func runningFillCommand() async throws {
+        let rig = try FillRig()
+        let track = try await rig.discover()
+        let options = MediaFillOptions(subscriberPriority: 77, groupOrder: .descending,
+                                       timeoutMilliseconds: 1234, location: .relativeGroup(offset: 2))
+        try await rig.receiver.fill(track, options: options)
+        #expect(rig.backend.snapshot().fillTrackCalls == [.init(handleID: 7, options: options)])
+        #expect(rig.receiver.attachment.stagedTrackEventCount == 0)
+        let foreign = MediaTrack(description: track.description)
+        await #expect(throws: MoQServiceError.self) { try await rig.receiver.fill(foreign, options: options) }
+        let refusals: [(ReceiverCommandResult, MoQServiceError)] = [
+            (.wouldBlock, .wouldBlock), (.wrongState, .wrongState), (.closed, .closed),
+            (.unsupported, .unsupported), (.nativeFailure(-14), .internalError(-14)),
+        ]
+        for (result, error) in refusals {
+            rig.backend.scriptFillTrackResults([result])
+            await #expect(throws: error) { try await rig.receiver.fill(track, options: .init()) }
+        }
+        #expect(rig.backend.snapshot().fillTrackCalls.count == 1 + refusals.count)
+        await rig.receiver.close()
+        await #expect(throws: MoQServiceError.closed) { try await rig.receiver.fill(track, options: options) }
+        #expect(rig.backend.snapshot().fillTrackCalls.count == 1 + refusals.count)
+        await rig.endpoint.close()
+        #expect(rig.backend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A staged receipt holds the command slot until the event consumer dequeues it")
+    func receiptHoldsSlotUntilDequeued() async throws {
+        let rig = try FillRig()
+        let track = try await rig.discover()
+        try await rig.receiver.fill(track, options: .init())
+        /* A wait cancelled before the receipt arrives consumes nothing. */
+        let wakes = rig.endpointBackend.snapshot().wakeCount
+        let waiter = Task {
+            var iterator = rig.receiver.trackEventsExtended.makeAsyncIterator()
+            _ = try await iterator.next()
+        }
+        #expect(await rig.endpointBackend.awaitCondition { $0.wakeCount > wakes })
+        waiter.cancel()
+        await #expect(throws: CancellationError.self) { try await waiter.value }
+        /* The eager drain frees the native slot; the binding still holds it. */
+        try await rig.stage([.created(7, requestID: 12), .catalogReady])
+        await #expect(throws: MoQServiceError.wouldBlock) { try await rig.receiver.fill(track, options: .init()) }
+        #expect(rig.backend.snapshot().fillTrackCalls.count == 1)
+        var events = rig.receiver.trackEventsExtended.makeAsyncIterator()
+        guard case .fillCreated(let created, let id)? = try await events.next() else {
+            Issue.record("missing receipt"); await rig.endpoint.close(); return
+        }
+        #expect(created === track && id == 12)
+        try await rig.receiver.fill(track, options: .init())
+        #expect(rig.backend.snapshot().fillTrackCalls.count == 2)
+        if case .legacy(.catalogReady)? = try await events.next() {} else { Issue.record("tail lost") }
+        await rig.endpoint.close()
+        #expect(rig.backend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A cancelled call on either view leaves a staged receipt and its command slot")
+    func cancelledCallsKeepReceipt() async throws {
+        for extendedView in [false, true] {
+            let rig = try FillRig()
+            let track = try await rig.discover()
+            try await rig.receiver.fill(track, options: .init())
+            try await rig.stage([.created(7, requestID: 21)])
+            let task = Task {
+                withUnsafeCurrentTask { $0?.cancel() }
+                if extendedView {
+                    var iterator = rig.receiver.trackEventsExtended.makeAsyncIterator()
+                    _ = try await iterator.next()
+                } else {
+                    var iterator = rig.receiver.trackEvents.makeAsyncIterator()
+                    _ = try await iterator.next()
+                }
+            }
+            await #expect(throws: CancellationError.self) { try await task.value }
+            /* A lost receipt would leave the reads below waiting forever. */
+            guard rig.receiver.attachment.stagedTrackEventCount == 1 else {
+                Issue.record("a cancelled call consumed the receipt")
+                await rig.endpoint.close(); return
+            }
+            await #expect(throws: MoQServiceError.wouldBlock) {
+                try await rig.receiver.fill(track, options: .init())
+            }
+            #expect(rig.backend.snapshot().fillTrackCalls.count == 1)
+            var events = rig.receiver.trackEventsExtended.makeAsyncIterator()
+            guard case .fillCreated(let created, let id)? = try await events.next() else {
+                Issue.record("receipt lost to a cancelled call"); await rig.endpoint.close(); return
+            }
+            #expect(created === track && id == 21)
+            try await rig.receiver.fill(track, options: .init())
+            #expect(rig.backend.snapshot().fillTrackCalls.count == 2)
+            await rig.endpoint.close()
+            #expect(rig.backend.snapshot().violations.isEmpty)
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Dequeuing a receipt frees only its own command and its own track")
+    func receiptFreesOnlyItsCommand() async throws {
+        let rig = try FillRig()
+        let video = try await rig.discover()
+        try await rig.stage([.added(8, name: "audio", mediaType: .audio)])
+        var legacy = rig.receiver.trackEvents.makeAsyncIterator()
+        guard case .added(let audio)? = try await legacy.next() else {
+            Issue.record("missing audio"); await rig.endpoint.close(); return
+        }
+        try await rig.receiver.fill(video, options: .init())
+        try await rig.receiver.fill(audio, options: .init())
+        /* A receipt the binding did not issue (no command) stages without a slot. */
+        try await rig.stage([.created(7, requestID: 1), .created(8, requestID: 2), .created(7, requestID: nil)])
+        await #expect(throws: MoQServiceError.wouldBlock) { try await rig.receiver.fill(video, options: .init()) }
+        await #expect(throws: MoQServiceError.wouldBlock) { try await rig.receiver.fill(audio, options: .init()) }
+        var events = rig.receiver.trackEventsExtended.makeAsyncIterator()
+        guard case .fillCreated(_, let first)? = try await events.next() else {
+            Issue.record("missing first receipt"); await rig.endpoint.close(); return
+        }
+        #expect(first == 1)
+        try await rig.receiver.fill(video, options: .init())
+        await #expect(throws: MoQServiceError.wouldBlock) { try await rig.receiver.fill(audio, options: .init()) }
+        /* The audio receipt frees audio. The stray video receipt was staged
+         * while the slot was held, so it answers no command: dequeuing it
+         * leaves the video command issued since then in place, and that
+         * command's own receipt below holds the slot again. */
+        guard case .fillCreated(_, let second)? = try await events.next(),
+              case .fillCreated(_, let absent)? = try await events.next() else {
+            Issue.record("missing receipts"); await rig.endpoint.close(); return
+        }
+        #expect(second == 2 && absent == nil)
+        try await rig.receiver.fill(audio, options: .init())
+        try await rig.stage([.created(7, requestID: 3)])
+        await #expect(throws: MoQServiceError.wouldBlock) { try await rig.receiver.fill(video, options: .init()) }
+        #expect(rig.backend.snapshot().fillTrackCalls.map(\.handleID) == [7, 8, 7, 8])
+        await rig.endpoint.close()
+        #expect(rig.backend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("The legacy view consumes a receipt, forfeiting its ID and freeing the slot")
+    func legacyViewConsumesReceipt() async throws {
+        let rig = try FillRig()
+        let track = try await rig.discover()
+        try await rig.receiver.fill(track, options: .init())
+        try await rig.stage([.created(7, requestID: 4), .catalogReady])
+        var legacy = rig.receiver.trackEvents.makeAsyncIterator()
+        if case .catalogReady? = try await legacy.next() {} else { Issue.record("legacy tail lost") }
+        try await rig.receiver.fill(track, options: .init())
+        #expect(rig.backend.snapshot().fillTrackCalls.count == 2)
+        #expect(rig.receiver.attachment.stagedTrackEventCount == 0)
+        await rig.endpoint.close()
+        #expect(rig.backend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Receipts take bounded staging slots and the retained surplus keeps its order")
+    func receiptsUnderStagingPressure() async throws {
+        let rig = try FillRig()
+        let track = try await rig.discover()
+        try await rig.receiver.fill(track, options: .init())
+        try await rig.stage((0..<64).map { .fill(7, requestID: UInt64($0)) } + [.created(7, requestID: 99)])
+        #expect(rig.receiver.attachment.stagedTrackEventCount == 64)
+        #expect(rig.backend.snapshot().queuedEventsRemaining == 1)
+        /* Still only issued: the binding defers to the native slot. */
+        rig.backend.scriptFillTrackResults([.wouldBlock])
+        await #expect(throws: MoQServiceError.wouldBlock) { try await rig.receiver.fill(track, options: .init()) }
+        var events = rig.receiver.trackEventsExtended.makeAsyncIterator()
+        for _ in 0..<64 { _ = try await events.next() }
+        guard case .fillCreated(_, let id)? = try await events.next() else {
+            Issue.record("receipt lost under pressure"); await rig.endpoint.close(); return
+        }
+        #expect(id == 99)
+        await rig.endpoint.close()
+        #expect(rig.backend.snapshot().fillTrackCalls.count == 2)
         #expect(rig.backend.snapshot().violations.isEmpty)
     }
 

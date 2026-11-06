@@ -53,12 +53,15 @@ typedef struct fixture {
     moq_media_track_t *media, *other, *sap, *timeline;
     moq_media_track_t *slot_tracks[SLOT_TRACKS];
     uint8_t value[sizeof(original)];
+    /* When set, the bytes a Forward-only UPDATE must carry instead. */
+    uint8_t forward_value[sizeof(original)];
+    bool forward_value_set;
     uint64_t type;
     bool anonymous;
     moq_media_auth_action_t fail_action;
     const char *fail_name;
     enum policy policy;
-    unsigned selects[6], outcomes, subscribes, fetches, fills, updates;
+    unsigned selects[6], outcomes, subscribes, fetches, fills, updates, fill_updates;
     unsigned selected_resources[6][RESOURCE_COUNT], wire_subscribes[RESOURCE_COUNT];
     unsigned wire_updates[RESOURCE_COUNT], wire_unsubscribes[RESOURCE_COUNT];
     moq_subscription_t peer_subs[RESOURCE_COUNT];
@@ -236,15 +239,21 @@ static void receiver_pump(fixture_t *f)
     moq_media_receiver_test_pump(f->receiver, f->client, moq_simpair_now_us(f->pair));
 }
 
-static void tokens_equal(fixture_t *f, const moq_resolved_token_t *t, size_t n)
+static void tokens_match(fixture_t *f, const moq_resolved_token_t *t, size_t n,
+                         const uint8_t *expected)
 {
     CHECK(n == (f->anonymous ? 0u : 1u));
     if (!f->anonymous && n == 1 && t) {
         CHECK(t[0].token_type == f->type);
         CHECK(t[0].token_value.len == sizeof(original));
         if (t[0].token_value.len == sizeof(original))
-            CHECK(memcmp(t[0].token_value.data, original, sizeof(original)) == 0);
+            CHECK(memcmp(t[0].token_value.data, expected, sizeof(original)) == 0);
     }
+}
+
+static void tokens_equal(fixture_t *f, const moq_resolved_token_t *t, size_t n)
+{
+    tokens_match(f, t, n, original);
 }
 
 /* The peer accepts real SUBSCRIBEs and observes actual decoded credentials.
@@ -288,7 +297,9 @@ static void peer_requests(fixture_t *f)
             CHECK(f->peer_subs[0]._opaque != 0);
             f->fetches++;
         } else if (e.kind == MOQ_EVENT_SUBSCRIBE_UPDATED) {
-            tokens_equal(f, e.u.subscribe_updated.tokens, e.u.subscribe_updated.token_count);
+            bool forward_only = !e.u.subscribe_updated.fill_requested;
+            tokens_match(f, e.u.subscribe_updated.tokens, e.u.subscribe_updated.token_count,
+                         forward_only && f->forward_value_set ? f->forward_value : original);
             bool known = false;
             for (size_t i = 1; i < RESOURCE_COUNT; i++)
                 if (e.u.subscribe_updated.sub._opaque == f->peer_subs[i]._opaque &&
@@ -296,8 +307,10 @@ static void peer_requests(fixture_t *f)
                     known = true;
                     f->wire_updates[i]++;
                 }
-            CHECK(known && e.u.subscribe_updated.has_forward);
-            f->updates++;
+            CHECK(known && (e.u.subscribe_updated.has_forward ||
+                            e.u.subscribe_updated.fill_requested));
+            if (e.u.subscribe_updated.fill_requested) f->fill_updates++;
+            else f->updates++;
         } else if (e.kind == MOQ_EVENT_UNSUBSCRIBED) {
             bool known = false;
             for (size_t i = 0; i < RESOURCE_COUNT; i++) {
@@ -979,6 +992,138 @@ static void test_native_update_failure_no_reselection(moq_version_t version)
     close_fixture(&f);
 }
 
+typedef struct fill_withdraw {
+    moq_media_track_t *track;
+    const moq_fill_cfg_t *b;
+    unsigned calls;
+    moq_result_t refill;
+} fill_withdraw_t;
+
+/* After the credential for fill command A is selected: disable, resume, and
+ * request B while A is still taken. */
+static void withdraw_fill(moq_media_receiver_t *r, moq_media_track_t *t, void *ctx)
+{
+    fill_withdraw_t *w = ctx;
+    if (t != w->track || w->calls++) return;
+    REQUIRE(moq_media_receiver_unsubscribe_track(r, t) == MOQ_OK);
+    REQUIRE(moq_media_receiver_subscribe_track(r, t, NULL) == MOQ_OK);
+    w->refill = moq_media_receiver_fill_track(r, t, w->b);
+}
+
+/* A fill_track command's REQUEST_UPDATE credential is selected for that
+ * command only: A, withdrawn after selection, sends nothing, and B selects
+ * its own, which the peer decodes on its fill-bearing UPDATE. */
+static void test_d22_fill_command_credential(void)
+{
+    fixture_t f; open_fixture(&f, MOQ_VERSION_DRAFT_22, false, false);
+    discover_d22(&f);
+    REQUIRE(moq_media_receiver_subscribe_track(f.receiver, f.media, NULL) == MOQ_OK);
+    receiver_pump(&f); peer_requests(&f); receiver_pump(&f); peer_requests(&f);
+    unsigned fills = f.fills, before = f.selects[MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE];
+    moq_location_filter_cfg_t location;
+    moq_location_filter_cfg_init(&location);
+    location.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    moq_fill_cfg_t a, b;
+    moq_fill_cfg_init(&a);
+    a.location = &location;
+    b = a;
+    REQUIRE(moq_media_receiver_fill_track(f.receiver, f.media, &a) == MOQ_OK);
+    fill_withdraw_t w = {f.media, &b, 0, MOQ_ERR_INTERNAL};
+    moq_media_receiver_test_set_auth_hook(withdraw_fill, &w);
+    receiver_pump(&f);
+    moq_media_receiver_test_set_auth_hook(NULL, NULL);
+    peer_requests(&f);
+    CHECK(w.calls == 1 && w.refill == MOQ_ERR_WOULD_BLOCK);
+    CHECK(f.selects[MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE] == before + 1);
+    CHECK(f.fill_updates == 0 && f.fills == fills);
+    REQUIRE(moq_media_receiver_fill_track(f.receiver, f.media, &b) == MOQ_OK);
+    receiver_pump(&f); peer_requests(&f);
+    CHECK(f.selects[MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE] == before + 2);
+    CHECK(f.fill_updates == 1 && f.fills == fills + 1 && f.outcomes == 0);
+    close_fixture(&f);
+}
+
+/* A fill_track command keeps the credential selected for it across its
+ * transient admission retries, and a Forward pause and resume of the same
+ * track in between select their own: A is selected once, and its one
+ * fill-bearing UPDATE carries the original bytes although the selector has
+ * since started returning others, which the Forward UPDATEs carry. */
+static void test_d22_fill_command_retry_keeps_selection(void)
+{
+    fixture_t f; open_fixture_mode(&f, MOQ_VERSION_DRAFT_22, false, false, true);
+    discover_d22(&f);
+    REQUIRE(moq_media_receiver_subscribe_track(f.receiver, f.media, NULL) == MOQ_OK);
+    receiver_pump(&f); peer_requests(&f); receiver_pump(&f); peer_requests(&f);
+    unsigned before = f.selects[MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE];
+    unsigned updates = f.updates, fills = f.fills;
+    moq_location_filter_cfg_t location;
+    moq_location_filter_cfg_init(&location);
+    location.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    moq_fill_cfg_t a;
+    moq_fill_cfg_init(&a);
+    a.location = &location;
+    REQUIRE(moq_media_receiver_fill_track(f.receiver, f.media, &a) == MOQ_OK);
+    size_t cap = occupy_actions(&f);
+    receiver_pump(&f);
+    CHECK(f.selects[MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE] == before + 1);
+    memset(f.value, 0x33, sizeof(f.value));
+    memset(f.forward_value, 0x33, sizeof(f.forward_value));
+    f.forward_value_set = true;
+    receiver_pump(&f); receiver_pump(&f); /* the same command, still refused */
+    CHECK(f.selects[MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE] == before + 1);
+    /* The third queued object crosses the flow threshold: a Forward pause
+     * goes first, under the same pressure, with the command still queued. */
+    send_payload(&f, 1, 1, "one");
+    send_payload(&f, 1, 2, "two");
+    send_payload(&f, 1, 3, "three");
+    receiver_pump(&f);
+    release_actions(&f, cap);
+    receiver_pump(&f); peer_requests(&f);
+    CHECK(f.updates == updates + 1 && f.fill_updates == 0);
+    moq_media_object_t object;
+    while (moq_media_receiver_poll_object(f.receiver, &object, sizeof(object)) == MOQ_OK)
+        moq_media_object_cleanup(&object);
+    for (int i = 0; i < 4; i++) { receiver_pump(&f); peer_requests(&f); }
+    CHECK(f.updates == updates + 2);
+    CHECK(f.fill_updates == 1 && f.fills == fills + 1 && f.outcomes == 0);
+    CHECK(f.selects[MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE] ==
+          before + 1 + (f.updates - updates));
+    close_fixture(&f);
+}
+
+/* The command's selection has storage of its own only while the command
+ * holds one. When that storage is refused, the command stays queued with no
+ * selection made and nothing failed; a later pass selects once and sends. */
+static void test_d22_fill_command_storage_refused(void)
+{
+    fixture_t f; open_fixture(&f, MOQ_VERSION_DRAFT_22, false, false);
+    discover_d22(&f);
+    REQUIRE(moq_media_receiver_subscribe_track(f.receiver, f.media, NULL) == MOQ_OK);
+    receiver_pump(&f); peer_requests(&f); receiver_pump(&f); peer_requests(&f);
+    unsigned before = f.selects[MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE];
+    unsigned fills = f.fills, refused = f.refused_allocations;
+    moq_location_filter_cfg_t location;
+    moq_location_filter_cfg_init(&location);
+    location.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    moq_fill_cfg_t a;
+    moq_fill_cfg_init(&a);
+    a.location = &location;
+    REQUIRE(moq_media_receiver_fill_track(f.receiver, f.media, &a) == MOQ_OK);
+    f.fail_next_alloc = true;
+    receiver_pump(&f); peer_requests(&f);
+    CHECK(f.refused_allocations == refused + 1);
+    CHECK(f.selects[MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE] == before);
+    CHECK(f.fill_updates == 0 && f.fills == fills && f.outcomes == 0);
+    moq_media_track_state_t state;
+    CHECK(moq_media_receiver_track_state(f.receiver, f.media, &state) == MOQ_OK &&
+          state == MOQ_MEDIA_TRACK_STATE_ACTIVE);
+    CHECK(moq_media_receiver_fill_track(f.receiver, f.media, &a) == MOQ_ERR_WOULD_BLOCK);
+    receiver_pump(&f); peer_requests(&f);
+    CHECK(f.selects[MOQ_MEDIA_AUTH_ACTION_REQUEST_UPDATE] == before + 1);
+    CHECK(f.fill_updates == 1 && f.fills == fills + 1 && f.outcomes == 0);
+    close_fixture(&f);
+}
+
 static void test_d22_carriage(bool stat, bool anonymous, bool deny_update)
 {
     fixture_t f; open_fixture(&f, MOQ_VERSION_DRAFT_22, stat, anonymous);
@@ -1419,6 +1564,9 @@ int main(void)
     test_d22_carriage(false, false, true);
     test_terminal_composition(MOQ_VERSION_DRAFT_22);
     test_retry_copy(MOQ_VERSION_DRAFT_22);
+    test_d22_fill_command_credential();
+    test_d22_fill_command_retry_keeps_selection();
+    test_d22_fill_command_storage_refused();
     for (unsigned occupied = 0; occupied < 2; occupied++) {
         test_d16_parameter_limit(false, occupied != 0);
         test_d16_parameter_limit(true, occupied != 0);
