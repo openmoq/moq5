@@ -507,9 +507,16 @@ moq_result_t moq_media_sender_attach(moq_endpoint_t *ep, const moq_media_sender_
                  cp->drm_system.has_pssh ? "+pssh" : "");
         strncat(cps, one, sizeof cps - strlen(cps) - 1);
     }
+    /* The pair is read only when the cfg covers all of it, as the service does. */
+    char initial_group[24] = "-";
+    if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t, initial_group_id) +
+                                sizeof cfg->initial_group_id &&
+        cfg->has_initial_group_id)
+        snprintf(initial_group, sizeof initial_group, "%" PRIu64, cfg->initial_group_id);
     logf_("sender_attach ns=%s catalog=%.*s bp=%d block_timeout_us=%" PRIu64
           " queue=%u/%u pre_ready=%u/%u validate_cmaf=%d cps=%zu[%s] callbacks=%d publish=%d "
-          "drop_without_demand=%d refresh_us=%" PRIu64 " companion=%u struct_size=%u",
+          "drop_without_demand=%d refresh_us=%" PRIu64 " companion=%u initial_group=%s "
+          "struct_size=%u",
           ns, SPAN(cfg->catalog_track), (int)cfg->backpressure, cfg->block_timeout_us,
           cfg->queue_max_objects, cfg->queue_max_bytes, cfg->pre_ready_max_objects,
           cfg->pre_ready_max_bytes, cfg->validate_cmaf ? 1 : 0, cfg->content_protection_count,
@@ -518,7 +525,8 @@ moq_result_t moq_media_sender_attach(moq_endpoint_t *ep, const moq_media_sender_
            cfg->callbacks.on_subscriber_joined || cfg->callbacks.on_subscriber_left ||
            cfg->callbacks.on_track_closed || cfg->callbacks.ctx) ? 1 : 0,
           cfg->publish_tracks ? 1 : 0, cfg->drop_without_demand ? 1 : 0,
-          cfg->catalog_refresh_interval_us, cfg->companion_profile, cfg->struct_size);
+          cfg->catalog_refresh_interval_us, cfg->companion_profile, initial_group,
+          cfg->struct_size);
     moq_result_t rc = (moq_result_t)get("sender_attach_result");
     if (rc != MOQ_OK) return rc;
     moq_media_sender_t *s = fake_alloc(sizeof *s);

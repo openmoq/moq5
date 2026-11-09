@@ -277,12 +277,15 @@ typedef struct moq_media_sender_cfg {
      * Use a sized initializer to enable this complete pointer field. */
     const moq_media_auth_cfg_t          *resource_auth;
     /* Optional first Group ID of every track of this sender instance (media,
-     * generated timeline and catalog alike). Honored only when
-     * has_initial_group_id is true; use a sized initializer to enable this
-     * appended pair. It replaces the companion's default base: 0 for the
-     * legacy companion, the wallclock milliseconds read at creation for
-     * D22_MSF01_LOC04_PUBLIC. An AUTO sender keeps the value whichever
-     * companion it resolves to.
+     * generated timeline and catalog alike). Read only when struct_size
+     * covers initial_group_id, and honored only when has_initial_group_id is
+     * true; use a sized initializer to enable this appended pair.
+     * _reserved_initial_group_id is never read: it keeps the pair past the
+     * original sizeof where that ends in tail padding. The value replaces
+     * the companion's default base (0 for the legacy companion, the
+     * wallclock milliseconds read at creation for D22_MSF01_LOC04_PUBLIC),
+     * and the clock is then not read. An AUTO sender keeps the value
+     * whichever companion it resolves to.
      *
      * A publisher that restarts a Track must not reuse the Locations of
      * Objects it already published (draft-ietf-moq-transport-22 2.5; MSF-01
@@ -291,9 +294,12 @@ typedef struct moq_media_sender_cfg {
      * them. Values above MOQ_QUIC_VARINT_MAX, the largest Group ID the
      * library writes, fail creation with MOQ_ERR_LIMIT. A value of exactly
      * MOQ_QUIC_VARINT_MAX is valid; the next group is then refused with
-     * MOQ_ERR_LIMIT where it is requested. */
-    uint64_t                             initial_group_id;
+     * MOQ_ERR_LIMIT where it is requested. The sender signals no Prior Group
+     * ID Gap (MSF-01 6.1): one starting value for the whole sender does not
+     * name each track's previous Group. */
+    uint32_t                             _reserved_initial_group_id;
     bool                                 has_initial_group_id;
+    uint64_t                             initial_group_id;
 } moq_media_sender_cfg_t;
 
 /* Plain init leaves backpressure UNSET on purpose -- the choice is forced,

@@ -46,6 +46,26 @@ struct SenderConfigurationMappingTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("The initial Group ID maps unclamped, and only when set")
+    func initialGroupIDMapping() {
+        withSenderCFG(.live(namespace: "live/cam1")) { cfg in
+            #expect(cfg.has_initial_group_id == false)
+            #expect(cfg.initial_group_id == 0)
+        }
+        /* The service owns the range check: every value reaches the C cfg
+         * as given, including past the largest Group ID. */
+        for value: UInt64 in [0, 42, (1 << 62) - 1, 1 << 62, .max] {
+            var configuration = MediaSender.Configuration.live(namespace: "live/cam1")
+            configuration.initialGroupID = value
+            withSenderCFG(configuration) { cfg in
+                #expect(cfg.struct_size == MemoryLayout<moq_media_sender_cfg_t>.size)
+                #expect(cfg.has_initial_group_id == true)
+                #expect(cfg.initial_group_id == value)
+            }
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Send policies map to the C backpressure modes")
     func policyMapping() throws {
         withSenderCFG(.live(namespace: "live/cam1")) { cfg in

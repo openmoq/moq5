@@ -144,6 +144,7 @@ pub struct SenderConfig {
     drop_without_demand: Option<bool>,
     catalog_refresh_interval: Option<Duration>,
     companion_profile: Option<CompanionProfile>,
+    initial_group_id: Option<u64>,
 }
 
 impl SenderConfig {
@@ -164,6 +165,7 @@ impl SenderConfig {
             drop_without_demand: None,
             catalog_refresh_interval: None,
             companion_profile: None,
+            initial_group_id: None,
         }
     }
 
@@ -252,6 +254,19 @@ impl SenderConfig {
     #[must_use]
     pub fn companion_profile(mut self, profile: CompanionProfile) -> Self {
         self.companion_profile = Some(profile);
+        self
+    }
+    /// The first Group ID of every track of this sender, replacing the
+    /// companion's default (0 for the legacy companion, the wallclock
+    /// milliseconds for the draft-22 one); the clock is then not read. A
+    /// publisher resuming a Track it published before sets this above the
+    /// Groups it already used. Values above the largest Group ID the library
+    /// writes (`2^62 - 1`) fail [`Sender::attach`] with [`Error::LIMIT`];
+    /// nothing is clamped. Exactly `2^62 - 1` is valid, and the next Group
+    /// is then refused with [`Error::LIMIT`] where it is requested.
+    #[must_use]
+    pub fn initial_group_id(mut self, group_id: u64) -> Self {
+        self.initial_group_id = Some(group_id);
         self
     }
 }
@@ -770,6 +785,10 @@ impl Sender {
         }
         if let Some(profile) = config.companion_profile {
             raw_config.companion_profile = profile.raw();
+        }
+        if let Some(group_id) = config.initial_group_id {
+            raw_config.has_initial_group_id = true;
+            raw_config.initial_group_id = group_id;
         }
 
         // The content-protection records, with each entry's defaultKID

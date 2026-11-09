@@ -107,6 +107,7 @@ class Sender:
             config.drop_without_demand,
             config.catalog_refresh_interval_us,
             int(config.companion_profile),
+            config.initial_group_id,
         )
         return sender
 

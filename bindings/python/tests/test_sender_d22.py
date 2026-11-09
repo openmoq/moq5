@@ -66,6 +66,72 @@ class SenderD22Tests(unittest.TestCase):
         for item in moq5.CompanionProfile:
             self.assertEqual(item.value, _native.constants["MEDIA_COMPANION_" + item.name])
 
+    def test_initial_group_id_defaults_absent(self):
+        config = moq5.SenderConfig.live(NS)
+        self.assertIsNone(config.initial_group_id)
+        with self.connect() as endpoint:
+            with moq5.Sender.attach(endpoint, config):
+                captured = _native._test_sender_config()
+                self.assertFalse(captured["has_initial_group_id"])
+                self.assertEqual(captured["initial_group_id"], 0)
+
+    def test_initial_group_id_reaches_the_native_config_unclamped(self):
+        # The service owns the range check: every 64-bit value is passed as
+        # given, including past the largest Group ID.
+        with self.connect() as endpoint:
+            for value in (0, 42, 2**62 - 1, 2**62, 2**64 - 1):
+                with self.subTest(value=value):
+                    with moq5.Sender.attach(
+                            endpoint, moq5.SenderConfig.live(NS, initial_group_id=value)):
+                        captured = _native._test_sender_config()
+                        self.assertTrue(captured["full_size"])
+                        self.assertTrue(captured["has_initial_group_id"])
+                        self.assertEqual(captured["initial_group_id"], value)
+
+    def test_initial_group_id_limit_refusal_keeps_its_code(self):
+        limit = _native.constants["ERR_LIMIT"]
+        with self.connect() as endpoint:
+            _native._test_sender_attach_result(limit)
+            try:
+                with self.assertRaises(moq5.MoqError) as raised:
+                    moq5.Sender.attach(
+                        endpoint, moq5.SenderConfig.live(NS, initial_group_id=2**62))
+                self.assertEqual(raised.exception.code, limit)
+                self.assertEqual(raised.exception.operation, "attach")
+                self.assertEqual(_native._test_sender_config()["initial_group_id"], 2**62)
+            finally:
+                _native._test_sender_attach_result(0)
+
+    def test_initial_group_id_is_keyword_only_checked_and_frozen(self):
+        parameter = inspect.signature(moq5.SenderConfig).parameters["initial_group_id"]
+        self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+        cases = [(value, TypeError) for value in (True, 1.0, "1", b"1")]
+        cases += [(value, ValueError) for value in (-1, 2**64)]
+        for value, error in cases:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(error, "initial_group_id"):
+                    moq5.SenderConfig.live(NS, initial_group_id=value)
+        config = moq5.SenderConfig.lossless(NS, initial_group_id=7)
+        self.assertEqual(config.initial_group_id, 7)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            config.initial_group_id = 8
+
+    def test_invalid_native_initial_group_id_leaves_the_handle_inert(self):
+        cases = [(value, TypeError) for value in (True, 1.0, "1")]
+        cases += [(value, ValueError) for value in (-1, 2**64)]
+        with self.connect() as endpoint:
+            handle = _native.sender_prepare(endpoint._Endpoint__handle)
+            try:
+                for value, error in cases:
+                    with self.subTest(value=value):
+                        with self.assertRaisesRegex(error, "initial_group_id"):
+                            _native.sender_activate(*self.native_args(handle), D22, value)
+                        self.assert_no_attach()
+                _native.sender_activate(*self.native_args(handle), D22, None)
+                self.assertFalse(_native._test_sender_config()["has_initial_group_id"])
+            finally:
+                _native.sender_close(handle)
+
     def test_transport_offer_does_not_select_the_media_profile(self):
         for versions in ((), (moq5.Version.DRAFT_16,), (moq5.Version.DRAFT_18,),
                          (moq5.Version.DRAFT_22,)):

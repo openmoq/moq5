@@ -299,6 +299,8 @@ static uint8_t scfg_catalog[FIXTURE_SCFG_CATALOG_CAP];
 static size_t scfg_catalog_captured, scfg_catalog_declared;
 static int scfg_backpressure;
 static moq_media_companion_profile_t scfg_companion;
+static bool scfg_has_initial_group;
+static uint64_t scfg_initial_group_id;
 static uint64_t scfg_block_timeout_us, scfg_catalog_refresh_interval_us;
 static uint32_t scfg_queue_max_objects, scfg_queue_max_bytes;
 static uint32_t scfg_pre_ready_max_objects, scfg_pre_ready_max_bytes;
@@ -2641,6 +2643,8 @@ static sender_shape_t sender_record_cfg(const moq_media_sender_cfg_t *cfg)
     scfg_catalog_captured = scfg_catalog_declared = 0;
     scfg_backpressure = 0;
     scfg_companion = MOQ_MEDIA_COMPANION_AUTO;
+    scfg_has_initial_group = false;
+    scfg_initial_group_id = 0;
     scfg_block_timeout_us = scfg_catalog_refresh_interval_us = 0;
     scfg_queue_max_objects = scfg_queue_max_bytes = 0;
     scfg_pre_ready_max_objects = scfg_pre_ready_max_bytes = 0;
@@ -2664,6 +2668,8 @@ static sender_shape_t sender_record_cfg(const moq_media_sender_cfg_t *cfg)
     scfg_endpoint_null = (cfg->endpoint == NULL);
     scfg_backpressure = (int)cfg->backpressure;
     scfg_companion = cfg->companion_profile;
+    scfg_has_initial_group = cfg->has_initial_group_id;
+    scfg_initial_group_id = cfg->initial_group_id;
     scfg_block_timeout_us = cfg->block_timeout_us;
     scfg_queue_max_objects = cfg->queue_max_objects;
     scfg_queue_max_bytes = cfg->queue_max_bytes;
@@ -5294,7 +5300,7 @@ PyObject *test_sender_cfg_shape(PyObject *self, PyObject *args)
         cfg.callbacks.on_subscriber_left == NULL && cfg.callbacks.on_ready == NULL &&
         cfg.callbacks.on_closed == NULL && cfg.callbacks.on_track_closed == NULL;
     return Py_BuildValue(
-        "{s:n,s:n,s:n,s:I,s:I,s:O,s:i,s:O,s:O,s:I}",
+        "{s:n,s:n,s:n,s:I,s:I,s:O,s:i,s:O,s:O,s:I,s:O,s:K,s:k}",
         "cfg_size", (Py_ssize_t)sizeof(cfg),
         "callbacks_size", (Py_ssize_t)sizeof(cfg.callbacks),
         "callbacks_offset", (Py_ssize_t)offsetof(moq_media_sender_cfg_t, callbacks),
@@ -5306,7 +5312,10 @@ PyObject *test_sender_cfg_shape(PyObject *self, PyObject *args)
         "content_protections_null",
         (cfg.content_protections == NULL && cfg.content_protection_count == 0)
             ? Py_True : Py_False,
-        "companion_profile", (unsigned int)cfg.companion_profile);
+        "companion_profile", (unsigned int)cfg.companion_profile,
+        "has_initial_group_id", cfg.has_initial_group_id ? Py_True : Py_False,
+        "initial_group_id", (unsigned long long)cfg.initial_group_id,
+        "reserved_initial_group_id", (unsigned long)cfg._reserved_initial_group_id);
 }
 
 
@@ -5332,6 +5341,8 @@ PyObject *test_sender_reset(PyObject *module, PyObject *args)
     scfg_catalog_captured = scfg_catalog_declared = 0;
     scfg_backpressure = 0;
     scfg_companion = MOQ_MEDIA_COMPANION_AUTO;
+    scfg_has_initial_group = false;
+    scfg_initial_group_id = 0;
     scfg_block_timeout_us = scfg_catalog_refresh_interval_us = 0;
     scfg_queue_max_objects = scfg_queue_max_bytes = 0;
     scfg_pre_ready_max_objects = scfg_pre_ready_max_bytes = 0;
@@ -5446,7 +5457,7 @@ PyObject *test_sender_config(PyObject *module, PyObject *args)
         }
     }
     PyObject *result = Py_BuildValue(
-        "{s:O,s:O,s:n,s:y#,s:n,s:i,s:I,s:K,s:I,s:I,s:I,s:I,s:O,s:O,s:O,s:K,s:O,s:O,s:O,s:I,s:O,s:O,s:z,s:O,s:z,s:O,s:z}",
+        "{s:O,s:O,s:n,s:y#,s:n,s:i,s:I,s:K,s:I,s:I,s:I,s:I,s:O,s:O,s:O,s:K,s:O,s:O,s:O,s:I,s:O,s:O,s:z,s:O,s:z,s:O,s:z,s:O,s:K}",
         "namespace", parts,
         "namespace_declared_lengths", declared,
         "namespace_declared_count", (Py_ssize_t)scfg_declared_count,
@@ -5473,7 +5484,9 @@ PyObject *test_sender_config(PyObject *module, PyObject *args)
         "shape_refused", scfg_shape_refused ? Py_True : Py_False,
         "shape_refused_reason", scfg_shape_refused_reason,
         "unsupported_prefix", scfg_unsupported_prefix ? Py_True : Py_False,
-        "unsupported_prefix_reason", scfg_unsupported_reason);
+        "unsupported_prefix_reason", scfg_unsupported_reason,
+        "has_initial_group_id", scfg_has_initial_group ? Py_True : Py_False,
+        "initial_group_id", (unsigned long long)scfg_initial_group_id);
     Py_DECREF(parts); Py_DECREF(declared);
     pthread_mutex_unlock(&mutex);
     return result;

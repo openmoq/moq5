@@ -554,6 +554,12 @@ draft-22 RAW metadata.
 native sender uses the profile matching the negotiated draft. An explicit
 `LEGACY_MSF01_LOC01` or `D22_MSF01_LOC04_PUBLIC` pins one; a known
 wire/companion mismatch is then `UNSUPPORTED`.
+
+`SenderConfig.initial_group_id` (default `None`) sets the first Group ID of
+every track instead of the profile's default (0 for the legacy profile, the
+wallclock milliseconds for draft 22). A publisher resuming a Track it
+published before sets it above the Groups it already used. The value reaches
+the service unclamped: one above `2**62 - 1` fails attach with `LIMIT`.
 For draft-22 RAW, supply `SendObject.loc_metadata` with an explicit Timestamp
 and optional Timescale. The `LocMetadata.present` bits must agree with its
 non-`None` fields; zero Timestamp and present-empty configuration spans remain

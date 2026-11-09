@@ -172,6 +172,23 @@ int main()
     if (scfg.struct_size != sizeof(moq_media_sender_cfg_t))
         return 6;
 
+    /* The optional initial Group ID pair, as a C++ caller sees it: the frozen
+     * v0 prefix never covers it, and a sized preset stamps it absent over
+     * whatever was there. */
+    moq_media_sender_cfg_init_live(&scfg);
+    if (scfg.struct_size > offsetof(moq_media_sender_cfg_t, has_initial_group_id))
+        return 18;
+    std::memset(&scfg, 0xA5, sizeof(scfg));
+    moq_media_sender_cfg_init_live_sized(&scfg, sizeof(scfg));
+    if (scfg.has_initial_group_id || scfg.initial_group_id != 0 ||
+        scfg._reserved_initial_group_id != 0)
+        return 19;
+    scfg.has_initial_group_id = true;
+    scfg.initial_group_id = 7000;
+    moq_media_sender_cfg_init_sized(&scfg, sizeof(scfg));
+    if (scfg.has_initial_group_id || scfg.initial_group_id != 0)
+        return 20;
+
     moq_media_sender_callbacks_t scb;
     moq_media_sender_callbacks_init(&scb);
     if (scb.struct_size == 0 ||

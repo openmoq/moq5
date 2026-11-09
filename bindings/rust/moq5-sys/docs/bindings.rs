@@ -3,7 +3,7 @@
 // scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: 9f2d3c8c48f8 (native headers modified in the worktree)
+// libmoq commit: unknown
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -11197,9 +11197,10 @@ pub struct moq_media_sender_cfg {
     pub _reserved_companion_profile: [u8; 4usize],
     #[doc = " Optional resource credentials, independent of endpoint SETUP tokens.\n Copied at construction, including all static token bytes. Selectors\n and local outcomes follow media_auth.h. Absent/partial/NULL means\n anonymous; a configured source never falls back to anonymous access.\n Use a sized initializer to enable this complete pointer field."]
     pub resource_auth: *const moq_media_auth_cfg_t,
-    #[doc = " Optional first Group ID of every track of this sender instance (media,\n generated timeline and catalog alike). Honored only when\n has_initial_group_id is true; use a sized initializer to enable this\n appended pair. It replaces the companion's default base: 0 for the\n legacy companion, the wallclock milliseconds read at creation for\n D22_MSF01_LOC04_PUBLIC. An AUTO sender keeps the value whichever\n companion it resolves to.\n\n A publisher that restarts a Track must not reuse the Locations of\n Objects it already published (draft-ietf-moq-transport-22 2.5; MSF-01\n 6.1). An application that remembers the Groups it used before, such as\n one that reconnects after a failed session, sets this to a value above\n them. Values above MOQ_QUIC_VARINT_MAX, the largest Group ID the\n library writes, fail creation with MOQ_ERR_LIMIT. A value of exactly\n MOQ_QUIC_VARINT_MAX is valid; the next group is then refused with\n MOQ_ERR_LIMIT where it is requested."]
-    pub initial_group_id: u64,
+    #[doc = " Optional first Group ID of every track of this sender instance (media,\n generated timeline and catalog alike). Read only when struct_size\n covers initial_group_id, and honored only when has_initial_group_id is\n true; use a sized initializer to enable this appended pair.\n _reserved_initial_group_id is never read: it keeps the pair past the\n original sizeof where that ends in tail padding. The value replaces\n the companion's default base (0 for the legacy companion, the\n wallclock milliseconds read at creation for D22_MSF01_LOC04_PUBLIC),\n and the clock is then not read. An AUTO sender keeps the value\n whichever companion it resolves to.\n\n A publisher that restarts a Track must not reuse the Locations of\n Objects it already published (draft-ietf-moq-transport-22 2.5; MSF-01\n 6.1). An application that remembers the Groups it used before, such as\n one that reconnects after a failed session, sets this to a value above\n them. Values above MOQ_QUIC_VARINT_MAX, the largest Group ID the\n library writes, fail creation with MOQ_ERR_LIMIT. A value of exactly\n MOQ_QUIC_VARINT_MAX is valid; the next group is then refused with\n MOQ_ERR_LIMIT where it is requested. The sender signals no Prior Group\n ID Gap (MSF-01 6.1): one starting value for the whole sender does not\n name each track's previous Group."]
+    pub _reserved_initial_group_id: u32,
     pub has_initial_group_id: bool,
+    pub initial_group_id: u64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -11245,10 +11246,12 @@ const _: () = {
         [::std::mem::offset_of!(moq_media_sender_cfg, _reserved_companion_profile) - 180usize];
     ["Offset of field: moq_media_sender_cfg::resource_auth"]
         [::std::mem::offset_of!(moq_media_sender_cfg, resource_auth) - 184usize];
-    ["Offset of field: moq_media_sender_cfg::initial_group_id"]
-        [::std::mem::offset_of!(moq_media_sender_cfg, initial_group_id) - 192usize];
+    ["Offset of field: moq_media_sender_cfg::_reserved_initial_group_id"]
+        [::std::mem::offset_of!(moq_media_sender_cfg, _reserved_initial_group_id) - 192usize];
     ["Offset of field: moq_media_sender_cfg::has_initial_group_id"]
-        [::std::mem::offset_of!(moq_media_sender_cfg, has_initial_group_id) - 200usize];
+        [::std::mem::offset_of!(moq_media_sender_cfg, has_initial_group_id) - 196usize];
+    ["Offset of field: moq_media_sender_cfg::initial_group_id"]
+        [::std::mem::offset_of!(moq_media_sender_cfg, initial_group_id) - 200usize];
 };
 impl Default for moq_media_sender_cfg {
     fn default() -> Self {

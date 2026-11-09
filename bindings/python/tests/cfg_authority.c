@@ -31,6 +31,9 @@ int main(void)
     printf("content_protections_null %d\n",
            (cfg.content_protections == NULL && cfg.content_protection_count == 0) ? 1 : 0);
     printf("companion_profile %lu\n", (unsigned long)cfg.companion_profile);
+    printf("has_initial_group_id %d\n", cfg.has_initial_group_id ? 1 : 0);
+    printf("initial_group_id %llu\n", (unsigned long long)cfg.initial_group_id);
+    printf("reserved_initial_group_id %lu\n", (unsigned long)cfg._reserved_initial_group_id);
 
     /* The track configuration the send-track slice declares against. */
     moq_media_track_cfg_t t;

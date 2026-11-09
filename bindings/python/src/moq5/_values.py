@@ -1088,7 +1088,13 @@ class SenderConfig:
     default, CATALOG_REFRESH_DISABLED turns refresh off, anything else is that
     interval. Namespace parts and the catalog name are binary and copied
     byte-exact. `companion_profile` selects the media dialect; its AUTO
-    default follows the draft the endpoint negotiates.
+    default follows the draft the endpoint negotiates. `initial_group_id`,
+    when not None, is the first Group ID of every track and replaces the
+    companion's default (0 for the legacy companion, the wallclock
+    milliseconds for the draft-22 one); a publisher resuming a Track sets it
+    above the Groups it already used. Any 64-bit value reaches the service
+    unclamped: one past the largest Group ID (2**62 - 1) fails attach with
+    MoqError code LIMIT.
     """
 
     namespace: tuple[bytes, ...]
@@ -1104,9 +1110,14 @@ class SenderConfig:
     drop_without_demand: bool = False
     catalog_refresh_interval_us: int = 0
     companion_profile: CompanionProfile = CompanionProfile.AUTO
+    initial_group_id: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "namespace", _namespace(self.namespace))
+        if self.initial_group_id is not None:
+            object.__setattr__(
+                self, "initial_group_id",
+                _bounded_integer(self.initial_group_id, "initial_group_id", _UINT64_MAX))
         object.__setattr__(
             self, "backpressure",
             Backpressure(_integer(self.backpressure, "backpressure")))

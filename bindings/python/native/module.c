@@ -1694,12 +1694,13 @@ static PyObject *sender_activate_py(PyObject *module, PyObject *args)
     PyObject *block_timeout, *queue_objects, *queue_bytes;
     PyObject *pre_ready_objects, *pre_ready_bytes;
     PyObject *validate_cmaf, *publish_tracks, *drop_without_demand, *refresh;
-    PyObject *companion = Py_None;
-    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOO|O:sender_activate", &capsule,
+    PyObject *companion = Py_None, *initial_group = Py_None;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOO|OO:sender_activate", &capsule,
                           &namespace, &catalog, &backpressure, &block_timeout,
                           &queue_objects, &queue_bytes, &pre_ready_objects,
                           &pre_ready_bytes, &validate_cmaf, &publish_tracks,
-                          &drop_without_demand, &refresh, &companion)) return NULL;
+                          &drop_without_demand, &refresh, &companion,
+                          &initial_group)) return NULL;
     sender_handle_t *handle = sender_get(capsule, 1, 0);
     if (!handle) return NULL;
     if (handle->activated) {
@@ -1739,6 +1740,12 @@ static PyObject *sender_activate_py(PyObject *module, PyObject *args)
         PyErr_SetString(PyExc_ValueError, "unknown companion_profile");
         return NULL;
     }
+    /* Any 64-bit value reaches the service as given: its range check, not a
+     * clamp here, refuses one past the largest Group ID (MOQ_ERR_LIMIT). */
+    uint64_t initial_group_id = 0;
+    if (initial_group != Py_None &&
+        uint_value(initial_group, UINT64_MAX, "initial_group_id", &initial_group_id) < 0)
+        return NULL;
     if (!PyTuple_Check(namespace)) {
         PyErr_SetString(PyExc_TypeError, "namespace must be a tuple");
         return NULL;
@@ -1783,6 +1790,8 @@ static PyObject *sender_activate_py(PyObject *module, PyObject *args)
     cfg.drop_without_demand = drop_without_demand == Py_True;
     cfg.catalog_refresh_interval_us = refresh_us;
     cfg.companion_profile = (moq_media_companion_profile_t)profile;
+    cfg.has_initial_group_id = initial_group != Py_None;
+    cfg.initial_group_id = initial_group_id;
 
     endpoint_handle_t *ep = handle_get(handle->endpoint, 1, 1);
     if (!ep) {

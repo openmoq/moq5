@@ -52,6 +52,14 @@ public final class MediaSender: @unchecked Sendable {
         public var validateCMAF: Bool
         /// Catalog track name; `nil` uses the MSF default ("catalog").
         public var catalogTrack: String?
+        /// First Group ID of every track (media, timeline and catalog);
+        /// `nil` keeps the profile's default (0 for the legacy companion,
+        /// the wallclock milliseconds for the draft-22 one). A publisher
+        /// resuming a Track sets this above the Groups it already used. The
+        /// value reaches the service unclamped: one above `2^62 - 1`, the
+        /// largest Group ID, fails attach with the C limit code
+        /// (``MoQServiceError/internalError(_:)`` carrying `MOQ_ERR_LIMIT`).
+        public var initialGroupID: UInt64?
 
         public init(namespace: MediaNamespace, sendPolicy: SendPolicy) {
             self.namespace = namespace
@@ -60,6 +68,7 @@ public final class MediaSender: @unchecked Sendable {
             self.companionProfile = .automatic
             self.validateCMAF = true
             self.catalogTrack = nil
+            self.initialGroupID = nil
         }
 
         /// The live preset (mirrors the C `cfg_init_live`): drop-to-keyframe.

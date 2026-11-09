@@ -68,11 +68,17 @@ PIN(sizeof(moq_media_send_object_t) ==
      ALIGNOF(old_send_object_t)) * ALIGNOF(old_send_object_t), "full object extent");
 PIN(sizeof(old_companion_sender_cfg_t) == sizeof(old_sender_cfg_t) + ALIGNOF(old_sender_cfg_t), "frozen companion cfg extent");
 PIN(offsetof(moq_media_sender_cfg_t, resource_auth) >= sizeof(old_companion_sender_cfg_t), "auth never uses old companion padding");
-PIN(offsetof(moq_media_sender_cfg_t, initial_group_id) >=
-    ((offsetof(moq_media_sender_cfg_t, resource_auth) + sizeof(void *) + ALIGNOF(old_sender_cfg_t) - 1) /
-     ALIGNOF(old_sender_cfg_t)) * ALIGNOF(old_sender_cfg_t), "initial Group ID never uses the auth padding");
+/* The sizeof through resource_auth: what every caller built before the
+ * initial Group ID pair passes as struct_size. */
+#define AUTH_CFG_EXTENT \
+    (((offsetof(moq_media_sender_cfg_t, resource_auth) + sizeof(void *) + ALIGNOF(old_sender_cfg_t) - 1) / \
+      ALIGNOF(old_sender_cfg_t)) * ALIGNOF(old_sender_cfg_t))
+PIN(offsetof(moq_media_sender_cfg_t, has_initial_group_id) >= AUTH_CFG_EXTENT,
+    "the initial Group ID pair never uses the auth padding");
+PIN(offsetof(moq_media_sender_cfg_t, initial_group_id) > offsetof(moq_media_sender_cfg_t, has_initial_group_id),
+    "flag before value");
 PIN(sizeof(moq_media_sender_cfg_t) ==
-    ((offsetof(moq_media_sender_cfg_t, has_initial_group_id) + sizeof(bool) + ALIGNOF(old_sender_cfg_t) - 1) /
+    ((offsetof(moq_media_sender_cfg_t, initial_group_id) + sizeof(uint64_t) + ALIGNOF(old_sender_cfg_t) - 1) /
      ALIGNOF(old_sender_cfg_t)) * ALIGNOF(old_sender_cfg_t), "full cfg extent");
 #if UINTPTR_MAX == UINT64_MAX
 PIN(sizeof(old_sender_cfg_t) == 176 && sizeof(old_companion_sender_cfg_t) == 184 && sizeof(moq_media_sender_cfg_t) == 208, "LP64 cfg pin");
@@ -81,7 +87,7 @@ PIN(sizeof(old_send_object_t) == 72 && sizeof(moq_media_send_object_t) == 80, "L
 PIN(sizeof(old_sender_cfg_t) == 112 && sizeof(old_companion_sender_cfg_t) == 120 && sizeof(moq_media_sender_cfg_t) == 144, "ARM cfg pin");
 PIN(sizeof(old_send_object_t) == 56 && sizeof(moq_media_send_object_t) == 64, "ARM object pin");
 #elif defined(__i386__)
-PIN(sizeof(old_sender_cfg_t) == 104 && sizeof(old_companion_sender_cfg_t) == 108 && sizeof(moq_media_sender_cfg_t) == 128, "i686 cfg pin");
+PIN(sizeof(old_sender_cfg_t) == 104 && sizeof(old_companion_sender_cfg_t) == 108 && sizeof(moq_media_sender_cfg_t) == 132, "i686 cfg pin");
 PIN(sizeof(old_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 48 : 52), "i686 old object pin");
 PIN(sizeof(moq_media_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 52 : 56), "i686 full object pin");
 #endif
@@ -214,6 +220,9 @@ static void drain_events(moq_session_t *s)
     moq_event_t e;
     while (moq_session_poll_events(s, &e, 1)) moq_event_cleanup(&e);
 }
+/* When set, the fixture track also emits its generated media timeline
+ * ("v.timeline"), which shares the media Group IDs. */
+static bool g_fixture_timeline;
 static bool start(fixture_t *f, old_sender_cfg_t *cfg, moq_version_t version,
                   moq_media_packaging_t packaging)
 {
@@ -225,6 +234,7 @@ static bool start(fixture_t *f, old_sender_cfg_t *cfg, moq_version_t version,
     moq_media_track_cfg_init(&tc);
     tc.name = MOQ_BYTES_LITERAL("v"); tc.codec = MOQ_BYTES_LITERAL("av01");
     tc.media_type = MOQ_MEDIA_TYPE_VIDEO; tc.packaging = packaging; tc.bitrate = 1000;
+    if (g_fixture_timeline) { tc.is_live = true; tc.emit_media_timeline = true; }
     /* CMSF-01 3.1: a CMAF track carries its initialization (opaque here). */
     static const uint8_t cmaf_init[] = {0x00,0x00,0x00,0x18};
     if (packaging == MOQ_MEDIA_PACKAGING_CMAF)
@@ -823,18 +833,65 @@ static void group_ids(bool d22)
     finish(&f);
 }
 
+/* Subscribe the peer to the fixture track's generated media timeline and
+ * let the sender serve it. */
+static bool subscribe_timeline(fixture_t *f, moq_subscription_t *sub)
+{
+    moq_subscribe_cfg_t sc; moq_subscribe_cfg_init(&sc);
+    sc.track_namespace = (moq_namespace_t){&ns_part,1};
+    sc.track_name = MOQ_BYTES_LITERAL("v.timeline");
+    bool ok = moq_session_subscribe(f->peer, &sc, 1005, sub) == MOQ_OK &&
+              moq_simpair_run_until_quiescent(f->pair, 16, NULL) == MOQ_OK;
+    CHECK(ok);
+    if (!ok) return false;
+    moq_media_sender_test_pump(f->sender, f->local, 1006);
+    ok = moq_simpair_run_until_quiescent(f->pair, 16, NULL) == MOQ_OK;
+    CHECK(ok);
+    return ok;
+}
+
+/* The Group IDs the peer received, in arrival order, split by subscription. */
+typedef struct received_groups {
+    uint64_t media[4], timeline[4];
+    unsigned media_n, timeline_n, other_n;
+} received_groups_t;
+static void receive_groups(fixture_t *f, moq_subscription_t timeline, received_groups_t *r)
+{
+    moq_event_t e;
+    while (moq_session_poll_events(f->peer, &e, 1)) {
+        if (e.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+            const moq_object_received_event_t *o = &e.u.object_received;
+            if (moq_subscription_eq(o->sub, f->subscription)) {
+                if (r->media_n < 4) r->media[r->media_n] = o->group_id;
+                ++r->media_n;
+            } else if (moq_subscription_eq(o->sub, timeline)) {
+                if (r->timeline_n < 4) r->timeline[r->timeline_n] = o->group_id;
+                ++r->timeline_n;
+            } else {
+                ++r->other_n;
+            }
+        }
+        moq_event_cleanup(&e);
+    }
+}
+
 /* cfg->initial_group_id replaces the companion's default base for every track
- * and the catalog, on either companion, and the clock is not read for it. A
- * struct too short to hold the pair leaves the default in place. */
+ * (media, its generated timeline) and the catalog, on either companion, and
+ * the clock is not read for it. The pair is read only when struct_size covers
+ * all of it: a struct too short for the flag, one that covers the flag but not
+ * the value, or one exactly the size callers used before the pair existed
+ * leaves the default in place, whatever the bytes past it hold. An explicit 0
+ * is a configured base like any other, so the clock is not read for it. */
 static void group_ids_configured(unsigned kind)
 {
     static const char *const names[] = {
         "initial-group-id-legacy", "initial-group-id-d22-ignores-clock",
-        "initial-group-id-short-struct-ignored",
+        "initial-group-id-short-struct-ignored", "initial-group-id-flag-without-value-ignored",
+        "initial-group-id-old-size-poisoned-tail-ignored", "initial-group-id-explicit-zero-d22",
     };
     label = names[kind]; ++rows;
-    const bool d22 = kind == 1;
-    const uint64_t initial = 7000;
+    const bool d22 = kind == 1 || kind == 5;
+    const uint64_t initial = kind == 5 ? 0 : 7000;
     moq_media_sender_cfg_t full;
     moq_media_sender_cfg_init_live_sized(&full, sizeof(full));
     full.namespace_ = (moq_namespace_t){&ns_part, 1};
@@ -843,19 +900,25 @@ static void group_ids_configured(unsigned kind)
     full.pre_ready_max_bytes = full.queue_max_bytes = 1024;
     full.companion_profile = d22 ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC
                                  : MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+    full._reserved_initial_group_id = 0xFFFFFFFFu;     /* never read */
     full.initial_group_id = initial;
     full.has_initial_group_id = true;
     if (kind == 2) full.struct_size = (uint32_t)offsetof(moq_media_sender_cfg_t, has_initial_group_id);
+    if (kind == 3) full.struct_size = (uint32_t)offsetof(moq_media_sender_cfg_t, initial_group_id);
+    if (kind == 4) full.struct_size = (uint32_t)AUTH_CFG_EXTENT;
+    const bool ignored = kind >= 2 && kind <= 4;
     /* The default draft-22 base would need the clock; configured, it is not read. */
     g_clock_rc = d22 ? -1 : 0; g_clock_ts = ms_clock(1700000000123ull);
     moq_media_sender_test_set_clock_hook(scripted_clock, NULL);
+    g_fixture_timeline = kind == 0;
     fixture_t f = {0};
     bool started = start(&f, (old_sender_cfg_t *)&full,
                          d22 ? MOQ_VERSION_DRAFT_22 : MOQ_VERSION_DRAFT_18, MOQ_MEDIA_PACKAGING_RAW);
+    g_fixture_timeline = false;
     moq_media_sender_test_set_clock_hook(NULL, NULL);
     g_clock_rc = 0;
     if (!started) { finish(&f); return; }
-    const uint64_t first = kind == 2 ? 0 : initial;
+    const uint64_t first = ignored ? 0 : initial;
     moq_media_metadata_t m; metadata(&m,false,7,0);
     for (unsigned g = 0; g < 2; ++g) {
         old_send_object_t *o = object(d22 ? sizeof(void *) : 0, &m);
@@ -864,18 +927,94 @@ static void group_ids_configured(unsigned kind)
     }
     if (arm_peer(&f)) {
         CHECK(moq_media_sender_test_catalog_group(f.sender) == first);
-        uint64_t groups[4]; unsigned n = 0;
-        moq_event_t e;
-        while (moq_session_poll_events(f.peer, &e, 1)) {
-            if (e.kind == MOQ_EVENT_OBJECT_RECEIVED && n < 4)
-                groups[n++] = e.u.object_received.group_id;
-            moq_event_cleanup(&e);
+        moq_subscription_t timeline = {0};
+        if (kind == 0 && !subscribe_timeline(&f, &timeline)) { finish(&f); return; }
+        received_groups_t r = {0};
+        receive_groups(&f, timeline, &r);
+        CHECK(r.media_n == 2);
+        if (r.media_n == 2) {
+            CHECK(r.media[0] == first);
+            CHECK(r.media[1] == first + 1);
         }
-        CHECK(n == 2);
-        if (n == 2) {
-            CHECK(groups[0] == first);
-            CHECK(groups[1] == first + 1);
+        if (kind == 0) {
+            /* One independent timeline Object per media Group, at its ID. */
+            CHECK(r.timeline_n == 2);
+            if (r.timeline_n == 2) {
+                CHECK(r.timeline[0] == first);
+                CHECK(r.timeline[1] == first + 1);
+            }
         }
+        CHECK(r.other_n == 0);
+    }
+    finish(&f);
+}
+
+/* A configured base of exactly MOQ_QUIC_VARINT_MAX is the last usable Group
+ * ID on every track: the media Group and its timeline Object take it, as does
+ * the initial catalog; the open Group still accepts objects; a new media
+ * Group, and every catalog change that would need a new catalog Group, is
+ * refused with MOQ_ERR_LIMIT without wrapping, and the sender stays healthy.
+ * The legacy companion would otherwise start at 0, and the failing clock is
+ * never read. */
+static void initial_group_id_exhaustion(void)
+{
+    label = "initial-group-id-max-then-exhaustion"; ++rows;
+    moq_media_sender_cfg_t full;
+    moq_media_sender_cfg_init_live_sized(&full, sizeof(full));
+    full.namespace_ = (moq_namespace_t){&ns_part, 1};
+    full.backpressure = MOQ_MEDIA_SEND_BP_RETURN_WOULD_BLOCK;
+    full.validate_cmaf = false;
+    full.pre_ready_max_bytes = full.queue_max_bytes = 1024;
+    full.companion_profile = MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+    full.initial_group_id = MOQ_QUIC_VARINT_MAX;
+    full.has_initial_group_id = true;
+    g_clock_rc = -1;
+    moq_media_sender_test_set_clock_hook(scripted_clock, NULL);
+    g_fixture_timeline = true;
+    fixture_t f = {0};
+    bool started = start(&f, (old_sender_cfg_t *)&full, MOQ_VERSION_DRAFT_18,
+                         MOQ_MEDIA_PACKAGING_RAW);
+    g_fixture_timeline = false;
+    moq_media_sender_test_set_clock_hook(NULL, NULL);
+    g_clock_rc = 0;
+    if (!started) { finish(&f); return; }
+    moq_media_metadata_t m; metadata(&m,false,7,0);
+    old_send_object_t *o = object(0, &m);
+    o->ends_group = false;
+    CHECK(write_object(&f, o) == MOQ_OK);             /* opens group MAX */
+    o->is_sync = false; o->starts_group = false;
+    CHECK(write_object(&f, o) == MOQ_OK);             /* continues group MAX */
+    o->is_sync = true; o->starts_group = true;
+    CHECK(write_object(&f, o) == MOQ_ERR_LIMIT);      /* no group after MAX */
+    CHECK(stats(&f).objects_written == 2);
+    free(o);
+    if (arm_peer(&f)) {
+        CHECK(moq_media_sender_is_ready(f.sender));
+        CHECK(moq_media_sender_test_catalog_group(f.sender) == MOQ_QUIC_VARINT_MAX);
+        moq_subscription_t timeline = {0};
+        if (!subscribe_timeline(&f, &timeline)) { finish(&f); return; }
+        received_groups_t r = {0};
+        receive_groups(&f, timeline, &r);
+        CHECK(r.media_n == 2);
+        for (unsigned i = 0; i < r.media_n && i < 4; ++i)
+            CHECK(r.media[i] == MOQ_QUIC_VARINT_MAX);
+        CHECK(r.timeline_n >= 1);
+        for (unsigned i = 0; i < r.timeline_n && i < 4; ++i)
+            CHECK(r.timeline[i] == MOQ_QUIC_VARINT_MAX);
+        CHECK(r.other_n == 0);
+        moq_media_track_cfg_t tc;
+        moq_media_track_cfg_init(&tc);
+        tc.name = MOQ_BYTES_LITERAL("late"); tc.codec = MOQ_BYTES_LITERAL("av01");
+        tc.media_type = MOQ_MEDIA_TYPE_VIDEO; tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+        tc.bitrate = 1000;
+        moq_media_track_t *late = NULL;
+        CHECK(moq_media_sender_add_track(f.sender, &tc, &late) == MOQ_ERR_LIMIT);
+        CHECK(late == NULL);
+        CHECK(moq_media_sender_remove_track(f.sender, f.track) == MOQ_ERR_LIMIT);
+        CHECK(moq_media_sender_complete(f.sender) == MOQ_ERR_LIMIT);
+        moq_media_sender_test_pump(f.sender, f.local, 1007);
+        CHECK(!moq_media_sender_is_fatal(f.sender));
+        CHECK(moq_media_sender_test_catalog_group(f.sender) == MOQ_QUIC_VARINT_MAX);
     }
     finish(&f);
 }
@@ -1100,10 +1239,13 @@ static bool observe_session(fixture_t *f, moq_version_t version)
  * (2.3.1.2). With a tail, the tail is authoritative on draft 22. Drafts 16/18
  * keep LOC-01 and ignore the tail. */
 /* An AUTO sender keeps a configured initial Group ID when it resolves to the
- * legacy companion, which would otherwise move its groups down to 0. */
-static void group_ids_configured_auto_legacy(void)
+ * legacy companion on draft 16 or 18, which would otherwise move its groups
+ * down to 0. */
+static void group_ids_configured_auto_legacy(moq_version_t version)
 {
-    label = "initial-group-id-auto-resolves-legacy-keeps-base"; ++rows;
+    label = version == MOQ_VERSION_DRAFT_16
+        ? "initial-group-id-auto-resolves-legacy-d16-keeps-base"
+        : "initial-group-id-auto-resolves-legacy-keeps-base"; ++rows;
     const uint64_t initial = 7000;
     moq_media_sender_cfg_t full;
     moq_media_sender_cfg_init_live_sized(&full, sizeof(full));
@@ -1128,7 +1270,7 @@ static void group_ids_configured_auto_legacy(void)
      * resolved to legacy: the base stays instead of dropping to 0. */
     CHECK(write_object(&f, o) == MOQ_OK);
     (void)m;
-    if (observe_session(&f, MOQ_VERSION_DRAFT_18)) {
+    if (observe_session(&f, version)) {
         CHECK(moq_media_sender_test_companion(f.sender) == MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01);
         CHECK(moq_media_sender_test_catalog_group(f.sender) == initial);
     }
@@ -1701,10 +1843,12 @@ int main(void)
     group_ids(true);
     group_ids(false);
     for (unsigned i = 0; i < 7; ++i) group_base_refusal(i);
-    for (unsigned i = 0; i < 3; ++i) group_ids_configured(i);
-    group_ids_configured_auto_legacy();
+    for (unsigned i = 0; i < 6; ++i) group_ids_configured(i);
+    group_ids_configured_auto_legacy(MOQ_VERSION_DRAFT_18);
+    group_ids_configured_auto_legacy(MOQ_VERSION_DRAFT_16);
     initial_group_id_limit(false);
     initial_group_id_limit(true);
+    initial_group_id_exhaustion();
     group_id_ceiling();
     catalog_last_group();
     unobserved_and_future_metadata();

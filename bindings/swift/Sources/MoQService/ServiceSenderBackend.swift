@@ -31,6 +31,10 @@ func withSenderCFG<T>(
         cfg.queue_max_bytes = UInt32(clamping: limits.maxBytes ?? 0)
     }
     cfg.validate_cmaf = configuration.validateCMAF
+    if let initialGroupID = configuration.initialGroupID {
+        cfg.has_initial_group_id = true
+        cfg.initial_group_id = initialGroupID
+    }
     return try withExtendedLifetime(arena) {
         try body(&cfg)
     }

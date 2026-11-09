@@ -153,6 +153,51 @@ fn attach_maps_the_presets_and_every_field() {
 }
 
 #[test]
+fn attach_passes_the_initial_group_id_through_unclamped() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let sender =
+        Sender::attach(&endpoint, &SenderConfig::live(namespace())).expect("attach accepted");
+    assert_eq!(
+        fake::field(
+            &fake::line(&s.take_log(), "sender_attach "),
+            "initial_group"
+        ),
+        "-",
+        "absent unless set"
+    );
+    drop(sender);
+    s.take_log();
+    // The service owns the range check: the binding passes every value as
+    // given, including past the largest Group ID, and never clamps.
+    for group_id in [0, 42, (1u64 << 62) - 1, 1u64 << 62, u64::MAX] {
+        let sender = Sender::attach(
+            &endpoint,
+            &SenderConfig::live(namespace()).initial_group_id(group_id),
+        )
+        .expect("the fake provider accepts the attach");
+        assert_eq!(
+            fake::field(
+                &fake::line(&s.take_log(), "sender_attach "),
+                "initial_group"
+            ),
+            group_id.to_string()
+        );
+        drop(sender);
+        s.take_log();
+    }
+    // The service's refusal of a value past the largest Group ID surfaces as
+    // the limit error, unchanged.
+    s.set("sender_attach_result", i64::from(sys::MOQ_ERR_LIMIT));
+    let refused = Sender::attach(
+        &endpoint,
+        &SenderConfig::live(namespace()).initial_group_id(1u64 << 62),
+    )
+    .err();
+    assert_eq!(refused, Some(Error::LIMIT));
+}
+
+#[test]
 fn attach_refuses_inexact_durations_before_the_service() {
     let s = fake::suite();
     let endpoint = connect(&s);

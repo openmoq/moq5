@@ -662,8 +662,9 @@ void moq_media_sender_test_set_companion(moq_media_sender_t *s,
     pthread_mutex_lock(&s->mu);
     s->companion_profile = profile;
     s->companion_auto = profile == MOQ_MEDIA_COMPANION_AUTO;
-    (void)sender_resolve_group_base(
-        profile != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, &s->group_base);
+    if (!s->group_base_explicit)
+        (void)sender_resolve_group_base(
+            profile != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, &s->group_base);
     pthread_mutex_unlock(&s->mu);
 }
 
