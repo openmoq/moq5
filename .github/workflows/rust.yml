@@ -7,6 +7,10 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -18,17 +22,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         shared: ["OFF", "ON"]
-    defaults:
+    defaults: &rows-defaults
       run:
         shell: bash
-    env:
+    env: &rows-env
       CC: clang
       CMAKE_BUILD_PARALLEL_LEVEL: "3"
       CARGO_TERM_COLOR: never
 
-    steps:
+    steps: &rows-steps
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
@@ -102,6 +106,20 @@ jobs:
             build/rust/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.rs
             build/rust/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.txt
 
+  rows-macos:
+    name: Rows (${{ matrix.os }}, shared=${{ matrix.shared }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os: [macos-latest]
+        shared: ["OFF", "ON"]
+    defaults: *rows-defaults
+    env: *rows-env
+    steps: *rows-steps
+
   relay-rows:
     name: Relay rows (${{ matrix.os }}, picoquic SDK)
     runs-on: ${{ matrix.os }}
@@ -109,15 +127,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
-    defaults:
+        os: [ubuntu-24.04]
+    defaults: &relay-defaults
       run:
         shell: bash
-    env:
+    env: &relay-env
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
       WTQ_BUILD_NETWORK: "OFF"
       CARGO_TERM_COLOR: never
-    steps:
+    steps: &relay-steps
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
@@ -225,3 +243,17 @@ jobs:
             build/rust-relay/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.rs
             build/rust-relay/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.txt
             build/rust-relay/bindings/rust/work/*.diagnostics.txt
+
+  relay-rows-macos:
+    name: Relay rows (${{ matrix.os }}, picoquic SDK)
+    needs: rows-macos
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    defaults: *relay-defaults
+    env: *relay-env
+    steps: *relay-steps

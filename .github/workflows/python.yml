@@ -7,6 +7,10 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -18,17 +22,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         shared: ["OFF", "ON"]
-    defaults:
+    defaults: &foundation-defaults
       run:
         shell: bash
-    env:
+    env: &foundation-env
       CC: clang
       CMAKE_BUILD_PARALLEL_LEVEL: "3"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
-    steps:
+    steps: &foundation-steps
       - name: Select macOS qualification deployment target
         if: runner.os == 'macOS'
         run: echo 'MACOSX_DEPLOYMENT_TARGET=13.0' >> "$GITHUB_ENV"
@@ -220,3 +224,17 @@ jobs:
             ${{ runner.temp }}/python-wheel-build/CMakeFiles/CMakeConfigureLog.yaml
             ${{ runner.temp }}/python-sdist-build/CMakeFiles/CMakeConfigureLog.yaml
             ${{ runner.temp }}/python-source-build/CMakeFiles/CMakeConfigureLog.yaml
+
+  foundation-macos:
+    name: CPython 3.12 (${{ matrix.os }}, shared=${{ matrix.shared }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        os: [macos-latest]
+        shared: ["OFF", "ON"]
+    defaults: *foundation-defaults
+    env: *foundation-env
+    steps: *foundation-steps

@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main, master]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   windows-msvc:
     name: Service and picoquic adapters (MSVC)
@@ -172,6 +176,10 @@ jobs:
 
   swift-binding:
     name: Swift Binding (macOS)
+    # Keep the macOS build/Swift jobs in one chain, and shell/stack checks
+    # in another, so one update uses at most two macOS runners here.
+    needs: build-and-test
+    if: ${{ !cancelled() }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -251,6 +259,8 @@ jobs:
 
   swift-service-binding:
     name: Swift Service Binding (macOS)
+    needs: swift-binding
+    if: ${{ !cancelled() }}
     runs-on: macos-latest
     defaults:
       run:
@@ -448,6 +458,8 @@ jobs:
 
   swift-service-ios:
     name: Swift Service iOS (simulator, macOS)
+    needs: swift-service-binding
+    if: ${{ !cancelled() }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -877,12 +889,10 @@ jobs:
         include:
           - os: ubuntu-latest
             cc: gcc
-          - os: macos-latest
-            cc: clang
-    env:
+    env: &stack-env
       CC: ${{ matrix.cc }}
       NM: nm
-    steps:
+    steps: &stack-steps
       - uses: actions/checkout@v5
       - name: Select macOS SDK
         if: runner.os == 'macOS'
@@ -919,6 +929,21 @@ jobs:
           path: |
             ${{ runner.temp }}/moq5-stack/
             ${{ runner.temp }}/stack-sdk.stderr
+
+  stack-frame-checks-macos:
+    name: Stack Frames (${{ matrix.os }}, ${{ matrix.cc }})
+    needs: shell-selftest
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            cc: clang
+    env: *stack-env
+    steps: *stack-steps
 
   seed-sweep-quick:
     name: Seed Sweep (quick)
