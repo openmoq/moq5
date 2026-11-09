@@ -3,7 +3,7 @@
 // scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: unknown
+// libmoq commit: 406aa0af99b0 (native headers modified in the worktree)
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -1310,7 +1310,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Feed data via a refcounted buffer for zero-copy streaming receive.\n\n Like on_data_bytes, but takes a caller-owned moq_rcbuf_t instead of\n a raw pointer. The session increfs or slices the rcbuf if it needs\n to retain data; the caller may decref after this call returns.\n\n When eligible (streaming continuation chunks, no buffered data),\n emitted OBJECT_CHUNK events carry slices of the input rcbuf\n instead of copies. The adapter's transport buffer is released when\n the last slice is decreffed via moq_event_cleanup.\n\n data may be NULL for zero-length or retry calls.\n\n Advancing call: invalidates borrows, takes now_us."]
+    #[doc = " Feed data via a refcounted buffer for zero-copy streaming receive.\n\n Like on_data_bytes, but takes a caller-owned moq_rcbuf_t instead of\n a raw pointer. The session increfs or slices the rcbuf if it needs\n to retain data; the caller may decref after this call returns.\n\n When eligible (streaming continuation chunks, no buffered data),\n emitted OBJECT_CHUNK events carry slices of the input rcbuf\n instead of copies. The adapter's transport buffer is released when\n the last slice is decreffed via moq_event_cleanup.\n\n In whole-object mode, when an object's header arrives without any of\n its payload and the next call delivers, with nothing buffered ahead of\n it, an input that is exactly that payload and is a created rcbuf\n (moq_rcbuf_create: neither a slice nor wrapped) allocated with this\n session's allocator (the same alloc, realloc, free and ctx it was created\n with), the OBJECT_RECEIVED payload is that input rcbuf itself, with a\n reference added. It keeps alive exactly what the copy it replaces would\n (the payload's bytes and one rcbuf header, from the same allocator). Any\n other payload, including every one from a slice, a wrapped input or\n another allocator, is a copy. The caller keeps its own reference and may\n feed one input more than once; every reference, the caller's and the\n events', stays under the rcbuf shard rule (rcbuf.h).\n\n data may be NULL for zero-length or retry calls.\n\n Advancing call: invalidates borrows, takes now_us."]
     pub fn moq_session_on_data_rcbuf(
         s: *mut moq_session_t,
         stream_ref: moq_stream_ref_t,
