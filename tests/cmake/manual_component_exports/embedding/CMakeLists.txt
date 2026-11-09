@@ -10,7 +10,8 @@ project(moq_package_embedding LANGUAGES C CXX)
 include(GNUInstallDirs)
 # A real source library owned by the embedding project. This is an export-graph
 # fixture, not a stand-in for a transport SDK or a backend runtime qualification.
-option(MOQ_BUILD_PACKAGE_EXPORTS "Generate LibMoQ package exports" ON)
+# MOQ_BUILD_PACKAGE_EXPORTS stays unset unless the driver passes it, so the
+# LibMoQ subdirectory default is exercised too.
 option(FIXTURE_PROVIDER_EXPORTS "Register the fixture provider's own exports" ON)
 option(FIXTURE_SERVICE "Build the embedding service component" ON)
 add_library(fixture_provider_runtime runtime.c)
