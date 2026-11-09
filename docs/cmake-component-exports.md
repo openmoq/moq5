@@ -19,6 +19,16 @@ withdraws its exact known build-tree package modules even when a component is
 simultaneously disabled. OFF does not advertise a CMake
 package or promise that pkg-config replaces its dependency closure.
 
+Embedded builds also defaulted to ON in earlier revisions. An embedding project
+that ships or imports the LibMoQ CMake package from its own build (an install
+step that includes `libmoqConfig.cmake`, or a consumer pointing `libmoq_DIR` at
+the embedded build tree) now selects it before adding LibMoQ, either with
+`-DMOQ_BUILD_PACKAGE_EXPORTS=ON` or with `set(MOQ_BUILD_PACKAGE_EXPORTS ON)`
+before `add_subdirectory()` or `FetchContent_MakeAvailable()`. An option keeps a
+value already in the cache, so an embedded build directory configured before
+this default changed stays ON until that cache entry is set to OFF or removed,
+or the directory is configured fresh.
+
 With exports ON, source dependencies injected by a caller must have their own
 unambiguous provider-owned native build/install exports. The caller also owns
 ordinary dependency-package discovery or supplies the consumer targets before
