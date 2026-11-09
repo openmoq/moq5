@@ -624,7 +624,9 @@ struct moq_media_sender {
                                                resolved and range-checked before
                                                the sender exists (sender_prepare);
                                                an AUTO sender resolving to legacy
-                                               resets it to 0 (under mu) */
+                                               resets it to 0 (under mu) unless
+                                               the application configured it */
+    bool              group_base_explicit;  /* cfg->initial_group_id was set */
     moq_rcbuf_t      *published_catalog;     /* last committed catalog bytes (the
                                                 independent base / no-op dedup) */
     /* MSF §5.1.2 generatedAt of the bytes in published_catalog. Paired with the
@@ -721,7 +723,8 @@ typedef struct sender_sizes {
     size_t   ring_bytes;
     size_t   ns_bytes;
     size_t   ns_data_size;    /* namespace bytes + catalog name bytes */
-    uint64_t group_base;      /* sender_resolve_group_base */
+    uint64_t group_base;      /* sender_resolve_group_base, or the configured one */
+    bool     group_base_explicit; /* cfg->initial_group_id: kept on resolve */
 } sender_sizes_t;
 #define SENDER_NS_PER_S 1000000000L
 

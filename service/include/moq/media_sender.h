@@ -276,6 +276,24 @@ typedef struct moq_media_sender_cfg {
      * anonymous; a configured source never falls back to anonymous access.
      * Use a sized initializer to enable this complete pointer field. */
     const moq_media_auth_cfg_t          *resource_auth;
+    /* Optional first Group ID of every track of this sender instance (media,
+     * generated timeline and catalog alike). Honored only when
+     * has_initial_group_id is true; use a sized initializer to enable this
+     * appended pair. It replaces the companion's default base: 0 for the
+     * legacy companion, the wallclock milliseconds read at creation for
+     * D22_MSF01_LOC04_PUBLIC. An AUTO sender keeps the value whichever
+     * companion it resolves to.
+     *
+     * A publisher that restarts a Track must not reuse the Locations of
+     * Objects it already published (draft-ietf-moq-transport-22 2.5; MSF-01
+     * 6.1). An application that remembers the Groups it used before, such as
+     * one that reconnects after a failed session, sets this to a value above
+     * them. Values above MOQ_QUIC_VARINT_MAX, the largest Group ID the
+     * library writes, fail creation with MOQ_ERR_LIMIT. A value of exactly
+     * MOQ_QUIC_VARINT_MAX is valid; the next group is then refused with
+     * MOQ_ERR_LIMIT where it is requested. */
+    uint64_t                             initial_group_id;
+    bool                                 has_initial_group_id;
 } moq_media_sender_cfg_t;
 
 /* Plain init leaves backpressure UNSET on purpose -- the choice is forced,

@@ -609,8 +609,19 @@ moq_result_t sender_prepare(const moq_media_sender_cfg_t *cfg,
      * are numbered from it, and a legacy resolution moves them down by it. */
     bool msf01 = sender_cfg_companion(cfg) !=
                  MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
-    rc = sender_resolve_group_base(msf01, &sz->group_base);
-    if (rc != MOQ_OK) return rc;
+    if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t, has_initial_group_id) +
+                            sizeof(cfg->has_initial_group_id) &&
+        cfg->has_initial_group_id) {
+        /* The application's base replaces the companion's, so the clock is
+         * not read. A base past the largest Group ID is a limit error before
+         * any allocation or endpoint effect, as for the clock. */
+        if (cfg->initial_group_id > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_LIMIT;
+        sz->group_base = cfg->initial_group_id;
+        sz->group_base_explicit = true;
+    } else {
+        rc = sender_resolve_group_base(msf01, &sz->group_base);
+        if (rc != MOQ_OK) return rc;
+    }
     sz->alloc = *SENDER_CTOR_ALLOC();
     const moq_media_auth_cfg_t *auth = NULL;
     if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t, resource_auth) +
@@ -645,6 +656,7 @@ moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
     s->validate_cmaf = cfg->validate_cmaf;
     sender_copy_cfg_tail(s, cfg);
     s->group_base = sz->group_base;
+    s->group_base_explicit = sz->group_base_explicit;
     s->block_timeout_us = cfg->block_timeout_us
         ? cfg->block_timeout_us : SENDER_DEFAULT_BLOCK_TIMEOUT_US;
     s->queue_cap = sz->queue_cap;
