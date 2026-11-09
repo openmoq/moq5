@@ -2300,6 +2300,34 @@ static moq_result_t rx_drive_data(moq_session_t *s,
         input_src_rcbuf = input_rcbuf;
     input_rcbuf = NULL;
 
+    /* The destination of a copied payload comes before its staging. A
+     * delivery that brings the first bytes of an admitted object whose
+     * storage is still deferred (its header arrived without any of them, and
+     * the delivery was not taken above as the payload itself), with nothing
+     * staged ahead of it, gets the object's buffer here, before the staging
+     * below may grow for those bytes. The buffer is released with its event,
+     * while the staging stays with the stream until the stream ends, so the
+     * shorter-lived block is requested before the longer-lived one grows
+     * rather than just after it.
+     *
+     * Buffer and staging are one step. The buffer is attached to the object
+     * only once its bytes are staged; a refused or failed staging releases
+     * it unattached (a refusal may already have released the entry) and
+     * leaves the object deferred exactly as it was. A refused buffer ends the
+     * call once the bytes are staged: the object stays admitted, deferred and
+     * charged, the bytes are retained for the retry as when the parse below
+     * cannot allocate, and nothing is tried again in this call. The object's
+     * receive charge was taken at admission and does not change. */
+    moq_rcbuf_t *first_payload = NULL;
+    uint8_t *first_payload_wr = NULL;
+    moq_result_t first_payload_rc = MOQ_OK;
+    bool first_payload_due = len > 0 && rx->input_len == 0 && rx->hdr_len == 0 &&
+                             rx->parse_state == MOQ_RX_READING_PAYLOAD &&
+                             rx->payload_deferred;
+    if (first_payload_due)
+        first_payload_rc = moq_rcbuf_alloc_uninit(&s->alloc,
+            (size_t)rx->payload_expected, &first_payload, &first_payload_wr);
+
     /* Stage caller bytes before parsing. With nothing staged ahead of them
      * they are parsed in place (rx_in_place_t): the staging is reserved as an
      * append would reserve it and input_len covers them, but the bytes are
@@ -2309,7 +2337,10 @@ static moq_result_t rx_drive_data(moq_session_t *s,
         bool staged;
         if (rx->input_len == 0 && !RX_STAGE_REFERENCE()) {
             moq_result_t rrc = rx_reserve_input(s, slot, len, &staged);
-            if (!staged) return rrc;
+            if (!staged) {
+                moq_rcbuf_decref(first_payload);
+                return rrc;
+            }
             rx->input_len = len;
             ip->data = data;
             ip->len = len;
@@ -2318,8 +2349,18 @@ static moq_result_t rx_drive_data(moq_session_t *s,
             ip->armed = true;
         } else {
             moq_result_t arc = rx_append_input(s, slot, data, len, &staged);
-            if (!staged) return arc;
+            if (!staged) {
+                moq_rcbuf_decref(first_payload);
+                return arc;
+            }
         }
+    }
+
+    if (first_payload_due) {
+        if (first_payload_rc < 0) return first_payload_rc;
+        rx->payload_rcbuf = first_payload;
+        rx->payload_buf = first_payload_wr;
+        rx->payload_deferred = false;
     }
 
     size_t cursor = 0;
@@ -3138,10 +3179,13 @@ static moq_result_t rx_drive_data(moq_session_t *s,
             size_t avail = rx->input_len - cursor;
             size_t need = (size_t)rx->payload_expected - rx->payload_written;
             if (rx->payload_deferred && avail > 0) {
-                /* The object's first payload bytes, not taken whole above:
-                 * its buffer is allocated now and filled below. On failure
-                 * the object stays admitted and deferred, and the bytes are
-                 * kept for the retry like any unparsed input. */
+                /* The object's first payload bytes reached the parse without
+                 * a buffer from the drive above: an earlier call retained
+                 * them when its allocation failed, and they return with an
+                 * empty retry or ahead of newer bytes. Its buffer is
+                 * allocated now and filled below. On failure the object stays
+                 * admitted and deferred, and the bytes are kept for the retry
+                 * like any unparsed input. */
                 moq_rcbuf_t *buf = NULL;
                 uint8_t *wr = NULL;
                 moq_result_t arc = moq_rcbuf_alloc_uninit(&s->alloc,

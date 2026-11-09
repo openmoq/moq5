@@ -9,7 +9,11 @@
  * input. The caller keeps its own reference and may feed
  * one input more than once; every alias is released exactly once. A payload
  * whose header arrived without any of its bytes is admitted and charged with
- * no storage yet; teardown in that state releases the charge.
+ * no storage yet; teardown in that state releases the charge. When its first
+ * bytes are copied, its buffer is allocated before the staging grows for
+ * them, as one step with that staging: a refused buffer retains the bytes for
+ * the retry, and a failed or refused staging releases the buffer and leaves
+ * the object deferred, as it was.
  *
  * Every case drives a real client/server pair: the server writes objects,
  * the test captures each SEND_DATA's header and payload and feeds them to
@@ -29,15 +33,37 @@
 static int failures = 0;
 static moq_version_t g_version;
 
-/* -- Watching allocator: counts, and observes the frees of chosen blocks -- */
+/* -- Watching allocator: counts, observes the frees of chosen blocks, and
+ *    records the order of its calls while a log is open ------------------ */
+
+#define WS_LOG_MAX 32
 
 typedef struct {
-    int64_t balance;
-    void   *watch[4];
-    int     freed[4];
-    size_t  refuse_size;    /* refuse the next allocation of exactly this size */
-    int     refused;
+    char   op;      /* 'a' allocation, 'r' reallocation, 'f' free,
+                     * 'x' refused allocation, 'y' refused reallocation */
+    size_t size;    /* the size requested (the new size of a reallocation) */
+    void  *ptr;     /* the block returned, reallocated or freed */
+} ws_call_t;
+
+typedef struct {
+    int64_t   balance;
+    void     *watch[4];
+    int       freed[4];
+    size_t    refuse_size;    /* refuse the next allocation of exactly this size */
+    int       refused;
+    int       refuse_reallocs; /* refuse this many next reallocations */
+    bool      logging;
+    ws_call_t log[WS_LOG_MAX];
+    int       nlog;
+    bool      log_overflow;
 } ws_alloc_t;
+
+static void ws_note(ws_alloc_t *a, char op, size_t size, void *ptr)
+{
+    if (!a->logging) return;
+    if (a->nlog == WS_LOG_MAX) { a->log_overflow = true; return; }
+    a->log[a->nlog++] = (ws_call_t){ .op = op, .size = size, .ptr = ptr };
+}
 
 static void *ws_alloc_fn(size_t n, void *ctx)
 {
@@ -45,16 +71,28 @@ static void *ws_alloc_fn(size_t n, void *ctx)
     if (a->refuse_size && n == a->refuse_size) {
         a->refuse_size = 0;
         a->refused++;
+        ws_note(a, 'x', n, NULL);
         return NULL;
     }
     void *p = malloc(n);
-    if (p) a->balance++;
+    if (p) {
+        a->balance++;
+        ws_note(a, 'a', n, p);
+    }
     return p;
 }
 static void *ws_realloc_fn(void *p, size_t o, size_t n, void *ctx)
 {
-    (void)o; (void)ctx;
-    return realloc(p, n);
+    ws_alloc_t *a = ctx;
+    (void)o;
+    if (a->refuse_reallocs > 0) {
+        a->refuse_reallocs--;
+        ws_note(a, 'y', n, p);
+        return NULL;
+    }
+    void *q = realloc(p, n);
+    if (q) ws_note(a, 'r', n, q);
+    return q;
 }
 static void ws_free_fn(void *p, size_t n, void *ctx)
 {
@@ -64,7 +102,35 @@ static void ws_free_fn(void *p, size_t n, void *ctx)
     for (int i = 0; i < 4; i++)
         if (a->watch[i] == p) { a->freed[i]++; a->watch[i] = NULL; }
     a->balance--;
+    ws_note(a, 'f', 0, p);
     free(p);
+}
+
+static void ws_log_open(ws_alloc_t *a)
+{
+    a->nlog = 0;
+    a->log_overflow = false;
+    a->logging = true;
+}
+static void ws_log_close(ws_alloc_t *a) { a->logging = false; }
+
+/* The index of the first logged call of kind `op` at or after `from` whose
+ * size is `size` (0 matches any) and whose block is `ptr` (NULL matches any),
+ * or -1. */
+static int ws_log_find(const ws_alloc_t *a, char op, size_t size, const void *ptr, int from)
+{
+    for (int i = from < 0 ? 0 : from; i < a->nlog; i++)
+        if (a->log[i].op == op && (!size || a->log[i].size == size) &&
+            (!ptr || a->log[i].ptr == ptr))
+            return i;
+    return -1;
+}
+static int ws_log_count(const ws_alloc_t *a, char op, size_t size, const void *ptr)
+{
+    int n = 0;
+    for (int i = ws_log_find(a, op, size, ptr, 0); i >= 0; i = ws_log_find(a, op, size, ptr, i + 1))
+        n++;
+    return n;
 }
 static moq_alloc_t ws_allocator(ws_alloc_t *a)
 {
@@ -299,7 +365,13 @@ static void test_split_created_input_is_shared(void)
     MOQ_TEST_CHECK(p.c->recv_payload_bytes == 600);
 
     moq_rcbuf_t *in = ws_root(&p.ia, &p.in_alloc, st.wire + st.pl_off[1], 600, 0);
+    ws_log_open(&p.ia);
     MOQ_TEST_CHECK(moq_session_on_data_rcbuf(p.c, ref, in, false, WS_NOW) == MOQ_OK);
+    ws_log_close(&p.ia);
+    /* Taking the input as the payload allocates nothing: no buffer for a
+     * copy, no staging. */
+    MOQ_TEST_CHECK(!p.ia.log_overflow && ws_log_count(&p.ia, 'a', 0, NULL) == 0 &&
+                   ws_log_count(&p.ia, 'r', 0, NULL) == 0);
     moq_rcbuf_decref(in);
     MOQ_TEST_CHECK(p.ia.freed[0] == 0);
     rx = ws_rx(&p, ref);
@@ -774,6 +846,357 @@ static void test_deferred_teardown_releases_charge(void)
     }
 }
 
+/* -- The buffer of a copied payload, ahead of its staging ------------------- */
+
+/* The block the log shows allocated at `at`, or NULL. */
+static void *ws_logged_block(const ws_alloc_t *a, int at)
+{
+    return at >= 0 && at < a->nlog ? a->log[at].ptr : NULL;
+}
+
+/* A payload copied from its first bytes (plain bytes, or a slice, which is
+ * never the payload itself), with and without a FIN in the same delivery:
+ * the object's buffer is allocated once, before the staging grows for those
+ * bytes, and that very block is the event's payload, holding exactly the
+ * object's bytes. The object's charge does not grow; the block is freed once,
+ * at the event's release; a FIN finishes the stream after the object. */
+static void test_copied_payload_buffer_before_staging(void)
+{
+    for (int shape = 0; shape < 3; shape++) {
+        bool slice = shape == 1, fin = shape == 2;
+        ws_pair_t p;
+        MOQ_TEST_CHECK(ws_open(&p, 0, 0));
+        const size_t sizes[] = { 600 };
+        ws_stream_t st;
+        ws_capture(&p, sizes, 1, 0, &st);
+        MOQ_TEST_CHECK(st.units == 3);
+        moq_stream_ref_t ref = ws_ref(20);
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, 0, st.pl_off[1], false) == MOQ_OK);
+        moq_rx_stream_t *rx = ws_rx(&p, ref);
+        MOQ_TEST_CHECK(rx && rx->payload_deferred && rx->input_cap < 600);
+        MOQ_TEST_CHECK(p.c->recv_payload_bytes == 600);
+        size_t pay = 0;
+        MOQ_TEST_CHECK(moq_rcbuf_allocation_size(600, &pay) == MOQ_OK);
+
+        moq_rcbuf_t *in = NULL;
+        if (slice) {
+            moq_rcbuf_t *root = ws_root(&p.ia, &p.in_alloc, st.wire + st.pl_off[1], 600, 0);
+            MOQ_TEST_CHECK(moq_rcbuf_slice(&p.in_alloc, root, 0, 600, &in) == MOQ_OK);
+            moq_rcbuf_decref(root);
+        }
+        ws_log_open(&p.ia);
+        moq_result_t rc = slice ? moq_session_on_data_rcbuf(p.c, ref, in, fin, WS_NOW)
+                                : ws_bytes(&p, ref, &st, st.pl_off[1], 600, fin);
+        ws_log_close(&p.ia);
+        MOQ_TEST_CHECK(rc == MOQ_OK);
+        if (in) {
+            MOQ_TEST_CHECK(moq_rcbuf_refcount(in) == 1);   /* the session kept nothing */
+            moq_rcbuf_decref(in);
+            MOQ_TEST_CHECK(p.ia.freed[0] == 1);
+        }
+        MOQ_TEST_CHECK(!p.ia.log_overflow);
+        int buf_at = ws_log_find(&p.ia, 'a', pay, NULL, 0);
+        int grow_at = ws_log_find(&p.ia, 'r', 0, NULL, 0);
+        MOQ_TEST_CHECK(buf_at >= 0 && grow_at >= 0 && buf_at < grow_at);
+        MOQ_TEST_CHECK(grow_at >= 0 && p.ia.log[grow_at].size >= 600);
+        MOQ_TEST_CHECK(ws_log_count(&p.ia, 'a', pay, NULL) == 1);
+        MOQ_TEST_CHECK(ws_log_count(&p.ia, 'x', 0, NULL) == 0);
+        void *buf = ws_logged_block(&p.ia, buf_at);
+        MOQ_TEST_CHECK(buf && ws_log_count(&p.ia, 'f', 0, buf) == 0);
+        MOQ_TEST_CHECK(p.c->recv_payload_bytes == 600);
+        p.ia.watch[1] = buf;
+        p.ia.freed[1] = 0;
+
+        moq_event_t ev;
+        MOQ_TEST_CHECK(ws_take(p.c, MOQ_EVENT_OBJECT_RECEIVED, &ev));
+        MOQ_TEST_CHECK((void *)ev.u.object_received.payload == buf);
+        MOQ_TEST_CHECK(ws_payload_ok(ev.u.object_received.payload, 0, 600, 0));
+        MOQ_TEST_CHECK(p.c->recv_payload_bytes == 0);
+        moq_event_cleanup(&ev);
+        MOQ_TEST_CHECK(p.ia.freed[1] == 1);
+        if (!fin)
+            MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, st.hdr_off[2], 0, true) == MOQ_OK);
+        MOQ_TEST_CHECK(ws_take(p.c, MOQ_EVENT_SUBGROUP_FINISHED, &ev));
+        moq_event_cleanup(&ev);
+        MOQ_TEST_CHECK(!moq_session_has_transport_stream(p.c, ref));
+        ws_close(&p);
+    }
+}
+
+/* The buffer for a copied payload's first bytes is refused, with and without
+ * a FIN in that delivery: the one request comes before any staging growth and
+ * is not repeated in the call; the bytes are staged and retained, the object
+ * stays admitted, deferred and charged, and nothing is delivered until the
+ * empty retry, which delivers the object's exact bytes (and finishes the
+ * stream when the FIN came with them). */
+static void test_first_payload_buffer_refused(void)
+{
+    for (int fin = 0; fin < 2; fin++) {
+        ws_pair_t p;
+        MOQ_TEST_CHECK(ws_open(&p, 0, 0));
+        const size_t sizes[] = { 600 };
+        ws_stream_t st;
+        ws_capture(&p, sizes, 1, 0, &st);
+        moq_stream_ref_t ref = ws_ref(21);
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, 0, st.pl_off[1], false) == MOQ_OK);
+        size_t pay = 0;
+        MOQ_TEST_CHECK(moq_rcbuf_allocation_size(600, &pay) == MOQ_OK);
+        p.ia.refuse_size = pay;
+        ws_log_open(&p.ia);
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, st.pl_off[1], 600, fin) == MOQ_ERR_NOMEM);
+        ws_log_close(&p.ia);
+        MOQ_TEST_CHECK(p.ia.refused == 1 && !p.ia.log_overflow);
+        int refused_at = ws_log_find(&p.ia, 'x', pay, NULL, 0);
+        int grow_at = ws_log_find(&p.ia, 'r', 0, NULL, 0);
+        MOQ_TEST_CHECK(refused_at >= 0 && grow_at >= 0 && refused_at < grow_at);
+        MOQ_TEST_CHECK(ws_log_count(&p.ia, 'x', pay, NULL) == 1 &&
+                       ws_log_count(&p.ia, 'a', pay, NULL) == 0);
+        moq_rx_stream_t *rx = ws_rx(&p, ref);
+        MOQ_TEST_CHECK(rx && rx->parse_state == MOQ_RX_READING_PAYLOAD && rx->payload_deferred &&
+                       !rx->payload_rcbuf && rx->input_len == 600 && rx->input_cap >= 600 &&
+                       rx->pending_fin == (fin != 0));
+        MOQ_TEST_CHECK(p.c->recv_payload_bytes == 600);
+        moq_event_t ev;
+        if (moq_session_poll_events(p.c, &ev, 1) != 0) {
+            MOQ_TEST_CHECK(!"no event before the retry");
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(moq_session_on_data_bytes(p.c, ref, NULL, 0, false, WS_NOW) == MOQ_OK);
+        MOQ_TEST_CHECK(ws_take(p.c, MOQ_EVENT_OBJECT_RECEIVED, &ev));
+        MOQ_TEST_CHECK(ws_payload_ok(ev.u.object_received.payload, 0, 600, 0));
+        MOQ_TEST_CHECK(p.c->recv_payload_bytes == 0);
+        moq_event_cleanup(&ev);
+        if (!fin)
+            MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, st.hdr_off[2], 0, true) == MOQ_OK);
+        MOQ_TEST_CHECK(ws_take(p.c, MOQ_EVENT_SUBGROUP_FINISHED, &ev));
+        moq_event_cleanup(&ev);
+        MOQ_TEST_CHECK(!moq_session_has_transport_stream(p.c, ref));
+        ws_close(&p);
+    }
+}
+
+/* The staging growth for a copied payload's first bytes fails after the
+ * object's buffer was allocated: the buffer is released unattached, once,
+ * within the call, and the stream is exactly as before it: admitted, deferred
+ * and charged, nothing staged and no capacity or charge added. The object then
+ * completes from a later delivery, of plain bytes, or of an exact created
+ * input, which is still taken as the payload itself. */
+static void test_staging_failure_releases_first_payload(void)
+{
+    for (int again_rcbuf = 0; again_rcbuf < 2; again_rcbuf++) {
+        ws_pair_t p;
+        MOQ_TEST_CHECK(ws_open(&p, 0, 0));
+        const size_t sizes[] = { 600 };
+        ws_stream_t st;
+        ws_capture(&p, sizes, 1, 0, &st);
+        moq_stream_ref_t ref = ws_ref(22);
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, 0, st.pl_off[1], false) == MOQ_OK);
+        moq_rx_stream_t *rx = ws_rx(&p, ref);
+        size_t cap = rx ? rx->input_cap : 0;
+        size_t in_bytes = p.c->recv_input_bytes;
+        MOQ_TEST_CHECK(rx && rx->payload_deferred && cap > 0 && cap < 600);
+        size_t pay = 0;
+        MOQ_TEST_CHECK(moq_rcbuf_allocation_size(600, &pay) == MOQ_OK);
+        p.ia.refuse_reallocs = 1;
+        ws_log_open(&p.ia);
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, st.pl_off[1], 600, false) == MOQ_ERR_NOMEM);
+        ws_log_close(&p.ia);
+        MOQ_TEST_CHECK(p.ia.refuse_reallocs == 0 && !p.ia.log_overflow);
+        int buf_at = ws_log_find(&p.ia, 'a', pay, NULL, 0);
+        int fail_at = ws_log_find(&p.ia, 'y', 0, NULL, 0);
+        void *buf = ws_logged_block(&p.ia, buf_at);
+        int free_at = buf ? ws_log_find(&p.ia, 'f', 0, buf, 0) : -1;
+        MOQ_TEST_CHECK(buf_at >= 0 && fail_at > buf_at && free_at > fail_at);
+        MOQ_TEST_CHECK(buf && ws_log_count(&p.ia, 'f', 0, buf) == 1);
+        rx = ws_rx(&p, ref);
+        MOQ_TEST_CHECK(rx && rx->parse_state == MOQ_RX_READING_PAYLOAD && rx->payload_deferred &&
+                       !rx->payload_rcbuf && !rx->payload_buf && rx->payload_written == 0 &&
+                       rx->input_len == 0 && rx->input_cap == cap);
+        MOQ_TEST_CHECK(p.c->recv_payload_bytes == 600 && p.c->recv_input_bytes == in_bytes);
+        moq_event_t ev;
+        if (moq_session_poll_events(p.c, &ev, 1) != 0) {
+            MOQ_TEST_CHECK(!"no event after the failed staging");
+            moq_event_cleanup(&ev);
+        }
+
+        moq_rcbuf_t *in = NULL;
+        if (again_rcbuf) {
+            in = ws_root(&p.ia, &p.in_alloc, st.wire + st.pl_off[1], 600, 0);
+            MOQ_TEST_CHECK(moq_session_on_data_rcbuf(p.c, ref, in, false, WS_NOW) == MOQ_OK);
+        } else {
+            MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, st.pl_off[1], 600, false) == MOQ_OK);
+        }
+        MOQ_TEST_CHECK(ws_take(p.c, MOQ_EVENT_OBJECT_RECEIVED, &ev));
+        MOQ_TEST_CHECK(ws_payload_ok(ev.u.object_received.payload, 0, 600, 0));
+        MOQ_TEST_CHECK(!again_rcbuf || ev.u.object_received.payload == in);
+        MOQ_TEST_CHECK(p.c->recv_payload_bytes == 0);
+        moq_event_cleanup(&ev);
+        if (in) {
+            moq_rcbuf_decref(in);
+            MOQ_TEST_CHECK(p.ia.freed[0] == 1);
+        }
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, st.hdr_off[2], 0, true) == MOQ_OK);
+        MOQ_TEST_CHECK(ws_take(p.c, MOQ_EVENT_SUBGROUP_FINISHED, &ev));
+        moq_event_cleanup(&ev);
+        ws_close(&p);
+    }
+}
+
+/* The receive budget refuses the staging for a copied payload's first bytes,
+ * with and without a FIN in that delivery: the stream is stopped as the
+ * refusal requires (without a FIN its entry stays, stopped and holding
+ * nothing; with one the entry is released at the stop), the object's buffer,
+ * allocated first, is released unattached, once, within the call, nothing is
+ * delivered, and every charge returns. */
+static void test_staging_refusal_releases_first_payload(void)
+{
+    for (int fin = 0; fin < 2; fin++) {
+        ws_pair_t p;
+        MOQ_TEST_CHECK(ws_open(&p, 0, 900));
+        const size_t sizes[] = { 600 };
+        ws_stream_t st;
+        ws_capture(&p, sizes, 1, 0, &st);
+        moq_stream_ref_t ref = ws_ref(23);
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, 0, st.pl_off[1], false) == MOQ_OK);
+        moq_rx_stream_t *rx = ws_rx(&p, ref);
+        /* Admitted beside the header's staging, but growing that staging by
+         * what 600 bytes need exceeds what the budget leaves beside the
+         * payload. */
+        MOQ_TEST_CHECK(rx && rx->payload_deferred && rx->input_cap < 300);
+        MOQ_TEST_CHECK(p.c->recv_payload_bytes == 600);
+        size_t pay = 0;
+        MOQ_TEST_CHECK(moq_rcbuf_allocation_size(600, &pay) == MOQ_OK);
+        ws_log_open(&p.ia);
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, st.pl_off[1], 600, fin) == MOQ_OK);
+        ws_log_close(&p.ia);
+        MOQ_TEST_CHECK(!p.ia.log_overflow);
+        int buf_at = ws_log_find(&p.ia, 'a', pay, NULL, 0);
+        void *buf = ws_logged_block(&p.ia, buf_at);
+        MOQ_TEST_CHECK(buf && ws_log_count(&p.ia, 'a', pay, NULL) == 1 &&
+                       ws_log_count(&p.ia, 'f', 0, buf) == 1);
+        MOQ_TEST_CHECK(ws_log_count(&p.ia, 'r', 0, NULL) == 0 &&
+                       ws_log_count(&p.ia, 'y', 0, NULL) == 0);
+        MOQ_TEST_CHECK(p.c->recv_payload_bytes == 0 && p.c->recv_input_bytes == 0);
+        if (fin) {
+            MOQ_TEST_CHECK(!moq_session_has_transport_stream(p.c, ref));
+            MOQ_TEST_CHECK(ws_rx(&p, ref) == NULL);
+        } else {
+            rx = ws_rx(&p, ref);
+            MOQ_TEST_CHECK(rx && rx->parse_state == MOQ_RX_STOPPED && !rx->payload_rcbuf &&
+                           !rx->payload_deferred && !rx->input_buf);
+        }
+        bool stopped = false;
+        moq_action_t act;
+        while (moq_session_poll_actions(p.c, &act, 1) > 0) {
+            if (act.kind == MOQ_ACTION_STOP_DATA && act.u.stop_data.stream_ref._v == ref._v)
+                stopped = true;
+            moq_action_cleanup(&act);
+        }
+        MOQ_TEST_CHECK(stopped);
+        moq_event_t ev;
+        MOQ_TEST_CHECK(!ws_take(p.c, MOQ_EVENT_OBJECT_RECEIVED, &ev));
+        ws_close(&p);
+    }
+}
+
+/* A copied payload completed by its first bytes whose event cannot be
+ * queued: the buffer allocated for those bytes stays parked with the stream,
+ * and the empty retry delivers that same block; after a reset instead, the
+ * block is released exactly once and the charge returns. */
+static void test_first_payload_parked(void)
+{
+    for (int reset = 0; reset < 2; reset++) {
+        ws_pair_t p;
+        MOQ_TEST_CHECK(ws_open(&p, 1, 0));
+        const size_t sizes[] = { 300, 300 };
+        ws_stream_t st;
+        ws_capture(&p, sizes, 2, 0, &st);
+        moq_stream_ref_t ref = ws_ref(24);
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, 0, st.pl_off[1] + 300, false) == MOQ_OK);
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, st.hdr_off[2], st.hdr_len[2], false) == MOQ_OK);
+        MOQ_TEST_CHECK(ws_rx(&p, ref) && ws_rx(&p, ref)->payload_deferred);
+        size_t pay = 0;
+        MOQ_TEST_CHECK(moq_rcbuf_allocation_size(300, &pay) == MOQ_OK);
+        ws_log_open(&p.ia);
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, st.pl_off[2], 300, false) == MOQ_ERR_WOULD_BLOCK);
+        ws_log_close(&p.ia);
+        MOQ_TEST_CHECK(!p.ia.log_overflow);
+        void *buf = ws_logged_block(&p.ia, ws_log_find(&p.ia, 'a', pay, NULL, 0));
+        MOQ_TEST_CHECK(buf && ws_log_count(&p.ia, 'a', pay, NULL) == 1 &&
+                       ws_log_count(&p.ia, 'f', 0, buf) == 0);
+        moq_rx_stream_t *rx = ws_rx(&p, ref);
+        MOQ_TEST_CHECK(rx && rx->parse_state == MOQ_RX_PENDING_EMIT &&
+                       (void *)rx->payload_rcbuf == buf && rx->input_len == 0);
+        MOQ_TEST_CHECK(p.c->recv_payload_bytes == 600);
+        p.ia.watch[1] = buf;
+        p.ia.freed[1] = 0;
+        moq_event_t ev;
+        MOQ_TEST_CHECK(moq_session_poll_events(p.c, &ev, 1) == 1);
+        MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_OBJECT_RECEIVED &&
+                       ws_payload_ok(ev.u.object_received.payload, 0, 300, 0));
+        moq_event_cleanup(&ev);
+        MOQ_TEST_CHECK(p.c->recv_payload_bytes == 300);
+        if (reset) {
+            (void)moq_session_on_data_reset(p.c, ref, 0, WS_NOW);
+            ws_drain(p.c);
+            MOQ_TEST_CHECK(p.ia.freed[1] == 1);
+            MOQ_TEST_CHECK(p.c->recv_payload_bytes == 0);
+        } else {
+            MOQ_TEST_CHECK(moq_session_on_data_bytes(p.c, ref, NULL, 0, false, WS_NOW) == MOQ_OK);
+            MOQ_TEST_CHECK(ws_take(p.c, MOQ_EVENT_OBJECT_RECEIVED, &ev));
+            MOQ_TEST_CHECK((void *)ev.u.object_received.payload == buf);
+            MOQ_TEST_CHECK(ws_payload_ok(ev.u.object_received.payload, 1, 300, 0));
+            moq_event_cleanup(&ev);
+            MOQ_TEST_CHECK(p.ia.freed[1] == 1);
+            MOQ_TEST_CHECK(p.c->recv_payload_bytes == 0);
+        }
+        ws_close(&p);
+    }
+}
+
+/* The first bytes of a copied payload arrive without the rest: they go into
+ * the buffer allocated for them before the staging grew, with no charge
+ * added. A reset then, or the session's destruction, releases that block once
+ * and every charge with it. */
+static void test_first_payload_partial_teardown(void)
+{
+    for (int how = 0; how < 2; how++) {
+        ws_pair_t p;
+        MOQ_TEST_CHECK(ws_open(&p, 0, 0));
+        const size_t sizes[] = { 600 };
+        ws_stream_t st;
+        ws_capture(&p, sizes, 1, 0, &st);
+        moq_stream_ref_t ref = ws_ref(25);
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, 0, st.pl_off[1], false) == MOQ_OK);
+        size_t pay = 0;
+        MOQ_TEST_CHECK(moq_rcbuf_allocation_size(600, &pay) == MOQ_OK);
+        ws_log_open(&p.ia);
+        MOQ_TEST_CHECK(ws_bytes(&p, ref, &st, st.pl_off[1], 250, false) == MOQ_OK);
+        ws_log_close(&p.ia);
+        MOQ_TEST_CHECK(!p.ia.log_overflow);
+        int buf_at = ws_log_find(&p.ia, 'a', pay, NULL, 0);
+        int grow_at = ws_log_find(&p.ia, 'r', 0, NULL, 0);
+        MOQ_TEST_CHECK(buf_at >= 0 && grow_at >= 0 && buf_at < grow_at);
+        void *buf = ws_logged_block(&p.ia, buf_at);
+        moq_rx_stream_t *rx = ws_rx(&p, ref);
+        MOQ_TEST_CHECK(rx && rx->parse_state == MOQ_RX_READING_PAYLOAD && !rx->payload_deferred &&
+                       buf && (void *)rx->payload_rcbuf == buf && rx->payload_written == 250 &&
+                       rx->input_len == 0);
+        MOQ_TEST_CHECK(p.c->recv_payload_bytes == 600);
+        p.ia.watch[1] = buf;
+        p.ia.freed[1] = 0;
+        if (how == 0) {
+            (void)moq_session_on_data_reset(p.c, ref, 0, WS_NOW);
+            ws_drain(p.c);
+            MOQ_TEST_CHECK(p.ia.freed[1] == 1);
+            MOQ_TEST_CHECK(p.c->recv_payload_bytes == 0);
+            MOQ_TEST_CHECK(!moq_session_has_transport_stream(p.c, ref));
+        }
+        ws_close(&p);
+        MOQ_TEST_CHECK(p.ia.freed[1] == 1);
+    }
+}
+
 int main(void)
 {
     static const moq_version_t versions[] = {
@@ -797,6 +1220,12 @@ int main(void)
         test_deferred_allocation_refused();
         test_budget_refusal_keeps_nothing();
         test_deferred_teardown_releases_charge();
+        test_copied_payload_buffer_before_staging();
+        test_first_payload_buffer_refused();
+        test_staging_failure_releases_first_payload();
+        test_staging_refusal_releases_first_payload();
+        test_first_payload_parked();
+        test_first_payload_partial_teardown();
         printf("draft version 0x%llx: %d failure(s)\n",
                (unsigned long long)g_version, failures - before);
     }
