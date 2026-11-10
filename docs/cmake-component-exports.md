@@ -8,9 +8,10 @@ export set; foreign dependencies stay in their provider's namespace and sets.
 `export(EXPORT ...)` and `install(EXPORT ...)`. It does not reconstruct imported
 artifact properties or library identity. CMake 3.20 remains the minimum version.
 
-`MOQ_BUILD_PACKAGE_EXPORTS` is a BOOL option, **ON by default**, including when
-LibMoQ is added as a subdirectory. Set it to OFF explicitly for an embedded
-project that supplies source dependencies without package exports. OFF retains
+`MOQ_BUILD_PACKAGE_EXPORTS` is a BOOL option, **ON by default** when LibMoQ is
+the top-level project and OFF when it is added as a subdirectory, where the
+embedding project owns the install and the exports of the source dependencies it
+supplies. An embedding project that wants the package sets it to ON. OFF retains
 the actual in-tree targets, artifact/header installation and existing pkg-config
 rules. It generates or installs no LibMoQ CMake config/version/target modules and
 registers no private foreign build export. Reusing an ON build tree with OFF also

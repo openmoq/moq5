@@ -25,7 +25,16 @@ project(libmoq
 )
 
 # -- Build options --------------------------------------------------
-option(MOQ_BUILD_PACKAGE_EXPORTS "Generate and install the LibMoQ CMake package" ON)
+# An embedding project owns its install and the export sets of the source
+# dependencies it supplies, so the package defaults to OFF there. Derived here
+# because PROJECT_IS_TOP_LEVEL needs CMake 3.21.
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(_MOQ_IS_TOP_LEVEL ON)
+else()
+    set(_MOQ_IS_TOP_LEVEL OFF)
+endif()
+option(MOQ_BUILD_PACKAGE_EXPORTS "Generate and install the LibMoQ CMake package"
+    ${_MOQ_IS_TOP_LEVEL})
 option(MOQ_BUILD_TESTS             "Build test suite"               ON)
 option(MOQ_BUILD_SIM               "Build moq-sim"                  ${MOQ_BUILD_TESTS})
 option(MOQ_BUILD_ADAPTER_PICOQUIC  "Build picoquic adapter"         OFF)

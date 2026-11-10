@@ -210,10 +210,12 @@ facade the service still builds, but that transport returns
 
 ### CMake component imports
 
-`MOQ_BUILD_PACKAGE_EXPORTS` defaults to ON. An embedding project may explicitly
-set `-DMOQ_BUILD_PACKAGE_EXPORTS=OFF` to use source dependencies without native
-exports. In-tree targets and ordinary artifact/header installation remain usable;
-LibMoQ CMake package config/version/target modules are omitted. Existing pkg-config
+`MOQ_BUILD_PACKAGE_EXPORTS` defaults to ON when LibMoQ is the top-level project
+and to OFF when it is added as a subdirectory, so an embedding project can supply
+source dependencies without native exports. An embedding project that wants the
+package sets `-DMOQ_BUILD_PACKAGE_EXPORTS=ON`. In-tree targets and ordinary
+artifact/header installation remain usable; LibMoQ CMake package
+config/version/target modules are omitted. Existing pkg-config
 availability follows its existing dependency rules. With exports ON, injected
 source providers own their unique native exports and ordinary consumer setup.
 

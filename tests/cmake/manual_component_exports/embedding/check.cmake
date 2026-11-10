@@ -105,6 +105,14 @@ command(packaging-off-again-build PASS "${CMAKE_COMMAND}" --build "${build}" --p
 embedding_run("${build}" embedding.cmake packaging-off-again)
 embedding_install("${build}" packaging-off-again OFF)
 
+# Left unset, an embedded LibMoQ defaults to no package exports, so a parent
+# with an unexported source provider still configures.
+command(unexported-provider-default PASS "${CMAKE_COMMAND}" ${context}
+    -S "${fixture}/embedding" -B "${WORK}/unexported-provider-default" -G Ninja
+    -DCMAKE_BUILD_TYPE=Debug "-DMOQ_SOURCE=${MOQ_SOURCE}" "-DBUILD_SHARED_LIBS=${MOQ_SHARED}"
+    -DFIXTURE_PROVIDER_EXPORTS=OFF)
+embedding_no_package("${WORK}/unexported-provider-default")
+
 # The explicit ON contract must not silently hide an unexported source edge.
 command(unexported-provider "not in any export set" "${CMAKE_COMMAND}" ${context}
     -S "${fixture}/embedding" -B "${WORK}/unexported-provider" -G Ninja -DCMAKE_BUILD_TYPE=Debug
