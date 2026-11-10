@@ -434,12 +434,17 @@ typedef struct moq_endpoint_cfg {
      * packet from the peer (the lower of the two peers' values applies), so a
      * lower value notices a relay that vanished sooner. The keepalive then runs
      * at half of it, and never slower than the default 15 s. 0 keeps the
-     * backend default (30 s on picoquic) and the 15 s keepalive. Honored by raw
-     * QUIC over picoquic only; a non-zero value on any other transport is
-     * MOQ_ERR_UNSUPPORTED, not a silent no-op. Set it via
+     * backend default (30 s on picoquic) and the 15 s keepalive. A value under
+     * MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS is MOQ_ERR_INVAL: picoquic also uses it
+     * as the handshake timeout. Honored by raw QUIC over picoquic only; a
+     * non-zero value on any other transport is MOQ_ERR_UNSUPPORTED, not a
+     * silent no-op. Set it via
      * moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
     uint32_t idle_timeout_ms;
 } moq_endpoint_cfg_t;
+
+/* Smallest non-zero moq_endpoint_cfg_t.idle_timeout_ms (see its doc above). */
+#define MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS UINT32_C(1000)
 
 #define MOQ_ENDPOINT_URI_LEGACY   UINT32_C(0)
 #define MOQ_ENDPOINT_URI_STANDARD UINT32_C(1)

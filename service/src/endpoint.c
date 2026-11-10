@@ -509,6 +509,9 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
     out->idle_timeout_ms = 0;
     if ((size_t)cfg->struct_size >=
         offsetof(moq_endpoint_cfg_t, idle_timeout_ms) + sizeof(cfg->idle_timeout_ms)) {
+        /* Range first, as with the handshake bound: INVAL on every backend. */
+        if (cfg->idle_timeout_ms != 0 && cfg->idle_timeout_ms < MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS)
+            return MOQ_ERR_INVAL;
         if (cfg->idle_timeout_ms != 0 &&
             (out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC ||
              out->protocol != MOQ_TRANSPORT_PROTOCOL_RAW_QUIC))
