@@ -388,7 +388,7 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(r.idle_timeout_ms, 3000);
 
-        /* Under 1 s every handshake times out, and the keepalive would round
+        /* Under 1 s the handshake may time out, and the keepalive could round
          * to 0, which turns it off: refused, the minimum itself accepted. */
         c.idle_timeout_ms = MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS - 1;
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_ERR_INVAL);
