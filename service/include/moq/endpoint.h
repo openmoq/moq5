@@ -429,6 +429,16 @@ typedef struct moq_endpoint_cfg {
      * backends ignore it. Set it via moq_endpoint_cfg_init_sized(&cfg,
      * sizeof cfg). */
     uint64_t send_queue_cap_bytes;
+    /* appended (enabled by struct_size): the QUIC idle timeout in milliseconds
+     * that the client offers. The connection closes after this long without a
+     * packet from the peer (the lower of the two peers' values applies), so a
+     * lower value notices a relay that vanished sooner. The keepalive then runs
+     * at half of it, and never slower than the default 15 s. 0 keeps the
+     * backend default (30 s on picoquic) and the 15 s keepalive. Honored by raw
+     * QUIC over picoquic only; a non-zero value on any other transport is
+     * MOQ_ERR_UNSUPPORTED, not a silent no-op. Set it via
+     * moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
+    uint32_t idle_timeout_ms;
 } moq_endpoint_cfg_t;
 
 #define MOQ_ENDPOINT_URI_LEGACY   UINT32_C(0)
@@ -457,7 +467,8 @@ typedef struct moq_endpoint_cfg {
  * MOQ_WT_PROFILE_BACKEND_DEFAULT for wt_profile (no explicit selection), to 0
  * (the backend default) for handshake_timeout_us, to no setup tokens, to no
  * application certificate callback, LEGACY for uri_mode, the library default
- * for preferred_version, no URI policy and the adapter's default queue bound. Because it never writes past the v0
+ * for preferred_version, no URI policy, the adapter's default queue bound and
+ * the backend's idle timeout. Because it never writes past the v0
  * floor, it can NEVER overflow the buffer of an old caller that predates a
  * later tail field. To SET any tail field, use moq_endpoint_cfg_init_sized(). */
 MOQ_API void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg);
@@ -466,7 +477,7 @@ MOQ_API void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg);
  * initializer to use whenever you set anything beyond the v0 floor (wt_profile,
  * handshake_timeout_us, setup_auth_tokens + setup_auth_token_count,
  * verify_certificate + verify_certificate_ctx, uri_mode, preferred_version,
- * accept_uri, send_queue_cap_bytes). Pass sizeof(moq_endpoint_cfg_t).
+ * accept_uri, send_queue_cap_bytes, idle_timeout_ms). Pass sizeof(moq_endpoint_cfg_t).
  * Never writes past cfg_size, so it is safe for a caller compiled against an older, smaller
  * header too. */
 MOQ_API void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg,

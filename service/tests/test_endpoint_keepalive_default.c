@@ -32,6 +32,7 @@ static int failures = 0;
 
 static unsigned g_calls;      /* how often create was reached */
 static uint32_t g_ka_ms;      /* keep_alive_interval_ms it carried */
+static uint32_t g_idle_ms;    /* idle_timeout_ms it carried */
 
 /* The symbol the endpoint object set calls in place of moq_pq_threaded_create. */
 moq_result_t moq_test_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
@@ -41,6 +42,7 @@ moq_result_t moq_test_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
 {
     g_calls++;
     g_ka_ms = cfg->keep_alive_interval_ms;
+    g_idle_ms = cfg->idle_timeout_ms;
     /* This TU is not renamed, so this reaches the real adapter create. */
     return moq_pq_threaded_create(cfg, out);
 }
@@ -51,16 +53,20 @@ static moq_bytes_t B(const char *s)
     return b;
 }
 
-int main(void)
+/* Connects with idle_timeout_ms and checks the idle timeout and keepalive
+ * that the adapter create received. */
+static void check_connect(uint32_t idle_ms, uint32_t want_idle_ms, uint32_t want_ka_ms)
 {
     g_calls = 0;
     g_ka_ms = 0;
+    g_idle_ms = 0;
 
     moq_endpoint_cfg_t c;
     moq_endpoint_cfg_init_sized(&c, sizeof(c));
     c.url = B(DEAD_PEER_URL_QUIC);
     c.protocol = MOQ_TRANSPORT_PROTOCOL_RAW_QUIC;
     c.insecure_skip_verify = true;   /* no peer, no cert: stay on the config path */
+    c.idle_timeout_ms = idle_ms;
 
     moq_endpoint_t *ep = NULL;
     moq_result_t rc = moq_endpoint_connect(&c, &ep);
@@ -68,12 +74,22 @@ int main(void)
     MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
     MOQ_TEST_CHECK(ep != NULL);
     if (rc == MOQ_OK && ep != NULL) {
-        /* Reached create exactly once, carrying the service default. */
         MOQ_TEST_CHECK_EQ_U64((uint64_t)g_calls, 1);
-        MOQ_TEST_CHECK_EQ_U64((uint64_t)g_ka_ms, (uint64_t)SERVICE_KA_MS);
+        MOQ_TEST_CHECK_EQ_U64((uint64_t)g_idle_ms, (uint64_t)want_idle_ms);
+        MOQ_TEST_CHECK_EQ_U64((uint64_t)g_ka_ms, (uint64_t)want_ka_ms);
         moq_endpoint_stop(ep);
         moq_endpoint_destroy(ep);
     }
+}
+
+int main(void)
+{
+    /* No idle timeout: the backend default and the service keepalive, as before. */
+    check_connect(0, 0, SERVICE_KA_MS);
+    /* An idle timeout: the keepalive runs at half of it ... */
+    check_connect(3000, 3000, 1500);
+    /* ... but never slower than the service keepalive. */
+    check_connect(60000, 60000, SERVICE_KA_MS);
 
     if (failures) return 1;
     printf("PASS: endpoint_keepalive_default\n");

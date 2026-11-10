@@ -369,6 +369,36 @@ int main(void)
 #endif
     }
 
+    /* == idle_timeout_ms resolve: gate + transport rejection ========== *
+     * The QUIC idle timeout is applied by the raw-QUIC picoquic adapter only.
+     * 0 keeps today's behaviour everywhere; a non-zero value on a transport
+     * that cannot apply it is refused rather than ignored. */
+    {
+        moq_endpoint_resolved_t r;
+
+        moq_endpoint_cfg_t v0 = mkcfg("moqt://relay.example:4433");
+        v0.struct_size = MOQ_ENDPOINT_CFG_V0_SIZE;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&v0, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.idle_timeout_ms, 0);
+
+        moq_endpoint_cfg_t c;
+        moq_endpoint_cfg_init_sized(&c, sizeof(c));
+        c.url = B("moqt://relay.example:4433");
+        c.idle_timeout_ms = 3000;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.idle_timeout_ms, 3000);
+
+        /* WebTransport has no idle timeout to set: refused, 0 still fine. */
+        moq_endpoint_cfg_t w;
+        moq_endpoint_cfg_init_sized(&w, sizeof(w));
+        w.url = B("https://relay.example:4433/moq");
+        w.idle_timeout_ms = 3000;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        w.idle_timeout_ms = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r), (int)MOQ_OK);
+    }
+
     /* == handshake_timeout_us upper boundary ========================== *
      * The bound becomes an ABSOLUTE deadline (connection start + duration) in
      * the backend, so a value with no headroom above that clock would wrap the
