@@ -455,6 +455,9 @@ PIN_AFTER(moq_endpoint_cfg_t, verify_certificate_ctx, accept_uri_ctx);
 PIN_THROUGH(moq_endpoint_cfg_t, accept_uri_ctx, 200,
             116 - ABI_ENDPOINT_ENUM_SHIFT, 120 - 2 * ABI_ENDPOINT_ENUM_SHIFT, 8, 4, 8);
 PIN_AFTER(moq_endpoint_cfg_t, accept_uri_ctx, send_queue_cap_bytes);
+PIN_THROUGH(moq_endpoint_cfg_t, send_queue_cap_bytes, 208,
+            124 - ABI_ENDPOINT_ENUM_SHIFT, 128 - 2 * ABI_ENDPOINT_ENUM_SHIFT, 8, 4, 8);
+PIN_AFTER(moq_endpoint_cfg_t, send_queue_cap_bytes, idle_timeout_ms);
 #endif
 
 /* -- Simulator ------------------------------------------------------------- */
@@ -879,8 +882,12 @@ PIN_AT(moq_endpoint_cfg_t, accept_uri_ctx, 192,
 /* The adapter queue bound starts at the sizeof through accept_uri_ctx. */
 PIN_AT(moq_endpoint_cfg_t, send_queue_cap_bytes, 200,
        116 - ABI_ENDPOINT_ENUM_SHIFT, 120 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
-PIN_SIZE(moq_endpoint_cfg_t, 208,
-         124 - ABI_ENDPOINT_ENUM_SHIFT, 128 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
+/* The QUIC idle timeout starts at the sizeof through send_queue_cap_bytes;
+ * the final uint64_t alignment pads it on LP64 and 32-bit ARM. */
+PIN_AT(moq_endpoint_cfg_t, idle_timeout_ms, 208,
+       124 - ABI_ENDPOINT_ENUM_SHIFT, 128 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
+PIN_SIZE(moq_endpoint_cfg_t, 216,
+         128 - ABI_ENDPOINT_ENUM_SHIFT, 136 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
 #endif
 
 #ifdef ABI_HAVE_MEDIA_RECEIVER
