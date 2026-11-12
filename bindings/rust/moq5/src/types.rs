@@ -220,13 +220,17 @@ impl DeliveryOrigin {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CompanionProfile {
-    /// Follow the negotiated draft: LEGACY on drafts 16/18, D22 on draft 22.
+    /// Follow the negotiated draft: LEGACY on drafts 16/18, LOC-05 on
+    /// draft 22.
     #[default]
     Auto,
     /// MSF-01 catalog with LOC-01 properties; requires drafts 16/18.
     LegacyMsf01Loc01,
     /// MSF-01 catalog with LOC-04 metadata; requires draft 22.
     D22Msf01Loc04Public,
+    /// MSF-01 catalog with LOC-05 metadata (LOC-04 plus the Codec String);
+    /// requires draft 22.
+    D22Msf01Loc05Public,
     /// A profile this crate does not know.
     Other(u32),
 }
@@ -239,6 +243,9 @@ impl CompanionProfile {
             CompanionProfile::D22Msf01Loc04Public => {
                 sys::MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC
             }
+            CompanionProfile::D22Msf01Loc05Public => {
+                sys::MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC
+            }
             CompanionProfile::Other(code) => code,
         }
     }
@@ -249,6 +256,9 @@ impl CompanionProfile {
             sys::MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 => CompanionProfile::LegacyMsf01Loc01,
             sys::MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC => {
                 CompanionProfile::D22Msf01Loc04Public
+            }
+            sys::MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC => {
+                CompanionProfile::D22Msf01Loc05Public
             }
             code => CompanionProfile::Other(code),
         }

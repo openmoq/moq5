@@ -161,8 +161,10 @@ encode a KVP's integers differently (draft-16 §1.4 `(i)`, draft-18
 §1.4.1 `(vi64)`). The two agree only below 64, so a wrong draft is
 invisible on small values and wrong on everything else. The draft also
 selects the LOC property registry: drafts 16 and 18 carry
-draft-ietf-moq-loc-01 ids, draft-22 carries draft-ietf-moq-loc-04 ids
-(`<moq/loc.h>`). A catalog
+draft-ietf-moq-loc-01 ids. Draft 22 supports LOC-04 and LOC-05, which adds
+the optional Codec String property. The revision is not negotiated; the
+LOC codec takes `MOQ_LOC_PROFILE_04` or `MOQ_LOC_PROFILE_05` explicitly
+(`<moq/loc.h>`). The service tier selects LOC-05 for AUTO on draft 22. A catalog
 describes the track, never the session carrying it, so the version
 comes from `moq_session_version(session)` — never from endpoint
 configuration or an offered preference.

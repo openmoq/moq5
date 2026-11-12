@@ -82,7 +82,7 @@ bool sender_ep_closed(const moq_media_sender_t *s)
  * unresolved AUTO companion is usable on none. CALLER MUST HOLD s->mu. */
 bool sender_version_usable(const moq_media_sender_t *s)
 {
-    if (s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+    if (sender_companion_d22(s->companion_profile))
         return s->transport_version == MOQ_VERSION_DRAFT_22;
     if (s->companion_profile == MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01)
         return s->transport_version == MOQ_VERSION_DRAFT_16 ||
@@ -99,7 +99,39 @@ bool sender_companion_refused_locked(const moq_media_sender_t *s)
 {
     if (sender_version_usable(s)) return false;
     return s->transport_version != 0 ||
-           s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+           sender_companion_d22(s->companion_profile);
+}
+
+
+/* Positive proof that an unresolved AUTO sender can only resolve to the
+ * draft-22 companion: the offer is nonempty, every entry was observed (not
+ * truncated by the buffer), and each is draft 22. Anything less proves
+ * nothing. */
+static bool sender_offer_only_d22(const moq_media_sender_t *s)
+{
+    moq_version_t versions[MOQ_ENDPOINT_MAX_VERSIONS];
+    size_t n = moq_endpoint_offered_versions_internal(s->ep, versions,
+                                                      MOQ_ENDPOINT_MAX_VERSIONS);
+    if (n == 0 || n > MOQ_ENDPOINT_MAX_VERSIONS) return false;
+    for (size_t i = 0; i < n; i++)
+        if (versions[i] != MOQ_VERSION_DRAFT_22) return false;
+    return true;
+}
+
+bool sender_loc05_track_input_ok_locked(const moq_media_sender_t *s)
+{
+    if (s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC)
+        return true;
+    return s->companion_auto &&
+           s->companion_profile == MOQ_MEDIA_COMPANION_AUTO &&
+           sender_offer_only_d22(s);
+}
+
+bool sender_loc05_object_input_ok_locked(const moq_media_sender_t *s)
+{
+    if (s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC)
+        return s->transport_version == MOQ_VERSION_DRAFT_22;
+    return sender_loc05_track_input_ok_locked(s);
 }
 
 
@@ -354,7 +386,7 @@ moq_result_t sender_validate_cfg(const moq_media_sender_cfg_t *cfg)
     moq_media_companion_profile_t companion = sender_cfg_companion(cfg);
     if (companion != MOQ_MEDIA_COMPANION_AUTO &&
         companion != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
-        companion != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+        !sender_companion_d22(companion))
         return MOQ_ERR_INVAL;
     if (cfg->namespace_.count == 0 || !cfg->namespace_.parts)
         return MOQ_ERR_INVAL;

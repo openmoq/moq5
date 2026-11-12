@@ -37,6 +37,11 @@ public struct TrackConfiguration: Sendable {
     /// Advertise DYNAMIC_GROUPS = 1: subscribers may then ask for a new
     /// group, reported by ``MediaSender/takeNewGroupRequest(for:)``.
     public var dynamicGroups: Bool = false
+    /// State ``codec`` as the track's LOC-05 Codec String track property too
+    /// (RAW only), never implicitly. Adding the track fails unless the sender
+    /// is LOC-05, or automatic and still unresolved with an endpoint offering
+    /// draft 22 alone, or when the track properties already carry one.
+    public var codecStringProperty: Bool = false
 
     public init(name: String, mediaType: MediaType,
                 packaging: MediaPackaging, codec: String, bitrate: UInt64) {

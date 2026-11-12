@@ -4,6 +4,7 @@
 #include "media_sender_complete_internal.h"
 #include "media_sender_mpeg2ts_internal.h"
 #include "media_sender_write_internal.h"
+#include <moq/vi64.h>
 
 moq_bytes_t default_role(moq_media_type_t t)
 {
@@ -350,65 +351,172 @@ static moq_result_t track_derive_sizes(const moq_media_track_cfg_t *cfg,
 }
 
 
-/* Read a caller's track cfg into a full current struct: the v0 prefix, then
- * each appended field only when struct_size covers all of it, and a has_X /
- * X pair or an array / count pair only when it covers the whole pair. Fields
- * left out keep their zero default. The caller has checked struct_size >=
- * MEDIA_TRACK_CFG_MIN_SIZE. */
+/* Read a caller's track cfg into a full current struct by byte offset (the
+ * caller's object may be an older, smaller struct, never read through this
+ * type): the v0 prefix, then each appended field only when struct_size covers
+ * all of it, and a has_X / X pair or an array / count pair only when it covers
+ * the whole pair. Fields left out keep their zero default. The caller has
+ * checked struct_size >= MEDIA_TRACK_CFG_MIN_SIZE. */
 static void sender_track_cfg_read(const moq_media_track_cfg_t *in,
                                   moq_media_track_cfg_t *out)
 {
+    const uint8_t *src = (const uint8_t *)in;
+    uint32_t size;
+    memcpy(&size, src, sizeof(size));
     memset(out, 0, sizeof(*out));
-    memcpy(out, in, MEDIA_TRACK_CFG_MIN_SIZE);
+    memcpy(out, src, MEDIA_TRACK_CFG_MIN_SIZE);
 #define TCFG_HAS(f) \
-    (in->struct_size >= offsetof(moq_media_track_cfg_t, f) + sizeof(in->f))
+    (size >= offsetof(moq_media_track_cfg_t, f) + sizeof(out->f))
+#define TCFG_COPY(f) \
+    memcpy(&out->f, src + offsetof(moq_media_track_cfg_t, f), sizeof(out->f))
     if (TCFG_HAS(track_duration_ms)) {
-        out->has_track_duration = in->has_track_duration;
-        out->track_duration_ms = in->track_duration_ms;
+        TCFG_COPY(has_track_duration);
+        TCFG_COPY(track_duration_ms);
     }
     if (TCFG_HAS(emit_media_timeline))
-        out->emit_media_timeline = in->emit_media_timeline;
+        TCFG_COPY(emit_media_timeline);
     if (TCFG_HAS(media_timeline_history_groups))
-        out->media_timeline_history_groups = in->media_timeline_history_groups;
+        TCFG_COPY(media_timeline_history_groups);
     if (TCFG_HAS(alt_group)) {
-        out->has_alt_group = in->has_alt_group;
-        out->alt_group = in->alt_group;
+        TCFG_COPY(has_alt_group);
+        TCFG_COPY(alt_group);
     }
     if (TCFG_HAS(publisher_priority)) {
-        out->has_publisher_priority = in->has_publisher_priority;
-        out->publisher_priority = in->publisher_priority;
+        TCFG_COPY(has_publisher_priority);
+        TCFG_COPY(publisher_priority);
     }
     if (TCFG_HAS(extension_count)) {
-        out->extensions = in->extensions;
-        out->extension_count = in->extension_count;
+        TCFG_COPY(extensions);
+        TCFG_COPY(extension_count);
     }
     if (TCFG_HAS(mpeg2ts_app_objects))
-        out->mpeg2ts_app_objects = in->mpeg2ts_app_objects;
+        TCFG_COPY(mpeg2ts_app_objects);
     if (TCFG_HAS(mpeg2ts_object_packets))
-        out->mpeg2ts_object_packets = in->mpeg2ts_object_packets;
+        TCFG_COPY(mpeg2ts_object_packets);
     if (TCFG_HAS(mpeg2ts_min_group_ms))
-        out->mpeg2ts_min_group_ms = in->mpeg2ts_min_group_ms;
+        TCFG_COPY(mpeg2ts_min_group_ms);
     if (TCFG_HAS(mpeg2ts_forward_before_random_access))
-        out->mpeg2ts_forward_before_random_access =
-            in->mpeg2ts_forward_before_random_access;
+        TCFG_COPY(mpeg2ts_forward_before_random_access);
     if (TCFG_HAS(track_properties))
-        out->track_properties = in->track_properties;
+        TCFG_COPY(track_properties);
     if (TCFG_HAS(dynamic_groups))
-        out->dynamic_groups = in->dynamic_groups;
-    if (TCFG_HAS(render_group) && in->has_render_group) {
-        out->has_render_group = true;
-        out->render_group = in->render_group;
+        TCFG_COPY(dynamic_groups);
+    /* A render group or label counts only with its flag set; a clear flag
+     * leaves the value at its default. */
+    if (TCFG_HAS(render_group)) {
+        bool has;
+        memcpy(&has, src + offsetof(moq_media_track_cfg_t, has_render_group),
+               sizeof(has));
+        if (has) {
+            out->has_render_group = true;
+            TCFG_COPY(render_group);
+        }
     }
-    if (TCFG_HAS(label) && in->has_label) {
-        out->has_label = true;
-        out->label = in->label;
+    if (TCFG_HAS(label)) {
+        bool has;
+        memcpy(&has, src + offsetof(moq_media_track_cfg_t, has_label),
+               sizeof(has));
+        if (has) {
+            out->has_label = true;
+            TCFG_COPY(label);
+        }
     }
     if (TCFG_HAS(group_order))
-        out->group_order = in->group_order;
+        TCFG_COPY(group_order);
+    if (TCFG_HAS(track_loc_ext))
+        TCFG_COPY(track_loc_ext);
+#undef TCFG_COPY
 #undef TCFG_HAS
     out->struct_size = (uint32_t)sizeof(*out);
 }
 
+
+/* -- Typed LOC-05 Track Properties ----------------------------------- */
+
+/* The Codec String (LOC-05 0x11) joins a well-formed draft-22 Track
+ * Properties block in type order: before its first property of a higher
+ * type. Only that property's Delta Type is re-encoded; every other byte,
+ * including any Immutable Properties block, is kept. */
+#define TRACK_LOC05_CODEC_STRING 0x11u
+
+typedef struct track_codec_insert {
+    size_t   at;           /* insertion offset */
+    uint64_t prev_type;    /* type before it, or 0 */
+    bool     has_next;     /* a higher-typed property follows */
+    uint64_t next_type;
+    size_t   next_rest;    /* offset just past that property's Delta Type */
+} track_codec_insert_t;
+
+static bool track_codec_insert_plan(moq_bytes_t raw, track_codec_insert_t *p)
+{
+    memset(p, 0, sizeof(*p));
+    size_t off = 0;
+    uint64_t prev = 0;
+    while (off < raw.len) {
+        uint64_t delta = 0, v = 0;
+        size_t n = moq_vi64_decode(raw.data + off, raw.len - off, &delta);
+        if (n == 0 || delta > UINT64_MAX - prev) return false;
+        uint64_t type = prev + delta;
+        if (type > TRACK_LOC05_CODEC_STRING) {
+            p->at = off;
+            p->prev_type = prev;
+            p->has_next = true;
+            p->next_type = type;
+            p->next_rest = off + n;
+            return true;
+        }
+        size_t pos = off + n;
+        n = moq_vi64_decode(raw.data + pos, raw.len - pos, &v);
+        if (n == 0) return false;
+        pos += n;
+        if (type & 1u) {
+            if (v > raw.len - pos) return false;
+            pos += (size_t)v;
+        }
+        off = pos;
+        prev = type;
+    }
+    p->at = raw.len;
+    p->prev_type = prev;
+    return true;
+}
+
+static bool track_codec_merged_len(moq_bytes_t raw,
+                                   const track_codec_insert_t *p,
+                                   moq_bytes_t codec, size_t *out)
+{
+    size_t n = p->at;
+    if (!sender_sum_fits(&n, moq_vi64_len(TRACK_LOC05_CODEC_STRING - p->prev_type)) ||
+        !sender_sum_fits(&n, moq_vi64_len((uint64_t)codec.len)) ||
+        !sender_sum_fits(&n, codec.len))
+        return false;
+    if (p->has_next &&
+        (!sender_sum_fits(&n, moq_vi64_len(p->next_type - TRACK_LOC05_CODEC_STRING)) ||
+         !sender_sum_fits(&n, raw.len - p->next_rest)))
+        return false;
+    *out = n;
+    return true;
+}
+
+/* Writes exactly track_codec_merged_len bytes. */
+static void track_codec_merge(moq_bytes_t raw, const track_codec_insert_t *p,
+                              moq_bytes_t codec, uint8_t *out, size_t out_len)
+{
+    size_t pos = 0;
+    if (p->at) memcpy(out, raw.data, p->at);
+    pos = p->at;
+    pos += moq_vi64_encode(TRACK_LOC05_CODEC_STRING - p->prev_type,
+                           out + pos, out_len - pos);
+    pos += moq_vi64_encode((uint64_t)codec.len, out + pos, out_len - pos);
+    memcpy(out + pos, codec.data, codec.len);
+    pos += codec.len;
+    if (p->has_next) {
+        pos += moq_vi64_encode(p->next_type - TRACK_LOC05_CODEC_STRING,
+                               out + pos, out_len - pos);
+        if (raw.len > p->next_rest)
+            memcpy(out + pos, raw.data + p->next_rest, raw.len - p->next_rest);
+    }
+}
 
 moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
                                         const moq_media_track_cfg_t *cfg,
@@ -416,7 +524,9 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
 {
     if (out) *out = NULL;
     if (!s || !cfg || !out) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < MEDIA_TRACK_CFG_MIN_SIZE)
+    uint32_t cfg_size;
+    memcpy(&cfg_size, cfg, sizeof(cfg_size));
+    if (cfg_size < MEDIA_TRACK_CFG_MIN_SIZE)
         return MOQ_ERR_INVAL;
     /* Prefix-safe by struct_size: read the caller's (possibly older/smaller,
      * or newer/larger) cfg into a zero-filled local, so appended fields an
@@ -516,28 +626,94 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     if (s->fatal) { pthread_mutex_unlock(&s->mu); return MOQ_ERR_CLOSED; }
     if (s->completing) { pthread_mutex_unlock(&s->mu); return MOQ_ERR_WRONG_STATE; }
     moq_version_t negotiated = s->transport_version;
+    bool loc05_ok = sender_loc05_track_input_ok_locked(s);
     pthread_mutex_unlock(&s->mu);
     SENDER_ADD_TRACK_GAP_HOOK();
+
+    /* Typed LOC-05 Track Properties, refused before anything is allocated
+     * or registered (see moq_media_track_cfg_t.track_loc_ext). Whenever such
+     * input is acceptable the properties are certainly draft-22 LOC-05, so the
+     * app's own track_properties are checked as LOC-05 as well. */
+    const moq_loc_ext_t *tx = cfg->track_loc_ext;
+    if (tx) {
+        if (tx->struct_size < MOQ_LOC_EXT_V0_SIZE ||
+            (tx->present & ~MOQ_LOC_EXT_PRESENT_MASK))
+            return MOQ_ERR_INVAL;
+        if (!(tx->present & MOQ_LOC_EXT_HAS_CODEC_STRING)) tx = NULL;
+    }
+    if (tx) {
+        if (cfg->packaging != MOQ_MEDIA_PACKAGING_RAW) return MOQ_ERR_INVAL;
+        if (!loc05_ok) return MOQ_ERR_UNSUPPORTED;
+        moq_bytes_t c = tx->codec_string;
+        if (c.len != cfg->codec.len ||
+            (c.len && (!c.data || memcmp(c.data, cfg->codec.data, c.len) != 0)))
+            return MOQ_ERR_INVAL;
+        /* The LOC encoder is the one authority on an acceptable Codec String. */
+        moq_loc_metadata_t none;
+        moq_loc_metadata_init_sized(&none, sizeof(none));
+        moq_rcbuf_t *probe = NULL;
+        moq_result_t prc = moq_loc_encode_metadata_ex(&s->alloc,
+            MOQ_VERSION_DRAFT_22, MOQ_LOC_PROFILE_05, &none, tx, &probe);
+        if (probe) moq_rcbuf_decref(probe);
+        if (prc != MOQ_OK) return prc == MOQ_ERR_NOMEM ? prc : MOQ_ERR_INVAL;
+    }
+    if (loc05_ok && cfg->track_properties.len) {
+        moq_loc_metadata_t pm;
+        moq_loc_ext_t pe;
+        if (moq_loc_parse_metadata_ex(MOQ_VERSION_DRAFT_22, MOQ_LOC_PROFILE_05,
+                                      cfg->track_properties, &pm, sizeof(pm),
+                                      &pe, sizeof(pe)) != MOQ_OK)
+            return MOQ_ERR_INVAL;
+        if (tx && (pe.present & MOQ_LOC_EXT_HAS_CODEC_STRING))
+            return MOQ_ERR_INVAL;
+    }
+    track_codec_insert_t ins = {0};
+    size_t merged_len = cfg->track_properties.len;
+    if (tx) {
+        if (!track_codec_insert_plan(cfg->track_properties, &ins) ||
+            !track_codec_merged_len(cfg->track_properties, &ins,
+                                    tx->codec_string, &merged_len))
+            return MOQ_ERR_INVAL;
+        /* The merged block replaces the app's in the strings buffer. It may
+         * be the shorter one: the following property's Delta Type is
+         * re-encoded in its shortest form, and the app's need not be. */
+        sz.strings -= cfg->track_properties.len;
+        if (!sender_sum_fits(&sz.strings, merged_len)) return MOQ_ERR_INVAL;
+    }
 
     /* Track Properties are checked here, as the publisher facade will check
      * them, so an unpublishable set is refused at the call rather than
      * failing the sender when the track activates: against the negotiated
      * version once known, before that against every version the endpoint
      * offers (any may be negotiated). */
-    if (cfg->track_properties.len > 0 || cfg->dynamic_groups ||
+    if (merged_len > 0 || cfg->dynamic_groups ||
         cfg->group_order != MOQ_GROUP_ORDER_DEFAULT) {
+        /* What will be stated: the app's set, with a typed Codec String
+         * merged in (a scratch copy freed before anything else happens). */
+        moq_bytes_t props = cfg->track_properties;
+        uint8_t *merged = NULL;
+        if (tx) {
+            merged = (uint8_t *)s->alloc.alloc(merged_len, s->alloc.ctx);
+            if (!merged) return MOQ_ERR_NOMEM;
+            track_codec_merge(cfg->track_properties, &ins, tx->codec_string,
+                              merged, merged_len);
+            props = (moq_bytes_t){ merged, merged_len };
+        }
         moq_version_t versions[MOQ_ENDPOINT_MAX_VERSIONS];
         size_t nv = 1;
         if (negotiated) versions[0] = negotiated;
         else nv = moq_endpoint_offered_versions_internal(s->ep, versions,
                                                          MOQ_ENDPOINT_MAX_VERSIONS);
+        moq_result_t vrc = MOQ_OK;
         for (size_t i = 0; i < nv && i < MOQ_ENDPOINT_MAX_VERSIONS; i++) {
-            moq_result_t vrc = moq_core_internal_track_properties_validate(
-                versions[i], cfg->track_properties.data,
-                cfg->track_properties.len, cfg->dynamic_groups,
+            vrc = moq_core_internal_track_properties_validate(
+                versions[i], props.data, props.len, cfg->dynamic_groups,
                 cfg->group_order);
-            if (vrc == MOQ_ERR_INVAL || vrc == MOQ_ERR_NOMEM) return vrc;
+            if (vrc == MOQ_ERR_INVAL || vrc == MOQ_ERR_NOMEM) break;
+            vrc = MOQ_OK;
         }
+        if (merged) s->alloc.free(merged, merged_len, s->alloc.ctx);
+        if (vrc != MOQ_OK) return vrc;
     }
 
     /* Deep-copy every span into one buffer so the cfg need not outlive the
@@ -575,7 +751,14 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     COPY_SPAN(t->lang, cfg->lang);
     COPY_SPAN(t->label, cfg->label);
     COPY_SPAN(t->channel_config, cfg->channel_config);
-    COPY_SPAN(t->track_properties, cfg->track_properties);
+    if (tx) {
+        track_codec_merge(cfg->track_properties, &ins, tx->codec_string,
+                          buf + off, merged_len);
+        t->track_properties = (moq_bytes_t){ buf + off, merged_len };
+        off += merged_len;
+    } else {
+        COPY_SPAN(t->track_properties, cfg->track_properties);
+    }
 #undef COPY_SPAN
     /* Read from the owned copy. Only a RAW track of a sender that can
      * synthesize LOC-04 (AUTO) needs it; it gates typed capture times in

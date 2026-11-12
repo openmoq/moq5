@@ -15,7 +15,7 @@
  * on the network thread, generating the standard LOC properties from the
  * typed fields and abandoning open subgroups wire-correctly under
  * backpressure. The media companion defaults to AUTO, which follows the
- * negotiated draft (legacy LOC-01 on drafts 16/18, LOC-04 on draft 22); an
+ * negotiated draft (legacy LOC-01 on drafts 16/18, LOC-05 on draft 22); an
  * explicit companion pins one and refuses the other drafts.
  */
 
@@ -209,18 +209,22 @@ typedef struct moq_media_sender_cfg {
      * it. A zeroed field is LEGACY_MSF01_LOC01, not AUTO.
      *
      * Explicit companions are fixed at creation: LEGACY_MSF01_LOC01 requires
-     * negotiated D16/18 and D22_MSF01_LOC04_PUBLIC negotiated D22. A known
+     * negotiated D16/18, and D22_MSF01_LOC04_PUBLIC or D22_MSF01_LOC05_PUBLIC
+     * negotiated D22. LOC05 differs from LOC04 only in accepting typed Codec
+     * Strings (moq_media_send_object_t.loc_ext, moq_media_track_cfg_t.
+     * track_loc_ext); without them its bytes are LOC04's. A known
      * mismatch reports UNSUPPORTED through write/wait and stats.last_error,
      * never endpoint/session termination.
      *
      * AUTO resolves once, when the sender first observes a draft-16/18/22
-     * session, to the matching companion, and then behaves exactly as that
+     * session, to the matching companion (LEGACY_MSF01_LOC01 on D16/18,
+     * D22_MSF01_LOC05_PUBLIC on D22), and then behaves exactly as that
      * companion (any other draft is UNSUPPORTED). Nothing is published before
      * then, so the catalog and every object follow the resolved companion.
      * Until it resolves, AUTO differs from an explicit companion in these
      * ways only:
      *   - Creation reads the wallclock Group-ID base described below, and
-     *     fails as D22_MSF01_LOC04_PUBLIC does when it cannot. Objects written
+     *     fails as an explicit draft-22 companion does when it cannot. Objects written
      *     before resolution are numbered from it; resolving to legacy renumbers
      *     them from 0, before any is sent.
      *   - write() accepts RAW objects (explicit D22 refuses writes before
@@ -241,8 +245,8 @@ typedef struct moq_media_sender_cfg {
      * write with has_capture_time and no metadata tail is MOQ_ERR_INVAL
      * whenever the object may go out as draft 22: once resolved to it, or
      * before resolution when the endpoint offers draft 22. Explicit
-     * D22_MSF01_LOC04_PUBLIC still requires the tail. On drafts 16/18 the
-     * tail is ignored, as with LEGACY.
+     * D22_MSF01_LOC04_PUBLIC or D22_MSF01_LOC05_PUBLIC still requires the
+     * tail. On drafts 16/18 the tail is ignored, as with LEGACY.
      *
      * Every companion publishes the MSF-01 catalog: version
      * "draft-01"; every track's init_data in the root initDataList,
@@ -251,9 +255,9 @@ typedef struct moq_media_sender_cfg {
      * init_data published as a full catalog, not a delta. This also applies
      * before AUTO resolves.
      *
-     * D22_MSF01_LOC04_PUBLIC selects each track's Group IDs (media, generated
-     * timeline and catalog) starting at the wallclock milliseconds read when
-     * the sender is created, the
+     * D22_MSF01_LOC04_PUBLIC and D22_MSF01_LOC05_PUBLIC select each track's
+     * Group IDs (media, generated timeline and catalog) starting at the
+     * wallclock milliseconds read when the sender is created, the
      * best-effort approach MSF-01 6.1 suggests. It keeps a restarted
      * publisher's IDs above its predecessor's only while the clock moves
      * forward and no instance numbers groups faster than the clock; restart
@@ -283,7 +287,8 @@ typedef struct moq_media_sender_cfg {
      * _reserved_initial_group_id is never read: it keeps the pair past the
      * original sizeof where that ends in tail padding. The value replaces
      * the companion's default base (0 for the legacy companion, the
-     * wallclock milliseconds read at creation for D22_MSF01_LOC04_PUBLIC),
+     * wallclock milliseconds read at creation for D22_MSF01_LOC04_PUBLIC and
+     * D22_MSF01_LOC05_PUBLIC),
      * and the clock is then not read. An AUTO sender keeps the value
      * whichever companion it resolves to.
      *
@@ -603,6 +608,35 @@ typedef struct moq_media_track_cfg {
     _Alignas(uint64_t)
 #endif
     moq_group_order_t group_order;
+
+    /* Typed LOC-05 Track Properties (moq_loc_ext_t), borrowed for the call,
+     * or NULL. Read only when struct_size covers this whole pointer; aligned
+     * past group_order on every target, so an older caller's struct_size
+     * never covers it. A covered record must have its complete v0 floor and
+     * known presence bits (otherwise MOQ_ERR_INVAL); one with nothing present
+     * changes nothing. A present Codec String:
+     *   - is RAW only, must be a usable identifier (see moq_loc_ext_t), and
+     *     must equal the catalog codec bytes exactly: MOQ_ERR_INVAL otherwise.
+     *     The two state the same track; an object's own Codec String may later
+     *     differ;
+     *   - is accepted only by a D22_MSF01_LOC05_PUBLIC sender, or an AUTO
+     *     sender that has not resolved and whose endpoint offers draft 22
+     *     alone; every other state is MOQ_ERR_UNSUPPORTED, with nothing
+     *     changed. An AUTO sender whose endpoint also offers draft 16 or 18
+     *     adds such a track after it resolves to draft 22;
+     *   - is added to track_properties as Codec String (0x11), in type order,
+     *     without rewriting any other property's bytes but the one delta that
+     *     follows it. track_properties that already carry a Codec String,
+     *     mutable or inside Immutable Properties, are MOQ_ERR_INVAL.
+     * Whenever typed LOC-05 input would be accepted, track_properties are also
+     * checked as LOC-05: a malformed or repeated Codec String in them is
+     * MOQ_ERR_INVAL. No Codec String is ever synthesized from the catalog. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_loc_ext_t *track_loc_ext;
 } moq_media_track_cfg_t;
 
 #define MOQ_MEDIA_TRACK_CFG_V0_SIZE \
@@ -723,8 +757,9 @@ typedef struct moq_media_send_object {
      * (moq_loc_value_max_for_version): MOQ_QUIC_VARINT_MAX on draft 16 and
      * before the draft is known; none on draft 18 (vi64 carries uint64).
      * Explicit D22 RAW uses the metadata tail instead, not a capture/PTS
-     * fallback; an AUTO sender on draft 22 generates LOC-04 from these fields
-     * when the tail is absent (capture time as Unix microseconds, else
+     * fallback; an AUTO sender on draft 22 generates the LOC block (the same
+     * bytes under LOC-04 and LOC-05) from these fields when the tail is absent
+     * (capture time as Unix microseconds, else
      * presentation time with Timescale 1000000; see
      * moq_media_sender_cfg_t.companion_profile). presentation_time_us still
      * drives generated timelines. */
@@ -762,6 +797,27 @@ typedef struct moq_media_send_object {
     _Alignas(uint64_t)
 #endif
     const moq_media_metadata_t *metadata;
+    /* Typed LOC-05 Object Properties (moq_loc_ext_t), borrowed for the call,
+     * or NULL. Read only when struct_size covers this whole pointer; aligned
+     * past metadata on every target. A covered record needs its complete v0
+     * floor and known presence bits (MOQ_ERR_INVAL otherwise); one with nothing
+     * present changes nothing. A present Codec String is RAW only
+     * (MOQ_ERR_INVAL otherwise) and must be a usable identifier; it is copied
+     * into the generated property block, after the metadata tail's keys, or
+     * after the typed-field LOC block an AUTO sender generates when there is
+     * no tail. It is accepted only when nothing can discard it later: a
+     * D22_MSF01_LOC05_PUBLIC sender that has observed draft 22, or an AUTO
+     * sender that has not resolved and whose endpoint offers draft 22 alone
+     * (or has resolved to LOC05). Every other state -- LEGACY, explicit LOC04,
+     * AUTO resolved to legacy, AUTO whose offer includes draft 16 or 18 -- is
+     * MOQ_ERR_UNSUPPORTED, synchronously, with no ownership taken. It never
+     * changes the metadata tail's own rules. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_loc_ext_t *loc_ext;
 } moq_media_send_object_t;
 
 /* Complete frozen pre-metadata input extent; old-sized writes remain legal. */

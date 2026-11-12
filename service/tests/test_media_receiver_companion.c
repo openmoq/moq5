@@ -214,7 +214,8 @@ static void test_config(void)
      * accepted at creation (it may resolve to legacy). */
     const moq_media_companion_profile_t known[] = {
         MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01,
-        MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, MOQ_MEDIA_COMPANION_AUTO
+        MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, MOQ_MEDIA_COMPANION_AUTO,
+        MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC
     };
     for (size_t k = 0; k < sizeof(known) / sizeof(*known); k++) {
         for (unsigned epoch = 0; epoch < 2; epoch++) {
@@ -223,7 +224,8 @@ static void test_config(void)
             moq_media_receiver_t *r = NULL;
             moq_result_t rc = moq_media_receiver_test_construct(&cfg, &r);
             bool refused = epoch &&
-                known[k] == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+                (known[k] == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC ||
+                 known[k] == MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC);
             MOQ_TEST_CHECK(rc == (refused ? MOQ_ERR_UNSUPPORTED : MOQ_OK));
             if (r) {
                 MOQ_TEST_CHECK(r->companion_profile == known[k]);
@@ -240,7 +242,7 @@ static void test_config(void)
     moq_endpoint_cfg_t endpoint;
     memset(&endpoint, 0, sizeof(endpoint));
     for (unsigned i = 0; i < 4; i++) {
-        init_cfg(&cfg, i == 0 ? UINT32_MAX : i == 3 ? MOQ_MEDIA_COMPANION_AUTO + 1u
+        init_cfg(&cfg, i == 0 ? UINT32_MAX : i == 3 ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC + 1u
                                 : MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC);
         cfg.endpoint = &endpoint;
         if (i == 1) cfg.struct_size = sizeof(frozen_receiver_cfg_t) - 1;
@@ -283,13 +285,13 @@ fail:
 
 /* Explicit companions accept only their own drafts; AUTO resolves to the one
  * matching the session (none for D22 with SHARED_EPOCH). A mismatch is a
- * receiver-local fatal with nothing sent. Rows: legacy, D22, AUTO, then AUTO
- * with SHARED_EPOCH. */
+ * receiver-local fatal with nothing sent. Rows: legacy, LOC-04, AUTO, AUTO
+ * with SHARED_EPOCH, then explicit LOC-05. */
 static void test_profiles(void)
 {
     const moq_version_t versions[] = { MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_22 };
     for (size_t i = 0; i < 3; i++) {
-        for (unsigned p = 0; p < 4; p++) {
+        for (unsigned p = 0; p < 5; p++) {
             test_alloc_state_t state = {0};
             moq_alloc_t alloc = test_allocator(&state);
             moq_simpair_t *sp = pair(&alloc, versions[i]);
@@ -297,7 +299,8 @@ static void test_profiles(void)
             if (!sp) { MOQ_TEST_CHECK(state.balance == 0); continue; }
             moq_media_receiver_cfg_t cfg;
             bool d22 = versions[i] == MOQ_VERSION_DRAFT_22;
-            init_cfg(&cfg, p < 2 ? p : MOQ_MEDIA_COMPANION_AUTO);
+            init_cfg(&cfg, p < 2 ? p : p == 4 ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC
+                                              : MOQ_MEDIA_COMPANION_AUTO);
             if (p == 3) cfg.time_mode = MOQ_MEDIA_TIME_SHARED_EPOCH;
             moq_media_receiver_test_set_alloc(&alloc);
             moq_media_receiver_t *r = moq_media_receiver_test_new_cfg(&cfg);
@@ -307,11 +310,14 @@ static void test_profiles(void)
                 moq_session_t *c = moq_simpair_client(sp);
                 MOQ_TEST_CHECK(r->companion_profile == cfg.companion_profile);
                 receiver_hook(NULL, c, moq_simpair_now_us(sp), r);
-                bool usable = p == 2 ? true : p == 3 ? !d22 :
+                bool usable = p == 2 ? true : p == 3 ? !d22 : p == 4 ? d22 :
                     (p == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC) == d22;
+                /* Explicit companions never change; AUTO takes LOC-05 on
+                 * draft 22. */
                 moq_media_companion_profile_t resolved =
-                    p < 2 ? p : !usable ? MOQ_MEDIA_COMPANION_AUTO :
-                    d22 ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC
+                    p < 2 ? p : p == 4 ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC :
+                    !usable ? MOQ_MEDIA_COMPANION_AUTO :
+                    d22 ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC
                         : MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
                 MOQ_TEST_CHECK(r->companion_profile == resolved);
                 MOQ_TEST_CHECK(r->transport_version == moq_session_version(c));
@@ -369,8 +375,10 @@ static void test_objects(moq_version_t version, bool auto_companion)
     receiver_hook(NULL, moq_simpair_client(sp), moq_simpair_now_us(sp), r);
     MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(r));
     if (moq_media_receiver_is_fatal(r)) goto cleanup;
-    MOQ_TEST_CHECK(r->companion_profile == (d22 ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC
-                                                : MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01));
+    MOQ_TEST_CHECK(r->companion_profile ==
+        (!d22 ? MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01
+              : auto_companion ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC
+                               : MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC));
     moq_media_receiver_test_ingest(r, 0, 0, catalog, sizeof(catalog) - 1);
     moq_media_track_t *track = NULL;
     moq_media_track_event_t ev;

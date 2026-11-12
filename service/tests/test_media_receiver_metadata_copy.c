@@ -667,7 +667,14 @@ static void legacy_resume(moq_version_t version)
     MOQ_TEST_PASS("legacy_depth_only_resume_and_nudge_ignore_byte_half");
 }
 
+/* A harness that includes this file supplies its own main; these controls
+ * stay compiled under another name. */
+#ifdef RECEIVER_METADATA_COPY_NO_MAIN
+int receiver_metadata_copy_main(void);
+int receiver_metadata_copy_main(void)
+#else
 int main(void)
+#endif
 {
     exclusive_copy();
     const moq_media_overflow_policy_t policies[] = {MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME,

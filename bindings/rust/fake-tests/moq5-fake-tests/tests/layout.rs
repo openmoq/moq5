@@ -70,12 +70,12 @@ fn rust_side() -> BTreeMap<String, Entry> {
             emit_media_timeline, media_timeline_history_groups, has_alt_group, alt_group,
             has_publisher_priority, publisher_priority, extensions, extension_count,
             mpeg2ts_app_objects, track_properties, dynamic_groups, has_render_group,
-            render_group, has_label, label, group_order,
+            render_group, has_label, label, group_order, track_loc_ext,
         }
         moq_media_send_object_t {
             struct_size, payload, properties, is_sync, starts_group, ends_group, decode_time_us,
             presentation_time_us, has_capture_time, capture_time_us, has_sap_type, sap_type,
-            metadata,
+            metadata, loc_ext,
         }
         moq_media_vod_track_t { track, duration_ms }
         moq_media_sender_stats_t {
@@ -140,7 +140,7 @@ fn rust_side() -> BTreeMap<String, Entry> {
             object_id, publisher_priority, has_subgroup, has_loss_report, gap, gap_group,
             gap_object, gap_tail_unknown, gap_duration_known, gap_duration_27mhz,
             discontinuous, metadata, track_properties_ref, delivery_origin,
-            initiating_request_id,
+            initiating_request_id, loc_ext_present, _reserved_loc_ext, codec_string,
         }
         moq_media_stream_terminal_t {
             struct_size, kind, track, group_id, subgroup_id, object_id, last_group_id,
@@ -196,6 +196,7 @@ fn rust_side() -> BTreeMap<String, Entry> {
             struct_size, time_domain, time_us, loc, has_time_us, independence_known,
             independent, reserved,
         }
+        moq_loc_ext_t { struct_size, present, codec_string }
     };
     #[cfg(feature = "player")]
     player_side(&mut v);
@@ -270,6 +271,10 @@ fn rust_side() -> BTreeMap<String, Entry> {
             sys::MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC as usize,
         ),
         (
+            "MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC",
+            sys::MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC as usize,
+        ),
+        (
             "MOQ_ENDPOINT_URI_LEGACY",
             sys::MOQ_ENDPOINT_URI_LEGACY as usize,
         ),
@@ -278,6 +283,7 @@ fn rust_side() -> BTreeMap<String, Entry> {
             sys::MOQ_ENDPOINT_URI_STANDARD as usize,
         ),
         ("MOQ_LOC_METADATA_V0_SIZE", sys::MOQ_LOC_METADATA_V0_SIZE),
+        ("MOQ_LOC_EXT_V0_SIZE", sys::MOQ_LOC_EXT_V0_SIZE),
         ("MOQ_MSF_MPEG2TS_V0_SIZE", sys::MOQ_MSF_MPEG2TS_V0_SIZE),
         (
             "MOQ_LOCATION_FILTER_CFG_V0_SIZE",
@@ -311,6 +317,14 @@ fn rust_side() -> BTreeMap<String, Entry> {
         (
             "MOQ_LOC_METADATA_PRESENT_MASK",
             sys::MOQ_LOC_METADATA_PRESENT_MASK as usize,
+        ),
+        (
+            "MOQ_LOC_EXT_HAS_CODEC_STRING",
+            sys::MOQ_LOC_EXT_HAS_CODEC_STRING as usize,
+        ),
+        (
+            "MOQ_LOC_EXT_PRESENT_MASK",
+            sys::MOQ_LOC_EXT_PRESENT_MASK as usize,
         ),
     ] {
         v.insert(name.into(), Entry::Value(value));

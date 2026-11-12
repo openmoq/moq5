@@ -240,17 +240,22 @@ typedef struct moq_playback_track_cfg {
 
     /* The negotiated MoQ transport draft, a moq_version_t value: 16, 18 or
      * 22. It selects the LOC companion and its property codec: LOC-01 on
-     * drafts 16 and 18, LOC-04 on draft 22. A caller whose struct_size does
+     * drafts 16 and 18, LOC-04 on draft 22 unless loc_profile names LOC-05.
+     * A caller whose struct_size does
      * not cover it gets draft 16. A covered value must be one of the three;
      * zero is refused rather than read as draft 16. */
     uint32_t                   transport_version;
 
-    /* Draft 22 only: the track's LOC-04 properties, as carried in the
-     * catalog or the track's request parameters. Borrowed for the call and
-     * copied. An object's own LOC fields win; only an absent timescale or
-     * video/audio configuration is inherited from here. Counts against
-     * max_track_config_bytes together with codec and init_data. Must be
-     * empty on drafts 16 and 18. */
+    /* Draft 22 only: the track's LOC properties (LOC-04, or LOC-05 when
+     * loc_profile names it), as carried in the catalog or the track's request
+     * parameters. Borrowed for the call and copied. An object's own LOC
+     * fields win; only an absent timescale, video/audio configuration and,
+     * on LOC-05, Codec String are inherited from here. On LOC-05 an object
+     * that names its own codec inherits the configuration only when that
+     * codec is the track's: the Codec String here, else `codec` (see
+     * moq_media_object_parse_sized). Counts against max_track_config_bytes
+     * together with codec and init_data. Must be empty on drafts 16 and
+     * 18. */
     moq_bytes_t                track_properties;
 
     /* Appended after track_properties. What the track does when it gives
@@ -258,6 +263,21 @@ typedef struct moq_playback_track_cfg {
      * struct_size does not cover it gets DISCONTINUITY; a covered value
      * must be one of the two. */
     moq_playback_gap_policy_t  gap_policy;
+
+    /* Appended past gap_policy and its tail padding on every target. The LOC
+     * revision (a moq_loc_profile_t value) push_object parses this track's
+     * properties and objects with. 0, and a caller whose struct_size does
+     * not cover it, take the draft's own: LOC-01 on drafts 16 and 18,
+     * LOC-04 on draft 22. MOQ_LOC_PROFILE_05 (draft 22 only) also reads the
+     * Codec String; any other value, or a revision of another draft, is
+     * MOQ_ERR_INVAL. push_parsed takes the revision the record was parsed
+     * with: its codec_string block, when covered. */
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    uint32_t                   loc_profile;
 } moq_playback_track_cfg_t;
 
 /* Frozen v0 floor: struct_size through is_live. */
@@ -593,22 +613,37 @@ MOQ_API moq_result_t moq_playback_remove_track(
  *    tick refused for queue capacity starts nothing). From then on, objects
  *    still buffered below the cursor are dropped STALE, one event each.
  *
- * Decoder configuration: on draft 22 the object's effective LOC-04 Video
+ * Decoder configuration: on draft 22 the object's effective LOC Video
  * Config (video track) or Audio Config (audio track), as the parser
- * resolves it from the object and the track properties, is copied and kept
- * with the object. When the object is released, a CONFIGURE carrying it
- * precedes the object's decode if the decoder is unconfigured or the bytes
- * differ from the configuration last emitted. A present but empty
- * configuration is a change to an empty one (CONFIGURE with no config
- * bytes); an absent one changes nothing. Without any, the first CONFIGURE
- * carries the catalog configuration (init_data or the CMAF init's codec
- * configuration). Drafts 16 and 18 carry no configuration the parser
- * reports. A multi-sample CMAF object's sample table is copied too.
+ * resolves it from the object, the track properties and the catalog codec,
+ * is copied and kept
+ * with the object, and on LOC-05 so is its effective Codec String unless it
+ * is byte-equal to the catalog codec. Each object decodes under a codec and
+ * a configuration:
+ *   - the codec is its own effective Codec String, else the catalog codec,
+ *     never an earlier object's;
+ *   - the configuration is its own effective LOC configuration when present
+ *     (an empty one included); else the configuration of the last released
+ *     unit, while that unit's codec is byte-equal to this object's; else the
+ *     catalog configuration (init_data or the CMAF init's codec
+ *     configuration) when this object's codec is the catalog codec; else
+ *     none. A configuration is never assumed to belong to another codec, and
+ *     no missing bytes are made up: whether a codec can decode without them
+ *     is the consumer's decision.
+ * When the object is released, a CONFIGURE carrying that pair precedes the
+ * object's decode if the decoder is unconfigured or either half differs, by
+ * exact bytes, from the pair last emitted; a codec change alone is a change.
+ * A CONFIGURE with no config bytes is how an empty or absent configuration
+ * is carried. Without any LOC Codec String every object decodes under the
+ * catalog codec, so an absent configuration changes nothing. Drafts 16 and 18 carry no
+ * configuration the parser reports. A multi-sample CMAF object's sample
+ * table is copied too.
  *
  * Results: MOQ_OK when the object was buffered, absorbed or dropped with
  * its event; MOQ_ERR_LIMIT when what it would keep (payload, sample
- * table, configuration copy) is larger than the whole max_buffered_bytes
- * budget, or its configuration is larger than max_track_config_bytes, so
+ * table, configuration and codec copies) is larger than the whole
+ * max_buffered_bytes budget, or its configuration or Codec String is larger
+ * than max_track_config_bytes, so
  * it can never be admitted (nothing is retained or reported, the cursor
  * does not move, and the caller must not retry it). MOQ_ERR_LIMIT also
  * when no object is buffered and the object does not fit beside the
@@ -641,7 +676,9 @@ MOQ_API moq_result_t moq_playback_push_object(
  * status), when its packaging is not the track's, when its status
  * contradicts `payload`, when a RAW record's payload span is not exactly
  * `payload`'s bytes, or when a CMAF record has no samples, a media range
- * outside `payload`, or a timing context other than the track's (below).
+ * outside `payload`, or a timing context other than the track's (below),
+ * or when a covered codec_string block reports MOQ_LOC_EXT_HAS_CODEC_STRING
+ * with an empty or NULL span.
  * A CMAF record with more samples than max_samples_per_object is dropped
  * UNSUPPORTED_MULTI_SAMPLE, and one of several chunks
  * UNSUPPORTED_MULTI_CHUNK, as push_object does. Every check on the record
@@ -658,11 +695,15 @@ MOQ_API moq_result_t moq_playback_push_object(
  *
  * Ownership: on admission the engine takes one ref on `payload`, copies
  * the record's scalars, and keeps owned copies of the multi-sample CMAF
- * sample table with its base tick and of a draft-22 effective decoder
- * configuration (see push_object). The byte charge is all of it. Release
- * reads only those copies, so the caller's record, sample array and
- * property bytes may go away as soon as the call returns. On every other
- * result nothing is retained and no ref changes.
+ * sample table with its base tick, of a draft-22 effective decoder
+ * configuration and, on LOC-05, of an effective Codec String that is not
+ * byte-equal to the catalog codec (see push_object). The byte charge is all
+ * of it. The record's configuration is taken as parsed: parse with the
+ * track's catalog codec in moq_media_object_parse_cfg_t.catalog_codec, as
+ * push_object does, so that an object naming the catalog codec keeps the
+ * track's configuration. Release reads only those copies, so the caller's
+ * record, sample array and property bytes may go away as soon as the call
+ * returns. On every other result nothing is retained and no ref changes.
  */
 MOQ_API moq_result_t moq_playback_push_parsed(
     moq_playback_t *pb,

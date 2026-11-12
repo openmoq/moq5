@@ -86,7 +86,10 @@ ORIGIN_ASSERT(offsetof(moq_media_object_t, delivery_origin) ==
     sizeof(origin_previous_object_t), "no previous allocation padding reuse");
 ORIGIN_ASSERT(offsetof(moq_media_object_t, initiating_request_id) ==
     offsetof(origin_expected_object_t, initiating_request_id), "initiator offset");
-ORIGIN_ASSERT(sizeof(moq_media_object_t) == sizeof(origin_expected_object_t), "full output extent");
+/* The extent through initiating_request_id is complete: the LOC-05 block
+ * starts after it. */
+ORIGIN_ASSERT(offsetof(moq_media_object_t, loc_ext_present) ==
+    sizeof(origin_expected_object_t), "output extent through initiating_request_id");
 #endif
 
 #ifdef MOQ_RECEIVER_ORIGIN_LAYOUT_ONLY
@@ -413,11 +416,14 @@ static bool origin_send_live(origin_fixture_t *f)
     return true;
 }
 
-static bool origin_output_valid(const origin_expected_object_t *out, bool cmaf,
-                                uint32_t origin, uint64_t initiator)
+/* `stamp` is the struct_size the caller's size yields: the size through
+ * initiating_request_id for that exact caller, the current size for any
+ * larger one. */
+static bool origin_output_valid(const origin_expected_object_t *out, size_t stamp,
+                                bool cmaf, uint32_t origin, uint64_t initiator)
 {
     const loss_report_media_object_t *base = &out->previous.base;
-    ORIGIN_REQUIRE(base->struct_size == sizeof(*out));
+    ORIGIN_REQUIRE(base->struct_size == stamp);
     ORIGIN_REQUIRE(out->delivery_origin == origin && out->initiating_request_id == initiator);
     ORIGIN_REQUIRE(base->group_id == origin_group && base->subgroup_id == origin_subgroup &&
         base->object_id == origin_object && base->publisher_priority == 213 &&
@@ -441,10 +447,23 @@ static bool origin_output_valid(const origin_expected_object_t *out, bool cmaf,
     return true;
 }
 
+/* The prefix through initiating_request_id of a held current record, copied
+ * for validation. The copy only borrows the record's resources and is never
+ * cleaned up. */
+static origin_expected_object_t origin_prefix(const moq_media_object_t *held)
+{
+    origin_expected_object_t prefix;
+    memcpy(&prefix, held, sizeof(prefix));
+    return prefix;
+}
+
 static void origin_wire_overlap(bool cmaf)
 {
     origin_fixture_t f;
-    origin_expected_object_t held[3] = {0};
+    /* Full current records: a caller sized through initiating_request_id fills
+     * that extent of one, and a larger caller fills all of it. */
+    moq_media_object_t held[3] = {0};
+    size_t stamp[3] = {0};
     ORIGIN_NEED(origin_wire_start(&f, cmaf));
     ORIGIN_NEED(origin_send_fill(&f, 0));
     ORIGIN_NEED(origin_send_live(&f));
@@ -474,29 +493,38 @@ static void origin_wire_overlap(bool cmaf)
             f.receiver->obj_sizes_total == bytes && f.receiver->obj_budget_total == budget);
         ORIGIN_NEED(moq_rcbuf_refcount(head) == refs);
     }
+    /* Objects 0 and 2 go to callers sized exactly through
+     * initiating_request_id; object 1 to a caller larger than the current
+     * record. Nothing past each stamp is written. */
     for (unsigned i = 0; i < 3; i++) {
-        struct { origin_expected_object_t object; uint8_t tail[17]; } future;
+        struct { moq_media_object_t object; uint8_t tail[17]; } future;
         memset(&future, 0xa5, sizeof(future));
-        size_t size = i == 1 ? sizeof(future) : sizeof(future.object);
-        ORIGIN_NEED(moq_media_receiver_poll_object(f.receiver, (moq_media_object_t *)&future, size) == MOQ_OK);
+        size_t size = i == 1 ? sizeof(future) : sizeof(origin_expected_object_t);
+        stamp[i] = i == 1 ? sizeof(future.object) : sizeof(origin_expected_object_t);
+        ORIGIN_NEED(moq_media_receiver_poll_object(f.receiver, &future.object, size) == MOQ_OK);
         held[i] = future.object;
-        for (size_t byte = sizeof(future.object); byte < sizeof(future); byte++)
+        for (size_t byte = stamp[i]; byte < sizeof(future); byte++)
             ORIGIN_NEED(((const uint8_t *)&future)[byte] == 0xa5);
-        ORIGIN_NEED(origin_output_valid(&held[i], cmaf, i == 0 ? EXPECTED_LIVE : EXPECTED_FILL,
-            i == 2 ? f.initiator[1] : 0));
+        origin_expected_object_t prefix = origin_prefix(&held[i]);
+        ORIGIN_NEED(origin_output_valid(&prefix, stamp[i], cmaf,
+            i == 0 ? EXPECTED_LIVE : EXPECTED_FILL, i == 2 ? f.initiator[1] : 0));
     }
-    ORIGIN_NEED(held[0].previous.track_properties_ref != held[1].previous.track_properties_ref &&
-        held[1].previous.track_properties_ref != held[2].previous.track_properties_ref &&
-        held[0].previous.track_properties_ref != held[2].previous.track_properties_ref);
+    /* The larger caller's LOC-05 block: no Codec String on this track. */
+    ORIGIN_NEED(held[1].loc_ext_present == 0 && held[1].codec_string.data == NULL);
+    ORIGIN_NEED(held[0].track_properties_ref != held[1].track_properties_ref &&
+        held[1].track_properties_ref != held[2].track_properties_ref &&
+        held[0].track_properties_ref != held[2].track_properties_ref);
     ORIGIN_NEED(f.receiver->obj_sizes_total == 0 && f.receiver->obj_budget_total == 0);
     origin_destroy_sources(&f);
-    for (unsigned i = 0; i < 3; i++)
-        ORIGIN_NEED(origin_output_valid(&held[i], cmaf, i == 0 ? EXPECTED_LIVE : EXPECTED_FILL,
-            i == 2 ? 4 : 0));
+    for (unsigned i = 0; i < 3; i++) {
+        origin_expected_object_t prefix = origin_prefix(&held[i]);
+        ORIGIN_NEED(origin_output_valid(&prefix, stamp[i], cmaf,
+            i == 0 ? EXPECTED_LIVE : EXPECTED_FILL, i == 2 ? 4 : 0));
+    }
 done:
     for (unsigned i = 0; i < 3; i++) {
-        moq_media_object_cleanup((moq_media_object_t *)&held[i]);
-        moq_media_object_cleanup((moq_media_object_t *)&held[i]);
+        moq_media_object_cleanup(&held[i]);
+        moq_media_object_cleanup(&held[i]);
     }
     origin_finish(&f);
 }

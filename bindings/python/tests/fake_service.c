@@ -2239,6 +2239,9 @@ static int fixture_metadata(PyObject *dict, moq_media_object_t *o)
     }
     if (fixture_config_span(d, "video_config", o, &l->video_config, MOQ_LOC_METADATA_HAS_VIDEO_CONFIG) < 0 ||
         fixture_config_span(d, "audio_config", o, &l->audio_config, MOQ_LOC_METADATA_HAS_AUDIO_CONFIG) < 0) return -1;
+    /* The LOC-05 Codec String, a span of the same backings. */
+    if (fixture_config_span(d, "codec_string", o, &o->codec_string, 0) < 0) return -1;
+    if (field(d, "codec_string")) o->loc_ext_present |= MOQ_LOC_EXT_HAS_CODEC_STRING;
     return 0;
 }
 
@@ -3151,6 +3154,10 @@ static text_t wr_payload, wr_properties;
 static size_t wr_payload_len, wr_properties_len;   /* DECLARED lengths */
 static uint32_t wr_payload_refs, wr_properties_refs;   /* at entry */
 static bool wr_metadata_null, wr_video_config_null, wr_audio_config_null;
+/* The typed LOC-05 Codec String the last write carried, copied. */
+static bool wr_codec_present;
+static uint8_t wr_codec[96];
+static size_t wr_codec_len;
 static moq_media_metadata_t wr_metadata;
 static text_t wr_video_config, wr_audio_config;
 static bool wr_oracle_limit;
@@ -3524,6 +3531,15 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
     if (wr_block_armed) wr_park();
     /* Read borrowed metadata AFTER the barrier, while the call still owns it. */
     wr_take_metadata(obj->metadata);
+    wr_codec_present = false;
+    wr_codec_len = 0;
+    if (obj->struct_size >= offsetof(moq_media_send_object_t, loc_ext) + sizeof(obj->loc_ext) &&
+        obj->loc_ext && (obj->loc_ext->present & MOQ_LOC_EXT_HAS_CODEC_STRING)) {
+        wr_codec_present = true;
+        wr_codec_len = obj->loc_ext->codec_string.len < sizeof(wr_codec)
+            ? obj->loc_ext->codec_string.len : sizeof(wr_codec);
+        if (wr_codec_len) memcpy(wr_codec, obj->loc_ext->codec_string.data, wr_codec_len);
+    }
 
     if (wr_result != MOQ_OK) {
         moq_result_t scripted = wr_result;
@@ -3609,9 +3625,13 @@ PyObject *test_write_object(PyObject *self, PyObject *args)
     if (!wr_seen) { pthread_mutex_unlock(&mutex); Py_RETURN_NONE; }
     PyObject *metadata = wr_metadata_image();
     if (!metadata) { pthread_mutex_unlock(&mutex); return NULL; }
+    PyObject *codec = wr_codec_present
+        ? PyBytes_FromStringAndSize((const char *)wr_codec, (Py_ssize_t)wr_codec_len)
+        : Py_NewRef(Py_None);
+    if (!codec) { Py_DECREF(metadata); pthread_mutex_unlock(&mutex); return NULL; }
     PyObject *r = Py_BuildValue(
         "{s:y#,s:n,s:y#,s:n,s:O,s:O,s:O,s:n,s:n,s:O,s:O,s:O,s:K,s:K,s:O,s:K,"
-        "s:O,s:i,s:I,s:I,s:I,s:O,s:O,s:z,s:O}",
+        "s:O,s:i,s:I,s:I,s:I,s:O,s:O,s:z,s:O,s:O}",
         "payload", (const char *)wr_payload.data, (Py_ssize_t)wr_payload.len,
         "payload_declared_length", (Py_ssize_t)wr_payload_len,
         "properties", (const char *)wr_properties.data,
@@ -3637,8 +3657,10 @@ PyObject *test_write_object(PyObject *self, PyObject *args)
         "full_size", wr_full_size ? Py_True : Py_False,
         "oracle_limit", wr_oracle_limit ? Py_True : Py_False,
         "oracle_limit_reason", wr_oracle_limit_reason,
-        "metadata", metadata);
+        "metadata", metadata,
+        "codec_string", codec);
     Py_DECREF(metadata);
+    Py_DECREF(codec);
     pthread_mutex_unlock(&mutex);
     return r;
 }

@@ -786,6 +786,47 @@ fn add_track_maps_draft22_track_properties() {
 }
 
 #[test]
+fn write_carries_a_codec_string() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let sender = sender(&s, &endpoint);
+    let track = sender
+        .add_track(&video())
+        .expect("the provider accepts the track");
+    s.take_log();
+    let mut object = SendObject::new(counted_buffer());
+    object.codec_string = Some("avc1.640028".to_string());
+    sender
+        .write(track, object)
+        .expect("the provider accepts the write");
+    let written = fake::line(&s.take_log(), "write ");
+    assert_eq!(fake::field(&written, "codec_string"), "avc1.640028");
+    sender
+        .write(track, SendObject::new(counted_buffer()))
+        .expect("the provider accepts the write");
+    let written = fake::line(&s.take_log(), "write ");
+    assert_eq!(fake::field(&written, "codec_string"), "none");
+}
+
+#[test]
+fn add_track_states_the_catalog_codec_on_request() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let sender = sender(&s, &endpoint);
+    s.take_log();
+    sender
+        .add_track(&video())
+        .expect("the provider accepts the track");
+    let added = fake::line(&s.take_log(), "add_track ");
+    assert_eq!(fake::field(&added, "track_codec_string"), "none");
+    sender
+        .add_track(&video().codec_string_property(true))
+        .expect("the provider accepts the track");
+    let added = fake::line(&s.take_log(), "add_track ");
+    assert_eq!(fake::field(&added, "track_codec_string"), "avc1.42e01e");
+}
+
+#[test]
 fn write_carries_explicit_metadata() {
     let s = fake::suite();
     let endpoint = connect(&s);

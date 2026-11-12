@@ -11,6 +11,10 @@ target_include_directories(moq-media-object
 )
 
 target_link_libraries(moq-media-object PUBLIC moq::core moq::loc moq::cmaf)
+# The Codec String acceptance rule is shared header-only with moq::loc, so the
+# parser validates a caller's track record exactly as the LOC codec does.
+target_include_directories(moq-media-object PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../loc/src)
 # The mpeg2ts packagings are parsed only when moq::mpeg2ts is in the build.
 # Linked privately: no public header of this target includes <moq/mpeg2ts.h>.
 if(TARGET moq::mpeg2ts)
@@ -67,7 +71,7 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME media_object_mpeg2ts COMMAND test_media_object_mpeg2ts)
 
     foreach(test IN ITEMS media_metadata media_old_client media_metadata_layout
-                          media_parsed_init)
+                          media_parsed_init media_loc05)
         add_executable(test_${test} tests/test_${test}.c)
         target_link_libraries(test_${test} PRIVATE moq::media-object)
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")

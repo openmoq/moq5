@@ -5,6 +5,7 @@
 #include <moq/rcbuf.h>
 #include <stddef.h>
 #include <string.h>
+#include "loc_codec_string.h"
 #ifdef MOQ_MEDIA_OBJECT_HAVE_MPEG2TS
 #include <moq/mpeg2ts.h>
 #endif
@@ -24,6 +25,17 @@ _Static_assert(MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE == 8,
 _Static_assert(MOQ_MEDIA_PARSED_OBJECT_V0_SIZE ==
                    offsetof(moq_media_parsed_object_t, metadata),
                "parsed output floor must include original tail padding");
+_Static_assert(offsetof(moq_media_parsed_object_t, loc_ext_present) ==
+                   MOQ_MEDIA_PARSED_OBJECT_METADATA_SIZE,
+               "the LOC-05 block starts at the complete sizeof through metadata");
+_Static_assert(offsetof(moq_media_object_parse_cfg_t, track_loc_ext) >=
+                   offsetof(moq_media_object_parse_cfg_t, mpeg2ts_packet_size) +
+                   sizeof(uint32_t),
+               "track_loc_ext follows mpeg2ts_packet_size");
+_Static_assert(offsetof(moq_media_object_parse_cfg_t, catalog_codec) >=
+                   offsetof(moq_media_object_parse_cfg_t, track_loc_ext) +
+                   sizeof(const moq_loc_ext_t *),
+               "catalog_codec follows track_loc_ext");
 
 /*
  * Which transport draft's integer codec this track's LOC properties are
@@ -148,18 +160,58 @@ static moq_result_t media_track_metadata_validate(const moq_loc_metadata_t *trac
     return MOQ_OK;
 }
 
+/* A caller-supplied track extension record: complete, known bits, and a
+ * present Codec String only on LOC05, where it must be usable. */
+static moq_result_t media_track_ext_validate(const moq_loc_ext_t *track,
+                                             bool loc05)
+{
+    if (!track) return MOQ_OK;
+    if (track->struct_size < MOQ_LOC_EXT_V0_SIZE ||
+        (track->present & ~MOQ_LOC_EXT_PRESENT_MASK)) return MOQ_ERR_INVAL;
+    if (!(track->present & MOQ_LOC_EXT_HAS_CODEC_STRING)) return MOQ_OK;
+    if (!loc05) return MOQ_ERR_UNSUPPORTED;
+    if (track->codec_string.len > 0xFFFFu ||
+        !moq_loc_internal_codec_string_ok(track->codec_string.data,
+                                          track->codec_string.len))
+        return MOQ_ERR_INVAL;
+    return MOQ_OK;
+}
+
 static moq_result_t media_metadata_parse(moq_version_t version,
     moq_loc_profile_t profile, moq_bytes_t properties,
-    const moq_loc_metadata_t *track,
-    moq_media_metadata_t *out)
+    const moq_loc_metadata_t *track, const moq_loc_ext_t *track_ext,
+    moq_bytes_t catalog_codec,
+    moq_media_metadata_t *out, moq_loc_ext_t *ext_out)
 {
-    moq_result_t rc = moq_loc_parse_metadata(version, profile, properties,
-                                             &out->loc, sizeof(out->loc));
+    moq_result_t rc = moq_loc_parse_metadata_ex(version, profile, properties,
+                                                &out->loc, sizeof(out->loc),
+                                                ext_out, sizeof(*ext_out));
     if (rc != MOQ_OK) return rc;
+    /* A Codec String and a Video/Audio Config are the two halves of one
+     * decoder configuration (draft-ietf-moq-loc-05 2.3.1.3, 2.3.2.1,
+     * 2.3.3.1). The track's configuration belongs to the track's codec: its
+     * own Codec String, else the catalog's. An object that names its own
+     * codec takes the track's configuration only when that codec is byte-equal
+     * to the track's; otherwise, or when the track's codec is unknown here,
+     * the configuration would be another codec's, so none is inherited. */
+    uint32_t inheritable = MOQ_LOC_METADATA_HAS_TIMESCALE |
+        MOQ_LOC_METADATA_HAS_VIDEO_CONFIG | MOQ_LOC_METADATA_HAS_AUDIO_CONFIG;
+    if (ext_out->present & MOQ_LOC_EXT_HAS_CODEC_STRING) {
+        moq_bytes_t track_codec = catalog_codec;
+        if (track_ext && (track_ext->present & MOQ_LOC_EXT_HAS_CODEC_STRING))
+            track_codec = track_ext->codec_string;
+        moq_bytes_t own = ext_out->codec_string;
+        if (track_codec.len == 0 || own.len != track_codec.len ||
+            memcmp(own.data, track_codec.data, own.len) != 0)
+            inheritable = MOQ_LOC_METADATA_HAS_TIMESCALE;
+    }
+    if (track_ext && !(ext_out->present & MOQ_LOC_EXT_HAS_CODEC_STRING) &&
+        (track_ext->present & MOQ_LOC_EXT_HAS_CODEC_STRING)) {
+        ext_out->codec_string = track_ext->codec_string;
+        ext_out->present |= MOQ_LOC_EXT_HAS_CODEC_STRING;
+    }
     if (track) {
-        uint32_t inherited = track->present & ~out->loc.present &
-            (MOQ_LOC_METADATA_HAS_TIMESCALE | MOQ_LOC_METADATA_HAS_VIDEO_CONFIG |
-             MOQ_LOC_METADATA_HAS_AUDIO_CONFIG);
+        uint32_t inherited = track->present & ~out->loc.present & inheritable;
         if (inherited & MOQ_LOC_METADATA_HAS_TIMESCALE)
             out->loc.timescale = track->timescale;
         if (inherited & MOQ_LOC_METADATA_HAS_VIDEO_CONFIG)
@@ -179,8 +231,10 @@ static moq_result_t media_metadata_parse(moq_version_t version,
             out->time_us = out->loc.timestamp;
         }
     }
+    bool loc04_family = profile == MOQ_LOC_PROFILE_04 ||
+                        profile == MOQ_LOC_PROFILE_05;
     if ((out->loc.present & MOQ_LOC_METADATA_HAS_MARKING) &&
-        out->loc.marking_len <= (profile == MOQ_LOC_PROFILE_04 ? 3 : 2)) {
+        out->loc.marking_len <= (loc04_family ? 3 : 2)) {
         out->independence_known = 1;
         out->independent = (out->loc.marking[0] & 0x20u) != 0;
     }
@@ -305,10 +359,15 @@ static moq_result_t media_object_parse_into(
     size_t sample_cap,
     moq_media_parsed_object_t *out,
     moq_media_drop_reason_t *drop_reason,
-    bool metadata,
+    moq_loc_profile_t metadata_profile,
     const moq_loc_metadata_t *track_metadata,
+    const moq_loc_ext_t *track_ext,
+    moq_bytes_t catalog_codec,
     uint32_t packet_size)
 {
+    /* The sized parser names the LOC revision its companion selects; the
+     * legacy unsized parser passes 0 and has no metadata output. */
+    bool metadata = metadata_profile != 0;
     if (drop_reason) *drop_reason = 0;
     if (!track || !in || !out) return MOQ_ERR_INVAL;
 
@@ -372,13 +431,16 @@ static moq_result_t media_object_parse_into(
         }
 
         if (metadata) {
-            moq_loc_profile_t profile = transport_version == MOQ_VERSION_DRAFT_22 ?
-                MOQ_LOC_PROFILE_04 : MOQ_LOC_PROFILE_01;
+            moq_loc_ext_t ext;
+            moq_loc_ext_init_sized(&ext, sizeof(ext));
             moq_result_t lr = media_metadata_parse(transport_version,
-                profile, props, track_metadata, &out->metadata);
+                metadata_profile, props, track_metadata, track_ext,
+                catalog_codec, &out->metadata, &ext);
             if (lr == MOQ_ERR_PROTO && drop_reason)
                 *drop_reason = MOQ_MEDIA_DROP_MALFORMED_LOC;
             if (lr != MOQ_OK) return lr;
+            out->loc_ext_present = ext.present;
+            out->codec_string = ext.codec_string;
             if (out->metadata.time_domain == MOQ_MEDIA_TIME_DOMAIN_UNIX_US &&
                 out->metadata.has_time_us) {
                 out->has_capture_time = true;
@@ -558,7 +620,34 @@ moq_result_t moq_media_object_parse(
     moq_media_drop_reason_t *drop_reason)
 {
     return media_object_parse_into(track, in, samples, sample_cap, out,
-                                   drop_reason, false, NULL, 0);
+                                   drop_reason, (moq_loc_profile_t)0, NULL,
+                                   NULL, (moq_bytes_t){ NULL, 0 }, 0);
+}
+
+/* Read a caller's parse config into a full current struct by byte offset
+ * (the caller's object may be an older, smaller struct, never read through
+ * this type): the v0 prefix, then each appended field only when struct_size
+ * covers all of it. Fields left out keep their zero default (NULL, 0). The
+ * caller has checked struct_size >= MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE. */
+static void media_parse_cfg_read(const moq_media_object_parse_cfg_t *in,
+                                 moq_media_object_parse_cfg_t *out)
+{
+    const uint8_t *src = (const uint8_t *)in;
+    uint32_t size;
+    memcpy(&size, src, sizeof(size));
+    memset(out, 0, sizeof(*out));
+    memcpy(out, src, MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE);
+#define PARSE_CFG_COPY(f) do { \
+    const size_t offset = offsetof(moq_media_object_parse_cfg_t, f); \
+    if (size >= offset + sizeof(out->f)) \
+        memcpy(&out->f, src + offset, sizeof(out->f)); \
+} while (0)
+    PARSE_CFG_COPY(track_loc_metadata);
+    PARSE_CFG_COPY(mpeg2ts_packet_size);
+    PARSE_CFG_COPY(track_loc_ext);
+    PARSE_CFG_COPY(catalog_codec);
+#undef PARSE_CFG_COPY
+    out->struct_size = (uint32_t)sizeof(*out);
 }
 
 moq_result_t moq_media_object_parse_sized(
@@ -573,38 +662,49 @@ moq_result_t moq_media_object_parse_sized(
 {
     if (!track || !in || !out || track->struct_size < TRACK_INFO_MIN_SIZE ||
         in->struct_size < OBJECT_INPUT_MIN_SIZE) return MOQ_ERR_INVAL;
-    if (cfg && cfg->struct_size < MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE)
-        return MOQ_ERR_INVAL;
-    moq_media_companion_profile_t companion_profile = cfg ? cfg->companion_profile :
-        MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+    /* Every config read below uses the full local copy; no config is the
+     * all-default one (legacy companion, nothing appended). */
+    moq_media_object_parse_cfg_t c = MOQ_MEDIA_OBJECT_PARSE_CFG_INIT;
+    if (cfg) {
+        uint32_t cfg_size;
+        memcpy(&cfg_size, cfg, sizeof(cfg_size));
+        if (cfg_size < MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE) return MOQ_ERR_INVAL;
+        media_parse_cfg_read(cfg, &c);
+    }
+    moq_media_companion_profile_t companion_profile = c.companion_profile;
     moq_version_t version;
     if (!track_transport_version(track, &version) ||
         (companion_profile != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
-         companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC))
+         companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC &&
+         companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC))
         return MOQ_ERR_INVAL;
-    bool d22 = companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+    bool loc05 = companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
+    bool d22 = loc05 ||
+               companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
     if (d22 != (version == MOQ_VERSION_DRAFT_22)) return MOQ_ERR_UNSUPPORTED;
     if (d22 && out_size < MOQ_MEDIA_PARSED_OBJECT_METADATA_SIZE)
         return MOQ_ERR_UNSUPPORTED;
+    if (loc05 && out_size < MOQ_MEDIA_PARSED_OBJECT_LOC_EXT_SIZE)
+        return MOQ_ERR_UNSUPPORTED;
     if (out_size < MOQ_MEDIA_PARSED_OBJECT_V0_SIZE) return MOQ_ERR_INVAL;
-#define PARSE_CFG_HAS(field) \
-    (cfg && cfg->struct_size >= offsetof(moq_media_object_parse_cfg_t, field) + \
-                               sizeof(cfg->field))
-    const moq_loc_metadata_t *track_metadata =
-        PARSE_CFG_HAS(track_loc_metadata) ? cfg->track_loc_metadata : NULL;
-    uint32_t packet_size = PARSE_CFG_HAS(mpeg2ts_packet_size) ?
-        cfg->mpeg2ts_packet_size : 0;
-#undef PARSE_CFG_HAS
+    moq_loc_profile_t profile = loc05 ? MOQ_LOC_PROFILE_05 :
+        d22 ? MOQ_LOC_PROFILE_04 : MOQ_LOC_PROFILE_01;
+    const moq_loc_metadata_t *track_metadata = c.track_loc_metadata;
+    uint32_t packet_size = c.mpeg2ts_packet_size;
+    const moq_loc_ext_t *track_ext = c.track_loc_ext;
     moq_result_t rc = media_track_metadata_validate(track_metadata, d22);
     if (rc != MOQ_OK) return rc;
+    rc = media_track_ext_validate(track_ext, loc05);
+    if (rc != MOQ_OK) return rc;
+    if (c.catalog_codec.len > 0 && !c.catalog_codec.data) return MOQ_ERR_INVAL;
     if (track->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS &&
         packet_size != 188 && packet_size != 192)
         return MOQ_ERR_INVAL;
     moq_media_parsed_object_t tmp;
     moq_media_parsed_object_init_sized(&tmp, sizeof(tmp));
     rc = media_object_parse_into(track, in, samples, sample_cap,
-                                 &tmp, drop_reason, true, track_metadata,
-                                 packet_size);
+                                 &tmp, drop_reason, profile, track_metadata,
+                                 track_ext, c.catalog_codec, packet_size);
     if (rc == MOQ_OK || rc == MOQ_ERR_BUFFER) {
         size_t n = out_size < sizeof(tmp) ? out_size : sizeof(tmp);
         tmp.struct_size = (uint32_t)n;

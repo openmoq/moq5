@@ -986,6 +986,12 @@ static void engine_input(const player_track_t *t, const moq_media_object_t *obj,
     if (obj->struct_size >= offsetof(moq_media_object_t, metadata) +
                             sizeof(moq_media_metadata_t))
         po->metadata = obj->metadata;
+    /* The effective LOC-05 Codec String; zero on every other companion. */
+    if (obj->struct_size >= offsetof(moq_media_object_t, codec_string) +
+                            sizeof(moq_bytes_t)) {
+        po->loc_ext_present = obj->loc_ext_present;
+        po->codec_string = obj->codec_string;
+    }
     moq_playback_parsed_input_init(in);
     in->track = t->eng;
     in->group_id = obj->group_id;

@@ -248,27 +248,35 @@ or partial companion tail, and every sized initializer, select it. AUTO
 resolves once, when the facade first observes a draft-16/18/22 session and
 before anything is published or subscribed, to the companion that matches the
 negotiated draft: legacy MSF-01/LOC-01 (Joining FETCH bootstrap) on drafts
-16/18, `MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC` on draft 22. An explicit
-`MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01` or
-`MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC` pins the companion; a known
+16/18, `MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC` on draft 22. An explicit
+`MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01`,
+`MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC` or
+`MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC` pins the companion; a known
 companion/version mismatch is then refused (sender `MOQ_ERR_UNSUPPORTED`,
 receiver-local `FATAL_SETUP_FAILED`), never upgraded. Before resolution an
 AUTO sender numbers Group IDs from the draft-22 wallclock base (renumbered
 from 0 on a legacy resolution), accepts a CMAF track without init data
 (reported `MOQ_ERR_UNSUPPORTED` if draft 22 is then negotiated while it is
 registered), and queues RAW objects with or without a metadata tail. On draft
-22 an AUTO sender generates LOC-04 metadata from the typed timing fields for a
+22 an AUTO sender generates LOC metadata from the typed timing fields for a
 RAW object without that tail: a capture time as an unscaled Timestamp (Unix
-microseconds, LOC-04 §2.3.1.1), otherwise the presentation time as media time
-with Timescale 1000000 (§2.3.1.2). Because a Track Properties Timescale
+microseconds, LOC §2.3.1.1), otherwise the presentation time as media time
+with Timescale 1000000 (§2.3.1.2). These bytes are the same under LOC-04 and
+LOC-05. Because a Track Properties Timescale
 applies to every object without its own, a capture time without a metadata
 tail on such a track (or one whose properties do not parse as LOC-04
 metadata) is `MOQ_ERR_INVAL` whenever the object may go out as draft 22,
 before anything is queued or evicted. The object parser takes only a resolved
 companion. Unknown values are `MOQ_ERR_INVAL`.
 
-The D22 companion combines MSF-01 catalog semantics with transport-22
-fills and LOC-04 metadata. Initial catalog discovery stages the independent
+The D22 companions combine MSF-01 catalog semantics with transport-22
+fills and LOC-04 or LOC-05 metadata. LOC-05 (draft-ietf-moq-loc-05) changes no
+LOC-04 property and adds the Codec String (0x11, Track and Object scope,
+§2.3.1.3); its Key-Value-Pair grammar is draft-22 §8.3's, and pairing it with
+draft 22 claims no draft-23 support. The LOC revision is not negotiated: AUTO
+picks LOC-05 on draft 22, so an AUTO receiver there reports the LOC-05
+companion and refuses a malformed or repeated Codec String that LOC-04 skips
+as unknown. Explicit LOC-04 keeps its behavior. Initial catalog discovery stages the independent
 base and selected deltas until the matching fill completes through the ACK's
 Largest Object; only then is CATALOG_READY published. An empty catalog with
 no ACK Largest and NO_STREAM can await a later live base. A gap, reset or
@@ -290,6 +298,30 @@ D22 RAW sending requires raw metadata, not a capture/PTS reinterpretation;
 AUTO generates it from those fields only when the tail is absent. The D22
 receiver requires RAW time mode; SHARED_EPOCH remains unsupported, and an
 AUTO receiver in that mode has no draft-22 match.
+
+The LOC-05 Codec String travels in the growable `moq_loc_ext_t`
+(`moq_loc_parse_metadata_ex()` / `moq_loc_encode_metadata_ex()`), since the
+embedded `moq_loc_metadata_t` cannot grow. A Codec String must be well-formed
+UTF-8 (RFC 3629) and a usable identifier: not empty, not only ASCII
+whitespace, without U+0000. It is kept as its exact bytes, never normalized
+or trimmed, and no codec list is consulted, so an accepted identifier is not a
+claim that any decoder supports it. A malformed one is a parse drop; encode
+refuses one. The effective value is the object's own, else the track's; it is
+reported in a `codec_string` block appended to the parsed object and to the
+service object, beside the unchanged metadata, and never merged with the
+catalog codec, which the track descriptor keeps. A Codec String and a Video
+or Audio Config are the two halves of one decoder configuration (LOC-05
+2.3.1.3, 2.3.2.1, 2.3.3.1), so an object that names its own codec inherits the
+track's configuration only when that codec is the track's: its Track
+Properties' Codec String, else the catalog codec, which the parser takes as
+`moq_media_object_parse_cfg_t.catalog_codec`. Senders accept typed Codec
+Strings only when nothing can later drop them, and never synthesize one from
+the catalog. Playback configures each object's decoder with its codec (its own
+Codec String, else the catalog codec) and with a configuration declared for
+that codec, never another codec's; the receiver's objects carry the same
+pairing. Secure Objects, Private Properties and
+encrypted payloads are not supported: the whole Object payload is the LOC
+payload, and the companions are public-property profiles.
 
 The sized service object owns its property backing through cleanup, including
 an independent track-property copy, and distinguishes LIVE from FILL plus

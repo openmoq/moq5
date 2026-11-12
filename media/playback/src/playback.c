@@ -63,6 +63,11 @@ _Static_assert(offsetof(moq_playback_cfg_t, max_known_ranges) ==
 _Static_assert(offsetof(moq_playback_track_cfg_t, gap_policy) ==
                offsetof(moq_playback_track_cfg_t, track_properties) +
                sizeof(moq_bytes_t), "gap_policy follows track_properties");
+_Static_assert(offsetof(moq_playback_track_cfg_t, loc_profile) >=
+               ((offsetof(moq_playback_track_cfg_t, gap_policy) +
+                 sizeof(uint32_t) + _Alignof(moq_playback_track_cfg_t) - 1) &
+                ~(size_t)(_Alignof(moq_playback_track_cfg_t) - 1)),
+               "loc_profile starts past the complete gap_policy-era sizeof");
 _Static_assert(sizeof(moq_playback_stream_terminal_t) ==
                MOQ_PLAYBACK_STREAM_TERMINAL_V0_SIZE,
                "stream terminal v0 size");
@@ -151,6 +156,21 @@ typedef struct {
     moq_rcbuf_t               *cur_config;
     bool                       rel_config_set;
     moq_rcbuf_t               *rel_config;
+    /* The codecs that go with them: cur_codec is what the last CONFIGURE
+     * carried; rel_codec the effective codec of the unit that established
+     * rel_config, which an object without its own configuration inherits
+     * only under that same codec. Each is a ref (a registered copy or the
+     * catalog codec), NULL with its _set flag when there is none. */
+    bool                       cur_codec_set;
+    moq_rcbuf_t               *cur_codec;
+    bool                       rel_codec_set;
+    moq_rcbuf_t               *rel_codec;
+    /* The LOC revision of the track's properties (MOQ_LOC_PROFILE_01, _04
+     * or _05), and on LOC-05 its parsed extension, whose Codec String span
+     * borrows track_properties. */
+    uint32_t                   loc_profile;
+    bool                       has_track_ext;
+    moq_loc_ext_t              track_ext;
 
     /* What happens on giving up a missing unit (moq_playback_gap_policy_t). */
     moq_playback_gap_policy_t  gap_policy;
@@ -207,6 +227,7 @@ typedef struct {
     bool         active;
     uint64_t     bytes;          /* payload and sample-table charge */
     moq_rcbuf_t *config;         /* a registered copy, or NULL */
+    moq_rcbuf_t *codec;          /* a registered codec copy, or NULL */
     moq_rcbuf_t *payload;        /* the unit's payload, or NULL */
 } pb_hold_t;
 
@@ -281,6 +302,11 @@ typedef struct {
      * owned copy, or NULL with config_present for a present-but-empty one. */
     bool                    config_present;
     moq_rcbuf_t            *config;
+    /* The object's effective LOC-05 Codec String: an owned registered copy.
+     * Absent when it carries none or one byte-equal to the catalog codec,
+     * which is then the codec it decodes under. */
+    bool                    codec_present;
+    moq_rcbuf_t            *codec;
     /* Bytes charged to max_buffered_bytes: payload, sample table, config. */
     uint64_t                charge;
     /* now_us of the push that admitted it: evidence for the wait on a
@@ -658,18 +684,36 @@ static moq_rcbuf_t *cmd_config(const moq_playback_cmd_t *c)
     return NULL;
 }
 
+/* The codec a CONFIGURE command owns, or NULL. */
+static moq_rcbuf_t *cmd_codec(const moq_playback_cmd_t *c)
+{
+    if (c->kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO)
+        return c->u.configure_video.codec;
+    if (c->kind == MOQ_PLAYBACK_CMD_CONFIGURE_AUDIO)
+        return c->u.configure_audio.codec;
+    return NULL;
+}
+
+/* Whether a buffered object is a holder of copy `b`. */
+static bool obj_holds(const pb_object_t *o, const moq_rcbuf_t *b)
+{
+    return o->config == b || o->codec == b;
+}
+
 /* Free everything a buffered object owns and return its charge. */
 static void free_object_storage(moq_playback_t *pb, pb_object_t *o)
 {
     pb->retained_bytes -= o->charge;
     moq_rcbuf_decref(o->payload);
     moq_rcbuf_t *config = o->config;
+    moq_rcbuf_t *codec = o->codec;
     if (o->samples)
         pb->alloc.free(o->samples, o->sample_count * sizeof(moq_cmaf_sample_t),
                        pb->alloc.ctx);
     memset(o, 0, sizeof(*o));
     pb->obj_count--;
     cfg_unhold(pb, config, false, true);
+    cfg_unhold(pb, codec, false, true);
 }
 
 static void release_track_objects(moq_playback_t *pb,
@@ -686,10 +730,17 @@ static void release_track_config(moq_playback_t *pb, pb_track_t *t)
 {
     if (t->cur_config_set) cfg_unhold(pb, t->cur_config, false, true);
     if (t->rel_config_set) cfg_unhold(pb, t->rel_config, false, true);
+    if (t->cur_codec_set) cfg_unhold(pb, t->cur_codec, false, true);
+    if (t->rel_codec_set) cfg_unhold(pb, t->rel_codec, false, true);
     t->cur_config = NULL;
     t->rel_config = NULL;
     t->cur_config_set = false;
     t->rel_config_set = false;
+    t->cur_codec = NULL;
+    t->rel_codec = NULL;
+    t->cur_codec_set = false;
+    t->rel_codec_set = false;
+    t->has_track_ext = false;
     moq_rcbuf_decref(t->codec);
     moq_rcbuf_decref(t->init_data);
     moq_rcbuf_decref(t->codec_config);
@@ -769,8 +820,8 @@ moq_result_t moq_playback_create(const moq_alloc_t *alloc,
     size_t range_slots = (size_t)c.max_tracks * c.max_known_ranges;
     if (sizeof(pb_range_t) + sizeof(pb_evidence_t) > SIZE_MAX / range_slots)
         return MOQ_ERR_INVAL;
-    /* The copy table: max_buffered_objects + 2 * max_tracks + max_commands
-     * + max_held_commands entries. The count is summed with a check at each
+    /* The copy table: 2 * (max_buffered_objects + 2 * max_tracks +
+     * max_commands + max_held_commands) entries. The count is summed with a check at each
      * step (size_t may be 32 bits), then its bytes. */
     size_t copy_cap = (size_t)c.max_buffered_objects;
     if (2 * (size_t)c.max_tracks > SIZE_MAX - copy_cap) return MOQ_ERR_INVAL;
@@ -779,6 +830,10 @@ moq_result_t moq_playback_create(const moq_alloc_t *alloc,
     copy_cap += (size_t)c.max_commands;
     if ((size_t)c.max_held_commands > SIZE_MAX - copy_cap) return MOQ_ERR_INVAL;
     copy_cap += (size_t)c.max_held_commands;
+    /* Each of those holders keeps at most a configuration and a codec copy,
+     * and a track four slots (decoder and release, of each). */
+    if (copy_cap > SIZE_MAX / 2) return MOQ_ERR_INVAL;
+    copy_cap *= 2;
     if (sizeof(pb_copy_t) > SIZE_MAX / copy_cap) return MOQ_ERR_INVAL;
 
     moq_playback_t *pb = (moq_playback_t *)alloc->alloc(
@@ -912,6 +967,7 @@ void moq_playback_destroy(moq_playback_t *pb)
         pb_hold_t *h = &pb->holds[i];
         if (!h->active) continue;
         if (h->config) moq_rcbuf_decref(h->config);
+        if (h->codec) moq_rcbuf_decref(h->codec);
         if (h->payload) moq_rcbuf_decref(h->payload);
     }
 
@@ -965,6 +1021,7 @@ moq_result_t moq_playback_add_track(moq_playback_t *pb,
     PB_TRACK_TAIL(transport_version);
     PB_TRACK_TAIL(track_properties);
     PB_TRACK_TAIL(gap_policy);
+    PB_TRACK_TAIL(loc_profile);
 #undef PB_TRACK_TAIL
     if (tc.gap_policy != MOQ_PLAYBACK_GAP_DISCONTINUITY &&
         tc.gap_policy != MOQ_PLAYBACK_GAP_CONTINUE)
@@ -978,6 +1035,17 @@ moq_result_t moq_playback_add_track(moq_playback_t *pb,
     if (track_props.len > 0 && !track_props.data) return MOQ_ERR_INVAL;
     if (track_props.len > 0 && version != (uint32_t)MOQ_VERSION_DRAFT_22)
         return MOQ_ERR_INVAL;
+    /* 0 selects the draft's own revision; a named one must belong to it. */
+    uint32_t loc_profile = tc.loc_profile;
+    bool d22 = version == (uint32_t)MOQ_VERSION_DRAFT_22;
+    if (loc_profile == 0)
+        loc_profile = d22 ? (uint32_t)MOQ_LOC_PROFILE_04
+                          : (uint32_t)MOQ_LOC_PROFILE_01;
+    else if (d22 ? loc_profile != (uint32_t)MOQ_LOC_PROFILE_04 &&
+                   loc_profile != (uint32_t)MOQ_LOC_PROFILE_05
+                 : loc_profile != (uint32_t)MOQ_LOC_PROFILE_01)
+        return MOQ_ERR_INVAL;
+    bool loc05 = loc_profile == (uint32_t)MOQ_LOC_PROFILE_05;
 
     if (tc.media_type != MOQ_PLAYBACK_MEDIA_VIDEO &&
         tc.media_type != MOQ_PLAYBACK_MEDIA_AUDIO)
@@ -1010,9 +1078,12 @@ moq_result_t moq_playback_add_track(moq_playback_t *pb,
      * allocated; their parsed form is rebuilt over the owned copy below. */
     moq_loc_metadata_t track_loc;
     moq_loc_metadata_init_sized(&track_loc, sizeof(track_loc));
+    moq_loc_ext_t track_ext;
+    moq_loc_ext_init_sized(&track_ext, sizeof(track_ext));
     if (track_props.len > 0) {
-        moq_result_t lr = moq_loc_parse_metadata(MOQ_VERSION_DRAFT_22,
-            MOQ_LOC_PROFILE_04, track_props, &track_loc, sizeof(track_loc));
+        moq_result_t lr = moq_loc_parse_metadata_ex(MOQ_VERSION_DRAFT_22,
+            (moq_loc_profile_t)loc_profile, track_props, &track_loc,
+            sizeof(track_loc), loc05 ? &track_ext : NULL, sizeof(track_ext));
         if (lr == MOQ_ERR_NOMEM) return lr;
         if (lr != MOQ_OK) return MOQ_ERR_PROTO;
     }
@@ -1086,8 +1157,10 @@ moq_result_t moq_playback_add_track(moq_playback_t *pb,
         if (rc == MOQ_OK) {
             moq_bytes_t owned = { moq_rcbuf_data(props_buf),
                                   moq_rcbuf_len(props_buf) };
-            rc = moq_loc_parse_metadata(MOQ_VERSION_DRAFT_22,
-                MOQ_LOC_PROFILE_04, owned, &track_loc, sizeof(track_loc));
+            rc = moq_loc_parse_metadata_ex(MOQ_VERSION_DRAFT_22,
+                (moq_loc_profile_t)loc_profile, owned, &track_loc,
+                sizeof(track_loc), loc05 ? &track_ext : NULL,
+                sizeof(track_ext));
         }
         if (rc != MOQ_OK) {
             moq_rcbuf_decref(props_buf);
@@ -1126,6 +1199,9 @@ moq_result_t moq_playback_add_track(moq_playback_t *pb,
     slot->track_properties = props_buf;
     slot->has_track_loc = props_buf != NULL;
     if (props_buf) slot->track_loc = track_loc;
+    slot->loc_profile = loc_profile;
+    slot->has_track_ext = props_buf != NULL && loc05;
+    if (slot->has_track_ext) slot->track_ext = track_ext;
     slot->gap_policy = tc.gap_policy;
     slot->ranges = pb->ranges + (size_t)slot_idx * pb->cfg.max_known_ranges;
     slot->evidence = pb->evidence + (size_t)slot_idx * pb->cfg.max_known_ranges;
@@ -1287,8 +1363,14 @@ static moq_result_t parse_track_object(moq_playback_t *pb,
             pb->cfg.max_samples_per_object, parsed, drop_reason);
 
     moq_media_object_parse_cfg_t pcfg = MOQ_MEDIA_OBJECT_PARSE_CFG_INIT;
-    pcfg.companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+    pcfg.companion_profile = t->loc_profile == (uint32_t)MOQ_LOC_PROFILE_05
+        ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC
+        : MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
     if (t->has_track_loc) pcfg.track_loc_metadata = &t->track_loc;
+    if (t->has_track_ext) pcfg.track_loc_ext = &t->track_ext;
+    if (t->codec)
+        pcfg.catalog_codec = (moq_bytes_t){ moq_rcbuf_data(t->codec),
+                                            moq_rcbuf_len(t->codec) };
     moq_result_t pr = moq_media_object_parse_sized(&mti, &moi, &pcfg,
         pb->sample_scratch, pb->cfg.max_samples_per_object,
         parsed, sizeof(*parsed), drop_reason);
@@ -1433,6 +1515,8 @@ typedef struct {
     uint64_t                 base_ticks;
     bool                     config_present;
     moq_bytes_t              config;
+    bool                     codec_present;   /* differs from the catalog */
+    moq_bytes_t              codec;
 } pb_capture_t;
 
 /* Collect what placement must own. A CMAF object's fragment index is read
@@ -1512,6 +1596,21 @@ static moq_result_t admit_capture(moq_playback_t *pb, const pb_track_t *t,
                 return MOQ_ERR_INVAL;
         }
     }
+    /* The effective LOC-05 Codec String (the record's own or its track's).
+     * One byte-equal to the catalog codec needs no copy: the object then
+     * decodes under the catalog codec, which is the same identifier. */
+    if (t->transport_version == (uint32_t)MOQ_VERSION_DRAFT_22 &&
+        parsed_size >= MOQ_MEDIA_PARSED_OBJECT_LOC_EXT_SIZE &&
+        (parsed->loc_ext_present & MOQ_LOC_EXT_HAS_CODEC_STRING)) {
+        moq_bytes_t c = parsed->codec_string;
+        if (c.len == 0 || !c.data) return MOQ_ERR_INVAL;
+        bool catalog = t->codec && moq_rcbuf_len(t->codec) == c.len &&
+                       memcmp(moq_rcbuf_data(t->codec), c.data, c.len) == 0;
+        if (!catalog) {
+            cap->codec_present = true;
+            cap->codec = c;
+        }
+    }
     return MOQ_OK;
 }
 
@@ -1519,7 +1618,7 @@ static moq_result_t admit_capture(moq_playback_t *pb, const pb_track_t *t,
  * sample table and a new configuration copy unless one the track holds is
  * reused. MOQ_ERR_LIMIT when it can never fit (placement's LIMIT). */
 typedef struct {
-    size_t       plen, table_bytes, new_config;
+    size_t       plen, table_bytes, new_config, new_codec;
     moq_rcbuf_t *reuse;
     uint64_t     charge;       /* payload + sample table */
     uint64_t     need;         /* charge + new configuration */
@@ -1536,7 +1635,8 @@ static moq_result_t admission_charge(moq_playback_t *pb, const pb_track_t *t,
      * a charge over the whole byte budget, can never be admitted. */
     size_t plen = in->payload ? moq_rcbuf_len(in->payload) : 0;
     size_t table_bytes = cap->sample_count * sizeof(moq_cmaf_sample_t);
-    if (cap->config.len > pb->cfg.max_track_config_bytes)
+    if (cap->config.len > pb->cfg.max_track_config_bytes ||
+        cap->codec.len > pb->cfg.max_track_config_bytes)
         return MOQ_ERR_LIMIT;
 
     /* A configuration the track already holds, as its decoder or release
@@ -1570,6 +1670,8 @@ static moq_result_t admission_charge(moq_playback_t *pb, const pb_track_t *t,
         }
     }
     size_t new_config = (cap->config_present && !reuse) ? cap->config.len : 0;
+    /* A codec copy is never shared between objects: always a new one. */
+    size_t new_codec = cap->codec_present ? cap->codec.len : 0;
 
     uint64_t charge = (uint64_t)plen;
     if (table_bytes > UINT64_MAX - charge) return MOQ_ERR_LIMIT;
@@ -1577,6 +1679,8 @@ static moq_result_t admission_charge(moq_playback_t *pb, const pb_track_t *t,
     uint64_t need = charge;
     if (new_config > UINT64_MAX - need) return MOQ_ERR_LIMIT;
     need += new_config;
+    if (new_codec > UINT64_MAX - need) return MOQ_ERR_LIMIT;
+    need += new_codec;
     if (need > pb->cfg.max_buffered_bytes)
         return MOQ_ERR_LIMIT;
     /* With nothing buffered, what is retained is configuration the tracks
@@ -1593,6 +1697,7 @@ static moq_result_t admission_charge(moq_playback_t *pb, const pb_track_t *t,
     out->plen = plen;
     out->table_bytes = table_bytes;
     out->new_config = new_config;
+    out->new_codec = new_codec;
     out->reuse = reuse;
     out->charge = charge;
     out->need = need;
@@ -1653,6 +1758,16 @@ static moq_result_t admit_place(moq_playback_t *pb, pb_track_t *t,
         moq_result_t rc = moq_rcbuf_create(&pb->alloc, cap->config.data,
                                            cap->config.len, &config);
         if (rc != MOQ_OK) {
+            if (table) pb->alloc.free(table, table_bytes, pb->alloc.ctx);
+            return rc;
+        }
+    }
+    moq_rcbuf_t *codec = NULL;
+    if (ch.new_codec > 0) {
+        moq_result_t rc = moq_rcbuf_create(&pb->alloc, cap->codec.data,
+                                           cap->codec.len, &codec);
+        if (rc != MOQ_OK) {
+            moq_rcbuf_decref(config);
             if (table) pb->alloc.free(table, table_bytes, pb->alloc.ctx);
             return rc;
         }
@@ -1723,6 +1838,11 @@ static moq_result_t admit_place(moq_playback_t *pb, pb_track_t *t,
     } else if (reuse) {
         cfg_hold(pb, reuse, false);
         oslot->config = reuse;
+    }
+    oslot->codec_present = codec != NULL;
+    if (codec) {
+        oslot->codec = codec;
+        copy_register(pb, codec);
     }
 
     pb->obj_count++;
@@ -1926,7 +2046,7 @@ static bool copy_freed_by(const moq_playback_t *pb, const pb_copy_t *c, unsigned
     uint32_t objects = 0, in_set = 0;
     for (size_t i = 0; i < pb->cfg.max_buffered_objects; i++) {
         const pb_object_t *o = &pb->objects[i];
-        if (!o->occupied || o->config != c->buf) continue;
+        if (!o->occupied || !obj_holds(o, c->buf)) continue;
         objects++;
         if (obj_in_set(pb, o, sets)) in_set++;
     }
@@ -1993,6 +2113,10 @@ static bool fits_after(const moq_playback_t *pb, const pb_track_t *t,
         !config_reuse_survives(pb, t, track, cap, sets)) {
         if (cap->config.len > UINT64_MAX - need) return false;
         need += cap->config.len;
+    }
+    if (cap->codec_present) {
+        if (cap->codec.len > UINT64_MAX - need) return false;
+        need += cap->codec.len;
     }
     size_t objects = pb->obj_count >= slots ? pb->obj_count - slots : 0;
     return objects < pb->cfg.max_buffered_objects &&
@@ -2683,16 +2807,6 @@ moq_result_t moq_playback_on_stream_terminal(moq_playback_t *pb,
     return MOQ_OK;
 }
 
-/* The configuration `obj` decodes under, in release order: its own when it
- * has one (NULL when present but empty), else the one released media
- * established, else the track's catalog configuration. */
-static moq_rcbuf_t *config_for(const pb_track_t *t, const pb_object_t *obj)
-{
-    if (obj && obj->config_present) return obj->config;
-    if (t->rel_config_set) return t->rel_config;
-    return t->codec_config ? t->codec_config : t->init_data;
-}
-
 static bool config_equal(const moq_rcbuf_t *a, const moq_rcbuf_t *b)
 {
     size_t la = a ? moq_rcbuf_len(a) : 0, lb = b ? moq_rcbuf_len(b) : 0;
@@ -2700,12 +2814,43 @@ static bool config_equal(const moq_rcbuf_t *a, const moq_rcbuf_t *b)
     return la == 0 || memcmp(moq_rcbuf_data(a), moq_rcbuf_data(b), la) == 0;
 }
 
+/* The codec `obj` decodes under: its own effective LOC Codec String (the
+ * object's, else its track's), else the catalog codec. Never the codec of
+ * an earlier object. */
+static moq_rcbuf_t *codec_for(const pb_track_t *t, const pb_object_t *obj)
+{
+    if (obj && obj->codec_present) return obj->codec;
+    return t->codec;
+}
+
+/* The configuration `obj` decodes under, in release order:
+ *   - its own effective LOC configuration when it has one (NULL when present
+ *     but empty): the publisher's, for this object;
+ *   - else the one released media established, but only while `obj`'s codec
+ *     is byte-equal to the codec it was established under;
+ *   - else the catalog configuration, when `obj`'s codec is the catalog's;
+ *   - else none: a configuration is never assumed to belong to another codec.
+ * Without any LOC Codec String every codec is the catalog's, so a
+ * configuration carries forward until another one is declared. */
+static moq_rcbuf_t *config_for(const pb_track_t *t, const pb_object_t *obj)
+{
+    if (obj && obj->config_present) return obj->config;
+    moq_rcbuf_t *codec = codec_for(t, obj);
+    if (t->rel_config_set && config_equal(codec, t->rel_codec))
+        return t->rel_config;
+    if (config_equal(codec, t->codec))
+        return t->codec_config ? t->codec_config : t->init_data;
+    return NULL;
+}
+
 /* A CONFIGURE is due before `obj` when the decoder is unconfigured, or when
- * the configuration `obj` decodes under is not the decoder's. */
+ * the codec/configuration pair `obj` decodes under is not the pair the last
+ * CONFIGURE carried: a codec change alone is a change. */
 static bool configure_due(const pb_track_t *t, const pb_object_t *obj)
 {
     if (!t->configured || !t->cur_config_set) return true;
-    return !config_equal(config_for(t, obj), t->cur_config);
+    return !config_equal(config_for(t, obj), t->cur_config) ||
+           !config_equal(codec_for(t, obj), t->cur_codec);
 }
 
 static moq_result_t emit_configure(moq_playback_t *pb,
@@ -2721,9 +2866,10 @@ static moq_result_t emit_configure(moq_playback_t *pb,
     moq_rcbuf_t *codec_ref = NULL;
     moq_rcbuf_t *config_ref = NULL;
 
-    if (t->codec) {
-        moq_rcbuf_incref(t->codec);
-        codec_ref = t->codec;
+    moq_rcbuf_t *codec = codec_for(t, obj);
+    if (codec) {
+        cfg_hold(pb, codec, true);
+        codec_ref = codec;
     }
     moq_rcbuf_t *cc = config_for(t, obj);
     if (cc) {
@@ -2747,11 +2893,13 @@ static moq_result_t emit_configure(moq_playback_t *pb,
 
     moq_result_t rc = push_cmd(pb, &cfg_cmd);
     if (rc != MOQ_OK) {
-        moq_rcbuf_decref(codec_ref);
+        cfg_unhold(pb, codec_ref, true, true);
         cfg_unhold(pb, config_ref, true, true);
         return rc;
     }
+    /* Only an enqueued CONFIGURE commits the decoder's pair. */
     cfg_set_slot(pb, &t->cur_config, &t->cur_config_set, cc);
+    cfg_set_slot(pb, &t->cur_codec, &t->cur_codec_set, codec);
     t->configured = true;
     return MOQ_OK;
 }
@@ -3055,7 +3203,7 @@ static moq_result_t relieve_admission_pressure(moq_playback_t *pb)
         for (size_t j = 0; j < pb->cfg.max_buffered_objects; j++) {
             const pb_object_t *o = &pb->objects[j];
             uint32_t slot;
-            if (o->occupied && o->config == c->buf &&
+            if (o->occupied && obj_holds(o, c->buf) &&
                 pb_resolve_handle(pb, o->track, &slot) &&
                 !pb->tracks[slot].anchored)
                 victims++;
@@ -3076,7 +3224,7 @@ static moq_result_t relieve_admission_pressure(moq_playback_t *pb)
             for (size_t j = 0; j < pb->cfg.max_buffered_objects; j++) {
                 const pb_object_t *o = &pb->objects[j];
                 uint32_t slot;
-                if (o->occupied && o->config == rc->buf &&
+                if (o->occupied && obj_holds(o, rc->buf) &&
                     pb_resolve_handle(pb, o->track, &slot) &&
                     !pb->tracks[slot].anchored)
                     victims++;
@@ -3665,10 +3813,15 @@ moq_result_t moq_playback_tick(moq_playback_t *pb, uint64_t now_us)
                 for (size_t k = cmds_before; k < pb->cmd_count; k++)
                     pb->cmd_multi[(pb->cmd_head + k) % pb->cfg.max_commands] = 1;
             if (rc != MOQ_OK) return rc;
-            /* Released media now runs under this object's configuration. */
-            if (first_unit)
-                cfg_set_slot(pb, &t->rel_config, &t->rel_config_set,
-                             config_for(t, obj));
+            /* Released media now runs under this object's configuration,
+             * established under its codec. Both are read before either slot
+             * moves, since the configuration depends on the old pair. */
+            if (first_unit) {
+                moq_rcbuf_t *rel_cfg = config_for(t, obj);
+                moq_rcbuf_t *rel_codec = codec_for(t, obj);
+                cfg_set_slot(pb, &t->rel_config, &t->rel_config_set, rel_cfg);
+                cfg_set_slot(pb, &t->rel_codec, &t->rel_codec_set, rel_codec);
+            }
 
             t->has_last_dts = true;
             t->last_dts = emitted_last_dts;
@@ -3715,6 +3868,7 @@ moq_result_t moq_playback_poll_command(moq_playback_t *pb,
     /* The command's configuration ref moves to the caller: the engine
      * stops holding it. Its bytes leave the budget with it. */
     cfg_unhold(pb, cmd_config(src), true, false);
+    cfg_unhold(pb, cmd_codec(src), true, false);
     cmd_uncharge(pb, ri);
     pb->cmd_multi[ri] = 0;
     size_t n = out_size < sizeof(*src) ? out_size : sizeof(*src);
@@ -3786,6 +3940,13 @@ moq_result_t moq_playback_poll_command_held(moq_playback_t *pb,
         copy->hold_holders++;
         e->config = config;
     }
+    moq_rcbuf_t *codec = cmd_codec(src);
+    pb_copy_t *codec_copy = copy_find(pb, codec);
+    if (codec_copy) {
+        cfg_hold(pb, codec, false);
+        codec_copy->hold_holders++;
+        e->codec = codec;
+    }
     moq_rcbuf_t *payload = cmd_payload(src);
     if (payload) moq_rcbuf_incref(payload);
     e->payload = payload;
@@ -3816,8 +3977,14 @@ void moq_playback_release_command_hold(moq_playback_t *pb,
         if (copy) copy->hold_holders--;
         cfg_unhold(pb, e->config, false, true);
     }
+    if (e->codec) {
+        pb_copy_t *copy = copy_find(pb, e->codec);
+        if (copy) copy->hold_holders--;
+        cfg_unhold(pb, e->codec, false, true);
+    }
     if (e->payload) moq_rcbuf_decref(e->payload);
     e->config = NULL;
+    e->codec = NULL;
     e->payload = NULL;
     e->bytes = 0;
     e->handle = 0;
@@ -3965,6 +4132,7 @@ moq_result_t moq_playback_handle_feedback(moq_playback_t *pb,
                 moq_playback_cmd_t *c = &pb->cmd_ring[ri];
                 if (c->track._opaque == fb->track._opaque) {
                     cfg_unhold(pb, cmd_config(c), true, false);
+                    cfg_unhold(pb, cmd_codec(c), true, false);
                     cmd_release_refs(c);
                     cmd_uncharge(pb, ri);
                     pb->cmd_multi[ri] = 0;

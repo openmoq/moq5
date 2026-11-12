@@ -311,6 +311,7 @@ pub struct SendTrackConfig {
     mpeg2ts: Option<(Mpeg2tsRecord, Mpeg2tsInput)>,
     track_properties: Vec<u8>,
     dynamic_groups: bool,
+    codec_string_property: bool,
 }
 
 impl SendTrackConfig {
@@ -351,6 +352,7 @@ impl SendTrackConfig {
             mpeg2ts: None,
             track_properties: Vec::new(),
             dynamic_groups: false,
+            codec_string_property: false,
         }
     }
 
@@ -518,6 +520,28 @@ impl SendTrackConfig {
         self.dynamic_groups = dynamic;
         self
     }
+    /// State the catalog codec as the track's LOC-05 Codec String track
+    /// property as well (RAW only), added to the track properties in type
+    /// order. Never done implicitly. [`Sender::add_track`] refuses it with
+    /// [`Error::UNSUPPORTED`] unless the sender is LOC-05, or AUTO and still
+    /// unresolved with an endpoint that offers draft 22 alone; and with
+    /// [`Error::INVAL`] for a non-RAW track, an unusable codec string, or
+    /// track properties that already carry one.
+    #[must_use]
+    pub fn codec_string_property(mut self, state: bool) -> Self {
+        self.codec_string_property = state;
+        self
+    }
+}
+
+/// The LOC-05 extension record carrying `codec`, borrowing its bytes.
+fn loc_codec_ext(codec: &str) -> sys::moq_loc_ext_t {
+    let mut ext = sys::moq_loc_ext_t::default();
+    // SAFETY: a writable struct of exactly the size passed.
+    unsafe { sys::moq_loc_ext_init_sized(&mut ext, mem::size_of_val(&ext)) };
+    ext.present = sys::MOQ_LOC_EXT_HAS_CODEC_STRING;
+    ext.codec_string = ffi::span(codec.as_bytes());
+    ext
 }
 
 // -- handles ----------------------------------------------------------------------
@@ -581,6 +605,14 @@ pub struct SendObject {
     /// (capture time as Unix microseconds, else the presentation time with
     /// a timescale of 1000000). Drafts 16/18 and CMAF ignore it.
     pub metadata: Option<LocMetadata>,
+    /// RAW only: the object's LOC-05 Codec String, its exact WebCodecs codec
+    /// string, emitted with the LOC metadata (given or generated). It may
+    /// differ from the catalog codec to mark a change. The service refuses
+    /// it unless nothing can later drop it: a LOC-05 sender on draft 22, or
+    /// an unresolved AUTO sender whose endpoint offers draft 22 alone
+    /// ([`Error::UNSUPPORTED`] otherwise, the object handed back); an empty,
+    /// whitespace-only or NUL-bearing string is [`Error::INVAL`].
+    pub codec_string: Option<String>,
 }
 
 impl SendObject {
@@ -598,6 +630,7 @@ impl SendObject {
             capture_time_us: None,
             sap_type: None,
             metadata: None,
+            codec_string: None,
         }
     }
 }
@@ -963,6 +996,12 @@ impl Sender {
         }
         raw_config.track_properties = ffi::span(&config.track_properties);
         raw_config.dynamic_groups = config.dynamic_groups;
+        let track_ext = config
+            .codec_string_property
+            .then(|| loc_codec_ext(&config.codec));
+        if let Some(ext) = &track_ext {
+            raw_config.track_loc_ext = ext as *const _;
+        }
         let mut raw = ptr::null_mut();
         // SAFETY: every pointer in raw_config points into config, ref_ids,
         // si_pids, record or extension, alive for the call; the service
@@ -1004,6 +1043,10 @@ impl Sender {
         };
         // Borrows the object's metadata for the call; the service copies it.
         let metadata = object.metadata.as_ref().map(LocMetadata::raw);
+        let loc_ext = object
+            .codec_string
+            .as_ref()
+            .map(|codec| loc_codec_ext(codec));
         let raw_object = sys::moq_media_send_object_t {
             struct_size: mem::size_of::<sys::moq_media_send_object_t>() as u32,
             payload: object.payload.as_ptr(),
@@ -1023,6 +1066,7 @@ impl Sender {
             metadata: metadata
                 .as_ref()
                 .map_or(ptr::null(), |metadata| metadata as *const _),
+            loc_ext: loc_ext.as_ref().map_or(ptr::null(), |ext| ext as *const _),
         };
         // SAFETY: a live sender and one of its handles; the buffers are
         // live references this object owns, and the metadata record and the

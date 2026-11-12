@@ -305,10 +305,11 @@ int main(void)
 
     /* -- init functions null-safe ------------------------------------- */
     {
-        moq_playback_cfg_init(NULL);
-        moq_playback_track_cfg_init(NULL);
-        moq_playback_object_init(NULL);
-        moq_playback_feedback_init(NULL);
+        /* Typed null pointers: each macro measures *(arg). */
+        moq_playback_cfg_init((moq_playback_cfg_t *)NULL);
+        moq_playback_track_cfg_init((moq_playback_track_cfg_t *)NULL);
+        moq_playback_object_init((moq_playback_object_t *)NULL);
+        moq_playback_feedback_init((moq_playback_feedback_t *)NULL);
         moq_playback_cmd_cleanup(NULL);
     }
 
@@ -2226,9 +2227,10 @@ int main(void)
         CHECK(moq_playback_push_object(pb, &obj, 0) == MOQ_OK);
         CHECK(moq_playback_tick(pb, 0) == MOQ_OK);
 
-        /* CONFIGURE_VIDEO increfed track config; the track also keeps it
-         * as its decoder and its release-order configuration. */
-        CHECK(moq_rcbuf_refcount(stored_codec) == 2);
+        /* CONFIGURE_VIDEO increfed the track's codec and configuration;
+         * the track also keeps both as its decoder's pair and as the pair
+         * released media runs under. */
+        CHECK(moq_rcbuf_refcount(stored_codec) == 4);
         CHECK(moq_rcbuf_refcount(stored_init) == 4);
 
         moq_playback_cmd_t cmd;
@@ -2236,7 +2238,7 @@ int main(void)
         CHECK(cmd.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO);
         moq_playback_cmd_cleanup(&cmd);
 
-        CHECK(moq_rcbuf_refcount(stored_codec) == 1);
+        CHECK(moq_rcbuf_refcount(stored_codec) == 3);
         CHECK(moq_rcbuf_refcount(stored_init) == 3);
 
         /* Drain DECODE too. */

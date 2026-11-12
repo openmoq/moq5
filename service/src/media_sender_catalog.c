@@ -374,7 +374,7 @@ uint8_t sender_track_scale_of(moq_bytes_t track_properties)
 bool sender_auto_d22_possible_locked(const moq_media_sender_t *s)
 {
     if (!s->companion_auto) return false;
-    if (s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+    if (sender_companion_d22(s->companion_profile))
         return true;
     if (s->companion_profile != MOQ_MEDIA_COMPANION_AUTO) return false;
     moq_version_t versions[MOQ_ENDPOINT_MAX_VERSIONS];

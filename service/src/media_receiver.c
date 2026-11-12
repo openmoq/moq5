@@ -189,6 +189,12 @@ _Static_assert(offsetof(moq_media_receiver_track_subscribe_cfg_t,
     (offsetof(moq_media_object_t, track_properties_ref) + sizeof(moq_rcbuf_t *))
 #define MEDIA_OBJECT_ORIGIN_SIZE \
     (offsetof(moq_media_object_t, initiating_request_id) + sizeof(uint64_t))
+/* Explicit LOC-05 receivers require the object through codec_string. */
+#define MEDIA_OBJECT_LOC_EXT_SIZE \
+    (offsetof(moq_media_object_t, codec_string) + sizeof(moq_bytes_t))
+_Static_assert(offsetof(moq_media_object_t, loc_ext_present) ==
+               MEDIA_OBJECT_ORIGIN_SIZE,
+               "the LOC-05 block starts at the complete sizeof through initiating_request_id");
 _Static_assert(offsetof(moq_media_object_t, delivery_origin) ==
                ((MEDIA_OBJECT_METADATA_SIZE + _Alignof(moq_media_object_t) - 1) &
                 ~(size_t)(_Alignof(moq_media_object_t) - 1)),
@@ -588,6 +594,11 @@ struct moq_media_receiver {
      * matching companion; the network thread reads it freely, the app
      * thread under mu. */
     moq_media_companion_profile_t companion_profile;
+    /* The configuration asked for AUTO. Set at creation and never changed:
+     * an AUTO receiver resolved to LOC-05 keeps the poll floor through
+     * initiating_request_id, while an explicit LOC-05 one requires the
+     * codec_string block. */
+    bool companion_auto;
 
     /* Owned copies of the configuration inputs. */
     moq_bytes_t    *ns_parts;
@@ -847,12 +858,19 @@ static bool obj_bytes_fit(const moq_media_receiver_t *r, uint64_t need,
     return need <= limit && r->obj_budget_total <= limit - need;
 }
 
+/* The draft-22 companions differ only in LOC revision. */
+static bool receiver_companion_d22(moq_media_companion_profile_t c)
+{
+    return c == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC ||
+           c == MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
+}
+
 /* Shared by network reconciliation and app-thread poll nudge, under r->mu.
  * D22 includes any in-flight conversion charge; legacy remains depth-only. */
 static bool obj_resume_ready_locked(const moq_media_receiver_t *r)
 {
     return r->obj_tail - r->obj_head <= r->obj_cap / 2 &&
-        (r->companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC ||
+        (!receiver_companion_d22(r->companion_profile) ||
          r->obj_budget_total <= r->byte_cap / 2);
 }
 
@@ -2516,21 +2534,28 @@ static moq_result_t receiver_parse_media_object(
 {
     /* The sized parser carries the draft-22 companion and an MPEG2TS track's
      * packet size; every other legacy track keeps the frozen-prefix parser. */
-    bool d22 = r->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+    bool d22 = receiver_companion_d22(r->companion_profile);
     if (!d22 && track->desc.info.packaging != MOQ_MEDIA_PACKAGING_MPEG2TS)
         return moq_media_object_parse(&track->desc.info, in, samples, sample_cap,
                                        parsed, why);
     moq_media_object_parse_cfg_t cfg = MOQ_MEDIA_OBJECT_PARSE_CFG_INIT;
     cfg.mpeg2ts_packet_size = receiver_ts_packet_size(&track->desc);
     moq_loc_metadata_t loc;
+    moq_loc_ext_t ext;
     if (d22) {
+        bool loc05 =
+            r->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
         cfg.companion_profile = r->companion_profile;
         if (track_properties.len) {
-            moq_result_t rc = moq_loc_parse_metadata(MOQ_VERSION_DRAFT_22,
-                MOQ_LOC_PROFILE_04, track_properties, &loc, sizeof(loc));
+            moq_result_t rc = moq_loc_parse_metadata_ex(MOQ_VERSION_DRAFT_22,
+                loc05 ? MOQ_LOC_PROFILE_05 : MOQ_LOC_PROFILE_04,
+                track_properties, &loc, sizeof(loc),
+                loc05 ? &ext : NULL, sizeof(ext));
             if (rc != MOQ_OK) return rc;
             cfg.track_loc_metadata = &loc;
+            if (loc05) cfg.track_loc_ext = &ext;
         }
+        cfg.catalog_codec = track->desc.codec;
     }
     return moq_media_object_parse_sized(&track->desc.info, in, &cfg,
                 samples, sample_cap, parsed, sizeof(*parsed), why);
@@ -3869,7 +3894,7 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
      * first parse determines admission/keyframe policy; none of its inherited
      * spans may cross the queue boundary until reparsed from a private copy. */
     moq_bytes_t track_properties = {0};
-    if (r->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC) {
+    if (receiver_companion_d22(r->companion_profile)) {
         const moq_sub_track_t *generation = so->track ? so->track : track->sub_track;
         if (generation) {
             moq_sub_track_result_t result;
@@ -4150,8 +4175,13 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
     o->delivery_origin = delivery_origin;
     o->initiating_request_id = delivery_origin == MOQ_MEDIA_DELIVERY_FILL
         ? initiating_request_id : 0;
-    if (r->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+    if (receiver_companion_d22(r->companion_profile)) {
         o->metadata = parsed.metadata;
+        /* Zero on LOC-04; on LOC-05 the effective Codec String, borrowing
+         * properties_ref or this object's track_properties_ref. */
+        o->loc_ext_present = parsed.loc_ext_present;
+        o->codec_string = parsed.codec_string;
+    }
     /* Steal the facade object's refs (no moq_sub_object_cleanup). A
      * replacement payload is what the app receives; the facade's own payload
      * reference is then released. */
@@ -4404,7 +4434,7 @@ static uint64_t receiver_charge(moq_media_receiver_t *r, moq_media_track_t *t,
                                 size_t payload_len)
 {
     uint64_t need = (uint64_t)payload_len;
-    if (r->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC &&
+    if (receiver_companion_d22(r->companion_profile) &&
         t->sub_track) {
         moq_sub_track_result_t result;
         if (moq_sub_get_track_result(r->sub, t->sub_track, &result,
@@ -6110,12 +6140,12 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         if (r->companion_profile == MOQ_MEDIA_COMPANION_AUTO) {
             if (v == MOQ_VERSION_DRAFT_22 &&
                 r->time_mode != MOQ_MEDIA_TIME_SHARED_EPOCH)
-                r->companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+                r->companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
             else if (v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18)
                 r->companion_profile = MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
         }
         bool usable =
-            r->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC
+            receiver_companion_d22(r->companion_profile)
                 ? v == MOQ_VERSION_DRAFT_22
             : r->companion_profile == MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01
                 ? v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18
@@ -6699,9 +6729,9 @@ static moq_result_t receiver_validate_cfg(const moq_media_receiver_cfg_t *cfg)
     moq_media_companion_profile_t companion = receiver_cfg_companion(cfg);
     if (companion != MOQ_MEDIA_COMPANION_AUTO &&
         companion != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
-        companion != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+        !receiver_companion_d22(companion))
         return MOQ_ERR_INVAL;
-    if (companion == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC &&
+    if (receiver_companion_d22(companion) &&
         cfg->time_mode == MOQ_MEDIA_TIME_SHARED_EPOCH)
         return MOQ_ERR_UNSUPPORTED;
     if (cfg->namespace_.count == 0 || !cfg->namespace_.parts)
@@ -6916,6 +6946,7 @@ static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
     r->auto_subscribe = cfg->auto_subscribe;
     r->time_mode = cfg->time_mode;
     r->companion_profile = receiver_cfg_companion(cfg);
+    r->companion_auto = r->companion_profile == MOQ_MEDIA_COMPANION_AUTO;
     r->overflow = cfg->overflow;
     r->max_stable_handles = RECEIVER_DEFAULT_MAX_STABLE_HANDLES;
     r->max_cp_snaps       = RECEIVER_DEFAULT_MAX_CP_SNAPS;
@@ -7552,7 +7583,7 @@ static moq_result_t receiver_check_track_options(
 {
     if (!options->has_location && !options->has_fill) return MOQ_OK;
     if (r->transport_version == MOQ_VERSION_DRAFT_22)
-        return r->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC
+        return receiver_companion_d22(r->companion_profile)
             ? MOQ_OK : MOQ_ERR_UNSUPPORTED;
     if ((r->transport_version != MOQ_VERSION_DRAFT_16 &&
          r->transport_version != MOQ_VERSION_DRAFT_18) ||
@@ -7753,7 +7784,7 @@ moq_result_t moq_media_receiver_fill_track(
     if (r->fatal) rc = MOQ_ERR_CLOSED;
     else if (!receiver_owns_track(r, track)) rc = MOQ_ERR_INVAL;
     else if (r->transport_version != MOQ_VERSION_DRAFT_22 ||
-             r->companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+             !receiver_companion_d22(r->companion_profile))
         rc = MOQ_ERR_UNSUPPORTED;
     else if (track->ended || track->removed || track->local_result != MOQ_OK ||
              track->auth_failed || !track->desired_subscribed)
@@ -7787,7 +7818,7 @@ moq_result_t moq_media_receiver_cancel_fill(
     if (r->fatal) rc = MOQ_ERR_CLOSED;
     else if (!receiver_owns_track(r, track)) rc = MOQ_ERR_INVAL;
     else if (r->transport_version != MOQ_VERSION_DRAFT_22 ||
-             r->companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+             !receiver_companion_d22(r->companion_profile))
         rc = MOQ_ERR_UNSUPPORTED;
     else {
         for (size_t i = 0; i < RECEIVER_SUB_MAX_FILLS; i++) {
@@ -7917,8 +7948,11 @@ static moq_result_t receiver_poll_object(moq_media_receiver_t *r,
      * an AUTO receiver resolving to draft 22 cannot hand an object to a
      * buffer below the draft-22 floor. */
     pthread_mutex_lock(&r->mu);
-    if (r->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC &&
-        obj_size < MEDIA_OBJECT_ORIGIN_SIZE) {
+    if (receiver_companion_d22(r->companion_profile) &&
+        obj_size < (r->companion_profile ==
+                            MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC &&
+                        !r->companion_auto
+                    ? MEDIA_OBJECT_LOC_EXT_SIZE : MEDIA_OBJECT_ORIGIN_SIZE)) {
         pthread_mutex_unlock(&r->mu);
         return MOQ_ERR_UNSUPPORTED;
     }

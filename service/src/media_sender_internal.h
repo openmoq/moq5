@@ -799,10 +799,14 @@ typedef struct sender_admit {
     uint64_t     capture_time_us;
     bool         has_sap_type;
     uint8_t      sap_type;
-    /* Draft-22 companion RAW: the object whose metadata generates the LOC
-     * property block, after the anchor checks and before any room is made.
-     * properties is then NULL. */
+    /* Draft-22 companion RAW: the object (the write's full local copy of the
+     * caller's) whose metadata generates the LOC property block, after the
+     * anchor checks and before any room is made. properties is then NULL. */
     const moq_media_send_object_t *metadata_src;
+    /* A present typed Codec String of a RAW write (its record), admitted by
+     * sender_loc05_object_input_ok_locked; NULL otherwise. Borrowed for the
+     * call: the generated property block copies it. */
+    const moq_loc_ext_t *loc_ext;
     /* Accepted input that complete() owes the wire (a TS track's source
      * being finished): it neither evicts queued media nor waits for room,
      * and is refused MOQ_ERR_WOULD_BLOCK while none is free. */
@@ -824,6 +828,22 @@ bool sender_ep_closed(const moq_media_sender_t *s);
 bool sender_version_usable(const moq_media_sender_t *s);
 
 bool sender_companion_refused_locked(const moq_media_sender_t *s);
+
+/* The draft-22 companions differ only in LOC revision. */
+static inline bool sender_companion_d22(moq_media_companion_profile_t c)
+{
+    return c == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC ||
+           c == MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
+}
+
+/* Whether typed LOC-05 input (a present Codec String) is accepted now, so that
+ * no later negotiation can discard it. A track's (add_track): the companion is
+ * D22_MSF01_LOC05_PUBLIC, explicit or resolved, or AUTO is unresolved and the
+ * endpoint's offer is nonempty, completely observed and draft 22 alone. An
+ * object's (write) additionally needs draft 22 observed when the companion is
+ * explicit. Every other state is a companion mismatch. CALLER MUST HOLD s->mu. */
+bool sender_loc05_track_input_ok_locked(const moq_media_sender_t *s);
+bool sender_loc05_object_input_ok_locked(const moq_media_sender_t *s);
 
 #ifdef MOQ_MEDIA_SENDER_TESTING
 

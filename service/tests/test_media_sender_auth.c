@@ -1183,7 +1183,7 @@ static void test_d22_media_action_retention(void)
     if (!admission_setup(&a, MOQ_VERSION_DRAFT_22, 32, 1)) goto done;
     admission_pump(&a);
     MOQ_TEST_CHECK(moq_media_sender_test_companion(a.f.sender) ==
-        MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC);
+        MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC);
     admission_expect(&a, a.f.track, 1, MOQ_ERR_WOULD_BLOCK);
     admission_expect(&a, NULL, 0, MOQ_OK);
     MOQ_TEST_CHECK(moq_media_sender_test_auth_pending(a.f.sender) == 2);

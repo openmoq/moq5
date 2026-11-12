@@ -543,7 +543,7 @@ void sender_pub_on_publish_finished(void *ctx, moq_pub_track_t *pt)
 
 
 /* Resolve an AUTO companion against the draft just latched: draft 22 selects
- * D22_MSF01_LOC04_PUBLIC, drafts 16/18 LEGACY_MSF01_LOC01, and any other draft
+ * D22_MSF01_LOC05_PUBLIC, drafts 16/18 LEGACY_MSF01_LOC01, and any other draft
  * leaves it unresolved, which no draft can use. The latch runs before this
  * session's publisher, catalog or first object exists, so nothing reaches the
  * wire under an unresolved companion. Resolution happens once:
@@ -557,7 +557,7 @@ static void sender_resolve_companion_locked(moq_media_sender_t *s)
     if (s->companion_profile == MOQ_MEDIA_COMPANION_AUTO) {
         moq_version_t v = s->transport_version;
         if (v == MOQ_VERSION_DRAFT_22) {
-            s->companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
+            s->companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
         } else if (v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18) {
             s->companion_profile = MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
             /* A configured initial Group ID is the application's, for either

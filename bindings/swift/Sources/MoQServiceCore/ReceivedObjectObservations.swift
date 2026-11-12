@@ -72,13 +72,27 @@ public struct MediaObjectMetadata: Sendable, Hashable {
     /// Nil means native independence is unknown, not false.
     public let isIndependent: Bool?
     public let loc: MediaLOCMetadata?
+    /// The effective LOC-05 Codec String (the object's own, else its
+    /// track's): its exact bytes, which the library has checked to be UTF-8
+    /// and a usable identifier. Nil when there is none, on any profile but
+    /// LOC-05, or when the native block was not observed. Kept as bytes so
+    /// equality never merges distinct byte strings; ``codecString`` is the
+    /// text. Accepted is not supported: no decoder is consulted.
+    public let codecStringBytes: Data?
+
+    /// The Codec String as text; nil when absent or not UTF-8.
+    public var codecString: String? {
+        codecStringBytes.flatMap { String(data: $0, encoding: .utf8) }
+    }
 
     public init(timeDomain: MediaTimeDomain, timeMicroseconds: UInt64? = nil,
-                isIndependent: Bool? = nil, loc: MediaLOCMetadata? = nil) {
+                isIndependent: Bool? = nil, loc: MediaLOCMetadata? = nil,
+                codecStringBytes: Data? = nil) {
         self.timeDomain = timeDomain
         self.timeMicroseconds = timeMicroseconds
         self.isIndependent = isIndependent
         self.loc = loc
+        self.codecStringBytes = codecStringBytes
     }
 }
 

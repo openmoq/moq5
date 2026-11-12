@@ -58,15 +58,18 @@ typedef enum moq_media_type {
     MOQ_MEDIA_TYPE_AUDIO = 2,
 } moq_media_type_t;
 
-/* Fixed-width shared types. LEGACY_MSF01_LOC01 pairs with drafts 16/18 and
- * D22_MSF01_LOC04_PUBLIC with draft 22. AUTO is for the service sender and
- * receiver configs (their default): it resolves to whichever of the two
- * matches the session's negotiated draft. The object parser takes a resolved
- * companion and refuses AUTO. Values are never renumbered. */
+/* Fixed-width shared types. LEGACY_MSF01_LOC01 pairs with drafts 16/18;
+ * D22_MSF01_LOC04_PUBLIC and D22_MSF01_LOC05_PUBLIC with draft 22. LOC05 is
+ * LOC04 plus the Codec String property; neither is negotiated, and both cover
+ * public (unencrypted) properties only. AUTO is for the service sender and
+ * receiver configs (their default): it resolves to LEGACY_MSF01_LOC01 on
+ * drafts 16/18 and D22_MSF01_LOC05_PUBLIC on draft 22. The object parser takes
+ * a resolved companion and refuses AUTO. Values are never renumbered. */
 typedef uint32_t moq_media_companion_profile_t;
 #define MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01     UINT32_C(0)
 #define MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC UINT32_C(1)
 #define MOQ_MEDIA_COMPANION_AUTO                   UINT32_C(2)
+#define MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC UINT32_C(3)
 
 typedef uint32_t moq_media_time_domain_t;
 #define MOQ_MEDIA_TIME_DOMAIN_NONE              UINT32_C(0)
@@ -233,6 +236,18 @@ typedef struct moq_media_parsed_object {
     /* Starts after the complete baseline parsed-object sizeof. Read only
      * when the outer struct_size covers this entire field. */
     moq_media_metadata_t         metadata;    /* borrowed spans, no owned refs */
+
+    /* Appended after the complete metadata field. Read only when struct_size
+     * covers codec_string entirely; written only on the LOC05 companion,
+     * zero otherwise. The effective LOC-05 properties moq_loc_ext_t holds:
+     * loc_ext_present has a MOQ_LOC_EXT_HAS_* bit for each one present.
+     * codec_string is the object's own Codec String, else the track's
+     * (cfg->track_loc_ext); an object never inherits a value another object
+     * carried. It borrows the object properties, or the caller's track
+     * backing when inherited, exactly like the inherited config spans. */
+    uint32_t                     loc_ext_present;
+    uint32_t                     _reserved_loc_ext;  /* never read */
+    moq_bytes_t                  codec_string;
 } moq_media_parsed_object_t;
 
 /* Original padded sizeof through track_id, independent of future tails: the
@@ -251,9 +266,14 @@ typedef struct moq_media_parsed_object {
       MOQ_MEDIA_PARSED_OBJECT_V0_ALIGNMENT - 1) & \
      ~(size_t)(MOQ_MEDIA_PARSED_OBJECT_V0_ALIGNMENT - 1))
 
-/* D22 requires the whole metadata field, not a partial tail. */
+/* D22 requires the whole metadata field, not a partial tail. It is also the
+ * complete layout before codec_string's block on every target. */
 #define MOQ_MEDIA_PARSED_OBJECT_METADATA_SIZE \
     (offsetof(moq_media_parsed_object_t, metadata) + sizeof(moq_media_metadata_t))
+
+/* The LOC05 companion requires the output through codec_string. */
+#define MOQ_MEDIA_PARSED_OBJECT_LOC_EXT_SIZE \
+    (offsetof(moq_media_parsed_object_t, codec_string) + sizeof(moq_bytes_t))
 
 /* Pointer-only initializer clears/stamps ONLY the complete baseline record,
  * including its tail padding, and sets sap_type to MOQ_SAP_UNKNOWN. Metadata
@@ -326,15 +346,27 @@ MOQ_API moq_result_t moq_media_object_parse(
 
 /* Separate from the frozen embedded track record. NULL cfg selects legacy with
  * no track context; it never opts into draft-22. The frozen input floor covers
- * companion_profile. Each tail (track_loc_metadata, mpeg2ts_packet_size) is
- * read only when its whole field is covered. Config/metadata records are
- * borrowed for the call; inherited byte spans borrow their original backing
- * for the output's lifetime. No ownership transfer or cleanup. */
+ * companion_profile. Each tail (track_loc_metadata, mpeg2ts_packet_size,
+ * track_loc_ext, catalog_codec) is read only when its whole field is covered.
+ * Config/metadata records and catalog_codec are borrowed for the call;
+ * inherited byte spans borrow their original backing for the output's
+ * lifetime. No ownership transfer or cleanup. */
 typedef struct moq_media_object_parse_cfg {
     uint32_t struct_size;
     uint32_t companion_profile;
     const moq_loc_metadata_t *track_loc_metadata;
     uint32_t mpeg2ts_packet_size;
+    /* Appended past mpeg2ts_packet_size and its padding: the track's
+     * moq_loc_ext_t (from moq_loc_parse_metadata_ex on its Track
+     * Properties), or NULL. */
+    const moq_loc_ext_t *track_loc_ext;
+    /* Appended past track_loc_ext: the codec the track's catalog entry names
+     * (MSF-01 "codec"), or empty (len 0) when there is none. A nonempty value
+     * needs data. On LOC05 it names the codec the track's Video/Audio Config
+     * belongs to when the Track Properties carry no Codec String; on other
+     * companions every object decodes under the catalog codec, so it changes
+     * nothing. Compared by exact bytes, never parsed. */
+    moq_bytes_t catalog_codec;
 } moq_media_object_parse_cfg_t;
 
 #define MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE \
@@ -342,13 +374,15 @@ typedef struct moq_media_object_parse_cfg {
      sizeof(((moq_media_object_parse_cfg_t *)0)->companion_profile))
 #define MOQ_MEDIA_OBJECT_PARSE_CFG_INIT \
     { (uint32_t)sizeof(moq_media_object_parse_cfg_t), \
-      MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, NULL, 0 }
+      MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, NULL, 0, NULL, { NULL, 0 } }
 
-/* Explicit LEGACY_MSF01_LOC01+D16/18 or D22_MSF01_LOC04_PUBLIC+D22.
+/* Explicit LEGACY_MSF01_LOC01+D16/18, or D22_MSF01_LOC04_PUBLIC or
+ * D22_MSF01_LOC05_PUBLIC with D22.
  * Unknown companion/version (AUTO included) or malformed sized config is
  * INVAL; a known but
- * mismatched pair is UNSUPPORTED. D22 requires METADATA_SIZE bytes; shorter output returns
- * UNSUPPORTED before any output/drop-reason store. Legacy pairs require the
+ * mismatched pair is UNSUPPORTED. D22 requires METADATA_SIZE bytes, and LOC05
+ * LOC_EXT_SIZE bytes; shorter output returns UNSUPPORTED before any
+ * output/drop-reason store. Legacy pairs require the
  * old V0_SIZE floor. No caller input output-stamp is required.
  * Success copies/stamps min(out_size, library size). Other failures leave out
  * untouched, except BUFFER publishes the required sample_count as on the old
@@ -358,10 +392,26 @@ typedef struct moq_media_object_parse_cfg {
  * object config borrow in/sample backing. These must outlive use of out;
  * no cleanup is needed. Only absent timescale/video/audio configuration inherits
  * from track_loc_metadata. Present object fields, including empty config, win.
+ * A Codec String and a Video/Audio Config are the two halves of one decoder
+ * configuration (draft-ietf-moq-loc-05 2.3.1.3, 2.3.2.1, 2.3.3.1), so on
+ * LOC05 an object that carries its own Codec String inherits the track's
+ * video/audio configuration only when that Codec String is byte-equal to the
+ * track's codec: the track_loc_ext Codec String, else catalog_codec. With
+ * neither, or with a different one, it inherits no configuration; timescale
+ * is still inherited. An object without its own Codec String inherits as on
+ * LOC04, together with the track's codec.
  * Track timestamp/marking/audio-level fields do not become object metadata.
  * A supplied track record needs its complete v0 floor, known presence bits,
  * zero reserved bytes, and coherent selected config spans; otherwise INVAL.
  * Track timescale/audio configuration on the legacy companion is UNSUPPORTED.
+ * LOC05 parses the object's LOC-05 properties (moq_loc_parse_metadata_ex):
+ * an invalid Codec String is PROTO with MALFORMED_LOC, a repeated one
+ * UNSUPPORTED. The effective Codec String is the object's own, else the
+ * track_loc_ext one. A supplied track_loc_ext needs its complete v0 floor and
+ * known presence bits, and a present Codec String must be a usable identifier
+ * (see moq_loc_ext_t) with a coherent span, or INVAL; a present one on the
+ * LOC04 or legacy companion is UNSUPPORTED, never ignored. LOC04 still skips
+ * 0x11 as an unknown property.
  * Timestamp without effective LOC timescale is UNIX/capture time; with any
  * scale it is application time, never capture. Zero scale/overflow keeps raw
  * metadata with has_time_us=false. RAW timing uses available time_us; CMAF

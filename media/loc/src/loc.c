@@ -1,15 +1,16 @@
 #include <moq/loc.h>
 #include <moq/vi64.h>
+#include "loc_codec_string.h"
 #include <moq/wire.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 /*
- * Two LOC revisions are registered, each bound to the transport drafts
+ * Three LOC revisions are registered, each bound to the transport drafts
  * that carry it (see loc_row_for): LOC-01 ids on drafts 16 and 18, LOC-04
- * ids on draft 22. LOC-02 is reserved and selected by no row. The KVP
- * INTEGER CODEC is the second axis of the same row, so a draft can never
+ * and LOC-05 ids on draft 22. LOC-02 is reserved and selected by no row. The
+ * KVP INTEGER CODEC is the second axis of the same row, so a draft can never
  * be half-applied: its ids and its integer encoding travel together.
  */
 
@@ -28,6 +29,10 @@
 #define LOC04_VIDEO_CONFIG        0x0du   /* odd: codec extradata */
 #define LOC04_AUDIO_CONFIG        0x0fu   /* odd: codec configuration */
 #define LOC04_TIMESTAMP           0x10u   /* even: vi64, timescale units */
+
+/* -- Property IDs added by LOC-05 (draft-ietf-moq-loc-05 section 6.1) ------ */
+
+#define LOC05_CODEC_STRING        0x11u   /* odd: UTF-8 WebCodecs codec string */
 
 /* LOC04 preserves the complete declared payload, including opaque fourth-byte
  * forms; this codec does not normalize or invent RFC fields. */
@@ -67,18 +72,26 @@ static const loc_int_codec_t k_codec_d18 = {
     UINT64_MAX,
 };
 
-/* One row per transport draft: the integer codec its KVPs use and the LOC
- * revision whose property ids it carries. Lookup returns NULL for anything
- * not registered, which is what makes an unknown or future version fail
- * closed instead of silently borrowing a neighbour's encoding or ids. */
+/* One row per transport draft: the integer codec its KVPs use, the LOC
+ * revisions whose property ids it carries, and the compatibility selection
+ * among them. Lookup returns NULL for anything not registered, which is what
+ * makes an unknown or future version fail closed instead of silently
+ * borrowing a neighbour's encoding or ids. */
 typedef struct loc_row {
     const loc_int_codec_t *codec;
-    moq_loc_profile_t      profile;
+    moq_loc_profile_t      profile;    /* moq_loc_profile_for_version */
+    uint32_t               revisions;  /* LOC_REV(p) for each registered p */
 } loc_row_t;
 
-static const loc_row_t k_row_d16 = { &k_codec_d16, MOQ_LOC_PROFILE_01 };
-static const loc_row_t k_row_d18 = { &k_codec_d18, MOQ_LOC_PROFILE_01 };
-static const loc_row_t k_row_d22 = { &k_codec_d18, MOQ_LOC_PROFILE_04 };
+#define LOC_REV(p) (UINT32_C(1) << (unsigned)(p))
+
+static const loc_row_t k_row_d16 = { &k_codec_d16, MOQ_LOC_PROFILE_01,
+                                     LOC_REV(MOQ_LOC_PROFILE_01) };
+static const loc_row_t k_row_d18 = { &k_codec_d18, MOQ_LOC_PROFILE_01,
+                                     LOC_REV(MOQ_LOC_PROFILE_01) };
+static const loc_row_t k_row_d22 = { &k_codec_d18, MOQ_LOC_PROFILE_04,
+                                     LOC_REV(MOQ_LOC_PROFILE_04) |
+                                     LOC_REV(MOQ_LOC_PROFILE_05) };
 
 static const loc_row_t *loc_row_for(moq_version_t v)
 {
@@ -103,12 +116,20 @@ uint64_t moq_loc_value_max_for_version(moq_version_t transport_version)
 }
 
 /* The row for a (version, profile) pair, or NULL when the version is not
- * registered or the profile is not the revision registered for it. */
+ * registered or the profile is not a revision registered for it. */
 static const loc_row_t *loc_row_select(moq_version_t v, moq_loc_profile_t p)
 {
     const loc_row_t *row = loc_row_for(v);
-    if (!row || row->profile != p) return NULL;
+    if (!row || (unsigned)p == 0 || (unsigned)p > 31 ||
+        !(row->revisions & LOC_REV(p)))
+        return NULL;
     return row;
+}
+
+/* LOC-05 changes no LOC-04 property; it only adds the Codec String. */
+static bool loc_profile_is_loc04_family(moq_loc_profile_t p)
+{
+    return p == MOQ_LOC_PROFILE_04 || p == MOQ_LOC_PROFILE_05;
 }
 
 /* -- The bounded KVP walker ------------------------------------------
@@ -267,6 +288,8 @@ _Static_assert(sizeof(moq_loc_headers_t) == MOQ_LOC_HEADERS_V0_SIZE,
                "legacy LOC complete layout is frozen");
 _Static_assert(sizeof(moq_loc_metadata_t) == MOQ_LOC_METADATA_V0_SIZE,
                "metadata v0 includes its complete current layout");
+_Static_assert(sizeof(moq_loc_ext_t) == MOQ_LOC_EXT_V0_SIZE,
+               "extension v0 includes its complete first-published layout");
 
 void moq_loc_headers_init(moq_loc_headers_t *h)
 {
@@ -276,6 +299,14 @@ void moq_loc_headers_init(moq_loc_headers_t *h)
 }
 
 void moq_loc_metadata_init_sized(moq_loc_metadata_t *out, size_t size)
+{
+    if (!out || size < sizeof(uint32_t)) return;
+    size_t n = size < sizeof(*out) ? size : sizeof(*out);
+    memset(out, 0, n);
+    out->struct_size = (uint32_t)n;
+}
+
+void moq_loc_ext_init_sized(moq_loc_ext_t *out, size_t size)
 {
     if (!out || size < sizeof(uint32_t)) return;
     size_t n = size < sizeof(*out) ? size : sizeof(*out);
@@ -408,9 +439,18 @@ moq_result_t moq_loc_parse(moq_version_t transport_version,
 /* -- Lossless parse -------------------------------------------------- */
 
 static moq_result_t loc_metadata_item(moq_loc_profile_t profile,
-    const loc_kvp_item_t *item, moq_loc_metadata_t *out)
+    const loc_kvp_item_t *item, moq_loc_metadata_t *out, moq_loc_ext_t *ext)
 {
-    bool loc04 = profile == MOQ_LOC_PROFILE_04;
+    bool loc04 = loc_profile_is_loc04_family(profile);
+    if (profile == MOQ_LOC_PROFILE_05 && item->type == LOC05_CODEC_STRING) {
+        if (ext->present & MOQ_LOC_EXT_HAS_CODEC_STRING)
+            return MOQ_ERR_UNSUPPORTED;
+        if (!moq_loc_internal_codec_string_ok(item->bytes, item->bytes_len))
+            return MOQ_ERR_PROTO;
+        ext->codec_string = (moq_bytes_t){item->bytes, item->bytes_len};
+        ext->present |= MOQ_LOC_EXT_HAS_CODEC_STRING;
+        return MOQ_OK;
+    }
     uint32_t flag = 0;
     if (item->type == (loc04 ? LOC04_TIMESTAMP : LOC01_CAPTURE_TIMESTAMP))
         flag = MOQ_LOC_METADATA_HAS_TIMESTAMP;
@@ -467,15 +507,41 @@ static moq_result_t loc_metadata_item(moq_loc_profile_t profile,
     return MOQ_OK;
 }
 
+/* Whether two caller output ranges share a byte. */
+static bool loc_ranges_overlap(const void *a, size_t a_len,
+                               const void *b, size_t b_len)
+{
+    uintptr_t pa = (uintptr_t)a, pb = (uintptr_t)b;
+    return pa < pb + b_len && pb < pa + a_len;
+}
+
 moq_result_t moq_loc_parse_metadata(moq_version_t transport_version,
     moq_loc_profile_t profile, moq_bytes_t properties,
     moq_loc_metadata_t *out, size_t out_size)
+{
+    return moq_loc_parse_metadata_ex(transport_version, profile, properties,
+                                     out, out_size, NULL, 0);
+}
+
+moq_result_t moq_loc_parse_metadata_ex(moq_version_t transport_version,
+    moq_loc_profile_t profile, moq_bytes_t properties,
+    moq_loc_metadata_t *out, size_t out_size,
+    moq_loc_ext_t *ext, size_t ext_size)
 {
     const loc_row_t *row = loc_row_select(transport_version, profile);
     if (!row || !out || out_size < MOQ_LOC_METADATA_V0_SIZE ||
         (properties.len > 0 && !properties.data))
         return MOQ_ERR_INVAL;
+    size_t out_n = out_size < sizeof(moq_loc_metadata_t) ?
+        out_size : sizeof(moq_loc_metadata_t);
+    size_t ext_n = 0;
+    if (ext) {
+        if (ext_size < MOQ_LOC_EXT_V0_SIZE) return MOQ_ERR_INVAL;
+        ext_n = ext_size < sizeof(moq_loc_ext_t) ? ext_size : sizeof(moq_loc_ext_t);
+        if (loc_ranges_overlap(out, out_n, ext, ext_n)) return MOQ_ERR_INVAL;
+    }
     moq_loc_metadata_t tmp = {0};
+    moq_loc_ext_t tmp_ext = {0};
     loc_kvp_walker_t outer;
     loc_kvp_walker_init(&outer, row->codec, properties.data, properties.len);
     loc_kvp_item_t item;
@@ -488,19 +554,22 @@ moq_result_t moq_loc_parse_metadata(moq_version_t transport_version,
             loc_kvp_walker_init(&inner, row->codec, item.bytes, item.bytes_len);
             while ((rc = loc_kvp_next(&inner, &item)) == MOQ_OK) {
                 if (item.type == 0x0b) return MOQ_ERR_PROTO;
-                rc = loc_metadata_item(profile, &item, &tmp);
+                rc = loc_metadata_item(profile, &item, &tmp, &tmp_ext);
                 if (rc < 0) return rc;
             }
             if (rc != MOQ_DONE) return rc;
         } else {
-            rc = loc_metadata_item(profile, &item, &tmp);
+            rc = loc_metadata_item(profile, &item, &tmp, &tmp_ext);
             if (rc < 0) return rc;
         }
     }
     if (rc != MOQ_DONE) return rc;
-    size_t n = out_size < sizeof(tmp) ? out_size : sizeof(tmp);
-    tmp.struct_size = (uint32_t)n;
-    memcpy(out, &tmp, n);
+    tmp.struct_size = (uint32_t)out_n;
+    memcpy(out, &tmp, out_n);
+    if (ext) {
+        tmp_ext.struct_size = (uint32_t)ext_n;
+        memcpy(ext, &tmp_ext, ext_n);
+    }
     return MOQ_OK;
 }
 
@@ -591,6 +660,15 @@ moq_result_t moq_loc_encode_metadata(const moq_alloc_t *alloc,
     moq_version_t transport_version, moq_loc_profile_t profile,
     const moq_loc_metadata_t *in, moq_rcbuf_t **out_properties)
 {
+    return moq_loc_encode_metadata_ex(alloc, transport_version, profile, in,
+                                      NULL, out_properties);
+}
+
+moq_result_t moq_loc_encode_metadata_ex(const moq_alloc_t *alloc,
+    moq_version_t transport_version, moq_loc_profile_t profile,
+    const moq_loc_metadata_t *in, const moq_loc_ext_t *ext,
+    moq_rcbuf_t **out_properties)
+{
     const loc_row_t *row = loc_row_select(transport_version, profile);
     if (!row || !alloc || !alloc->alloc || !alloc->free || !in || !out_properties ||
         in->struct_size < MOQ_LOC_METADATA_V0_SIZE)
@@ -598,7 +676,16 @@ moq_result_t moq_loc_encode_metadata(const moq_alloc_t *alloc,
     if ((in->present & ~MOQ_LOC_METADATA_PRESENT_MASK) ||
         in->reserved[0] || in->reserved[1])
         return MOQ_ERR_INVAL;
-    bool loc04 = profile == MOQ_LOC_PROFILE_04;
+    if (ext && (ext->struct_size < MOQ_LOC_EXT_V0_SIZE ||
+                (ext->present & ~MOQ_LOC_EXT_PRESENT_MASK)))
+        return MOQ_ERR_INVAL;
+    bool codec = ext && (ext->present & MOQ_LOC_EXT_HAS_CODEC_STRING);
+    if (codec && profile != MOQ_LOC_PROFILE_05) return MOQ_ERR_UNSUPPORTED;
+    if (codec && (ext->codec_string.len > LOC_KVP_MAX_VALUE_LEN ||
+                  !moq_loc_internal_codec_string_ok(ext->codec_string.data,
+                                                    ext->codec_string.len)))
+        return MOQ_ERR_INVAL;
+    bool loc04 = loc_profile_is_loc04_family(profile);
     if (!loc04 && (in->present & (MOQ_LOC_METADATA_HAS_TIMESCALE | MOQ_LOC_METADATA_HAS_AUDIO_CONFIG)))
         return MOQ_ERR_UNSUPPORTED;
     if (((in->present & MOQ_LOC_METADATA_HAS_TIMESTAMP) && in->timestamp > row->codec->max_value) ||
@@ -611,7 +698,7 @@ moq_result_t moq_loc_encode_metadata(const moq_alloc_t *alloc,
         in->marking_len > 1 && in->marking[0] == 0)
         return MOQ_ERR_UNSUPPORTED;
 
-    loc_kvp_item_t props[6];
+    loc_kvp_item_t props[7];
     size_t count = 0;
     if (!loc04 && (in->present & MOQ_LOC_METADATA_HAS_TIMESTAMP))
         props[count++] = (loc_kvp_item_t){.type = LOC01_CAPTURE_TIMESTAMP,
@@ -643,5 +730,8 @@ moq_result_t moq_loc_encode_metadata(const moq_alloc_t *alloc,
     if (loc04 && (in->present & MOQ_LOC_METADATA_HAS_TIMESTAMP))
         props[count++] = (loc_kvp_item_t){.type = LOC04_TIMESTAMP,
             .is_varint = true, .value = in->timestamp};
+    if (codec)
+        props[count++] = (loc_kvp_item_t){.type = LOC05_CODEC_STRING,
+            .bytes = ext->codec_string.data, .bytes_len = ext->codec_string.len};
     return loc_encode_items(alloc, row->codec, props, count, out_properties);
 }

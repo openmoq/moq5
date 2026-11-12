@@ -316,7 +316,7 @@ fn metadata_and_track_properties_arrive_with_the_objects() {
     assert_eq!(
         info.companion_profile,
         if d22() {
-            CompanionProfile::D22Msf01Loc04Public
+            CompanionProfile::D22Msf01Loc05Public
         } else {
             CompanionProfile::LegacyMsf01Loc01
         }

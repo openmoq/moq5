@@ -30,13 +30,17 @@
  * both, so a codec confusion is invisible below 64 and produces wrong
  * bytes at or above it.
  *
- * Supported explicit pairs are LOC-01 with D16/18 and LOC-04 with D22.
+ * Supported explicit pairs are LOC-01 with D16/18, and LOC-04 or LOC-05
+ * with D22. LOC-05 is LOC-04 plus the Codec String property (0x11); its
+ * other property definitions are unchanged, and its Key-Value-Pair grammar
+ * is draft-22 section 8.3's. Pairing it with draft 22 claims nothing about
+ * draft 23. The LOC revision is not negotiated, so the caller names it.
  * There is no default: an unsupported or unknown
  * version -- including 0 -- FAILS CLOSED with MOQ_ERR_INVAL rather than
  * guessing a codec, and so does a revision paired with a version it is not
- * registered for (LOC-01 ids on draft 22, LOC-04 ids on draft 16 or 18).
- * A future draft becomes usable here only when its row is deliberately
- * registered in the table.
+ * registered for (LOC-01 ids on draft 22, LOC-04 or LOC-05 ids on draft 16
+ * or 18). A future draft becomes usable here only when its row is
+ * deliberately registered in the table.
  */
 
 #include <stddef.h>
@@ -54,6 +58,7 @@ typedef enum moq_loc_profile {
     MOQ_LOC_PROFILE_01 = 1,  /* draft-ietf-moq-loc-01: drafts 16 and 18 */
     MOQ_LOC_PROFILE_02 = 2,  /* draft-ietf-moq-loc-02; reserved, never selected */
     MOQ_LOC_PROFILE_04 = 4,  /* draft-ietf-moq-loc-04: draft 22 */
+    MOQ_LOC_PROFILE_05 = 5,  /* draft-ietf-moq-loc-05: draft 22 */
 } moq_loc_profile_t;
 
 /*
@@ -62,7 +67,9 @@ typedef enum moq_loc_profile {
  * drafts 16 and 18, MOQ_LOC_PROFILE_04 for draft 22, and 0 for a version
  * the table does not register (including 0). This is the single place
  * the compatibility mapping lives. This is not companion opt-in or proof that
- * an unconverted media/service caller supports D22. Pure function.
+ * an unconverted media/service caller supports D22. It is not the latest
+ * revision for a draft either: LOC-05 is selected only by naming it. Pure
+ * function.
  */
 MOQ_API moq_loc_profile_t moq_loc_profile_for_version(
     moq_version_t transport_version);
@@ -195,6 +202,8 @@ MOQ_API moq_result_t moq_loc_encode(const moq_alloc_t *alloc,
 #define MOQ_LOC_METADATA_HAS_AUDIO_CONFIG UINT32_C(0x20)
 #define MOQ_LOC_METADATA_PRESENT_MASK     UINT32_C(0x3f)
 
+/* Complete and frozen: embedded by value in moq_media_metadata_t, so it never
+ * grows. Properties registered after LOC-04 are reported in moq_loc_ext_t. */
 typedef struct moq_loc_metadata {
     uint32_t struct_size;
     uint32_t present;
@@ -215,7 +224,10 @@ typedef struct moq_loc_metadata {
 /* Clears/stamps min(size, library size); size < 4 writes nothing. */
 MOQ_API void moq_loc_metadata_init_sized(moq_loc_metadata_t *out, size_t size);
 
-/* Explicit LOC01+D16/18 or LOC04+D22; unknown/mismatched pairs are INVAL.
+/* Explicit LOC01+D16/18, or LOC04 or LOC05 with D22; unknown/mismatched pairs
+ * are INVAL. Exactly moq_loc_parse_metadata_ex with ext NULL: on LOC05 the
+ * Codec String is still a known property, validated (and a duplicate refused)
+ * although this call does not report it.
  * No input output-stamp is required. Size below the full v0 floor or invalid
  * arguments => INVAL. Malformed KVP/known values => PROTO. A known field
  * repeated in one block (outer or inner immutable lists) => UNSUPPORTED,
@@ -230,7 +242,8 @@ MOQ_API moq_result_t moq_loc_parse_metadata(moq_version_t transport_version,
     moq_loc_profile_t profile, moq_bytes_t properties,
     moq_loc_metadata_t *out, size_t out_size);
 
-/* Requires input struct_size >= full v0; reads only the covered library prefix.
+/* Exactly moq_loc_encode_metadata_ex with ext NULL.
+ * Requires input struct_size >= full v0; reads only the covered library prefix.
  * Unknown present bits, reserved bytes, invalid spans/marking lengths or an
  * unrepresentable integer => INVAL, before allocation. LOC01 timescale/audio
  * config, or multi-byte marking with an unrepresentable leading zero, =>
@@ -242,6 +255,78 @@ MOQ_API moq_result_t moq_loc_parse_metadata(moq_version_t transport_version,
 MOQ_API moq_result_t moq_loc_encode_metadata(const moq_alloc_t *alloc,
     moq_version_t transport_version, moq_loc_profile_t profile,
     const moq_loc_metadata_t *in, moq_rcbuf_t **out_properties);
+
+/* -- Properties beyond the frozen metadata record --------------------- */
+
+#define MOQ_LOC_EXT_HAS_CODEC_STRING UINT32_C(0x01)
+#define MOQ_LOC_EXT_PRESENT_MASK     UINT32_C(0x01)
+
+/*
+ * LOC properties registered after LOC-04. Never embedded by value in another
+ * public record, so it grows by appending; every field is read or written only
+ * when struct_size covers all of it.
+ *
+ * codec_string: the LOC-05 Codec String (draft-ietf-moq-loc-05 2.3.1.3), the
+ * WebCodecs codec string of the track or object. Exact bytes, BORROWED, not
+ * NUL-terminated, never normalized or trimmed. A present value is well-formed
+ * UTF-8 (RFC 3629) and a usable identifier: not empty, not only ASCII
+ * whitespace (U+0009, U+000A, U+000C, U+000D, U+0020), and free of U+0000.
+ * Nothing else is checked: an identifier the library accepts is not a claim
+ * that any decoder recognizes or supports it, and there is no codec list.
+ */
+typedef struct moq_loc_ext {
+    uint32_t    struct_size;
+    uint32_t    present;        /* MOQ_LOC_EXT_HAS_* */
+    moq_bytes_t codec_string;
+} moq_loc_ext_t;
+
+/* Complete first-published extent, including codec_string. Future fields
+ * never raise this floor. */
+#define MOQ_LOC_EXT_V0_SIZE \
+    (offsetof(moq_loc_ext_t, codec_string) + sizeof(moq_bytes_t))
+
+/* Clears/stamps min(size, library size); NULL or size < 4 writes nothing. */
+MOQ_API void moq_loc_ext_init_sized(moq_loc_ext_t *out, size_t size);
+
+/*
+ * moq_loc_parse_metadata, also reporting the properties moq_loc_ext_t holds.
+ *
+ * One bounded walk validates the whole block for the selected revision, as
+ * moq_loc_parse_metadata does. On LOC05 the Codec String (0x11) is known in
+ * both the mutable list and the Immutable Properties list: malformed UTF-8 or
+ * an unusable identifier is PROTO, and a second occurrence anywhere in the
+ * block is UNSUPPORTED. On LOC01/04 0x11 is an unknown property and is
+ * skipped, as before; ext then reports nothing.
+ *
+ * ext NULL omits that report and ext_size is not read; validation is the same.
+ * A non-NULL ext needs ext_size >= MOQ_LOC_EXT_V0_SIZE and must not overlap the
+ * bytes out receives; otherwise INVAL. On success only, out receives
+ * min(out_size, library size) and ext min(ext_size, library size), each
+ * stamped; any failure leaves both untouched. codec_string borrows the ORIGINAL
+ * property bytes, including an immutable inner offset; the caller keeps that
+ * backing for as long as the span is used. No allocation or cleanup.
+ */
+MOQ_API moq_result_t moq_loc_parse_metadata_ex(moq_version_t transport_version,
+    moq_loc_profile_t profile, moq_bytes_t properties,
+    moq_loc_metadata_t *out, size_t out_size,
+    moq_loc_ext_t *ext, size_t ext_size);
+
+/*
+ * moq_loc_encode_metadata, also emitting the properties moq_loc_ext_t holds.
+ *
+ * ext NULL is exactly moq_loc_encode_metadata. A non-NULL ext needs
+ * struct_size >= MOQ_LOC_EXT_V0_SIZE and only known present bits, or INVAL. A
+ * present Codec String on LOC01 or LOC04 is UNSUPPORTED: it is never dropped.
+ * On LOC05 it must be a usable identifier as moq_loc_ext_t describes, at most
+ * 65535 bytes, with a coherent span; otherwise INVAL. Every refusal happens
+ * before allocation and leaves *out_properties untouched. The Codec String
+ * follows the moq_loc_metadata_t keys (0x11 is the highest LOC id), with its
+ * bytes copied exactly; spans are borrowed for this call only.
+ */
+MOQ_API moq_result_t moq_loc_encode_metadata_ex(const moq_alloc_t *alloc,
+    moq_version_t transport_version, moq_loc_profile_t profile,
+    const moq_loc_metadata_t *in, const moq_loc_ext_t *ext,
+    moq_rcbuf_t **out_properties);
 
 #ifdef __cplusplus
 }

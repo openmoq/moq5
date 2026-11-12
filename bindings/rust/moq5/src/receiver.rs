@@ -1251,6 +1251,27 @@ impl MediaObject {
         }
         ObjectMetadata::from_raw(&self.raw.metadata)
     }
+    /// The effective LOC-05 Codec String (the object's own, else its
+    /// track's), borrowed from the object: exact bytes the library has
+    /// checked to be UTF-8 and a usable identifier, never normalized. `None`
+    /// when there is none, on any companion but LOC-05, or when the library
+    /// did not report the block. Accepted is not supported: no decoder is
+    /// consulted.
+    #[must_use]
+    pub fn codec_string(&self) -> Option<&str> {
+        let reported = self.covers(ffi::field_end!(
+            sys::moq_media_object_t,
+            codec_string,
+            sys::moq_bytes_t
+        ));
+        if !reported || self.raw.loc_ext_present & sys::MOQ_LOC_EXT_HAS_CODEC_STRING == 0 {
+            return None;
+        }
+        // SAFETY: the span borrows the object's properties or its private
+        // track properties, both owned by the object until cleanup.
+        let bytes = unsafe { ffi::bytes(self.raw.codec_string) };
+        std::str::from_utf8(bytes).ok()
+    }
     /// The track properties the subscription's acknowledgment carried
     /// (draft 22), the object's own copy, raw in the negotiated draft's
     /// encoding; `None` for an empty block, a draft-16/18 object, or when

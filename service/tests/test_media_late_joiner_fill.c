@@ -887,6 +887,245 @@ static void test_completion_order(moq_version_t ver, co_mode_t mode)
                 (unsigned long long)seed, failures - before);
 }
 
+/* -- LOC-05 Codec Strings through a real sender and receiver --------------
+ * An explicit LOC-05 sender states the catalog codec as the track's Codec
+ * String and gives one object its own; the receiver reports each object's
+ * effective Codec String (its own, else its track's) and, in a build with
+ * playback, the engine configures each object's decoder with that codec and a
+ * configuration declared for it. */
+#if defined(LJ_HAVE_PLAYBACK)
+#include <moq/playback.h>
+#endif
+#define E2E_TRACK_CODEC "avc1.64001f"
+#define E2E_OBJECT_CODEC "avc1.640028"
+
+static moq_result_t write05(moq_media_sender_t *s, moq_media_track_t *t,
+                            const moq_alloc_t *alloc, uint8_t tag, uint64_t ts,
+                            bool config, const char *codec, bool first, bool last)
+{
+    const uint8_t bytes[4] = { tag, 2, 3, 4 };
+    static const uint8_t cfg_a[3] = { 0xA1, 1, 2 };
+    moq_rcbuf_t *p = NULL;
+    moq_result_t rc = moq_rcbuf_create(alloc, bytes, sizeof(bytes), &p);
+    MOQ_TEST_CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) return rc;
+    moq_media_metadata_t m = {0};
+    m.struct_size = sizeof(m);
+    moq_loc_metadata_init_sized(&m.loc, sizeof(m.loc));
+    m.loc.present = MOQ_LOC_METADATA_HAS_TIMESTAMP | MOQ_LOC_METADATA_HAS_MARKING;
+    m.loc.timestamp = ts;
+    m.loc.marking_len = 1;
+    m.loc.marking[0] = first ? 0x20 : 0x00;
+    if (config) {
+        m.loc.present |= MOQ_LOC_METADATA_HAS_VIDEO_CONFIG;
+        m.loc.video_config = (moq_bytes_t){ cfg_a, sizeof(cfg_a) };
+    }
+    moq_loc_ext_t ext;
+    moq_loc_ext_init_sized(&ext, sizeof(ext));
+    if (codec) {
+        ext.present = MOQ_LOC_EXT_HAS_CODEC_STRING;
+        ext.codec_string = (moq_bytes_t){ (const uint8_t *)codec, strlen(codec) };
+    }
+    moq_media_send_object_t o;
+    memset(&o, 0, sizeof(o));
+    o.struct_size = sizeof(o);
+    o.payload = p;
+    o.is_sync = o.starts_group = first;
+    o.ends_group = last;
+    o.metadata = &m;
+    o.loc_ext = codec ? &ext : NULL;
+    rc = moq_media_sender_write(s, t, &o);
+    if (rc != MOQ_OK) moq_rcbuf_decref(p);
+    return rc;
+}
+
+static void test_loc05_codec_end_to_end(void)
+{
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    moq_simpair_t *sp = pair(&alloc, MOQ_VERSION_DRAFT_22);
+    if (!sp) { MOQ_TEST_CHECK(as.balance == 0); return; }
+    moq_session_t *srv = moq_simpair_server(sp);
+    uint64_t now = moq_simpair_now_us(sp);
+    moq_media_receiver_t *r = NULL;
+    moq_media_object_t got[3];
+    size_t received = 0;
+    memset(got, 0, sizeof(got));
+    g_ns_parts[0] = MOQ_BYTES_LITERAL("svc");
+    g_ns_parts[1] = MOQ_BYTES_LITERAL("loc05");
+    moq_media_sender_cfg_t cfg;
+    moq_media_sender_cfg_init_live_sized(&cfg, sizeof(cfg));
+    cfg.companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
+    cfg.namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
+    moq_media_sender_t *s = moq_media_sender_test_new_cfg(&cfg);
+    MOQ_TEST_CHECK(s != NULL);
+    if (!s) goto cleanup;
+    static const uint8_t init[4] = { 0xC0, 9, 9, 9 };
+    moq_media_track_cfg_t tc;
+    moq_media_track_cfg_init_sized(&tc, sizeof(tc));
+    tc.name = MOQ_BYTES_LITERAL("v");
+    tc.media_type = MOQ_MEDIA_TYPE_VIDEO;
+    tc.packaging = MOQ_MEDIA_PACKAGING_RAW;
+    tc.codec = MOQ_BYTES_LITERAL(E2E_TRACK_CODEC);
+    tc.init_data = (moq_bytes_t){ init, sizeof(init) };
+    tc.bitrate = 1500000;
+    moq_loc_ext_t track_ext;
+    moq_loc_ext_init_sized(&track_ext, sizeof(track_ext));
+    track_ext.present = MOQ_LOC_EXT_HAS_CODEC_STRING;
+    track_ext.codec_string = tc.codec;
+    tc.track_loc_ext = &track_ext;
+    moq_media_track_t *v = NULL;
+    MOQ_TEST_CHECK(moq_media_sender_add_track(s, &tc, &v) == MOQ_OK);
+    if (!v) goto cleanup;
+    moq_event_t ev;
+    for (int cycle = 0; cycle < 12 && !moq_media_sender_is_ready(s); cycle++) {
+        if (!pump_sender(s, sp, now)) goto cleanup;
+        while (moq_session_poll_events(srv, &ev, 1) == 1) {
+            if (ev.kind == MOQ_EVENT_NAMESPACE_PUBLISHED) {
+                moq_accept_namespace_cfg_t ac; moq_accept_namespace_cfg_init(&ac);
+                MOQ_TEST_CHECK(moq_session_accept_namespace(srv,
+                    ev.u.namespace_published.ann, &ac, now) == MOQ_OK);
+            }
+            moq_event_cleanup(&ev);
+        }
+        if (!pump_sender(s, sp, now)) goto cleanup;
+    }
+    if (!moq_media_sender_is_ready(s)) { MOQ_TEST_CHECK(false); goto cleanup; }
+
+    moq_media_receiver_cfg_t rcfg;
+    moq_media_receiver_cfg_init_live_sized(&rcfg, sizeof(rcfg));
+    rcfg.companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
+    rcfg.namespace_ = (moq_namespace_t){ g_ns_parts, 2 };
+    rcfg.auto_subscribe = true;
+    r = moq_media_receiver_test_new_cfg(&rcfg);
+    MOQ_TEST_CHECK(r != NULL);
+    if (!r) goto cleanup;
+    moq_media_track_t *rv = NULL;
+    for (int cycle = 0; cycle < 24 && !moq_media_sender_track_has_subscriber(s, v); cycle++) {
+        if (!pump_both(s, r, sp, now)) goto cleanup;
+        moq_media_track_event_t te;
+        while (moq_media_receiver_poll_track(r, &te, sizeof(te)) == MOQ_OK)
+            if (te.kind == MOQ_MEDIA_TRACK_ADDED) rv = te.track;
+    }
+    MOQ_TEST_CHECK(rv != NULL && moq_media_sender_track_has_subscriber(s, v));
+    if (!rv) goto cleanup;
+
+    MOQ_TEST_CHECK_EQ_INT((int)write05(s, v, &alloc, 0, 1000, true, NULL, true, false), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)write05(s, v, &alloc, 1, 2000, false, E2E_OBJECT_CODEC, false, false),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)write05(s, v, &alloc, 2, 3000, true, NULL, false, true), (int)MOQ_OK);
+    for (int cycle = 0; cycle < 16 && received < 3; cycle++) {
+        if (!pump_both(s, r, sp, now)) goto cleanup;
+        moq_media_track_event_t te;
+        while (moq_media_receiver_poll_track(r, &te, sizeof(te)) == MOQ_OK) {}
+        while (received < 3 &&
+               moq_media_receiver_poll_object(r, &got[received], sizeof(got[0])) == MOQ_OK)
+            received++;
+    }
+    MOQ_TEST_CHECK(received == 3);
+    /* The track's Codec String reaches the peer in its Track Properties. */
+    static const uint8_t track_props[] = { 0x11, 0x0b, 'a', 'v', 'c', '1', '.', '6', '4',
+                                           '0', '0', '1', 'f' };
+    const char *want[3] = { E2E_TRACK_CODEC, E2E_OBJECT_CODEC, E2E_TRACK_CODEC };
+    for (size_t i = 0; i < received; i++) {
+        const moq_media_object_t *o = &got[i];
+        MOQ_TEST_CHECK(o->track_properties_ref &&
+                       moq_rcbuf_len(o->track_properties_ref) == sizeof(track_props) &&
+                       memcmp(moq_rcbuf_data(o->track_properties_ref), track_props,
+                              sizeof(track_props)) == 0);
+        MOQ_TEST_CHECK(o->loc_ext_present == MOQ_LOC_EXT_HAS_CODEC_STRING &&
+                       o->codec_string.len == strlen(want[i]) &&
+                       memcmp(o->codec_string.data, want[i], strlen(want[i])) == 0);
+    }
+#if defined(LJ_HAVE_PLAYBACK)
+    if (received == 3) {
+        moq_playback_cfg_t pcfg;
+        moq_playback_cfg_init(&pcfg);
+        /* As the media player configures it: the sender sets END_OF_GROUP
+         * on every subgroup header (one subgroup per group), so the bit on
+         * an object does not say that object closes its group. */
+        pcfg.ignore_eog_bit = true;
+        moq_playback_t *pb = NULL;
+        MOQ_TEST_CHECK(moq_playback_create(&alloc, &pcfg, &pb) == MOQ_OK);
+        moq_playback_track_cfg_t ptc;
+        moq_playback_track_cfg_init(&ptc);
+        ptc.media_type = MOQ_PLAYBACK_MEDIA_VIDEO;
+        ptc.packaging = MOQ_PLAYBACK_PACKAGING_RAW;
+        ptc.transport_version = (uint32_t)MOQ_VERSION_DRAFT_22;
+        ptc.codec = MOQ_BYTES_LITERAL(E2E_TRACK_CODEC);
+        ptc.init_data = (moq_bytes_t){ init, sizeof(init) };
+        moq_playback_track_t pt = MOQ_PLAYBACK_TRACK_INVALID;
+        MOQ_TEST_CHECK(pb && moq_playback_add_track(pb, &ptc, &pt) == MOQ_OK);
+        for (size_t i = 0; pb && i < 3; i++) {
+            const moq_media_object_t *o = &got[i];
+            moq_media_parsed_object_t po;
+            moq_media_parsed_object_init_sized(&po, sizeof(po));
+            po.packaging = o->packaging; po.status = o->status;
+            po.end_of_group = o->end_of_group; po.keyframe = o->keyframe;
+            po.has_capture_time = o->has_capture_time; po.capture_time_us = o->capture_time_us;
+            po.decode_time_us = o->decode_time_us;
+            po.composition_offset_us = o->composition_offset_us;
+            po.presentation_time_us = o->presentation_time_us;
+            po.payload = o->payload; po.sap_type = MOQ_SAP_UNKNOWN;
+            po.metadata = o->metadata;
+            po.loc_ext_present = o->loc_ext_present;
+            po.codec_string = o->codec_string;
+            moq_playback_parsed_input_t in;
+            moq_playback_parsed_input_init(&in);
+            in.track = pt; in.group_id = o->group_id; in.object_id = o->object_id;
+            in.parsed = &po; in.payload = o->payload_ref;
+            MOQ_TEST_CHECK(moq_playback_push_parsed(pb, &in, now) == MOQ_OK);
+        }
+        if (pb) {
+            MOQ_TEST_CHECK(moq_playback_tick(pb, now) == MOQ_OK);
+            /* CONFIGURE(track codec, A), decode; CONFIGURE(object codec, no
+             * bytes: none was declared for it), decode; CONFIGURE(track
+             * codec, A), decode. */
+            static const struct { bool configure; const char *codec; bool cfg; } seq[] = {
+                {true, E2E_TRACK_CODEC, true}, {false, NULL, false},
+                {true, E2E_OBJECT_CODEC, false}, {false, NULL, false},
+                {true, E2E_TRACK_CODEC, true}, {false, NULL, false},
+            };
+            size_t n = 0;
+            moq_playback_cmd_t c;
+            while (moq_playback_poll_command(pb, &c, sizeof(c)) == MOQ_OK) {
+                if (n < 6) {
+                    bool configure = c.kind == MOQ_PLAYBACK_CMD_CONFIGURE_VIDEO;
+                    MOQ_TEST_CHECK(configure == seq[n].configure);
+                    if (configure) {
+                        moq_rcbuf_t *codec = c.u.configure_video.codec;
+                        moq_rcbuf_t *config = c.u.configure_video.codec_config;
+                        MOQ_TEST_CHECK(codec && moq_rcbuf_len(codec) == strlen(seq[n].codec) &&
+                                       memcmp(moq_rcbuf_data(codec), seq[n].codec,
+                                              strlen(seq[n].codec)) == 0);
+                        MOQ_TEST_CHECK(seq[n].cfg ? config && moq_rcbuf_data(config)[0] == 0xA1
+                                                  : config == NULL);
+                    } else {
+                        MOQ_TEST_CHECK(c.kind == MOQ_PLAYBACK_CMD_DECODE_VIDEO);
+                    }
+                }
+                n++;
+                moq_playback_cmd_cleanup(&c);
+            }
+            MOQ_TEST_CHECK(n == 6);
+            moq_playback_destroy(pb);
+        }
+    }
+#endif
+cleanup:
+    for (size_t i = 0; i < received; i++) moq_media_object_cleanup(&got[i]);
+    if (r) moq_media_receiver_test_destroy_with_session(r, srv, now);
+    moq_media_sender_test_free(s);
+    moq_event_t e;
+    while (moq_session_poll_events(moq_simpair_client(sp), &e, 1) == 1)
+        moq_event_cleanup(&e);
+    while (moq_session_poll_events(srv, &e, 1) == 1)
+        moq_event_cleanup(&e);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("loc05_codec_end_to_end");
+}
+
 int main(void)
 {
     test_late_joiner_fill_d22(false);
@@ -894,6 +1133,7 @@ int main(void)
     test_late_joiner_fetch_d18();
     test_track_timescale_capture_d22(false);
     test_track_timescale_capture_d22(true);
+    test_loc05_codec_end_to_end();
     static const moq_version_t co_versions[] = {
         MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_22 };
     for (size_t i = 0; i < sizeof(co_versions) / sizeof(co_versions[0]); i++) {

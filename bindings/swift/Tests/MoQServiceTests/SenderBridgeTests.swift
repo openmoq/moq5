@@ -34,6 +34,7 @@ struct SenderConfigurationMappingTests {
                 case .automatic: expected = moq_swift_media_companion_auto()
                 case .legacyMSF01LOC01: expected = moq_swift_media_companion_legacy()
                 case .draft22MSF01LOC04Public: expected = moq_swift_media_companion_d22_public()
+                case .draft22MSF01LOC05Public: expected = moq_swift_media_companion_d22_loc05_public()
                 }
                 #expect(cfg.companion_profile == expected)
                 #expect(cfg.struct_size == MemoryLayout<moq_media_sender_cfg_t>.size)

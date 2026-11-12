@@ -3,7 +3,7 @@
 // scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: 406aa0af99b0 (native headers modified in the worktree)
+// libmoq commit: 285990238a58 (native headers modified in the worktree)
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -10336,12 +10336,14 @@ pub const MOQ_LOC_PROFILE_01: moq_loc_profile = 1;
 pub const MOQ_LOC_PROFILE_02: moq_loc_profile = 2;
 #[doc = " draft-ietf-moq-loc-04: draft 22"]
 pub const MOQ_LOC_PROFILE_04: moq_loc_profile = 4;
+#[doc = " draft-ietf-moq-loc-05: draft 22"]
+pub const MOQ_LOC_PROFILE_05: moq_loc_profile = 5;
 #[doc = " -- LOC profile selection --------------------------------------------"]
 pub type moq_loc_profile = ::std::os::raw::c_uint;
 #[doc = " -- LOC profile selection --------------------------------------------"]
 pub use self::moq_loc_profile as moq_loc_profile_t;
 unsafe extern "C" {
-    #[doc = " Compatibility selector retained pending migration of existing callers:\n MOQ_LOC_PROFILE_01 for\n drafts 16 and 18, MOQ_LOC_PROFILE_04 for draft 22, and 0 for a version\n the table does not register (including 0). This is the single place\n the compatibility mapping lives. This is not companion opt-in or proof that\n an unconverted media/service caller supports D22. Pure function."]
+    #[doc = " Compatibility selector retained pending migration of existing callers:\n MOQ_LOC_PROFILE_01 for\n drafts 16 and 18, MOQ_LOC_PROFILE_04 for draft 22, and 0 for a version\n the table does not register (including 0). This is the single place\n the compatibility mapping lives. This is not companion opt-in or proof that\n an unconverted media/service caller supports D22. It is not the latest\n revision for a draft either: LOC-05 is selected only by naming it. Pure\n function."]
     pub fn moq_loc_profile_for_version(transport_version: moq_version_t) -> moq_loc_profile_t;
 }
 unsafe extern "C" {
@@ -10491,6 +10493,7 @@ unsafe extern "C" {
         out_properties: *mut *mut moq_rcbuf_t,
     ) -> moq_result_t;
 }
+#[doc = " Complete and frozen: embedded by value in moq_media_metadata_t, so it never\n grows. Properties registered after LOC-04 are reported in moq_loc_ext_t."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct moq_loc_metadata {
@@ -10544,6 +10547,7 @@ impl Default for moq_loc_metadata {
         }
     }
 }
+#[doc = " Complete and frozen: embedded by value in moq_media_metadata_t, so it never\n grows. Properties registered after LOC-04 are reported in moq_loc_ext_t."]
 pub type moq_loc_metadata_t = moq_loc_metadata;
 unsafe extern "C" {
     #[doc = " Clears/stamps min(size, library size); size < 4 writes nothing."]
@@ -10551,7 +10555,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Explicit LOC01+D16/18 or LOC04+D22; unknown/mismatched pairs are INVAL.\n No input output-stamp is required. Size below the full v0 floor or invalid\n arguments => INVAL. Malformed KVP/known values => PROTO. A known field\n repeated in one block (outer or inner immutable lists) => UNSUPPORTED,\n even for equal values. Unknown well-formed fields are skipped.\n Success alone copies/stamps min(out_size, library size); any failure leaves\n the entire caller output untouched. Configs borrow ORIGINAL property bytes,\n including immutable inner offsets; their presence may have length zero.\n The caller retains that backing for as long as either span is used.\n LOC01 integer marking is represented as minimal big-endian payload bytes;\n LOC04 preserves all 1..4 bytes verbatim. No owned resource or cleanup."]
+    #[doc = " Explicit LOC01+D16/18, or LOC04 or LOC05 with D22; unknown/mismatched pairs\n are INVAL. Exactly moq_loc_parse_metadata_ex with ext NULL: on LOC05 the\n Codec String is still a known property, validated (and a duplicate refused)\n although this call does not report it.\n No input output-stamp is required. Size below the full v0 floor or invalid\n arguments => INVAL. Malformed KVP/known values => PROTO. A known field\n repeated in one block (outer or inner immutable lists) => UNSUPPORTED,\n even for equal values. Unknown well-formed fields are skipped.\n Success alone copies/stamps min(out_size, library size); any failure leaves\n the entire caller output untouched. Configs borrow ORIGINAL property bytes,\n including immutable inner offsets; their presence may have length zero.\n The caller retains that backing for as long as either span is used.\n LOC01 integer marking is represented as minimal big-endian payload bytes;\n LOC04 preserves all 1..4 bytes verbatim. No owned resource or cleanup."]
     pub fn moq_loc_parse_metadata(
         transport_version: moq_version_t,
         profile: moq_loc_profile_t,
@@ -10562,12 +10566,72 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Requires input struct_size >= full v0; reads only the covered library prefix.\n Unknown present bits, reserved bytes, invalid spans/marking lengths or an\n unrepresentable integer => INVAL, before allocation. LOC01 timescale/audio\n config, or multi-byte marking with an unrepresentable leading zero, =>\n UNSUPPORTED (no lossy fallback). Raw timestamp/scale zero/MAX remain metadata,\n not a usable service-clock promise. Emits sorted mutable keys into one owned\n rcbuf; does not concatenate/rewrite raw immutable blocks. On success only,\n publishes *out_properties (NULL for no fields); NOMEM or any other refusal\n leaves it untouched. Configs are borrowed for this call only."]
+    #[doc = " Exactly moq_loc_encode_metadata_ex with ext NULL.\n Requires input struct_size >= full v0; reads only the covered library prefix.\n Unknown present bits, reserved bytes, invalid spans/marking lengths or an\n unrepresentable integer => INVAL, before allocation. LOC01 timescale/audio\n config, or multi-byte marking with an unrepresentable leading zero, =>\n UNSUPPORTED (no lossy fallback). Raw timestamp/scale zero/MAX remain metadata,\n not a usable service-clock promise. Emits sorted mutable keys into one owned\n rcbuf; does not concatenate/rewrite raw immutable blocks. On success only,\n publishes *out_properties (NULL for no fields); NOMEM or any other refusal\n leaves it untouched. Configs are borrowed for this call only."]
     pub fn moq_loc_encode_metadata(
         alloc: *const moq_alloc_t,
         transport_version: moq_version_t,
         profile: moq_loc_profile_t,
         in_: *const moq_loc_metadata_t,
+        out_properties: *mut *mut moq_rcbuf_t,
+    ) -> moq_result_t;
+}
+#[doc = " LOC properties registered after LOC-04. Never embedded by value in another\n public record, so it grows by appending; every field is read or written only\n when struct_size covers all of it.\n\n codec_string: the LOC-05 Codec String (draft-ietf-moq-loc-05 2.3.1.3), the\n WebCodecs codec string of the track or object. Exact bytes, BORROWED, not\n NUL-terminated, never normalized or trimmed. A present value is well-formed\n UTF-8 (RFC 3629) and a usable identifier: not empty, not only ASCII\n whitespace (U+0009, U+000A, U+000C, U+000D, U+0020), and free of U+0000.\n Nothing else is checked: an identifier the library accepts is not a claim\n that any decoder recognizes or supports it, and there is no codec list."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct moq_loc_ext {
+    pub struct_size: u32,
+    #[doc = " MOQ_LOC_EXT_HAS_*"]
+    pub present: u32,
+    pub codec_string: moq_bytes_t,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of moq_loc_ext"][::std::mem::size_of::<moq_loc_ext>() - 24usize];
+    ["Alignment of moq_loc_ext"][::std::mem::align_of::<moq_loc_ext>() - 8usize];
+    ["Offset of field: moq_loc_ext::struct_size"]
+        [::std::mem::offset_of!(moq_loc_ext, struct_size) - 0usize];
+    ["Offset of field: moq_loc_ext::present"]
+        [::std::mem::offset_of!(moq_loc_ext, present) - 4usize];
+    ["Offset of field: moq_loc_ext::codec_string"]
+        [::std::mem::offset_of!(moq_loc_ext, codec_string) - 8usize];
+};
+impl Default for moq_loc_ext {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " LOC properties registered after LOC-04. Never embedded by value in another\n public record, so it grows by appending; every field is read or written only\n when struct_size covers all of it.\n\n codec_string: the LOC-05 Codec String (draft-ietf-moq-loc-05 2.3.1.3), the\n WebCodecs codec string of the track or object. Exact bytes, BORROWED, not\n NUL-terminated, never normalized or trimmed. A present value is well-formed\n UTF-8 (RFC 3629) and a usable identifier: not empty, not only ASCII\n whitespace (U+0009, U+000A, U+000C, U+000D, U+0020), and free of U+0000.\n Nothing else is checked: an identifier the library accepts is not a claim\n that any decoder recognizes or supports it, and there is no codec list."]
+pub type moq_loc_ext_t = moq_loc_ext;
+unsafe extern "C" {
+    #[doc = " Clears/stamps min(size, library size); NULL or size < 4 writes nothing."]
+    pub fn moq_loc_ext_init_sized(out: *mut moq_loc_ext_t, size: usize);
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " moq_loc_parse_metadata, also reporting the properties moq_loc_ext_t holds.\n\n One bounded walk validates the whole block for the selected revision, as\n moq_loc_parse_metadata does. On LOC05 the Codec String (0x11) is known in\n both the mutable list and the Immutable Properties list: malformed UTF-8 or\n an unusable identifier is PROTO, and a second occurrence anywhere in the\n block is UNSUPPORTED. On LOC01/04 0x11 is an unknown property and is\n skipped, as before; ext then reports nothing.\n\n ext NULL omits that report and ext_size is not read; validation is the same.\n A non-NULL ext needs ext_size >= MOQ_LOC_EXT_V0_SIZE and must not overlap the\n bytes out receives; otherwise INVAL. On success only, out receives\n min(out_size, library size) and ext min(ext_size, library size), each\n stamped; any failure leaves both untouched. codec_string borrows the ORIGINAL\n property bytes, including an immutable inner offset; the caller keeps that\n backing for as long as the span is used. No allocation or cleanup."]
+    pub fn moq_loc_parse_metadata_ex(
+        transport_version: moq_version_t,
+        profile: moq_loc_profile_t,
+        properties: moq_bytes_t,
+        out: *mut moq_loc_metadata_t,
+        out_size: usize,
+        ext: *mut moq_loc_ext_t,
+        ext_size: usize,
+    ) -> moq_result_t;
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " moq_loc_encode_metadata, also emitting the properties moq_loc_ext_t holds.\n\n ext NULL is exactly moq_loc_encode_metadata. A non-NULL ext needs\n struct_size >= MOQ_LOC_EXT_V0_SIZE and only known present bits, or INVAL. A\n present Codec String on LOC01 or LOC04 is UNSUPPORTED: it is never dropped.\n On LOC05 it must be a usable identifier as moq_loc_ext_t describes, at most\n 65535 bytes, with a coherent span; otherwise INVAL. Every refusal happens\n before allocation and leaves *out_properties untouched. The Codec String\n follows the moq_loc_metadata_t keys (0x11 is the highest LOC id), with its\n bytes copied exactly; spans are borrowed for this call only."]
+    pub fn moq_loc_encode_metadata_ex(
+        alloc: *const moq_alloc_t,
+        transport_version: moq_version_t,
+        profile: moq_loc_profile_t,
+        in_: *const moq_loc_metadata_t,
+        ext: *const moq_loc_ext_t,
         out_properties: *mut *mut moq_rcbuf_t,
     ) -> moq_result_t;
 }
@@ -10579,7 +10643,7 @@ pub const MOQ_MEDIA_TYPE_VIDEO: moq_media_type = 1;
 pub const MOQ_MEDIA_TYPE_AUDIO: moq_media_type = 2;
 pub type moq_media_type = ::std::os::raw::c_uint;
 pub use self::moq_media_type as moq_media_type_t;
-#[doc = " Fixed-width shared types. LEGACY_MSF01_LOC01 pairs with drafts 16/18 and\n D22_MSF01_LOC04_PUBLIC with draft 22. AUTO is for the service sender and\n receiver configs (their default): it resolves to whichever of the two\n matches the session's negotiated draft. The object parser takes a resolved\n companion and refuses AUTO. Values are never renumbered."]
+#[doc = " Fixed-width shared types. LEGACY_MSF01_LOC01 pairs with drafts 16/18;\n D22_MSF01_LOC04_PUBLIC and D22_MSF01_LOC05_PUBLIC with draft 22. LOC05 is\n LOC04 plus the Codec String property; neither is negotiated, and both cover\n public (unencrypted) properties only. AUTO is for the service sender and\n receiver configs (their default): it resolves to LEGACY_MSF01_LOC01 on\n drafts 16/18 and D22_MSF01_LOC05_PUBLIC on draft 22. The object parser takes\n a resolved companion and refuses AUTO. Values are never renumbered."]
 pub type moq_media_companion_profile_t = u32;
 pub type moq_media_time_domain_t = u32;
 #[doc = " Sized, value-only metadata. LOC is the effective snapshot: object presence\n overrides track presence for timescale/video/audio config, including empty\n config. Object spans borrow object properties; inherited config spans borrow\n the caller's distinct track-properties backing. Neither is retained here.\n time_us is available only when has_time_us; raw zero/overflow survives in loc.\n Independence describes normalized LOC marking, not a guessed opaque form."]
@@ -10758,11 +10822,16 @@ pub struct moq_media_parsed_object {
     pub track_id: u32,
     #[doc = " borrowed spans, no owned refs"]
     pub metadata: moq_media_metadata_t,
+    #[doc = " Appended after the complete metadata field. Read only when struct_size\n covers codec_string entirely; written only on the LOC05 companion,\n zero otherwise. The effective LOC-05 properties moq_loc_ext_t holds:\n loc_ext_present has a MOQ_LOC_EXT_HAS_* bit for each one present.\n codec_string is the object's own Codec String, else the track's\n (cfg->track_loc_ext); an object never inherits a value another object\n carried. It borrows the object properties, or the caller's track\n backing when inherited, exactly like the inherited config spans."]
+    pub loc_ext_present: u32,
+    #[doc = " never read"]
+    pub _reserved_loc_ext: u32,
+    pub codec_string: moq_bytes_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of moq_media_parsed_object"]
-        [::std::mem::size_of::<moq_media_parsed_object>() - 224usize];
+        [::std::mem::size_of::<moq_media_parsed_object>() - 248usize];
     ["Alignment of moq_media_parsed_object"]
         [::std::mem::align_of::<moq_media_parsed_object>() - 8usize];
     ["Offset of field: moq_media_parsed_object::struct_size"]
@@ -10809,6 +10878,12 @@ const _: () = {
         [::std::mem::offset_of!(moq_media_parsed_object, track_id) - 132usize];
     ["Offset of field: moq_media_parsed_object::metadata"]
         [::std::mem::offset_of!(moq_media_parsed_object, metadata) - 136usize];
+    ["Offset of field: moq_media_parsed_object::loc_ext_present"]
+        [::std::mem::offset_of!(moq_media_parsed_object, loc_ext_present) - 224usize];
+    ["Offset of field: moq_media_parsed_object::_reserved_loc_ext"]
+        [::std::mem::offset_of!(moq_media_parsed_object, _reserved_loc_ext) - 228usize];
+    ["Offset of field: moq_media_parsed_object::codec_string"]
+        [::std::mem::offset_of!(moq_media_parsed_object, codec_string) - 232usize];
 };
 impl Default for moq_media_parsed_object {
     fn default() -> Self {
@@ -10841,7 +10916,7 @@ unsafe extern "C" {
         drop_reason: *mut moq_media_drop_reason_t,
     ) -> moq_result_t;
 }
-#[doc = " Separate from the frozen embedded track record. NULL cfg selects legacy with\n no track context; it never opts into draft-22. The frozen input floor covers\n companion_profile. Each tail (track_loc_metadata, mpeg2ts_packet_size) is\n read only when its whole field is covered. Config/metadata records are\n borrowed for the call; inherited byte spans borrow their original backing\n for the output's lifetime. No ownership transfer or cleanup."]
+#[doc = " Separate from the frozen embedded track record. NULL cfg selects legacy with\n no track context; it never opts into draft-22. The frozen input floor covers\n companion_profile. Each tail (track_loc_metadata, mpeg2ts_packet_size,\n track_loc_ext, catalog_codec) is read only when its whole field is covered.\n Config/metadata records and catalog_codec are borrowed for the call;\n inherited byte spans borrow their original backing for the output's\n lifetime. No ownership transfer or cleanup."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct moq_media_object_parse_cfg {
@@ -10849,11 +10924,15 @@ pub struct moq_media_object_parse_cfg {
     pub companion_profile: u32,
     pub track_loc_metadata: *const moq_loc_metadata_t,
     pub mpeg2ts_packet_size: u32,
+    #[doc = " Appended past mpeg2ts_packet_size and its padding: the track's\n moq_loc_ext_t (from moq_loc_parse_metadata_ex on its Track\n Properties), or NULL."]
+    pub track_loc_ext: *const moq_loc_ext_t,
+    #[doc = " Appended past track_loc_ext: the codec the track's catalog entry names\n (MSF-01 \"codec\"), or empty (len 0) when there is none. A nonempty value\n needs data. On LOC05 it names the codec the track's Video/Audio Config\n belongs to when the Track Properties carry no Codec String; on other\n companions every object decodes under the catalog codec, so it changes\n nothing. Compared by exact bytes, never parsed."]
+    pub catalog_codec: moq_bytes_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of moq_media_object_parse_cfg"]
-        [::std::mem::size_of::<moq_media_object_parse_cfg>() - 24usize];
+        [::std::mem::size_of::<moq_media_object_parse_cfg>() - 48usize];
     ["Alignment of moq_media_object_parse_cfg"]
         [::std::mem::align_of::<moq_media_object_parse_cfg>() - 8usize];
     ["Offset of field: moq_media_object_parse_cfg::struct_size"]
@@ -10864,6 +10943,10 @@ const _: () = {
         [::std::mem::offset_of!(moq_media_object_parse_cfg, track_loc_metadata) - 8usize];
     ["Offset of field: moq_media_object_parse_cfg::mpeg2ts_packet_size"]
         [::std::mem::offset_of!(moq_media_object_parse_cfg, mpeg2ts_packet_size) - 16usize];
+    ["Offset of field: moq_media_object_parse_cfg::track_loc_ext"]
+        [::std::mem::offset_of!(moq_media_object_parse_cfg, track_loc_ext) - 24usize];
+    ["Offset of field: moq_media_object_parse_cfg::catalog_codec"]
+        [::std::mem::offset_of!(moq_media_object_parse_cfg, catalog_codec) - 32usize];
 };
 impl Default for moq_media_object_parse_cfg {
     fn default() -> Self {
@@ -10874,11 +10957,11 @@ impl Default for moq_media_object_parse_cfg {
         }
     }
 }
-#[doc = " Separate from the frozen embedded track record. NULL cfg selects legacy with\n no track context; it never opts into draft-22. The frozen input floor covers\n companion_profile. Each tail (track_loc_metadata, mpeg2ts_packet_size) is\n read only when its whole field is covered. Config/metadata records are\n borrowed for the call; inherited byte spans borrow their original backing\n for the output's lifetime. No ownership transfer or cleanup."]
+#[doc = " Separate from the frozen embedded track record. NULL cfg selects legacy with\n no track context; it never opts into draft-22. The frozen input floor covers\n companion_profile. Each tail (track_loc_metadata, mpeg2ts_packet_size,\n track_loc_ext, catalog_codec) is read only when its whole field is covered.\n Config/metadata records and catalog_codec are borrowed for the call;\n inherited byte spans borrow their original backing for the output's\n lifetime. No ownership transfer or cleanup."]
 pub type moq_media_object_parse_cfg_t = moq_media_object_parse_cfg;
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Explicit LEGACY_MSF01_LOC01+D16/18 or D22_MSF01_LOC04_PUBLIC+D22.\n Unknown companion/version (AUTO included) or malformed sized config is\n INVAL; a known but\n mismatched pair is UNSUPPORTED. D22 requires METADATA_SIZE bytes; shorter output returns\n UNSUPPORTED before any output/drop-reason store. Legacy pairs require the\n old V0_SIZE floor. No caller input output-stamp is required.\n Success copies/stamps min(out_size, library size). Other failures leave out\n untouched, except BUFFER publishes the required sample_count as on the old\n parser. Caller sample storage is scratch during CMAF parsing, even on error.\n PROTO sets MALFORMED_LOC/CMAF; duplicate known LOC is UNSUPPORTED, not a drop.\n No refs are taken or transferred on any result. Payload/fragment/samples and\n object config borrow in/sample backing. These must outlive use of out;\n no cleanup is needed. Only absent timescale/video/audio configuration inherits\n from track_loc_metadata. Present object fields, including empty config, win.\n Track timestamp/marking/audio-level fields do not become object metadata.\n A supplied track record needs its complete v0 floor, known presence bits,\n zero reserved bytes, and coherent selected config spans; otherwise INVAL.\n Track timescale/audio configuration on the legacy companion is UNSUPPORTED.\n Timestamp without effective LOC timescale is UNIX/capture time; with any\n scale it is application time, never capture. Zero scale/overflow keeps raw\n metadata with has_time_us=false. RAW timing uses available time_us; CMAF\n tfdt/trun timing stays authoritative. Catalog timescale is not a LOC default.\n LOC04 marking1..3 uses the first payload byte's I bit; marking4 is opaque.\n Well-formed unknown properties are skipped; original property bytes stay\n unchanged and separate. No automatic companion or service eligibility.\n\n MPEG2TS requires a covered packet size of 188 or 192 (otherwise INVAL);\n other packaging ignores it. The unsized parser cannot supply TS context and\n returns INVAL for TS. Valid TS context in a build without moq::mpeg2ts\n returns UNSUPPORTED. Empty, partial or invalid-sync TS packets return PROTO\n with drop reason MOQ_MEDIA_DROP_MALFORMED_MPEG2TS. An MPEG2TS object's\n properties are not parsed as LOC, so its metadata stays empty."]
+    #[doc = " Explicit LEGACY_MSF01_LOC01+D16/18, or D22_MSF01_LOC04_PUBLIC or\n D22_MSF01_LOC05_PUBLIC with D22.\n Unknown companion/version (AUTO included) or malformed sized config is\n INVAL; a known but\n mismatched pair is UNSUPPORTED. D22 requires METADATA_SIZE bytes, and LOC05\n LOC_EXT_SIZE bytes; shorter output returns UNSUPPORTED before any\n output/drop-reason store. Legacy pairs require the\n old V0_SIZE floor. No caller input output-stamp is required.\n Success copies/stamps min(out_size, library size). Other failures leave out\n untouched, except BUFFER publishes the required sample_count as on the old\n parser. Caller sample storage is scratch during CMAF parsing, even on error.\n PROTO sets MALFORMED_LOC/CMAF; duplicate known LOC is UNSUPPORTED, not a drop.\n No refs are taken or transferred on any result. Payload/fragment/samples and\n object config borrow in/sample backing. These must outlive use of out;\n no cleanup is needed. Only absent timescale/video/audio configuration inherits\n from track_loc_metadata. Present object fields, including empty config, win.\n A Codec String and a Video/Audio Config are the two halves of one decoder\n configuration (draft-ietf-moq-loc-05 2.3.1.3, 2.3.2.1, 2.3.3.1), so on\n LOC05 an object that carries its own Codec String inherits the track's\n video/audio configuration only when that Codec String is byte-equal to the\n track's codec: the track_loc_ext Codec String, else catalog_codec. With\n neither, or with a different one, it inherits no configuration; timescale\n is still inherited. An object without its own Codec String inherits as on\n LOC04, together with the track's codec.\n Track timestamp/marking/audio-level fields do not become object metadata.\n A supplied track record needs its complete v0 floor, known presence bits,\n zero reserved bytes, and coherent selected config spans; otherwise INVAL.\n Track timescale/audio configuration on the legacy companion is UNSUPPORTED.\n LOC05 parses the object's LOC-05 properties (moq_loc_parse_metadata_ex):\n an invalid Codec String is PROTO with MALFORMED_LOC, a repeated one\n UNSUPPORTED. The effective Codec String is the object's own, else the\n track_loc_ext one. A supplied track_loc_ext needs its complete v0 floor and\n known presence bits, and a present Codec String must be a usable identifier\n (see moq_loc_ext_t) with a coherent span, or INVAL; a present one on the\n LOC04 or legacy companion is UNSUPPORTED, never ignored. LOC04 still skips\n 0x11 as an unknown property.\n Timestamp without effective LOC timescale is UNIX/capture time; with any\n scale it is application time, never capture. Zero scale/overflow keeps raw\n metadata with has_time_us=false. RAW timing uses available time_us; CMAF\n tfdt/trun timing stays authoritative. Catalog timescale is not a LOC default.\n LOC04 marking1..3 uses the first payload byte's I bit; marking4 is opaque.\n Well-formed unknown properties are skipped; original property bytes stay\n unchanged and separate. No automatic companion or service eligibility.\n\n MPEG2TS requires a covered packet size of 188 or 192 (otherwise INVAL);\n other packaging ignores it. The unsized parser cannot supply TS context and\n returns INVAL for TS. Valid TS context in a build without moq::mpeg2ts\n returns UNSUPPORTED. Empty, partial or invalid-sync TS packets return PROTO\n with drop reason MOQ_MEDIA_DROP_MALFORMED_MPEG2TS. An MPEG2TS object's\n properties are not parsed as LOC, so its metadata stays empty."]
     pub fn moq_media_object_parse_sized(
         track: *const moq_media_track_info_t,
         in_: *const moq_media_object_input_t,
@@ -11191,13 +11274,13 @@ pub struct moq_media_sender_cfg {
     pub drop_without_demand: bool,
     #[doc = " OPT-IN interval between automatic independent catalog refreshes, in\n microseconds. Default OFF: MSF-01 §5 says a catalog object SHOULD be\n published only when the availability of tracks changes, or after a\n period of time such that the object might fall out of cache in a\n delivery network. The sender always republishes on a real track\n add/remove/conversion; it does NOT republish on a timer unless asked.\n   0 (or an old-size caller whose struct_size predates this field) or\n      UINT64_MAX: no timed refresh (the default).\n   a finite nonzero value: while the catalog track has demand,\n      republish the current catalog every interval as a new\n      independent group (object 0 = the complete catalog, never a\n      delta). Use this only for the cache-staleness case the draft\n      allows, e.g. a late viewer joining through a relay that resolves\n      Joining FETCHes locally and neither proxies nor caches unresolved\n      ones upstream (there only the FIRST catalog joiner per publisher\n      session obtains the catalog), and pick an interval on the order\n      of the relay's cache lifetime rather than seconds.\n A real mutation generation always takes precedence and resets the\n refresh cadence; no demand means no refresh."]
     pub catalog_refresh_interval_us: u64,
-    #[doc = " Media companion. AUTO is the default: an absent or partially covered\n field, and every initializer that covers it (the _sized forms), select\n it. A zeroed field is LEGACY_MSF01_LOC01, not AUTO.\n\n Explicit companions are fixed at creation: LEGACY_MSF01_LOC01 requires\n negotiated D16/18 and D22_MSF01_LOC04_PUBLIC negotiated D22. A known\n mismatch reports UNSUPPORTED through write/wait and stats.last_error,\n never endpoint/session termination.\n\n AUTO resolves once, when the sender first observes a draft-16/18/22\n session, to the matching companion, and then behaves exactly as that\n companion (any other draft is UNSUPPORTED). Nothing is published before\n then, so the catalog and every object follow the resolved companion.\n Until it resolves, AUTO differs from an explicit companion in these\n ways only:\n   - Creation reads the wallclock Group-ID base described below, and\n     fails as D22_MSF01_LOC04_PUBLIC does when it cannot. Objects written\n     before resolution are numbered from it; resolving to legacy renumbers\n     them from 0, before any is sent.\n   - write() accepts RAW objects (explicit D22 refuses writes before\n     D22 is observed). A RAW object's metadata tail, when present, is\n     validated and kept for draft 22 (an invalid one is INVAL); its\n     legacy timestamp must fit the narrowest draft (see\n     presentation_time_us).\n On draft 22, an AUTO sender's RAW object written without the metadata\n tail is not refused: it carries LOC-04 metadata generated from the typed\n fields. With has_capture_time, capture_time_us is an unscaled Timestamp\n (Unix-epoch microseconds, LOC-04 2.3.1.1). Otherwise\n presentation_time_us is media time: the Timestamp goes with a Timescale\n of 1000000 (2.3.1.2), so a receiver reads it as application media time,\n not a capture clock. On video a one-byte frame marking whose I bit is\n is_sync is added. A track whose track_properties carry a LOC-04\n Timescale (or do not parse as LOC-04 metadata) would make a receiver\n read every object's Timestamp at that scale, so on such a track a\n write with has_capture_time and no metadata tail is MOQ_ERR_INVAL\n whenever the object may go out as draft 22: once resolved to it, or\n before resolution when the endpoint offers draft 22. Explicit\n D22_MSF01_LOC04_PUBLIC still requires the tail. On drafts 16/18 the\n tail is ignored, as with LEGACY.\n\n Every companion publishes the MSF-01 catalog: version\n \"draft-01\"; every track's init_data in the root initDataList,\n referenced by initRef (no per-track initData); a CMAF track without\n init_data refused by add_track (CMSF-01 3.1); an added track with\n init_data published as a full catalog, not a delta. This also applies\n before AUTO resolves.\n\n D22_MSF01_LOC04_PUBLIC selects each track's Group IDs (media, generated\n timeline and catalog) starting at the wallclock milliseconds read when\n the sender is created, the\n best-effort approach MSF-01 6.1 suggests. It keeps a restarted\n publisher's IDs above its predecessor's only while the clock moves\n forward and no instance numbers groups faster than the clock; restart\n identity otherwise remains the application's responsibility. Creation\n fails with MOQ_ERR_INTERNAL when the clock cannot be read and with\n MOQ_ERR_LIMIT when the reading is above the largest Group ID the\n library writes (2^62 - 1, its object write-path bound on every\n profile). Group IDs never wrap: a write that would open a group past\n that ID, and an add_track / remove_track / convert_to_vod / complete\n whose catalog change would need one, return MOQ_ERR_LIMIT without\n taking ownership or changing state. The legacy companion keeps its\n Group IDs from 0. Unknown values fail creation with\n MOQ_ERR_INVAL."]
+    #[doc = " Media companion. AUTO is the default: an absent or partially covered\n field, and every initializer that covers it (the _sized forms), select\n it. A zeroed field is LEGACY_MSF01_LOC01, not AUTO.\n\n Explicit companions are fixed at creation: LEGACY_MSF01_LOC01 requires\n negotiated D16/18, and D22_MSF01_LOC04_PUBLIC or D22_MSF01_LOC05_PUBLIC\n negotiated D22. LOC05 differs from LOC04 only in accepting typed Codec\n Strings (moq_media_send_object_t.loc_ext, moq_media_track_cfg_t.\n track_loc_ext); without them its bytes are LOC04's. A known\n mismatch reports UNSUPPORTED through write/wait and stats.last_error,\n never endpoint/session termination.\n\n AUTO resolves once, when the sender first observes a draft-16/18/22\n session, to the matching companion (LEGACY_MSF01_LOC01 on D16/18,\n D22_MSF01_LOC05_PUBLIC on D22), and then behaves exactly as that\n companion (any other draft is UNSUPPORTED). Nothing is published before\n then, so the catalog and every object follow the resolved companion.\n Until it resolves, AUTO differs from an explicit companion in these\n ways only:\n   - Creation reads the wallclock Group-ID base described below, and\n     fails as an explicit draft-22 companion does when it cannot. Objects written\n     before resolution are numbered from it; resolving to legacy renumbers\n     them from 0, before any is sent.\n   - write() accepts RAW objects (explicit D22 refuses writes before\n     D22 is observed). A RAW object's metadata tail, when present, is\n     validated and kept for draft 22 (an invalid one is INVAL); its\n     legacy timestamp must fit the narrowest draft (see\n     presentation_time_us).\n On draft 22, an AUTO sender's RAW object written without the metadata\n tail is not refused: it carries LOC-04 metadata generated from the typed\n fields. With has_capture_time, capture_time_us is an unscaled Timestamp\n (Unix-epoch microseconds, LOC-04 2.3.1.1). Otherwise\n presentation_time_us is media time: the Timestamp goes with a Timescale\n of 1000000 (2.3.1.2), so a receiver reads it as application media time,\n not a capture clock. On video a one-byte frame marking whose I bit is\n is_sync is added. A track whose track_properties carry a LOC-04\n Timescale (or do not parse as LOC-04 metadata) would make a receiver\n read every object's Timestamp at that scale, so on such a track a\n write with has_capture_time and no metadata tail is MOQ_ERR_INVAL\n whenever the object may go out as draft 22: once resolved to it, or\n before resolution when the endpoint offers draft 22. Explicit\n D22_MSF01_LOC04_PUBLIC or D22_MSF01_LOC05_PUBLIC still requires the\n tail. On drafts 16/18 the tail is ignored, as with LEGACY.\n\n Every companion publishes the MSF-01 catalog: version\n \"draft-01\"; every track's init_data in the root initDataList,\n referenced by initRef (no per-track initData); a CMAF track without\n init_data refused by add_track (CMSF-01 3.1); an added track with\n init_data published as a full catalog, not a delta. This also applies\n before AUTO resolves.\n\n D22_MSF01_LOC04_PUBLIC and D22_MSF01_LOC05_PUBLIC select each track's\n Group IDs (media, generated timeline and catalog) starting at the\n wallclock milliseconds read when the sender is created, the\n best-effort approach MSF-01 6.1 suggests. It keeps a restarted\n publisher's IDs above its predecessor's only while the clock moves\n forward and no instance numbers groups faster than the clock; restart\n identity otherwise remains the application's responsibility. Creation\n fails with MOQ_ERR_INTERNAL when the clock cannot be read and with\n MOQ_ERR_LIMIT when the reading is above the largest Group ID the\n library writes (2^62 - 1, its object write-path bound on every\n profile). Group IDs never wrap: a write that would open a group past\n that ID, and an add_track / remove_track / convert_to_vod / complete\n whose catalog change would need one, return MOQ_ERR_LIMIT without\n taking ownership or changing state. The legacy companion keeps its\n Group IDs from 0. Unknown values fail creation with\n MOQ_ERR_INVAL."]
     pub companion_profile: moq_media_companion_profile_t,
     #[doc = " Preserve the complete preceding allocation; never read."]
     pub _reserved_companion_profile: [u8; 4usize],
     #[doc = " Optional resource credentials, independent of endpoint SETUP tokens.\n Copied at construction, including all static token bytes. Selectors\n and local outcomes follow media_auth.h. Absent/partial/NULL means\n anonymous; a configured source never falls back to anonymous access.\n Use a sized initializer to enable this complete pointer field."]
     pub resource_auth: *const moq_media_auth_cfg_t,
-    #[doc = " Optional first Group ID of every track of this sender instance (media,\n generated timeline and catalog alike). Read only when struct_size\n covers initial_group_id, and honored only when has_initial_group_id is\n true; use a sized initializer to enable this appended pair.\n _reserved_initial_group_id is never read: it keeps the pair past the\n original sizeof where that ends in tail padding. The value replaces\n the companion's default base (0 for the legacy companion, the\n wallclock milliseconds read at creation for D22_MSF01_LOC04_PUBLIC),\n and the clock is then not read. An AUTO sender keeps the value\n whichever companion it resolves to.\n\n A publisher that restarts a Track must not reuse the Locations of\n Objects it already published (draft-ietf-moq-transport-22 2.5; MSF-01\n 6.1). An application that remembers the Groups it used before, such as\n one that reconnects after a failed session, sets this to a value above\n them. Values above MOQ_QUIC_VARINT_MAX, the largest Group ID the\n library writes, fail creation with MOQ_ERR_LIMIT. A value of exactly\n MOQ_QUIC_VARINT_MAX is valid; the next group is then refused with\n MOQ_ERR_LIMIT where it is requested. The sender signals no Prior Group\n ID Gap (MSF-01 6.1): one starting value for the whole sender does not\n name each track's previous Group."]
+    #[doc = " Optional first Group ID of every track of this sender instance (media,\n generated timeline and catalog alike). Read only when struct_size\n covers initial_group_id, and honored only when has_initial_group_id is\n true; use a sized initializer to enable this appended pair.\n _reserved_initial_group_id is never read: it keeps the pair past the\n original sizeof where that ends in tail padding. The value replaces\n the companion's default base (0 for the legacy companion, the\n wallclock milliseconds read at creation for D22_MSF01_LOC04_PUBLIC and\n D22_MSF01_LOC05_PUBLIC),\n and the clock is then not read. An AUTO sender keeps the value\n whichever companion it resolves to.\n\n A publisher that restarts a Track must not reuse the Locations of\n Objects it already published (draft-ietf-moq-transport-22 2.5; MSF-01\n 6.1). An application that remembers the Groups it used before, such as\n one that reconnects after a failed session, sets this to a value above\n them. Values above MOQ_QUIC_VARINT_MAX, the largest Group ID the\n library writes, fail creation with MOQ_ERR_LIMIT. A value of exactly\n MOQ_QUIC_VARINT_MAX is valid; the next group is then refused with\n MOQ_ERR_LIMIT where it is requested. The sender signals no Prior Group\n ID Gap (MSF-01 6.1): one starting value for the whole sender does not\n name each track's previous Group."]
     pub _reserved_initial_group_id: u32,
     pub has_initial_group_id: bool,
     pub initial_group_id: u64,
@@ -11365,10 +11448,11 @@ pub struct moq_media_track_cfg {
     pub has_label: bool,
     pub label: moq_bytes_t,
     pub group_order: moq_group_order_t,
+    pub track_loc_ext: *const moq_loc_ext_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_media_track_cfg"][::std::mem::size_of::<moq_media_track_cfg>() - 336usize];
+    ["Size of moq_media_track_cfg"][::std::mem::size_of::<moq_media_track_cfg>() - 344usize];
     ["Alignment of moq_media_track_cfg"][::std::mem::align_of::<moq_media_track_cfg>() - 8usize];
     ["Offset of field: moq_media_track_cfg::struct_size"]
         [::std::mem::offset_of!(moq_media_track_cfg, struct_size) - 0usize];
@@ -11464,6 +11548,8 @@ const _: () = {
         [::std::mem::offset_of!(moq_media_track_cfg, label) - 312usize];
     ["Offset of field: moq_media_track_cfg::group_order"]
         [::std::mem::offset_of!(moq_media_track_cfg, group_order) - 328usize];
+    ["Offset of field: moq_media_track_cfg::track_loc_ext"]
+        [::std::mem::offset_of!(moq_media_track_cfg, track_loc_ext) - 336usize];
 };
 impl Default for moq_media_track_cfg {
     fn default() -> Self {
@@ -11518,7 +11604,7 @@ pub struct moq_media_send_object {
     pub ends_group: bool,
     #[doc = " advisory in v0 (order conveys decode seq)"]
     pub decode_time_us: u64,
-    #[doc = " Legacy RAW/LOC timing. Every legacy RAW/LOC object carries one timestamp:\n   drafts 16 and 18: the LOC-01 Capture Timestamp (ID 0x02, LOC-01\n     2.3.1.1), wall-clock microseconds since the Unix epoch;\n The value is capture_time_us when has_capture_time is true (emitted\n verbatim, no clamp/scale); otherwise it falls back to\n presentation_time_us. presentation_time_us also drives the generated\n SAP/media timelines. These fields are RAW/LOC-only -- for CMAF the\n object's timing and properties live in the passed-through `properties`\n block and these are ignored. moq_media_sender_write() rejects, with\n MOQ_ERR_INVAL (synchronously, without taking payload ownership), a\n RAW/LOC timestamp above what the session's draft can encode\n (moq_loc_value_max_for_version): MOQ_QUIC_VARINT_MAX on draft 16 and\n before the draft is known; none on draft 18 (vi64 carries uint64).\n Explicit D22 RAW uses the metadata tail instead, not a capture/PTS\n fallback; an AUTO sender on draft 22 generates LOC-04 from these fields\n when the tail is absent (capture time as Unix microseconds, else\n presentation time with Timescale 1000000; see\n moq_media_sender_cfg_t.companion_profile). presentation_time_us still\n drives generated timelines."]
+    #[doc = " Legacy RAW/LOC timing. Every legacy RAW/LOC object carries one timestamp:\n   drafts 16 and 18: the LOC-01 Capture Timestamp (ID 0x02, LOC-01\n     2.3.1.1), wall-clock microseconds since the Unix epoch;\n The value is capture_time_us when has_capture_time is true (emitted\n verbatim, no clamp/scale); otherwise it falls back to\n presentation_time_us. presentation_time_us also drives the generated\n SAP/media timelines. These fields are RAW/LOC-only -- for CMAF the\n object's timing and properties live in the passed-through `properties`\n block and these are ignored. moq_media_sender_write() rejects, with\n MOQ_ERR_INVAL (synchronously, without taking payload ownership), a\n RAW/LOC timestamp above what the session's draft can encode\n (moq_loc_value_max_for_version): MOQ_QUIC_VARINT_MAX on draft 16 and\n before the draft is known; none on draft 18 (vi64 carries uint64).\n Explicit D22 RAW uses the metadata tail instead, not a capture/PTS\n fallback; an AUTO sender on draft 22 generates the LOC block (the same\n bytes under LOC-04 and LOC-05) from these fields when the tail is absent\n (capture time as Unix microseconds, else\n presentation time with Timescale 1000000; see\n moq_media_sender_cfg_t.companion_profile). presentation_time_us still\n drives generated timelines."]
     pub presentation_time_us: u64,
     #[doc = " true: emit capture_time_us as the LOC\ntimestamp property (an AUTO sender that\nmay send draft 22 refuses it on a track\nwith a Track Properties Timescale; see\ncompanion_profile)"]
     pub has_capture_time: bool,
@@ -11528,10 +11614,11 @@ pub struct moq_media_send_object {
     pub has_sap_type: bool,
     pub sap_type: moq_sap_type_t,
     pub metadata: *const moq_media_metadata_t,
+    pub loc_ext: *const moq_loc_ext_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_media_send_object"][::std::mem::size_of::<moq_media_send_object>() - 80usize];
+    ["Size of moq_media_send_object"][::std::mem::size_of::<moq_media_send_object>() - 88usize];
     ["Alignment of moq_media_send_object"]
         [::std::mem::align_of::<moq_media_send_object>() - 8usize];
     ["Offset of field: moq_media_send_object::struct_size"]
@@ -11560,6 +11647,8 @@ const _: () = {
         [::std::mem::offset_of!(moq_media_send_object, sap_type) - 68usize];
     ["Offset of field: moq_media_send_object::metadata"]
         [::std::mem::offset_of!(moq_media_send_object, metadata) - 72usize];
+    ["Offset of field: moq_media_send_object::loc_ext"]
+        [::std::mem::offset_of!(moq_media_send_object, loc_ext) - 80usize];
 };
 impl Default for moq_media_send_object {
     fn default() -> Self {
@@ -12658,17 +12747,22 @@ pub struct moq_media_object {
     pub gap_duration_known: bool,
     pub gap_duration_27mhz: u64,
     pub discontinuous: bool,
-    #[doc = " D22's effective object metadata; complete old object layout preserved.\n Read only when struct_size covers this entire field. Object config\n spans borrow properties_ref and remain valid until object cleanup,\n including after receiver destruction (track itself does not survive).\n Inherited config spans borrow this object's private track_properties_ref;\n present object fields (including empty config) override the track block.\n Raw Track and Object Properties remain separate and unchanged.\n Legacy objects leave this metadata zero. No clock domain is inferred."]
+    #[doc = " D22's effective object metadata; complete old object layout preserved.\n Read only when struct_size covers this entire field. Object config\n spans borrow properties_ref and remain valid until object cleanup,\n including after receiver destruction (track itself does not survive).\n Inherited config spans borrow this object's private track_properties_ref;\n present object fields (including empty config) override the track block.\n On LOC-05 an object naming a codec other than the track's inherits no\n configuration (see codec_string below).\n Raw Track and Object Properties remain separate and unchanged.\n Legacy objects leave this metadata zero. No clock domain is inferred."]
     pub metadata: moq_media_metadata_t,
     #[doc = " Exact independent copy of this subscription generation's initial ACK\n block, NULL for an empty block or D16/18. Poll transfers its sole ref:\n neither the facade, receiver nor another object shares ownership. Valid\n through cleanup even after receiver/session destruction. Allocation or\n conversion failure drops/counts this object as PARSE_DROP, not a permanent\n track LOCAL_FAILURE. Cleanup reads/releases only a fully stamped field."]
     pub track_properties_ref: *mut moq_rcbuf_t,
     #[doc = " MOQ_MEDIA_DELIVERY_*"]
     pub delivery_origin: u32,
     pub initiating_request_id: u64,
+    #[doc = " Appended after the complete layout through initiating_request_id on\n every target. Available only when struct_size covers codec_string\n entirely; zero on every companion but D22_MSF01_LOC05_PUBLIC. The\n effective LOC-05 properties (MOQ_LOC_EXT_HAS_* bits in loc_ext_present,\n see moq_loc_ext_t): codec_string is the object's own Codec String, else\n its track's. It borrows properties_ref or this object's private\n track_properties_ref and stays valid until cleanup, like the config\n spans in metadata. It adds no owned reference and no charge. Raw Track\n and Object Properties stay separate and unchanged, and the catalog codec\n stays in the track descriptor. A Codec String and a configuration are\n the two halves of one decoder configuration, so an object that names\n its own codec carries the track's video/audio configuration in metadata\n only when that codec is the track's: its Track Properties' Codec\n String, else the catalog codec (moq_media_object_parse_sized)."]
+    pub loc_ext_present: u32,
+    #[doc = " never read"]
+    pub _reserved_loc_ext: u32,
+    pub codec_string: moq_bytes_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_media_object"][::std::mem::size_of::<moq_media_object>() - 344usize];
+    ["Size of moq_media_object"][::std::mem::size_of::<moq_media_object>() - 368usize];
     ["Alignment of moq_media_object"][::std::mem::align_of::<moq_media_object>() - 8usize];
     ["Offset of field: moq_media_object::struct_size"]
         [::std::mem::offset_of!(moq_media_object, struct_size) - 0usize];
@@ -12750,6 +12844,12 @@ const _: () = {
         [::std::mem::offset_of!(moq_media_object, delivery_origin) - 328usize];
     ["Offset of field: moq_media_object::initiating_request_id"]
         [::std::mem::offset_of!(moq_media_object, initiating_request_id) - 336usize];
+    ["Offset of field: moq_media_object::loc_ext_present"]
+        [::std::mem::offset_of!(moq_media_object, loc_ext_present) - 344usize];
+    ["Offset of field: moq_media_object::_reserved_loc_ext"]
+        [::std::mem::offset_of!(moq_media_object, _reserved_loc_ext) - 348usize];
+    ["Offset of field: moq_media_object::codec_string"]
+        [::std::mem::offset_of!(moq_media_object, codec_string) - 352usize];
 };
 impl Default for moq_media_object {
     fn default() -> Self {
@@ -12767,7 +12867,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Dequeue the next media object into *obj. Pass `obj_size = sizeof(*obj)` as YOU\n compiled it; the library requires at least the frozen v0 base size, writes at\n most min(obj_size, its own struct size), and stamps obj->struct_size with the\n bytes written -- so a newer caller can detect truncation by an older library\n and a newer library never writes past an older caller's struct. MOQ_OK\n transfers ownership (see above), MOQ_DONE = nothing now, MOQ_ERR_INTERRUPTED\n while the endpoint latch is set, MOQ_ERR_CLOSED when empty AND terminal,\n MOQ_ERR_INVAL for NULL args or a legacy obj_size below the v0 base size. An object for a\n track is never pollable before that track's TRACK_ADDED has been queued --\n drain track events before objects on each wakeup and every handle is known\n before its first object. For the D22 companion (explicit, or AUTO resolved on\n draft 22), obj_size must cover\n the whole metadata/ref and delivery-origin observation through the end of\n initiating_request_id; otherwise\n MOQ_ERR_UNSUPPORTED leaves output and queue untouched, with no transfer.\n Legacy D16/18 retains the v0 minimum."]
+    #[doc = " Dequeue the next media object into *obj. Pass `obj_size = sizeof(*obj)` as YOU\n compiled it; the library requires at least the frozen v0 base size, writes at\n most min(obj_size, its own struct size), and stamps obj->struct_size with the\n bytes written -- so a newer caller can detect truncation by an older library\n and a newer library never writes past an older caller's struct. MOQ_OK\n transfers ownership (see above), MOQ_DONE = nothing now, MOQ_ERR_INTERRUPTED\n while the endpoint latch is set, MOQ_ERR_CLOSED when empty AND terminal,\n MOQ_ERR_INVAL for NULL args or a legacy obj_size below the v0 base size. An object for a\n track is never pollable before that track's TRACK_ADDED has been queued --\n drain track events before objects on each wakeup and every handle is known\n before its first object. For a D22 companion (explicit, or AUTO resolved on\n draft 22), obj_size must cover\n the whole metadata/ref and delivery-origin observation through the end of\n initiating_request_id, and for explicit D22_MSF01_LOC05_PUBLIC through the\n end of codec_string; otherwise\n MOQ_ERR_UNSUPPORTED leaves output and queue untouched, with no transfer.\n Legacy D16/18 retains the v0 minimum."]
     pub fn moq_media_receiver_poll_object(
         r: *mut moq_media_receiver_t,
         obj: *mut moq_media_object_t,
@@ -13466,6 +13566,7 @@ pub const MOQ_OBJECT_STATUS_END_OF_TRACK: u32 = 4;
 pub const MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01: u32 = 0;
 pub const MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC: u32 = 1;
 pub const MOQ_MEDIA_COMPANION_AUTO: u32 = 2;
+pub const MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC: u32 = 3;
 pub const MOQ_MEDIA_TIME_DOMAIN_NONE: u32 = 0;
 pub const MOQ_MEDIA_TIME_DOMAIN_UNIX_US: u32 = 1;
 pub const MOQ_MEDIA_TIME_DOMAIN_APPLICATION_MEDIA: u32 = 2;
@@ -13479,6 +13580,8 @@ pub const MOQ_LOC_METADATA_HAS_AUDIO_LEVEL: u32 = 8;
 pub const MOQ_LOC_METADATA_HAS_VIDEO_CONFIG: u32 = 16;
 pub const MOQ_LOC_METADATA_HAS_AUDIO_CONFIG: u32 = 32;
 pub const MOQ_LOC_METADATA_PRESENT_MASK: u32 = 63;
+pub const MOQ_LOC_EXT_HAS_CODEC_STRING: u32 = 1;
+pub const MOQ_LOC_EXT_PRESENT_MASK: u32 = 1;
 #[doc = " The core publisher-property builder's offsetof-based frozen input floor."]
 pub const MOQ_TRACK_DELIVERY_TIMEOUTS_CFG_V0_SIZE: usize = 32;
 #[doc = " Frozen v0 floors of the sized records the service tier reads and writes."]
@@ -13498,4 +13601,5 @@ pub const MOQ_MEDIA_TRACK_INFO_V0_SIZE: usize = 16;
 pub const MOQ_CMAF_INIT_INFO_V0_SIZE: usize = 96;
 pub const MOQ_MEDIA_METADATA_V0_SIZE: usize = 88;
 pub const MOQ_LOC_METADATA_V0_SIZE: usize = 64;
+pub const MOQ_LOC_EXT_V0_SIZE: usize = 24;
 pub const MOQ_MSF_MPEG2TS_V0_SIZE: usize = 140;

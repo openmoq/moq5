@@ -295,27 +295,41 @@ static bool preq_make_room(moq_media_sender_t *s,
  *     as a Unix wall clock;
  *   - on video, a one-byte frame marking (0x09) whose I bit is the object's
  *     sync flag. */
+static void sender_typed_loc_metadata(const moq_media_track_t *track,
+                                      bool has_capture_time,
+                                      uint64_t capture_time_us, uint64_t pts_us,
+                                      bool keyframe, moq_loc_metadata_t *m)
+{
+    moq_loc_metadata_init_sized(m, sizeof(*m));
+    m->present = MOQ_LOC_METADATA_HAS_TIMESTAMP;
+    if (has_capture_time) {
+        m->timestamp = capture_time_us;
+    } else {
+        m->timestamp = pts_us;
+        m->present |= MOQ_LOC_METADATA_HAS_TIMESCALE;
+        m->timescale = 1000000u;
+    }
+    if (track->media_type == MOQ_MEDIA_TYPE_VIDEO) {
+        m->present |= MOQ_LOC_METADATA_HAS_MARKING;
+        m->marking_len = 1;
+        m->marking[0] = keyframe ? 0x20u : 0x00u;   /* RFC 9626 I bit */
+    }
+}
+
+/* Typed generation carries no Codec String, so its bytes are the same on
+ * LOC-04 and LOC-05; they are encoded under the companion's own revision. */
 static bool sender_build_typed_loc04(moq_media_sender_t *s,
                                      const sender_preq_entry_t *e,
                                      moq_rcbuf_t **out)
 {
     moq_loc_metadata_t m;
-    moq_loc_metadata_init_sized(&m, sizeof(m));
-    m.present = MOQ_LOC_METADATA_HAS_TIMESTAMP;
-    if (e->has_capture_time) {
-        m.timestamp = e->capture_time_us;
-    } else {
-        m.timestamp = e->pts_us;
-        m.present |= MOQ_LOC_METADATA_HAS_TIMESCALE;
-        m.timescale = 1000000u;
-    }
-    if (e->track->media_type == MOQ_MEDIA_TYPE_VIDEO) {
-        m.present |= MOQ_LOC_METADATA_HAS_MARKING;
-        m.marking_len = 1;
-        m.marking[0] = e->keyframe ? 0x20u : 0x00u;   /* RFC 9626 I bit */
-    }
+    sender_typed_loc_metadata(e->track, e->has_capture_time, e->capture_time_us,
+                              e->pts_us, e->keyframe, &m);
+    moq_loc_profile_t profile =
+        s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC
+            ? MOQ_LOC_PROFILE_05 : MOQ_LOC_PROFILE_04;
     return moq_loc_encode_metadata(&s->alloc, MOQ_VERSION_DRAFT_22,
-                                   MOQ_LOC_PROFILE_04, &m, out) == MOQ_OK &&
+                                   profile, &m, out) == MOQ_OK &&
            *out;
 }
 
@@ -334,13 +348,13 @@ static bool sender_build_props(moq_media_sender_t *s,
     moq_media_track_t *t = e->track;
 
     if (t->packaging == MOQ_MEDIA_PACKAGING_RAW &&
-        s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC &&
+        sender_companion_d22(s->companion_profile) &&
         !e->properties && s->companion_auto) {
         if (!sender_version_usable(s)) return false;
         return sender_build_typed_loc04(s, e, out);
     }
     if (t->packaging != MOQ_MEDIA_PACKAGING_RAW ||
-        s->companion_profile == MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC) {
+        sender_companion_d22(s->companion_profile)) {
         if (e->properties) *out = moq_rcbuf_incref(e->properties);
         return true;
     }
@@ -393,24 +407,40 @@ static bool sender_loc_time_usable(uint64_t ticks, uint64_t scale)
 }
 
 
+/* The owned draft-22 property block of a RAW write: from its metadata tail,
+ * or, for an AUTO sender's object that carries only a typed Codec String
+ * (`ext`), from the typed fields as drain generation would build them. The
+ * Codec String is emitted under LOC-05; without it the bytes are the LOC-04
+ * ones. Both revisions pair only with draft 22, so the integer codec is known
+ * even before an AUTO sender has latched the session's draft. */
 static moq_result_t sender_encode_metadata(moq_media_sender_t *s,
-    const moq_media_send_object_t *obj, moq_rcbuf_t **out)
+    const moq_media_track_t *track, const moq_media_send_object_t *obj,
+    const moq_loc_ext_t *ext, moq_rcbuf_t **out)
 {
-    if (obj->struct_size < offsetof(moq_media_send_object_t, metadata) +
-                           sizeof(obj->metadata) || !obj->metadata)
+    moq_loc_metadata_t typed;
+    const moq_loc_metadata_t *loc;
+    if (obj->metadata) {
+        const moq_media_metadata_t *m = obj->metadata;
+        if (m->struct_size < MOQ_MEDIA_METADATA_V0_SIZE ||
+            m->loc.struct_size < MOQ_LOC_METADATA_V0_SIZE ||
+            !(m->loc.present & MOQ_LOC_METADATA_HAS_TIMESTAMP))
+            return MOQ_ERR_INVAL;
+        if ((m->loc.present & MOQ_LOC_METADATA_HAS_TIMESCALE) &&
+            !sender_loc_time_usable(m->loc.timestamp, m->loc.timescale))
+            return MOQ_ERR_INVAL;
+        loc = &m->loc;
+    } else if (ext && s->companion_auto) {
+        sender_typed_loc_metadata(track, obj->has_capture_time,
+                                  obj->capture_time_us,
+                                  obj->presentation_time_us, obj->is_sync,
+                                  &typed);
+        loc = &typed;
+    } else {
         return MOQ_ERR_INVAL;
-    const moq_media_metadata_t *m = obj->metadata;
-    if (m->struct_size < MOQ_MEDIA_METADATA_V0_SIZE ||
-        m->loc.struct_size < MOQ_LOC_METADATA_V0_SIZE ||
-        !(m->loc.present & MOQ_LOC_METADATA_HAS_TIMESTAMP))
-        return MOQ_ERR_INVAL;
-    if ((m->loc.present & MOQ_LOC_METADATA_HAS_TIMESCALE) &&
-        !sender_loc_time_usable(m->loc.timestamp, m->loc.timescale))
-        return MOQ_ERR_INVAL;
-    /* LOC-04 pairs only with draft 22, so its codec is known even before an
-     * AUTO sender has latched the session's draft. */
-    return moq_loc_encode_metadata(&s->alloc, MOQ_VERSION_DRAFT_22,
-                                   MOQ_LOC_PROFILE_04, &m->loc, out);
+    }
+    return moq_loc_encode_metadata_ex(&s->alloc, MOQ_VERSION_DRAFT_22,
+                                      ext ? MOQ_LOC_PROFILE_05 : MOQ_LOC_PROFILE_04,
+                                      loc, ext, out);
 }
 
 
@@ -941,7 +971,8 @@ moq_result_t sender_admit_locked(moq_media_sender_t *s,
 
     moq_rcbuf_t *generated = NULL;
     if (a->metadata_src) {
-        moq_result_t rc = sender_encode_metadata(s, a->metadata_src, &generated);
+        moq_result_t rc = sender_encode_metadata(s, track, a->metadata_src,
+                                                 a->loc_ext, &generated);
         if (rc != MOQ_OK) {
             s->stats.last_error = rc;
             return rc;
@@ -1100,15 +1131,45 @@ moq_result_t sender_admit_locked(moq_media_sender_t *s,
 
 /* -- Write (app thread) ----------------------------------------------- */
 
+/* Read a caller's send object into a full current struct by byte offset (the
+ * caller's object may be an older, smaller struct, never read through this
+ * type): the v0 prefix, then each appended pointer only when struct_size
+ * covers all of it. A pointer left out is NULL. The caller has checked
+ * struct_size >= MOQ_MEDIA_SEND_OBJECT_V0_SIZE. */
+static void sender_send_object_read(const moq_media_send_object_t *in,
+                                    moq_media_send_object_t *out)
+{
+    const uint8_t *src = (const uint8_t *)in;
+    uint32_t size;
+    memcpy(&size, src, sizeof(size));
+    memset(out, 0, sizeof(*out));
+    memcpy(out, src, MOQ_MEDIA_SEND_OBJECT_V0_SIZE);
+#define SOBJ_COPY(f) do { \
+    const size_t offset = offsetof(moq_media_send_object_t, f); \
+    if (size >= offset + sizeof(out->f)) \
+        memcpy(&out->f, src + offset, sizeof(out->f)); \
+} while (0)
+    SOBJ_COPY(metadata);
+    SOBJ_COPY(loc_ext);
+#undef SOBJ_COPY
+    out->struct_size = (uint32_t)sizeof(*out);
+}
+
 moq_result_t moq_media_sender_write(moq_media_sender_t *s,
                                     moq_media_track_t *track,
-                                    const moq_media_send_object_t *obj)
+                                    const moq_media_send_object_t *in)
 {
-    /* Only obj fields are touched here; the opaque track (shared with the
+    /* Only object fields are touched here; the opaque track (shared with the
      * receiver API) is NOT dereferenced until proven sender-owned below. */
-    if (!s || !track || !obj) return MOQ_ERR_INVAL;
-    if (obj->struct_size < MOQ_MEDIA_SEND_OBJECT_V0_SIZE)
+    if (!s || !track || !in) return MOQ_ERR_INVAL;
+    uint32_t in_size;
+    memcpy(&in_size, in, sizeof(in_size));
+    if (in_size < MOQ_MEDIA_SEND_OBJECT_V0_SIZE)
         return MOQ_ERR_INVAL;
+    /* Every read below uses the full local copy. */
+    moq_media_send_object_t obj_local;
+    sender_send_object_read(in, &obj_local);
+    const moq_media_send_object_t *obj = &obj_local;
     if (!obj->payload) return MOQ_ERR_INVAL;
     /* A declared SAP type must be concrete (CMSF §3.6.1: 0/1/2/3); the internal
      * UNKNOWN sentinel is not a serializable/declarable value. */
@@ -1167,7 +1228,7 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
     /* An unresolved AUTO companion may still become legacy, so its RAW
      * timestamps are held to the same bound. */
     if (track->packaging == MOQ_MEDIA_PACKAGING_RAW &&
-        s->companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC) {
+        !sender_companion_d22(s->companion_profile)) {
         uint64_t loc_ts = obj->has_capture_time ? obj->capture_time_us
                                                 : obj->presentation_time_us;
         if (loc_ts > sender_loc_ts_max(s->transport_version)) {
@@ -1307,14 +1368,37 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
     a.pts_us = obj->presentation_time_us;
     a.has_capture_time = obj->has_capture_time;
     a.capture_time_us = obj->capture_time_us;
+    /* Typed LOC-05 input (present only when the caller's struct_size covers
+     * the whole pointer). A record without a present field is a no-op. A
+     * present Codec String is RAW-only (other packagings carry their own
+     * property block), and is refused, before anything is evicted or owned,
+     * unless nothing can later discard it
+     * (sender_loc05_object_input_ok_locked). */
+    if (obj->loc_ext) {
+        const moq_loc_ext_t *ext = obj->loc_ext;
+        moq_result_t erc = MOQ_OK;
+        if (ext->struct_size < MOQ_LOC_EXT_V0_SIZE ||
+            (ext->present & ~MOQ_LOC_EXT_PRESENT_MASK))
+            erc = MOQ_ERR_INVAL;
+        else if (!(ext->present & MOQ_LOC_EXT_HAS_CODEC_STRING))
+            ext = NULL;
+        else if (track->packaging != MOQ_MEDIA_PACKAGING_RAW)
+            erc = MOQ_ERR_INVAL;
+        else if (!sender_loc05_object_input_ok_locked(s))
+            erc = MOQ_ERR_UNSUPPORTED;
+        if (erc != MOQ_OK) {
+            s->stats.last_error = erc;
+            pthread_mutex_unlock(&s->mu);
+            return erc;
+        }
+        a.loc_ext = ext;
+    }
     /* Explicit D22 RAW requires the metadata snapshot. An AUTO sender that
      * is (or may still become) draft-22 encodes one when the object carries
      * it, and otherwise generates LOC-04 from the typed fields at drain; a
      * sender resolved to legacy ignores it, as explicit legacy does. */
     if (track->packaging == MOQ_MEDIA_PACKAGING_RAW) {
-        bool has_metadata =
-            obj->struct_size >= offsetof(moq_media_send_object_t, metadata) +
-                                sizeof(obj->metadata) && obj->metadata;
+        bool has_metadata = obj->metadata != NULL;
         /* A typed capture time is sent as an unscaled LOC-04 Timestamp, Unix
          * microseconds (LOC-04 2.3.1.1). A Timescale among the Track
          * Properties applies to every object without its own (2.3.1.2), so
@@ -1333,9 +1417,9 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
         }
         if (s->companion_auto
                 ? s->companion_profile !=
-                      MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 && has_metadata
-                : s->companion_profile ==
-                      MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
+                      MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
+                      (has_metadata || a.loc_ext)
+                : sender_companion_d22(s->companion_profile))
             a.metadata_src = obj;
     }
     if (track->sap_timeline && obj->has_sap_type) {

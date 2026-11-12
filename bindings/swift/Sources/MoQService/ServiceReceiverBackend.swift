@@ -221,8 +221,16 @@ func takeReceivedObject(_ object: inout moq_media_object_t) -> ReceiverPolledObj
             subgroupID: object.has_subgroup ? object.subgroup_id : nil,
             objectID: object.object_id, publisherPriority: object.publisher_priority)
         : nil
-    let metadata = receivedFieldIsPresent(object.struct_size, \moq_media_object_t.metadata)
+    var metadata = receivedFieldIsPresent(object.struct_size, \moq_media_object_t.metadata)
         ? copyReceivedMetadata(object.metadata) : nil
+    if let base = metadata,
+       receivedFieldIsPresent(object.struct_size, \moq_media_object_t.codec_string),
+       object.loc_ext_present & moq_swift_loc_ext_has_codec_string() != 0 {
+        metadata = MediaObjectMetadata(
+            timeDomain: base.timeDomain, timeMicroseconds: base.timeMicroseconds,
+            isIndependent: base.isIndependent, loc: base.loc,
+            codecStringBytes: copyReceivedSpan(object.codec_string))
+    }
     let trackProperties = receivedFieldIsPresent(
         object.struct_size, \moq_media_object_t.track_properties_ref)
         ? copyReceivedProperties(object.track_properties_ref) : nil

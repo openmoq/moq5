@@ -159,10 +159,15 @@ typedef struct moq_media_receiver_cfg {
      * field is LEGACY_MSF01_LOC01, not AUTO. AUTO resolves once, when the
      * receiver first observes a draft-16/18/22 session and before anything
      * is subscribed, to the matching companion (LEGACY_MSF01_LOC01 on D16/18,
-     * D22_MSF01_LOC04_PUBLIC on D22) and then behaves exactly as it does,
-     * including poll_object's draft-22 size floor. With SHARED_EPOCH, AUTO
-     * has no draft-22 match. Explicit LEGACY_MSF01_LOC01 requires negotiated
-     * D16/18; explicit D22_MSF01_LOC04_PUBLIC requires negotiated D22 and RAW
+     * D22_MSF01_LOC05_PUBLIC on D22) and then behaves exactly as it does,
+     * except that it keeps the draft-22 poll_object size floor through
+     * initiating_request_id (an older caller's object then simply does not
+     * cover the codec_string block). AUTO on D22 therefore reports companion
+     * D22_MSF01_LOC05_PUBLIC, and a malformed or repeated LOC-05 Codec String
+     * is a parse drop where LOC-04 skipped it as unknown. With SHARED_EPOCH,
+     * AUTO has no draft-22 match. Explicit LEGACY_MSF01_LOC01 requires
+     * negotiated D16/18; explicit D22_MSF01_LOC04_PUBLIC or
+     * D22_MSF01_LOC05_PUBLIC requires negotiated D22 and RAW
      * time mode (SHARED_EPOCH is UNSUPPORTED at creation without an explicit
      * clock mapping). A negotiated mismatch, or an unmatched AUTO, reports
      * receiver-local FATAL_SETUP_FAILED; it does not close the
@@ -1120,6 +1125,8 @@ typedef struct moq_media_object {
      * including after receiver destruction (track itself does not survive).
      * Inherited config spans borrow this object's private track_properties_ref;
      * present object fields (including empty config) override the track block.
+     * On LOC-05 an object naming a codec other than the track's inherits no
+     * configuration (see codec_string below).
      * Raw Track and Object Properties remain separate and unchanged.
      * Legacy objects leave this metadata zero. No clock domain is inferred. */
     moq_media_metadata_t   metadata;
@@ -1146,6 +1153,24 @@ typedef struct moq_media_object {
 #endif
     uint32_t              delivery_origin; /* MOQ_MEDIA_DELIVERY_* */
     uint64_t              initiating_request_id;
+
+    /* Appended after the complete layout through initiating_request_id on
+     * every target. Available only when struct_size covers codec_string
+     * entirely; zero on every companion but D22_MSF01_LOC05_PUBLIC. The
+     * effective LOC-05 properties (MOQ_LOC_EXT_HAS_* bits in loc_ext_present,
+     * see moq_loc_ext_t): codec_string is the object's own Codec String, else
+     * its track's. It borrows properties_ref or this object's private
+     * track_properties_ref and stays valid until cleanup, like the config
+     * spans in metadata. It adds no owned reference and no charge. Raw Track
+     * and Object Properties stay separate and unchanged, and the catalog codec
+     * stays in the track descriptor. A Codec String and a configuration are
+     * the two halves of one decoder configuration, so an object that names
+     * its own codec carries the track's video/audio configuration in metadata
+     * only when that codec is the track's: its Track Properties' Codec
+     * String, else the catalog codec (moq_media_object_parse_sized). */
+    uint32_t              loc_ext_present;
+    uint32_t              _reserved_loc_ext; /* never read */
+    moq_bytes_t           codec_string;
 } moq_media_object_t;
 
 /* Release the buffers a successful poll transferred. Safe on a zeroed
@@ -1163,10 +1188,11 @@ MOQ_API void moq_media_object_cleanup(moq_media_object_t *obj);
  * MOQ_ERR_INVAL for NULL args or a legacy obj_size below the v0 base size. An object for a
  * track is never pollable before that track's TRACK_ADDED has been queued --
  * drain track events before objects on each wakeup and every handle is known
- * before its first object. For the D22 companion (explicit, or AUTO resolved on
+ * before its first object. For a D22 companion (explicit, or AUTO resolved on
  * draft 22), obj_size must cover
  * the whole metadata/ref and delivery-origin observation through the end of
- * initiating_request_id; otherwise
+ * initiating_request_id, and for explicit D22_MSF01_LOC05_PUBLIC through the
+ * end of codec_string; otherwise
  * MOQ_ERR_UNSUPPORTED leaves output and queue untouched, with no transfer.
  * Legacy D16/18 retains the v0 minimum. */
 MOQ_API moq_result_t moq_media_receiver_poll_object(moq_media_receiver_t *r,

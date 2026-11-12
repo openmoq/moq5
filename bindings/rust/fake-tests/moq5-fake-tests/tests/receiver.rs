@@ -1812,6 +1812,45 @@ fn objects_report_their_draft22_metadata() {
 }
 
 #[test]
+fn objects_report_their_codec_string() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    const CODEC: &[u8] = b"avc1.64001f";
+    let short_of_block = std::mem::offset_of!(sys::moq_media_object_t, loc_ext_present) as i64;
+    for (stamp, present, expected) in [
+        (0, true, Some("avc1.64001f")),
+        (0, false, None),
+        (short_of_block, true, None),
+    ] {
+        s.set("poll_object_stamp", stamp);
+        // SAFETY: the provider copies the record; the span is static.
+        unsafe {
+            fake::moq5_fake_push_object(&sys::moq_media_object_t {
+                track: raw_track(&receiver, 0),
+                loc_ext_present: if present {
+                    sys::MOQ_LOC_EXT_HAS_CODEC_STRING
+                } else {
+                    0
+                },
+                codec_string: fake::span(CODEC),
+                ..Default::default()
+            })
+        };
+        let object = receiver
+            .poll_object()
+            .expect("poll_object on a live receiver")
+            .expect("the pushed object is pollable");
+        assert_eq!(
+            object.codec_string(),
+            expected,
+            "stamp {stamp}, present {present}"
+        );
+    }
+    s.set("poll_object_stamp", 0);
+}
+
+#[test]
 fn information_is_the_effective_configuration() {
     let s = fake::suite();
     let endpoint = connect(&s);
@@ -1851,6 +1890,17 @@ fn information_is_the_effective_configuration() {
     s.set("info_time_mode", 9);
     s.set("info_overflow_policy", 0);
     s.set("info_terminals", 0);
+    s.set(
+        "info_companion",
+        i64::from(sys::MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC),
+    );
+    assert_eq!(
+        receiver
+            .info()
+            .expect("information on a live receiver")
+            .companion_profile,
+        CompanionProfile::D22Msf01Loc05Public
+    );
     s.set("info_companion", i64::from(sys::MOQ_MEDIA_COMPANION_AUTO));
     s.set("info_version", 0);
     let info = receiver.info().expect("information on a live receiver");

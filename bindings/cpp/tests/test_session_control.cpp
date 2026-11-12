@@ -344,6 +344,33 @@ static int test_loc_metadata()
     MOQ_CHECK(moq::loc::encode_metadata(MOQ_VERSION_DRAFT_16, m).error().code() ==
               moq::errc::unsupported);
     MOQ_CHECK(moq::loc::parse_metadata(static_cast<moq_version_t>(0), {}).error().code() == moq::errc::invalid);
+
+    /* LOC-05 by name: the Codec String's exact bytes round trip, after the
+     * other keys; the no-profile overloads stay LOC-04, which refuses to
+     * encode one and skips it on parse. */
+    moq::loc::metadata c;
+    c.timestamp = 7;
+    c.codec_string = std::string_view("avc1.64001f");
+    auto enc5 = moq::loc::encode_metadata(MOQ_VERSION_DRAFT_22, MOQ_LOC_PROFILE_05, c);
+    MOQ_CHECK(enc5.ok());
+    if (enc5.ok()) {
+        static const uint8_t wire[] = {0x10, 0x07, 0x01, 0x0b, 'a', 'v', 'c', '1', '.',
+                                       '6', '4', '0', '0', '1', 'f'};
+        MOQ_CHECK(enc5->size() == sizeof(wire) &&
+                  std::memcmp(enc5->data(), wire, sizeof(wire)) == 0);
+        moq::bytes_view bytes(enc5->data(), enc5->size());
+        auto dec5 = moq::loc::parse_metadata(MOQ_VERSION_DRAFT_22, MOQ_LOC_PROFILE_05, bytes);
+        MOQ_CHECK(dec5.ok() && dec5->codec_string &&
+                  *dec5->codec_string == std::string_view("avc1.64001f") &&
+                  dec5->codec_string->data() == reinterpret_cast<const char *>(enc5->data()) + 4);
+        auto dec4 = moq::loc::parse_metadata(MOQ_VERSION_DRAFT_22, bytes);
+        MOQ_CHECK(dec4.ok() && !dec4->codec_string && dec4->timestamp == std::optional<uint64_t>(7));
+    }
+    MOQ_CHECK(moq::loc::encode_metadata(MOQ_VERSION_DRAFT_22, c).error().code() ==
+              moq::errc::unsupported);
+    c.codec_string = std::string_view("op\0us", 5);
+    MOQ_CHECK(moq::loc::encode_metadata(MOQ_VERSION_DRAFT_22, MOQ_LOC_PROFILE_05, c).error().code() ==
+              moq::errc::invalid);
     MOQ_PASS("loc_metadata");
     return failures;
 }

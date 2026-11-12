@@ -233,7 +233,7 @@ static void test_info(moq_version_t ver)
     CHECK(info.max_stream_terminals == 64);
     CHECK(info.transport_version == (uint32_t)ver);
     CHECK(info.companion_profile == (ver == MOQ_VERSION_DRAFT_22
-                                         ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC
+                                         ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC
                                          : MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01));
     CHECK(info.track_events_polled >= 2);   /* TRACK_ADDED, CATALOG_READY */
     uint64_t polled = info.track_events_polled;

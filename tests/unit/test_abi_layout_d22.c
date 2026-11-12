@@ -855,6 +855,11 @@ PIN_AT(moq_loc_metadata_t, reserved, 30, 30, 30);
 PIN_AT(moq_loc_metadata_t, video_config, 32, 32, 32);
 PIN_AT(moq_loc_metadata_t, audio_config, 48, 40, 40);
 PIN_SIZE(moq_loc_metadata_t, 64, 48, 48);
+PIN_AT(moq_loc_ext_t, struct_size, 0, 0, 0);
+PIN_AT(moq_loc_ext_t, present, 4, 4, 4);
+PIN_AT(moq_loc_ext_t, codec_string, 8, 8, 8);
+PIN_SIZE(moq_loc_ext_t, 24, 16, 16);
+_Static_assert(MOQ_LOC_EXT_V0_SIZE == ABI_PICK(24, 16, 16), "extension v0 extent");
 #endif
 #ifdef ABI_HAVE_ENDPOINT
 /* The SETUP token pair and the certificate callback pair start at the
@@ -1172,6 +1177,17 @@ PIN_SIZE(moq_media_stream_terminal_t, 88, 84, 88);
  * sizeof of the layout before them. */
 PIN_AFTER(moq_media_receiver_track_subscribe_cfg_t, mpeg2ts_program_number, location);
 PIN_AFTER(moq_media_object_t, discontinuous, metadata);
+/* The LOC-05 blocks start past the complete layouts before them. */
+PIN_AFTER(moq_media_object_t, initiating_request_id, loc_ext_present);
+_Static_assert(offsetof(moq_media_object_t, codec_string) ==
+               offsetof(moq_media_object_t, loc_ext_present) + 8,
+               "moq_media_object_t.codec_string follows its presence word");
+PIN_AFTER(moq_media_parsed_object_t, metadata, loc_ext_present);
+_Static_assert(offsetof(moq_media_parsed_object_t, codec_string) ==
+               offsetof(moq_media_parsed_object_t, loc_ext_present) + 8,
+               "moq_media_parsed_object_t.codec_string follows its presence word");
+PIN_AFTER(moq_media_object_parse_cfg_t, mpeg2ts_packet_size, track_loc_ext);
+PIN_AFTER(moq_media_object_parse_cfg_t, track_loc_ext, catalog_codec);
 PIN_AFTER(moq_media_receiver_stats_t, reorder_refused, tracks_malformed);
 #endif
 
@@ -1196,6 +1212,8 @@ PIN_AFTER(moq_media_track_cfg_t, mpeg2ts_forward_before_random_access,
 PIN_AFTER(moq_media_track_cfg_t, mpeg2ts_forward_before_random_access,
           dynamic_groups);
 PIN_AFTER(moq_media_track_cfg_t, label, group_order);
+PIN_AFTER(moq_media_track_cfg_t, group_order, track_loc_ext);
+PIN_AFTER(moq_media_send_object_t, metadata, loc_ext);
 _Static_assert(offsetof(moq_media_track_cfg_t, track_properties) ==
                ABI_SIZEOF_THROUGH(moq_media_track_cfg_t,
                                   mpeg2ts_forward_before_random_access),

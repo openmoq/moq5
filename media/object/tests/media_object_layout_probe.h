@@ -43,6 +43,21 @@ typedef struct media_old_parsed {
     uint32_t track_id;
 } media_old_parsed_t;
 
+/* The parsed object through metadata and the parser context through
+ * mpeg2ts_packet_size, declared on their own: the complete layouts before
+ * the LOC-05 tails. */
+typedef struct media_through_metadata_parsed {
+    media_old_parsed_t base;
+    moq_media_metadata_t metadata;
+} media_through_metadata_parsed_t;
+
+typedef struct media_old_parse_cfg {
+    uint32_t struct_size;
+    uint32_t companion_profile;
+    const moq_loc_metadata_t *track_loc_metadata;
+    uint32_t mpeg2ts_packet_size;
+} media_old_parse_cfg_t;
+
 #define MEDIA_OLD_OFFSET(T, OLD, field) \
     MEDIA_ASSERT(offsetof(T, field) == offsetof(OLD, field), "old offset " #field)
 #define MEDIA_PIN_TRACK(f) MEDIA_OLD_OFFSET(moq_media_track_info_t, media_old_track_t, f)
@@ -92,9 +107,26 @@ MEDIA_ASSERT(MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE == 8,
 MEDIA_ASSERT(offsetof(moq_media_object_parse_cfg_t, mpeg2ts_packet_size) ==
              (sizeof(void *) == 8 ? 16 : 12),
              "packet size follows the whole metadata pointer");
-MEDIA_ASSERT(sizeof(moq_media_object_parse_cfg_t) == (sizeof(void *) == 8 ? 24 : 16),
+MEDIA_ASSERT(sizeof(media_old_parse_cfg_t) == (sizeof(void *) == 8 ? 24 : 16),
+             "parser context complete extent before track_loc_ext");
+MEDIA_ASSERT(offsetof(moq_media_object_parse_cfg_t, track_loc_ext) ==
+             sizeof(media_old_parse_cfg_t),
+             "track_loc_ext starts at the complete extent through mpeg2ts_packet_size");
+MEDIA_ASSERT(offsetof(moq_media_object_parse_cfg_t, catalog_codec) ==
+             (sizeof(void *) == 8 ? 32 : 20),
+             "catalog_codec follows the whole track_loc_ext pointer");
+MEDIA_ASSERT(sizeof(moq_media_object_parse_cfg_t) == (sizeof(void *) == 8 ? 48 : 28),
              "parser context complete extent");
 MEDIA_ASSERT(MOQ_MEDIA_METADATA_V0_SIZE == sizeof(moq_media_metadata_t), "full metadata floor");
-MEDIA_ASSERT(MOQ_MEDIA_PARSED_OBJECT_METADATA_SIZE == sizeof(moq_media_parsed_object_t),
+MEDIA_ASSERT(offsetof(media_through_metadata_parsed_t, metadata) ==
+             offsetof(moq_media_parsed_object_t, metadata),
+             "metadata keeps its offset");
+MEDIA_ASSERT(MOQ_MEDIA_PARSED_OBJECT_METADATA_SIZE ==
+             sizeof(media_through_metadata_parsed_t),
+             "the D22 floor is the complete extent through metadata");
+MEDIA_ASSERT(offsetof(moq_media_parsed_object_t, loc_ext_present) ==
+             sizeof(media_through_metadata_parsed_t),
+             "the LOC-05 block starts at the sizeof through metadata");
+MEDIA_ASSERT(MOQ_MEDIA_PARSED_OBJECT_LOC_EXT_SIZE == sizeof(moq_media_parsed_object_t),
              "full current parsed floor");
 #endif

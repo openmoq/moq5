@@ -43,6 +43,27 @@ private final class ReleaseWitness {
 @Suite("Receiver observation bridge")
 struct ReceiverObservationBridgeTests {
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("The Codec String is copied as exact bytes only when present and covered")
+    func codecString() {
+        let text: [UInt8] = Array("avc1.640028".utf8)
+        text.withUnsafeBufferPointer { buffer in
+            for (present, covered) in [(true, true), (false, true), (true, false)] {
+                var object = fullObject()
+                object.loc_ext_present = present ? moq_swift_loc_ext_has_codec_string() : 0
+                object.codec_string = moq_bytes_t(data: buffer.baseAddress, len: buffer.count)
+                if !covered {
+                    object.struct_size = UInt32(MemoryLayout<moq_media_object_t>.offset(
+                        of: \moq_media_object_t.loc_ext_present)!)
+                }
+                let copied = takeReceivedObject(&object)
+                let expected: Data? = present && covered ? Data(text) : nil
+                #expect(copied.metadata?.codecStringBytes == expected)
+                #expect(copied.metadata?.codecString == (expected == nil ? nil : "avc1.640028"))
+            }
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Full-width wire identity and FILL zero survive the actual copy path")
     func identityAndFill() {
         var object = moq_media_object_t()

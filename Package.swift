@@ -34,7 +34,7 @@ let package = Package(
             ]
         ),
 
-        // C media: LOC properties (draft-ietf-moq-loc-01).
+        // C media: LOC property codecs.
         .target(
             name: "CMoQLOC",
             dependencies: ["CMoQCore"],
@@ -58,7 +58,11 @@ let package = Package(
             dependencies: ["CMoQCore", "CMoQLOC", "CMoQCMAF"],
             path: "media/object",
             sources: ["src"],
-            publicHeadersPath: "include"
+            publicHeadersPath: "include",
+            cSettings: [
+                // The Codec String validator shared with CMoQLOC.
+                .headerSearchPath("../loc/src"),
+            ]
         ),
 
         // Swift bindings.

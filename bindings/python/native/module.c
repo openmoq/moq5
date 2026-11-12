@@ -464,7 +464,8 @@ static PyObject *receiver_attach_py(PyObject *module, PyObject *args)
         return NULL;
     if (profile != MOQ_MEDIA_COMPANION_AUTO &&
         profile != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
-        profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC) {
+        profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC &&
+        profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC) {
         PyErr_SetString(PyExc_ValueError, "unknown companion_profile");
         return NULL;
     }
@@ -1398,7 +1399,25 @@ static PyObject *object_metadata(PyObject *module, const moq_media_object_t *o)
     }
     result = PyDict_New();
     if (!result) goto out;
-    if (put(result, "time_domain", PyLong_FromUnsignedLong(m->time_domain)) < 0 ||
+    /* The effective LOC-05 Codec String, decoded strictly: the library
+     * reports only well-formed UTF-8, so a failure here is a lost object. */
+    PyObject *codec = NULL;
+    if (COVERS(o->struct_size, moq_media_object_t, codec_string) &&
+        (o->loc_ext_present & MOQ_LOC_EXT_HAS_CODEC_STRING)) {
+        if (o->codec_string.len > (size_t)PY_SSIZE_T_MAX ||
+            (o->codec_string.len && !o->codec_string.data)) {
+            Py_CLEAR(result);
+            result = object_lost(module, "codec_string", o, true);
+            goto out;
+        }
+        codec = PyUnicode_DecodeUTF8((const char *)o->codec_string.data,
+                                     (Py_ssize_t)o->codec_string.len, "strict");
+        if (!codec) { Py_CLEAR(result); goto out; }
+    } else {
+        codec = Py_NewRef(Py_None);
+    }
+    if (put(result, "codec_string", codec) < 0 ||
+        put(result, "time_domain", PyLong_FromUnsignedLong(m->time_domain)) < 0 ||
         put(result, "time_us", opt_u64(m->has_time_us, m->time_us)) < 0 ||
         put(result, "independent", m->independence_known ? PyBool_FromLong(m->independent) : Py_NewRef(Py_None)) < 0 ||
         PyDict_SetItemString(result, "loc", loc) < 0) Py_CLEAR(result);
@@ -1736,7 +1755,8 @@ static PyObject *sender_activate_py(PyObject *module, PyObject *args)
         return NULL;
     if (profile != MOQ_MEDIA_COMPANION_AUTO &&
         profile != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
-        profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC) {
+        profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC &&
+        profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC) {
         PyErr_SetString(PyExc_ValueError, "unknown companion_profile");
         return NULL;
     }
@@ -1993,13 +2013,13 @@ static PyObject *send_track_activate_py(PyObject *module, PyObject *args)
     PyObject *capsule, *codec, *init_data, *role, *lang, *channel_config;
     PyObject *media_type, *packaging, *bitrate, *timescale, *width, *height;
     PyObject *framerate, *samplerate, *is_live, *duration;
-    PyObject *properties, *dynamic_groups;
-    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOOOOOOO:send_track_activate",
+    PyObject *properties, *dynamic_groups, *codec_property = Py_False;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOOOOOOOOOO|O:send_track_activate",
                           &capsule, &media_type, &packaging, &codec, &bitrate,
                           &timescale, &init_data, &role, &lang, &is_live,
                           &width, &height, &framerate, &samplerate,
                           &channel_config, &duration, &properties,
-                          &dynamic_groups))
+                          &dynamic_groups, &codec_property))
         return NULL;
     send_track_handle_t *handle = send_track_get(capsule, 1, 0, 0);
     if (!handle) return NULL;
@@ -2013,6 +2033,10 @@ static PyObject *send_track_activate_py(PyObject *module, PyObject *args)
     }
     if (!PyBool_Check(dynamic_groups)) {
         PyErr_SetString(PyExc_TypeError, "dynamic_groups must be bool");
+        goto abort_prepared;
+    }
+    if (!PyBool_Check(codec_property)) {
+        PyErr_SetString(PyExc_TypeError, "codec_string_property must be bool");
         goto abort_prepared;
     }
     /* The prepared owner must still be usable: prepare and activate are two
@@ -2073,6 +2097,14 @@ static PyObject *send_track_activate_py(PyObject *module, PyObject *args)
     cfg.track_duration_ms = dur;
     cfg.track_properties = property_bytes;
     cfg.dynamic_groups = dynamic_groups == Py_True;
+    /* The catalog codec, stated as the LOC-05 Codec String track property. */
+    moq_loc_ext_t track_ext;
+    moq_loc_ext_init_sized(&track_ext, sizeof(track_ext));
+    if (codec_property == Py_True) {
+        track_ext.present = MOQ_LOC_EXT_HAS_CODEC_STRING;
+        track_ext.codec_string = codec_bytes;
+        cfg.track_loc_ext = &track_ext;
+    }
 
     moq_media_track_t *native = NULL;
     moq_result_t rc;
@@ -2275,12 +2307,12 @@ static PyObject *sender_write_py(PyObject *module, PyObject *args)
     PyObject *sender_capsule, *track_capsule, *payload, *properties;
     PyObject *is_sync, *starts_group, *ends_group;
     PyObject *decode_time, *presentation_time, *capture_time, *sap_type;
-    PyObject *metadata = Py_None;
-    if (!PyArg_ParseTuple(args, "OOOOOOOOOOO|O:sender_write",
+    PyObject *metadata = Py_None, *codec_string = Py_None;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOOOO|OO:sender_write",
                           &sender_capsule, &track_capsule, &payload,
                           &properties, &is_sync, &starts_group, &ends_group,
                           &decode_time, &presentation_time, &capture_time,
-                          &sap_type, &metadata))
+                          &sap_type, &metadata, &codec_string))
         return NULL;
 
     /* Owner thread, same process, live sender and a REGISTERED track of THIS
@@ -2319,6 +2351,15 @@ static PyObject *sender_write_py(PyObject *module, PyObject *args)
     }
     moq_media_metadata_t metadata_value;
     if (sender_metadata_value(metadata, &metadata_value) < 0) return NULL;
+    /* The LOC-05 Codec String: exact UTF-8 bytes, borrowed from the argument
+     * tuple for the call. The service checks it as an identifier. */
+    moq_loc_ext_t codec_ext;
+    moq_loc_ext_init_sized(&codec_ext, sizeof(codec_ext));
+    if (codec_string != Py_None) {
+        if (binary_value(codec_string, "codec_string", &codec_ext.codec_string) < 0)
+            return NULL;
+        codec_ext.present = MOQ_LOC_EXT_HAS_CODEC_STRING;
+    }
 
     /* Nothing above runs foreign Python: uint_value requires PyLong and the
      * spans must be bytes. The owner is rechecked anyway, because prepare-time
@@ -2363,6 +2404,7 @@ static PyObject *sender_write_py(PyObject *module, PyObject *args)
     object.sap_type = (moq_sap_type_t)sap;
     /* The argument tuple owns every borrowed bytes value through this call. */
     object.metadata = metadata == Py_None ? NULL : &metadata_value;
+    object.loc_ext = codec_string == Py_None ? NULL : &codec_ext;
 
     moq_result_t rc;
     Py_BEGIN_ALLOW_THREADS
@@ -2843,7 +2885,7 @@ PyMODINIT_FUNC PyInit__native(void)
     ADD(MEDIA_TIME_RAW); ADD(MEDIA_TIME_SHARED_EPOCH);
     ADD(MEDIA_START_CURRENT); ADD(MEDIA_START_NEXT_GROUP);
     ADD(MEDIA_COMPANION_LEGACY_MSF01_LOC01); ADD(MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC);
-    ADD(MEDIA_COMPANION_AUTO);
+    ADD(MEDIA_COMPANION_AUTO); ADD(MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC);
     ADD(LOCATION_FILTER_NONE); ADD(LOCATION_FILTER_RELATIVE_GROUP); ADD(LOCATION_FILTER_ABSOLUTE_START);
     ADD(LOCATION_FILTER_GROUP_END); ADD(LOCATION_FILTER_OBJECT_END); ADD(LOCATION_FILTER_NEXT_OBJECT);
     ADD(GROUP_ORDER_ASCENDING); ADD(GROUP_ORDER_DESCENDING);

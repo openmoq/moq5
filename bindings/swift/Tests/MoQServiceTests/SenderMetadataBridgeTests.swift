@@ -149,6 +149,33 @@ struct SenderMetadataBridgeTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A Codec String reaches the service as its exact bytes, borrowed for the call")
+    func codecString() {
+        let exact = Data([0x61, 0x76, 0x63, 0x31, 0xc3, 0xa9])   // "avc1" + U+00E9
+        var object = OutgoingObject(payload: Data())
+        object.codecStringBytes = exact
+        var calls = 0
+        _ = writeSenderObject(object) { send in
+            calls += 1
+            let ext = send.pointee.loc_ext
+            #expect(ext != nil)
+            if let ext {
+                #expect(ext.pointee.struct_size == MemoryLayout<moq_loc_ext_t>.size)
+                #expect(ext.pointee.present == moq_swift_loc_ext_has_codec_string())
+                #expect(spanData(ext.pointee.codec_string) == exact)
+            }
+            return moq_result_t(MOQ_ERR_INVAL)
+        }
+        #expect(calls == 1)
+        _ = writeSenderObject(OutgoingObject(payload: Data())) { send in
+            #expect(send.pointee.loc_ext == nil)
+            return moq_result_t(MOQ_ERR_INVAL)
+        }
+        object.codecString = "opus"
+        #expect(object.codecStringBytes == Data("opus".utf8))
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("All six independent presence bits and combinations retain zero/MAX")
     func presenceMatrix() {
         let bits = [moq_swift_loc_metadata_has_timestamp(), moq_swift_loc_metadata_has_timescale(),

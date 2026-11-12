@@ -42,10 +42,12 @@ service-tier player composes this engine with the media receiver for those.
   which kinds own rcbuf refs, reads only what the stamp covers, is idempotent,
   and is legal after the engine was destroyed.
 
-Track config appends two fields after the v0 floor: `transport_version`
-(16, 18 or 22; draft 16 when uncovered; zero or any other value refused) and,
-on draft 22 only, `track_properties` (the track's LOC-04 properties, copied
-and validated at `add_track`).
+Track config appends fields after the v0 floor: `transport_version`
+(16, 18 or 22; draft 16 when uncovered; zero or any other value refused);
+on draft 22 only, `track_properties` (the track's LOC properties, copied
+and validated at `add_track`); and `loc_profile`, the LOC revision
+`push_object` parses with (0 takes the draft's own, LOC-01 or LOC-04;
+`MOQ_LOC_PROFILE_05` adds the Codec String on draft 22).
 
 ## 3. Objects in, commands out
 
@@ -73,11 +75,15 @@ scale: the same sample table, decode time and first-sample duration, and the
 same media range, with the samples fitting inside it.
 
 Either path keeps owned copies of what release needs: a multi-sample CMAF
-object's sample table and base tick, and a draft-22 object's effective
-decoder configuration (LOC-04 Video or Audio Config). The byte charge is
-payload plus those copies; a configuration over `max_track_config_bytes` or a
-charge over the whole budget is `MOQ_ERR_LIMIT`, a failed copy
-`MOQ_ERR_NOMEM`. A refusal on either path retains nothing. Release reads only
+object's sample table and base tick, a draft-22 object's effective
+decoder configuration (LOC Video or Audio Config), and on LOC-05 its
+effective Codec String when it differs from the catalog codec. The byte charge
+is payload plus those copies; a configuration or Codec String over
+`max_track_config_bytes` or a charge over the whole budget is `MOQ_ERR_LIMIT`,
+a failed copy `MOQ_ERR_NOMEM`. Codec copies are never shared between objects;
+like configuration copies they are charged once while any holder (an object,
+a track's decoder or release slot, a queued CONFIGURE, a command hold) keeps
+them. A refusal on either path retains nothing. Release reads only
 the owned copies; it never parses.
 
 **Configuration.** Each track keeps two configurations apart: the decoder's
@@ -112,9 +118,26 @@ Commands own their refs until cleanup. Events are scalar.
 
 Drafts 16 and 18 parse LOC-01 through the frozen media-object parser with the
 track's `transport_version`, which selects the property integer codec. Draft
-22 parses LOC-04 through the sized parser on the draft-22 companion, passing
-the track's parsed `track_properties` so an object without its own timescale
-or codec configuration inherits them.
+22 parses LOC-04, or LOC-05 when the track names it, through the sized parser
+on the matching draft-22 companion, passing the track's parsed
+`track_properties` so an object without its own timescale, codec
+configuration or Codec String inherits them, and the catalog codec. A Codec
+String and a configuration are the two halves of one decoder configuration,
+so an object that names its own codec inherits the track's configuration
+only when that codec is the track's: its Track Properties' Codec String, else
+the catalog codec.
+
+Each released object decodes under a codec/configuration pair. The codec is
+its own effective Codec String, else the catalog codec; never an earlier
+object's. The configuration is its own effective LOC configuration when
+present (an empty one included), else the last released unit's while that
+unit's codec is byte-equal to this one's, else the catalog configuration when
+this object's codec is the catalog codec, else none. A CONFIGURE carrying the
+pair precedes the decode when the decoder is unconfigured or either half
+differs by exact bytes from the pair last emitted. Only an enqueued CONFIGURE
+commits the decoder's pair; the released pair moves only with the release of
+media. Without any Codec String every codec is the catalog's, so a
+configuration carries forward until another one is declared.
 
 A RAW object must carry usable media time or it is dropped
 `MISSING_TIMESTAMP`. On drafts 16/18 that is the LOC capture timestamp (UNIX

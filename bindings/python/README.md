@@ -244,8 +244,11 @@ read elsewhere. To cancel a blocked receiver wait from another thread use
 
 `ReceiverConfig.companion_profile` defaults to `CompanionProfile.AUTO`, which
 the native receiver resolves to the profile matching the negotiated draft:
-`LEGACY_MSF01_LOC01` on draft 16/18, `D22_MSF01_LOC04_PUBLIC` on draft 22.
-An explicit profile pins one and refuses the other drafts. Native
+`LEGACY_MSF01_LOC01` on draft 16/18, `D22_MSF01_LOC05_PUBLIC` on draft 22.
+An explicit profile pins one and refuses the other drafts. On LOC-05,
+`MediaMetadata.codec_string` is the object's effective Codec String (its own,
+else its track's), decoded strictly; the catalog codec stays in the track
+description, and nothing compares the two. Native
 eligibility/refusals remain authoritative, including the D22 `SHARED_EPOCH`
 refusal (AUTO with `SHARED_EPOCH` has no draft-22 match). Receiver and subscribe configuration use
 the sized native initializers; endpoint and existing receiver defaults do not
@@ -551,9 +554,14 @@ by the service, not clamped here. These legacy timing fields do not supply
 draft-22 RAW metadata.
 
 `SenderConfig.companion_profile` defaults to `CompanionProfile.AUTO`: the
-native sender uses the profile matching the negotiated draft. An explicit
-`LEGACY_MSF01_LOC01` or `D22_MSF01_LOC04_PUBLIC` pins one; a known
-wire/companion mismatch is then `UNSUPPORTED`.
+native sender uses the profile matching the negotiated draft (LOC-05 on draft
+22). An explicit `LEGACY_MSF01_LOC01`, `D22_MSF01_LOC04_PUBLIC` or
+`D22_MSF01_LOC05_PUBLIC` pins one; a known wire/companion mismatch is then
+`UNSUPPORTED`. `SendObject.codec_string` (RAW) adds the object's LOC-05 Codec
+String and `SendTrackConfig.codec_string_property` states the catalog codec as
+the track's; both are refused (`UNSUPPORTED`) unless nothing can later drop
+them: a LOC-05 sender, or an unresolved AUTO sender whose endpoint offers draft
+22 alone.
 
 `SenderConfig.initial_group_id` (default `None`) sets the first Group ID of
 every track instead of the profile's default (0 for the legacy profile, the
@@ -565,7 +573,7 @@ and optional Timescale. The `LocMetadata.present` bits must agree with its
 non-`None` fields; zero Timestamp and present-empty configuration spans remain
 declared values. With the explicit draft-22 profile no timestamp is inferred
 from capture time or PTS; under AUTO an object without `loc_metadata` carries
-LOC-04 metadata generated from the typed fields: `capture_time_us` as an
+LOC metadata generated from the typed fields: `capture_time_us` as an
 unscaled Timestamp (UNIX microseconds), else the presentation time as media
 time with Timescale 1,000,000, plus the video sync marking. A capture time
 on a track whose `track_properties` carry a LOC-04 Timescale is refused with

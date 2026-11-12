@@ -117,6 +117,22 @@ int main()
     rcfg.companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
     if (rcfg.companion_profile != MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC)
         return 2;
+    rcfg.companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
+    {
+        /* The installed LOC codec reads a LOC-05 Codec String. */
+        static const uint8_t codec[] = {0x11, 0x04, 'o', 'p', 'u', 's'};
+        moq_bytes_t bytes;
+        bytes.data = codec;
+        bytes.len = sizeof(codec);
+        moq_loc_metadata_t m;
+        moq_loc_ext_t e;
+        moq_loc_metadata_init_sized(&m, sizeof(m));
+        moq_loc_ext_init_sized(&e, sizeof(e));
+        if (moq_loc_parse_metadata_ex(MOQ_VERSION_DRAFT_22, MOQ_LOC_PROFILE_05, bytes,
+                                      &m, sizeof(m), &e, sizeof(e)) != MOQ_OK ||
+            e.present != MOQ_LOC_EXT_HAS_CODEC_STRING || e.codec_string.len != 4)
+            return 2;
+    }
     rcfg.mpeg2ts_reorder_slots = 32;
     rcfg.mpeg2ts_reorder_window_us = 200000;
     rcfg.mpeg2ts_strip_prefix = true;

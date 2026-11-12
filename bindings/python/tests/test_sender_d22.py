@@ -12,6 +12,7 @@ from moq5 import _native
 
 LEGACY = moq5.CompanionProfile.LEGACY_MSF01_LOC01
 D22 = moq5.CompanionProfile.D22_MSF01_LOC04_PUBLIC
+LOC05 = moq5.CompanionProfile.D22_MSF01_LOC05_PUBLIC
 AUTO = moq5.CompanionProfile.AUTO
 NS = (b"live", b"cam\x001")
 
@@ -138,6 +139,7 @@ class SenderD22Tests(unittest.TestCase):
             with self.subTest(versions=versions), self.connect(versions) as endpoint:
                 for fields, expected in (({}, AUTO), ({"companion_profile": LEGACY}, LEGACY),
                                          ({"companion_profile": D22}, D22),
+                                         ({"companion_profile": LOC05}, LOC05),
                                          ({"companion_profile": AUTO}, AUTO)):
                     with self.subTest(profile=expected):
                         with moq5.Sender.attach(endpoint, moq5.SenderConfig.live(NS, **fields)):
@@ -168,7 +170,7 @@ class SenderD22Tests(unittest.TestCase):
 
     def test_invalid_config_profiles_precede_prepare_and_attach(self):
         cases = [(value, TypeError) for value in (True, False, None, 1.0, "1", b"1", object())]
-        cases += [(value, ValueError) for value in (-1, 3, 2**32 - 1, 2**32, 2**64)]
+        cases += [(value, ValueError) for value in (-1, 4, 2**32 - 1, 2**32, 2**64)]
         with self.connect() as endpoint:
             with mock.patch.object(_native, "sender_prepare") as prepare:
                 for value, error in cases:
@@ -192,7 +194,8 @@ class SenderD22Tests(unittest.TestCase):
     def test_optional_native_tail_accepts_known_profiles_and_none(self):
         with self.connect() as endpoint:
             for profile, expected in ((int(LEGACY), LEGACY), (int(D22), D22),
-                                      (int(AUTO), AUTO), (None, AUTO)):
+                                      (int(LOC05), LOC05), (int(AUTO), AUTO),
+                                      (None, AUTO)):
                 with self.subTest(profile=profile):
                     handle = _native.sender_prepare(endpoint._Endpoint__handle)
                     try:
@@ -203,7 +206,7 @@ class SenderD22Tests(unittest.TestCase):
 
     def test_invalid_native_profile_leaves_the_prepared_handle_inert(self):
         cases = [(value, TypeError) for value in (True, False, 1.0, "1", b"1", object())]
-        cases += [(value, ValueError) for value in (-1, 3, 2**32 - 1, 2**32, 2**64)]
+        cases += [(value, ValueError) for value in (-1, 4, 2**32 - 1, 2**32, 2**64)]
         with self.connect() as endpoint:
             handle = _native.sender_prepare(endpoint._Endpoint__handle)
             try:
@@ -217,7 +220,7 @@ class SenderD22Tests(unittest.TestCase):
                 args = list(self.native_args(handle))
                 args[1] = object()
                 with self.assertRaisesRegex(ValueError, "companion_profile"):
-                    _native.sender_activate(*args, 3)
+                    _native.sender_activate(*args, 4)
                 self.assert_no_attach()
                 _native.sender_activate(*self.native_args(handle), D22)
                 self.assertEqual(_native._test_sender_config()["companion_profile"], D22)

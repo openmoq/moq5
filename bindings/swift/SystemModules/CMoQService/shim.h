@@ -28,6 +28,16 @@ static inline moq_media_companion_profile_t moq_swift_media_companion_d22_public
     return MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC;
 }
 
+static inline moq_media_companion_profile_t moq_swift_media_companion_d22_loc05_public(void)
+{
+    return MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
+}
+
+static inline uint32_t moq_swift_loc_ext_has_codec_string(void)
+{
+    return MOQ_LOC_EXT_HAS_CODEC_STRING;
+}
+
 static inline uint32_t moq_swift_loc_metadata_has_timestamp(void)
 {
     return MOQ_LOC_METADATA_HAS_TIMESTAMP;

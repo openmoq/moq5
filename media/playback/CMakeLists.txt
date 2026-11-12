@@ -80,6 +80,12 @@ if(MOQ_BUILD_TESTS)
     target_compile_definitions(test_playback_parsed PRIVATE MOQ_PLAYBACK_TESTING)
     add_test(NAME playback_parsed COMMAND test_playback_parsed)
 
+    add_executable(test_playback_loc05 tests/test_playback_loc05.c)
+    target_link_libraries(test_playback_loc05 PRIVATE
+        moq-playback-test-internals moq::loc)
+    target_compile_definitions(test_playback_loc05 PRIVATE MOQ_PLAYBACK_TESTING)
+    add_test(NAME playback_loc05 COMMAND test_playback_loc05)
+
     add_executable(test_playback_admission tests/test_playback_admission.c)
     target_link_libraries(test_playback_admission PRIVATE
         moq-playback-test-internals moq::loc)

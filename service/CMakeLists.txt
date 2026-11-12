@@ -868,6 +868,21 @@ if(MOQ_BUILD_TESTS)
                 COMMAND test_media_receiver_metadata_copy)
             set_tests_properties(media_receiver_metadata_copy PROPERTIES TIMEOUT 30)
 
+            add_executable(test_media_receiver_loc05
+                tests/test_media_receiver_loc05.c)
+            target_link_libraries(test_media_receiver_loc05 PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_loc05 PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_loc05 PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_loc05
+                COMMAND test_media_receiver_loc05)
+            set_tests_properties(media_receiver_loc05 PROPERTIES TIMEOUT 30)
+
             add_executable(test_media_receiver_origin
                 tests/test_media_receiver_origin.c
                 tests/receiver_legacy_ts_caller.c)
@@ -1566,6 +1581,11 @@ if(MOQ_BUILD_TESTS)
             endif()
             add_test(NAME media_late_joiner_fill
                 COMMAND test_media_late_joiner_fill)
+            if(TARGET moq::playback)
+                target_link_libraries(test_media_late_joiner_fill PRIVATE moq::playback)
+                target_compile_definitions(test_media_late_joiner_fill PRIVATE
+                    LJ_HAVE_PLAYBACK)
+            endif()
 
             # Negotiated-profile closure tests. Two independent directions
             # over the SAME substrate: a real sender's LOC-01 property bytes

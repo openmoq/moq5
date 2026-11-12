@@ -120,6 +120,19 @@ public struct OutgoingObject: Sendable {
     /// Raw outbound LOC metadata. Native service profile and clock rules
     /// apply; this does not derive values from the legacy time helpers.
     public var locMetadata: MediaLOCMetadata?
+    /// RAW only: the object's LOC-05 Codec String, its exact bytes, sent with
+    /// the LOC metadata (given or generated). The native service refuses it
+    /// unless nothing can later drop it (a LOC-05 sender on draft 22, or an
+    /// unresolved automatic one whose endpoint offers draft 22 alone), and
+    /// refuses empty, whitespace-only, NUL-bearing or non-UTF-8 bytes; it
+    /// never repairs them.
+    public var codecStringBytes: Data?
+
+    /// The Codec String as text; setting it stores its UTF-8 bytes.
+    public var codecString: String? {
+        get { codecStringBytes.flatMap { String(data: $0, encoding: .utf8) } }
+        set { codecStringBytes = newValue.map { Data($0.utf8) } }
+    }
 
     public init(payload: Data,
                 isSync: Bool = false,
@@ -140,6 +153,7 @@ public struct OutgoingObject: Sendable {
         self.captureTime = captureTime
         self.sapType = sapType
         self.locMetadata = nil
+        self.codecStringBytes = nil
     }
 
     public init(payload: Data,

@@ -91,6 +91,24 @@ class SendMetadataTests(writes.WriteGatedBase):
                 self.assertEqual(image["metadata"][field], getattr(raw, field), field)
             self.assert_metadata(raw)
 
+    def test_codec_string_reaches_c_as_its_exact_utf8_bytes(self):
+        with self.connect() as endpoint, self.attach(endpoint) as sender:
+            track = self.track(sender)
+            for text in ("avc1.640028", " opus\t", "h\u00e9v1", "\U0010ffff"):
+                with self.subTest(text=text):
+                    self.assertIs(sender.write(track, self.obj(codec_string=text)),
+                                  moq5.WriteOutcome.ACCEPTED)
+                    self.assertEqual(_native._test_write_object()["codec_string"],
+                                     text.encode("utf-8"))
+            self.assertIs(sender.write(track, self.obj()), moq5.WriteOutcome.ACCEPTED)
+            self.assertIsNone(_native._test_write_object()["codec_string"])
+
+    def test_codec_string_refusals_precede_native_entry(self):
+        for value, error in (("\ud800", ValueError), (b"opus", TypeError), (7, TypeError)):
+            with self.subTest(value=value):
+                with self.assertRaises(error):
+                    self.obj(codec_string=value)
+
     def test_individual_bits_zero_max_and_marking_lengths_are_lossless(self):
         cases = [loc(), loc(timestamp=0), loc(timestamp=MAX), loc(timescale=0),
                  loc(timescale=MAX), loc(timescale=1_000_000), loc(audio_level=0),

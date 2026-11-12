@@ -613,6 +613,11 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s, const moq_media_t
                  m->has_mode ? (int)m->mode : -1, m->has_packet_size ? m->packet_size : 0, es, prog,
                  pcr, mux, si, ra, tsm, scte, m->struct_size);
     }
+    moq_bytes_t track_codec = {(const uint8_t *)"none", 4};
+    if (cfg->struct_size >= offsetof(moq_media_track_cfg_t, track_loc_ext) +
+                                sizeof cfg->track_loc_ext &&
+        cfg->track_loc_ext && (cfg->track_loc_ext->present & MOQ_LOC_EXT_HAS_CODEC_STRING))
+        track_codec = cfg->track_loc_ext->codec_string;
     char props[80] = "";
     for (size_t i = 0; i < cfg->track_properties.len && i < 32; i++) {
         char one[4];
@@ -625,7 +630,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s, const moq_media_t
           "sap_timeline=%s duration=%s media_timeline=%s alt_group=%s priority=%s "
           "extensions=%zu mpeg2ts_app_objects=%d track_properties=%zu dynamic_groups=%d "
           "render_group=%s label=%s mpeg2ts=%s object_packets=%u min_group_ms=%u forward=%d "
-          "properties=[%s] struct_size=%u",
+          "properties=[%s] track_codec_string=%.*s struct_size=%u",
           SPAN(cfg->name), (int)cfg->media_type, cfg->packaging, SPAN(cfg->codec), cfg->timescale,
           cfg->init_data.len, SPAN(cfg->role), SPAN(cfg->lang), cfg->is_live ? 1 : 0, cfg->width,
           cfg->height, cfg->framerate_millis, cfg->samplerate, SPAN(cfg->channel_config),
@@ -633,7 +638,8 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s, const moq_media_t
           alt, prio, cfg->extension_count, cfg->mpeg2ts_app_objects ? 1 : 0,
           cfg->track_properties.len, cfg->dynamic_groups ? 1 : 0, render, label, ts,
           cfg->mpeg2ts_object_packets, cfg->mpeg2ts_min_group_ms,
-          cfg->mpeg2ts_forward_before_random_access ? 1 : 0, props, cfg->struct_size);
+          cfg->mpeg2ts_forward_before_random_access ? 1 : 0, props,
+          SPAN(track_codec), cfg->struct_size);
     moq_result_t rc = (moq_result_t)get("add_track_result");
     if (get("add_track_fail_at") == get("add_track")) rc = MOQ_ERR_NOMEM;
     if (rc != MOQ_OK) return rc;
@@ -696,11 +702,16 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s, moq_media_track_t *tr
                  m->loc.timescale, mark, m->loc.audio_level, m->loc.video_config.len,
                  m->loc.audio_config.len);
     }
+    /* The typed LOC-05 Codec String, when the record covers and sets it. */
+    moq_bytes_t codec = {(const uint8_t *)"none", 4};
+    if (obj->struct_size >= offsetof(moq_media_send_object_t, loc_ext) + sizeof obj->loc_ext &&
+        obj->loc_ext && (obj->loc_ext->present & MOQ_LOC_EXT_HAS_CODEC_STRING))
+        codec = obj->loc_ext->codec_string;
     logf_("write track=%d len=%zu props=%s sync=%d starts=%d ends=%d dts=%" PRIu64
-          " pts=%" PRIu64 " capture=%s sap=%s metadata=%d meta=%s struct_size=%u",
+          " pts=%" PRIu64 " capture=%s sap=%s metadata=%d meta=%s codec_string=%.*s struct_size=%u",
           i, moq_rcbuf_len(obj->payload), props, obj->is_sync ? 1 : 0, obj->starts_group ? 1 : 0,
           obj->ends_group ? 1 : 0, obj->decode_time_us, obj->presentation_time_us, capture, sap,
-          obj->metadata ? 1 : 0, meta, obj->struct_size);
+          obj->metadata ? 1 : 0, meta, SPAN(codec), obj->struct_size);
     if (s->ep->interrupted) return MOQ_ERR_INTERRUPTED;
     if (s->tracks[i].removed || s->tracks[i].ended) return MOQ_ERR_WRONG_STATE;
     moq_result_t rc = (moq_result_t)get("write_result");

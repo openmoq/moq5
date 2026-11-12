@@ -266,12 +266,14 @@ class StartMode(IntEnum):
 
 class CompanionProfile(IntEnum):
     """Media dialect. AUTO (the default) follows the negotiated draft: the
-    legacy dialect on draft 16/18, the draft-22 dialect on draft 22. An
+    legacy dialect on draft 16/18, the LOC-05 dialect on draft 22. An
     explicit dialect refuses the other drafts."""
 
     LEGACY_MSF01_LOC01 = _constants["MEDIA_COMPANION_LEGACY_MSF01_LOC01"]
     D22_MSF01_LOC04_PUBLIC = _constants["MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC"]
     AUTO = _constants["MEDIA_COMPANION_AUTO"]
+    # LOC-04 plus the LOC-05 Codec String, on draft 22; AUTO's choice there.
+    D22_MSF01_LOC05_PUBLIC = _constants["MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC"]
 
 
 class LocationFilterKind(IntEnum):
@@ -795,6 +797,10 @@ class MediaMetadata:
     time_us: int | None
     independent: bool | None
     loc: LocMetadata | None
+    # The effective LOC-05 Codec String (the object's own, else its track's),
+    # decoded strictly from its exact bytes; None when absent or on any
+    # dialect but LOC-05. Accepted is not supported: no decoder is consulted.
+    codec_string: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1041,6 +1047,13 @@ class SendObject:
     semantics and companion compatibility are checked by the native service;
     legacy RAW and CMAF ignore this metadata input.
 
+    `codec_string` is the object's LOC-05 Codec String (RAW only), sent as
+    its exact UTF-8 bytes: a string that cannot be encoded strictly (a lone
+    surrogate) raises ValueError here. The service refuses it with a MoqError
+    unless nothing can later drop it (a LOC-05 sender on draft 22, or an
+    unresolved AUTO sender whose endpoint offers draft 22 alone), and refuses
+    an empty, whitespace-only or NUL-bearing one.
+
     `decode_time_us` is advisory in v0: per track, write order IS decode order.
     """
 
@@ -1054,6 +1067,7 @@ class SendObject:
     capture_time_us: int | None = None
     sap_type: SapType | None = None
     loc_metadata: LocMetadata | None = None
+    codec_string: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.payload) is not bytes:
@@ -1077,6 +1091,18 @@ class SendObject:
                 self, "sap_type",
                 SapType(_integer(self.sap_type, "sap_type")))
         _loc_metadata_arguments(self.loc_metadata)
+        _codec_string_argument(self.codec_string)
+
+
+def _codec_string_argument(value: str | None) -> bytes | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise TypeError("codec_string must be str or None")
+    try:
+        return value.encode("utf-8", "strict")
+    except UnicodeEncodeError as error:
+        raise ValueError("codec_string is not encodable as UTF-8") from error
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1192,6 +1218,11 @@ class SendTrackConfig:
     # Advertise DYNAMIC_GROUPS = 1: subscribers may then ask for a new group,
     # which Sender.take_new_group_request reports.
     dynamic_groups: bool = False
+    # State `codec` as the LOC-05 Codec String track property too (RAW only);
+    # never done implicitly. The service refuses it unless the sender is
+    # LOC-05, or AUTO and still unresolved with an endpoint offering draft 22
+    # alone.
+    codec_string_property: bool = False
 
     def __post_init__(self) -> None:
         for field in ("name", "codec", "init_data", "role", "lang",
@@ -1202,6 +1233,8 @@ class SendTrackConfig:
             raise TypeError("is_live must be bool")
         if type(self.dynamic_groups) is not bool:
             raise TypeError("dynamic_groups must be bool")
+        if type(self.codec_string_property) is not bool:
+            raise TypeError("codec_string_property must be bool")
         object.__setattr__(
             self, "media_type", MediaType(_integer(self.media_type, "media_type")))
         object.__setattr__(

@@ -74,7 +74,15 @@ func withTrackCFG<T>(
     cfg.track_properties = arena.bytes(configuration.trackProperties)
     cfg.dynamic_groups = configuration.dynamicGroups
     return try withExtendedLifetime(arena) {
-        try body(&cfg)
+        guard configuration.codecStringProperty else { return try body(&cfg) }
+        var ext = moq_loc_ext_t()
+        moq_loc_ext_init_sized(&ext, MemoryLayout<moq_loc_ext_t>.size)
+        ext.present = moq_swift_loc_ext_has_codec_string()
+        ext.codec_string = cfg.codec    /* the catalog codec, arena-owned */
+        return try withUnsafePointer(to: &ext) { extPointer in
+            cfg.track_loc_ext = extPointer
+            return try body(&cfg)
+        }
     }
 }
 
@@ -199,7 +207,20 @@ func writeSenderObject(
 
     let rc = withSenderMetadata(object.locMetadata) { metadata in
         send.metadata = metadata
-        return withUnsafePointer(to: send, write)
+        guard let codec = object.codecStringBytes else {
+            return withUnsafePointer(to: send, write)
+        }
+        return codec.withUnsafeBytes { raw -> moq_result_t in
+            var ext = moq_loc_ext_t()
+            moq_loc_ext_init_sized(&ext, MemoryLayout<moq_loc_ext_t>.size)
+            ext.present = moq_swift_loc_ext_has_codec_string()
+            ext.codec_string = moq_bytes_t(
+                data: raw.bindMemory(to: UInt8.self).baseAddress, len: raw.count)
+            return withUnsafePointer(to: &ext) { extPointer in
+                send.loc_ext = extPointer
+                return withUnsafePointer(to: send, write)
+            }
+        }
     }
     if rc == moq_result_t(MOQ_OK) {
         return .ok

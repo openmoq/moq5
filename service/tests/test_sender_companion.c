@@ -27,6 +27,16 @@ typedef struct old_send_object {
     bool has_sap_type;
     moq_sap_type_t sap_type;
 } old_send_object_t;
+/* The complete object through metadata, before loc_ext. */
+typedef struct old_metadata_send_object {
+    old_send_object_t base;
+#ifdef __cplusplus
+    alignas(uint64_t)
+#else
+    _Alignas(uint64_t)
+#endif
+    const moq_media_metadata_t *metadata;
+} old_metadata_send_object_t;
 typedef struct old_callbacks_v0 {
     uint32_t struct_size;
     void *ctx;
@@ -63,8 +73,15 @@ PIN(offsetof(moq_media_send_object_t, metadata) == sizeof(old_send_object_t), "m
 PIN(offsetof(moq_media_sender_cfg_t, companion_profile) == sizeof(old_sender_cfg_t), "companion never uses old padding");
 PIN(ALIGNOF(old_send_object_t) == ALIGNOF(moq_media_send_object_t), "object alignment stable");
 PIN(ALIGNOF(old_sender_cfg_t) == ALIGNOF(moq_media_sender_cfg_t), "cfg alignment stable");
-PIN(sizeof(moq_media_send_object_t) ==
+PIN(sizeof(old_metadata_send_object_t) ==
     ((sizeof(old_send_object_t) + sizeof(void *) + ALIGNOF(old_send_object_t) - 1) /
+     ALIGNOF(old_send_object_t)) * ALIGNOF(old_send_object_t), "object extent through metadata");
+PIN(offsetof(moq_media_send_object_t, metadata) ==
+    offsetof(old_metadata_send_object_t, metadata), "metadata keeps its offset");
+PIN(offsetof(moq_media_send_object_t, loc_ext) == sizeof(old_metadata_send_object_t),
+    "loc_ext never uses the padding after metadata");
+PIN(sizeof(moq_media_send_object_t) ==
+    ((sizeof(old_metadata_send_object_t) + sizeof(void *) + ALIGNOF(old_send_object_t) - 1) /
      ALIGNOF(old_send_object_t)) * ALIGNOF(old_send_object_t), "full object extent");
 PIN(sizeof(old_companion_sender_cfg_t) == sizeof(old_sender_cfg_t) + ALIGNOF(old_sender_cfg_t), "frozen companion cfg extent");
 PIN(offsetof(moq_media_sender_cfg_t, resource_auth) >= sizeof(old_companion_sender_cfg_t), "auth never uses old companion padding");
@@ -82,14 +99,17 @@ PIN(sizeof(moq_media_sender_cfg_t) ==
      ALIGNOF(old_sender_cfg_t)) * ALIGNOF(old_sender_cfg_t), "full cfg extent");
 #if UINTPTR_MAX == UINT64_MAX
 PIN(sizeof(old_sender_cfg_t) == 176 && sizeof(old_companion_sender_cfg_t) == 184 && sizeof(moq_media_sender_cfg_t) == 208, "LP64 cfg pin");
-PIN(sizeof(old_send_object_t) == 72 && sizeof(moq_media_send_object_t) == 80, "LP64 object pin");
+PIN(sizeof(old_send_object_t) == 72 && sizeof(old_metadata_send_object_t) == 80 &&
+    sizeof(moq_media_send_object_t) == 88, "LP64 object pin");
 #elif defined(__arm__)
 PIN(sizeof(old_sender_cfg_t) == 112 && sizeof(old_companion_sender_cfg_t) == 120 && sizeof(moq_media_sender_cfg_t) == 144, "ARM cfg pin");
-PIN(sizeof(old_send_object_t) == 56 && sizeof(moq_media_send_object_t) == 64, "ARM object pin");
+PIN(sizeof(old_send_object_t) == 56 && sizeof(old_metadata_send_object_t) == 64 &&
+    sizeof(moq_media_send_object_t) == 72, "ARM object pin");
 #elif defined(__i386__)
 PIN(sizeof(old_sender_cfg_t) == 104 && sizeof(old_companion_sender_cfg_t) == 108 && sizeof(moq_media_sender_cfg_t) == 132, "i686 cfg pin");
 PIN(sizeof(old_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 48 : 52), "i686 old object pin");
-PIN(sizeof(moq_media_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 52 : 56), "i686 full object pin");
+PIN(sizeof(old_metadata_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 52 : 56), "i686 object-through-metadata pin");
+PIN(sizeof(moq_media_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 56 : 60), "i686 full object pin");
 #endif
 #endif
 
@@ -343,7 +363,7 @@ static void configuration_controls(void)
      * is refused. */
     for (size_t tail = 0; tail < 9; ++tail) {
         old_sender_cfg_t *cfg = config(tail, tail < 4 ? UINT32_MAX :
-                                             MOQ_MEDIA_COMPANION_AUTO + 1u, 1024);
+                                             MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC + 1u, 1024);
         moq_media_sender_t *s = NULL;
         moq_result_t rc = moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg, &s);
         CHECK(rc == (tail < 4 ? MOQ_OK : MOQ_ERR_INVAL));
@@ -359,7 +379,8 @@ static void configuration_controls(void)
     }
     /* Every known value is kept as configured until a session is observed. */
     const uint32_t known[] = {MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01,
-        MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, MOQ_MEDIA_COMPANION_AUTO};
+        MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, MOQ_MEDIA_COMPANION_AUTO,
+        MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC};
     for (size_t k = 0; k < sizeof(known) / sizeof(*known); ++k) {
         old_sender_cfg_t *cfg = config(4, known[k], 1024);
         moq_media_sender_t *s = NULL;
@@ -1303,7 +1324,7 @@ static void auto_resolution(moq_version_t version, bool before_latch, bool with_
     }
     if (!observe_session(&f, version)) goto done;
     CHECK(moq_media_sender_test_companion(f.sender) ==
-          (d22 ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC
+          (d22 ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC
                : MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01));
     CHECK(stats(&f).last_error == MOQ_OK && !moq_media_sender_is_fatal(f.sender));
     CHECK(write_object(&f, o) == MOQ_OK);
@@ -1821,6 +1842,403 @@ done:
     scaled_finish(&x);
 }
 
+/* -- LOC-05 typed Codec Strings --------------------------------------- */
+
+/* A full-sized object: the old fields, a metadata tail (or NULL) and a
+ * typed extension (or NULL). */
+static moq_media_send_object_t *object05(moq_media_metadata_t *meta, const moq_loc_ext_t *ext)
+{
+    moq_media_send_object_t *o = calloc(1, sizeof(*o));
+    REQUIRE(o);
+    o->struct_size = (uint32_t)sizeof(*o);
+    o->is_sync = o->starts_group = o->ends_group = true;
+    o->presentation_time_us = 17;
+    o->has_capture_time = true; o->capture_time_us = 99;
+    o->metadata = meta;
+    o->loc_ext = ext;
+    return o;
+}
+static moq_result_t write05(fixture_t *f, moq_media_send_object_t *o)
+{
+    return write_object(f, (old_send_object_t *)(void *)o);
+}
+static moq_loc_ext_t codec_ext(const char *text, size_t len)
+{
+    moq_loc_ext_t e;
+    moq_loc_ext_init_sized(&e, sizeof(e));
+    e.present = MOQ_LOC_EXT_HAS_CODEC_STRING;
+    e.codec_string = (moq_bytes_t){(const uint8_t *)text, len};
+    return e;
+}
+
+/* The track cfg extent loc05_start declares: 0 is the full current struct;
+ * otherwise struct_size is this, and with g_track_cfg_poison every byte past
+ * it is 0xa5. */
+static size_t g_track_cfg_size;
+static bool g_track_cfg_poison;
+
+/* Construct with `companion`, optionally attach an endpoint offering
+ * `offer`, add one video track (catalog codec "av01") with `props` and,
+ * when `track_codec`, the typed track Codec String `codec`; `*add` gets the
+ * add_track result. Then observe a `version` session (0: none). */
+static bool loc05_start(scaled_t *x, uint32_t companion, const moq_version_t *offer,
+                        size_t offer_n, moq_media_packaging_t packaging,
+                        const uint8_t *props, size_t props_n, const moq_loc_ext_t *track_ext,
+                        moq_result_t *add, moq_version_t version)
+{
+    fixture_t *f = &x->f;
+    f->alloc = (moq_alloc_t){.ctx=&f->memory,.alloc=allocate,.realloc=resize,.free=release};
+    moq_media_sender_test_set_alloc(&f->alloc);
+    old_sender_cfg_t *cfg = config(4, companion, 1 << 16);
+    g_clock_rc = 0; g_clock_ts = ms_clock(1700000000123ull);
+    moq_media_sender_test_set_clock_hook(scripted_clock, NULL);
+    moq_result_t rc = moq_media_sender_test_construct((const moq_media_sender_cfg_t *)cfg, &f->sender);
+    moq_media_sender_test_set_clock_hook(NULL, NULL);
+    free(cfg);
+    CHECK(rc == MOQ_OK);
+    if (rc != MOQ_OK) return false;
+    if (offer_n) {
+        x->ep = moq_endpoint_test_make_bare();
+        CHECK(x->ep != NULL);
+        if (!x->ep) return false;
+        moq_endpoint_test_set_offer(x->ep, offer, offer_n);
+        moq_media_sender_test_set_ep(f->sender, x->ep);
+    }
+    if (props_n) memcpy(x->props, props, props_n);
+    moq_media_track_cfg_t tc;
+    moq_media_track_cfg_init_sized(&tc, sizeof(tc));
+    tc.name = MOQ_BYTES_LITERAL("v"); tc.media_type = MOQ_MEDIA_TYPE_VIDEO; tc.bitrate = 1000;
+    tc.packaging = packaging;
+    tc.codec = MOQ_BYTES_LITERAL("av01");
+    static const uint8_t cmaf_init[] = {0x00,0x00,0x00,0x18};
+    if (packaging == MOQ_MEDIA_PACKAGING_CMAF)
+        tc.init_data = (moq_bytes_t){cmaf_init, sizeof(cmaf_init)};
+    tc.track_properties = (moq_bytes_t){x->props, props_n};
+    tc.track_loc_ext = track_ext;
+    if (g_track_cfg_size) {
+        tc.struct_size = (uint32_t)g_track_cfg_size;
+        if (g_track_cfg_poison)
+            memset((uint8_t *)&tc + g_track_cfg_size, 0xa5, sizeof(tc) - g_track_cfg_size);
+    }
+    *add = moq_media_sender_add_track(f->sender, &tc, &f->track);
+    memset(x->props, 0xa5, sizeof(x->props));   /* the copy is what counts */
+    if (*add != MOQ_OK || !version) return *add == MOQ_OK;
+    moq_simpair_cfg_t pc = MOQ_SIMPAIR_CFG_INIT;
+    pc.alloc = moq_alloc_default(); pc.version = version;
+    pc.client_send_request_capacity = pc.server_send_request_capacity = true;
+    pc.client_initial_request_capacity = pc.server_initial_request_capacity = 32;
+    bool ok = moq_simpair_create(&pc, &f->pair) == MOQ_OK &&
+              moq_simpair_start(f->pair) == MOQ_OK &&
+              moq_simpair_run_until_quiescent(f->pair, 16, NULL) == MOQ_OK;
+    CHECK(ok);
+    if (!ok) return false;
+    f->local = moq_simpair_client(f->pair); f->peer = moq_simpair_server(f->pair);
+    drain_events(f->local); drain_events(f->peer);
+    moq_media_sender_test_pump(f->sender, f->local, 1000);
+    return true;
+}
+
+/* The Track Properties the peer's SUBSCRIBE_OK states, compared to a
+ * literal. */
+static void expect_track_properties(fixture_t *f, const uint8_t *want, size_t n)
+{
+    if (!arm_peer(f)) return;
+    moq_event_t e;
+    unsigned seen = 0;
+    while (moq_session_poll_events(f->peer, &e, 1)) {
+        if (e.kind == MOQ_EVENT_SUBSCRIBE_OK) {
+            ++seen;
+            moq_bytes_t got = e.u.subscribe_ok.track_properties;
+            if (got.len != n) {
+                fprintf(stderr, "TRACK PROPERTIES expected=%zu actual=%zu:", n, got.len);
+                for (size_t i = 0; i < got.len; ++i) fprintf(stderr, " %02x", got.data[i]);
+                fputc('\n', stderr);
+            }
+            CHECK(got.len == n && (n == 0 || memcmp(got.data, want, n) == 0));
+        }
+        moq_event_cleanup(&e);
+    }
+    CHECK(seen == 1);
+}
+
+static void loc05_object_codec(void)
+{
+    label = "loc05-object-codec-string"; ++rows;
+    /* Explicit LOC05: the metadata tail's keys, then the Codec String. */
+    {
+        fixture_t f = {0};
+        old_sender_cfg_t *cfg = config(4, MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, 1 << 16);
+        bool started = start(&f, cfg, MOQ_VERSION_DRAFT_22, MOQ_MEDIA_PACKAGING_RAW);
+        free(cfg);
+        if (started) {
+            moq_media_metadata_t m; metadata(&m, false, 99, 0);
+            moq_loc_ext_t e = codec_ext("opus", 4);
+            moq_media_send_object_t *o = object05(&m, &e);
+            CHECK(write05(&f, o) == MOQ_OK);
+            memset(&e, 0xcc, sizeof(e));   /* borrowed for the call only */
+            static const uint8_t wire[] = {0x10,0x63,0x01,0x04,'o','p','u','s'};
+            expect_wire(&f, wire, sizeof(wire));
+            free(o);
+        }
+        finish(&f);
+    }
+    /* An empty extension record changes nothing; a malformed one, or an
+     * unusable Codec String, is refused with nothing taken. */
+    {
+        fixture_t f = {0};
+        old_sender_cfg_t *cfg = config(4, MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, 1 << 16);
+        bool started = start(&f, cfg, MOQ_VERSION_DRAFT_22, MOQ_MEDIA_PACKAGING_RAW);
+        free(cfg);
+        if (started) {
+            moq_media_metadata_t m; metadata(&m, false, 99, 0);
+            moq_loc_ext_t e = codec_ext("", 0);
+            moq_media_send_object_t *o = object05(&m, &e);
+            CHECK(write05(&f, o) == MOQ_ERR_INVAL);
+            e = codec_ext("op\0us", 5);
+            CHECK(write05(&f, o) == MOQ_ERR_INVAL);
+            e = codec_ext("opus", 4); e.struct_size = MOQ_LOC_EXT_V0_SIZE - 1;
+            CHECK(write05(&f, o) == MOQ_ERR_INVAL);
+            e = codec_ext("opus", 4); e.present |= 0x2;
+            CHECK(write05(&f, o) == MOQ_ERR_INVAL);
+            CHECK(stats(&f).objects_written == 0);
+            moq_loc_ext_init_sized(&e, sizeof(e));
+            CHECK(write05(&f, o) == MOQ_OK);
+            static const uint8_t wire[] = {0x10,0x63};
+            expect_wire(&f, wire, sizeof(wire));
+            free(o);
+        }
+        finish(&f);
+    }
+}
+
+/* Typed Codec Strings are accepted only when nothing can later drop them. */
+static void loc05_object_preconditions(void)
+{
+    label = "loc05-object-codec-preconditions"; ++rows;
+    static const moq_version_t o22[] = {MOQ_VERSION_DRAFT_22},
+        omix[] = {MOQ_VERSION_DRAFT_22, MOQ_VERSION_DRAFT_18},
+        o18[] = {MOQ_VERSION_DRAFT_18};
+    static const struct {
+        uint32_t companion; const moq_version_t *offer; size_t n;
+        moq_version_t version; moq_media_packaging_t packaging; moq_result_t want;
+    } r[] = {
+        /* Unresolved AUTO: only a nonempty, wholly draft-22 offer proves it. */
+        {MOQ_MEDIA_COMPANION_AUTO, NULL, 0, 0, MOQ_MEDIA_PACKAGING_RAW, MOQ_ERR_UNSUPPORTED},
+        {MOQ_MEDIA_COMPANION_AUTO, o22, 1, 0, MOQ_MEDIA_PACKAGING_RAW, MOQ_OK},
+        {MOQ_MEDIA_COMPANION_AUTO, omix, 2, 0, MOQ_MEDIA_PACKAGING_RAW, MOQ_ERR_UNSUPPORTED},
+        {MOQ_MEDIA_COMPANION_AUTO, o18, 1, 0, MOQ_MEDIA_PACKAGING_RAW, MOQ_ERR_UNSUPPORTED},
+        /* Resolved AUTO: LOC-05 on draft 22, legacy refuses. */
+        {MOQ_MEDIA_COMPANION_AUTO, omix, 2, MOQ_VERSION_DRAFT_22, MOQ_MEDIA_PACKAGING_RAW, MOQ_OK},
+        {MOQ_MEDIA_COMPANION_AUTO, omix, 2, MOQ_VERSION_DRAFT_18, MOQ_MEDIA_PACKAGING_RAW,
+         MOQ_ERR_UNSUPPORTED},
+        /* Explicit companions. */
+        {MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, NULL, 0, MOQ_VERSION_DRAFT_22,
+         MOQ_MEDIA_PACKAGING_RAW, MOQ_ERR_UNSUPPORTED},
+        {MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01, NULL, 0, MOQ_VERSION_DRAFT_18,
+         MOQ_MEDIA_PACKAGING_RAW, MOQ_ERR_UNSUPPORTED},
+        {MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, NULL, 0, 0, MOQ_MEDIA_PACKAGING_RAW,
+         MOQ_ERR_UNSUPPORTED},
+        {MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, NULL, 0, MOQ_VERSION_DRAFT_22,
+         MOQ_MEDIA_PACKAGING_RAW, MOQ_OK},
+        /* RAW only. */
+        {MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, NULL, 0, MOQ_VERSION_DRAFT_22,
+         MOQ_MEDIA_PACKAGING_CMAF, MOQ_ERR_INVAL},
+    };
+    for (size_t i = 0; i < sizeof(r) / sizeof(*r); ++i) {
+        scaled_t x; memset(&x, 0, sizeof(x));
+        moq_result_t add = MOQ_OK;
+        if (loc05_start(&x, r[i].companion, r[i].offer, r[i].n, r[i].packaging, NULL, 0,
+                        NULL, &add, r[i].version)) {
+            moq_media_metadata_t m; metadata(&m, false, 99, 0);
+            moq_loc_ext_t e = codec_ext("opus", 4);
+            /* AUTO writes without a tail; explicit draft 22 needs one. */
+            bool tail = r[i].companion != MOQ_MEDIA_COMPANION_AUTO;
+            moq_media_send_object_t *o = object05(tail ? &m : NULL, &e);
+            if (r[i].packaging == MOQ_MEDIA_PACKAGING_CMAF) {
+                static const uint8_t block[] = {0x02, 0x00};
+                REQUIRE(moq_rcbuf_create(&x.f.alloc, block, sizeof(block),
+                                         &o->properties) == MOQ_OK);
+            }
+            moq_result_t rc = write05(&x.f, o);
+            if (rc != r[i].want) fprintf(stderr, "precondition row %zu: rc=%d\n", i, (int)rc);
+            CHECK(rc == r[i].want);
+            if (rc != MOQ_OK) {
+                CHECK(stats(&x.f).objects_written == 0);
+                if (o->properties) moq_rcbuf_decref(o->properties);
+            }
+            /* The refusal was not permanent: once draft 22 is observed an
+             * AUTO sender takes the same write. */
+            if (rc == MOQ_ERR_UNSUPPORTED && r[i].companion == MOQ_MEDIA_COMPANION_AUTO &&
+                r[i].version == 0 && observe_session(&x.f, MOQ_VERSION_DRAFT_22)) {
+                CHECK(moq_media_sender_test_companion(x.f.sender) ==
+                      MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC);
+                CHECK(write05(&x.f, o) == MOQ_OK);
+                /* Typed fields with the Codec String after them: marking
+                 * (I=1), unscaled Timestamp 99, Codec String. */
+                static const uint8_t wire[] = {0x09,0x01,0x20,0x07,0x63,
+                                               0x01,0x04,'o','p','u','s'};
+                expect_wire(&x.f, wire, sizeof(wire));
+            }
+            free(o);
+        }
+        scaled_finish(&x);
+    }
+}
+
+static void loc05_track_codec(void)
+{
+    label = "loc05-track-codec-string"; ++rows;
+    static const moq_version_t o22[] = {MOQ_VERSION_DRAFT_22},
+        omix[] = {MOQ_VERSION_DRAFT_22, MOQ_VERSION_DRAFT_16};
+    moq_loc_ext_t catalog = codec_ext("av01", 4), other = codec_ext("av1x", 4);
+    /* Merged in type order; only the following property's delta changes. */
+    static const uint8_t scale1[] = {0x08,0x01};
+    static const uint8_t merged1[] = {0x08,0x01,0x09,0x04,'a','v','0','1'};
+    static const uint8_t around[] = {0x08,0x01,0x36,0x05};
+    static const uint8_t merged2[] = {0x08,0x01,0x09,0x04,'a','v','0','1',0x2d,0x05};
+    static const uint8_t alone[] = {0x11,0x04,'a','v','0','1'};
+    /* A valid block whose following Delta Type is not in its shortest form
+     * (type 0x12 in nine bytes): the merged block is the shorter one. */
+    static const uint8_t wide[] = {0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x12,0x00};
+    static const uint8_t merged3[] = {0x11,0x04,'a','v','0','1',0x01,0x00};
+    static const struct { const uint8_t *in; size_t n; const uint8_t *out; size_t m; } ok[] = {
+        {scale1, sizeof(scale1), merged1, sizeof(merged1)},
+        {around, sizeof(around), merged2, sizeof(merged2)},
+        {NULL, 0, alone, sizeof(alone)},
+        {wide, sizeof(wide), merged3, sizeof(merged3)},
+    };
+    {
+        /* The wide block is itself acceptable LOC-05 Track Properties. */
+        moq_loc_metadata_t pm;
+        moq_loc_ext_t pe;
+        CHECK(moq_loc_parse_metadata_ex(MOQ_VERSION_DRAFT_22, MOQ_LOC_PROFILE_05,
+                  (moq_bytes_t){wide, sizeof(wide)}, &pm, sizeof(pm), &pe, sizeof(pe)) == MOQ_OK);
+        CHECK(pe.present == 0);
+        CHECK(sizeof(merged3) < sizeof(wide));
+    }
+    for (size_t i = 0; i < sizeof(ok) / sizeof(*ok); ++i) {
+        scaled_t x; memset(&x, 0, sizeof(x));
+        moq_result_t add = MOQ_OK;
+        if (loc05_start(&x, MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, NULL, 0,
+                        MOQ_MEDIA_PACKAGING_RAW, ok[i].in, ok[i].n, &catalog, &add,
+                        MOQ_VERSION_DRAFT_22))
+            expect_track_properties(&x.f, ok[i].out, ok[i].m);
+        CHECK(add == MOQ_OK);
+        scaled_finish(&x);
+    }
+    /* Refusals, with nothing registered. */
+    static const uint8_t has_codec[] = {0x11,0x01,'a'};
+    static const uint8_t inner_codec[] = {0x0b,0x03,0x11,0x01,'a'};
+    static const uint8_t bad_codec[] = {0x11,0x00};
+    const struct {
+        uint32_t companion; const moq_version_t *offer; size_t n;
+        moq_media_packaging_t packaging; const uint8_t *props; size_t props_n;
+        const moq_loc_ext_t *ext; moq_result_t want;
+    } r[] = {
+        {MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, NULL, 0, MOQ_MEDIA_PACKAGING_RAW,
+         NULL, 0, &other, MOQ_ERR_INVAL},                     /* not the catalog codec */
+        {MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, NULL, 0, MOQ_MEDIA_PACKAGING_CMAF,
+         NULL, 0, &catalog, MOQ_ERR_INVAL},                   /* RAW only */
+        {MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, NULL, 0, MOQ_MEDIA_PACKAGING_RAW,
+         has_codec, sizeof(has_codec), &catalog, MOQ_ERR_INVAL},
+        {MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, NULL, 0, MOQ_MEDIA_PACKAGING_RAW,
+         inner_codec, sizeof(inner_codec), &catalog, MOQ_ERR_INVAL},
+        {MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, NULL, 0, MOQ_MEDIA_PACKAGING_RAW,
+         bad_codec, sizeof(bad_codec), NULL, MOQ_ERR_INVAL},  /* raw, checked as LOC-05 */
+        {MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, NULL, 0, MOQ_MEDIA_PACKAGING_RAW,
+         bad_codec, sizeof(bad_codec), NULL, MOQ_OK},         /* opaque on LOC-04 */
+        {MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC, NULL, 0, MOQ_MEDIA_PACKAGING_RAW,
+         NULL, 0, &catalog, MOQ_ERR_UNSUPPORTED},
+        {MOQ_MEDIA_COMPANION_AUTO, NULL, 0, MOQ_MEDIA_PACKAGING_RAW,
+         NULL, 0, &catalog, MOQ_ERR_UNSUPPORTED},             /* offer unproven */
+        {MOQ_MEDIA_COMPANION_AUTO, omix, 2, MOQ_MEDIA_PACKAGING_RAW,
+         NULL, 0, &catalog, MOQ_ERR_UNSUPPORTED},
+        {MOQ_MEDIA_COMPANION_AUTO, o22, 1, MOQ_MEDIA_PACKAGING_RAW,
+         NULL, 0, &catalog, MOQ_OK},
+    };
+    for (size_t i = 0; i < sizeof(r) / sizeof(*r); ++i) {
+        scaled_t x; memset(&x, 0, sizeof(x));
+        moq_result_t add = MOQ_OK;
+        (void)loc05_start(&x, r[i].companion, r[i].offer, r[i].n, r[i].packaging,
+                          r[i].props, r[i].props_n, r[i].ext, &add, 0);
+        if (add != r[i].want) fprintf(stderr, "track row %zu: rc=%d\n", i, (int)add);
+        CHECK(add == r[i].want);
+        if (add != MOQ_OK) CHECK(x.f.track == NULL);
+        scaled_finish(&x);
+    }
+}
+
+/* The typed LOC-05 inputs are read only where the caller's struct_size
+ * covers the whole pointer: an older caller's object or track cfg (its
+ * padding and everything past it poisoned) and a tail one byte short of the
+ * pointer both send no Codec String; the current caller's does. */
+static void loc05_reader_extents(void)
+{
+    label = "loc05-reader-extents"; ++rows;
+    const size_t loc_ext_end = offsetof(moq_media_send_object_t, loc_ext) + sizeof(void *);
+    static const uint8_t plain[] = {0x10,0x63};
+    static const uint8_t coded[] = {0x10,0x63,0x01,0x04,'o','p','u','s'};
+    for (unsigned c = 0; c < 3; ++c) {
+        fixture_t f = {0};
+        old_sender_cfg_t *cfg = config(4, MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, 1 << 16);
+        bool started = start(&f, cfg, MOQ_VERSION_DRAFT_22, MOQ_MEDIA_PACKAGING_RAW);
+        free(cfg);
+        if (started) {
+            moq_media_metadata_t m; metadata(&m, false, 99, 0);
+            moq_loc_ext_t e = codec_ext("opus", 4);
+            moq_media_send_object_t *o = calloc(1, sizeof(*o));
+            REQUIRE(o);
+            if (c == 0) {
+                /* The object through metadata: its own padding and the slot
+                 * after it poisoned. */
+                memset(o, 0xa5, sizeof(*o));
+                old_metadata_send_object_t *old = (old_metadata_send_object_t *)(void *)o;
+                old->base.struct_size = (uint32_t)sizeof(*old);
+                old->base.payload = NULL; old->base.properties = NULL;
+                old->base.is_sync = old->base.starts_group = old->base.ends_group = true;
+                old->base.decode_time_us = 0; old->base.presentation_time_us = 17;
+                old->base.has_capture_time = true; old->base.capture_time_us = 99;
+                old->base.has_sap_type = false; old->base.sap_type = MOQ_SAP_NONE;
+                old->metadata = &m;
+            } else {
+                o->struct_size = (uint32_t)(c == 1 ? loc_ext_end - 1 : sizeof(*o));
+                o->is_sync = o->starts_group = o->ends_group = true;
+                o->presentation_time_us = 17;
+                o->has_capture_time = true; o->capture_time_us = 99;
+                o->metadata = &m;
+                o->loc_ext = &e;
+            }
+            CHECK(write05(&f, o) == MOQ_OK);
+            if (c == 2) expect_wire(&f, coded, sizeof(coded));
+            else expect_wire(&f, plain, sizeof(plain));
+            free(o);
+        }
+        finish(&f);
+    }
+    moq_loc_ext_t catalog = codec_ext("av01", 4);
+    static const uint8_t scale1[] = {0x08,0x01};
+    static const uint8_t merged1[] = {0x08,0x01,0x09,0x04,'a','v','0','1'};
+    const size_t track_ext_at = offsetof(moq_media_track_cfg_t, track_loc_ext);
+    const struct { size_t size; bool poison; const uint8_t *want; size_t n; } t[] = {
+        {track_ext_at, true, scale1, sizeof(scale1)},                    /* group_order era */
+        {track_ext_at + sizeof(void *) - 1, false, scale1, sizeof(scale1)},  /* half a pointer */
+        {0, false, merged1, sizeof(merged1)},                            /* current caller */
+    };
+    for (size_t i = 0; i < sizeof(t) / sizeof(*t); ++i) {
+        scaled_t x; memset(&x, 0, sizeof(x));
+        moq_result_t add = MOQ_ERR_INVAL;
+        g_track_cfg_size = t[i].size; g_track_cfg_poison = t[i].poison;
+        if (loc05_start(&x, MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC, NULL, 0,
+                        MOQ_MEDIA_PACKAGING_RAW, scale1, sizeof(scale1), &catalog, &add,
+                        MOQ_VERSION_DRAFT_22))
+            expect_track_properties(&x.f, t[i].want, t[i].n);
+        g_track_cfg_size = 0; g_track_cfg_poison = false;
+        if (add != MOQ_OK) fprintf(stderr, "extent row %zu: rc=%d\n", i, (int)add);
+        CHECK(add == MOQ_OK);
+        scaled_finish(&x);
+    }
+}
+
 int main(void)
 {
     configuration_controls();
@@ -1880,6 +2298,10 @@ int main(void)
     scale_detector();
     scale_metadata_boundaries();
     scale_refusal_owns_nothing();
+    loc05_object_codec();
+    loc05_object_preconditions();
+    loc05_track_codec();
+    loc05_reader_extents();
     printf("sender_companion rows=%u failures=%u\n",rows,failures);
     return failures ? 1 : 0;
 }

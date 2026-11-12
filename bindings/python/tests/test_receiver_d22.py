@@ -199,7 +199,7 @@ class ReceiverD22Tests(unittest.TestCase):
         for call in (
             lambda: moq5.ReceiverConfig.live((b"n",), companion_profile=True),
             lambda: moq5.ReceiverConfig.live((b"n",), companion_profile=9),
-            lambda: moq5.ReceiverConfig.live((b"n",), companion_profile=3),
+            lambda: moq5.ReceiverConfig.live((b"n",), companion_profile=4),
             lambda: moq5.LocationFilter(kind=True),
             lambda: moq5.LocationFilter(kind=6),
             lambda: moq5.LocationFilter(start_group=-1),
@@ -375,6 +375,18 @@ class ReceiverD22Tests(unittest.TestCase):
             moq5.LocMetadata(0x8000003f, MAX, MAX, b"\x00\x80\x00\xff", 255, b"conf", b"")))
         self.assertIsNone(obj.capture_time_us, "application clock is not capture time")
         self.assertEqual(obj.initiating_request_id, 0)
+
+    def test_codec_string_is_the_effective_value_decoded_strictly(self):
+        for source, properties, track_properties in ((0, b"avc1.640028", b""),
+                                                     (1, b"x", b"avc1.64001f")):
+            backing = properties if source == 0 else track_properties
+            self.push(metadata={"time_domain": moq5.MediaTimeDomain.NONE,
+                                "codec_string": (source, 0, len(backing))},
+                      properties=properties, track_properties=track_properties)
+            obj = self.receiver.poll_object()
+            self.assertEqual(obj.metadata.codec_string, backing.decode("utf-8"))
+        self.push(metadata={"time_domain": moq5.MediaTimeDomain.NONE})
+        self.assertIsNone(self.receiver.poll_object().metadata.codec_string)
 
     def test_time_domain_presence_and_raw_values_are_not_recomputed(self):
         cases = (

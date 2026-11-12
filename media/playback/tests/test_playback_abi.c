@@ -99,7 +99,8 @@ _Static_assert(offsetof(moq_playback_track_cfg_t, media_type) == 4 &&
                offsetof(moq_playback_track_cfg_t, transport_version) == 88 &&
                offsetof(moq_playback_track_cfg_t, track_properties) == 96 &&
                offsetof(moq_playback_track_cfg_t, gap_policy) == 112 &&
-               sizeof(moq_playback_track_cfg_t) == 120, "track cfg layout");
+               offsetof(moq_playback_track_cfg_t, loc_profile) == 120 &&
+               sizeof(moq_playback_track_cfg_t) == 128, "track cfg layout");
 _Static_assert(offsetof(moq_playback_stream_terminal_t, group_id) == 8 &&
                offsetof(moq_playback_stream_terminal_t, object_id) == 24 &&
                offsetof(moq_playback_stream_terminal_t, error_code) == 40 &&

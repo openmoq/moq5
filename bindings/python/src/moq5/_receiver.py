@@ -73,7 +73,8 @@ def _metadata(value: dict | None) -> MediaMetadata | None:
         return None
     return MediaMetadata(
         _known_or_int(MediaTimeDomain, value["time_domain"]), value["time_us"],
-        value["independent"], None if value["loc"] is None else LocMetadata(**value["loc"]))
+        value["independent"], None if value["loc"] is None else LocMetadata(**value["loc"]),
+        value["codec_string"])
 
 
 def _description(d: dict) -> TrackDescription:

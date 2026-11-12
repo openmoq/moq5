@@ -9,6 +9,7 @@ from . import _native, _send_track
 from ._endpoint import (Endpoint, MoqError, TrackNameBusy, _call,
                         _endpoint_handle, _sliced_wait)
 from ._values import (
+    _codec_string_argument,
     _loc_metadata_arguments,
     SendObject,
     WaitResult,
@@ -154,6 +155,7 @@ class Sender:
                 config.track_duration_ms,
                 config.track_properties,
                 config.dynamic_groups,
+                config.codec_string_property,
             )
             # Only the NATIVE activation result is translated, and only here.
             try:
@@ -209,6 +211,7 @@ class Sender:
             object.capture_time_us,
             None if object.sap_type is None else int(object.sap_type),
             _loc_metadata_arguments(object.loc_metadata),
+            _codec_string_argument(object.codec_string),
         )
         return WriteOutcome(_call(_native.sender_write, self.__handle,
                                   _send_track._handle_of(track), *arguments))

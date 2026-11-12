@@ -44,18 +44,20 @@ player's contracts.
 These C examples leave the media companion at its default, AUTO, which follows
 the draft the endpoint negotiates. On drafts 16/18 that is the legacy profile:
 LOC-01 object metadata and Group IDs from 0. On draft 22 it is the draft-22
-profile: LOC-04 object metadata and Group IDs starting at the sender's wallclock
-milliseconds. Every profile, including explicit LEGACY and unresolved AUTO,
+profile: LOC-05 object metadata and Group IDs starting at the sender's wallclock
+milliseconds. Without a supplied Codec String, the metadata bytes are the same
+as LOC-04. Every profile, including explicit LEGACY and unresolved AUTO,
 publishes MSF-01 catalogs with `"version":"draft-01"` and supplied init data in
 the root `initDataList`, referenced by each track's `initRef`.
-On draft 22 the sender generates the LOC-04 block from the typed fields of
+On draft 22 the sender generates the LOC block from the typed fields of
 each RAW `write`: a capture time (`has_capture_time`) is a Unix-microsecond
 Timestamp; a presentation time alone, as in `media_send.c`, is media time and
 goes out with a Timescale of 1000000, so it is never presented as a wall
 clock. Setting `companion_profile` explicitly (with the `*_cfg_init_sized`
 initializers) pins one profile: `MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01` works
-only on drafts 16/18, and `MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC` only on
-draft 22, where RAW writes must then carry their own LOC metadata.
+only on drafts 16/18; `MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC` and
+`MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC` work only on draft 22, where RAW
+writes must then carry their own LOC metadata.
 
 ## The model
 
@@ -375,7 +377,7 @@ Its payloads are placeholder bytes, not an encoded bitstream — the example
 shows the send *lifecycle*, not media encoding. A real sender passes encoded
 access units (e.g. H.264 byte-stream AUs) as the payload and sets `is_sync`
 on random-access points; the service generates the LOC timing/keyframe
-metadata from the typed fields (LOC-01 on drafts 16/18, LOC-04 on draft 22,
+metadata from the typed fields (LOC-01 on drafts 16/18, LOC-05 on draft 22,
 where this example's presentation times are sent as media time). For a worked
 codec integration over a real relay, see the GStreamer `moqsrc`/`moqsink`
 elements.

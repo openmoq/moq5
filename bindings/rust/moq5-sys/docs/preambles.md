@@ -138,7 +138,7 @@ into a bounded, per-track sync-anchored queue and drained to the session
 on the network thread, generating the standard LOC properties from the
 typed fields and abandoning open subgroups wire-correctly under
 backpressure. The media companion defaults to AUTO, which follows the
-negotiated draft (legacy LOC-01 on drafts 16/18, LOC-04 on draft 22); an
+negotiated draft (legacy LOC-01 on drafts 16/18, LOC-05 on draft 22); an
 explicit companion pins one and refuses the other drafts.
 ```
 

@@ -479,6 +479,10 @@ static int context_sizes_and_refusals(void)
     context.present = MOQ_LOC_METADATA_HAS_TIMESCALE;
     context.timescale = 1000;
     const size_t pointer_end = offsetof(moq_media_object_parse_cfg_t, track_loc_metadata) + sizeof(&context);
+    /* A covered track_loc_ext is the caller's own field: this caller names
+     * none. A size that covers only part of it leaves it unread. */
+    const size_t ext_end = offsetof(moq_media_object_parse_cfg_t, track_loc_ext) +
+                           sizeof(const moq_loc_ext_t *);
     for (size_t size = 0; size <= sizeof(moq_media_object_parse_cfg_t) + 8; ++size) {
         size_t allocated = size < sizeof(uint32_t) ? sizeof(uint32_t) : size;
         uint8_t *bytes = malloc(allocated);
@@ -494,6 +498,10 @@ static int context_sizes_and_refusals(void)
         if (size >= pointer_end) {
             const moq_loc_metadata_t *ptr = &context;
             memcpy(bytes + offsetof(moq_media_object_parse_cfg_t, track_loc_metadata), &ptr, sizeof(ptr));
+        }
+        if (size >= ext_end) {
+            const moq_loc_ext_t *none = NULL;
+            memcpy(bytes + offsetof(moq_media_object_parse_cfg_t, track_loc_ext), &none, sizeof(none));
         }
         moq_media_parsed_object_t out;
         memset(&out, 0xa5, sizeof(out));

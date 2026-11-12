@@ -283,8 +283,12 @@ static bool start_configured(fixture_t *f, moq_version_t version, uint64_t budge
     cfg.namespace_ = (moq_namespace_t){ns, 1};
     cfg.auto_subscribe = true;
     cfg.max_track_events = 3; /* Two discoveries + READY fill the ordinary queue. */
+    /* A harness that includes this file may name the draft-22 companion. */
+#ifndef ACK_FAILURE_D22_COMPANION
+#define ACK_FAILURE_D22_COMPANION MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC
+#endif
     cfg.companion_profile = version == MOQ_VERSION_DRAFT_22
-        ? MOQ_MEDIA_COMPANION_D22_MSF01_LOC04_PUBLIC : MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+        ? ACK_FAILURE_D22_COMPANION : MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
     moq_media_receiver_test_set_alloc(&alloc);
     f->r = moq_media_receiver_test_new_cfg(&cfg);
     moq_media_receiver_test_set_alloc(NULL);
