@@ -1597,6 +1597,12 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
     if (cfg->struct_size >= offsetof(moq_endpoint_cfg_t, send_queue_cap_bytes) +
                             sizeof(cfg->send_queue_cap_bytes))
         fc.send_queue_cap_bytes = cfg->send_queue_cap_bytes;
+#ifdef __linux__
+    /* The default UDP receive buffer (about 208 KB) overflows at media rates.
+     * Linux caps the request at net.core.rmem_max without failing. macOS
+     * refuses a size above kern.ipc.maxsockbuf, so other systems keep theirs. */
+    fc.socket_buffer_bytes = 8u * 1024u * 1024u;
+#endif
     moq_pq_threaded_t *fac = NULL;
     moq_result_t crc = moq_pq_threaded_create(&fc, &fac);
     if (crc < 0) return crc;
