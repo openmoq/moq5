@@ -52,7 +52,7 @@ static uint64_t g_next_bidi = 0;    /* client-initiated bidi: 0, 4, 8 .. */
 static uint64_t g_reset_code = 0;   /* code the next stream_reset event carries */
 static uint64_t g_peer_stop_code = 0;
 static uint64_t g_rx_window = 65535;
-static uint64_t g_tp_streams_uni = 64;   /* initial_max_stream_id_unidir */
+static uint64_t g_tp_streams_uni = 64;   /* initial_max_streams_uni */
 static uint64_t g_tp_streams_bidi = 0;
 static uint32_t g_client_max_events = 64;   /* the fetcher session's event queue */
 static picoquic_state_enum g_cnx_state = picoquic_state_ready;
@@ -196,8 +196,8 @@ picoquic_tp_t const *picoquic_get_transport_parameters(picoquic_cnx_t *c, int ge
       tp.initial_max_stream_data_uni = g_rx_window;
       tp.initial_max_stream_data_bidi_remote = g_rx_window;
       tp.initial_max_stream_data_bidi_local = g_rx_window;
-      tp.initial_max_stream_id_unidir = g_tp_streams_uni;
-      tp.initial_max_stream_id_bidir = g_tp_streams_bidi;
+      tp.initial_max_streams_uni = g_tp_streams_uni;
+      tp.initial_max_streams_bidi = g_tp_streams_bidi;
       return &tp; }
 
 /* Flow-control instrumentation: app-flow-control takeover and grants per stream. */

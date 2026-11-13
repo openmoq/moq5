@@ -892,7 +892,7 @@ if(MOQ_PICOQUIC_SOURCE_DIR)
         # The provider's own edges are used as declared: picoquic-log links
         # picoquic-core, picoquic-test links picoquic-log, and picoquic-core
         # needs nothing from picoquic-log. That holds for the pinned source
-        # baseline (picoquic 70b5fd5), whose core no longer calls the log
+        # baseline (picoquic 36f49b7), whose core no longer calls the log
         # library. Automatic accommodation of the older core/log cycle (e.g.
         # 55b473e2, whose core calls picoquic_set_qlog) is retired, and there
         # is no configure-time capability check. Consumers of such a source

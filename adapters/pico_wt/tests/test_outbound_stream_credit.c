@@ -370,7 +370,7 @@ static int setup(credit_pair_t *p, uint8_t discriminator)
      * completable DATA to trigger replenishment without closing control.
      * Three WT bidis cover CONNECT and two held MoQ requests. */
     picoquic_tp_t tp = *picoquic_get_transport_parameters(h->test_ctx->cnx_client, 1);
-    tp.initial_max_stream_id_unidir = p->wt ? 9 : 3;
+    tp.initial_max_streams_uni = p->wt ? 9 : 3;
     tp.is_reset_stream_at_enabled = 1;
     picoquic_set_transport_parameters(h->test_ctx->cnx_client, &tp);
     picoquic_set_default_tp_value(h->test_ctx->qserver,

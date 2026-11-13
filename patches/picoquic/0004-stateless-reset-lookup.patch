@@ -1,6 +1,6 @@
 Look up a stateless reset without processing the datagram.
 
-Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
+Applies to picoquic 36f49b73d532369882d97474ac018655b6739a58, after 0001 to
 0003.
 
 RFC 9000 Section 10.3.1 has an endpoint compare a datagram's last 16 bytes
@@ -20,7 +20,9 @@ current_time, &detection) performs only that comparison, against the
   match. The comparison is constant time on every platform.
 - The registered pair is refreshed whenever the default path's first tuple
   changes, including the path-0 replacement when a multipath path is
-  abandoned, so the lookup finds the token in use.
+  abandoned, so the lookup finds the token in use. Upstream promotes a
+  verified or NAT-rebound tuple through picoquic_promote_tuple_to_default,
+  which re-registers it.
 
 Ordinary ingress keeps its convention: picoquic_incoming_stateless_reset
 applies the same reset and returns PICOQUIC_ERROR_AEAD_CHECK.
@@ -30,10 +32,10 @@ stateless_reset_detect_rotated and stateless_reset_detect_abandon. In LibMoQ:
 the threaded_lane_group_reset_* rows.
 
 diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
-index d5ad9bbc..22cdd2f8 100644
+index 4075be2f..cf018450 100644
 --- a/UnitTest1/unittest1.cpp
 +++ b/UnitTest1/unittest1.cpp
-@@ -1360,6 +1360,48 @@ namespace UnitTest1
+@@ -1448,6 +1448,48 @@ namespace UnitTest1
              Assert::AreEqual(ret, 0);
          }
  
@@ -82,23 +84,11 @@ index d5ad9bbc..22cdd2f8 100644
          TEST_METHOD(immediate_close)
          {
              int ret = immediate_close_test();
-diff --git a/picoquic/frames.c b/picoquic/frames.c
-index 7017c855..a4634b28 100644
---- a/picoquic/frames.c
-+++ b/picoquic/frames.c
-@@ -5069,6 +5069,7 @@ const uint8_t* picoquic_decode_path_response_frame(picoquic_cnx_t* cnx, const ui
-                         picoquic_log_app_message(cnx, "Migration to server preferred address successful on path %" PRIu64, path_x->unique_path_id);
-                     }
-                     picoquic_reset_path_mtu(path_x);
-+                    picoquic_register_net_secret_for_path(cnx, path_x);
-                 }
-                 if (cnx->are_path_callbacks_enabled && cnx->callback_fn != NULL &&
-                     cnx->callback_fn(cnx, path_x->unique_path_id, NULL, 0, picoquic_callback_path_available,
 diff --git a/picoquic/packet.c b/picoquic/packet.c
-index 17addf71..eb2a4f1b 100644
+index 436e2097..8dea0d8e 100644
 --- a/picoquic/packet.c
 +++ b/picoquic/packet.c
-@@ -1823,22 +1823,71 @@ int picoquic_incoming_client_handshake(
+@@ -1823,20 +1823,71 @@ int picoquic_incoming_client_handshake(
  
  /*
  * Processing of stateless reset packet.
@@ -119,11 +109,12 @@ index 17addf71..eb2a4f1b 100644
      if (cnx->cnx_state <= picoquic_state_ready) {
          cnx->remote_error = PICOQUIC_ERROR_STATELESS_RESET;
      }
-+    cnx->cnx_state = picoquic_state_disconnected;
-     if (cnx->callback_fn) {
-         (void)(cnx->callback_fn)(cnx, 0, NULL, 0, picoquic_callback_stateless_reset, cnx->callback_ctx, NULL);
-     }
+-    (void)(cnx->callback_fn)(cnx, 0, NULL, 0, picoquic_callback_stateless_reset, cnx->callback_ctx, NULL);
 -    picoquic_connection_disconnect(cnx);
++    cnx->cnx_state = picoquic_state_disconnected;
++    if (cnx->callback_fn) {
++        (void)(cnx->callback_fn)(cnx, 0, NULL, 0, picoquic_callback_stateless_reset, cnx->callback_ctx, NULL);
++    }
 +    if (cnx->callback_fn) {
 +        (void)(cnx->callback_fn)(cnx, 0, NULL, 0, picoquic_callback_close, cnx->callback_ctx, NULL);
 +    }
@@ -174,7 +165,7 @@ index 17addf71..eb2a4f1b 100644
   * Processing of 0-RTT packet
   */
 diff --git a/picoquic/paths.c b/picoquic/paths.c
-index b42142ee..1f86b361 100644
+index 04fc653d..1e84b305 100644
 --- a/picoquic/paths.c
 +++ b/picoquic/paths.c
 @@ -79,6 +79,7 @@ void picoquic_set_tuple_challenge_failed(picoquic_path_t* path_x, picoquic_tuple
@@ -185,11 +176,19 @@ index b42142ee..1f86b361 100644
  }
  
  /* picoquic_check_tuple_challenge_expired:
+@@ -905,6 +906,7 @@ void picoquic_promote_tuple_to_default(
+             picoquic_log_app_message(path_x->cnx, "Migration to server preferred address successful on path %" PRIu64, path_x->unique_path_id);
+         }
+         picoquic_reset_path_mtu(path_x);
++        picoquic_register_net_secret_for_path(path_x->cnx, path_x);
+         if (is_new_address) {
+             picoquic_reset_path_congestion(path_x->cnx, path_x, current_time);
+         }
 diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
-index 83a408c8..65148739 100644
+index 713b053c..1fd8d543 100644
 --- a/picoquic/picoquic.h
 +++ b/picoquic/picoquic.h
-@@ -1402,6 +1402,44 @@ int picoquic_incoming_packet_ex(
+@@ -1400,6 +1400,44 @@ int picoquic_incoming_packet_ex(
      picoquic_cnx_t** first_cnx,
      uint64_t current_time);
  
@@ -235,10 +234,10 @@ index 83a408c8..65148739 100644
   * next packet that will be set over the network. The API for that is
   * picoquic_prepare_next_packet", which operates on a "quic context".
 diff --git a/picoquic/picoquic_internal.h b/picoquic/picoquic_internal.h
-index 55b6766d..75c4a143 100644
+index f2d2b054..5994572e 100644
 --- a/picoquic/picoquic_internal.h
 +++ b/picoquic/picoquic_internal.h
-@@ -1613,6 +1613,7 @@ int picoquic_register_cnx_id(picoquic_quic_t* quic, picoquic_cnx_t* cnx, picoqui
+@@ -1628,6 +1628,7 @@ int picoquic_register_cnx_id(picoquic_quic_t* quic, picoquic_cnx_t* cnx, picoqui
  
  /* Register or update default address and reset secret */
  int picoquic_register_net_secret(picoquic_cnx_t* cnx);
@@ -247,7 +246,7 @@ index 55b6766d..75c4a143 100644
  /* Registration of initial connection ID and peer IP */
  int picoquic_register_net_icid(picoquic_cnx_t* cnx);
 diff --git a/picoquic/quicctx.c b/picoquic/quicctx.c
-index 6de0f739..3aaf7e1f 100644
+index 11196215..da2462b8 100644
 --- a/picoquic/quicctx.c
 +++ b/picoquic/quicctx.c
 @@ -363,11 +363,8 @@ static int picoquic_net_secret_compare(const void* key1, const void* key2)
@@ -263,7 +262,7 @@ index 6de0f739..3aaf7e1f 100644
      }
      return ret;
  }
-@@ -1410,6 +1407,20 @@ int picoquic_register_net_secret(picoquic_cnx_t* cnx)
+@@ -1435,6 +1432,20 @@ int picoquic_register_net_secret(picoquic_cnx_t* cnx)
      return ret;
  }
  
@@ -284,7 +283,7 @@ index 6de0f739..3aaf7e1f 100644
  void picoquic_init_transport_parameters(picoquic_tp_t* tp)
  {
      memset(tp, 0, sizeof(picoquic_tp_t));
-@@ -1857,6 +1868,7 @@ void picoquic_unchain_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple)
+@@ -1868,6 +1879,7 @@ void picoquic_unchain_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple)
  
  void picoquic_delete_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple, int is_deleting_path)
  {
@@ -292,7 +291,7 @@ index 6de0f739..3aaf7e1f 100644
      /* TODO: dereference local CID, retire remote CID ??? */
      /* Dereference the remote CID */
      if (tuple->p_remote_cnxid != NULL) {
-@@ -1864,6 +1876,10 @@ void picoquic_delete_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple, int
+@@ -1875,6 +1887,10 @@ void picoquic_delete_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple, int
      }
      /* Remove from chain to the path */
      picoquic_unchain_tuple(path_x, tuple);
@@ -303,7 +302,7 @@ index 6de0f739..3aaf7e1f 100644
      /* And finally free */
      free(tuple);
  }
-@@ -1874,6 +1890,7 @@ void picoquic_set_first_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple)
+@@ -1885,6 +1901,7 @@ void picoquic_set_first_tuple(picoquic_path_t* path_x, picoquic_tuple_t* tuple)
      picoquic_unchain_tuple(path_x, tuple);
      path_x->first_tuple = tuple;
      tuple->next_tuple = old_first;
@@ -311,7 +310,7 @@ index 6de0f739..3aaf7e1f 100644
  }
  
  /* Set default interface -- to call just after creating a connection context */
-@@ -2185,6 +2202,8 @@ void picoquic_demote_path(picoquic_cnx_t* cnx, int path_index, uint64_t current_
+@@ -2210,6 +2227,8 @@ void picoquic_demote_path(picoquic_cnx_t* cnx, int path_index, uint64_t current_
                  cnx->path[0] = cnx->path[alt_path0];
                  cnx->path[alt_path0] = path_x;
                  path_index = alt_path0;
@@ -321,10 +320,10 @@ index 6de0f739..3aaf7e1f 100644
              else {
                  can_demote = 0;
 diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
-index c65a0618..21a7fba3 100644
+index f77dd44c..a76c85d3 100644
 --- a/picoquic_t/picoquic_t.c
 +++ b/picoquic_t/picoquic_t.c
-@@ -313,6 +313,12 @@ static const picoquic_test_def_t test_table[] = {
+@@ -327,6 +327,12 @@ static const picoquic_test_def_t test_table[] = {
      { "stateless_reset_bad", stateless_reset_bad_test },
      { "stateless_reset_client", stateless_reset_client_test },
      { "stateless_reset_handshake", stateless_reset_handshake_test },
@@ -338,10 +337,10 @@ index c65a0618..21a7fba3 100644
      { "tls_api_very_long_stream", tls_api_very_long_stream_test },
      { "tls_api_very_long_max", tls_api_very_long_max_test },
 diff --git a/picoquictest/multipath_test.c b/picoquictest/multipath_test.c
-index 9ba2c170..de1aade1 100644
+index b2c0e135..b75088e7 100644
 --- a/picoquictest/multipath_test.c
 +++ b/picoquictest/multipath_test.c
-@@ -2704,3 +2704,247 @@ int multipath_cid_retire_test(void)
+@@ -3500,3 +3500,247 @@ int multipath_idle_rotation_test(void)
   * 
   * TODO: break that into parts that can be verified!
   */
@@ -590,10 +589,10 @@ index 9ba2c170..de1aade1 100644
 +    return (ret_old == 0 && ret_new == 0 && ret_other == 0) ? 0 : -1;
 +}
 diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
-index 820b651d..192a2ae9 100644
+index a8186add..e8b4b4ce 100644
 --- a/picoquictest/picoquictest.h
 +++ b/picoquictest/picoquictest.h
-@@ -114,6 +114,12 @@ int stateless_reset_test(void);
+@@ -119,6 +119,12 @@ int stateless_reset_test(void);
  int stateless_reset_bad_test(void);
  int stateless_reset_client_test(void);
  int stateless_reset_handshake_test(void);
@@ -607,10 +606,10 @@ index 820b651d..192a2ae9 100644
  int sim_link_test(void);
  int tls_api_very_long_stream_test(void);
 diff --git a/picoquictest/tls_api_test.c b/picoquictest/tls_api_test.c
-index 49945d44..90db7ef4 100644
+index 07ac2766..e8b50f62 100644
 --- a/picoquictest/tls_api_test.c
 +++ b/picoquictest/tls_api_test.c
-@@ -3683,6 +3683,378 @@ int stateless_reset_handshake_test(void)
+@@ -3737,6 +3737,378 @@ int stateless_reset_handshake_test(void)
      return ret;
  }
  

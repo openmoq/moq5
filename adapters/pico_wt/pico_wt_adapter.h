@@ -137,7 +137,7 @@ struct moq_pico_wt_conn {
     bool                        rx_replay_complete;
     uint64_t                    rx_replay_complete_sid;
 
-    /* The peer-unidirectional stream credit (initial_max_stream_id_unidir)
+    /* The peer-unidirectional stream credit (initial_max_streams_uni)
      * this endpoint's transport parameters carried when the adapter attached,
      * after picowt's own adjustment (picowt_set_transport_parameters raises
      * it to at least 63). A later picoquic_set_transport_parameters on the
