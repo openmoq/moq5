@@ -1,0 +1,142 @@
+Never request an ACK_FREQUENCY max ack delay below the peer's min_ack_delay
+
+Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
+0011.
+
+picoquic_compute_ack_gap_and_delay() corrects the requested max ack delay when
+the return path is slow, then caps it at PICOQUIC_ACK_DELAY_MAX (10 ms). If the
+peer advertised a min_ack_delay above 10 ms, which quicly does with 25 ms, that
+cap can produce an ACK_FREQUENCY request below the peer's min_ack_delay. This
+happens when there is some queueing and the return data rate is low. The peer
+then closes the connection with PROTOCOL_VIOLATION on frame type 0xaf. After
+the cap, the delay is now raised back to remote_min_ack_delay.
+
+Upstream: PR2369, merged as 36f49b73d532369882d97474ac018655b6739a58. This is
+the same change, backported. Remove this patch once the pin includes that
+commit.
+
+Test: ackfrq_min_delay (ack_frequency_test.c) sets a 25 ms remote
+min_ack_delay and a 2000 B/s receive rate, which triggers the correction and
+the 10 ms cap. The requested max ack delay must not be lower than the remote
+min_ack_delay. Without the fix it fails; with the fix it passes.
+
+diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
+index afac4969..7b584ff1 100644
+--- a/UnitTest1/unittest1.cpp
++++ b/UnitTest1/unittest1.cpp
+@@ -827,6 +827,13 @@ namespace UnitTest1
+             Assert::AreEqual(ret, 0);
+         }
+ 
++        TEST_METHOD(ackfrq_min_delay)
++        {
++            int ret = ackfrq_min_delay_test();
++
++            Assert::AreEqual(ret, 0);
++        }
++
+         TEST_METHOD(test_sim_link)
+         {
+             int ret = sim_link_test();
+diff --git a/picoquic/frames.c b/picoquic/frames.c
+index 907b3c42..ade0f64a 100644
+--- a/picoquic/frames.c
++++ b/picoquic/frames.c
+@@ -3017,6 +3017,11 @@ void picoquic_compute_ack_gap_and_delay(picoquic_cnx_t* cnx, uint64_t rtt, uint6
+                 if (*ack_delay_max > PICOQUIC_ACK_DELAY_MAX) {
+                     *ack_delay_max = PICOQUIC_ACK_DELAY_MAX;
+                 }
++                /* The requested ack delay must never be lower than the
++                 * min_ack_delay advertised by the peer. */
++                if (*ack_delay_max < remote_min_ack_delay) {
++                    *ack_delay_max = remote_min_ack_delay;
++                }
+             }
+             /* if ack gap smaller than ack time fraction of CWIN, perform correction */
+             uint64_t rtt_target = (cnx->path[0]->smoothed_rtt + cnx->path[0]->rtt_min) / 2;
+diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
+index 4da8b17d..cc21be7f 100644
+--- a/picoquic_t/picoquic_t.c
++++ b/picoquic_t/picoquic_t.c
+@@ -226,6 +226,7 @@ static const picoquic_test_def_t test_table[] = {
+     { "ack_of_ack", ack_of_ack_test },
+     { "ackfrq_basic", ackfrq_basic_test },
+     { "ackfrq_short", ackfrq_short_test },
++    { "ackfrq_min_delay", ackfrq_min_delay_test },
+     { "sim_link", sim_link_test },
+     { "clear_text_aead", cleartext_aead_test },
+     { "pn_ctr", pn_ctr_test },
+diff --git a/picoquictest/ack_frequency_test.c b/picoquictest/ack_frequency_test.c
+index 03fb075a..0b041aec 100644
+--- a/picoquictest/ack_frequency_test.c
++++ b/picoquictest/ack_frequency_test.c
+@@ -205,3 +205,57 @@ int ackfrq_short_test(void)
+ 
+     return ackfrq_test_one(&spec);
+ }
++
++/* Verify that the ack delay computed for the ACK_FREQUENCY frame is never
++ * lower than the min_ack_delay advertised by the peer, even when the
++ * correction for slow return paths applies the PICOQUIC_ACK_DELAY_MAX cap.
++ */
++int ackfrq_min_delay_test(void)
++{
++    int ret = 0;
++    uint64_t simulated_time = 0;
++    uint64_t remote_min_ack_delay = 25000;
++    uint64_t ack_gap = 0;
++    uint64_t ack_delay_max = 0;
++    struct sockaddr_in addr;
++    picoquic_cnx_t* cnx = NULL;
++    picoquic_quic_t* quic = picoquic_create(8, NULL, NULL, NULL, NULL, NULL, NULL,
++        NULL, NULL, NULL, simulated_time, &simulated_time, NULL, NULL, 0);
++
++    if (quic == NULL) {
++        ret = -1;
++    }
++    else {
++        memset(&addr, 0, sizeof(struct sockaddr_in));
++        addr.sin_family = AF_INET;
++        addr.sin_port = 4433;
++        cnx = picoquic_create_cnx(quic, picoquic_null_connection_id, picoquic_null_connection_id,
++            (struct sockaddr*)&addr, simulated_time, 0, NULL, NULL, 1);
++        if (cnx == NULL) {
++            ret = -1;
++        }
++    }
++
++    if (ret == 0) {
++        cnx->is_ack_frequency_negotiated = 1;
++        cnx->path[0]->rtt_min = 20000;
++        cnx->path[0]->smoothed_rtt = 40000;
++        /* ACK transmission time = 115 bytes / 2000 B/s = 57.5 ms */
++        cnx->path[0]->receive_rate_max = 2000;
++
++        picoquic_compute_ack_gap_and_delay(cnx, cnx->path[0]->rtt_min, remote_min_ack_delay,
++            cnx->path[0]->peak_bandwidth_estimate, &ack_gap, &ack_delay_max);
++
++        if (ack_delay_max < remote_min_ack_delay) {
++            DBG_PRINTF("Ack delay max %" PRIu64 " < remote min ack delay %" PRIu64,
++                ack_delay_max, remote_min_ack_delay);
++            ret = -1;
++        }
++    }
++
++    if (quic != NULL) {
++        picoquic_free(quic);
++    }
++
++    return ret;
++}
+diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
+index 9f12078d..a07d7652 100644
+--- a/picoquictest/picoquictest.h
++++ b/picoquictest/picoquictest.h
+@@ -73,6 +73,7 @@ int sendacktest(void);
+ int sendack_loop_test(void);
+ int ackfrq_basic_test(void);
+ int ackfrq_short_test(void);
++int ackfrq_min_delay_test(void);
+ #if 0
+ /* The TLS API connect test is only useful when debugging issues step by step */
+ int tls_api_connect_test(void);

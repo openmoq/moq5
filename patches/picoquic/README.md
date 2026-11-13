@@ -48,6 +48,7 @@ after rebasing; no new test result is asserted by this inventory.
 | 0009 | Stateless-reset ingress and sending policy preserve authentication, routing and opt-out behavior. |
 | 0010 | STOP refuses a direct-receive stream whose receive half has completed, without changing its context. |
 | 0011 | Loading, unloading and resetting the crypto providers are serialized, so contexts created concurrently on different threads each see the providers completely loaded. |
+| 0012 | The pin includes upstream [PR2369](https://github.com/private-octopus/picoquic/pull/2369) (`36f49b73d532369882d97474ac018655b6739a58`): an ACK_FREQUENCY request never asks for a max ack delay below the peer's min_ack_delay. |
 
 No new provider API is introduced by this rebase. External provider headers and
 binaries must still implement the existing declared semantic contracts together.
