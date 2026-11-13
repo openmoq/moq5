@@ -262,7 +262,7 @@ int moq_pico_wt_conn_create(const moq_pico_wt_conn_cfg_t *cfg,
     c->stop_sending_count = 0;
     c->last_stop_sending_stream_id = UINT64_MAX;
 
-    c->tp_max_streams_uni = tp->initial_max_stream_id_unidir;
+    c->tp_max_streams_uni = tp->initial_max_streams_uni;
 
     /* Initialize endpoint ops. */
     if (pico_wt_endpoint_init(&c->endpoint_ops, &c->endpoint_ctx,
@@ -910,7 +910,7 @@ static void pw_rx_sweep(moq_pico_wt_conn_t *c, uint64_t now)
     if (c->cnx) {
         const picoquic_tp_t *tp = picoquic_get_transport_parameters(c->cnx, 1);
         if (tp == NULL ||
-            tp->initial_max_stream_id_unidir != c->tp_max_streams_uni) {
+            tp->initial_max_streams_uni != c->tp_max_streams_uni) {
             moq_transport_bridge_on_transport_error(
                 c->bridge, PICO_WT_INBOUND_FATAL_CODE, now);
             return;

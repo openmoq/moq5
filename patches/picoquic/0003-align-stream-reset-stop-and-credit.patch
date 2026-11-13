@@ -1,6 +1,6 @@
 Align stream reset, stop, credit and direct-receive handling with RFC 9000.
 
-Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 and
+Applies to picoquic 36f49b73d532369882d97474ac018655b6739a58, after 0001 and
 0002.
 
 Eight related topics, retaining the existing regression coverage:
@@ -39,6 +39,15 @@ The upstream reset_at_end acknowledged-FIN row expects the retained
 ALREADY_CLOSED refusal and checks context preservation without preventing
 its later reliable-size cases from running.
 
+Since upstream 6152f9e6, a connection without a callback no longer queues
+in-order data: picoquic replaces a NULL callback with one that refuses every
+event. The direct-receive tests therefore queue a stream's data and FIN
+behind a missing first byte, which their application does not need, instead
+of receiving them with no callback. The queued data is kept in upstream's
+cached first stream segment (83cd9728), and a queued close check is unlinked
+with the stream in picoquic_stream_node_delete, which upstream (9fb927c8) now
+gives the connection.
+
 Tests (picoquic_ct): reset_at_end, stream_reset_after_fin, reset_after_fin_wire,
 stream_reset_prefix_retirement, reset_stream_at_reliable_size,
 stream_reset_at_prefix_delivery, stream_empty_frame_ack,
@@ -49,10 +58,10 @@ adapters/picoquic/tests/test_pq_reset_after_fin.c and
 test_pq_provider_stream_credit.c.
 
 diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
-index 7bccfd8b..efc6262d 100644
+index 7b584ff1..4075be2f 100644
 --- a/UnitTest1/unittest1.cpp
 +++ b/UnitTest1/unittest1.cpp
-@@ -544,6 +544,13 @@ namespace UnitTest1
+@@ -551,6 +551,13 @@ namespace UnitTest1
              Assert::AreEqual(ret, 0);
          }
  
@@ -66,7 +75,7 @@ index 7bccfd8b..efc6262d 100644
          TEST_METHOD(stop_sending_needs_repeat)
          {
              int ret = stop_sending_needs_repeat_test();
-@@ -551,6 +558,13 @@ namespace UnitTest1
+@@ -558,6 +565,13 @@ namespace UnitTest1
              Assert::AreEqual(ret, 0);
          }
  
@@ -80,7 +89,7 @@ index 7bccfd8b..efc6262d 100644
          TEST_METHOD(stream_invalid_id)
          {
              int ret = stream_invalid_id_test();
-@@ -565,6 +579,13 @@ namespace UnitTest1
+@@ -572,6 +586,13 @@ namespace UnitTest1
              Assert::AreEqual(ret, 0);
          }
  
@@ -94,7 +103,7 @@ index 7bccfd8b..efc6262d 100644
          TEST_METHOD(queue_multipath_blocked_frames)
          {
              int ret = queue_multipath_blocked_frames_test();
-@@ -586,6 +607,13 @@ namespace UnitTest1
+@@ -593,6 +614,13 @@ namespace UnitTest1
              Assert::AreEqual(ret, 0);
          }
  
@@ -108,7 +117,7 @@ index 7bccfd8b..efc6262d 100644
          TEST_METHOD(frames_format)
          {
              int ret = frames_format_test();
-@@ -607,6 +635,27 @@ namespace UnitTest1
+@@ -614,6 +642,27 @@ namespace UnitTest1
              Assert::AreEqual(ret, 0);
          }
  
@@ -133,10 +142,10 @@ index 7bccfd8b..efc6262d 100644
 +            Assert::AreEqual(ret, 0);
 +        }
 +
-         TEST_METHOD(test_logger)
+         TEST_METHOD(null_callback_setters)
          {
-             int ret = logger_test();
-@@ -1645,6 +1694,20 @@ namespace UnitTest1
+             int ret = null_callback_setters_test();
+@@ -1701,6 +1750,20 @@ namespace UnitTest1
              Assert::AreEqual(ret, 0);
          }
  
@@ -157,7 +166,7 @@ index 7bccfd8b..efc6262d 100644
          TEST_METHOD(stop_sending_loss)
          {
              int ret = stop_sending_loss_test();
-@@ -3698,6 +3761,18 @@ namespace UnitTest1
+@@ -3794,6 +3857,18 @@ namespace UnitTest1
              Assert::AreEqual(ret, 0);
          }
  
@@ -176,7 +185,7 @@ index 7bccfd8b..efc6262d 100644
          TEST_METHOD(queue_network_input) {
              int ret = queue_network_input_test();
  
-@@ -3722,6 +3797,12 @@ namespace UnitTest1
+@@ -3818,6 +3893,12 @@ namespace UnitTest1
              Assert::AreEqual(ret, 0);
          }
  
@@ -190,7 +199,7 @@ index 7bccfd8b..efc6262d 100644
              int ret = address_discovery_test();
  
 diff --git a/picoquic/frames.c b/picoquic/frames.c
-index 1bf1106a..b3dcb41b 100644
+index ade0f64a..9e5c8142 100644
 --- a/picoquic/frames.c
 +++ b/picoquic/frames.c
 @@ -97,7 +97,10 @@ int picoquic_is_stream_acked(picoquic_stream_head_t* stream)
@@ -211,7 +220,7 @@ index 1bf1106a..b3dcb41b 100644
  {
 -    picoquic_update_max_stream_ID_local(cnx, stream);
 -
-     if (cnx->callback_fn != NULL && !stream->reset_signalled) {
+     if (!stream->reset_signalled) {
          /* Once the FIN was delivered, the stream is in the terminal "Data Read" state (RFC 9000 3.2): do not signal the reset. */
          if (!stream->is_discarded && !stream->fin_signalled) {
 @@ -301,6 +302,8 @@ void picoquic_signal_stream_reset(picoquic_cnx_t* cnx, picoquic_stream_head_t* s
@@ -253,7 +262,7 @@ index 1bf1106a..b3dcb41b 100644
          }
      }
      return ret;
-@@ -1256,18 +1267,41 @@ static void picoquic_stream_data_chunk_callback(picoquic_cnx_t* cnx, picoquic_st
+@@ -1260,18 +1271,41 @@ static void picoquic_stream_data_chunk_callback(picoquic_cnx_t* cnx, picoquic_st
  {
      picoquic_call_back_event_t fin_now = picoquic_callback_stream_data;
      int call_back_needed = data_length > 0;
@@ -297,15 +306,15 @@ index 1bf1106a..b3dcb41b 100644
          }
  
          if (call_back_needed && !stream->stop_sending_requested && !stream->is_discarded &&
-@@ -1284,18 +1318,27 @@ void picoquic_stream_data_callback(picoquic_cnx_t* cnx, picoquic_stream_head_t*
+@@ -1288,17 +1322,26 @@ void picoquic_stream_data_callback(picoquic_cnx_t* cnx, picoquic_stream_head_t*
  {
      picoquic_stream_data_node_t* data;
  
--    while ((data = (picoquic_stream_data_node_t*)picosplay_first(&stream->stream_data_tree)) != NULL && data->offset <= stream->consumed_offset) {
+-    while ((data = stream->first_stream_data) != NULL && data->offset <= stream->consumed_offset) {
 +    /* Once the stream is marked direct receive, picoquic_mark_direct_receive_stream
 +     * has passed the rest of the queue to the direct receive callback. */
 +    while (stream->direct_receive_fn == NULL &&
-+        (data = (picoquic_stream_data_node_t*)picosplay_first(&stream->stream_data_tree)) != NULL && data->offset <= stream->consumed_offset) {
++        (data = stream->first_stream_data) != NULL && data->offset <= stream->consumed_offset) {
          size_t start = (size_t)(stream->consumed_offset - data->offset);
          if (data->length >= start) {
              size_t data_length = data->length - start;
@@ -315,8 +324,7 @@ index 1bf1106a..b3dcb41b 100644
              picoquic_stream_data_chunk_callback(cnx, stream, data->bytes + start, data_length);
 +            data->is_being_delivered = 0;
          }
-         picosplay_delete_hint(&stream->stream_data_tree, &data->stream_data_node);
-         cnx->nb_stream_data_nodes--;
+         picoquic_remove_stream_data_node(cnx, stream, data);
      }
  
 -    /* handle the case where the fin frame does not carry any data */
@@ -328,7 +336,7 @@ index 1bf1106a..b3dcb41b 100644
  }
  
  static int add_chunk_node(picoquic_quic_t * quic, picosplay_tree_t* tree, uint64_t offset,
-@@ -1435,7 +1478,6 @@ static int picoquic_stream_network_input(picoquic_cnx_t* cnx, uint64_t stream_id
+@@ -1438,7 +1481,6 @@ static int picoquic_stream_network_input(picoquic_cnx_t* cnx, uint64_t stream_id
              stream->fin_received = 1;
              should_notify = 1;
              cnx->latest_receive_time = current_time;
@@ -336,7 +344,7 @@ index 1bf1106a..b3dcb41b 100644
          }
  
          if (new_fin_offset > stream->fin_offset) {
-@@ -1450,12 +1492,11 @@ static int picoquic_stream_network_input(picoquic_cnx_t* cnx, uint64_t stream_id
+@@ -1453,12 +1495,11 @@ static int picoquic_stream_network_input(picoquic_cnx_t* cnx, uint64_t stream_id
  
      if (ret == 0) {
          if (stream->direct_receive_fn != NULL) {
@@ -353,7 +361,7 @@ index 1bf1106a..b3dcb41b 100644
                  uint64_t err = (ret >= PICOQUIC_ERROR_CLASS) ? PICOQUIC_TRANSPORT_INTERNAL_ERROR : (uint64_t)ret;
                  ret = picoquic_connection_error(cnx, err, 0);
              }
-@@ -3624,8 +3665,13 @@ int picoquic_process_ack_of_stream_frame(picoquic_cnx_t* cnx, uint8_t* bytes,
+@@ -3615,8 +3656,13 @@ int picoquic_process_ack_of_stream_frame(picoquic_cnx_t* cnx, uint8_t* bytes,
          /* record the ack range for the stream */
          stream = picoquic_find_stream(cnx, stream_id);
          if (stream != NULL) {
@@ -369,7 +377,7 @@ index 1bf1106a..b3dcb41b 100644
  
              picoquic_delete_stream_if_closed(cnx, stream);
          }
-@@ -4662,12 +4708,32 @@ uint8_t * picoquic_format_max_streams_frame_if_needed(picoquic_cnx_t* cnx,
+@@ -4663,12 +4709,32 @@ uint8_t * picoquic_format_max_streams_frame_if_needed(picoquic_cnx_t* cnx,
      return bytes;
  }
  
@@ -405,10 +413,10 @@ index 1bf1106a..b3dcb41b 100644
                  if (stream->fin_sent || stream->reset_sent)
                  {
 diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
-index 00477235..bf6f0e0e 100644
+index 424fdecb..713b053c 100644
 --- a/picoquic/picoquic.h
 +++ b/picoquic/picoquic.h
-@@ -1476,6 +1476,13 @@ void picoquic_notify_destination_unreachable_by_cnxid(picoquic_quic_t* quic, pic
+@@ -1473,6 +1473,13 @@ void picoquic_notify_destination_unreachable_by_cnxid(picoquic_quic_t* quic, pic
   *
   * If stream data was queued at the time the picoquic_mark_direct_receive_stream
   * function is called, the callback will be activated immediately.
@@ -423,10 +431,10 @@ index 00477235..bf6f0e0e 100644
   * The callback function shall return:
   * - 0 if the data was processed normally.
 diff --git a/picoquic/picoquic_internal.h b/picoquic/picoquic_internal.h
-index 12804694..0634832b 100644
+index bbaee5c4..f2d2b054 100644
 --- a/picoquic/picoquic_internal.h
 +++ b/picoquic/picoquic_internal.h
-@@ -317,6 +317,7 @@ typedef struct st_picoquic_stream_data_node_t {
+@@ -314,6 +314,7 @@ typedef struct st_picoquic_stream_data_node_t {
      uint64_t offset;  /* Stream offset of the first octet in "bytes" */
      size_t length;    /* Number of octets in "bytes" */
      const uint8_t* bytes;
@@ -434,7 +442,7 @@ index 12804694..0634832b 100644
      uint8_t data[PICOQUIC_MAX_PACKET_SIZE];
  } picoquic_stream_data_node_t;
  
-@@ -782,6 +783,9 @@ typedef struct st_picoquic_stream_head_t {
+@@ -779,6 +780,9 @@ typedef struct st_picoquic_stream_head_t {
      void * app_stream_ctx;
      picoquic_stream_direct_receive_fn direct_receive_fn; /* direct receive function, if not NULL */
      void* direct_receive_ctx; /* direct receive context */
@@ -444,7 +452,7 @@ index 12804694..0634832b 100644
      picoquic_sack_list_t sack_list; /* Track which parts of the stream were acknowledged by the peer */
      /* Stream priority -- lowest is most urgent.
      * The stream priority should only be modified through the `picoquic_set_stream_priority` API.
-@@ -810,6 +814,8 @@ typedef struct st_picoquic_stream_head_t {
+@@ -807,6 +811,8 @@ typedef struct st_picoquic_stream_head_t {
      unsigned int is_discarded : 1; /* There should be no more callback for that stream, the application has discarded it */
      unsigned int use_app_flow_control : 1; /* Do not automatically increment the flow control window, wait for app calls. */
      unsigned int is_not_coalesced : 1; /* do not mix data for this stream with data from other stream in same packet */
@@ -453,7 +461,7 @@ index 12804694..0634832b 100644
  } picoquic_stream_head_t;
  
  #define IS_CLIENT_STREAM_ID(id) (unsigned int)(((id) & 1) == 0)
-@@ -1499,6 +1505,11 @@ typedef struct st_picoquic_cnx_t {
+@@ -1504,6 +1510,11 @@ typedef struct st_picoquic_cnx_t {
      /* Management of streams */
      picosplay_tree_t stream_tree;
      uint64_t nb_stream_data_nodes; /* Sum of stream_data_tree.size over all data streams */
@@ -465,7 +473,7 @@ index 12804694..0634832b 100644
      picoquic_output_stream_t output_streams;
      uint64_t high_priority_stream_id;
      uint64_t next_stream_id[4];
-@@ -1980,6 +1991,10 @@ uint8_t* picoquic_format_reset_stream_frame(picoquic_stream_head_t* stream,
+@@ -2002,6 +2013,10 @@ uint8_t* picoquic_format_reset_stream_frame(picoquic_stream_head_t* stream,
  uint8_t* picoquic_format_reset_stream_at_frame(picoquic_stream_head_t* stream,
      uint8_t* bytes, uint8_t* bytes_max, int* more_data, int* is_pure_ack);
  void picoquic_update_max_stream_ID_local(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream);
@@ -477,10 +485,10 @@ index 12804694..0634832b 100644
  /* Handling of retransmission of frames.
   * When a packet is deemed lost, the code looks at the frames that it contained and
 diff --git a/picoquic/sender.c b/picoquic/sender.c
-index b3c065da..0167a9c3 100644
+index 3c929f29..bedd032e 100644
 --- a/picoquic/sender.c
 +++ b/picoquic/sender.c
-@@ -3617,6 +3617,9 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
+@@ -3630,6 +3630,9 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
      uint64_t next_wake_time;
      int ret;
      PICOQUIC_THREAD_CHECK(cnx->quic);
@@ -490,7 +498,7 @@ index b3c065da..0167a9c3 100644
          
      ret = picoquic_handle_send_timers(cnx, current_time, &next_wake_time);
      *send_length = 0;
-@@ -3832,6 +3835,11 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
+@@ -3845,6 +3848,11 @@ int picoquic_prepare_packet_ex(picoquic_cnx_t* cnx,
          ret = picoquic_program_app_wake_time(cnx, &next_wake_time);
      }
  
@@ -503,10 +511,10 @@ index b3c065da..0167a9c3 100644
  
      return ret;
 diff --git a/picoquic/streams.c b/picoquic/streams.c
-index b85a8897..088c3d4d 100644
+index 8ec8e35e..033fa70a 100644
 --- a/picoquic/streams.c
 +++ b/picoquic/streams.c
-@@ -89,6 +89,7 @@ picoquic_stream_data_node_t* picoquic_stream_data_node_alloc(picoquic_quic_t* qu
+@@ -102,6 +102,7 @@ picoquic_stream_data_node_t* picoquic_stream_data_node_alloc(picoquic_quic_t* qu
          quic->p_first_data_node = stream_data->next_stream_data;
          stream_data->next_stream_data = NULL;
          stream_data->bytes = NULL;
@@ -514,18 +522,18 @@ index b85a8897..088c3d4d 100644
          quic->nb_data_nodes_in_pool--;
      }
  
-@@ -130,6 +131,10 @@ void picoquic_clear_stream(picoquic_stream_head_t* stream)
-     if (stream->is_output_stream) {
-         picoquic_remove_output_stream(stream->cnx, stream);
-     }
+@@ -154,6 +155,10 @@ static void picoquic_stream_node_delete(void* tree, picosplay_node_t* node)
+     /* Only application streams are counted and scheduled for output. */
+     cnx->nb_stream_data_nodes -= (uint64_t)stream->stream_data_tree.size;
+     picoquic_remove_output_stream(cnx, stream);
 +    if (stream->is_close_check_queued) {
 +        /* Only application streams are queued; the embedded TLS streams never are. */
-+        picoquic_dequeue_stream_close_check(stream->cnx, stream);
++        picoquic_dequeue_stream_close_check(cnx, stream);
 +    }
-     picosplay_empty_tree(&stream->stream_data_tree);
-     picoquic_sack_list_free(&stream->sack_list);
- }
-@@ -455,21 +460,30 @@ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
+     picoquic_clear_stream(stream);
+ 
+     free(stream);
+@@ -467,21 +472,30 @@ int picoquic_reset_stream_at(picoquic_cnx_t* cnx,
      if (reliable_size > 0 && !cnx->is_reset_stream_at_enabled) {
          ret = PICOQUIC_ERROR_ILLEGAL_TRANSPORT_EXTENSION;
      }
@@ -560,7 +568,7 @@ index b85a8897..088c3d4d 100644
                  stream->reliable_size = reliable_size;
                  stream->local_error = local_stream_error;
                  stream->reset_requested = 1;
-@@ -530,18 +544,23 @@ int picoquic_stop_sending(picoquic_cnx_t* cnx,
+@@ -542,18 +556,23 @@ int picoquic_stop_sending(picoquic_cnx_t* cnx,
      picoquic_stream_head_t* stream = NULL;
      PICOQUIC_THREAD_CHECK(cnx->quic);
  
@@ -591,7 +599,7 @@ index b85a8897..088c3d4d 100644
              uint8_t buffer[128];
              uint8_t* bytes;
              int more_data = 0;
-@@ -958,6 +977,80 @@ void picoquic_delete_stream(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream)
+@@ -969,6 +988,80 @@ void picoquic_delete_stream(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream)
      picosplay_delete(&cnx->stream_tree, stream);
  }
  
@@ -661,7 +669,7 @@ index b85a8897..088c3d4d 100644
 +/* First queued node of the stream whose bytes are not with an application callback. */
 +static picoquic_stream_data_node_t* picoquic_first_undelivered_stream_data(picoquic_stream_head_t* stream)
 +{
-+    picoquic_stream_data_node_t* data = (picoquic_stream_data_node_t*)picosplay_first(&stream->stream_data_tree);
++    picoquic_stream_data_node_t* data = stream->first_stream_data;
 +
 +    while (data != NULL && data->is_being_delivered) {
 +        data = (picoquic_stream_data_node_t*)picosplay_next(&data->stream_data_node);
@@ -672,7 +680,7 @@ index b85a8897..088c3d4d 100644
  int picoquic_mark_direct_receive_stream(picoquic_cnx_t* cnx, uint64_t stream_id, picoquic_stream_direct_receive_fn direct_receive_fn, void* direct_receive_ctx)
  {
      int ret = 0;
-@@ -975,11 +1068,21 @@ int picoquic_mark_direct_receive_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
+@@ -986,11 +1079,21 @@ int picoquic_mark_direct_receive_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
          /* This is illegal! */
          ret = PICOQUIC_ERROR_NO_CALLBACK_PROVIDED;
      }
@@ -688,7 +696,7 @@ index b85a8897..088c3d4d 100644
          stream->direct_receive_fn = direct_receive_fn;
          stream->direct_receive_ctx = direct_receive_ctx;
 -        /* If there is pending data, pass it. */
--        while ((data = (picoquic_stream_data_node_t*)picosplay_first(&stream->stream_data_tree)) != NULL) {
+-        while ((data = stream->first_stream_data) != NULL) {
 +        /* If there is pending data, pass it. A node whose bytes are already
 +         * with an application callback stays with the loop that passed them:
 +         * that loop deletes it when the callback returns. */
@@ -696,7 +704,7 @@ index b85a8897..088c3d4d 100644
              size_t length = data->length;
              uint64_t offset = data->offset;
  
-@@ -995,7 +1098,12 @@ int picoquic_mark_direct_receive_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
+@@ -1006,7 +1109,12 @@ int picoquic_mark_direct_receive_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
              }
  
              if (length > 0) {
@@ -710,7 +718,7 @@ index b85a8897..088c3d4d 100644
              }
  
              if (ret == 0) {
-@@ -1012,7 +1120,15 @@ int picoquic_mark_direct_receive_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
+@@ -1022,7 +1130,15 @@ int picoquic_mark_direct_receive_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
          /* If there is a fin offset, pass it. */
          if (ret == 0 && stream->fin_received && !stream->fin_signalled) {
              uint8_t fin_bytes[8];
@@ -728,10 +736,10 @@ index b85a8897..088c3d4d 100644
      }
  
 diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
-index 9c9cb9e4..6ab43d96 100644
+index cc21be7f..f77dd44c 100644
 --- a/picoquic_t/picoquic_t.c
 +++ b/picoquic_t/picoquic_t.c
-@@ -186,15 +186,22 @@ static const picoquic_test_def_t test_table[] = {
+@@ -187,16 +187,23 @@ static const picoquic_test_def_t test_table[] = {
      { "frames_ackof_error", frames_ackof_error_test },
      { "reset_stream_at_needs_repeat", reset_stream_at_needs_repeat_test },
      { "process_ack_of_reset_stream_at", process_ack_of_reset_stream_at_test },
@@ -748,13 +756,14 @@ index 9c9cb9e4..6ab43d96 100644
      { "frames_format", frames_format_test },
      { "flow_control_check_stream_offset", flow_control_check_stream_offset_test },
      { "signal_stream_reset", signal_stream_reset_test },
+     { "null_callback_setters", null_callback_setters_test },
 +    { "stream_credit_receive_complete", stream_credit_receive_complete_test },
 +    { "stream_direct_receive_handover", stream_direct_receive_handover_test },
 +    { "stream_reset_at_prefix_delivery", stream_reset_at_prefix_delivery_test },
      { "logger", logger_test },
      { "binlog", binlog_test },
      { "binlog_compare_mismatch", binlog_compare_mismatch_test },
-@@ -355,6 +362,8 @@ static const picoquic_test_def_t test_table[] = {
+@@ -364,6 +371,8 @@ static const picoquic_test_def_t test_table[] = {
      { "zero_rtt", zero_rtt_test },
      { "zero_rtt_loss", zero_rtt_loss_test },
      { "stop_sending", stop_sending_test },
@@ -763,7 +772,7 @@ index 9c9cb9e4..6ab43d96 100644
      { "stop_sending_loss", stop_sending_loss_test },
      { "discard_stream", discard_stream_test },
      { "unidir", unidir_test },
-@@ -667,10 +676,13 @@ static const picoquic_test_def_t test_table[] = {
+@@ -682,10 +691,13 @@ static const picoquic_test_def_t test_table[] = {
      { "scone_prepare_format_failure", scone_prepare_format_failure_test },
      { "scone_report_guards", scone_report_guards_test },
      { "stream_ack", stream_ack_test },
@@ -778,7 +787,7 @@ index 9c9cb9e4..6ab43d96 100644
      { "af_undef", af_undef_test },
      { "app_limit_cc", app_limit_cc_test },
 diff --git a/picoquictest/edge_cases.c b/picoquictest/edge_cases.c
-index 01c0aadf..1f27458a 100644
+index 0d0afee9..3d11594e 100644
 --- a/picoquictest/edge_cases.c
 +++ b/picoquictest/edge_cases.c
 @@ -1392,6 +1392,7 @@ int reset_at_end_test(void)
@@ -812,10 +821,10 @@ index 01c0aadf..1f27458a 100644
          /* Reset stream at, with a reliable size equal to or below the last offset. */
          if (ret == 0 && (ret = reset_at_end_prepare(cnx, 16, 0)) == 0 &&
 diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
-index c20c01d5..a1e110d9 100644
+index a07d7652..a8186add 100644
 --- a/picoquictest/picoquictest.h
 +++ b/picoquictest/picoquictest.h
-@@ -168,6 +168,7 @@ int ticket_key_rotation_test(void);
+@@ -175,6 +175,7 @@ int ticket_key_rotation_test(void);
  int zero_rtt_test(void);
  int zero_rtt_loss_test(void);
  int stop_sending_test(void);
@@ -823,7 +832,7 @@ index c20c01d5..a1e110d9 100644
  int stop_sending_loss_test(void);
  int discard_stream_test(void);
  int unidir_test(void);
-@@ -234,15 +235,23 @@ int observed_address_ack_after_path_deleted_test(void);
+@@ -242,16 +243,24 @@ int observed_address_ack_after_path_deleted_test(void);
  int frames_ackof_error_test(void);
  int reset_stream_at_needs_repeat_test(void);
  int process_ack_of_reset_stream_at_test(void);
@@ -841,13 +850,14 @@ index c20c01d5..a1e110d9 100644
  int frames_format_test(void);
  int flow_control_check_stream_offset_test(void);
  int signal_stream_reset_test(void);
+ int null_callback_setters_test(void);
 +int stream_credit_receive_complete_test(void);
 +int stream_direct_receive_handover_test(void);
 +int stream_reset_at_prefix_delivery_test(void);
  int stress_test(void);
  int cnx_stress_unit_test(void);
  int cnx_stress_do_test(uint64_t duration, int nb_clients, int do_report);
-@@ -580,6 +589,8 @@ int scone_format_packet_too_small_test(void);
+@@ -592,6 +601,8 @@ int scone_format_packet_too_small_test(void);
  int scone_prepare_format_failure_test(void);
  int scone_report_guards_test(void);
  int stream_ack_test(void);
@@ -856,7 +866,7 @@ index c20c01d5..a1e110d9 100644
  int queue_network_input_test(void);
  int fastcc_test(void);
  int fastcc_jitter_test(void);
-@@ -639,6 +650,7 @@ int connection_drop_test(void);
+@@ -655,6 +666,7 @@ int connection_drop_test(void);
  int pacing_update_test(void);
  int quality_update_test(void);
  int direct_receive_test(void);
@@ -865,10 +875,10 @@ index c20c01d5..a1e110d9 100644
  int af_undef_test(void);
  int app_limit_cc_test(void);
 diff --git a/picoquictest/skip_frame_test.c b/picoquictest/skip_frame_test.c
-index 003e83aa..e037435d 100644
+index c925d7d4..827cff77 100644
 --- a/picoquictest/skip_frame_test.c
 +++ b/picoquictest/skip_frame_test.c
-@@ -1899,6 +1899,91 @@ int process_ack_of_reset_stream_at_test(void)
+@@ -1907,6 +1907,91 @@ int process_ack_of_reset_stream_at_test(void)
      return ret;
  }
  
@@ -898,7 +908,7 @@ index 003e83aa..e037435d 100644
 +{
 +    int ret = 0;
 +    uint64_t simulated_time = 0;
-+    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, NULL,
++    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, picoquic_test_permissive_callback,
 +        NULL, NULL, NULL, NULL, simulated_time,
 +        &simulated_time, NULL, NULL, 0);
 +    struct sockaddr_in saddr = { 0 };
@@ -960,7 +970,7 @@ index 003e83aa..e037435d 100644
  int picoquic_check_stop_sending_needs_repeat(picoquic_cnx_t* cnx, const uint8_t* bytes, size_t bytes_size, int* no_need_to_repeat);
  
  /* picoquic_check_stop_sending_needs_repeat has a "stream closed by peer" branch, reached
-@@ -2083,6 +2168,282 @@ picoquic_cnx_t * frames_format_test_get_cnx(picoquic_quic_t * qclient, struct so
+@@ -2091,6 +2176,282 @@ picoquic_cnx_t * frames_format_test_get_cnx(picoquic_quic_t * qclient, struct so
      return cnx;
  }
  
@@ -1243,7 +1253,7 @@ index 003e83aa..e037435d 100644
  /* Several public stream-mutation APIs share the same "stream not found" error path:
   * picoquic_find_stream returns NULL, and the function returns PICOQUIC_ERROR_INVALID_STREAM_ID
   * without touching anything else. None of them were ever exercised with a stream_id that
-@@ -2200,6 +2561,241 @@ int stream_never_called_apis_test(void)
+@@ -2208,6 +2569,241 @@ int stream_never_called_apis_test(void)
      return ret;
  }
  
@@ -1485,7 +1495,16 @@ index 003e83aa..e037435d 100644
  /* picoquic_queue_paths_blocked_frame and picoquic_queue_path_cid_blocked_frame are not
   * called from any production code path yet -- the trigger logic for when to send these
   * multipath frames is a separate design question. Exercise them directly here so the
-@@ -2451,9 +3047,157 @@ int picoquic_flow_control_check_stream_offset(picoquic_cnx_t* cnx, picoquic_stre
+@@ -2284,7 +2880,7 @@ int quicctx_never_called_apis_test(void)
+ {
+     int ret = 0;
+     uint64_t simulated_time = 0;
+-    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, picoquic_test_permissive_callback,
++    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, NULL,
+         NULL, NULL, NULL, NULL, simulated_time,
+         &simulated_time, NULL, NULL, 0);
+     struct sockaddr_in saddr = { 0 };
+@@ -2459,7 +3055,155 @@ int picoquic_flow_control_check_stream_offset(picoquic_cnx_t* cnx, picoquic_stre
      uint64_t new_fin_offset);
  void picoquic_signal_stream_reset(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream);
  
@@ -1501,8 +1520,7 @@ index 003e83aa..e037435d 100644
 +static int reset_prefix_test_cb(picoquic_cnx_t* UNUSED(cnx), uint64_t UNUSED(stream_id),
 +    uint8_t* UNUSED(bytes), size_t UNUSED(length),
 +    picoquic_call_back_event_t UNUSED(fin_or_event), void* UNUSED(callback_ctx), void* UNUSED(v_stream_ctx))
- {
--    int ret = 0;
++{
 +    return 0;
 +}
 +
@@ -1640,18 +1658,18 @@ index 003e83aa..e037435d 100644
 +}
 +
 +int frames_format_test(void)
-+{
-+    int ret = 0;
+ {
+     int ret = 0;
      uint8_t buffer[PICOQUIC_MAX_PACKET_SIZE];
-     uint8_t data[] = { 0xaa, 0xaa };
-     uint8_t* bytes = NULL;
-@@ -2563,229 +3307,1396 @@ int frames_format_test(void)
-     return ret;
- }
- 
--/* picoquic never sends past a limit its peer advertised, so a picoquic-to-picoquic exchange
-- * never reaches either violation branch below -- exercise both directly instead. */
--int flow_control_check_stream_offset_test(void)
+@@ -2567,214 +3311,1383 @@ int frames_format_test(void)
+     if (qclient != NULL) {
+         picoquic_free(qclient);
+     }
+-
++
++    return ret;
++}
++
 +/* picoquic never sends past a limit its peer advertised, so a picoquic-to-picoquic exchange
 + * never reaches either violation branch below -- exercise both directly instead. */
 +int flow_control_check_stream_offset_test(void)
@@ -1659,7 +1677,7 @@ index 003e83aa..e037435d 100644
 +    int ret = 0;
 +    uint64_t simulated_time = 0;
 +    uint8_t data[] = { 0xaa, 0xaa };
-+    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, NULL,
++    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, picoquic_test_permissive_callback,
 +        NULL, NULL, NULL, NULL, simulated_time,
 +        &simulated_time, NULL, NULL, 0);
 +    struct sockaddr_in saddr = { 0 };
@@ -1921,15 +1939,15 @@ index 003e83aa..e037435d 100644
 +    return ret;
 +}
 +
-+/* picoquic_signal_stream_reset has branches no other test reaches: no callback registered, a
-+ * redundant second signal on an already-signalled stream, offset_received not exceeding the
-+ * unconsumed delta, and the callback returning an error -- exercise all four directly. */
++/* picoquic_signal_stream_reset has branches no other test reaches: a redundant second signal
++ * on an already-signalled stream, offset_received not exceeding the unconsumed delta, and the
++ * callback returning an error -- exercise all three directly. */
 +int signal_stream_reset_test(void)
 +{
 +    int ret = 0;
 +    uint64_t simulated_time = 0;
 +    uint8_t data[] = { 0xaa, 0xaa, 0xaa, 0xaa };
-+    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, NULL,
++    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, picoquic_test_permissive_callback,
 +        NULL, NULL, NULL, NULL, simulated_time,
 +        &simulated_time, NULL, NULL, 0);
 +    struct sockaddr_in saddr = { 0 };
@@ -1970,25 +1988,6 @@ index 003e83aa..e037435d 100644
 +        picoquic_signal_stream_reset(cnx, stream);
 +        if (signal_stream_reset_test_nb_reset_calls != 1) {
 +            ret = -1;
-+        }
-+    }
-+
-+    if (ret == 0) {
-+        /* Nothing happens at all if the connection has no callback registered. */
-+        picoquic_add_to_stream(cnx, 4, data, sizeof(data), 0);
-+        stream = picoquic_find_stream(cnx, 4);
-+        if (stream == NULL) {
-+            ret = -1;
-+        }
-+        else {
-+            picoquic_stream_data_cb_fn saved_cb = cnx->callback_fn;
-+            cnx->callback_fn = NULL;
-+            signal_stream_reset_test_nb_reset_calls = 0;
-+            picoquic_signal_stream_reset(cnx, stream);
-+            cnx->callback_fn = saved_cb;
-+            if (stream->reset_signalled || signal_stream_reset_test_nb_reset_calls != 0) {
-+                ret = -1;
-+            }
 +        }
 +    }
 +
@@ -2480,7 +2479,7 @@ index 003e83aa..e037435d 100644
 +    int is_pure_ack = 1;
 +    uint64_t max_streams = 0;
 +
-+    cnx->local_parameters.initial_max_stream_id_unidir = 2;
++    cnx->local_parameters.initial_max_streams_uni = 2;
 +    cnx->max_streams_unidir_local = 2;
 +
 +    if (stream_credit_test_stream(cnx, 3, 0, 4, 0, simulated_time) != 0 ||
@@ -2626,32 +2625,55 @@ index 003e83aa..e037435d 100644
 +            ret = STREAM_HANDOVER_TEST_REFUSAL;
 +        }
 +    }
-+    return ret;
-+}
-+
+     return ret;
+ }
+ 
+-/* picoquic never sends past a limit its peer advertised, so a picoquic-to-picoquic exchange
+- * never reaches either violation branch below -- exercise both directly instead. */
+-int flow_control_check_stream_offset_test(void)
 +/* The replacement direct receive callback: same completion rule, own counts. */
 +static int stream_handover_test_direct_fn2(picoquic_cnx_t* UNUSED(cnx), uint64_t UNUSED(stream_id), int fin,
 +    const uint8_t* UNUSED(bytes), uint64_t offset, size_t length, void* direct_receive_ctx)
-+{
+ {
 +    stream_handover_test_ctx_t* ctx;
-+    int ret = 0;
-+
+     int ret = 0;
+-    uint64_t simulated_time = 0;
+-    uint8_t data[] = { 0xaa, 0xaa };
+-    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, picoquic_test_permissive_callback,
+-        NULL, NULL, NULL, NULL, simulated_time,
+-        &simulated_time, NULL, NULL, 0);
+-    struct sockaddr_in saddr = { 0 };
+-    picoquic_cnx_t* cnx = NULL;
+-    picoquic_stream_head_t* stream = NULL;
+ 
+-    if (qclient == NULL) {
+-        ret = -1;
 +    if (*(uint32_t*)direct_receive_ctx == STREAM_HANDOVER_TEST_SECOND_MAGIC) {
 +        ctx = ((stream_handover_test_second_t*)direct_receive_ctx)->main;
-+    }
-+    else {
+     }
+     else {
+-        cnx = frames_format_test_get_cnx(qclient, (struct sockaddr*)&saddr, picoquic_epoch_1rtt, simulated_time, 0);
+-        if (cnx == NULL) {
+-            ret = -1;
+-        }
 +        /* Called with the first callback's context: the replacement context was not installed. */
 +        ctx = (stream_handover_test_ctx_t*)direct_receive_ctx;
 +        ctx->direct2_wrong_ctx++;
-+    }
-+
+     }
+ 
+-    if (ret == 0) {
+-        picoquic_add_to_stream(cnx, 0, data, 2, 0);
+-        stream = picoquic_find_stream(cnx, 0);
+-        if (stream == NULL) {
+-            ret = -1;
+-        }
 +    ctx->direct2_calls++;
 +    ctx->direct2_bytes += length;
 +    if (fin) {
 +        ctx->direct2_fins++;
 +        ctx->direct_fin_received = 1;
 +        ctx->direct_final_size = offset + length;
-+    }
+     }
 +    if (offset <= ctx->direct_next_offset && offset + length > ctx->direct_next_offset) {
 +        ctx->direct_next_offset = offset + length;
 +    }
@@ -2660,13 +2682,22 @@ index 003e83aa..e037435d 100644
 +    }
 +    return ret;
 +}
-+
+ 
+-    if (ret == 0) {
+-        /* Baseline: within both limits, so the offset is accepted and accounting is updated. */
+-        stream->maxdata_local = 1000;
+-        stream->fin_offset = 0;
+-        cnx->maxdata_local = 1000;
+-        cnx->offset_received = 0;
 +static int stream_handover_test_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
 +    uint8_t* UNUSED(bytes), size_t length,
 +    picoquic_call_back_event_t fin_or_event, void* callback_ctx, void* UNUSED(v_stream_ctx))
 +{
 +    stream_handover_test_ctx_t* ctx = (stream_handover_test_ctx_t*)callback_ctx;
-+
+ 
+-        if (picoquic_flow_control_check_stream_offset(cnx, stream, 100) != 0 ||
+-            stream->fin_offset != 100 || cnx->offset_received != 100) {
+-            ret = -1;
 +    if (stream_id == ctx->stream_id &&
 +        (fin_or_event == picoquic_callback_stream_data || fin_or_event == picoquic_callback_stream_fin)) {
 +        ctx->ordinary_data_calls++;
@@ -2678,18 +2709,25 @@ index 003e83aa..e037435d 100644
 +            /* The direct receive callback continues after the bytes delivered so far. */
 +            ctx->direct_next_offset = ctx->ordinary_bytes;
 +            ctx->mark_ret = picoquic_mark_direct_receive_stream(cnx, stream_id, stream_handover_test_direct_fn, ctx);
-+        }
-+    }
+         }
+     }
 +    return 0;
 +}
-+
+ 
+-    if (ret == 0) {
+-        /* Per-stream limit exceeded: new_fin_offset > stream->maxdata_local. */
+-        stream->maxdata_local = 500;
+-        cnx->cnx_state = picoquic_state_ready;
+-        cnx->local_error = 0;
 +/* Every node in the free list appears once. A node recycled twice links to
 + * itself, so the walk does not end within the recorded count. */
 +static int stream_handover_test_pool_ok(picoquic_quic_t* quic)
 +{
 +    int nb_nodes = 0;
 +    picoquic_stream_data_node_t* node = quic->p_first_data_node;
-+
+ 
+-        if (picoquic_flow_control_check_stream_offset(cnx, stream, 2000) != PICOQUIC_ERROR_DETECTED ||
+-            cnx->local_error != PICOQUIC_TRANSPORT_FLOW_CONTROL_ERROR) {
 +    while (node != NULL && nb_nodes <= quic->nb_data_nodes_in_pool) {
 +        nb_nodes++;
 +        node = node->next_stream_data;
@@ -2721,26 +2759,14 @@ index 003e83aa..e037435d 100644
 +} stream_handover_test_case_t;
 +
 +static int stream_handover_test_one(stream_handover_test_case_t const* tc)
- {
-     int ret = 0;
-     uint64_t simulated_time = 0;
--    uint8_t data[] = { 0xaa, 0xaa };
--    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, NULL,
--        NULL, NULL, NULL, NULL, simulated_time,
--        &simulated_time, NULL, NULL, 0);
-     struct sockaddr_in saddr = { 0 };
++{
++    int ret = 0;
++    uint64_t simulated_time = 0;
++    struct sockaddr_in saddr = { 0 };
 +    stream_handover_test_ctx_t ctx = { 0 };
 +    picoquic_quic_t* quic = picoquic_create(8, NULL, NULL, NULL, NULL, NULL,
 +        NULL, NULL, NULL, NULL, simulated_time, &simulated_time, NULL, NULL, 0);
-     picoquic_cnx_t* cnx = NULL;
--    picoquic_stream_head_t* stream = NULL;
--
--    if (qclient == NULL) {
--        ret = -1;
--    }
--    else {
--        cnx = frames_format_test_get_cnx(qclient, (struct sockaddr*)&saddr, picoquic_epoch_1rtt, simulated_time, 0);
--        if (cnx == NULL) {
++    picoquic_cnx_t* cnx = NULL;
 +    int pool_ok = 0;
 +
 +    if (quic == NULL ||
@@ -2769,50 +2795,6 @@ index 003e83aa..e037435d 100644
      }
  
      if (ret == 0) {
--        picoquic_add_to_stream(cnx, 0, data, 2, 0);
--        stream = picoquic_find_stream(cnx, 0);
--        if (stream == NULL) {
-+        if (ctx.ordinary_data_calls != tc->ordinary_data_calls || ctx.ordinary_bytes != tc->ordinary_bytes ||
-+            ctx.ordinary_fins != tc->ordinary_fins) {
-+            DBG_PRINTF("Stream handover, %s: ordinary callback got %d calls, %" PRIu64 " bytes, %d FIN\n",
-+                tc->name, ctx.ordinary_data_calls, ctx.ordinary_bytes, ctx.ordinary_fins);
-             ret = -1;
-         }
--    }
--
--    if (ret == 0) {
--        /* Baseline: within both limits, so the offset is accepted and accounting is updated. */
--        stream->maxdata_local = 1000;
--        stream->fin_offset = 0;
--        cnx->maxdata_local = 1000;
--        cnx->offset_received = 0;
--
--        if (picoquic_flow_control_check_stream_offset(cnx, stream, 100) != 0 ||
--            stream->fin_offset != 100 || cnx->offset_received != 100) {
-+        if (ctx.direct_calls != tc->direct_calls || ctx.direct_bytes != tc->direct_bytes ||
-+            ctx.direct_fins != tc->direct_fins) {
-+            DBG_PRINTF("Stream handover, %s: direct callback got %d calls, %" PRIu64 " bytes, %d FIN\n",
-+                tc->name, ctx.direct_calls, ctx.direct_bytes, ctx.direct_fins);
-             ret = -1;
-         }
--    }
--
--    if (ret == 0) {
--        /* Per-stream limit exceeded: new_fin_offset > stream->maxdata_local. */
--        stream->maxdata_local = 500;
--        cnx->cnx_state = picoquic_state_ready;
--        cnx->local_error = 0;
--
--        if (picoquic_flow_control_check_stream_offset(cnx, stream, 2000) != PICOQUIC_ERROR_DETECTED ||
--            cnx->local_error != PICOQUIC_TRANSPORT_FLOW_CONTROL_ERROR) {
-+        if (tc->mark_on_data_call != 0 &&
-+            ctx.mark_ret != ((tc->direct_refuses) ? STREAM_HANDOVER_TEST_REFUSAL : 0)) {
-+            DBG_PRINTF("Stream handover, %s: mark returned 0x%x\n", tc->name, ctx.mark_ret);
-             ret = -1;
-         }
--    }
--
--    if (ret == 0) {
 -        /* Under the per-stream limit but over the connection-wide limit -- the overflow-safe subtraction arm. */
 -        stream->maxdata_local = 1000000;
 -        stream->fin_offset = 100;
@@ -2823,6 +2805,23 @@ index 003e83aa..e037435d 100644
 -
 -        if (picoquic_flow_control_check_stream_offset(cnx, stream, 250) != PICOQUIC_ERROR_DETECTED ||
 -            cnx->local_error != PICOQUIC_TRANSPORT_FLOW_CONTROL_ERROR) {
++        if (ctx.ordinary_data_calls != tc->ordinary_data_calls || ctx.ordinary_bytes != tc->ordinary_bytes ||
++            ctx.ordinary_fins != tc->ordinary_fins) {
++            DBG_PRINTF("Stream handover, %s: ordinary callback got %d calls, %" PRIu64 " bytes, %d FIN\n",
++                tc->name, ctx.ordinary_data_calls, ctx.ordinary_bytes, ctx.ordinary_fins);
++            ret = -1;
++        }
++        if (ctx.direct_calls != tc->direct_calls || ctx.direct_bytes != tc->direct_bytes ||
++            ctx.direct_fins != tc->direct_fins) {
++            DBG_PRINTF("Stream handover, %s: direct callback got %d calls, %" PRIu64 " bytes, %d FIN\n",
++                tc->name, ctx.direct_calls, ctx.direct_bytes, ctx.direct_fins);
++            ret = -1;
++        }
++        if (tc->mark_on_data_call != 0 &&
++            ctx.mark_ret != ((tc->direct_refuses) ? STREAM_HANDOVER_TEST_REFUSAL : 0)) {
++            DBG_PRINTF("Stream handover, %s: mark returned 0x%x\n", tc->name, ctx.mark_ret);
++            ret = -1;
++        }
 +        if (cnx->max_streams_unidir_local_computed != (uint64_t)tc->counted) {
 +            DBG_PRINTF("Stream handover, %s: counted %" PRIu64 ", expected %d\n", tc->name,
 +                cnx->max_streams_unidir_local_computed, tc->counted);
@@ -2898,9 +2897,9 @@ index 003e83aa..e037435d 100644
      return ret;
  }
  
--/* picoquic_signal_stream_reset has branches no other test reaches: no callback registered, a
-- * redundant second signal on an already-signalled stream, offset_received not exceeding the
-- * unconsumed delta, and the callback returning an error -- exercise all four directly. */
+-/* picoquic_signal_stream_reset has branches no other test reaches: a redundant second signal
+- * on an already-signalled stream, offset_received not exceeding the unconsumed delta, and the
+- * callback returning an error -- exercise all three directly. */
 -int signal_stream_reset_test(void)
 +/* A stream completed by a marking outside any callback is queued for a close
 + * check; deleting the connection before any preparation unlinks it, and the
@@ -2910,7 +2909,7 @@ index 003e83aa..e037435d 100644
      int ret = 0;
      uint64_t simulated_time = 0;
 -    uint8_t data[] = { 0xaa, 0xaa, 0xaa, 0xaa };
--    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, NULL,
+-    picoquic_quic_t* qclient = picoquic_create(8, NULL, NULL, NULL, NULL, picoquic_test_permissive_callback,
 -        NULL, NULL, NULL, NULL, simulated_time,
 -        &simulated_time, NULL, NULL, 0);
      struct sockaddr_in saddr = { 0 };
@@ -2928,18 +2927,20 @@ index 003e83aa..e037435d 100644
 +        }
 +        return -1;
 +    }
-+    /* Without a callback, the data and the FIN stay queued. */
++    /* The first byte is missing, so the rest of the data and the FIN stay
++     * queued. The application needs the stream only from that byte on. */
 +    ctx.stream_id = 3;
 +    ctx.magic = STREAM_HANDOVER_TEST_MAIN_MAGIC;
 +    ctx.second.magic = STREAM_HANDOVER_TEST_SECOND_MAGIC;
 +    ctx.second.main = &ctx;
-+    if (stream_credit_test_stream(cnx, 3, 0, 4, 1, simulated_time) != 0) {
++    ctx.direct_next_offset = 1;
++    picoquic_set_callback(cnx, stream_handover_test_cb, &ctx);
++    if (stream_credit_test_stream(cnx, 3, 1, 3, 1, simulated_time) != 0) {
          ret = -1;
      }
      else {
 -        cnx = frames_format_test_get_cnx(qclient, (struct sockaddr*)&saddr, picoquic_epoch_1rtt, simulated_time, 0);
 -        if (cnx == NULL) {
-+        picoquic_set_callback(cnx, stream_handover_test_cb, &ctx);
 +        if (picoquic_mark_direct_receive_stream(cnx, 3, stream_handover_test_direct_fn, &ctx) != 0 ||
 +            ctx.direct_fins != 1 || cnx->nb_close_checks != 1 || picoquic_find_stream(cnx, 3) == NULL) {
 +            DBG_PRINTF("Stream handover, teardown with a queued stream: %d FIN, %" PRIu64 " queued\n",
@@ -2984,23 +2985,20 @@ index 003e83aa..e037435d 100644
 +}
  
 -    if (ret == 0) {
--        /* Nothing happens at all if the connection has no callback registered. */
--        picoquic_add_to_stream(cnx, 4, data, sizeof(data), 0);
--        stream = picoquic_find_stream(cnx, 4);
+-        /* offset_received not greater than the unconsumed delta: it must be left unchanged. */
+-        picoquic_add_to_stream(cnx, 8, data, sizeof(data), 0);
+-        stream = picoquic_find_stream(cnx, 8);
 -        if (stream == NULL) {
 -            ret = -1;
 -        }
 -        else {
--            picoquic_stream_data_cb_fn saved_cb = cnx->callback_fn;
--            cnx->callback_fn = NULL;
+-            stream->consumed_offset = 100;
+-            stream->fin_offset = 500;
+-            cnx->offset_received = 300; /* <= delta (400), so no decrement should happen */
 -            signal_stream_reset_test_nb_reset_calls = 0;
 -            picoquic_signal_stream_reset(cnx, stream);
--            cnx->callback_fn = saved_cb;
--            if (stream->reset_signalled || signal_stream_reset_test_nb_reset_calls != 0) {
--                ret = -1;
--            }
--        }
--    }
+-            if (cnx->offset_received != 300 || !stream->reset_signalled ||
+-                signal_stream_reset_test_nb_reset_calls != 1) {
 +/* A direct receive callback replaces itself while the stream is being passed
 + * to it. The rest of the stream, and the FIN, reach the new callback once;
 + * the result of the call that replaced the callback, completion or refusal,
@@ -3034,22 +3032,7 @@ index 003e83aa..e037435d 100644
 +    picoquic_quic_t* quic = picoquic_create(8, NULL, NULL, NULL, NULL, NULL,
 +        NULL, NULL, NULL, NULL, simulated_time, &simulated_time, NULL, NULL, 0);
 +    picoquic_cnx_t* cnx = NULL;
- 
--    if (ret == 0) {
--        /* offset_received not greater than the unconsumed delta: it must be left unchanged. */
--        picoquic_add_to_stream(cnx, 8, data, sizeof(data), 0);
--        stream = picoquic_find_stream(cnx, 8);
--        if (stream == NULL) {
--            ret = -1;
--        }
--        else {
--            stream->consumed_offset = 100;
--            stream->fin_offset = 500;
--            cnx->offset_received = 300; /* <= delta (400), so no decrement should happen */
--            signal_stream_reset_test_nb_reset_calls = 0;
--            picoquic_signal_stream_reset(cnx, stream);
--            if (cnx->offset_received != 300 || !stream->reset_signalled ||
--                signal_stream_reset_test_nb_reset_calls != 1) {
++
 +    if (quic == NULL ||
 +        (cnx = frames_format_test_get_cnx(quic, (struct sockaddr*)&saddr, picoquic_epoch_1rtt, simulated_time, 0)) == NULL) {
 +        if (quic != NULL) {
@@ -3209,7 +3192,7 @@ index 003e83aa..e037435d 100644
      return ret;
  }
  
-@@ -5338,3 +7249,75 @@ int stream_ack_test(void)
+@@ -5409,3 +7322,75 @@ int stream_ack_test(void)
  
      return ret;
  }
@@ -3286,10 +3269,10 @@ index 003e83aa..e037435d 100644
 +    return ret;
 +}
 diff --git a/picoquictest/tls_api_test.c b/picoquictest/tls_api_test.c
-index 2ff052e1..56734184 100644
+index 9e1f19ed..07ac2766 100644
 --- a/picoquictest/tls_api_test.c
 +++ b/picoquictest/tls_api_test.c
-@@ -5188,6 +5188,272 @@ int discard_stream_test(void)
+@@ -5242,6 +5242,272 @@ int discard_stream_test(void)
      return ret;
  }
  
@@ -3562,18 +3545,20 @@ index 2ff052e1..56734184 100644
  /*
  * MTU discovery tests. Perform a moderate transmission.
  * Verify that MTU was properly set to expected value,
-@@ -12383,6 +12649,529 @@ int direct_receive_test(void)
+@@ -12438,6 +12704,546 @@ int direct_receive_test(void)
      return ret;
  }
  
 +/* A stream whose receive half completes while the application marks it as
 + * direct receive is retired at the next packet preparation, through either
 + * public preparation API, without another incoming packet. Each scenario
-+ * runs on its own connection. The client has no callback while the peer's
-+ * data arrives, so the data and the FIN are still queued when the stream is
-+ * marked. */
++ * runs on its own connection. The first byte of the peer's data is missing,
++ * so the rest of the data and the FIN are still queued when the stream is
++ * marked; the application needs the stream only from that missing byte on. */
 +
 +#define CLOSE_CHECK_TEST_MAX_STREAM_ID 16
++/* The application needs each stream from this offset: the byte before it is missing. */
++#define CLOSE_CHECK_TEST_FIRST_OFFSET 1
 +
 +typedef struct st_close_check_test_ctx_t {
 +    uint64_t released[CLOSE_CHECK_TEST_MAX_STREAM_ID];
@@ -3601,6 +3586,9 @@ index 2ff052e1..56734184 100644
 +    int ret = 0;
 +
 +    if (stream_id < CLOSE_CHECK_TEST_MAX_STREAM_ID) {
++        if (ctx->next_offset[stream_id] < CLOSE_CHECK_TEST_FIRST_OFFSET) {
++            ctx->next_offset[stream_id] = CLOSE_CHECK_TEST_FIRST_OFFSET;
++        }
 +        if (fin) {
 +            ctx->fin_received[stream_id] = 1;
 +            ctx->final_size[stream_id] = offset + length;
@@ -3670,30 +3658,42 @@ index 2ff052e1..56734184 100644
 +    return ret;
 +}
 +
-+/* The server sends length bytes on stream_id, with or without FIN, while the
-+ * client has no callback: the client queues them without delivering them. */
++/* The peer's STREAM frame for bytes CLOSE_CHECK_TEST_FIRST_OFFSET to length of
++ * stream_id, with or without FIN, reaches the client, while the frame for the
++ * bytes before it does not: the client queues the data without delivering it.
++ * The frame is passed to the client directly, so that no repeat of the missing
++ * bytes follows. A peer bidirectional stream is opened on the server, which
++ * then accepts the client's data on it. */
 +static int close_check_test_queue_peer_data(picoquic_test_tls_api_ctx_t* test_ctx, uint64_t* simulated_time,
 +    uint64_t stream_id, size_t length, int fin)
 +{
-+    uint8_t data[256];
++    uint8_t buffer[512];
++    uint8_t* bytes = buffer;
++    uint8_t* bytes_max = buffer + sizeof(buffer);
++    uint8_t frame_type = (uint8_t)(picoquic_frame_type_stream_range_min | 0x04 | 0x02 | ((fin) ? 0x01 : 0));
++    size_t data_length = length - CLOSE_CHECK_TEST_FIRST_OFFSET;
++    picoquic_cnx_t* cnx = test_ctx->cnx_client;
++    picoquic_stream_head_t* stream;
 +    int ret = 0;
-+    int is_queued = 0;
 +
-+    memset(data, 0x5a, sizeof(data));
-+    picoquic_set_callback(test_ctx->cnx_client, NULL, NULL);
-+    if (length > sizeof(data) || picoquic_add_to_stream(test_ctx->cnx_server, stream_id, data, length, fin) != 0) {
++    if (length <= CLOSE_CHECK_TEST_FIRST_OFFSET ||
++        (IS_BIDIR_STREAM_ID(stream_id) && picoquic_set_app_stream_ctx(test_ctx->cnx_server, stream_id, NULL) != 0) ||
++        (bytes = picoquic_frames_uint8_encode(bytes, bytes_max, frame_type)) == NULL ||
++        (bytes = picoquic_frames_varint_encode(bytes, bytes_max, stream_id)) == NULL ||
++        (bytes = picoquic_frames_varint_encode(bytes, bytes_max, CLOSE_CHECK_TEST_FIRST_OFFSET)) == NULL ||
++        (bytes = picoquic_frames_varint_encode(bytes, bytes_max, data_length)) == NULL ||
++        data_length > (size_t)(bytes_max - bytes)) {
 +        ret = -1;
 +    }
-+    for (int i = 0; ret == 0 && !is_queued && i < 200; i++) {
-+        int was_active = 0;
-+        picoquic_stream_head_t* stream;
-+
-+        ret = tls_api_one_sim_round(test_ctx, simulated_time, 0, &was_active);
-+        stream = picoquic_find_stream(test_ctx->cnx_client, stream_id);
-+        is_queued = (stream != NULL && stream->fin_offset == length && (!fin || stream->fin_received) &&
-+            stream->consumed_offset == 0 && stream->stream_data_tree.size > 0);
++    else {
++        memset(bytes, 0x5a, data_length);
++        bytes += data_length;
++        ret = picoquic_decode_frames(cnx, cnx->path[0], buffer, bytes - buffer, NULL, picoquic_epoch_1rtt,
++            NULL, NULL, 0, 0, NULL, *simulated_time);
 +    }
-+    if (ret == 0 && !is_queued) {
++    stream = picoquic_find_stream(cnx, stream_id);
++    if (ret != 0 || cnx->local_error != 0 || stream == NULL || stream->fin_offset != length ||
++        (fin && !stream->fin_received) || stream->consumed_offset != 0 || stream->stream_data_tree.size == 0) {
 +        DBG_PRINTF("Close check, data for stream %" PRIu64 " not queued on the client\n", stream_id);
 +        ret = -1;
 +    }

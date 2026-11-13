@@ -44,7 +44,7 @@ struct moq_pq_conn {
     size_t                      rx_count;
     size_t                      rx_cap;
 
-    /* The peer-unidirectional stream credit (initial_max_stream_id_unidir)
+    /* The peer-unidirectional stream credit (initial_max_streams_uni)
      * this endpoint's transport parameters carried when the adapter attached.
      * Attach comes after the caller's transport-parameter preparation; a
      * later picoquic_set_transport_parameters on the connection is outside
@@ -664,7 +664,7 @@ static void pq_rx_after_service(moq_pq_conn_t *c, uint64_t now)
     if (c->cnx) {
         const picoquic_tp_t *tp = picoquic_get_transport_parameters(c->cnx, 1);
         if (tp == NULL ||
-            tp->initial_max_stream_id_unidir != c->tp_max_streams_uni) {
+            tp->initial_max_streams_uni != c->tp_max_streams_uni) {
             moq_transport_bridge_on_transport_error(c->bridge, 0, now);
             return;
         }
@@ -952,7 +952,7 @@ int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
         sizeof(cfg->after_callback))
         c->after_callback = cfg->after_callback;
 
-    c->tp_max_streams_uni = tp->initial_max_stream_id_unidir;
+    c->tp_max_streams_uni = tp->initial_max_streams_uni;
     uint64_t queue_cap = MOQ_PQ_SEND_QUEUE_CAP_DEFAULT;
     if (cfg->struct_size >= offsetof(moq_pq_conn_cfg_t, send_queue_cap_bytes) +
         sizeof(cfg->send_queue_cap_bytes) && cfg->send_queue_cap_bytes)

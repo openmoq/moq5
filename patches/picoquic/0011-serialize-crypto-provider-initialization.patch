@@ -1,6 +1,6 @@
 Serialize loading, unloading and resetting the crypto providers
 
-Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
+Applies to picoquic 36f49b73d532369882d97474ac018655b6739a58, after 0001 to
 0010.
 
 picoquic_create() loads the crypto providers on first use through
@@ -25,7 +25,7 @@ unchanged. The lock does not make an unload or a reset safe while a context
 exists or is being created: those still require that no other picoquic call is
 in progress.
 
-Upstream: the 2026-11-02 release (v2026.11.02.b9893f2) still loads the
+Upstream: the 2026-11-12 release (v2026.11.12.36f49b7) still loads the
 providers without synchronization.
 
 Test: tls_api_concurrent_init (tls_api_test.c) unloads the providers and
@@ -38,10 +38,10 @@ under ThreadSanitizer it reports the races; with the lock it passes and
 ThreadSanitizer reports none.
 
 diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
-index e17d6bb..c87a8ee 100644
+index 918a5336..8e7050ed 100644
 --- a/UnitTest1/unittest1.cpp
 +++ b/UnitTest1/unittest1.cpp
-@@ -1294,6 +1294,13 @@ namespace UnitTest1
+@@ -1350,6 +1350,13 @@ namespace UnitTest1
              Assert::AreEqual(ret, 0);
          }
  
@@ -56,10 +56,10 @@ index e17d6bb..c87a8ee 100644
          {
              int ret = tls_api_remove_ticket_test();
 diff --git a/picoquic/tls_api.c b/picoquic/tls_api.c
-index 754a5c2..2fae2b2 100644
+index dfce63e6..cde23c4e 100644
 --- a/picoquic/tls_api.c
 +++ b/picoquic/tls_api.c
-@@ -178,6 +178,23 @@ void picoquic_ptls_minicrypto_load(int unload);
+@@ -169,6 +169,23 @@ void picoquic_ptls_minicrypto_load(int unload);
  static uint64_t tls_api_init_flags = 0;
  static int tls_api_is_init = 0;
  
@@ -83,7 +83,7 @@ index 754a5c2..2fae2b2 100644
  /* Initialization of providers. The latest registration wins.
  * This implies an initialization order from least desirable
  * to most desirable.
-@@ -266,26 +283,31 @@ void picoquic_tls_api_log_versions(picoquic_cnx_t * cnx)
+@@ -242,26 +259,31 @@ void picoquic_tls_api_log_versions(picoquic_cnx_t * cnx)
  
  void picoquic_tls_api_init(void)
  {
@@ -116,7 +116,7 @@ index 754a5c2..2fae2b2 100644
      if (tls_api_is_init) {
          tls_api_is_init = 0;
          picoquic_tls_api_init_providers(2);
-@@ -294,6 +316,7 @@ void picoquic_tls_api_reset(uint64_t init_flags)
+@@ -270,6 +292,7 @@ void picoquic_tls_api_reset(uint64_t init_flags)
      tls_api_init_flags = init_flags;
      picoquic_tls_api_init_providers(0);
      tls_api_is_init = 1;
@@ -125,10 +125,10 @@ index 754a5c2..2fae2b2 100644
  /* Registration of ciphersuites.
   * This API is called by crypto providers to register available cipher suites.
 diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
-index 2ba7a0b..93e94f2 100644
+index a248b70e..53f3afa7 100644
 --- a/picoquic_t/picoquic_t.c
 +++ b/picoquic_t/picoquic_t.c
-@@ -304,6 +304,7 @@ static const picoquic_test_def_t test_table[] = {
+@@ -313,6 +313,7 @@ static const picoquic_test_def_t test_table[] = {
      { "tls_x25519", tls_x25519_test },
      { "tls_x25519mlkem", tls_x25519mlkem_test },
      { "tls_api_dispose_certificate_verifier", tls_api_dispose_certificate_verifier_test },
@@ -137,10 +137,10 @@ index 2ba7a0b..93e94f2 100644
      { "tls_api_null_arg_checks", tls_api_null_arg_checks_test },
      { "tls_api_server_decrypt_short_token", tls_api_server_decrypt_short_token_test },
 diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
-index c97f105..d252294 100644
+index ccea89bb..67882afa 100644
 --- a/picoquictest/picoquictest.h
 +++ b/picoquictest/picoquictest.h
-@@ -100,6 +100,7 @@ int tls_api_alpn_test(void);
+@@ -105,6 +105,7 @@ int tls_api_alpn_test(void);
  int tls_x25519_test(void);
  int tls_x25519mlkem_test(void);
  int tls_api_dispose_certificate_verifier_test(void);
@@ -149,7 +149,7 @@ index c97f105..d252294 100644
  int tls_api_null_arg_checks_test(void);
  int tls_api_server_decrypt_short_token_test(void);
 diff --git a/picoquictest/tls_api_test.c b/picoquictest/tls_api_test.c
-index f7524fd..338ec90 100644
+index 10711fa7..fdd9fe46 100644
 --- a/picoquictest/tls_api_test.c
 +++ b/picoquictest/tls_api_test.c
 @@ -32,6 +32,7 @@
@@ -160,13 +160,10 @@ index f7524fd..338ec90 100644
  #include "picoquic_binlog.h"
  #include "csv.h"
  #include "qlog.h"
-@@ -17050,4 +17051,139 @@ int tls_api_verify_retry_protection_short_test(void)
-     }
- 
-     return ret;
--}
-\ No newline at end of file
-+}
+@@ -17356,3 +17357,138 @@ int wrong_source_addr_retry_test(void)
+ {
+     return wrong_source_addr_test(wrong_addr_retry);
+ }
 +
 +/* Concurrent first use of the crypto providers.
 + *
@@ -179,14 +176,14 @@ index f7524fd..338ec90 100644
 +#define TLS_API_CONCURRENT_THREADS 8
 +
 +typedef struct st_tls_api_providers_t {
-+    struct st_picoquic_cipher_suites_t cipher_suites[PICOQUIC_CIPHER_SUITES_NB_MAX + 1];
++    ptls_cipher_suite_t* cipher_suites[PICOQUIC_CIPHER_SUITES_NB_MAX + 1];
 +    ptls_key_exchange_algorithm_t* key_exchanges[PICOQUIC_KEY_EXCHANGES_NB_MAX + 1];
 +    picoquic_crypto_random_provider_t random_provider;
 +} tls_api_providers_t;
 +
 +static void tls_api_providers_read(tls_api_providers_t* p)
 +{
-+    memcpy(p->cipher_suites, picoquic_cipher_suites, sizeof(p->cipher_suites));
++    memcpy(p->cipher_suites, (void*)picoquic_cipher_suites, sizeof(p->cipher_suites));
 +    memcpy(p->key_exchanges, (void*)picoquic_key_exchanges, sizeof(p->key_exchanges));
 +    p->random_provider = picoquic_crypto_random_provider_fn;
 +}
