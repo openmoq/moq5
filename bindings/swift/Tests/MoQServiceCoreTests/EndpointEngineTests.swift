@@ -310,6 +310,84 @@ struct EngineCancellationTests {
 struct EngineShutdownTests {
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A job accepted while the service thread is in its hook step runs before teardown")
+    func jobAcceptedDuringHookStepRuns() async throws {
+        let backend = ScriptedEndpointBackend()
+        let endpoint = makeEndpoint(backend)
+        let engine = endpoint.engine
+        let gate = TestGate()
+        let recorder = EventRecorder()
+
+        /* A pass runs its hooks after its job drain and before its shutdown
+         * check, with the engine lock released: hold the service thread
+         * there. */
+        try engine.installPumpHook(
+            kind: .receiver,
+            run: { recorder.record("hook"); gate.pass() },
+            teardown: { recorder.record("teardown") })
+        #expect(await gate.awaitBlocked(count: 1))
+
+        /* Accepted while running. What the job itself submits, once
+         * shutdown has begun, is refused like any other new submission. */
+        #expect(engine.post {
+            recorder.record("job")
+            recorder.record(engine.post {} ? "nested accepted" : "nested refused")
+        })
+        engine.beginShutdown()
+        #expect(!engine.post { recorder.record("late") })
+        gate.openGate()
+        await endpoint.close()
+
+        /* The accepted job, then the hooks' last per-pass step, then their
+         * teardown. */
+        #expect(recorder.events
+                == ["hook", "job", "nested refused", "hook", "teardown"])
+        let snap = backend.snapshot()
+        #expect(snap.stopCount == 1)
+        #expect(snap.destroyCount == 1)
+        #expect(snap.violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("postAndWait and perform accepted during the hook step resume their callers")
+    func waitingJobsAcceptedDuringHookStepResume() async throws {
+        let backend = ScriptedEndpointBackend()
+        let endpoint = makeEndpoint(backend)
+        let engine = endpoint.engine
+        let gate = TestGate()
+        try engine.installPumpHook(
+            kind: .receiver, run: { gate.pass() }, teardown: {})
+        #expect(await gate.awaitBlocked(count: 1))
+
+        let resumed = TestSignal()
+        let wakes = backend.snapshot().wakeCount
+        let waiter = Task { () -> Bool in
+            let ran = await engine.postAndWait {}
+            resumed.mark()
+            return ran
+        }
+        let performer = Task { () -> Int in
+            let value = try await engine.perform { 7 }
+            resumed.mark()
+            return value
+        }
+        /* Each accepted submission wakes the backend once, under the engine
+         * lock: two more wakes mean both jobs are queued. */
+        #expect(await backend.awaitCondition { $0.wakeCount >= wakes + 2 })
+        engine.beginShutdown()
+        gate.openGate()
+        await endpoint.close()
+
+        let both = await resumed.awaitMarked(count: 2)
+        #expect(both)
+        if both {
+            #expect(await waiter.value)
+            #expect(try await performer.value == 7)
+        }
+        #expect(backend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("close() fails parked waiters, stops and destroys exactly once, idempotent")
     func closeTeardown() async throws {
         let backend = ScriptedEndpointBackend()

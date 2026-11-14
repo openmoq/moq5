@@ -23,7 +23,8 @@ import Foundation
 /// Submission contract: once shutdown begins (`close()` or the deinit
 /// backstop), NEW submissions fail deterministically with
 /// ``MoQServiceError/closed`` (or `false`) and never run; jobs accepted
-/// before shutdown still run before teardown. `perform` is Task-
+/// before shutdown still run before teardown, wherever in a pass the
+/// service thread was when they were accepted. `perform` is Task-
 /// cancellable; `postAndWait` is NOT -- it is the teardown-grade submission
 /// for cleanup that must never be skipped.
 ///
@@ -575,6 +576,17 @@ package final class EndpointEngine: @unchecked Sendable {
              * thread makes backend calls, and the accessors answer from the
              * snapshot. */
             if phase == .stopping {
+                /* The hooks above ran with the lock released, so a job can
+                 * have been accepted, and shutdown begun, since this pass
+                 * drained the queue. Accepted jobs run before teardown: take
+                 * another pass, which drains them and then gives the hooks
+                 * their per-pass step once more, so that step stays the last
+                 * thing before teardown. Nothing is accepted once stopping,
+                 * so the queue only shrinks and that pass tears down. */
+                if !jobs.isEmpty {
+                    cond.unlock()
+                    continue
+                }
                 let tearingDown = orderedHooksLocked()
                 hookSlots.removeAll()
                 cond.unlock()

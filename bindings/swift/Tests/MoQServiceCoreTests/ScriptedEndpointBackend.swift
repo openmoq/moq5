@@ -441,3 +441,36 @@ final class TestGate: @unchecked Sendable {
         await offPool { self.awaitBlocked(count: count, ceiling: ceiling) }
     }
 }
+
+/// A test signal: marked from any thread, awaited from the test under a
+/// ceiling, so a caller that never resumes fails its test instead of hanging
+/// it.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+final class TestSignal: @unchecked Sendable {
+    private let cond = NSCondition()
+    private var marks = 0
+
+    func mark() {
+        cond.lock()
+        marks += 1
+        cond.broadcast()
+        cond.unlock()
+    }
+
+    /// Await >= n marks.
+    @discardableResult
+    func awaitMarked(count: Int, ceiling: TimeInterval = 10) -> Bool {
+        cond.lock()
+        defer { cond.unlock() }
+        let deadline = Date().addingTimeInterval(ceiling)
+        while marks < count {
+            if !cond.wait(until: deadline) { return false }
+        }
+        return true
+    }
+
+    @discardableResult
+    func awaitMarked(count: Int, ceiling: TimeInterval = 10) async -> Bool {
+        await offPool { self.awaitMarked(count: count, ceiling: ceiling) }
+    }
+}

@@ -691,6 +691,39 @@ struct SenderTeardownTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Forgotten close() while the service thread is in its hook step still detaches")
+    func forgottenCloseDuringHookStep() async throws {
+        let endpointBackend = ScriptedEndpointBackend()
+        let senderBackend = ScriptedSenderBackend()
+        var endpoint: MoQEndpoint? = MoQEndpoint(
+            configuration: .init(url: URL(string: "moqt://relay.test:4443")!),
+            engine: EndpointEngine(backend: endpointBackend))
+        var sender: MediaSender? = try MediaSender.attach(
+            to: endpoint!, configuration: .live(namespace: "live/cam1"),
+            backend: senderBackend)
+        _ = sender
+
+        /* Hold the service thread inside its hook step (after that pass's
+         * job drain, before its shutdown check) with a hook in the free
+         * slot. */
+        let gate = TestGate()
+        try endpoint!.engine.installPumpHook(
+            kind: .receiver, run: { gate.pass() }, teardown: {})
+        #expect(await gate.awaitBlocked(count: 1))
+
+        /* The sender's deinit has its detach job accepted and removes its
+         * hook; the endpoint's deinit then begins shutdown. Only the
+         * accepted job is left to detach. */
+        sender = nil
+        endpoint = nil
+        gate.openGate()
+        #expect(await senderBackend.awaitCondition { $0.detachCalls == 1 })
+        #expect(await endpointBackend.awaitCondition { $0.destroyCount == 1 })
+        #expect(senderBackend.snapshot().violations.isEmpty)
+        #expect(endpointBackend.snapshot().violations.isEmpty)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Dropping a sender while endpoint.close() is in progress still detaches")
     func deinitDuringEndpointClose() async throws {
         let endpointBackend = ScriptedEndpointBackend()
