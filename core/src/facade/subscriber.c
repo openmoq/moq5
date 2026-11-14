@@ -966,18 +966,20 @@ void moq_sub_callbacks_init_sized(moq_sub_callbacks_t *cb, size_t cfg_size)
  * size, so it touches only this prefix -- safe for a caller compiled against the
  * original (smaller) struct. */
 #define MOQ_SUB_CFG_V0_SIZE (offsetof(moq_sub_cfg_t, on_goaway))
+_Static_assert(offsetof(moq_sub_cfg_t, callbacks) +
+                       sizeof(((moq_sub_cfg_t *)0)->callbacks) <=
+                   MOQ_SUB_CFG_V0_SIZE,
+               "callbacks is inside the v0 prefix");
 
+/* Clear and stamp ONLY the frozen v0 prefix: writing sizeof(*cfg) here would
+ * overflow a caller that allocated the smaller original struct. Appended
+ * fields (on_goaway, on_subscribe_done, max_queued_object_bytes) stay
+ * disabled (struct_size == prefix); callers that want them use
+ * moq_sub_cfg_init_sized(). callbacks is inside the prefix, so it is
+ * initialized too. */
 void moq_sub_cfg_init(moq_sub_cfg_t *cfg)
 {
-    if (!cfg) return;
-    /* Clear and stamp ONLY the frozen v0 prefix: writing sizeof(*cfg) here would
-     * overflow a caller that allocated the smaller original struct. Appended
-     * fields (on_goaway, on_subscribe_done, max_queued_object_bytes) stay
-     * disabled (struct_size == prefix); callers that want them use
-     * moq_sub_cfg_init_sized(). callbacks is inside the prefix. */
-    memset(cfg, 0, MOQ_SUB_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_SUB_CFG_V0_SIZE;
-    moq_sub_callbacks_init(&cfg->callbacks);
+    moq_sub_cfg_init_sized(cfg, MOQ_SUB_CFG_V0_SIZE);
 }
 
 void moq_sub_cfg_init_sized(moq_sub_cfg_t *cfg, size_t cfg_size)
@@ -1622,9 +1624,7 @@ _Static_assert(offsetof(moq_sub_update_cfg_t, has_filter) ==
 
 void moq_sub_update_cfg_init(moq_sub_update_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_SUB_UPDATE_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_SUB_UPDATE_CFG_V0_SIZE;
+    moq_sub_update_cfg_init_sized(cfg, MOQ_SUB_UPDATE_CFG_V0_SIZE);
 }
 
 void moq_sub_update_cfg_init_sized(moq_sub_update_cfg_t *cfg,
@@ -2925,9 +2925,7 @@ _Static_assert(MOQ_SUB_JOINING_FETCH_CFG_V0_SIZE ==
 
 void moq_sub_joining_fetch_cfg_init(moq_sub_joining_fetch_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_SUB_JOINING_FETCH_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_SUB_JOINING_FETCH_CFG_V0_SIZE;
+    moq_sub_joining_fetch_cfg_init_sized(cfg, MOQ_SUB_JOINING_FETCH_CFG_V0_SIZE);
 }
 
 void moq_sub_joining_fetch_cfg_init_sized(moq_sub_joining_fetch_cfg_t *cfg,

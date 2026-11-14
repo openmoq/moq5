@@ -1661,9 +1661,7 @@ _Static_assert(offsetof(moq_fetch_cfg_t, auth_tokens) <
 
 void moq_fetch_cfg_init(moq_fetch_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_FETCH_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_FETCH_CFG_V0_SIZE;
+    moq_fetch_cfg_init_sized(cfg, MOQ_FETCH_CFG_V0_SIZE);
 }
 
 void moq_fetch_cfg_init_sized(moq_fetch_cfg_t *cfg, size_t cfg_size)

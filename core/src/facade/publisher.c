@@ -3367,14 +3367,12 @@ static bool pub_cfg_has_field(const moq_pub_cfg_t *cfg,
 #define MOQ_PUB_CALLBACKS_V0_SIZE \
     offsetof(moq_pub_callbacks_t, on_publish_ok)
 
+/* Clear and stamp ONLY the frozen v0 prefix: writing sizeof(*cb) would
+ * overflow an old caller's smaller storage. The appended on_publish_*
+ * fields stay disabled (struct_size == prefix); callers that set them
+ * use moq_pub_callbacks_init_sized(). */
 void moq_pub_callbacks_init(moq_pub_callbacks_t *cb) {
-    if (!cb) return;
-    /* Clear and stamp ONLY the frozen v0 prefix: writing sizeof(*cb) would
-     * overflow an old caller's smaller storage. The appended on_publish_*
-     * fields stay disabled (struct_size == prefix); callers that set them
-     * use moq_pub_callbacks_init_sized(). */
-    memset(cb, 0, MOQ_PUB_CALLBACKS_V0_SIZE);
-    cb->struct_size = (uint32_t)MOQ_PUB_CALLBACKS_V0_SIZE;
+    moq_pub_callbacks_init_sized(cb, MOQ_PUB_CALLBACKS_V0_SIZE);
 }
 
 void moq_pub_callbacks_init_sized(moq_pub_callbacks_t *cb, size_t cb_size) {
@@ -3428,14 +3426,13 @@ static bool pub_cfg_normalize(const void *storage, moq_pub_cfg_t *cfg)
     return true;
 }
 
+/* Clear and stamp ONLY the frozen prefix: writing sizeof(*cfg) here would
+ * overflow a caller compiled against the original (smaller) struct. Appended
+ * fields (on_subscribe, on_subscribe_ctx, callbacks) stay disabled
+ * (struct_size == prefix); callers that want them use
+ * moq_pub_cfg_init_sized(). */
 void moq_pub_cfg_init(moq_pub_cfg_t *cfg) {
-    if (!cfg) return;
-    /* Clear and stamp ONLY the frozen prefix: writing sizeof(*cfg) here would
-     * overflow a caller compiled against the original (smaller) struct. Appended
-     * fields (on_subscribe, on_subscribe_ctx, callbacks) stay disabled
-     * (struct_size == prefix); callers that want them use
-     * moq_pub_cfg_init_sized(). */
-    pub_cfg_init_bytes((void *)cfg, MOQ_PUB_CFG_V0_SIZE);
+    moq_pub_cfg_init_sized(cfg, MOQ_PUB_CFG_V0_SIZE);
 }
 
 void moq_pub_cfg_init_sized(moq_pub_cfg_t *cfg, size_t cfg_size) {
@@ -3831,8 +3828,7 @@ static moq_result_t track_set_properties(moq_publisher_t *pub, moq_pub_track_t *
 }
 
 void moq_pub_track_cfg_init(moq_pub_track_cfg_t *cfg) {
-    if (!cfg) return;
-    pub_track_cfg_init_bytes(cfg, MOQ_PUB_TRACK_CFG_V0_SIZE);
+    moq_pub_track_cfg_init_sized(cfg, MOQ_PUB_TRACK_CFG_V0_SIZE);
 }
 
 void moq_pub_track_cfg_init_sized(moq_pub_track_cfg_t *cfg, size_t cfg_size) {
@@ -4298,9 +4294,7 @@ moq_result_t moq_pub_clear_retained_group(moq_publisher_t *pub,
     offsetof(moq_pub_object_cfg_t, _reserved_obj)
 
 void moq_pub_object_cfg_init(moq_pub_object_cfg_t *cfg) {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_PUB_OBJECT_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_PUB_OBJECT_CFG_V0_SIZE;
+    moq_pub_object_cfg_init_sized(cfg, MOQ_PUB_OBJECT_CFG_V0_SIZE);
 }
 
 void moq_pub_object_cfg_init_sized(moq_pub_object_cfg_t *cfg,
@@ -4975,9 +4969,7 @@ moq_result_t moq_pub_finish_subscribers(moq_publisher_t *pub,
      sizeof(((moq_pub_begin_object_cfg_t *)0)->payload_length))
 
 void moq_pub_begin_object_cfg_init(moq_pub_begin_object_cfg_t *cfg) {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_PUB_BEGIN_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_PUB_BEGIN_CFG_V0_SIZE;
+    moq_pub_begin_object_cfg_init_sized(cfg, MOQ_PUB_BEGIN_CFG_V0_SIZE);
 }
 
 void moq_pub_begin_object_cfg_init_sized(moq_pub_begin_object_cfg_t *cfg,

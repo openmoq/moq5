@@ -55,10 +55,7 @@ static moq_result_t bridge_input_not_consumed(moq_transport_bridge_t *b)
 void moq_transport_bridge_cfg_init(moq_transport_bridge_cfg_t *cfg,
                                     const moq_alloc_t *alloc)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_TRANSPORT_BRIDGE_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_TRANSPORT_BRIDGE_CFG_V0_SIZE;
-    cfg->alloc = alloc;
+    moq_transport_bridge_cfg_init_sized(cfg, MOQ_TRANSPORT_BRIDGE_CFG_V0_SIZE, alloc);
 }
 
 void moq_transport_bridge_cfg_init_sized(moq_transport_bridge_cfg_t *cfg,

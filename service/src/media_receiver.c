@@ -6522,27 +6522,36 @@ static receiver_teardown_t *receiver_take_teardown(moq_media_receiver_t *r)
 
 /* -- cfg ---------------------------------------------------------------- */
 
+/* What the v0 prefix holds, and so what the pointer-only initializers set:
+ * overflow.policy lies inside it (UNSET, zero, unless a preset names one);
+ * companion_profile lies past it and is not written. */
+_Static_assert(offsetof(moq_media_receiver_cfg_t, overflow) +
+                       offsetof(moq_media_overflow_cfg_t, policy) +
+                       sizeof(((moq_media_overflow_cfg_t *)0)->policy) <=
+                   MOQ_MEDIA_RECEIVER_CFG_V0_SIZE,
+               "overflow.policy is inside the v0 prefix");
+_Static_assert(MOQ_MEDIA_OVERFLOW_UNSET == 0, "UNSET is the cleared value");
+_Static_assert(offsetof(moq_media_receiver_cfg_t, companion_profile) >=
+                   MOQ_MEDIA_RECEIVER_CFG_V0_SIZE,
+               "companion_profile lies past the v0 prefix");
+
 /* The pointer-only initializers clear and stamp only the frozen v0 prefix:
  * writing the current sizeof would overflow a caller compiled against the
- * smaller original struct. */
+ * smaller original struct. The plain one leaves overflow.policy UNSET on
+ * purpose: forced choice (§6.4). */
 void moq_media_receiver_cfg_init(moq_media_receiver_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_MEDIA_RECEIVER_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_MEDIA_RECEIVER_CFG_V0_SIZE;
-    /* overflow.policy stays UNSET on purpose: forced choice (§6.4). */
+    moq_media_receiver_cfg_init_sized(cfg, MOQ_MEDIA_RECEIVER_CFG_V0_SIZE);
 }
 
 void moq_media_receiver_cfg_init_live(moq_media_receiver_cfg_t *cfg)
 {
-    moq_media_receiver_cfg_init(cfg);
-    if (cfg) cfg->overflow.policy = MOQ_MEDIA_OVERFLOW_DROP_TO_KEYFRAME;
+    moq_media_receiver_cfg_init_live_sized(cfg, MOQ_MEDIA_RECEIVER_CFG_V0_SIZE);
 }
 
 void moq_media_receiver_cfg_init_flow_control(moq_media_receiver_cfg_t *cfg)
 {
-    moq_media_receiver_cfg_init(cfg);
-    if (cfg) cfg->overflow.policy = MOQ_MEDIA_OVERFLOW_FLOW_CONTROL;
+    moq_media_receiver_cfg_init_flow_control_sized(cfg, MOQ_MEDIA_RECEIVER_CFG_V0_SIZE);
 }
 
 /* min(cfg_size, sizeof) cleared and stamped; the preset is applied only

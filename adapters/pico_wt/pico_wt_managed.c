@@ -1397,14 +1397,15 @@ static int loop_callback(picoquic_quic_t *quic,
 /* -- cfg_init ------------------------------------------------------- */
 
 /* A pointer-only initializer cannot know an old caller's allocation size.
- * Freeze it at the original prefix; the sized form enables appended fields. */
+ * Freeze it at the v0 prefix, through wt_protocols; the sized form
+ * enables appended fields. */
+#define PICO_WT_MANAGED_CFG_V0_SIZE \
+    (offsetof(moq_pico_wt_managed_cfg_t, wt_protocols) + \
+     sizeof(((moq_pico_wt_managed_cfg_t *)0)->wt_protocols))
+
 void moq_pico_wt_managed_cfg_init(moq_pico_wt_managed_cfg_t *cfg)
 {
-    if (!cfg) return;
-    size_t v0 = offsetof(moq_pico_wt_managed_cfg_t, wt_protocols) +
-                sizeof(cfg->wt_protocols);
-    memset(cfg, 0, v0);
-    cfg->struct_size = (uint32_t)v0;
+    moq_pico_wt_managed_cfg_init_sized(cfg, PICO_WT_MANAGED_CFG_V0_SIZE);
 }
 
 /* setup_auth_tokens starts at or past the sizeof of the layout that ended at

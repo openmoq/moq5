@@ -1148,15 +1148,13 @@ static_assert(offsetof(moq_mvfst_managed_cfg_t, keep_alive_interval_ms) >=
 #define MOQ_MVFST_MANAGED_CFG_V0_SIZE \
     (offsetof(moq_mvfst_managed_cfg_t, goaway_timeout_us))
 
+/* Clear and stamp ONLY the frozen v0 prefix: writing sizeof(*cfg) here would
+ * overflow a caller compiled against the original (smaller) struct. Appended
+ * fields stay disabled (struct_size == prefix); callers that want them use
+ * moq_mvfst_managed_cfg_init_sized(). */
 void moq_mvfst_managed_cfg_init(moq_mvfst_managed_cfg_t *cfg)
 {
-    if (!cfg) return;
-    /* Clear and stamp ONLY the frozen v0 prefix: writing sizeof(*cfg) here
-     * would overflow a caller compiled against the original (smaller) struct.
-     * Appended fields stay disabled (struct_size == prefix); callers that want
-     * them use moq_mvfst_managed_cfg_init_sized(). */
-    std::memset(cfg, 0, MOQ_MVFST_MANAGED_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_MVFST_MANAGED_CFG_V0_SIZE;
+    moq_mvfst_managed_cfg_init_sized(cfg, MOQ_MVFST_MANAGED_CFG_V0_SIZE);
 }
 
 void moq_mvfst_managed_cfg_init_sized(moq_mvfst_managed_cfg_t *cfg,

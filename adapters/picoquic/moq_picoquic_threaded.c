@@ -1416,15 +1416,13 @@ static int loop_callback_pump(picoquic_quic_t *quic,
 #define MOQ_PQ_THREADED_CFG_V0_SIZE \
     (offsetof(moq_pq_threaded_cfg_t, goaway_timeout_us))
 
+/* Clear and stamp ONLY the frozen prefix: writing sizeof(*cfg) here would
+ * overflow an old caller that allocated the v0 struct, through alpn_count.
+ * Appended fields past the prefix stay disabled (struct_size == prefix);
+ * callers that want them use moq_pq_threaded_cfg_init_sized(). */
 void moq_pq_threaded_cfg_init(moq_pq_threaded_cfg_t *cfg)
 {
-    if (!cfg) return;
-    /* Clear and stamp ONLY the frozen prefix: writing sizeof(*cfg) here would
-     * overflow an old caller that allocated the smaller pre-goaway struct.
-     * Appended fields past the prefix stay disabled (struct_size == prefix);
-     * callers that want them use moq_pq_threaded_cfg_init_sized(). */
-    memset(cfg, 0, MOQ_PQ_THREADED_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_PQ_THREADED_CFG_V0_SIZE;
+    moq_pq_threaded_cfg_init_sized(cfg, MOQ_PQ_THREADED_CFG_V0_SIZE);
 }
 
 /* setup_auth_tokens starts at or past the sizeof of the layout that ended at

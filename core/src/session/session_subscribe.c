@@ -4860,9 +4860,7 @@ moq_result_t moq_session_set_defer_subscription_updates(moq_session_t *s, bool d
 /* Parenthesized: defines the symbol, not the header's sized macro. */
 void (moq_subscribe_cfg_init)(moq_subscribe_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_SUBSCRIBE_CFG_SIZE_THROUGH_NEW_GROUP_REQUEST);
-    cfg->struct_size = (uint32_t)MOQ_SUBSCRIBE_CFG_SIZE_THROUGH_NEW_GROUP_REQUEST;
+    moq_subscribe_cfg_init_sized(cfg, MOQ_SUBSCRIBE_CFG_SIZE_THROUGH_NEW_GROUP_REQUEST);
 }
 
 void moq_subscribe_cfg_init_sized(moq_subscribe_cfg_t *cfg, size_t cfg_size)
@@ -6135,9 +6133,7 @@ _Static_assert(offsetof(moq_subscription_update_cfg_t, has_filter) ==
 
 void moq_subscription_update_cfg_init(moq_subscription_update_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_SUB_UPDATE_SESSION_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_SUB_UPDATE_SESSION_CFG_V0_SIZE;
+    moq_subscription_update_cfg_init_sized(cfg, MOQ_SUB_UPDATE_SESSION_CFG_V0_SIZE);
 }
 
 void moq_subscription_update_cfg_init_sized(

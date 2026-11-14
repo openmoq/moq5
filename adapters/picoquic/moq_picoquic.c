@@ -877,15 +877,13 @@ uint64_t moq_pq_test_release_terminals(moq_pq_conn_t *conn)
  * this size. */
 #define MOQ_PQ_CONN_CFG_V0_SIZE (offsetof(moq_pq_conn_cfg_t, user_ctx))
 
+/* Clear and stamp ONLY the v0 prefix: writing sizeof(*cfg) here would
+ * overflow an old caller that allocated the smaller v0 struct. Appended
+ * fields stay disabled (struct_size == v0 size); callers that want them use
+ * moq_pq_conn_cfg_init_sized(). */
 void moq_pq_conn_cfg_init(moq_pq_conn_cfg_t *cfg)
 {
-    if (!cfg) return;
-    /* Clear and stamp ONLY the v0 prefix: writing sizeof(*cfg) here would
-     * overflow an old caller that allocated the smaller v0 struct. Appended
-     * fields stay disabled (struct_size == v0 size); callers that want them
-     * use moq_pq_conn_cfg_init_sized(). */
-    memset(cfg, 0, MOQ_PQ_CONN_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_PQ_CONN_CFG_V0_SIZE;
+    moq_pq_conn_cfg_init_sized(cfg, MOQ_PQ_CONN_CFG_V0_SIZE);
 }
 
 void moq_pq_conn_cfg_init_sized(moq_pq_conn_cfg_t *cfg, size_t cfg_size)

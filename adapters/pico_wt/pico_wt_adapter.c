@@ -185,15 +185,13 @@ static void on_local_uni_opened(void *ctx, uint64_t stream_id)
 #define MOQ_PICO_WT_CONN_CFG_V0_SIZE \
     (offsetof(moq_pico_wt_conn_cfg_t, user_ctx))
 
+/* Clear and stamp ONLY the v0 prefix: writing sizeof(*cfg) here would
+ * overflow an old caller that allocated the smaller v0 struct. The appended
+ * user_ctx stays disabled (struct_size == v0 size); callers that want it use
+ * moq_pico_wt_conn_cfg_init_sized(). */
 void moq_pico_wt_conn_cfg_init(moq_pico_wt_conn_cfg_t *cfg)
 {
-    if (!cfg) return;
-    /* Clear and stamp ONLY the v0 prefix: writing sizeof(*cfg) here would
-     * overflow an old caller that allocated the smaller v0 struct. The
-     * appended user_ctx stays disabled (struct_size == v0 size); callers that
-     * want it use moq_pico_wt_conn_cfg_init_sized(). */
-    memset(cfg, 0, MOQ_PICO_WT_CONN_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_PICO_WT_CONN_CFG_V0_SIZE;
+    moq_pico_wt_conn_cfg_init_sized(cfg, MOQ_PICO_WT_CONN_CFG_V0_SIZE);
 }
 
 void moq_pico_wt_conn_cfg_init_sized(moq_pico_wt_conn_cfg_t *cfg,

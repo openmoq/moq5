@@ -19,6 +19,13 @@
 #define TRACK_INFO_VERSION_SIZE \
     (offsetof(moq_media_track_info_t, transport_version) + \
      sizeof(((moq_media_track_info_t *)0)->transport_version))
+_Static_assert(offsetof(moq_media_track_info_t, transport_version) >=
+                   MOQ_MEDIA_TRACK_INFO_V0_SIZE,
+               "transport_version lies past the v0 prefix");
+_Static_assert(offsetof(moq_media_parsed_object_t, sap_type) +
+                       sizeof(((moq_media_parsed_object_t *)0)->sap_type) <=
+                   MOQ_MEDIA_PARSED_OBJECT_V0_SIZE,
+               "sap_type is inside the v0 prefix");
 
 _Static_assert(MOQ_MEDIA_OBJECT_PARSE_CFG_V0_SIZE == 8,
                "config floor through companion_profile must remain eight bytes");
@@ -85,14 +92,12 @@ static bool loc_time_us(uint64_t ticks, uint64_t scale, uint64_t *out_us)
 }
 
 
+/* Pointer-only: the caller's struct may be an OLD, SMALLER one, so only
+ * the frozen v0 prefix may be written. transport_version lies past it and
+ * is deliberately left alone -- see the header. */
 void moq_media_track_info_init(moq_media_track_info_t *info)
 {
-    if (!info) return;
-    /* Pointer-only: the caller's struct may be an OLD, SMALLER one, so
-     * only the frozen v0 prefix may be written. transport_version is
-     * deliberately left alone -- see the header. */
-    memset(info, 0, MOQ_MEDIA_TRACK_INFO_V0_SIZE);
-    info->struct_size = (uint32_t)MOQ_MEDIA_TRACK_INFO_V0_SIZE;
+    moq_media_track_info_init_sized(info, MOQ_MEDIA_TRACK_INFO_V0_SIZE);
 }
 
 void moq_media_track_info_init_sized(moq_media_track_info_t *info,
@@ -117,12 +122,11 @@ void moq_media_object_input_init(moq_media_object_input_t *in)
     in->struct_size = sizeof(*in);
 }
 
+/* The frozen v0 prefix: sap_type is UNKNOWN (NONE, 0, means "known not a
+ * SAP"); the metadata that follows the prefix is left alone. */
 void moq_media_parsed_object_init(moq_media_parsed_object_t *out)
 {
-    if (!out) return;
-    memset(out, 0, MOQ_MEDIA_PARSED_OBJECT_V0_SIZE);
-    out->struct_size = (uint32_t)MOQ_MEDIA_PARSED_OBJECT_V0_SIZE;
-    out->sap_type = MOQ_SAP_UNKNOWN;  /* NONE (0) means "known not a SAP" */
+    moq_media_parsed_object_init_sized(out, MOQ_MEDIA_PARSED_OBJECT_V0_SIZE);
 }
 
 void moq_media_parsed_object_init_sized(moq_media_parsed_object_t *out,

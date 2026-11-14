@@ -3217,20 +3217,23 @@ static moq_result_t session_step(moq_session_t *s, const moq_input_t *input)
  * moq_session_create() requires at least this much. Must never shrink. */
 #define MOQ_SESSION_CFG_V0_SIZE \
     (offsetof(moq_session_cfg_t, send_request_capacity))
+_Static_assert(MOQ_SESSION_CFG_V0_SIZE >=
+                   offsetof(moq_session_cfg_t, perspective) +
+                       sizeof(((moq_session_cfg_t *)0)->perspective) &&
+               MOQ_SESSION_CFG_V0_SIZE >=
+                   offsetof(moq_session_cfg_t, alloc) +
+                       sizeof(((moq_session_cfg_t *)0)->alloc),
+               "the v0 prefix covers alloc and perspective");
 
+/* Pointer-only: clear/stamp ONLY the frozen v0 prefix so an old caller's
+ * smaller struct is never written past. Fields beyond the prefix are left
+ * as-is and ignored by create (struct_size == V0); a caller that sets them
+ * must use moq_session_cfg_init_sized(). */
 void moq_session_cfg_init(moq_session_cfg_t *cfg,
                            const moq_alloc_t *alloc,
                            moq_perspective_t perspective)
 {
-    if (!cfg) return;
-    /* Pointer-only: clear/stamp ONLY the frozen v0 prefix so an old caller's
-     * smaller struct is never written past. Fields beyond the prefix are left
-     * as-is and ignored by create (struct_size == V0); a caller that sets them
-     * must use moq_session_cfg_init_sized(). */
-    memset(cfg, 0, MOQ_SESSION_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_SESSION_CFG_V0_SIZE;
-    cfg->alloc = alloc;
-    cfg->perspective = perspective;
+    moq_session_cfg_init_sized(cfg, MOQ_SESSION_CFG_V0_SIZE, alloc, perspective);
 }
 
 void moq_session_cfg_init_sized(moq_session_cfg_t *cfg, size_t cfg_size,

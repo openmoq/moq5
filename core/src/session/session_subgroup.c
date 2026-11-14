@@ -980,9 +980,7 @@ uint64_t moq_subgroup_id_for_trace(moq_subgroup_handle_t h)
  * clears and stamps only that extent; first_object stays unread. */
 void (moq_subgroup_cfg_init)(moq_subgroup_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, SUBGROUP_CFG_SIZE_THROUGH_END_OF_GROUP);
-    cfg->struct_size = (uint32_t)SUBGROUP_CFG_SIZE_THROUGH_END_OF_GROUP;
+    moq_subgroup_cfg_init_sized(cfg, SUBGROUP_CFG_SIZE_THROUGH_END_OF_GROUP);
 }
 
 void moq_subgroup_cfg_init_sized(moq_subgroup_cfg_t *cfg, size_t cfg_size)
@@ -1325,9 +1323,7 @@ moq_result_t moq_session_write_status_object(
 /* Parenthesized: defines the symbol, not the header's sized macro. */
 void (moq_object_cfg_init)(moq_object_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_OBJECT_CFG_SIZE_THROUGH_PROPERTIES);
-    cfg->struct_size = (uint32_t)MOQ_OBJECT_CFG_SIZE_THROUGH_PROPERTIES;
+    moq_object_cfg_init_sized(cfg, MOQ_OBJECT_CFG_SIZE_THROUGH_PROPERTIES);
 }
 
 void moq_object_cfg_init_sized(moq_object_cfg_t *cfg, size_t cfg_size)

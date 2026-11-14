@@ -1331,9 +1331,7 @@ _Static_assert(MOQ_ACCEPT_PUBLISH_CFG_V0_SIZE >=
  * appended field use the _sized variants below. */
 void moq_publish_cfg_init(moq_publish_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_PUBLISH_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_PUBLISH_CFG_V0_SIZE;
+    moq_publish_cfg_init_sized(cfg, MOQ_PUBLISH_CFG_V0_SIZE);
 }
 
 void moq_publish_cfg_init_sized(moq_publish_cfg_t *cfg, size_t cfg_size)
@@ -1349,9 +1347,7 @@ void moq_publish_cfg_init_sized(moq_publish_cfg_t *cfg, size_t cfg_size)
 
 void moq_accept_publish_cfg_init(moq_accept_publish_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_ACCEPT_PUBLISH_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MOQ_ACCEPT_PUBLISH_CFG_V0_SIZE;
+    moq_accept_publish_cfg_init_sized(cfg, MOQ_ACCEPT_PUBLISH_CFG_V0_SIZE);
 }
 
 void moq_accept_publish_cfg_init_sized(moq_accept_publish_cfg_t *cfg,
@@ -3221,10 +3217,8 @@ _Static_assert(offsetof(moq_publication_update_cfg_t, location) ==
 /* Parenthesized: defines the symbol, not the header's sized macro. */
 void (moq_publication_update_cfg_init)(moq_publication_update_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_PUBLICATION_UPDATE_CFG_SIZE_THROUGH_NEW_GROUP_REQUEST);
-    cfg->struct_size =
-        (uint32_t)MOQ_PUBLICATION_UPDATE_CFG_SIZE_THROUGH_NEW_GROUP_REQUEST;
+    moq_publication_update_cfg_init_sized(
+        cfg, MOQ_PUBLICATION_UPDATE_CFG_SIZE_THROUGH_NEW_GROUP_REQUEST);
 }
 
 void moq_publication_update_cfg_init_sized(moq_publication_update_cfg_t *cfg,

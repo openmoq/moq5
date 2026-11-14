@@ -152,50 +152,55 @@ bool sender_loc05_object_input_ok_locked(const moq_media_sender_t *s)
     (offsetof(moq_media_sender_cfg_t, callbacks) + \
      MEDIA_SENDER_CALLBACKS_V0_SIZE)
 
+/* What the v0 prefix holds, and so what the pointer-only initializers set:
+ * backpressure, block_timeout_us and validate_cmaf lie inside it;
+ * companion_profile lies past it and is not written. */
+_Static_assert(offsetof(moq_media_sender_cfg_t, backpressure) +
+                       sizeof(((moq_media_sender_cfg_t *)0)->backpressure) <=
+                   MEDIA_SENDER_CFG_V0_SIZE &&
+               offsetof(moq_media_sender_cfg_t, block_timeout_us) +
+                       sizeof(((moq_media_sender_cfg_t *)0)->block_timeout_us) <=
+                   MEDIA_SENDER_CFG_V0_SIZE &&
+               offsetof(moq_media_sender_cfg_t, validate_cmaf) +
+                       sizeof(((moq_media_sender_cfg_t *)0)->validate_cmaf) <=
+                   MEDIA_SENDER_CFG_V0_SIZE,
+               "the presets' fields are inside the v0 prefix");
+_Static_assert(offsetof(moq_media_sender_cfg_t, companion_profile) >=
+                   MEDIA_SENDER_CFG_V0_SIZE,
+               "companion_profile lies past the v0 prefix");
 
+
+/* Clear and stamp ONLY the frozen v0 prefix: writing sizeof(*cfg) would
+ * overflow a caller compiled against the pre-publish (smaller) struct.
+ * Appended fields (the on_ready/on_closed/on_track_closed callbacks,
+ * publish_tracks, drop_without_demand, catalog_refresh_interval_us) stay
+ * disabled/default; callers that set them use the _sized initializers. The
+ * nested callbacks.struct_size is the v0 portion of the callbacks, and
+ * validate_cmaf is set (strict); backpressure stays UNSET on purpose:
+ * forced choice (§7.5). */
 void moq_media_sender_cfg_init(moq_media_sender_cfg_t *cfg)
 {
-    if (!cfg) return;
-    /* Clear and stamp ONLY the frozen v0 prefix: writing sizeof(*cfg) would
-     * overflow a caller compiled against the pre-publish (smaller) struct.
-     * Appended fields (the on_ready/on_closed/on_track_closed callbacks,
-     * publish_tracks, drop_without_demand, catalog_refresh_interval_us) stay
-     * disabled/default; callers that set them use the _sized initializers. */
-    memset(cfg, 0, MEDIA_SENDER_CFG_V0_SIZE);
-    cfg->struct_size = (uint32_t)MEDIA_SENDER_CFG_V0_SIZE;
-    /* Nested struct_size: the v0 portion this initializer cleared. */
-    cfg->callbacks.struct_size = (uint32_t)MEDIA_SENDER_CALLBACKS_V0_SIZE;
-    /* CMSF §3.3/§3.4: validate CMAF output by default (strict). Affects CMAF
-     * tracks only; RAW/LOC is unaffected. Callers wanting passthrough set
-     * validate_cmaf = false explicitly after init. */
-    cfg->validate_cmaf = true;
-    /* backpressure stays UNSET on purpose: forced choice (§7.5). */
+    moq_media_sender_cfg_init_sized(cfg, MEDIA_SENDER_CFG_V0_SIZE);
 }
 
 
+/* Frozen v0 prefix only (see MEDIA_SENDER_CALLBACKS_V0_SIZE): the appended
+ * lifecycle callbacks need moq_media_sender_callbacks_init_sized. */
 void moq_media_sender_callbacks_init(moq_media_sender_callbacks_t *cb)
 {
-    if (!cb) return;
-    /* Frozen v0 prefix only (see MEDIA_SENDER_CALLBACKS_V0_SIZE): the
-     * appended lifecycle callbacks need moq_media_sender_callbacks_init_sized. */
-    memset(cb, 0, MEDIA_SENDER_CALLBACKS_V0_SIZE);
-    cb->struct_size = (uint32_t)MEDIA_SENDER_CALLBACKS_V0_SIZE;
+    moq_media_sender_callbacks_init_sized(cb, MEDIA_SENDER_CALLBACKS_V0_SIZE);
 }
 
 
 void moq_media_sender_cfg_init_live(moq_media_sender_cfg_t *cfg)
 {
-    moq_media_sender_cfg_init(cfg);
-    if (cfg) cfg->backpressure = MOQ_MEDIA_SEND_BP_DROP_TO_KEYFRAME;
+    moq_media_sender_cfg_init_live_sized(cfg, MEDIA_SENDER_CFG_V0_SIZE);
 }
 
 
 void moq_media_sender_cfg_init_lossless(moq_media_sender_cfg_t *cfg)
 {
-    moq_media_sender_cfg_init(cfg);
-    if (!cfg) return;
-    cfg->backpressure = MOQ_MEDIA_SEND_BP_BLOCK_TIMEOUT;
-    cfg->block_timeout_us = SENDER_DEFAULT_BLOCK_TIMEOUT_US;
+    moq_media_sender_cfg_init_lossless_sized(cfg, MEDIA_SENDER_CFG_V0_SIZE);
 }
 
 
@@ -228,6 +233,9 @@ void moq_media_sender_cfg_init_sized(moq_media_sender_cfg_t *cfg,
         if (n > cb_off)
             moq_media_sender_callbacks_init_sized(&cfg->callbacks, n - cb_off);
     }
+    /* CMSF §3.3/§3.4: validate CMAF output by default (strict). Affects CMAF
+     * tracks only; RAW/LOC is unaffected. Callers wanting passthrough set
+     * validate_cmaf = false explicitly after init. */
     if (n >= offsetof(moq_media_sender_cfg_t, validate_cmaf) +
              sizeof(cfg->validate_cmaf))
         cfg->validate_cmaf = true;

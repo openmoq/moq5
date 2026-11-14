@@ -160,11 +160,7 @@ static moqr_group_t *group_find(const moqr_log_t *log, uint64_t group_id,
 void
 (moqr_log_append_desc_init)(moqr_log_append_desc_t *d)
 {
-    if (d == NULL) {
-        return;
-    }
-    memset(d, 0, LOG_DESC_SIZE_THROUGH_DECLARED_LEN);
-    d->struct_size = (uint32_t)LOG_DESC_SIZE_THROUGH_DECLARED_LEN;
+    moqr_log_append_desc_init_sized(d, LOG_DESC_SIZE_THROUGH_DECLARED_LEN);
 }
 
 void

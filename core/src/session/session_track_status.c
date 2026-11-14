@@ -596,9 +596,7 @@ moq_result_t session_core_on_track_status_error(moq_session_t *s, int slot,
 /* Parenthesized: defines the symbol, not the header's sized macro. */
 void (moq_track_status_cfg_init)(moq_track_status_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_TRACK_STATUS_CFG_SIZE_THROUGH_TOKENS);
-    cfg->struct_size = (uint32_t)MOQ_TRACK_STATUS_CFG_SIZE_THROUGH_TOKENS;
+    moq_track_status_cfg_init_sized(cfg, MOQ_TRACK_STATUS_CFG_SIZE_THROUGH_TOKENS);
 }
 
 void moq_track_status_cfg_init_sized(moq_track_status_cfg_t *cfg, size_t cfg_size)
@@ -791,9 +789,7 @@ moq_result_t moq_session_track_status(moq_session_t *s,
 /* Parenthesized: defines the symbol, not the header's sized macro. */
 void (moq_accept_track_status_cfg_init)(moq_accept_track_status_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, MOQ_ACCEPT_TRACK_STATUS_CFG_SIZE_THROUGH_EXPIRES);
-    cfg->struct_size = (uint32_t)MOQ_ACCEPT_TRACK_STATUS_CFG_SIZE_THROUGH_EXPIRES;
+    moq_accept_track_status_cfg_init_sized(cfg, MOQ_ACCEPT_TRACK_STATUS_CFG_SIZE_THROUGH_EXPIRES);
 }
 
 void moq_accept_track_status_cfg_init_sized(moq_accept_track_status_cfg_t *cfg,

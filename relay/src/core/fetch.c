@@ -69,11 +69,7 @@ moqr_fetch_eq(moqr_fetch_t a, moqr_fetch_t b)
 void
 (moqr_fetch_req_init)(moqr_fetch_req_t *req)
 {
-    if (req == NULL) {
-        return;
-    }
-    memset(req, 0, MOQR_FETCH_REQ_SIZE_THROUGH_COOKIE);
-    req->struct_size = (uint32_t)MOQR_FETCH_REQ_SIZE_THROUGH_COOKIE;
+    moqr_fetch_req_init_sized(req, MOQR_FETCH_REQ_SIZE_THROUGH_COOKIE);
 }
 
 

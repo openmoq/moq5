@@ -70,10 +70,7 @@ subscribe_req_clear(moqr_subscribe_req_t *req, size_t n)
 void
 (moqr_subscribe_req_init)(moqr_subscribe_req_t *req)
 {
-    if (req == NULL) {
-        return;
-    }
-    subscribe_req_clear(req, MOQR_SUBSCRIBE_REQ_SIZE_THROUGH_FORWARD);
+    moqr_subscribe_req_init_sized(req, MOQR_SUBSCRIBE_REQ_SIZE_THROUGH_FORWARD);
 }
 
 
