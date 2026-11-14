@@ -14,8 +14,12 @@ Refcounted byte buffer for zero-copy relay forwarding.
 Shard / threading contract: refcount operations (incref/decref) are
 NOT atomic. All references to a given rcbuf must stay within one
 shard — a single executor-affinity domain (a thread, executor, or run
-loop). Sharing rcbuf ownership across shards via incref/decref is NOT
-supported by libmoq's engine model. To hand bytes to another shard,
+loop). A shard is not pinned to one thread: it may move between threads
+provided exactly one thread acts for it at a time, the handoff carries a
+happens-before edge, and every rcbuf it holds moves with it (a session's
+buffers move with the session). Sharing rcbuf ownership across shards via
+incref/decref is NOT supported by libmoq's engine model. To hand bytes to
+another shard,
 make an independent copy with moq_rcbuf_clone() using an allocator
 valid for the destination shard. (Legacy/manual external
 synchronization may protect raw calls in single-buffer use, but it is

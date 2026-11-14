@@ -17,8 +17,9 @@ use std::process::Command;
 /// A fixture and what the type checker must say about it: `Some((code,
 /// phrase))` for a refusal, `None` for one that must compile.
 const CASES: &[(&str, Option<(&str, &str)>)] = &[
+    ("session_moves_to_a_thread", None),
     (
-        "session_sent_to_thread",
+        "payload_crosses_thread_after_move",
         Some(("E0277", "cannot be sent between threads safely")),
     ),
     (

@@ -77,13 +77,16 @@
 //!
 //! # Threads and borrows
 //!
-//! The owner is neither `Send` nor `Sync`. Every polled record borrows it
+//! The owner is `Send` and not `Sync`: a session may move to another thread
+//! between calls (the native session has no thread affinity), and only one
+//! thread calls into it at a time. Every polled record borrows it
 //! exclusively, and so does every field taken out of a record: a field
 //! keeps the session borrow after its record is dropped, so nothing a
 //! record lends can outlive the session borrow or overlap an advancing
 //! call. Records themselves, a [`Payload`] (a native reference) and the
 //! views over native arrays ([`NamespaceView`], [`Tokens`]) are neither
-//! `Send` nor `Sync`: they stay on the session's thread. The plain slices a
+//! `Send` nor `Sync`: they stay on the session's current thread, and while
+//! one lives the owner cannot move. The plain slices a
 //! record lends (its `&[u8]` fields, [`ResolvedToken`]'s value,
 //! [`ClusterView`]'s Hop IDs) are ordinary shared slices: a scoped thread
 //! may read one while the session borrow it carries lasts, which keeps the

@@ -98,9 +98,8 @@
 //! took, an input or action taken, a report, a claim, a commit. A refused
 //! write, a pending result or a blocked tick is not.
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use moq5_core::{
     Action, ActionDetail, ActionPoll, ActionTag, Buffer, ConnectionTarget, DataEndOutcome,
@@ -387,12 +386,12 @@ struct Held {
     /// The record was a FETCH's final message a STOP replaced: it resets
     /// its stream with this code instead.
     cancel: Option<u64>,
-    live: Rc<Cell<i64>>,
+    live: Arc<Mutex<i64>>,
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        self.live.set(self.live.get() - 1);
+        *self.live.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
     }
 }
 
@@ -547,7 +546,7 @@ struct State {
     peer_close_told: bool,
     fault: Option<Fault>,
     n: Counters,
-    live: Rc<Cell<i64>>,
+    live: Arc<Mutex<i64>>,
     ticked: bool,
     tick_blocked: Option<(Instant, Option<Instant>)>,
     /// The last action poll found the session's output empty: no reset it
@@ -836,7 +835,7 @@ impl Host {
         side: usize,
         version: Version,
         options: &Options,
-        live: Rc<Cell<i64>>,
+        live: Arc<Mutex<i64>>,
         now: Instant,
     ) -> moq5_core::Result<Host> {
         let perspective = if side == 0 {
@@ -2461,7 +2460,7 @@ impl State {
         let final_for = action.tag().and_then(ActionTag::final_for);
         match action.into_owned() {
             Ok(owned) => {
-                self.live.set(self.live.get() + 1);
+                *self.live.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                 self.n.held_records += 1;
                 self.out.entry(key).or_default().push_back(Held {
                     local,
@@ -2471,7 +2470,7 @@ impl State {
                     deadline,
                     final_for,
                     cancel: None,
-                    live: Rc::clone(&self.live),
+                    live: Arc::clone(&self.live),
                 });
                 Ok(())
             }
@@ -3156,7 +3155,7 @@ pub struct Pair {
     pub hosts: [Host; 2],
     pub now: Instant,
     pub version: Version,
-    live: Rc<Cell<i64>>,
+    live: Arc<Mutex<i64>>,
 }
 
 pub const CLIENT: usize = 0;
@@ -3166,15 +3165,15 @@ impl Pair {
     /// Both sessions created, bound where the profile needs it, and started.
     pub fn new(version: Version, options: &Options) -> moq5_core::Result<Pair> {
         let now = Instant::from_micros(1);
-        let live = Rc::new(Cell::new(0));
+        let live = Arc::new(Mutex::new(0));
         let mut wire = Wire::new(MAX_STREAMS);
         wire.write_limit = options.write_limit;
         wire.read_limit = options.read_limit;
         wire.drop_after_stop = options.drop_after_stop;
         wire.rng = options.seed.map(crate::wire::Rng::new);
         let mut hosts = [
-            Host::new(CLIENT, version, options, Rc::clone(&live), now)?,
-            Host::new(SERVER, version, options, Rc::clone(&live), now)?,
+            Host::new(CLIENT, version, options, Arc::clone(&live), now)?,
+            Host::new(SERVER, version, options, Arc::clone(&live), now)?,
         ];
         hosts[CLIENT].session.start(now)?;
         if version != Version::DRAFT_16 {
@@ -3240,12 +3239,12 @@ impl Pair {
 
     /// Held output records not yet released, across both sides.
     pub fn live_records(&self) -> i64 {
-        self.live.get()
+        *self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The counter of held records, to read after the pair is gone.
-    pub fn live_counter(&self) -> Rc<Cell<i64>> {
-        Rc::clone(&self.live)
+    pub fn live_counter(&self) -> Arc<Mutex<i64>> {
+        Arc::clone(&self.live)
     }
 
     /// Both sessions established and no fault.

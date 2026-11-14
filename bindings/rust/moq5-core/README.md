@@ -34,9 +34,11 @@ with the caller's obligations stated. The raw C API is re-exported as
 `moq5_core::sys` (the `moq5-sys` crate with its default, core-only
 features).
 
-The session itself, `Session` (created with `Session::try_new`), stays on
-the thread that created it; what it lends borrows it, and payloads leave it
-only as copies. Its module documentation states the host contract, the
+The session itself, `Session` (created with `Session::try_new`), has no
+thread affinity: it is `Send` and may move between threads between calls,
+and `!Sync`, so one thread calls into it at a time. What it lends borrows it
+and stays with it, and payloads leave it only as copies. Its module
+documentation states the host contract, the
 request families and which of a record's views a scoped thread may read.
 
 ## Linking

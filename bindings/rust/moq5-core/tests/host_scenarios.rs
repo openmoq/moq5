@@ -34,6 +34,7 @@
 //! neither does any number of streams whose type is incomplete or that have
 //! sent nothing; a stream whose type completes after setup waits with that
 //! prefix while the pending streams are full.
+//! A live pair moves between threads mid-exchange and completes.
 //! The seeded case prints its seed; set `MOQ5_HOST_SEED` to replay it.
 
 use std::cell::Cell;
@@ -1096,7 +1097,7 @@ fn cleanup_releases_every_held_record_once() {
         let records = pair.live_counter();
         drop(pair);
         assert_eq!(
-            records.get(),
+            *records.lock().unwrap_or_else(|e| e.into_inner()),
             0,
             "draft {}: every held record released",
             version.draft()
@@ -5673,6 +5674,64 @@ fn a_stream_typed_after_setup_waits_with_its_prefix() {
             pair.drain(CLIENT);
             pair.drain(SERVER);
             close(pair);
+        }
+    }
+    assert_eq!(outstanding(), 0);
+}
+
+// -- A session moves between threads ---------------------------------------
+
+/// The pair, both sessions inside it, is handed to another thread in the
+/// middle of an exchange: a subscription established and its first object
+/// delivered on the first thread, the second object written, delivered and
+/// the subgroup closed on the second, the close on a third. Nothing is lent
+/// across a handoff (every polled record was dropped by `drain`), each
+/// `join` is the happens-before edge, and every count the hosts keep is the
+/// same as on one thread.
+#[test]
+fn a_live_session_moves_to_another_thread_mid_exchange() {
+    for version in VERSIONS {
+        for (mode, options) in modes() {
+            let what = format!("draft {} {mode}", version.draft());
+            let mut pair = open(version, &options);
+            let track = subscribe(&mut pair, "moved");
+            let sg = group(&mut pair, &track, 0);
+            write(&mut pair, sg, 0, "on the first thread");
+            assert!(pair.run(PASSES), "{what}");
+            assert_eq!(
+                objects(&pair.drain(CLIENT)),
+                [(0, 0, b"on the first thread".to_vec())],
+                "{what}"
+            );
+
+            let what2 = what.clone();
+            let (mut pair, delivered) = std::thread::spawn(move || {
+                let mut pair = pair;
+                write(&mut pair, sg, 1, "on the second thread");
+                let now = pair.now;
+                pair.session(SERVER).close_subgroup(sg, now).expect("close");
+                assert!(pair.run(PASSES), "{what2}");
+                let c = pair.drain(CLIENT);
+                let delivered = objects(&c);
+                assert_eq!(count(&c, EventKind::SubgroupFinished), 1, "{what2}");
+                (pair, delivered)
+            })
+            .join()
+            .expect("the second thread");
+            assert_eq!(
+                delivered,
+                [(0, 1, b"on the second thread".to_vec())],
+                "{what}"
+            );
+            assert!(pair.established(), "{what}");
+
+            std::thread::spawn(move || {
+                let s = pair.drain(SERVER);
+                assert_eq!(count(&s, EventKind::OutgoingSubgroupTerminated), 0);
+                close(pair);
+            })
+            .join()
+            .expect("the third thread");
         }
     }
     assert_eq!(outstanding(), 0);

@@ -30,9 +30,15 @@ use crate::{sys, Buffer, Error, Result, Version};
 /// happened) out of it. It reads no clock, opens no socket and starts no
 /// thread. See the crate documentation for the host contract.
 ///
-/// **Threads.** The owner is neither `Send` nor `Sync`: the native session
-/// is confined to the thread that created it, and no written native contract
-/// yet allows a whole session to move between threads. Every method takes
+/// **Threads.** The owner is `Send` and not `Sync`. The native session has
+/// no thread affinity: it may move to another thread between calls, and
+/// Rust's ownership supplies what the native contract asks for, one caller
+/// at a time with a happens-before edge at the handoff. What the session
+/// lends stays with it: every polled record, [`Payload`](crate::Payload)
+/// and view borrows the owner and is neither `Send` nor `Sync`, so the
+/// owner cannot move while any of them lives. The URI policy a binding
+/// stores is `Send` for the same reason; it runs on whichever thread owns
+/// the session when the setup it decides arrives. Every method takes
 /// `&mut self` unless the native call only observes.
 ///
 /// **Borrows.** A polled [`Action`] or [`Event`] borrows the owner
@@ -51,8 +57,21 @@ pub struct Session {
     /// Borrowed by C's close outputs until they are polled; kept until the
     /// session is destroyed.
     close_reason: Option<CString>,
-    _confined: PhantomData<*mut ()>,
+    /// One caller at a time, never two threads at once: `!Sync`, while the
+    /// owner itself may move (`Send`).
+    _confined: PhantomData<std::cell::Cell<()>>,
 }
+
+// SAFETY: the native session has no thread affinity (session.h, "owning
+// shard"): it may move between threads provided one thread calls into it at
+// a time, the handoff carries a happens-before edge, and nothing it lent is
+// left behind. Rust supplies each: `&mut self` on every call and `!Sync`
+// (the marker field) give one caller at a time; moving a value is a
+// happens-before edge; and every polled record, payload and view borrows the
+// owner and is itself `!Send`, so the owner cannot move while one lives.
+// The URI policy the owner stores is `Send` by its type, and the close reason
+// is an owned C string; the raw pointer carries no thread-local state.
+unsafe impl Send for Session {}
 
 impl Drop for Session {
     fn drop(&mut self) {

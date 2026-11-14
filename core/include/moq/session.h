@@ -496,7 +496,12 @@ MOQ_API moq_result_t moq_session_cluster_info(const moq_session_t *s, moq_cluste
  * history only -- it does not advance the borrow epoch, consume time, or
  * produce actions/events (so it never invalidates borrowed spans from a prior
  * poll). Must run on the session's owning shard; NOT thread-safe against
- * concurrent session calls.
+ * concurrent session calls. A session has no thread affinity: its owning
+ * shard may change thread between calls, provided exactly one thread calls
+ * into it at a time, the handoff carries a happens-before edge, and
+ * everything the session lent (rcbufs, borrowed spans, polled records) has
+ * been released or moves with it. Host-supplied callbacks and the allocator
+ * must be safe to invoke from whichever thread currently owns the session.
  *
  * Merge is monotonic in location order: a location not greater than the
  * track's current largest is a no-op success (idempotent under reorder /
@@ -1332,7 +1337,10 @@ MOQ_API size_t moq_session_action_capacity(const moq_session_t *s);
  * mutate, transfer ownership or invalidate borrows. Call it serialized with
  * every other call on the session, on its owning serialized executor -- for
  * a session a managed adapter owns, within that adapter's documented
- * session-access window; it is not a cross-thread accessor.
+ * session-access window; it is not a cross-thread accessor. The executor
+ * itself may move the session between threads under the conditions stated
+ * with moq_session_note_object_published(): one caller at a time, a happens-before
+ * edge at the handoff, and nothing lent left behind.
  *
  * Not counted: answers the application has not supplied yet, timers alone,
  * receive-only backpressure, and the send scratch arena. It says nothing
