@@ -140,6 +140,9 @@ typedef struct ph_options {
     /* Sides that keep each stream's output order alone (see above) instead
      * of the order output was polled in across all streams. */
     bool     per_stream_order[2];
+    /* The sessions' subgroup pools (moq_session_cfg_t.max_open_subgroups);
+     * 0 keeps the default. */
+    uint32_t max_open_subgroups[2];
 } ph_options_t;
 
 /* What a side did, for tests to assert on. */
@@ -167,6 +170,7 @@ typedef struct ph_counters {
     unsigned violations;         /* closes this host asked for */
     /* Tagged mode only. */
     unsigned opens_reported;     /* moq_session_report_data_open == OK */
+    unsigned fins_reported;      /* moq_session_report_data_fin == OK */
     unsigned claims;             /* moq_session_claim_data_reset == OK */
     unsigned claims_settled;     /* ... of which UNOPENED, settled */
     unsigned claim_waits;        /* offer or claim WOULD_BLOCK */

@@ -3111,7 +3111,8 @@ static uint8_t dt_timer_actions(moq_session_t *s, moq_stream_ref_t ref,
     return header_len;
 }
 
-/* -- the subgroup timer uses the exact NEGOTIATED SUBGROUP timeout ----- */
+/* -- the subgroup timer uses the exact NEGOTIATED SUBGROUP timeout; a
+ * draft-16 subgroup has no timer of its own ----------------------------- */
 static void test_dt_subgroup_consumer(moq_version_t ver)
 {
     sc_alloc_state_t as = {0};
@@ -3160,10 +3161,25 @@ static void test_dt_subgroup_consumer(moq_version_t ver)
     uint8_t header_len = dt_timer_actions(sv, ref, 0, 0, 0);
     uint64_t deadline;
     if (ver == MOQ_VERSION_DRAFT_16) {
-        /* Preserved D16 behavior: expiry runs from open without a FIN. */
-        deadline = now + 8000ull * 1000ull;
+        /* Draft-16 9.2.2.2: the negotiated 8000 ms DELIVERY_TIMEOUT runs per
+         * object from its header. The subgroup slot holds the same value but
+         * arms no stream timer: not at open, not after an idle interval
+         * longer than the budget, not at the FIN. */
+        MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, UINT64_MAX);
+        MOQ_TEST_CHECK_EQ_U64(sv->subgroup_deadline_us, UINT64_MAX);
+        MOQ_TEST_CHECK(moq_session_tick(sv, now + 9000000) == MOQ_OK);
+        (void)dt_timer_actions(sv, ref, header_len, 0, 0);
         MOQ_TEST_CHECK(sv->subgroups[slot].state == MOQ_SG_OPEN);
-        MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, deadline);
+        MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, UINT64_MAX);
+        const uint64_t fin_us = now + 11000000;
+        MOQ_TEST_CHECK(moq_session_close_subgroup(sv, sg, fin_us) == MOQ_OK);
+        (void)dt_timer_actions(sv, ref, header_len, 1, 0);
+        MOQ_TEST_CHECK_EQ_U64(sv->subgroup_deadline_us, UINT64_MAX);
+        MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(sv), UINT64_MAX);
+        MOQ_TEST_CHECK(moq_session_tick(sv, fin_us + 9000000) == MOQ_OK);
+        (void)dt_timer_actions(sv, ref, header_len, 0, 0);
+        MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_ESTABLISHED);
+        goto out;
     } else {
         MOQ_TEST_CHECK_EQ_U64(sv->subgroups[slot].delivery_deadline_us, UINT64_MAX);
         MOQ_TEST_CHECK_EQ_U64(sv->subgroup_deadline_us, UINT64_MAX);

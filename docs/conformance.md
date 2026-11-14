@@ -396,6 +396,10 @@ Drafts 16 and 18 keep one subscription per track and role. Tests:
 OBJECT_DELIVERY_TIMEOUT starts at the object's header and
 SUBGROUP_DELIVERY_TIMEOUT at the subgroup's FIN, and the first object's
 property overrides the track's value for its subgroup (§5.2, §10.1, §10.2).
+Draft-16 has one DELIVERY TIMEOUT, which starts when each object's header is
+provided (draft-16 §9.2.2.2); a subgroup stream has no timer of its own,
+however long it stays open, and its FIN starts none. Tests:
+`d16_delivery_timeout`.
 The publisher's queue follows §5.1.2 (subscriber priority, publisher
 priority, group order, fill-delivered first within a group, datagram before
 subgroup, lowest Subgroup or Object ID). An omitted GROUP_ORDER on a
@@ -410,7 +414,13 @@ object's stream is reset with DELIVERY_TIMEOUT, a stream not yet opened is
 never opened, and the session ends the subgroup. The publisher facade then
 drops the rest of that group for the subscriber and keeps the subscription,
 as after a STOP_SENDING on one subgroup stream. Tests: `scheduling`,
-`publisher_stream_loss`.
+`publisher_stream_loss`. A subgroup whose FIN has left the session keeps its
+identity while output of it with a delivery deadline may still be held by the
+bridge or a tagged host, until the transport accepts its FIN (a tagged host
+reports that with `moq_session_report_data_fin()`), so an expiry or STOP of
+that output still reports its one `MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED`.
+The FIN itself is never timed. Tests: `subgroup_custody`,
+`host_fin_report`.
 
 Initial SUBSCRIBE, subscription and publication UPDATE, and the acceptance of
 a PUBLISH expose independent, presence-selected `object_delivery_timeout_ms`

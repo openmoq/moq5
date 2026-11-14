@@ -1855,22 +1855,19 @@ static void tagged_handed_unopened(moq_version_t version)
 
 #define TIMEOUT_MS 50           /* the object delivery timeout of these rows */
 
-/* A subgroup reset owed on its subgroup, not queued, while the stream's
- * header is still queued. Draft-16's one DELIVERY_TIMEOUT runs each
- * subgroup's timer from its open, so the session latches without a host
- * pass: two subgroups' headers fill an action ring of two, and at the
- * deadline both terminals latch with no free slot, so each reset stays owed
- * and the tick returns MOQ_ERR_WOULD_BLOCK. The first is offered UNOPENED
- * and claimed so: it settles with its header, its open is suppressed, its
- * event commits, and it is never offered again. The slot it frees lets the
- * second reset queue behind its own header; the host claims that one
- * UNOPENED too. Nothing of either is polled, no stream or reset reaches
- * the transport, and the DONE counts none. */
+/* A subgroup reset that waits behind its stream's still-queued header. Two
+ * subgroups each queue a header and one object, and no host pass runs. At
+ * the objects' deadline the session latches both itself: each expired
+ * object is dropped, its terminal event commits, and its reset waits behind
+ * its own header. The first is offered UNOPENED and claimed so: it settles
+ * with its header, its open is suppressed, and it is never offered again;
+ * the second is offered UNOPENED next, and the host claims that one too.
+ * Nothing of either is polled, no stream or reset reaches the transport,
+ * and the DONE counts none. */
 static void tagged_unopened_owed(moq_version_t version)
 {
     name_case("tagged.unopened_owed", version);
     ph_options_t o = tagged_server();
-    o.max_actions[SERVER] = 2;
     ph_pair_t *p = open_pair(version, &o);
     drain(p, CLIENT, NULL);
     drain(p, SERVER, NULL);
@@ -1878,13 +1875,15 @@ static void tagged_unopened_owed(moq_version_t version)
     subscribe_timed(p, &t, "t", TIMEOUT_MS);
     moq_session_t *srv = ph_session(p, SERVER);
     const ph_counters_t *sn = ph_counters(p, SERVER);
-    (void)open_group(p, &t, 0);
-    (void)open_group(p, &t, 1);
-    /* No host pass runs until both are settled or owed: the headers stay
-     * queued, and they fill the ring. */
+    moq_subgroup_handle_t first = open_group(p, &t, 0);
+    write_object(p, first, 0, "a");
+    moq_subgroup_handle_t second = open_group(p, &t, 1);
+    write_object(p, second, 0, "b");
+    /* No host pass runs until both are settled: the headers and objects
+     * stay queued. */
     uint64_t due = moq_session_next_deadline_us(srv);
     REQUIRE(due != UINT64_MAX && due > ph_now(p));
-    CHECK(moq_session_tick(srv, due) == MOQ_ERR_WOULD_BLOCK);
+    CHECK(moq_session_tick(srv, due) == MOQ_OK);
     moq_data_reset_offer_t off;
     size_t n = 0;
     REQUIRE(moq_session_offer_data_reset(srv, &off, sizeof(off), &n) == MOQ_OK && n == 1);
@@ -1896,7 +1895,7 @@ static void tagged_unopened_owed(moq_version_t version)
                                          &cl, sizeof(cl)) == MOQ_OK);
     CHECK(cl.flags & MOQ_DATA_RESET_CLAIM_SETTLED);
     CHECK(cl.flags & MOQ_DATA_RESET_CLAIM_OPEN_SUPPRESSED);
-    CHECK(cl.flags & MOQ_DATA_RESET_CLAIM_EVENT_COMMITTED);
+    CHECK(!(cl.flags & MOQ_DATA_RESET_CLAIM_EVENT_COMMITTED));   /* at the tick */
     CHECK(cl.released_data_actions == 1);            /* its header */
     /* The settled reset is not offered again; the other one is next. */
     moq_data_reset_offer_t next;
@@ -1938,6 +1937,99 @@ static void tagged_unopened_owed(moq_version_t version)
     close_pair(p);
 }
 
+/* A reset owed on its subgroup, not queued, while the stream's header is
+ * still queued, reached through the subscriber's cancellation. Two
+ * subgroups' headers fill an action ring of two and no host pass polls
+ * them; the publisher then takes the UNSUBSCRIBE (or, on drafts 18 and 22,
+ * the end of the request stream), and with no free slot each CANCELLED
+ * reset stays owed on its subgroup. Each is offered UNOPENED and claimed
+ * so: it settles with its header, no event commits (a cancellation has no
+ * terminal) and no counted open is left to suppress (the cancelled owner's
+ * count ended with it), and it is never offered again. Nothing of either
+ * is polled, and no data stream or data reset reaches the transport (on
+ * drafts 18 and 22 the request stream itself still ends with its reset).
+ *
+ * `direct` (draft-16, whose UNSUBSCRIBE is a control message): the test
+ * hands the subscriber's UNSUBSCRIBE to the publisher itself and claims the
+ * first reset, so the claim's own result is seen; the host claims the
+ * second. Otherwise the publisher's input is held while the subscriber
+ * ends the subscription, and released once the headers are queued: the
+ * host takes the cancellation and claims both resets in that same pass. */
+static void tagged_unopened_owed_cancel(moq_version_t version, bool direct)
+{
+    name_case(direct ? "tagged.unopened_owed_cancel.direct" : "tagged.unopened_owed_cancel",
+              version);
+    ph_options_t o = tagged_server();
+    o.max_actions[SERVER] = 2;
+    ph_pair_t *p = open_pair(version, &o);
+    drain(p, CLIENT, NULL);
+    drain(p, SERVER, NULL);
+    track_t t;
+    subscribe_timed(p, &t, "t", TIMEOUT_MS);
+    moq_session_t *srv = ph_session(p, SERVER), *cli = ph_session(p, CLIENT);
+    const ph_counters_t *sn = ph_counters(p, SERVER);
+    if (!direct) {
+        ph_set_input_hold(p, SERVER, true);
+        REQUIRE(moq_session_unsubscribe(cli, t.csub, ph_now(p)) == MOQ_OK);
+        CHECK(ph_run(p, PASSES));
+    }
+    (void)open_group(p, &t, 0);
+    (void)open_group(p, &t, 1);
+    if (!direct) {
+        ph_set_input_hold(p, SERVER, false);
+        CHECK(ph_run(p, PASSES));
+        CHECK(sn->claims == 2 && sn->claims_settled == 2 && sn->commits == 0);
+    } else {
+        REQUIRE(moq_session_unsubscribe(cli, t.csub, ph_now(p)) == MOQ_OK);
+        moq_action_t a;
+        size_t count = 0;
+        memset(&a, 0, sizeof(a));
+        REQUIRE(moq_session_poll_actions_ex(cli, &a, 1, sizeof(a), &count) == MOQ_OK &&
+                count == 1 && a.kind == MOQ_ACTION_SEND_CONTROL);
+        REQUIRE(moq_session_on_control_bytes(srv, a.u.send_control.data,
+                                             a.u.send_control.len, ph_now(p)) == MOQ_OK);
+        moq_action_cleanup(&a);
+        moq_data_reset_offer_t off;
+        size_t n = 0;
+        REQUIRE(moq_session_offer_data_reset(srv, &off, sizeof(off), &n) == MOQ_OK && n == 1);
+        REQUIRE(off.state == MOQ_DATA_RESET_UNOPENED);
+        CHECK(off.error_code == 0x1);                /* CANCELLED */
+        CHECK(off.cause == MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE);
+        moq_data_reset_claim_t cl;
+        REQUIRE(moq_session_claim_data_reset(srv, &off, sizeof(off), MOQ_DATA_PREFIX_UNOPENED,
+                                             &cl, sizeof(cl)) == MOQ_OK);
+        CHECK(cl.flags == MOQ_DATA_RESET_CLAIM_SETTLED);
+        CHECK(cl.released_data_actions == 1);        /* its header */
+        /* The settled reset is not offered again; the other one is next. */
+        moq_data_reset_offer_t next;
+        n = 0;
+        CHECK(moq_session_offer_data_reset(srv, &next, sizeof(next), &n) == MOQ_OK && n == 1);
+        if (n == 1) {
+            CHECK(next.stream_ref._v != off.stream_ref._v);
+            CHECK(next.state == MOQ_DATA_RESET_UNOPENED);
+            CHECK(next.error_code == 0x1);
+        }
+        CHECK(ph_run(p, PASSES));
+        CHECK(sn->claims == 1 && sn->claims_settled == 1 && sn->commits == 0);
+    }
+    CHECK(sn->resets_unknown == 0);                  /* nothing polled */
+    CHECK(sn->opens_reported == 0);
+    moq_data_reset_offer_t none;
+    size_t n = 9;
+    CHECK(moq_session_offer_data_reset(srv, &none, sizeof(none), &n) == MOQ_OK && n == 0);
+    moq_stream_ref_t refs[4];
+    CHECK(ph_local_data_refs(p, SERVER, refs, 4) == 0);   /* no data stream exists */
+    CHECK(ph_counters(p, CLIENT)->routed_data == 0);
+    log_t s = {0};
+    drain(p, SERVER, &s);
+    CHECK(count_kind(&s, MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED) == 0);
+    log_t c = {0};
+    drain(p, CLIENT, &c);
+    CHECK(count_kind(&c, MOQ_EVENT_SUBGROUP_RESET) == 0);
+    CHECK(ph_fault(p, CLIENT) == PH_FAULT_NONE && ph_fault(p, SERVER) == PH_FAULT_NONE);
+    close_pair(p);
+}
+
 /* An object datagram on the subscription, from the pair's allocator. */
 static void send_datagram(ph_pair_t *p, const track_t *t, uint64_t group,
                           const char *text)
@@ -1971,9 +2063,9 @@ static void request_unpolled(ph_pair_t *p, const char *name)
  * event is reported once. With `refuse` the transport refuses that reset
  * twice: the wake settles on the second refusal with the claim held and
  * nothing committed, and the next run writes the reset and commits it once.
- * Draft-16 has one DELIVERY_TIMEOUT, which also runs the subgroup's own
- * timer from its open, so there the session ends such a stream itself; this
- * runs on drafts 18 and 22. */
+ * Every draft: the object's clock starts at its header on drafts 16 and 22
+ * and at its first payload byte on draft 18, and no draft gives the open
+ * subgroup a timer of its own. */
 static void host_held_expiry(moq_version_t version, bool refuse)
 {
     name_case(refuse ? "host.expiry.reset_refused" : "host.expiry", version);
@@ -2243,8 +2335,7 @@ static void host_final_fence_datagram(moq_version_t version)
  * at that same time does not tick. Nothing spins: a blocked tick moves
  * nothing, so each run or wake settles. Once the application polls its
  * events, the terminal event surfaces once, behind them, and the reset is
- * claimed, written and committed. Drafts 18 and 22, as for
- * host_held_expiry. */
+ * claimed, written and committed. Every draft, as for host_held_expiry. */
 static void host_blocked_tick(moq_version_t version)
 {
     name_case("host.blocked_tick", version);
@@ -2333,7 +2424,7 @@ static void host_blocked_tick(moq_version_t version)
  * the host. At it, with writes taken again, the expired object is dropped,
  * never written; A's reset goes once, with 0x9, with no report, claim or
  * second reset; B's DONE goes once the object no longer stands in front of
- * it. Drafts 18 and 22, as for host_held_expiry. */
+ * it. Every draft, as for host_held_expiry. */
 static void host_reset_before_expiry(moq_version_t version)
 {
     name_case("host.reset_before_expiry", version);
@@ -2426,8 +2517,8 @@ static void host_reset_before_expiry(moq_version_t version)
  * retry deadline returns MOQ_ERR_WOULD_BLOCK. With no input, no event
  * polling and no write relief after that, the wake at the GOAWAY deadline
  * ticks again, though the blocked retry is the earliest deadline the
- * session reports, and the server closes with GOAWAY_TIMEOUT. Drafts 18
- * and 22, as for host_blocked_tick. */
+ * session reports, and the server closes with GOAWAY_TIMEOUT. Every draft,
+ * as for host_blocked_tick. */
 static void host_goaway_behind_blocked_tick(moq_version_t version)
 {
     name_case("host.goaway_behind_blocked_tick", version);
@@ -3606,24 +3697,22 @@ int main(void)
         if (row_wanted("fill_two_stops", (unsigned)all[i])) fill_two_stops(all[i]);
         if (row_wanted("held_expiry", (unsigned)all[i])) held_expiry(all[i]);
         if (row_wanted("tagged_handed_unopened", (unsigned)all[i])) tagged_handed_unopened(all[i]);
-        /* Each subgroup's timer runs from its open on draft-16 alone. */
-        if (all[i] == MOQ_VERSION_DRAFT_16 && row_wanted("tagged_unopened_owed", (unsigned)all[i]))
+        if (row_wanted("tagged_unopened_owed", (unsigned)all[i]))
             tagged_unopened_owed(all[i]);
-        if (all[i] != MOQ_VERSION_DRAFT_16 && row_wanted("host_held_expiry", (unsigned)all[i]))
-            host_held_expiry(all[i], false);
-        if (all[i] != MOQ_VERSION_DRAFT_16 && row_wanted("host_held_expiry", (unsigned)all[i]))
-            host_held_expiry(all[i], true);
+        if (row_wanted("tagged_unopened_owed_cancel", (unsigned)all[i])) {
+            tagged_unopened_owed_cancel(all[i], false);
+            if (all[i] == MOQ_VERSION_DRAFT_16) tagged_unopened_owed_cancel(all[i], true);
+        }
+        if (row_wanted("host_held_expiry", (unsigned)all[i])) host_held_expiry(all[i], false);
+        if (row_wanted("host_held_expiry", (unsigned)all[i])) host_held_expiry(all[i], true);
         if (row_wanted("host_datagram_expiry", (unsigned)all[i])) host_datagram_expiry(all[i]);
         if (row_wanted("host_final_fence", (unsigned)all[i])) host_final_fence(all[i]);
         if (row_wanted("host_final_fence_datagram", (unsigned)all[i]))
             host_final_fence_datagram(all[i]);
-        if (all[i] != MOQ_VERSION_DRAFT_16 && row_wanted("host_blocked_tick", (unsigned)all[i]))
-            host_blocked_tick(all[i]);
-        if (all[i] != MOQ_VERSION_DRAFT_16 &&
-            row_wanted("host_reset_before_expiry", (unsigned)all[i]))
+        if (row_wanted("host_blocked_tick", (unsigned)all[i])) host_blocked_tick(all[i]);
+        if (row_wanted("host_reset_before_expiry", (unsigned)all[i]))
             host_reset_before_expiry(all[i]);
-        if (all[i] != MOQ_VERSION_DRAFT_16 &&
-            row_wanted("host_goaway_behind_blocked_tick", (unsigned)all[i]))
+        if (row_wanted("host_goaway_behind_blocked_tick", (unsigned)all[i]))
             host_goaway_behind_blocked_tick(all[i]);
         /* A FETCH's request stream exists on drafts 18 and 22 alone. */
         if (all[i] != MOQ_VERSION_DRAFT_16) {
@@ -3675,7 +3764,6 @@ int main(void)
     per_stream_pass = true;
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         const unsigned d = (unsigned)all[i];
-        const bool streams = all[i] != MOQ_VERSION_DRAFT_16;
         if (row_wanted("tagged_enable", d)) tagged_enable(all[i]);
         if (row_wanted("tagged_stream_count", d)) tagged_stream_count(all[i], false);
         if (row_wanted("tagged_stream_count", d)) tagged_stream_count(all[i], true);
@@ -3687,16 +3775,19 @@ int main(void)
         if (row_wanted("tagged_claim_closed", d)) tagged_claim_closed(all[i]);
         if (row_wanted("held_expiry", d)) held_expiry(all[i]);
         if (row_wanted("tagged_handed_unopened", d)) tagged_handed_unopened(all[i]);
-        if (!streams && row_wanted("tagged_unopened_owed", d)) tagged_unopened_owed(all[i]);
-        if (streams && row_wanted("host_held_expiry", d)) host_held_expiry(all[i], false);
-        if (streams && row_wanted("host_held_expiry", d)) host_held_expiry(all[i], true);
+        if (row_wanted("tagged_unopened_owed", d)) tagged_unopened_owed(all[i]);
+        if (row_wanted("tagged_unopened_owed_cancel", d)) {
+            tagged_unopened_owed_cancel(all[i], false);
+            if (all[i] == MOQ_VERSION_DRAFT_16) tagged_unopened_owed_cancel(all[i], true);
+        }
+        if (row_wanted("host_held_expiry", d)) host_held_expiry(all[i], false);
+        if (row_wanted("host_held_expiry", d)) host_held_expiry(all[i], true);
         if (row_wanted("host_datagram_expiry", d)) host_datagram_expiry(all[i]);
         if (row_wanted("host_final_fence", d)) host_final_fence(all[i]);
         if (row_wanted("host_final_fence_datagram", d)) host_final_fence_datagram(all[i]);
-        if (streams && row_wanted("host_blocked_tick", d)) host_blocked_tick(all[i]);
-        if (streams && row_wanted("host_reset_before_expiry", d))
-            host_reset_before_expiry(all[i]);
-        if (streams && row_wanted("host_goaway_behind_blocked_tick", d))
+        if (row_wanted("host_blocked_tick", d)) host_blocked_tick(all[i]);
+        if (row_wanted("host_reset_before_expiry", d)) host_reset_before_expiry(all[i]);
+        if (row_wanted("host_goaway_behind_blocked_tick", d))
             host_goaway_behind_blocked_tick(all[i]);
     }
     per_stream_pass = false;

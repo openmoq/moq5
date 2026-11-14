@@ -683,6 +683,16 @@ target_compile_definitions(test_host_retire PRIVATE MOQ_SESSION_SWEEP_TESTING)
 add_test(NAME host_retire COMMAND test_host_retire)
 set_tests_properties(host_retire PROPERTIES TIMEOUT 30)
 
+# The tagged host's FIN-acceptance report through the same public-only host:
+# results, held output past its deadline, hand-off, STOP, cancellation, close
+# and a negotiated subgroup timer, with the session's private state observed
+# by the test only.
+add_executable(test_host_fin_report
+    unit/test_host_fin_report.c public_host/public_host.c)
+target_link_libraries(test_host_fin_report PRIVATE moq-core-test-internals)
+add_test(NAME host_fin_report COMMAND test_host_fin_report)
+set_tests_properties(host_fin_report PROPERTIES TIMEOUT 60)
+
 # A peer RESET of a request bidi ends only the peer's half: our send half keeps
 # its mapping until it is closed, or reset once in answer to a later STOP.
 add_executable(test_bridge_bidi_reset_half unit/test_bridge_bidi_reset_half.c)
@@ -1161,6 +1171,14 @@ if(TARGET moq::sim)
     target_link_libraries(test_subgroup_commit_timer PRIVATE moq::core moq::sim)
     add_test(NAME subgroup_commit_timer COMMAND test_subgroup_commit_timer)
     set_tests_properties(subgroup_commit_timer PROPERTIES TIMEOUT 30)
+    add_executable(test_d16_delivery_timeout unit/test_d16_delivery_timeout.c)
+    target_link_libraries(test_d16_delivery_timeout PRIVATE moq::core moq::sim)
+    add_test(NAME d16_delivery_timeout COMMAND test_d16_delivery_timeout)
+    set_tests_properties(d16_delivery_timeout PROPERTIES TIMEOUT 30)
+    add_executable(test_subgroup_custody unit/test_subgroup_custody.c)
+    target_link_libraries(test_subgroup_custody PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME subgroup_custody COMMAND test_subgroup_custody)
+    set_tests_properties(subgroup_custody PROPERTIES TIMEOUT 60)
     add_executable(test_subgroup_stop_after_fin unit/test_subgroup_stop_after_fin.c)
     target_link_libraries(test_subgroup_stop_after_fin PRIVATE moq-core-test-internals moq::sim)
     target_compile_definitions(test_subgroup_stop_after_fin PRIVATE MOQ_SESSION_SWEEP_TESTING)

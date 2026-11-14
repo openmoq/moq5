@@ -840,6 +840,8 @@ static void bridge_dstreams_clear(moq_transport_bridge_t *b)
 static void bridge_clear_all_state(moq_transport_bridge_t *b)
 {
     bridge_session_abandon_data_opens(b->session);
+    /* The retained output is dropped below; its custody ends with it. */
+    bridge_session_drop_custody(b->session);
     bridge_cleanup_all_pending(b);
     b->pending_control = false;
     b->pending_control_fin = false;
@@ -2288,6 +2290,9 @@ static moq_result_t dispatch_close_session(moq_transport_bridge_t *b,
  * stream; otherwise the stream is retired here. */
 static void bridge_local_data_fin_done(moq_transport_bridge_t *b, moq_stream_ref_t ref)
 {
+    /* Same-stream order holds in the bridge, so no earlier byte of the stream
+     * remains here once its FIN is accepted. */
+    bridge_session_on_data_fin_accepted(b->session, ref);
     bridge_mark_local_close(b, ref);
     bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
     /* The provider took the FIN of a FETCH response stream: from here a

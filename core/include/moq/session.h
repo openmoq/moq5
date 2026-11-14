@@ -6687,6 +6687,10 @@ typedef struct moq_output_owner { uint64_t _v; } moq_output_owner_t;
  * - an open of a data stream whose Stream Count the session reports stays
  *   pending until the host reports it (moq_session_report_data_open) or a
  *   reset claim resolves it, so the count is exact.
+ * - the host reports every FIN of a local data stream that the transport
+ *   accepted (moq_session_report_data_fin), whatever the stream carries.
+ *   Polling an action begins the host's custody of it; it is not transport
+ *   acceptance.
  *
  * Returns MOQ_ERR_INVAL for NULL. Returns MOQ_ERR_WRONG_STATE, with no
  * effect, once the session is no longer pristine or is attached.
@@ -6997,8 +7001,10 @@ MOQ_API moq_result_t moq_session_on_data_stop_ex(moq_session_t *s,
  * tag deadline. A live subgroup latches DELIVERY_TIMEOUT (its header is still
  * the reset's reliable prefix) and returns RESET_FOLLOWS; its event commits
  * when the reset is taken. An earlier STOP, reset or timeout stays the first
- * cause. A subgroup that already left the session with nothing reset is
- * NO_RESET with host_reset_code MOQ_RESET_DELIVERY_TIMEOUT. A FETCH or fill
+ * cause. A closed subgroup stays live while output of it with a deadline may
+ * still be held, until moq_session_report_data_fin() reports its FIN
+ * accepted (see there). A subgroup that already left the session with
+ * nothing reset is NO_RESET with host_reset_code MOQ_RESET_DELIVERY_TIMEOUT. A FETCH or fill
  * stream has no delivery deadline: MOQ_ERR_WRONG_STATE, nothing changed.
  * Datagrams are never reported here; the host drops them itself.
  *
@@ -7038,6 +7044,65 @@ typedef uint32_t moq_data_open_outcome_t;  /* open set; never renumbered */
 MOQ_API moq_result_t moq_session_report_data_open(moq_session_t *s,
     moq_stream_ref_t stream_ref, moq_output_owner_t owner,
     moq_data_open_outcome_t outcome);
+
+/*
+ * Report that the transport accepted the FIN of a local data stream (tagged
+ * mode only).
+ *
+ * The transport accepted the write carrying the FIN, including a FIN on the
+ * stream's last bytes, and every earlier byte of the stream has left the
+ * host. A refused or partial write is not acceptance. This is not
+ * acknowledgement (moq_session_on_data_committed() reports the FIN's
+ * acknowledgement), peer receipt or the transport's retirement of the stream.
+ * The host keeps each stream's bytes and FIN in order; the session cannot
+ * check that, nor that the transport accepted anything. Report once for every
+ * such FIN, on any local data stream this session handed out: a subgroup with
+ * or without a delivery deadline, a FETCH or fill response alike.
+ *
+ * A closed subgroup whose output with a deadline (a tag whose deadline_us is
+ * not UINT64_MAX) was handed out keeps its identity -- handle, owner, group,
+ * subgroup, first terminal cause -- while that output may still be held, so
+ * that moq_session_on_held_data_expired() or a STOP of the stream still commits
+ * its one MOQ_EVENT_OUTGOING_SUBGROUP_TERMINATED. This report ends that hold.
+ * It does not release the identity by itself: the entry becomes eligible once
+ * its other obligations are settled. A negotiated SUBGROUP_DELIVERY_TIMEOUT
+ * keeps running until moq_session_on_data_committed() or its expiry, and a
+ * terminal already recognized keeps its event and reset. A FIN that the
+ * transport has not accepted starts no timer here. A host that never reports
+ * keeps those subgroups, and their slots, until a reset, the owner's
+ * cancellation or the session's close ends them.
+ *
+ * Results, in this order, each refusal changing nothing:
+ *   MOQ_ERR_INVAL        NULL session, ref 0, or a ref in the peer range
+ *                        (at or above MOQ_STREAM_REF_LOCAL_END).
+ *   MOQ_ERR_WRONG_STATE  not in the tagged mode.
+ *   MOQ_ERR_CLOSED       the session is closed.
+ *   MOQ_OK               the stream already ends in a reset: queued, claimed,
+ *                        or still owed after a recognized terminal, whether
+ *                        or not its FIN was handed out and whether or not
+ *                        the session still keeps the entry. The report is
+ *                        obsolete and changes nothing: no cause, claim, debt
+ *                        or slot moves, and no capacity is needed.
+ *   MOQ_ERR_WRONG_STATE  the subgroup is open, streaming or closing and its
+ *                        FIN has not been handed out (queued, or not yet
+ *                        written).
+ *   MOQ_OK               the hold ended; also when the session holds no
+ *                        identity for the ref (a stream with no deadline, one
+ *                        already reported, a FETCH or fill stream), which
+ *                        changes nothing. A stream_ref is never reused
+ *                        within a session, so a duplicate or late report
+ *                        cannot affect another stream; OK does not validate a
+ *                        ref this session never handed out.
+ *
+ * Not an advancing call: it takes no time, runs no pending work, does not
+ * change the borrow epoch, releases no buffer, frees no slot and queues no
+ * event or action; the next advancing call may reclaim the subgroup. It is
+ * not a pure observation either, and not callable concurrently: `s` is
+ * borrowed for the call, no ownership transfers, and the caller serializes
+ * it with the session's other calls on the session's owning executor.
+ */
+MOQ_API moq_result_t moq_session_report_data_fin(moq_session_t *s,
+    moq_stream_ref_t stream_ref);
 
 /*
  * Drain actions with their tags (tagged mode only).

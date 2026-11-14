@@ -2327,6 +2327,7 @@ static moq_result_t pub_reset_subgroups(moq_session_t *s, int slot)
                 need_recompute = true;
             }
         }
+        sg_settle_cancelled_closing(s, MOQ_SUBSCRIPTION_INVALID, pub_handle, 0);
     }
     if (need_recompute) sg_recompute_deadline(s);
     return MOQ_OK;
@@ -2357,6 +2358,7 @@ moq_result_t session_core_on_publish_unsubscribed(moq_session_t *s, int slot,
                 moq_publication_eq(sg->pub, pub_handle))
                 sg_reset_or_owe(s, (size_t)i, 0x1 /* CANCELLED */, keep);
         }
+        sg_settle_cancelled_closing(s, MOQ_SUBSCRIPTION_INVALID, pub_handle, keep);
     }
 
     moq_event_t ev;
@@ -2760,6 +2762,8 @@ static moq_result_t pub_inbound_update_fail_terminal(moq_session_t *s, size_t sl
             moq_publication_eq(sg->pub, pe->handle))
             sg_reset_or_owe(s, (size_t)i, 0x1 /* CANCELLED */, n_err + reserve_done + fills);
     }
+    sg_settle_cancelled_closing(s, MOQ_SUBSCRIPTION_INVALID, pe->handle,
+                                n_err + reserve_done + fills);
     uint8_t buf[64 + 1024];
     for (size_t k = 0; k < n_err; k++) {
         size_t len = 0;
@@ -3779,6 +3783,8 @@ moq_result_t moq_session_open_pub_subgroup(
     entry->ovr_has_object = entry->ovr_has_subgroup = false;
     entry->terminal_cause = MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
     entry->terminal_code = 0;
+    entry->timed_custody = false;
+    entry->fin_handed = false;
     /* Saturates at the profile's unknown Stream Count, which every
      * PUBLISH_DONE clamps to anyway. */
     if (s->publishes[pub_slot].subgroup_streams_opened <

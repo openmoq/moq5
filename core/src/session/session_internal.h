@@ -1376,6 +1376,18 @@ typedef struct moq_sg_entry {
     uint64_t               streaming_bytes_written;
     uint64_t               delivery_deadline_us;
     bool                   has_extensions;
+    /* A SEND_DATA of this stream with a delivery deadline was handed to the
+     * transport owner (the bridge or the tagged host), which may still hold
+     * it. A closing subgroup keeps its entry, and so its identity, while this
+     * is set, so that an expiry or STOP of that output still commits the
+     * subgroup's one terminal event. Accepted FIN (the bridge's, or the host's
+     * moq_session_report_data_fin()), a reset, the owner's cancellation, the
+     * bridge dropping its storage or the session's end discharges it.
+     * Accepted FIN is a conservative boundary: the last timed bytes may have
+     * been accepted before the FIN was. It starts no timer of its own. */
+    bool                   timed_custody;
+    /* The stream's FIN was handed to the transport owner. */
+    bool                   fin_handed;
     /* The first object's OBJECT_DELIVERY_TIMEOUT / SUBGROUP_DELIVERY_TIMEOUT
      * properties: on profiles that honour them they replace the track-level
      * publisher values for this subgroup. */
@@ -3054,6 +3066,24 @@ void sg_retry_owed_resets(moq_session_t *s);
  * debts. Does not advance time or invalidate borrows. */
 void session_service_outgoing_terminals(moq_session_t *s);
 bool sg_has_terminal_debt(const moq_session_t *s);
+/* The transport owner is taking action `a` (with record `m`) from the queue:
+ * a SEND_DATA with a delivery deadline puts its live subgroup's timed output
+ * in the owner's custody (moq_sg_entry_t.timed_custody), and one carrying the
+ * FIN marks the FIN handed. Call before the action is taken, so no
+ * settlement can reap the entry first. */
+void sg_note_owner_handoff(moq_session_t *s, const moq_action_t *a,
+                           const moq_action_meta_t *m);
+/* The owner (`sub` or `pub`; the other invalid) was cancelled. A closing
+ * subgroup of it whose timed output is in the transport owner's custody is
+ * cancelled like an open one: its queued output past a still-queued
+ * subgroup header is dropped, so none of it can enter custody again, and
+ * the stream is reset with CANCELLED (now while more than `keep` action
+ * slots are free, else owed). A closing subgroup with no output in that
+ * custody -- none handed out yet, or all of it already accepted -- is left
+ * to finish as before: its queued output keeps its own deadlines. A
+ * terminal already recognized keeps its debt; no terminal is added. */
+void sg_settle_cancelled_closing(moq_session_t *s, moq_subscription_t sub,
+                                 moq_publication_t pub, size_t keep);
 /* Acknowledge new terminal recognition for bridge queue pruning. Private;
  * event polling does not clear it, and reset retries do not set it again. */
 bool bridge_session_take_terminal_changes(moq_session_t *s);

@@ -1383,6 +1383,13 @@ static ph_step_t host_out_step(ph_host_t *h, ph_out_t *o, bool *progress)
         if (o->fin) {
             wire_fin(w, l->wire, h->side);   /* after the last byte */
             l->out_done = true;
+            if (h->tagged && l->role == PH_ROLE_DATA_OUT) {
+                /* The transport accepted the FIN after every earlier byte of
+                 * the stream: reported once, whatever the stream carries. */
+                moq_result_t rc = moq_session_report_data_fin(h->s, l->ref);
+                if (rc == MOQ_OK) h->n.fins_reported++;
+                else if (rc != MOQ_ERR_CLOSED) host_fail(h, PH_FAULT_OUTCOME);
+            }
         }
         return PH_STEP_DONE;
 
@@ -2153,6 +2160,8 @@ static bool ph_create_session(ph_pair_t *p, int side, moq_version_t version,
     if (o && o->max_actions[side]) cfg.max_actions = o->max_actions[side];
     if (o && o->max_data_streams[side])
         cfg.max_data_streams = o->max_data_streams[side];
+    if (o && o->max_open_subgroups[side])
+        cfg.max_open_subgroups = o->max_open_subgroups[side];
     if (o && o->idle_timeout_us[side]) cfg.idle_timeout_us = o->idle_timeout_us[side];
     if (o && o->goaway_timeout_us[side])
         cfg.goaway_timeout_us = o->goaway_timeout_us[side];

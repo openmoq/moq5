@@ -656,8 +656,12 @@ typedef struct moq_profile_ops {
      * count its streams: the terminal is deferred to the wait deadline
      * instead of being satisfied by counting. */
     uint64_t stream_count_unknown;
-    /* A subgroup's delivery timer starts at its FIN and honours the first
-     * object's override. False starts it as the stream opens. */
+    /* A subgroup has a delivery timer of its own: it starts when the
+     * subgroup's FIN is queued, honours the first object's override, and
+     * stops when the transport reports the stream committed. False: the
+     * profile's delivery timeout bounds each object alone, from where
+     * object_timer_at_header starts its clock; a subgroup stream carries no
+     * timer of its own, neither while open nor after its FIN. */
     bool subgroup_timer_at_fin;
     /* An object's delivery clock starts when its header has been provided.
      * False starts it at the object's first payload byte. */

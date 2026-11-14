@@ -177,8 +177,9 @@ static void send_group(struct side *side, moq_session_t *s,
     NEED(r, ms != NULL && !ms->bidi && ms->commit_enabled && !ms->fin_sent);
     r->ref = moq_transport_bridge_find_ref(c->bridge, r->key);
     NEED(r, r->ref._v != 0);
-    CHECK(r, (moq_session_next_deadline_us(s) != UINT64_MAX) ==
-             (r->version == MOQ_VERSION_DRAFT_16));
+    /* Opening arms no timer on any draft: each object carries its own
+     * deadline, and a draft with a subgroup timer starts it at the FIN. */
+    CHECK(r, moq_session_next_deadline_us(s) == UINT64_MAX);
     if (r->payload_group) {
         NEED(r, moq_rcbuf_create(&r->alloc, (const uint8_t *)"payload", 7,
                                  &r->payload) == MOQ_OK);
@@ -194,7 +195,8 @@ static void send_group(struct side *side, moq_session_t *s,
     CHECK(r, atomic_load(&r->commits) == 0);
     CHECK(r, atomic_load(&r->bare_fins) == 1 && atomic_load(&r->data_fins) == 0);
     if (r->version == MOQ_VERSION_DRAFT_16)
-        NEED(r, r->deadline == UINT64_MAX); /* Legacy timer ends at FIN. */
+        /* No subgroup timer on draft-16; the object, if any, already left. */
+        NEED(r, r->deadline == UINT64_MAX);
     else
         NEED(r, r->deadline != UINT64_MAX && r->deadline > now);
     r->pending = true;

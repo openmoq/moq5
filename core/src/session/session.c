@@ -992,8 +992,10 @@ void moq_session_unregister_transport_owner(moq_session_t *s,
 {
     if (s && owner && s->transport_owner == owner) {
         /* Cancel bridge-owned, still-unopened refs before dropping retained
-         * output. Core-owned headers remain pending for a replacement owner. */
+         * output. Core-owned headers remain pending for a replacement owner.
+         * Output the owner retained leaves its custody with it. */
         bridge_session_abandon_data_opens(s);
+        bridge_session_drop_custody(s);
         s->transport_owner = NULL;
         s->has_owner_deadline = false;
         s->owner_deadline_us = 0;
@@ -5104,6 +5106,7 @@ static bool bridge_session_poll_action_impl(moq_session_t *s, moq_action_t *out,
         return false;
     *meta = s->action_meta[selected % s->action_cap];
     session_open_handed(s, &s->actions[selected % s->action_cap], meta);
+    sg_note_owner_handoff(s, &s->actions[selected % s->action_cap], meta);
     action_take(s, selected, out);
     out->borrow_epoch = s->borrow_epoch;
     session_action_poll_settled(s, true);
@@ -5168,6 +5171,7 @@ bool bridge_session_poll_ready_action(moq_session_t *s, moq_action_t *out,
             return false;
         *meta = s->action_meta[selected % s->action_cap];
         session_open_handed(s, &s->actions[selected % s->action_cap], meta);
+        sg_note_owner_handoff(s, &s->actions[selected % s->action_cap], meta);
         action_take(s, selected, out);
         out->borrow_epoch = s->borrow_epoch;
         session_action_poll_settled(s, true);
@@ -5339,6 +5343,7 @@ bool bridge_session_poll_mapped_action(moq_session_t *s, moq_action_t *out,
         BRIDGE_ACTION_READY) return false;
     *meta = s->action_meta[at];
     session_open_handed(s, &s->actions[at], meta);
+    sg_note_owner_handoff(s, &s->actions[at], meta);
     action_take(s, best, out);
     out->borrow_epoch = s->borrow_epoch;
     session_action_poll_settled(s, true);
@@ -5395,8 +5400,10 @@ static moq_result_t session_poll_actions(moq_session_t *s,
     uint8_t *dst = (uint8_t *)out;
     uint8_t *tag_dst = (uint8_t *)tags;
 
-    /* Handing an action to the adapter is the handover to the transport: an
-     * object whose OBJECT_DELIVERY_TIMEOUT has elapsed must not cross it. */
+    /* Handing an action out is where the session stops timing it: an object
+     * whose OBJECT_DELIVERY_TIMEOUT has elapsed must not leave. Whoever takes
+     * it (an adapter, the bridge, a tagged host) may still hold it before the
+     * transport accepts it. */
     session_action_poll_prepare(s);
 
     /* The selections of this call share one certificate (see
@@ -5427,6 +5434,10 @@ static moq_result_t session_poll_actions(moq_session_t *s,
             if (head->kind == MOQ_ACTION_SEND_DATA && element_size < send_data_needed)
                 break;
             if (tags) {
+                /* Handed to the host: its custody begins here, before the
+                 * take below can settle (and reap) anything. Only the host's
+                 * moq_session_report_data_fin() establishes FIN acceptance. */
+                sg_note_owner_handoff(s, head, hm);
                 tag_owner = hm->owner;
                 tag_final_for = hm->terminal_owner;
                 tag_deadline = hm->deadline_us;

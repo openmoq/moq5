@@ -2468,6 +2468,7 @@ static void sub_cancel_subgroups(moq_session_t *s, size_t slot, size_t keep)
             moq_subscription_eq(s->subs[slot].handle, sg->sub))
             sg_reset_or_owe(s, (size_t)i, 0x1 /* CANCELLED */, keep);
     }
+    sg_settle_cancelled_closing(s, s->subs[slot].handle, MOQ_PUBLICATION_INVALID, keep);
 }
 
 /* End the request `ep` names with the terminal `term`: the family's terminal

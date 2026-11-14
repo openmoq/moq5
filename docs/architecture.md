@@ -146,7 +146,7 @@ value:
 | `fetch_request_options` | FETCH carries a Location Filter range and FILL_TIMEOUT | no | no | yes |
 | `fetch_range_timed_out` | A fetch stream can mark a range Timed-Out | no | no | yes |
 | `stream_count_unknown` | PUBLISH_DONE Stream Count meaning "not counted" | 2^62-1 | 2^62-1 | 2^64-1 | <!-- api-boundary-exempt -->
-| `subgroup_timer_at_fin` | SUBGROUP_DELIVERY_TIMEOUT starts at the subgroup's FIN | no | no | yes |
+| `subgroup_timer_at_fin` | A subgroup has a timer of its own (SUBGROUP_DELIVERY_TIMEOUT), started at its FIN; without one the delivery timeout bounds each object alone | no | yes | yes |
 | `object_timer_at_header` | OBJECT_DELIVERY_TIMEOUT starts at the object's header | yes | no (first payload byte) | yes |
 | `first_object_timeout_override` | The first object's timeout property overrides the track's | no | no | yes |
 | `publish_done_subscription_ended` | PUBLISH_DONE has SUBSCRIPTION_ENDED for an exhausted filter | yes | yes | no | <!-- api-boundary-exempt -->

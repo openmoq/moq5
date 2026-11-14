@@ -5284,6 +5284,8 @@ static const moq_profile_ops_t d16_ops = {
     .commit_subscribe_update_location = NULL,
     .supports_fill                   = false,
     .stream_count_unknown            = MOQ_QUIC_VARINT_MAX,
+    /* §9.2.2.2: the one DELIVERY TIMEOUT runs per Object from when its
+     * header is provided; no clause gives a subgroup stream a timer. */
     .subgroup_timer_at_fin           = false,
     .object_timer_at_header          = true,
     .first_object_timeout_override   = false,

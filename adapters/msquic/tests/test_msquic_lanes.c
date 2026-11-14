@@ -229,6 +229,8 @@ static struct {
     uint64_t dl_now;
     bool dl_read;
     uint64_t sg_opened_at;
+    uint64_t dl_at_open;  /* read right after the open, before any object */
+    bool obj_written;
 
     /* subscription script driving a real subgroup delivery deadline */
     moq_subscription_t sub;
@@ -275,6 +277,8 @@ static void pump_reset(void)
     g_pump.dl_now = 0;
     g_pump.dl_read = false;
     g_pump.sg_opened_at = 0;
+    g_pump.dl_at_open = 0;
+    g_pump.obj_written = false;
     g_pump.sub = MOQ_SUBSCRIPTION_INVALID;
     g_pump.have_sub = false;
     g_pump.updated = false;
@@ -509,8 +513,12 @@ static void pump_terminal(moq_msquic_managed_lane_t *lane)
 }
 
 /* The server half of the deadline fixture: accept the peer's subscription,
- * adopt the delivery timeout it asks for, then open a subgroup and leave it
- * open -- that is what gives the session a lasting FAR deadline. */
+ * adopt the delivery timeout it asks for, then open a subgroup and write one
+ * object into it. Opening alone arms nothing; the object's own delivery
+ * deadline runs from its header (draft-16, section 9.2.2.2). The transport of
+ * this row grants no unidirectional stream, so the subgroup's stream never
+ * opens and the object is never taken: that keeps the session's FAR deadline
+ * armed for the whole row. */
 static void pump_session(moq_msquic_managed_lane_t *lane, uint64_t now_us)
 {
     moq_msquic_managed_conn_t *c = NULL;
@@ -566,8 +574,18 @@ static void pump_session(moq_msquic_managed_lane_t *lane, uint64_t now_us)
             sgc.publisher_priority = 200;
             if (moq_session_open_subgroup(s, g_pump.sub, &sgc, now_us,
                                           &sg) == MOQ_OK) {
+                moq_rcbuf_t *obj = NULL;
+
                 g_pump.sg_open = true;
                 g_pump.sg_opened_at = now_us;
+                g_pump.dl_at_open = moq_session_next_deadline_us(s);
+                if (moq_rcbuf_create(moq_alloc_default(),
+                                     (const uint8_t *)"o", 1,
+                                     &obj) == MOQ_OK) {
+                    g_pump.obj_written = moq_session_write_object(
+                        s, sg, 0, obj, now_us) == MOQ_OK;
+                    moq_rcbuf_decref(obj);
+                }
                 g_pump.dl = moq_session_next_deadline_us(s);
                 g_pump.dl_now = now_us;
                 g_pump.dl_read = true;
@@ -854,6 +872,18 @@ static QUIC_STATUS deliver_registered(fake_msq_t *f,
         ev.STREAMS_AVAILABLE.BidirectionalCount = (uint16_t)code;
         ev.STREAMS_AVAILABLE.UnidirectionalCount = (uint16_t)code;
     }
+    return fake_msq_deliver_conn_event(f, &ev);
+}
+
+/* STREAMS_AVAILABLE with separate bidirectional and unidirectional counts. */
+static QUIC_STATUS deliver_streams(fake_msq_t *f, uint16_t bidi, uint16_t uni)
+{
+    QUIC_CONNECTION_EVENT ev;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.Type = QUIC_CONNECTION_EVENT_STREAMS_AVAILABLE;
+    ev.STREAMS_AVAILABLE.BidirectionalCount = bidi;
+    ev.STREAMS_AVAILABLE.UnidirectionalCount = uni;
     return fake_msq_deliver_conn_event(f, &ev);
 }
 
@@ -1478,7 +1508,7 @@ static bool peer_step(struct peer *p, struct rig *r, uint64_t *entry,
 
 /* --- 7. far deadline, idle cap, and wake consumption --------------------- */
 
-#define FAR_DELIVERY_US 30000000u /* the subgroup's delivery timeout */
+#define FAR_DELIVERY_US 30000000u /* the object's delivery timeout */
 #define CAP_STEP_US 200000u       /* the production doorbell idle cap */
 
 static void t_far_deadline_causes(void)
@@ -1496,7 +1526,7 @@ static void t_far_deadline_causes(void)
     pump_reset();
     chooser_reset(plan, 1);
     /* no session idle timeout: the ONLY finite deadline this row can read is
-     * the subgroup delivery deadline it arms below */
+     * the object delivery deadline it arms below */
     if (!rig_up(&r, 2, 2, 0, choose_planned, NULL, NULL)) {
         rig_down(&r);
         return;
@@ -1506,9 +1536,9 @@ static void t_far_deadline_causes(void)
     CHECK(deliver_registered(&g_conn_fake[0],
                              QUIC_CONNECTION_EVENT_CONNECTED,
                              0) == QUIC_STATUS_SUCCESS);
-    CHECK(deliver_registered(&g_conn_fake[0],
-                             QUIC_CONNECTION_EVENT_STREAMS_AVAILABLE,
-                             16) == QUIC_STATUS_SUCCESS);
+    /* no unidirectional stream: the subgroup's stream cannot open, so its
+     * object stays in the endpoint, untaken, with its deadline */
+    CHECK(deliver_streams(&g_conn_fake[0], 16, 0) == QUIC_STATUS_SUCCESS);
 
     if (!peer_up(&p, &g_conn_fake[0])) {
         peer_down(&p);
@@ -1520,7 +1550,8 @@ static void t_far_deadline_causes(void)
     CHECK(moq_session_start(p.s, t0) == MOQ_OK);
 
     /* establish, subscribe, ask for the far delivery timeout, open the
-     * subgroup -- every step driven by real wire bytes on both sides */
+     * subgroup and write its object -- every step driven by real wire bytes
+     * on both sides */
     bool subscribed = false;
     bool asked = false;
     uint64_t cev_setup = 0, cev_sub_ok = 0, cev_unexpected = 0;
@@ -1573,8 +1604,8 @@ static void t_far_deadline_causes(void)
     CHECK(subscribed);
     CHECK(asked);
 
-    /* One more relay so the subgroup's own stream traffic is classified too,
-     * then the whole arm is checked fail-closed. */
+    /* One more relay so any child traffic is classified too, then the whole
+     * arm is checked fail-closed. */
     peer_relay(&p, t0);
     /* both peers reached exactly the declared sequence, and nothing else */
     CHECK(cev_setup == 1);
@@ -1609,7 +1640,7 @@ static void t_far_deadline_causes(void)
         fprintf(stderr, "  unexpected endpoint op kind=%d\n",
                 p.op_unexpected_kind);
     CHECK(p.send_ctrl == 3);
-    CHECK(p.send_subgroup == 1);
+    CHECK(p.send_subgroup == 0); /* the subgroup's stream never opened */
     CHECK(p.send_unexpected == 0);
     CHECK(moq_session_state(p.s) == MOQ_SESS_ESTABLISHED);
     CHECK(!moq_transport_bridge_is_fatal(p.bridge));
@@ -1622,27 +1653,37 @@ static void t_far_deadline_causes(void)
     CHECK(g_pump.updated);
     CHECK(armed);
     if (armed) {
-        /* the armed deadline is an EXACT injected-clock relation against the
-         * delivery timeout the peer asked for -- not an inequality */
+        /* the open arms nothing; the object's deadline is an EXACT
+         * injected-clock relation against the delivery timeout the peer
+         * asked for -- not an inequality */
+        CHECK(g_pump.dl_at_open == UINT64_MAX);
+        CHECK(g_pump.obj_written);
         CHECK(g_pump.dl_now == t0);
         CHECK(g_pump.sg_opened_at == t0);
         CHECK(g_pump.dl != UINT64_MAX);
         CHECK(g_pump.dl - g_pump.dl_now == FAR_DELIVERY_US);
         CHECK(g_pump.dl - g_pump.dl_now > CAP_STEP_US);
     }
+    g_pump.dl_read = false;
     pthread_mutex_unlock(&g_pump.mu);
-    pump_arm(PUMP_IDLE);
+    pump_arm(PUMP_DEADLINE);
     if (!armed) {
         peer_down(&p);
         rig_down(&r);
         return;
     }
 
-    /* let the lane settle so the next release is a bare wait cycle */
+    /* let the lane settle so the next release is a bare wait cycle; its pump
+     * reads the deadline again: the untaken object keeps it, unchanged */
     CHECK(moq_msquic_lane_wake(r.lane[0]) == MOQ_OK);
     gate_release(0, entry);
     entry++;
     CHECK(gate_await(0, entry));
+    pthread_mutex_lock(&g_pump.mu);
+    CHECK(g_pump.dl_read);
+    CHECK(g_pump.dl == t0 + FAR_DELIVERY_US);
+    CHECK(g_pump.dl - g_pump.dl_now == FAR_DELIVERY_US);
+    pthread_mutex_unlock(&g_pump.mu);
 
     /* the wait is bounded by the idle cap, not by that far deadline: at
      * exactly the cap the wake classifies as an idle-cap expiry, nothing else */
@@ -1657,6 +1698,10 @@ static void t_far_deadline_causes(void)
     CHECK(b.deadline_sweeps == a.deadline_sweeps);
     CHECK(b.wake_to_pump_samples == a.wake_to_pump_samples);
     CHECK(b.pump_sweeps == a.pump_sweeps);
+    /* every scan of that wait found the far deadline still in the future */
+    CHECK(b.deadline_queries > a.deadline_queries);
+    CHECK(b.deadline_class_future - a.deadline_class_future ==
+          b.deadline_queries - a.deadline_queries);
 
     /* a callback-origin cross-lane wake to the SAME armed lane carries the
      * opposite signature: consumed as a wake, with no deadline sweep */
@@ -1687,11 +1732,28 @@ static void t_far_deadline_causes(void)
     CHECK(d.pump_sweeps == c.pump_sweeps + 1);
     CHECK(d.deadline_sweeps == c.deadline_sweeps);
     CHECK(d.idle_cap_wakes == c.idle_cap_wakes);
+    CHECK(d.deadline_class_none == c.deadline_class_none);
+    CHECK(d.deadline_class_due == c.deadline_class_due);
+
+    /* a last pump re-reads it: the same deadline, armed at t0, throughout */
+    pthread_mutex_lock(&g_pump.mu);
+    g_pump.dl_read = false;
+    pthread_mutex_unlock(&g_pump.mu);
+    pump_arm(PUMP_DEADLINE);
+    CHECK(moq_msquic_lane_wake(r.lane[0]) == MOQ_OK);
+    gate_release(0, entry);
+    entry++;
+    CHECK(gate_await(0, entry));
+    pthread_mutex_lock(&g_pump.mu);
+    CHECK(g_pump.dl_read);
+    CHECK(g_pump.dl == t0 + FAR_DELIVERY_US);
+    pthread_mutex_unlock(&g_pump.mu);
+    pump_arm(PUMP_IDLE);
 
     peer_down(&p);
     rig_down(&r);
     if (failures == before)
-        printf("PASS: far subgroup deadline armed, idle cap and wake causes separated\n");
+        printf("PASS: far object deadline armed, idle cap and wake causes separated\n");
 }
 
 /* --- 8. on_activity confinement ------------------------------------------ */

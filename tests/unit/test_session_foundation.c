@@ -3254,7 +3254,11 @@ deadline_retry_cleanup:
         MOQ_TEST_CHECK(as.balance == 0);
     }
 
-    /* == Deadline: REQUEST_UPDATE affects only future subgroups ======== */
+    /* == Deadline: REQUEST_UPDATE applies to every later object ======== */
+    /* Draft-16 9.2.2.2: DELIVERY TIMEOUT runs per object from its header.
+     * An object already queued keeps the deadline its header set; every
+     * object provided after the update uses the new value, on a subgroup
+     * opened before the update or after it. No subgroup carries a timer. */
     {
         test_alloc_state_t as = {0};
         moq_alloc_t alloc = test_allocator(&as);
@@ -3283,13 +3287,22 @@ deadline_retry_cleanup:
         moq_accept_subscribe_cfg_init(&acc);
         moq_session_accept_subscribe(sv, ssub, &acc, 0);
 
-        /* Open first subgroup at t=1000. Deadline = 1000 + 500000 = 501000. */
+        /* Open the first subgroup at t=1000: no timer of its own. */
         moq_subgroup_cfg_t sg_cfg;
         moq_subgroup_cfg_init(&sg_cfg);
         moq_subgroup_handle_t sg1;
         sg_cfg.group_id = 0;
         moq_session_open_subgroup(sv, ssub, &sg_cfg, 1000, &sg1);
-        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg1) == 501000);
+        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg1) == UINT64_MAX);
+        moq_action_t acts[16]; size_t na;
+        while ((na = moq_session_poll_actions(sv, acts, 16)) > 0)
+            for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
+
+        /* An object provided at t=1000 is due by 1000 + 500000. */
+        moq_rcbuf_t *obj = NULL;
+        MOQ_TEST_CHECK(moq_rcbuf_create(&alloc, (const uint8_t *)"obj", 3, &obj) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_write_object(sv, sg1, 0, obj, 1000) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_next_deadline_us(sv) == 501000);
 
         /* REQUEST_UPDATE changes timeout to 2000ms. */
         uint8_t tv2[8];
@@ -3305,27 +3318,38 @@ deadline_retry_cleanup:
         moq_buf_writer_t uw;
         moq_buf_writer_init(&uw, upd_buf, sizeof(upd_buf));
         moq_d16_encode_request_update(&uw, 2, 0, upd_params, 1);
-        moq_action_t acts[16]; size_t na;
-        while ((na = moq_session_poll_actions(sv, acts, 16)) > 0)
-            for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
-        moq_session_on_control_bytes(sv, upd_buf,
-            moq_buf_writer_offset(&uw), 2000);
+        MOQ_TEST_CHECK(moq_session_on_control_bytes(sv, upd_buf,
+            moq_buf_writer_offset(&uw), 2000) == MOQ_OK);
         while (moq_session_poll_events(sv, &ev, 1) == 1) moq_event_cleanup(&ev);
 
-        /* First subgroup keeps old deadline. */
-        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg1) == 501000);
+        /* The queued object keeps the deadline its header set. */
+        MOQ_TEST_CHECK(moq_session_next_deadline_us(sv) == 501000);
+        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg1) == UINT64_MAX);
+        while ((na = moq_session_poll_actions(sv, acts, 16)) > 0)
+            for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
+        MOQ_TEST_CHECK(moq_session_next_deadline_us(sv) == UINT64_MAX);
 
-        /* Open second subgroup at t=2000. Should use new 2000ms timeout.
-         * Deadline = 2000 + 2000000 = 2002000. */
+        /* A later object on the subgroup opened before the update uses the
+         * new value: 3000 + 2000000. */
+        MOQ_TEST_CHECK(moq_session_write_object(sv, sg1, 1, obj, 3000) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_next_deadline_us(sv) == 2003000);
+        while ((na = moq_session_poll_actions(sv, acts, 16)) > 0)
+            for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
+
+        /* So does one on a subgroup opened after it: 4000 + 2000000. */
         moq_subgroup_handle_t sg2;
         sg_cfg.group_id = 1;
+        moq_session_open_subgroup(sv, ssub, &sg_cfg, 4000, &sg2);
+        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg2) == UINT64_MAX);
         while ((na = moq_session_poll_actions(sv, acts, 16)) > 0)
             for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
-        moq_session_open_subgroup(sv, ssub, &sg_cfg, 2000, &sg2);
-        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg2) == 2002000);
+        MOQ_TEST_CHECK(moq_session_write_object(sv, sg2, 0, obj, 4000) == MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_next_deadline_us(sv) == 2004000);
 
         while ((na = moq_session_poll_actions(sv, acts, 16)) > 0)
             for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
+        MOQ_TEST_CHECK(moq_rcbuf_refcount(obj) == 1);
+        moq_rcbuf_decref(obj);
         moq_session_destroy(c);
         moq_session_destroy(sv);
         MOQ_TEST_CHECK(as.balance == 0);
@@ -3364,7 +3388,11 @@ deadline_retry_cleanup:
         moq_subgroup_cfg_init(&sg_cfg);
         moq_subgroup_handle_t sg;
         moq_session_open_subgroup(sv, ssub, &sg_cfg, 0, &sg);
-        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg) != UINT64_MAX);
+        /* Opening arms nothing on draft-16; arm the subgroup timer here so
+         * the close path's clearing is what this case observes. */
+        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg) == UINT64_MAX);
+        test_set_sg_deadline(sv, sg, 1000000);
+        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg) == 1000000);
 
         /* Close before timeout fires. */
         moq_session_close_subgroup(sv, sg, 500);
@@ -3422,8 +3450,12 @@ deadline_retry_cleanup:
         moq_subgroup_cfg_init(&sg_cfg);
         moq_subgroup_handle_t sg;
         moq_session_open_subgroup(sv, ssub, &sg_cfg, 0, &sg);
-        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg) != UINT64_MAX);
-        MOQ_TEST_CHECK(test_get_session_sg_deadline(sv) != UINT64_MAX);
+        /* Opening arms nothing on draft-16; arm the subgroup timer here so
+         * the UNSUBSCRIBE path's clearing is what this case observes. */
+        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg) == UINT64_MAX);
+        test_set_sg_deadline(sv, sg, 1000000);
+        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg) == 1000000);
+        MOQ_TEST_CHECK(test_get_session_sg_deadline(sv) == 1000000);
 
         /* Drain actions. */
         moq_action_t acts[16]; size_t na;
@@ -3500,7 +3532,7 @@ deadline_retry_cleanup:
         while ((na = moq_session_poll_actions(sv, acts, 16)) > 0)
             for (size_t i = 0; i < na; i++) moq_action_cleanup(&acts[i]);
 
-        /* Open two subgroups at different times → different deadlines. */
+        /* Open two subgroups; neither open arms a timer on draft-16. */
         moq_subgroup_cfg_t sg_cfg;
         moq_subgroup_cfg_init(&sg_cfg);
         moq_subgroup_handle_t sg1, sg2;
@@ -3512,9 +3544,13 @@ deadline_retry_cleanup:
         sg_cfg.group_id = 1;
         moq_session_open_subgroup(sv, ssub, &sg_cfg, 200, &sg2);
         /* sg2 header sits in the queue (1 of 2 slots used). */
+        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg1) == UINT64_MAX);
+        MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg2) == UINT64_MAX);
 
-        /* sg1 deadline = 100 + 1000000 = 1000100
-         * sg2 deadline = 200 + 1000000 = 1000200 */
+        /* Arm two different subgroup deadlines so the UNSUBSCRIBE path's
+         * clearing and recomputation is what this case observes. */
+        test_set_sg_deadline(sv, sg1, 1000100);
+        test_set_sg_deadline(sv, sg2, 1000200);
         MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg1) == 1000100);
         MOQ_TEST_CHECK(test_get_sg_deadline(sv, sg2) == 1000200);
         MOQ_TEST_CHECK(test_get_session_sg_deadline(sv) == 1000100);

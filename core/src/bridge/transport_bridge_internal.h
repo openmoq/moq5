@@ -662,6 +662,15 @@ bool bridge_session_take_data_timeout(moq_session_t *s, moq_stream_ref_t ref,
                                       uint64_t now_us,
                                       moq_reset_data_action_t *reset,
                                       bool *outgoing_terminal);
+/* The transport accepted the FIN of local data stream `ref`: no earlier byte
+ * of the stream remains in the bridge, so its subgroup's timed output has
+ * left the bridge's custody. Clears only that custody; a recognized
+ * terminal, an owed reset and a negotiated subgroup timer are unaffected. */
+void bridge_session_on_data_fin_accepted(moq_session_t *s, moq_stream_ref_t ref);
+/* The bridge is dropping its storage (destroy, fatal or close) while the
+ * session may survive: every subgroup's timed output leaves its custody,
+ * with no FIN, reset or terminal fabricated and no recognized debt removed. */
+void bridge_session_drop_custody(moq_session_t *s);
 
 /* Local receive retirement (session_receive.c): the transport finished with a
  * peer data stream after our accepted STOP_SENDING, and no FIN or RESET for it

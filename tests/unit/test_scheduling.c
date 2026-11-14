@@ -6662,13 +6662,12 @@ typedef struct {
 /* Three owners -- a subscription whose objects carry a 7 ms delivery
  * timeout, an untimed subscription and a publication -- each open one
  * subgroup, and objects wait in the publisher's session. Its deadline is the
- * timed objects' (draft-16's one DELIVERY TIMEOUT also bounds that stream,
- * whose timer started when it opened, with them); once they are written,
- * each stream carrying its own objects once and in order, only that
- * draft-16 subgroup timer is left, and once the subgroups close none is. The
- * subscriber arms nothing. Each walk reads the live owners: three subgroups,
- * two subscriptions and one publication on the publisher; two subscriptions
- * and one publication on the subscriber. */
+ * timed objects'; once they are written, each stream carrying its own
+ * objects once and in order, none is left on any draft (draft-16's one
+ * DELIVERY TIMEOUT bounds the objects, never the stream), and closing the
+ * subgroups arms none. The subscriber arms nothing. Each walk reads the live
+ * owners: three subgroups, two subscriptions and one publication on the
+ * publisher; two subscriptions and one publication on the subscriber. */
 static bool ss_sparse_row(pair_t *p, ss_image_t *img)
 {
     memset(img, 0, sizeof(*img));
@@ -6735,8 +6734,7 @@ static bool ss_sparse_row(pair_t *p, ss_image_t *img)
     MOQ_TEST_CHECK(ss_stream_carried(p, sid[1], plain_objs, 1));
     MOQ_TEST_CHECK(ss_stream_carried(p, sid[2], pub_objs, 1));
     img->drained_dl = ss_rel(moq_session_next_deadline_us(p->pub), t0);
-    MOQ_TEST_CHECK_EQ_U64(img->drained_dl, p->ver == MOQ_VERSION_DRAFT_16
-                                               ? SS_TIMEOUT_US : UINT64_MAX);
+    MOQ_TEST_CHECK_EQ_U64(img->drained_dl, UINT64_MAX);
     for (int i = 0; i < 3; i++)
         SS_REQUIRE(moq_session_close_subgroup(p->pub, sg[i], p->now) == MOQ_OK);
     serve_all(p);
@@ -6844,15 +6842,14 @@ static bool ss_expiry_row(pair_t *p)
  * 7 ms delivery timeouts, each open a subgroup at the same instant behind a
  * network that takes no data. The longer one's object is queued first and
  * the shorter one's after it, which moves the deadline earlier, to the
- * shorter one's (draft-16's subgroup timers run from the open, so there it
- * is the deadline from the start). Just before it nothing changes; at it the
- * shorter stream is reset with DELIVERY_TIMEOUT after its header, and the
- * deadline moves later, to the longer object's. That object then goes out,
- * and once its subgroup closes nothing is due. */
+ * shorter one's, on every draft: opening a subgroup arms no timer. Just
+ * before it nothing changes; at it the shorter stream is reset with
+ * DELIVERY_TIMEOUT after its header, and the deadline moves later, to the
+ * longer object's. Once that object goes out nothing is due, and closing
+ * its subgroup arms nothing. */
 static bool ss_earlier_row(pair_t *p)
 {
     const uint64_t t0 = p->now;
-    const bool d16 = p->ver == MOQ_VERSION_DRAFT_16;
     regression_owner_t lo, sh;
     if (!regression_owner(p, false, "ss-long", 128, SS_LONG_MS, &lo) ||
         !regression_owner(p, false, "ss-short", 128, SS_TIMEOUT_MS, &sh))
@@ -6866,8 +6863,7 @@ static bool ss_earlier_row(pair_t *p)
     p->mt->cap = 0;
     SS_REQUIRE(write_object(p, sgl, 1, 1, 0, 0) == MOQ_OK);
     CHECK_SESSION_COUNTS(p->pub);
-    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub),
-                          t0 + (d16 ? SS_TIMEOUT_US : SS_LONG_US));
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), t0 + SS_LONG_US);
     SS_REQUIRE(write_object(p, sgs, 2, 1, 0, 0) == MOQ_OK);
     CHECK_SESSION_COUNTS(p->pub);
     SS_REQUIRE(ss_queued(p->pub) == 2 && p->pub->action_timed == 2);
@@ -6898,8 +6894,7 @@ static bool ss_earlier_row(pair_t *p)
     serve_all(p);
     MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sidl), 1);
     MOQ_TEST_CHECK_EQ_INT((int)ss_objects_on(p, sids), 0);
-    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub),
-                          d16 ? t0 + SS_LONG_US : UINT64_MAX);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
     SS_REQUIRE(moq_session_close_subgroup(p->pub, sgl, p->now) == MOQ_OK);
     serve_all(p);
     MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(p->pub), UINT64_MAX);
@@ -7734,8 +7729,8 @@ static void test_object_timeout_after_handover(void)
 /* [DT-03] An expired subgroup whose stream the bridge has not opened yet
  * (the stream map is full) gets no stream: draft-18 8 "SHOULD NOT attempt
  * to open a new stream to deliver additional Objects in that Subgroup".
- * Drafts 18 and 22: draft-16 times a whole subgroup from its open, so its
- * earlier subgroup would time out too. */
+ * Drafts 18 and 22, whose two control streams and request stream fill the
+ * stream map below; the object timer itself is per object on every draft. */
 static void test_object_timeout_before_open_case(bool lost_header)
 {
     static const moq_version_t vers[] = { MOQ_VERSION_DRAFT_18,

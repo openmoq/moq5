@@ -160,6 +160,8 @@ void sg_free_entry(moq_session_t *s, size_t slot)
     sg_occ_unlink(s, slot);
     entries[slot].delivery_deadline_us = UINT64_MAX;
     entries[slot].streaming_deadline_us = UINT64_MAX;
+    entries[slot].timed_custody = false;
+    entries[slot].fin_handed = false;
     entries[slot].ovr_has_object = entries[slot].ovr_has_subgroup = false;
     entries[slot].terminal_cause = MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
     entries[slot].terminal_code = 0;
@@ -467,6 +469,96 @@ bool sg_has_terminal_debt(const moq_session_t *s)
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
         if (s->subgroups[i].state == MOQ_SG_TERMINAL_OWED) return true;
     return false;
+}
+
+/* -- Timed output in the transport owner's custody ------------------ */
+
+void sg_note_owner_handoff(moq_session_t *s, const moq_action_t *a,
+                           const moq_action_meta_t *m)
+{
+    if (a->kind != MOQ_ACTION_SEND_DATA) return;
+    const bool timed = m->deadline_us != UINT64_MAX;
+    if (!timed && !a->u.send_data.fin) return;
+    int slot = sg_find_by_stream_ref(s, a->u.send_data.stream_ref);
+    if (slot < 0) return;
+    if (timed) s->subgroups[slot].timed_custody = true;
+    if (a->u.send_data.fin) s->subgroups[slot].fin_handed = true;
+}
+
+void bridge_session_on_data_fin_accepted(moq_session_t *s, moq_stream_ref_t ref)
+{
+    int slot = sg_find_by_stream_ref(s, ref);
+    if (slot >= 0) s->subgroups[slot].timed_custody = false;
+}
+
+void bridge_session_drop_custody(moq_session_t *s)
+{
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
+        s->subgroups[i].timed_custody = false;
+}
+
+moq_result_t moq_session_report_data_fin(moq_session_t *s, moq_stream_ref_t stream_ref)
+{
+    if (!s || stream_ref._v == 0 || stream_ref._v >= MOQ_STREAM_REF_LOCAL_END)
+        return MOQ_ERR_INVAL;
+    if (!s->tagged_output) return MOQ_ERR_WRONG_STATE;
+    if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
+    int slot = sg_find_by_stream_ref(s, stream_ref);
+    if (slot < 0) return MOQ_OK;
+    moq_sg_entry_t *sg = &s->subgroups[slot];
+    /* A reset already ends the stream, whether queued, claimed or still owed
+     * after a recognized terminal: the report is obsolete and changes nothing,
+     * as it does once that entry is reaped. */
+    if (sg->state == MOQ_SG_RESETTING || sg->state == MOQ_SG_RESET_OWED ||
+        sg->state == MOQ_SG_TERMINAL_OWED)
+        return MOQ_OK;
+    /* Queuing the FIN, or closing the subgroup, is not handing it out. */
+    if (!sg->fin_handed) return MOQ_ERR_WRONG_STATE;
+    sg->timed_custody = false;
+    return MOQ_OK;
+}
+
+/* Drop the stream's queued SEND_DATA except a subgroup header the transport
+ * owner has not taken yet: the reset that follows still delivers it. */
+static void sg_drop_queued_output(moq_session_t *s, moq_stream_ref_t ref)
+{
+    size_t w = s->action_head, cap = s->action_cap;
+    for (size_t r = s->action_head; r < s->action_tail; r++) {
+        moq_action_t *a = &s->actions[r % cap];
+        moq_action_meta_t *m = &s->action_meta[r % cap];
+        if (a->kind == MOQ_ACTION_SEND_DATA && a->u.send_data.stream_ref._v == ref._v &&
+            !m->subgroup_header && !m->terminal_barrier) {
+            session_action_dequeued(s, a, m);
+            moq_action_cleanup(a);
+            continue;
+        }
+        if (w != r) {
+            s->actions[w % cap] = *a;
+            s->action_meta[w % cap] = *m;
+        }
+        w++;
+    }
+    for (size_t r = w; r < s->action_tail; r++) {
+        memset(&s->actions[r % cap], 0, sizeof(*s->actions));
+        memset(&s->action_meta[r % cap], 0, sizeof(*s->action_meta));
+    }
+    s->action_tail = w;
+}
+
+void sg_settle_cancelled_closing(moq_session_t *s, moq_subscription_t sub,
+                                 moq_publication_t pub, size_t keep)
+{
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+        moq_sg_entry_t *sg = &s->subgroups[i];
+        if (sg->state != MOQ_SG_CLOSING) continue;
+        bool owned = moq_subscription_is_valid(sub)
+            ? moq_subscription_eq(sg->sub, sub)
+            : moq_publication_is_valid(sg->pub) && moq_publication_eq(sg->pub, pub);
+        if (!owned || !sg->timed_custody) continue;
+        sg_drop_queued_output(s, sg->stream_ref);
+        sg->timed_custody = false;
+        sg_reset_or_owe(s, (size_t)i, 0x1 /* CANCELLED */, keep);
+    }
 }
 
 bool bridge_session_take_terminal_changes(moq_session_t *s)
@@ -796,7 +888,10 @@ bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget)
         session_work_sg_reap_probes++;
 #endif
         /* A CLOSING entry with an armed deadline is awaiting the transport's
-         * commit report for its FIN; it stays until that report or its timer. */
+         * commit report for its FIN; it stays until that report or its timer.
+         * One whose timed output is in the transport owner's custody stays
+         * until that custody ends (accepted FIN, reset, cancellation, owner
+         * teardown), so an expiry or STOP of that output keeps its identity. */
         bool queued_expiry = false;
         if (s->action_timed != 0 && s->subgroups[i].state == MOQ_SG_CLOSING)
             for (size_t j = s->action_head; j < s->action_tail; j++)
@@ -810,7 +905,8 @@ bool sg_reap_terminal_resumable(moq_session_t *s, uint32_t *budget)
         if (queued_expiry || (s->subgroups[i].state != MOQ_SG_CLOSING &&
              s->subgroups[i].state != MOQ_SG_RESETTING) ||
             (s->subgroups[i].state == MOQ_SG_CLOSING &&
-             s->subgroups[i].delivery_deadline_us != UINT64_MAX)) {
+             (s->subgroups[i].delivery_deadline_us != UINT64_MAX ||
+              s->subgroups[i].timed_custody))) {
             s->sweep_slot = (nxt >= 0) ? (size_t)nxt : s->sg_cap;
             continue;                      /* costs nothing; never suspends */
         }
@@ -1058,24 +1154,13 @@ moq_result_t moq_session_open_subgroup(
     entry->ovr_has_object = entry->ovr_has_subgroup = false;
     entry->terminal_cause = MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
     entry->terminal_code = 0;
-    /* The subgroup timer uses the negotiated SUBGROUP timeout: the per-type
-     * smaller non-zero of the publisher-side (our Track Properties) and
-     * subscriber-side (peer parameters / acknowledged updates) values. On
-     * profiles whose timer runs from the FIN it is armed by close_subgroup
-     * instead, where the first object's override is also known. */
+    entry->timed_custody = false;
+    entry->fin_handed = false;
+    /* Opening a stream arms no timer. Each object carries its own deadline
+     * from where its clock starts; a profile with a subgroup timer arms it
+     * in close_subgroup, where the first object's override is also known.
+     * The publication path opens the same way. */
     entry->delivery_deadline_us = UINT64_MAX;
-    if (!s->profile->subgroup_timer_at_fin) {
-        const moq_sub_entry_t *dte = &s->subs[sub_slot];
-        uint64_t sg_ms = dt_negotiate_ms(
-            dte->dt_pub_has_subgroup, dte->dt_pub_subgroup_ms,
-            dte->dt_sub_has_subgroup, dte->dt_sub_subgroup_ms);
-        uint64_t sg_us = ms_to_us_sat(sg_ms);
-        if (sg_us > 0) {
-            entry->delivery_deadline_us = deadline_add(now_us, sg_us);
-            if (entry->delivery_deadline_us < s->subgroup_deadline_us)
-                s->subgroup_deadline_us = entry->delivery_deadline_us;
-        }
-    }
     if (s->subs[sub_slot].subgroup_streams_opened != UINT64_MAX)
         s->subs[sub_slot].subgroup_streams_opened++;
     s->next_stream_ref++;

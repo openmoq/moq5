@@ -1,6 +1,8 @@
-/* Native fake-time contract: FIN starts D18/D22 subgroup delivery timing.
- * SimPair establishes the real owners, then only public session inputs and
- * polled action refs are used. Handing FIN to the transport is not a commit. */
+/* Native fake-time contract: FIN starts D18/D22 subgroup delivery timing,
+ * and D16, whose one DELIVERY_TIMEOUT bounds each object, has no subgroup
+ * timer at all. SimPair establishes the real owners, then only public
+ * session inputs and polled action refs are used. Handing FIN to the
+ * transport is not a commit. */
 #include <moq/moq.h>
 #include <moq/sim.h>
 #include "test_alloc_support.h"
@@ -362,26 +364,43 @@ done:
     cleanup(&f, before);
 }
 
-/* Compatibility control only: D16's declared open-start/close-clear behavior,
- * with its own DELIVERY_TIMEOUT extension, not a D18 conformance assertion. */
-static void d16_control(void)
+/* D16 has no subgroup timer: its one DELIVERY_TIMEOUT (here the 100 ms Track
+ * Extension) runs per object from the object's header (section 9.2.2.2).
+ * Opening a subgroup, an age past the budget, a commit report and the FIN
+ * all leave the session without a deadline, and a stream older than the
+ * budget keeps carrying objects. Object expiry itself is pinned by
+ * d16_delivery_timeout. */
+static void d16_row(bool publication)
 {
-    case_name = "d16/subscribe/legacy-control";
+    case_name = publication ? "d16/publish/per-object-only" : "d16/subscribe/per-object-only";
     unsigned before = failures;
     fixture_t f;
-    if (!setup(&f, MOQ_VERSION_DRAFT_16, false)) goto done;
+    if (!setup(&f, MOQ_VERSION_DRAFT_16, publication)) goto done;
     moq_subgroup_handle_t sg;
     moq_stream_ref_t ref = moq_stream_ref_from_u64(0);
-    if (!open_group(&f, 7, 10, &sg, &ref) || !write_object(&f, sg, ref, 20)) goto done;
-    expect("legacy-open-deadline", moq_session_next_deadline_us(f.sender), f.base + 110 * MS);
+    if (!open_group(&f, 7, 10, &sg, &ref)) goto done;
+    expect("open-arms-no-timer", moq_session_next_deadline_us(f.sender), UINT64_MAX);
+    if (!write_object(&f, sg, ref, 20)) goto done;
+    expect("handed-over-object-leaves-no-timer", moq_session_next_deadline_us(f.sender),
+           UINT64_MAX);
     NEED(moq_session_on_data_committed(f.sender, ref, f.base + 30 * MS) == MOQ_OK);
-    expect("legacy-open-commit-noop", moq_session_next_deadline_us(f.sender), f.base + 110 * MS);
-    if (!finish_group(&f, sg, ref, 50)) goto done;
-    expect("legacy-close-clears", moq_session_next_deadline_us(f.sender), UINT64_MAX);
-    NEED(moq_session_on_data_committed(f.sender, ref, f.base + 60 * MS) == MOQ_OK);
-    NEED(moq_session_tick(f.sender, f.base + 200 * MS) == MOQ_OK);
-    timer_actions(&f, ref, "legacy-no-post-fin-reset", 0);
-    expect("legacy-session-live", moq_session_state(f.sender), MOQ_SESS_ESTABLISHED);
+    expect("open-stream-commit-noop", moq_session_next_deadline_us(f.sender), UINT64_MAX);
+    NEED(moq_session_tick(f.sender, f.base + 160 * MS) == MOQ_OK);
+    timer_actions(&f, ref, "no-reset-past-open-plus-budget", 0);
+    moq_result_t rc = moq_session_write_object(f.sender, sg, 1, f.payload, f.base + 161 * MS);
+    expect("old-stream-keeps-publishing", rc == MOQ_OK, true);
+    actions_t t = poll_actions(&f, ref);
+    expect("continued-object", t.payloads, 1);
+    expect("continued-no-reset", t.resets, 0);
+    if (!finish_group(&f, sg, ref, 170)) goto done;
+    expect("fin-starts-no-timer", moq_session_next_deadline_us(f.sender), UINT64_MAX);
+    NEED(moq_session_on_data_committed(f.sender, ref, f.base + 180 * MS) == MOQ_OK);
+    NEED(moq_session_tick(f.sender, f.base + 400 * MS) == MOQ_OK);
+    timer_actions(&f, ref, "no-post-fin-reset", 0);
+    expect("sender-live", moq_session_state(f.sender), MOQ_SESS_ESTABLISHED);
+    expect("receiver-live", moq_session_state(f.receiver), MOQ_SESS_ESTABLISHED);
+    expect_terminal(&f, sg, ref, 7, false);
+    expect("no-receiver-events", drain_events(f.receiver), 0);
 done:
     cleanup(&f, before);
 }
@@ -393,7 +412,8 @@ int main(void)
         for (unsigned origin = 0; origin < 2; ++origin)
             for (unsigned mode = 0; mode < 3; ++mode)
                 timer_row(versions[v], origin != 0, mode);
-    d16_control();
+    d16_row(false);
+    d16_row(true);
     printf("%u cases, %u checks, %u failed cases, %u behavioral failures, %u prerequisite failures\n",
            cases, checks, failed_cases, failures - prerequisites, prerequisites);
     return failures ? 1 : 0;
