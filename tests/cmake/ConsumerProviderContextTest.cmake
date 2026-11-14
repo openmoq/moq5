@@ -64,6 +64,11 @@ function(_configure what src build)
     execute_process(
         COMMAND ${isolated} ${common_args} -S "${src}" -B "${MOQ_WORK}/${build}" ${ARGN}
         RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+    # Each nested configure's status and whole output are kept and shown even
+    # on success, so its diagnostics can be judged after the work tree is gone.
+    file(WRITE "${MOQ_WORK}/logs/${build}.configure.log" "${out}")
+    file(WRITE "${MOQ_WORK}/logs/${build}.configure.status" "${rc}\n")
+    message(STATUS "${what} configure exit ${rc}:\n${out}")
     if(NOT rc EQUAL 0)
         message(FATAL_ERROR "${what} configure failed (${rc}):\n${out}")
     endif()

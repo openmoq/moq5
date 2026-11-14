@@ -500,6 +500,14 @@ moq_stream_ref_t bridge_assign_inbound_ref(
     bridge_stream_entry_t *existing = bridge_find_by_id(b, transport_id);
     if (existing) return existing->ref;
 
+    /* Every peer ref has been issued once the counter wrapped past
+     * UINT64_MAX: a further peer stream cannot be named without reusing a
+     * ref the session may still hold records for. */
+    if (b->next_inbound_ref == 0) {
+        bridge_set_fatal(b, 0x1);
+        return moq_stream_ref_from_u64(0);
+    }
+
     bridge_stream_entry_t *e = bridge_alloc_stream(b);
     if (!e) {
         bridge_set_fatal(b, 0x1);
@@ -1054,6 +1062,49 @@ static bridge_domain_t bridge_pending_domain(const bridge_pending_item_t *p)
 }
 
 
+/* Our send half of a bidi takes no more output: the peer's STOP_SENDING
+ * reset it, or the peer stopped the response stream of the FETCH it
+ * carries (fetch_req_stopped), so its reset is owed instead. */
+static bool bridge_bidi_send_frozen(const bridge_stream_entry_t *e)
+{
+    return e->peer_stop_received || e->fetch_req_stopped;
+}
+
+/* A request half frozen by its FETCH's data STOP that no reset has settled
+ * yet: none is owed or sent for it (the session's, a peer STOP's answer, an
+ * abort, the bridge's own). An accepted FIN does not settle it: acceptance
+ * is not completion, and the FETCH's paired reset is still owed. (The
+ * FETCH's request FIN is its final message, held until the response stream
+ * has its FIN or reset accepted, so it is never accepted while the response
+ * stream can still be stopped.) */
+static bool bridge_fetch_req_unsettled(const bridge_stream_entry_t *e)
+{
+    return e->active && e->kind == BRIDGE_STREAM_BIDI && e->fetch_req_stopped &&
+           !e->local_cancel_queued && !e->peer_stop_received && !e->aborting;
+}
+
+/* ...and its reset with CANCELLED is the bridge's to send now: no native
+ * FETCH holds the request any more (a live one can still commit its own
+ * teardown, which resets the half, and while its teardown is refused for
+ * event capacity no send capacity changes that), and the session queues no
+ * reset or abort of it (a native terminal that committed first keeps its
+ * cause). Send-side work: the readiness queries report it. */
+static bool bridge_fetch_req_reset_owed(const moq_transport_bridge_t *b,
+                                        const bridge_stream_entry_t *e)
+{
+    return bridge_fetch_req_unsettled(e) &&
+           !bridge_session_fetch_request_live(b->session, e->ref) &&
+           !bridge_session_has_queued_request_reset(b->session, e->ref);
+}
+
+/* Reset work the bridge owes itself for a stopped FETCH, by stream entry. */
+static bool bridge_fetch_debt_owed(const moq_transport_bridge_t *b,
+                                   const bridge_stream_entry_t *e)
+{
+    return e->active &&
+           (e->fetch_reset_owed || bridge_fetch_req_reset_owed(b, e));
+}
+
 /* Queued output that a STOP_SENDING on this stream has made obsolete. Items
  * carrying the stream's ref are matched by ref; the control-channel writes
  * that carry none are matched by transport id only when they name this stream,
@@ -1222,6 +1273,9 @@ static moq_result_t bridge_stop_bidi_send_half(moq_transport_bridge_t *b,
         e->peer_stop_received = true;
         return MOQ_OK;
     }
+    /* A stopped FETCH already owes this half its reset with CANCELLED: the
+     * STOP's answer is that reset, with that first code, and only once. */
+    if (e->fetch_req_stopped) error_code = MOQ_STREAM_ERROR_CANCELLED;
 
     bridge_drop_pending_bidi_output(b, e);
     e->peer_stop_received = true;
@@ -1798,7 +1852,8 @@ bool moq_transport_bridge_has_pending(const moq_transport_bridge_t *b)
     for (uint32_t i = 0; i < b->max_streams; i++) {
         if (b->streams[i].active &&
             (b->streams[i].reset_source_held ||
-             bridge_stream_has_inbound_pending(&b->streams[i])))
+             bridge_stream_has_inbound_pending(&b->streams[i]) ||
+             bridge_fetch_debt_owed(b, &b->streams[i])))
             return true;
     }
     for (uint32_t i = 0, n = bridge_hold_span(b); i < n; i++) {
@@ -1828,6 +1883,12 @@ bool moq_transport_bridge_has_outbound_pending(const moq_transport_bridge_t *b)
      * of the pending FIFO. Transport readiness must still retry it. */
     for (uint32_t i = 0; i < b->max_streams; ++i)
         if (b->streams[i].active && b->streams[i].reset_source_held)
+            return true;
+    /* A reset the bridge owes itself for a stopped FETCH is send-side work
+     * once nothing native can still settle it. A FETCH whose teardown waits
+     * for event capacity is not: its stored STOP is inbound retry state. */
+    for (uint32_t i = 0; i < b->max_streams; ++i)
+        if (bridge_fetch_debt_owed(b, &b->streams[i]))
             return true;
     /* An owed cancellation of a held stream is send-side work. */
     for (uint32_t i = 0, n = bridge_hold_span(b); i < n; i++)
@@ -2229,12 +2290,35 @@ static void bridge_local_data_fin_done(moq_transport_bridge_t *b, moq_stream_ref
 {
     bridge_mark_local_close(b, ref);
     bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
+    /* The provider took the FIN of a FETCH response stream: from here a
+     * STOP is its to answer. Not an acknowledgement. */
+    if (e && e->fetch_end == BRIDGE_FETCH_END_OPEN)
+        e->fetch_end = BRIDGE_FETCH_END_FIN_ACCEPTED;
     if (e && e->kind == BRIDGE_STREAM_UNI && e->origin == BRIDGE_ORIGIN_LOCAL &&
         (b->ops->capabilities & MOQ_TRANSPORT_CAP_COMMIT_REPORT)) {
         e->awaiting_commit = true;
         return;
     }
     bridge_retire_or_tombstone(b, ref);
+}
+
+/* A local unidirectional data stream was just opened for `sd`, its first
+ * action. A FETCH header starts the stream's end custody
+ * (bridge_fetch_end_t) and records its request stream from the header's
+ * private record: both outlive the FETCH, whose native state can end, even
+ * before this header was handed over, while the stream's FIN still waits
+ * for the provider. */
+static void bridge_note_local_data_open(moq_transport_bridge_t *b,
+                                        bridge_stream_entry_t *e,
+                                        const moq_send_data_action_t *sd,
+                                        const moq_action_meta_t *meta)
+{
+    if (e->fetch_end != BRIDGE_FETCH_END_NONE || sd->header_len == 0 ||
+        !bridge_session_is_fetch_header(b->session, sd))
+        return;
+    e->fetch_end = BRIDGE_FETCH_END_OPEN;
+    e->fetch_header_len = sd->header_len;
+    e->fetch_req_ref = moq_stream_ref_from_u64(meta ? meta->paired_request : 0);
 }
 
 /* -- Data-stream scheduling (MOQT 7.2) ----------------------------------- */
@@ -3157,6 +3241,7 @@ static moq_result_t dispatch_send_data(moq_transport_bridge_t *b,
         e->transport_id = uni_id;
         e->kind = BRIDGE_STREAM_UNI;
         e->origin = BRIDGE_ORIGIN_LOCAL;
+        bridge_note_local_data_open(b, e, sd, meta);
     }
 
     (void)bridge_session_resolve_data_open(b->session, ref,
@@ -3304,6 +3389,14 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
         bool deferred;
         moq_result_t frc = bridge_dstream_reset(b, ref, error_code, reliable, terminal,
                                                 &deferred);
+        if (deferred) {
+            /* Retained behind its prefix, the reset already owns the end. */
+            bridge_stream_entry_t *fe = bridge_find_by_ref(b, ref);
+            if (fe && fe->fetch_end != BRIDGE_FETCH_END_NONE) {
+                fe->fetch_end = BRIDGE_FETCH_END_RESET;
+                fe->fetch_reset_owed = false;
+            }
+        }
         if (frc < 0 || deferred) return frc;
     }
 
@@ -3343,6 +3436,15 @@ static moq_result_t dispatch_reset_data(moq_transport_bridge_t *b,
     if (is_bidi && (e->peer_stop_received || e->local_cancel_queued)) {
         bridge_retire_or_tombstone(b, ref);
         return MOQ_OK;
+    }
+    /* From here this half's reset is owed or sent: a later peer STOP on the
+     * stream (its mapping may stay for a drain) reuses it, never a second.
+     * It also settles a request half its FETCH's data STOP froze. */
+    if (is_bidi) e->local_cancel_queued = true;
+    /* This reset owns a FETCH response stream's end, whoever queued it. */
+    if (!is_bidi && e->fetch_end != BRIDGE_FETCH_END_NONE) {
+        e->fetch_end = BRIDGE_FETCH_END_RESET;
+        e->fetch_reset_owed = false;
     }
     const bool retain_reset_mapping = !is_bidi &&
         ((e->awaiting_commit && e->subgroup_header_len != 0) ||
@@ -3492,6 +3594,71 @@ static moq_result_t bridge_settle_bidi_cancel(moq_transport_bridge_t *b,
             return bridge_retention_failed(b, &p);
         e->local_cancel_queued = true;
         *queued = true;
+    }
+    return MOQ_OK;
+}
+
+/* Service-pass step: the resets the bridge owes itself after a peer STOP on
+ * a FETCH response stream. The response stream's (bridge_fetch_owe_reset:
+ * its FETCH ended first), with the first STOP's code and its FETCH header
+ * as the reliable prefix; and, on drafts 18 and 22, its request stream's
+ * with CANCELLED once no native FETCH or native reset can still settle
+ * that half (bridge_fetch_req_reset_owed), independently of which reset
+ * owns the response stream. A reset that has meanwhile come from elsewhere
+ * (the peer's STOP of the request, the bridge's own request cancellation,
+ * an abort) answers instead; none is ever doubled. Each needs one
+ * retention slot in case the endpoint refuses it; with none free the debt
+ * stays due, like an action the drain step does not poll at saturation.
+ * Sets *moved when a reset was dispatched or queued. */
+static moq_result_t bridge_settle_fetch_debt(moq_transport_bridge_t *b,
+                                             bool *moved)
+{
+    b->fetch_debt_due = false;
+    for (uint32_t i = 0; i < b->max_streams && !b->fatal && !b->closed; i++) {
+        bridge_stream_entry_t *e = &b->streams[i];
+        if (!e->active) continue;
+        if (e->fetch_reset_owed) {
+            if (b->pending_count >= b->max_pending) {
+                b->fetch_debt_due = true;    /* backpressure, not a failure */
+                break;
+            }
+            moq_action_t a;
+            memset(&a, 0, sizeof(a));
+            a.kind = MOQ_ACTION_RESET_DATA;
+            a.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+            a.u.reset_data.stream_ref = e->ref;
+            a.u.reset_data.error_code = e->pending_stop_code;
+            a.u.reset_data.reliable_size = e->fetch_header_len;
+            moq_action_meta_t m;
+            memset(&m, 0, sizeof(m));
+            m.deadline_us = UINT64_MAX;
+            e->fetch_reset_owed = false;
+            /* May retire `e` once the endpoint accepts the reset. */
+            moq_result_t rc = dispatch_reset_data(b, &a, &m);
+            if (rc < 0) return rc;
+            *moved = true;
+            continue;
+        }
+        if (!bridge_fetch_req_unsettled(e)) continue;
+        if (!bridge_fetch_req_reset_owed(b, e)) {
+            /* A live FETCH or a queued native reset still settles it. */
+            b->fetch_debt_due = true;
+            continue;
+        }
+        if (b->pending_count >= b->max_pending) {
+            b->fetch_debt_due = true;
+            break;
+        }
+        bridge_pending_item_t p;
+        memset(&p, 0, sizeof(p));
+        p.kind = PENDING_RESET_STREAM;
+        bridge_item_set_sid(&p, e->transport_id);
+        p.stream_ref = e->ref;            /* the retry closes our half here */
+        p.error_code = MOQ_STREAM_ERROR_CANCELLED;
+        if (!bridge_enqueue_pending(b, &p))
+            return bridge_retention_failed(b, &p);
+        e->local_cancel_queued = true;
+        *moved = true;
     }
     return MOQ_OK;
 }
@@ -3852,7 +4019,7 @@ static moq_result_t dispatch_send_bidi(moq_transport_bridge_t *b,
     /* A peer STOP_SENDING reset this send half, so anything the session still
      * wants to write on it is obsolete. An ordinary FIN is left alone: that
      * path's existing behaviour is not this correction's business. */
-    if (e && e->peer_stop_received) {
+    if (e && bridge_bidi_send_frozen(e)) {
         moq_action_cleanup(act);
         return MOQ_OK;
     }
@@ -3908,8 +4075,9 @@ static moq_result_t dispatch_close_bidi(moq_transport_bridge_t *b,
 
     bridge_stream_entry_t *e = bridge_find_by_ref(b, ref);
     if (!e && !bridge_bidi_open_owed(b, ref)) return MOQ_OK;
-    /* A peer STOP_SENDING reset this send half: the FIN is obsolete, not owed. */
-    if (e && e->peer_stop_received) return MOQ_OK;
+    /* A peer STOP_SENDING reset this send half (or a stopped FETCH owes its
+     * reset): the FIN is obsolete, not owed. */
+    if (e && bridge_bidi_send_frozen(e)) return MOQ_OK;
 
     uint64_t sid = e ? e->transport_id : 0;
     moq_transport_result_t wr = !e || bridge_domain_blocked(b, ref, sid, true)
@@ -4914,7 +5082,7 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
             }
             if (pe) bridge_item_set_sid(p, pe->transport_id);
             if (pe && pe->kind == BRIDGE_STREAM_BIDI &&
-                pe->peer_stop_received) {
+                bridge_bidi_send_frozen(pe)) {
                 bridge_cleanup_pending_item(&b->alloc, p);
                 break;
             }
@@ -5110,6 +5278,7 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
                 e->transport_id = uni_id;
                 e->kind = BRIDGE_STREAM_UNI;
                 e->origin = BRIDGE_ORIGIN_LOCAL;
+                bridge_note_local_data_open(b, e, &p->act.u.send_data, &p->meta);
             }
             (void)bridge_session_resolve_data_open(b->session, p->stream_ref,
                 p->meta.owner, MOQ_DATA_OPENED);
@@ -5249,7 +5418,7 @@ static moq_result_t bridge_retry_outbound_pending(moq_transport_bridge_t *b)
 
         case PENDING_CLOSE_BIDI_FIN: {
             bridge_stream_entry_t *pe = bridge_find_by_ref(b, p->stream_ref);
-            if (!pe || pe->peer_stop_received) {
+            if (!pe || bridge_bidi_send_frozen(pe)) {
                 bridge_cleanup_pending_item(&b->alloc, p);
                 break;
             }
@@ -5339,6 +5508,48 @@ typedef struct {
     moq_result_t rc;         /* MOQ_OK, or MOQ_SESSION_SUSPENDED */
 } bridge_inbound_outcome_t;
 
+/* The peer stopped a FETCH response stream whose FIN the provider has not
+ * accepted (its payload and FIN are frozen). On drafts 18 and 22 the
+ * FETCH's request stream belongs to the same answer, whether the FETCH is
+ * still live or ended natively first: unless that half was already reset,
+ * freeze it, dropping its retained output, FIN included, which its owed
+ * reset makes obsolete. Its FIN cannot have been accepted yet: the FIN is
+ * the FETCH's final message, held until this response stream completes.
+ * Called at the STOP's receipt; no endpoint operation. */
+static void bridge_fetch_note_stop(moq_transport_bridge_t *b,
+                                   bridge_stream_entry_t *e)
+{
+    if (e->fetch_req_ref._v == 0) return;
+    bridge_stream_entry_t *r = bridge_find_by_ref(b, e->fetch_req_ref);
+    if (!r || r->kind != BRIDGE_STREAM_BIDI || r->fetch_req_stopped ||
+        r->peer_stop_received || r->local_cancel_queued || r->aborting)
+        return;
+    r->fetch_req_stopped = true;
+    bridge_drop_pending_bidi_output(b, r);
+    b->fetch_debt_due = true;
+}
+
+/* The session answered the peer's STOP on a FETCH response stream with
+ * NO_RESET: no native reset of the stream follows, because its FETCH ended
+ * before the STOP could be committed, and the stream's queued output left
+ * the session. A reset already owning the stream keeps it, and a FIN the
+ * provider accepted leaves the answer with the provider. Otherwise the
+ * bridge owes the reset itself, with the first STOP's code. Recorded only;
+ * the service pass dispatches it (bridge_settle_fetch_debt). The request
+ * half settles on its own (bridge_fetch_req_reset_owed), whatever reset
+ * owns this stream. */
+static void bridge_fetch_owe_reset(moq_transport_bridge_t *b,
+                                   bridge_stream_entry_t *e)
+{
+    if (e->fetch_end != BRIDGE_FETCH_END_OPEN || !e->peer_stop_received ||
+        e->fin_reset_pending || e->fetch_reset_owed)
+        return;
+    const bridge_dstream_t *d = bridge_dstream_find(b, e->ref);
+    if (d && d->has_reset) return;
+    e->fetch_reset_owed = true;
+    b->fetch_debt_due = true;
+}
+
 static moq_result_t bridge_stop_local_data(moq_transport_bridge_t *b,
                                             bridge_stream_entry_t *e,
                                             uint64_t code, uint64_t now_us)
@@ -5359,6 +5570,20 @@ static moq_result_t bridge_stop_local_data(moq_transport_bridge_t *b,
          * through output pressure; a later ACK must not erase that fact. */
         if (rc == MOQ_OK || rc == MOQ_ERR_WOULD_BLOCK)
             e->peer_stop_received = true;
+        return rc;
+    }
+    if (e->fetch_end != BRIDGE_FETCH_END_NONE) {
+        /* A FETCH response stream. RESET_FOLLOWS: the session's reset owns
+         * the end (a live FETCH's teardown, or a reset it already queued).
+         * NO_RESET: none follows; see bridge_fetch_owe_reset. WOULD_BLOCK:
+         * a live FETCH's teardown does not fit yet and nothing changed; the
+         * STOP is delivered again by the service pass. */
+        moq_data_end_result_t end;
+        memset(&end, 0, sizeof(end));
+        moq_result_t rc = moq_session_on_data_stop_ex(b->session, e->ref, code,
+                                                      now_us, &end, sizeof(end));
+        if (rc == MOQ_OK && end.outcome == MOQ_DATA_END_NO_RESET)
+            bridge_fetch_owe_reset(b, e);
         return rc;
     }
     return moq_session_on_data_stop(b->session, e->ref, code, now_us);
@@ -5788,6 +6013,16 @@ static moq_result_t bridge_service_pass(
             moq_result_t crc = bridge_settle_bidi_cancel(b, &queued);
             if (crc < 0) return crc;
             if (queued && !b->fatal && !b->closed) continue;
+        }
+
+        /* Step 3d: the resets a stopped FETCH owes when its native state
+         * ended before the STOP could be committed. Recorded by the STOP's
+         * receipt or its retry above; dispatched only here. */
+        if (!b->fatal && !b->closed && b->fetch_debt_due) {
+            bool moved = false;
+            moq_result_t frc = bridge_settle_fetch_debt(b, &moved);
+            if (frc < 0) return frc;
+            if (moved && !b->fatal && !b->closed) continue;
         }
 
         /* Prior input and retirement keep their cause. Only then may one
@@ -6846,10 +7081,20 @@ moq_result_t moq_transport_bridge_on_peer_stop_sending(
             return bridge_stop_local_data(b, e, error_code, now_us);
         if (e->fin_reset_pending || e->peer_stop_received)
             return e->pending_stop ? MOQ_ERR_WOULD_BLOCK : MOQ_OK;
+        /* After the peer's STOP_SENDING the stream's remaining payload is
+         * obsolete, not owed: only a reset whose reliable size covers the
+         * header follows. Freeze the payload and FIN of a subgroup, and of a
+         * FETCH response stream whose FIN the provider has not accepted
+         * (whether or not its FETCH is still live), at receipt, independent
+         * of the session's answer, and keep this first code for the retried
+         * STOP and for a reset the bridge itself may owe. */
         if (e->data_terminal_received || e->subgroup_header_len != 0 ||
-            bridge_session_is_outgoing_subgroup(b->session, e->ref)) {
+            bridge_session_is_outgoing_subgroup(b->session, e->ref) ||
+            e->fetch_end == BRIDGE_FETCH_END_OPEN) {
             e->peer_stop_received = true;
             e->pending_stop_code = error_code;
+            if (e->fetch_end == BRIDGE_FETCH_END_OPEN)
+                bridge_fetch_note_stop(b, e);
             bridge_prune_terminal_output(b);
         }
         rc = bridge_stop_local_data(b, e, error_code, now_us);

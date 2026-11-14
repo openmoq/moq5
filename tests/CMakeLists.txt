@@ -653,6 +653,36 @@ target_link_libraries(test_bridge_local_retire PRIVATE moq-core-test-internals)
 target_include_directories(test_bridge_local_retire PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME bridge_local_retire COMMAND test_bridge_local_retire)
 
+# Transport host operations (moq/session.h): stream routing by leading bytes
+# and the end of a control stream, through the public headers and the shipped
+# core alone.
+add_executable(test_host_route_control unit/test_host_route_control.c)
+target_link_libraries(test_host_route_control PRIVATE moq::core)
+add_test(NAME host_route_control COMMAND test_host_route_control)
+set_tests_properties(host_route_control PROPERTIES TIMEOUT 30)
+
+# A transport host that includes the public headers alone and links the
+# shipped core alone (public_host/), driving setup, a subscription, a
+# publication the server opens, a fetch, partial writes, refused input,
+# transport retirement, a request STOP, streams that end inside their type
+# and the end of a control stream on every draft.
+add_executable(test_public_host
+    public_host/test_public_host.c public_host/public_host.c)
+target_link_libraries(test_public_host PRIVATE moq::core)
+add_test(NAME public_host COMMAND test_public_host)
+set_tests_properties(public_host PROPERTIES TIMEOUT 60)
+
+# Transport retirement reported through the public calls, with the session's
+# private counters observed: admission, borrows, a done waiting for the
+# retired stream, and a fill's stream. The pair rows drive the same
+# public-only host; the private state is read by this test, never by the host.
+add_executable(test_host_retire
+    unit/test_host_retire.c public_host/public_host.c)
+target_link_libraries(test_host_retire PRIVATE moq-core-test-internals)
+target_compile_definitions(test_host_retire PRIVATE MOQ_SESSION_SWEEP_TESTING)
+add_test(NAME host_retire COMMAND test_host_retire)
+set_tests_properties(host_retire PROPERTIES TIMEOUT 30)
+
 # A peer RESET of a request bidi ends only the peer's half: our send half keeps
 # its mapping until it is closed, or reset once in answer to a later STOP.
 add_executable(test_bridge_bidi_reset_half unit/test_bridge_bidi_reset_half.c)
@@ -1286,6 +1316,9 @@ if(TARGET moq::sim)
     add_executable(test_bridge_reliable_reset unit/test_bridge_reliable_reset.c)
     target_link_libraries(test_bridge_reliable_reset PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME bridge_reliable_reset COMMAND test_bridge_reliable_reset)
+    add_executable(test_bridge_fetch_stop unit/test_bridge_fetch_stop.c)
+    target_link_libraries(test_bridge_fetch_stop PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME bridge_fetch_stop COMMAND test_bridge_fetch_stop)
 
     add_executable(test_abi_old_callers_d22 unit/test_abi_old_callers_d22.c)
     target_link_libraries(test_abi_old_callers_d22 PRIVATE moq-core-test-internals moq::sim)

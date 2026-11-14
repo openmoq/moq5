@@ -6,7 +6,9 @@
 int fetch_find_free(moq_session_t *s)
 {
     for (size_t i = 0; i < s->fetch_cap; i++)
-        if (s->fetches[i].state == MOQ_FETCH_FREE) return (int)i;
+        if (s->fetches[i].state == MOQ_FETCH_FREE &&
+            !session_slot_generation_spent(s, s->fetches[i].generation))
+            return (int)i;
     return -1;
 }
 
@@ -331,6 +333,12 @@ moq_result_t session_core_on_fetch_request_update(
         if (rc < 0) { result = rc; goto cleanup_all; }
         rc = queue_send_bidi(s, resp_ref, err_buf, moq_buf_writer_offset(&ew), true);
         if (rc < 0) { result = rc; goto cleanup_all; }
+        /* The FETCH's final message: the transport host hands it over only
+         * after the response stream's reset is accepted (MOQ_ACTION_TAG's
+         * final_for), so a peer STOP of that stream still finds this half
+         * open to reset. */
+        if (fe->data_stream_started && moq_session_uses_request_streams(s))
+            session_tag_owner_done(s, fe->handle._opaque);
         fetch_end_on_refused_update(s, d->target_slot, reset_data, need_drain);
         goto committed;
     }
@@ -1752,6 +1760,18 @@ bool bridge_session_is_fetch_header(
 /* A FETCH response stream's key: its single stream needs no group order.
  * The publisher priority is a placeholder; each object's travels in its
  * SEND_DATA scheduling_priority. */
+/* The FETCH_HEADER just queued opens the response stream: its private
+ * record names the fetch (assigned after the push, so derivation found no
+ * owner) and marks the stream's first action for the tagged poll. FETCH is
+ * not parent-counted, so it is never opens_data. */
+static void fetch_mark_header(moq_session_t *s, const moq_fetch_entry_t *f)
+{
+    moq_action_meta_t *m = &s->action_meta[(s->action_tail - 1) % s->action_cap];
+    m->owner = f->handle._opaque;
+    m->stream_first = true;
+    m->paired_request = f->rs.ref._v;
+}
+
 static moq_result_t fetch_push_data_key(moq_session_t *s,
                                         const moq_fetch_entry_t *e,
                                         moq_stream_ref_t ref)
@@ -1771,6 +1791,7 @@ moq_result_t moq_session_accept_fetch(
     uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
+    if (session_local_ref_spent(s)) return MOQ_ERR_LIMIT;
     if (cfg->struct_size < MOQ_ACCEPT_FETCH_CFG_V0_SIZE) return MOQ_ERR_INVAL;
 #define ACCEPT_FETCH_HAS(f) \
     (cfg->struct_size >= offsetof(moq_accept_fetch_cfg_t, f) + sizeof(cfg->f))
@@ -1822,20 +1843,30 @@ moq_result_t moq_session_accept_fetch(
         /* REQUEST_UPDATEs that arrived before this answer are answered right
          * after FETCH_OK, in the same send; a refused one ends the fetch
          * here (see fetch_end_on_refused_update). An empty fetch is finished
-         * by this call (§10.12.3: header and FIN on the data stream), so
-         * FETCH_OK also FINs the request stream's local half. Either way,
-         * while the fetcher's half is still open a drain slot absorbs its
-         * later FIN or RESET once the entry is gone. */
+         * by this call (§10.12.3: header and FIN on the data stream). Either
+         * way the request stream's local half ends too. For a host that
+         * orders a request's final message after its data streams (tagged
+         * output, or a transport bridge) that FIN is its own action, queued
+         * after the response stream's header and tagged as the FETCH's
+         * final: FETCH_OK goes out at once while the FIN waits for the
+         * response stream's FIN or reset to be accepted, so a peer STOP of
+         * the response stream before then still finds the request half open
+         * to reset. Otherwise FETCH_OK carries the FIN. While the fetcher's
+         * half is still open a drain slot absorbs its later FIN or RESET once
+         * the entry is gone. */
         moq_fetch_entry_t *fe = &s->fetches[slot];
         const bool upd_refused = fe->upd_failed;
         const bool empty_fin = cfg->empty;
         const bool need_drain = (upd_refused || empty_fin) &&
                                 !fetch_peer_fin_observed(fe);
+        const bool final_fin = (upd_refused || empty_fin) &&
+                               (s->tagged_output || s->transport_owner != NULL);
         /* FETCH_OK on the request bidi, FETCH_HEADER on the uni and the
          * uni's key; for a refusal also the data stream's reset and an
          * event. */
         if (action_queue_avail(s) < (upd_refused ? 3u : 2u) +
-                                    (s->data_priority_updates ? 1u : 0u))
+                                    (s->data_priority_updates ? 1u : 0u) +
+                                    (final_fin ? 1u : 0u))
             return MOQ_ERR_WOULD_BLOCK;
         if (upd_refused && event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
         if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
@@ -1888,7 +1919,7 @@ moq_result_t moq_session_accept_fetch(
             s->fetches[slot].rs.ref;
         ok_act.u.send_bidi_stream.data = s->send_buf + s->send_len;
         ok_act.u.send_bidi_stream.len = ok_len;
-        ok_act.u.send_bidi_stream.fin = upd_refused || empty_fin;
+        ok_act.u.send_bidi_stream.fin = (upd_refused || empty_fin) && !final_fin;
         rc = push_action(s, &ok_act);
         if (rc < 0) return rc;
         s->send_len += ok_len;
@@ -1912,12 +1943,15 @@ moq_result_t moq_session_accept_fetch(
         if (rc < 0) return rc;
         rc = push_action(s, &data_act);
         if (rc < 0) return rc;
+        fetch_mark_header(s, &s->fetches[slot]);
 
         s->fetches[slot].state = MOQ_FETCH_ACCEPTED;
         s->fetches[slot].data_stream_ref = data_act.u.send_data.stream_ref;
         s->fetches[slot].data_stream_started = true;
         s->fetches[slot].data_header_len = hdr_len;
         s->next_stream_ref++;
+        const uint64_t owner = s->fetches[slot].handle._opaque;
+        const moq_stream_ref_t req_ref = s->fetches[slot].rs.ref;
         if (upd_refused)
             fetch_end_on_refused_update(s, slot, true, need_drain);
         else if (cfg->empty) {
@@ -1925,6 +1959,11 @@ moq_result_t moq_session_accept_fetch(
                 (void)drain_ref_add(s, fe->rs.ref);
             fetch_free_entry(s, slot);
         }
+        /* The request stream's FIN, the FETCH's final message: after the
+         * header, so the host holds it until the response stream's FIN or
+         * reset is accepted (MOQ_ACTION_TAG's final_for). */
+        if (final_fin && queue_close_bidi(s, req_ref) == MOQ_OK)
+            session_tag_owner_done(s, owner);   /* slot reserved above */
         return MOQ_OK;
     }
 
@@ -1986,6 +2025,7 @@ moq_result_t moq_session_accept_fetch(
     if (rc < 0) return rc;
     rc = push_action(s, &data_act);
     if (rc < 0) return rc;
+    fetch_mark_header(s, &s->fetches[slot]);
 
     /* Commit. */
     moq_fetch_entry_t *entry = &s->fetches[slot];
@@ -2023,6 +2063,8 @@ moq_result_t moq_session_fetch(moq_session_t *s,
                                 moq_fetch_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
+    if (moq_session_uses_request_streams(s) && session_local_ref_spent(s))
+        return MOQ_ERR_LIMIT;
     /* The public frozen floor, not a duplicate local offset: a stamp below it
      * cannot describe even the original layout. */
     if (cfg->struct_size < MOQ_FETCH_CFG_V0_SIZE) return MOQ_ERR_INVAL;
@@ -3182,8 +3224,8 @@ moq_result_t moq_session_end_fetch(
     moq_result_t rc = push_action(s, &a);
     if (rc < 0) return rc;
 
-    if (close_req)
-        (void)queue_close_bidi(s, req_ref);   /* reserved above */
+    if (close_req && queue_close_bidi(s, req_ref) == MOQ_OK)   /* reserved above */
+        session_tag_owner_done(s, entry->handle._opaque);
     if (need_drain)
         (void)drain_ref_add(s, req_ref);      /* reserved above */
     fetch_free_entry(s, slot);
@@ -3257,6 +3299,134 @@ moq_result_t moq_session_abort_fetch(
      * the reset is absorbed (control-message cancellation profiles only; a
      * stream-correlated cancel is a request-bidi reset the session already
      * absorbs). Captured before the free, recorded only on success. */
+    if (!moq_session_uses_request_streams(s))
+        fetch_abort_tomb_add(s, entry->request_id);
+    fetch_free_entry(s, slot);
+    return MOQ_OK;
+}
+
+bool bridge_session_is_outgoing_fetch(const moq_session_t *s, moq_stream_ref_t ref)
+{
+    for (int32_t i = s->fetch_occ_head; i >= 0; i = s->fetches[i].occ_next) {
+        const moq_fetch_entry_t *f = &s->fetches[i];
+        if (f->role == MOQ_FETCH_ROLE_PUBLISHER && f->state == MOQ_FETCH_ACCEPTED &&
+            f->data_stream_started && f->data_stream_ref._v == ref._v)
+            return true;
+    }
+    return false;
+}
+
+bool bridge_session_fetch_request_live(const moq_session_t *s, moq_stream_ref_t req)
+{
+    if (req._v == 0) return false;
+    for (int32_t i = s->fetch_occ_head; i >= 0; i = s->fetches[i].occ_next) {
+        const moq_fetch_entry_t *f = &s->fetches[i];
+        if (f->role == MOQ_FETCH_ROLE_PUBLISHER && f->state != MOQ_FETCH_FREE &&
+            f->rs.ref._v == req._v)
+            return true;
+    }
+    return false;
+}
+
+bool bridge_session_has_queued_request_reset(const moq_session_t *s,
+                                             moq_stream_ref_t ref)
+{
+    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        if ((a->kind == MOQ_ACTION_RESET_BIDI_STREAM &&
+             a->u.reset_bidi_stream.stream_ref._v == ref._v) ||
+            (a->kind == MOQ_ACTION_ABORT_BIDI_STREAM &&
+             a->u.abort_bidi_stream.stream_ref._v == ref._v))
+            return true;
+    }
+    return false;
+}
+
+/* The peer stopped the response stream of a FETCH this endpoint serves.
+ * Drafts 18 and 22: the publisher "MUST reset the bidi request stream and
+ * unidirectional data stream associated with the FETCH" (draft-22 section
+ * 3.2.4; draft-18 section 5.2, "Fetch State Management"). Draft 16: the
+ * fetcher sends FETCH_CANCEL and the publisher may destroy its state after
+ * closing the data stream, so a crossing FETCH_CANCEL is absorbed by the
+ * abort tomb.
+ *
+ * Atomic: everything is reserved before anything changes. The data reset
+ * carries the peer's code and delivers the header; on drafts 18 and 22 the
+ * request stream is reset with CANCELLED, whatever the peer's FIN, and a
+ * drain reference absorbs the request's later FIN or RESET unless its FIN
+ * was already seen. One FETCH_CANCELLED reports the end. The stream's queued
+ * objects are obsolete after the STOP and are removed, so they count toward
+ * the reservation they free. */
+moq_result_t fetch_on_data_stop(moq_session_t *s, moq_stream_ref_t ref,
+                                uint64_t error_code, bool *request_ended,
+                                uint32_t *released)
+{
+    *request_ended = false;
+    *released = 0;
+    int slot = -1;
+    for (int32_t i = s->fetch_occ_head; i >= 0; i = s->fetches[i].occ_next) {
+        const moq_fetch_entry_t *f = &s->fetches[i];
+        if (f->role == MOQ_FETCH_ROLE_PUBLISHER && f->state == MOQ_FETCH_ACCEPTED &&
+            f->data_stream_started && f->data_stream_ref._v == ref._v) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    moq_fetch_entry_t *entry = &s->fetches[slot];
+
+    const moq_stream_ref_t req_ref = entry->rs.ref;
+    const bool uses_streams = req_ref._v != 0;
+    const bool need_drain = uses_streams && !fetch_peer_fin_observed(entry);
+    size_t freeable = 0;
+    for (size_t j = s->action_head; j < s->action_tail; j++) {
+        const moq_action_t *a = &s->actions[j % s->action_cap];
+        const moq_action_meta_t *m = &s->action_meta[j % s->action_cap];
+        if (a->kind == MOQ_ACTION_SEND_DATA &&
+            a->u.send_data.stream_ref._v == ref._v && !m->stream_first)
+            freeable++;
+    }
+    if (event_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+    if (need_drain && s->drain_ref_count >= s->drain_ref_cap)
+        return MOQ_ERR_WOULD_BLOCK;
+    if (action_queue_avail(s) + freeable < (size_t)(uses_streams ? 2 : 1))
+        return MOQ_ERR_WOULD_BLOCK;
+
+    /* Commit. The header stays: the reset follows it. */
+    *released = session_discard_stream_actions(s, ref._v, false, true);
+    moq_action_t a;
+    memset(&a, 0, sizeof(a));
+    a.kind = MOQ_ACTION_RESET_DATA;
+    a.detail_size = (uint32_t)sizeof(moq_reset_data_action_t);
+    a.borrow_epoch = s->borrow_epoch;
+    a.u.reset_data.stream_ref = ref;
+    a.u.reset_data.error_code = error_code;
+    a.u.reset_data.reliable_size = entry->data_header_len;
+    (void)push_action(s, &a);               /* slot reserved above */
+    s->action_meta[(s->action_tail - 1) % s->action_cap].peer_stopped = true;
+    if (uses_streams) {
+        memset(&a, 0, sizeof(a));
+        a.kind = MOQ_ACTION_RESET_BIDI_STREAM;
+        a.detail_size = (uint32_t)sizeof(moq_reset_bidi_stream_action_t);
+        a.borrow_epoch = s->borrow_epoch;
+        a.u.reset_bidi_stream.stream_ref = req_ref;
+        a.u.reset_bidi_stream.error_code = 0x1;   /* CANCELLED */
+        (void)push_action(s, &a);           /* slot reserved above */
+        *request_ended = true;
+    }
+    if (need_drain)
+        (void)drain_ref_add(s, req_ref);    /* slot reserved above */
+
+    moq_event_t e;
+    memset(&e, 0, sizeof(e));
+    e.kind = MOQ_EVENT_FETCH_CANCELLED;
+    e.detail_size = (uint32_t)sizeof(moq_fetch_cancelled_event_t);
+    e.borrow_epoch = s->borrow_epoch;
+    e.u.fetch_cancelled.fetch = entry->handle;
+    e.u.fetch_cancelled.cause = MOQ_REQUEST_TERMINAL_PEER_STOP_DATA;
+    e.u.fetch_cancelled.stream_error_code = error_code;
+    (void)push_event(s, &e);                /* capacity checked above */
+
     if (!moq_session_uses_request_streams(s))
         fetch_abort_tomb_add(s, entry->request_id);
     fetch_free_entry(s, slot);

@@ -305,6 +305,7 @@ static bool session_sweep_run(moq_session_t *s, uint32_t *budget)
 static void session_call_prepare(moq_session_t *s)
 {
     s->borrow_epoch++;
+    s->host_engaged = true;
     if (s->state_location_retired != s->state_location_cap) {
         s->state_locations[s->state_location_retired_tail].next = s->state_location_free;
         s->state_location_free = s->state_location_retired;
@@ -979,7 +980,8 @@ moq_result_t moq_session_register_transport_owner(moq_session_t *s,
                                                   const void *owner)
 {
     if (!s || !owner) return MOQ_ERR_INVAL;
-    if (s->virtual_batch || (s->transport_owner && s->transport_owner != owner))
+    if (s->tagged_output || s->virtual_batch ||
+        (s->transport_owner && s->transport_owner != owner))
         return MOQ_ERR_WRONG_STATE;
     s->transport_owner = owner;
     return MOQ_OK;
@@ -1014,6 +1016,30 @@ moq_uni_class_t moq_session_classify_peer_uni(const moq_session_t *s,
     if (!s->profile->classify_uni_stream)
         return MOQ_UNI_CLASS_DATA;
     return s->profile->classify_uni_stream(data, len);
+}
+
+/* The public route query: the profile's classification, in the header's
+ * open value set. The two sets are mapped by name so that neither's
+ * numbering constrains the other. */
+moq_result_t moq_session_route_peer_uni(const moq_session_t *s,
+                                        const uint8_t *data, size_t len,
+                                        moq_uni_route_t *out_route)
+{
+    if (out_route) *out_route = MOQ_UNI_ROUTE_NONE;
+    if (!s || !out_route || (len > 0 && !data)) return MOQ_ERR_INVAL;
+    if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
+
+    switch (moq_session_classify_peer_uni(s, data, len)) {
+    case MOQ_UNI_CLASS_DATA:      *out_route = MOQ_UNI_ROUTE_DATA; break;
+    case MOQ_UNI_CLASS_CONTROL:   *out_route = MOQ_UNI_ROUTE_CONTROL; break;
+    case MOQ_UNI_CLASS_PADDING:   *out_route = MOQ_UNI_ROUTE_PADDING; break;
+    case MOQ_UNI_CLASS_NEED_MORE: *out_route = MOQ_UNI_ROUTE_NEED_MORE; break;
+    case MOQ_UNI_CLASS_UNKNOWN:   *out_route = MOQ_UNI_ROUTE_UNKNOWN_TYPE; break;
+    default:
+        /* A class this mapping does not know is not a wire fact to act on. */
+        return MOQ_ERR_INTERNAL;
+    }
+    return MOQ_OK;
 }
 
 bool bridge_session_has_data_stream_type(
@@ -1086,7 +1112,7 @@ static moq_open_counts_t *owner_open_counts(moq_session_t *s, uint64_t owner)
 
 bool session_open_credit(const moq_session_t *s)
 {
-    return s->next_stream_ref != 0 && s->pending_open_count < s->action_cap;
+    return !session_local_ref_spent(s) && s->pending_open_count < s->action_cap;
 }
 
 bool session_owner_open_pending(const moq_session_t *s, uint64_t owner)
@@ -1101,8 +1127,9 @@ bool session_owner_open_pending(const moq_session_t *s, uint64_t owner)
 bool session_owner_open_blocked(const moq_session_t *s, uint64_t owner)
 {
     /* Raw callers supply their own application count. Without an observing
-     * transport an unresolved session-owned count is honestly unknown. */
-    return (s->transport_owner || s->virtual_observer) &&
+     * transport an unresolved session-owned count is honestly unknown. In
+     * the tagged mode the host reports every handed open, so DONE waits. */
+    return (s->transport_owner || s->virtual_observer || s->tagged_output) &&
            session_owner_open_pending(s, owner);
 }
 
@@ -1141,7 +1168,8 @@ uint64_t session_owner_stream_count(const moq_session_t *s, uint64_t owner,
 moq_result_t moq_core_internal_virtual_register(moq_session_t *s, const void *observer)
 {
     if (!s || !observer) return MOQ_ERR_INVAL;
-    if (s->virtual_batch || (s->virtual_observer && s->virtual_observer != observer))
+    if (s->tagged_output || s->virtual_batch ||
+        (s->virtual_observer && s->virtual_observer != observer))
         return MOQ_ERR_WRONG_STATE;
     s->virtual_observer = observer;
     return MOQ_OK;
@@ -1915,7 +1943,9 @@ static bool action_waits_for_terminal(const moq_session_t *s, size_t idx)
     if (owner == 0) return false;
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
         const moq_sg_entry_t *sg = &s->subgroups[i];
-        if ((sg->state == MOQ_SG_TERMINAL_OWED ||
+        /* A reset the host claimed is owed until its commit, whatever its
+         * cause: the owner's final message waits for it too. */
+        if ((sg->state == MOQ_SG_TERMINAL_OWED || sg->reset_claimed ||
              (sg->state == MOQ_SG_RESET_OWED &&
               sg->terminal_cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE)) &&
             (sg->sub._opaque == owner || sg->pub._opaque == owner))
@@ -2656,6 +2686,7 @@ moq_result_t close_with_error(moq_session_t *s,
                                uint64_t code, const char *reason)
 {
     s->state = MOQ_SESS_CLOSED;
+    s->host_claim.active = false;
     /* A closing session has no deferred completions left to sweep; an inherited
      * cursor would resume against freed owners. */
     session_sweep_discard(s);
@@ -4510,6 +4541,28 @@ moq_result_t moq_session_close(moq_session_t *s,
     return close_with_error(s, code, reason);
 }
 
+/* A control stream was ended at the transport while the session was alive:
+ * a protocol violation in every profile (draft-16 section 3.3, draft-18
+ * section 3.3, draft-22 section 6.3; PROTOCOL_VIOLATION is 0x3 in each).
+ * This is a local close, not a transport close: the transport is still
+ * there, so the close action that tells the caller to close it is queued
+ * beside the event. The first close wins, as for moq_session_close(), and
+ * an idle deadline already passed outranks the peer's fact, as it does for
+ * every other peer input. */
+moq_result_t moq_session_on_control_stream_ended(moq_session_t *s,
+                                                 uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
+
+    session_begin_advance(s, now_us);
+    /* The pending work run above may itself have closed the session. */
+    if (s->state == MOQ_SESS_CLOSED) return MOQ_OK;
+    if (session_idle_expired(s))
+        return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
+    return close_with_error(s, 0x3, "control stream closed");
+}
+
 moq_result_t moq_session_on_transport_close(moq_session_t *s,
                                               uint64_t code,
                                               uint64_t now_us)
@@ -4520,6 +4573,7 @@ moq_result_t moq_session_on_transport_close(moq_session_t *s,
     session_begin_advance(s, now_us);
 
     s->state = MOQ_SESS_CLOSED;
+    s->host_claim.active = false;
     s->goaway_deadline_us = UINT64_MAX;
     s->subgroup_deadline_us = UINT64_MAX;
     s->subgroup_retry_deadline_us = UINT64_MAX;
@@ -4609,6 +4663,12 @@ moq_result_t moq_session_on_bidi_stream_bytes(moq_session_t *s,
 {
     if (!s) return MOQ_ERR_INVAL;
     if (len > 0 && !buf) return MOQ_ERR_INVAL;
+    /* Tagged mode: a bidi the peer opened carries a ref from the host's
+     * range. A ref below it is one the session issued for a request it
+     * opened (its response arrives here) or none at all. */
+    if (s->tagged_output && stream_ref._v < MOQ_STREAM_REF_LOCAL_END &&
+        (stream_ref._v == 0 || stream_ref._v >= s->next_stream_ref))
+        return MOQ_ERR_INVAL;
     moq_result_t arc = session_advance_entry(s, now_us);
     if (arc != MOQ_OK) return arc;
     if (session_idle_expired(s))
@@ -4712,9 +4772,12 @@ bool bridge_session_bidi_owner_ended(const moq_session_t *s, moq_stream_ref_t re
            !session_has_queued_bidi_action(s, ref);
 }
 
-moq_result_t bridge_session_on_bidi_retired(moq_session_t *s,
-                                            moq_stream_ref_t ref,
-                                            uint64_t now_us)
+/* Local retirement of a request stream this side abandoned: the transport is
+ * finished with it and no peer terminal will arrive. One body serves the
+ * bridge and the public entry point. */
+static moq_result_t session_retire_bidi_stream(moq_session_t *s,
+                                               moq_stream_ref_t ref,
+                                               uint64_t now_us)
 {
     if (!s || ref._v == 0) return MOQ_ERR_INVAL;
     moq_result_t arc = session_advance_entry(s, now_us);
@@ -4725,9 +4788,24 @@ moq_result_t bridge_session_on_bidi_retired(moq_session_t *s,
     if (session_has_live_transport_owner(s, ref) ||
         session_has_queued_bidi_action(s, ref))
         return MOQ_ERR_WRONG_STATE;
-    /* The bridge proved local abort completion plus a genuine terminal.
-     * Release only its drain identity: no peer lifetime fact or event. */
+    /* The caller proved local abort completion plus the transport's own
+     * retirement. Release only the drain identity: no peer lifetime fact
+     * or event. */
     return drain_ref_remove(s, ref) ? MOQ_OK : MOQ_ERR_STALE_HANDLE;
+}
+
+moq_result_t bridge_session_on_bidi_retired(moq_session_t *s,
+                                            moq_stream_ref_t ref,
+                                            uint64_t now_us)
+{
+    return session_retire_bidi_stream(s, ref, now_us);
+}
+
+moq_result_t moq_session_on_bidi_stream_retired(moq_session_t *s,
+                                                moq_stream_ref_t stream_ref,
+                                                uint64_t now_us)
+{
+    return session_retire_bidi_stream(s, stream_ref, now_us);
 }
 
 bool moq_session_can_admit_data_stream(const moq_session_t *s)
@@ -4992,7 +5070,7 @@ static bool session_take_terminal_action(moq_session_t *s, moq_action_t *out,
     /* A retained terminal with no queued data can precede its owner's DONE
      * even when that DONE occupies the last action slot. Commit its event
      * with the reset, just as the public poll does. */
-    if (!session_is_active(s) || !sg_take_terminal_action(s, out)) return false;
+    if (!session_is_active(s) || !sg_take_terminal_action(s, out, NULL)) return false;
     memset(meta, 0, sizeof(*meta));
     meta->deadline_us = UINT64_MAX;
     meta->outgoing_terminal = true;
@@ -5267,9 +5345,39 @@ bool bridge_session_poll_mapped_action(moq_session_t *s, moq_action_t *out,
     return true;
 }
 
+/* Whether a queued RESET_DATA stands for a stream whose opening header
+ * never left the session: its open record is still pending and unhanded.
+ * The tagged poll never hands such a reset out; the UNOPENED reset claim
+ * settles it with no transport stream. */
+static bool tagged_reset_unopened(const moq_session_t *s, moq_stream_ref_t ref)
+{
+    for (size_t i = 0; s->pending_open_count && i < s->action_cap; ++i) {
+        const moq_pending_open_t *p = &s->pending_opens[i];
+        if (p->ref == ref._v) return !p->handed;
+    }
+    return false;
+}
+
+static void tag_write(uint8_t *dst, size_t tag_size, uint32_t flags,
+                      uint64_t owner, uint64_t final_for, uint64_t deadline_us)
+{
+    const size_t copy = sizeof(moq_action_tag_t) < tag_size
+        ? sizeof(moq_action_tag_t) : tag_size;
+    moq_action_tag_t t = {
+        .struct_size = (uint32_t)copy,
+        .flags = flags,
+        .owner = { owner },
+        .final_for = { final_for },
+        .deadline_us = deadline_us,
+    };
+    memset(dst, 0, tag_size);
+    memcpy(dst, &t, copy);
+}
+
 static moq_result_t session_poll_actions(moq_session_t *s,
     void *out, size_t cap, size_t element_size, size_t *out_count,
-    const void *observer, moq_core_observed_open_t *opens)
+    const void *observer, moq_core_observed_open_t *opens,
+    void *tags, size_t tag_size)
 {
     if (out_count) *out_count = 0;
     if (!s || !out || !out_count) return MOQ_ERR_INVAL;
@@ -5285,6 +5393,7 @@ static moq_result_t session_poll_actions(moq_session_t *s,
     size_t n = 0;
     bool terminal_blocked = false;
     uint8_t *dst = (uint8_t *)out;
+    uint8_t *tag_dst = (uint8_t *)tags;
 
     /* Handing an action to the adapter is the handover to the transport: an
      * object whose OBJECT_DELIVERY_TIMEOUT has elapsed must not cross it. */
@@ -5296,18 +5405,53 @@ static moq_result_t session_poll_actions(moq_session_t *s,
     while (n < cap && s->action_head < s->action_tail) {
         moq_action_t taken;
         moq_core_observed_open_t observed = {0};
-        if (!session_is_active(s) || !sg_take_terminal_action(s, &taken)) {
+        uint32_t tag_flags = 0;
+        uint64_t tag_owner = 0, tag_final_for = 0, tag_deadline = UINT64_MAX;
+        if (!session_is_active(s) || !sg_take_terminal_action(s, &taken, &tag_owner)) {
             const size_t head_at = s->action_head;
             size_t idx = action_select_batched(s, &cert);
             const moq_action_t *head = &s->actions[idx % s->action_cap];
-            if (s->action_meta[idx % s->action_cap].terminal_barrier ||
-                action_waits_for_terminal(s, idx)) {
+            const moq_action_meta_t *hm = &s->action_meta[idx % s->action_cap];
+            if (hm->terminal_barrier || action_waits_for_terminal(s, idx)) {
+                terminal_blocked = true;
+                break;
+            }
+            if (tags && head->kind == MOQ_ACTION_RESET_DATA &&
+                (hm->reset_claimed ||
+                 tagged_reset_unopened(s, head->u.reset_data.stream_ref))) {
+                /* A claimed reset, or one whose header never left: only
+                 * the reset claim takes it, so it stops the batch here. */
                 terminal_blocked = true;
                 break;
             }
             if (head->kind == MOQ_ACTION_SEND_DATA && element_size < send_data_needed)
                 break;
-            if (head->kind == MOQ_ACTION_SEND_DATA) {
+            if (tags) {
+                tag_owner = hm->owner;
+                tag_final_for = hm->terminal_owner;
+                tag_deadline = hm->deadline_us;
+                if (head->kind == MOQ_ACTION_SEND_DATA &&
+                    (hm->opens_data || hm->stream_first)) {
+                    tag_flags |= MOQ_ACTION_TAG_FIRST_OF_STREAM;
+                    /* A FETCH response paired with its request stream: a
+                     * STOP of it resets that stream too. */
+                    if (hm->paired_request != 0 && hm->owner != 0)
+                        tag_flags |= MOQ_ACTION_TAG_RESET_FINAL_ON_STOP;
+                }
+            }
+            if (head->kind == MOQ_ACTION_SEND_DATA && tags) {
+                /* The host reports this open (or a reset claim resolves
+                 * it); it is never resolved EXTERNAL at hand-out. */
+                for (size_t i = 0; s->pending_open_count && i < s->action_cap; ++i) {
+                    moq_pending_open_t *p = &s->pending_opens[i];
+                    if (p->ref != head->u.send_data.stream_ref._v ||
+                        p->owner != hm->owner || p->handed) continue;
+                    p->handed = true;
+                    p->tagged_handed = true;
+                    tag_flags |= MOQ_ACTION_TAG_OPEN_COUNTED;
+                    break;
+                }
+            } else if (head->kind == MOQ_ACTION_SEND_DATA) {
                 if (observer) {
                     for (size_t i = 0; i < s->action_cap; ++i) {
                         moq_pending_open_t *p = &s->pending_opens[i];
@@ -5339,7 +5483,7 @@ static moq_result_t session_poll_actions(moq_session_t *s,
         }
         /* A terminal can replace a never-polled header. Raw RESET handoff
          * remains unobservable, but must release its bounded pending credit. */
-        if (taken.kind == MOQ_ACTION_RESET_DATA && s->pending_open_count) {
+        if (!tags && taken.kind == MOQ_ACTION_RESET_DATA && s->pending_open_count) {
             for (size_t i = 0; i < s->action_cap; ++i) {
                 moq_pending_open_t p = s->pending_opens[i];
                 if (p.ref == taken.u.reset_data.stream_ref._v) {
@@ -5363,6 +5507,11 @@ static moq_result_t session_poll_actions(moq_session_t *s,
         uint64_t epoch = s->borrow_epoch;
         memcpy(dst + offsetof(moq_action_t, borrow_epoch), &epoch, sizeof(epoch));
         if (opens) opens[n] = observed;
+        if (tag_dst) {
+            tag_write(tag_dst, tag_size, tag_flags, tag_owner, tag_final_for,
+                      tag_deadline);
+            tag_dst += tag_size;
+        }
         dst += element_size;
         n++;
         if (session_is_active(s)) {
@@ -5391,11 +5540,515 @@ static moq_result_t session_poll_actions(moq_session_t *s,
 moq_result_t moq_session_poll_actions_ex(moq_session_t *s, void *out,
     size_t cap, size_t element_size, size_t *out_count)
 {
-    if (s && s->virtual_batch) {
+    if (s && (s->virtual_batch || s->tagged_output)) {
         if (out_count) *out_count = 0;
         return MOQ_ERR_WRONG_STATE;
     }
-    return session_poll_actions(s, out, cap, element_size, out_count, NULL, NULL);
+    return session_poll_actions(s, out, cap, element_size, out_count, NULL, NULL,
+                                NULL, 0);
+}
+
+moq_result_t moq_session_report_data_open(moq_session_t *s,
+    moq_stream_ref_t stream_ref, moq_output_owner_t owner,
+    moq_data_open_outcome_t outcome)
+{
+    if (!s || !stream_ref._v) return MOQ_ERR_INVAL;
+    if (outcome != MOQ_DATA_OPEN_OPENED && outcome != MOQ_DATA_OPEN_UNKNOWN)
+        return MOQ_ERR_INVAL;
+    if (!s->tagged_output) return MOQ_ERR_WRONG_STATE;
+    for (size_t i = 0; s->pending_open_count && i < s->action_cap; ++i) {
+        const moq_pending_open_t *p = &s->pending_opens[i];
+        if (p->ref != stream_ref._v || p->owner != owner._v) continue;
+        /* The header has not left the session: there is no open to report. */
+        if (!p->tagged_handed) return MOQ_ERR_WRONG_STATE;
+        return bridge_session_resolve_data_open(s, stream_ref, owner._v,
+                outcome == MOQ_DATA_OPEN_OPENED ? MOQ_DATA_OPENED
+                                                : MOQ_DATA_EXTERNAL)
+            ? MOQ_OK : MOQ_ERR_STALE_HANDLE;
+    }
+    /* Already resolved, a duplicate, a late report after the owner retired,
+     * or another owner's ref: a stale report never corrects a replacement. */
+    return MOQ_ERR_STALE_HANDLE;
+}
+
+/* -- The public reset transaction (tagged mode) ----------------------- */
+
+/* One selected reset, before it is written as an offer. */
+typedef struct host_reset_pick {
+    moq_data_reset_state_t state;
+    uint64_t ref, owner, code, reliable_size;
+    uint32_t cause;
+    uint8_t  mode;            /* MOQ_SCHED_MODE_* of the stream */
+    bool     queued;          /* a queued RESET_DATA; else owed on a subgroup */
+    size_t   index;           /* ring index of the queued reset */
+    int32_t  sg_slot;         /* its subgroup entry, or -1 */
+    bool     event_owed;      /* TERMINAL_OWED: the claim commits its event */
+} host_reset_pick_t;
+
+static int32_t host_sg_slot(const moq_session_t *s, uint64_t ref)
+{
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next)
+        if (s->subgroups[i].stream_ref._v == ref) return i;
+    return -1;
+}
+
+static const moq_pending_open_t *host_pending_open(const moq_session_t *s,
+                                                   uint64_t ref)
+{
+    for (size_t i = 0; s->pending_open_count && i < s->action_cap; ++i)
+        if (s->pending_opens[i].ref == ref) return &s->pending_opens[i];
+    return NULL;
+}
+
+/* Whether the stream's opening header is still queued, and what else of it
+ * is: *only_barrier is true when its sole queued data is a terminal barrier. */
+static bool host_header_queued(const moq_session_t *s, uint64_t ref,
+                               bool *only_barrier)
+{
+    bool header = false, other = false, barrier = false;
+    for (size_t j = s->action_head; j < s->action_tail; j++) {
+        const moq_action_t *a = &s->actions[j % s->action_cap];
+        const moq_action_meta_t *m = &s->action_meta[j % s->action_cap];
+        if (a->kind != MOQ_ACTION_SEND_DATA ||
+            a->u.send_data.stream_ref._v != ref) continue;
+        if (m->subgroup_header || m->opens_data || m->stream_first) header = true;
+        else if (m->terminal_barrier) barrier = true;
+        else other = true;
+    }
+    if (only_barrier) *only_barrier = barrier && !other && !header;
+    return header;
+}
+
+/* The state of a selected reset. A header that never left the session
+ * makes a subgroup reset UNOPENED; a FETCH or fill reset behind its own
+ * queued header is not offered (the next poll hands the header out). */
+static bool host_pick_state(const moq_session_t *s, host_reset_pick_t *k)
+{
+    const bool subgroup = k->mode == MOQ_SCHED_MODE_SUBGROUP;
+    const moq_pending_open_t *p = host_pending_open(s, k->ref);
+    bool header = host_header_queued(s, k->ref, NULL);
+    if (header || (p && !p->handed)) {
+        if (!subgroup) return false;
+        k->state = MOQ_DATA_RESET_UNOPENED;
+        return true;
+    }
+    k->state = MOQ_DATA_RESET_READY;
+    return true;
+}
+
+/* The reset the public offer names: the outstanding claim first, then the
+ * private selection with the tagged changes. *blocked is set when the
+ * selected reset waits only for event capacity. Reads only. */
+static bool host_select_reset(const moq_session_t *s, host_reset_pick_t *k,
+                              bool *blocked)
+{
+    *blocked = false;
+    memset(k, 0, sizeof(*k));
+    k->sg_slot = -1;
+    if (s->host_claim.active) {
+        k->state = MOQ_DATA_RESET_CLAIMED;
+        k->ref = s->host_claim.ref;
+        k->owner = s->host_claim.owner;
+        k->code = s->host_claim.code;
+        k->reliable_size = s->host_claim.reliable_size;
+        k->cause = s->host_claim.cause;
+        return true;
+    }
+    uint64_t done_owner = 0;
+    /* The first non-data action decides; a ring of data alone has none. */
+    for (size_t i = s->action_head; s->action_nondata != 0 && i < s->action_tail; ++i) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        const moq_action_meta_t *m = &s->action_meta[i % s->action_cap];
+        if (action_is_data(a)) continue;
+        if (a->kind != MOQ_ACTION_RESET_DATA) {
+            done_owner = m->terminal_owner;
+            if (done_owner == 0) return false;
+            break;
+        }
+        k->queued = true;
+        k->index = i;
+        k->ref = a->u.reset_data.stream_ref._v;
+        k->owner = m->owner;
+        k->code = a->u.reset_data.error_code;
+        if (a->detail_size >= offsetof(moq_reset_data_action_t, reliable_size) +
+                              sizeof(a->u.reset_data.reliable_size))
+            k->reliable_size = a->u.reset_data.reliable_size;
+        k->sg_slot = host_sg_slot(s, k->ref);
+        k->mode = m->mode;
+        if (k->sg_slot >= 0) {
+            k->mode = MOQ_SCHED_MODE_SUBGROUP;
+            k->cause = s->subgroups[k->sg_slot].terminal_cause;
+        }
+        return host_pick_state(s, k);
+    }
+    /* A reset owed on its subgroup. A terminal may precede its own DONE;
+     * every other non-data ordering barrier remains intact. */
+    for (int32_t i = s->sg_occ_head; s->sg_reset_owed && i >= 0;
+         i = s->subgroups[i].occ_next) {
+        const moq_sg_entry_t *sg = &s->subgroups[i];
+        bool terminal = sg->terminal_cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
+        if (sg->state != MOQ_SG_RESET_OWED && sg->state != MOQ_SG_TERMINAL_OWED)
+            continue;
+        if (done_owner && (!terminal ||
+            (sg->sub._opaque != done_owner && sg->pub._opaque != done_owner)))
+            continue;
+        bool only_barrier = false;
+        bool header = host_header_queued(s, sg->stream_ref._v, &only_barrier);
+        /* Readiness: nothing of the stream queued, or (tagged) its terminal
+         * barrier alone, which orders none of its payload; or its header
+         * still queued, which makes the reset UNOPENED. Earlier data of the
+         * stream still queued keeps today's order. */
+        bool any_data = false;
+        if (!header && !only_barrier) {
+            for (size_t j = s->action_head; j < s->action_tail; j++) {
+                const moq_action_t *a = &s->actions[j % s->action_cap];
+                if (a->kind == MOQ_ACTION_SEND_DATA &&
+                    a->u.send_data.stream_ref._v == sg->stream_ref._v) {
+                    any_data = true;
+                    break;
+                }
+            }
+        }
+        if (any_data) continue;
+        k->ref = sg->stream_ref._v;
+        k->owner = sg->sub._opaque ? sg->sub._opaque : sg->pub._opaque;
+        k->code = terminal ? sg->terminal_code : sg->owed_reset_code;
+        k->reliable_size = sg->header_len;
+        k->cause = sg->terminal_cause;
+        k->mode = MOQ_SCHED_MODE_SUBGROUP;
+        k->sg_slot = i;
+        k->event_owed = sg->state == MOQ_SG_TERMINAL_OWED;
+        if (k->event_owed && event_queue_full(s)) *blocked = true;
+        return host_pick_state(s, k);
+    }
+    return false;
+}
+
+/* Whether the peer's STOP_SENDING of the selected reset's stream is known:
+ * a subgroup terminal latched by it, a FETCH teardown's reset, a fill the
+ * peer stopped, or a STOP observed through moq_session_on_data_stop_ex
+ * while a reset with an earlier cause was held (on its queued action or on
+ * its subgroup). */
+static bool host_reset_peer_stopped(const moq_session_t *s,
+                                    const host_reset_pick_t *k)
+{
+    if (k->cause == MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING) return true;
+    if (k->queued && s->action_meta[k->index % s->action_cap].peer_stopped)
+        return true;
+    if (k->sg_slot >= 0 && s->subgroups[k->sg_slot].peer_stopped) return true;
+    for (size_t i = 0; s->fill_storage && i < s->fill_cap; i++) {
+        const moq_fill_entry_t *f = &s->fill_storage[i];
+        if (f->active && f->stream_bound && f->stream._v == k->ref && f->peer_stop)
+            return true;
+    }
+    return false;
+}
+
+static bool host_offer_valid(const moq_data_reset_offer_t *o, size_t size)
+{
+    if (!o || size < MOQ_DATA_RESET_OFFER_V0_SIZE) return false;
+    uint32_t stamp;
+    memcpy(&stamp, o, sizeof(stamp));
+    return stamp >= MOQ_DATA_RESET_OFFER_V0_SIZE && stamp <= size;
+}
+
+static void host_write_offer(const host_reset_pick_t *k,
+                             moq_data_reset_offer_t *out, size_t out_size)
+{
+    const size_t copy = sizeof(moq_data_reset_offer_t) < out_size
+        ? sizeof(moq_data_reset_offer_t) : out_size;
+    moq_data_reset_offer_t o = {
+        .struct_size = (uint32_t)copy,
+        .state = k->state,
+        .stream_ref = { k->ref },
+        .error_code = k->code,
+        .reliable_size = k->reliable_size,
+        .owner = { k->owner },
+        .cause = k->cause,
+    };
+    memset(out, 0, out_size);
+    memcpy(out, &o, copy);
+}
+
+/* Same immutable identity: stream, owner, code, reliable size, cause. The
+ * state is a snapshot and is not compared. */
+static bool host_same_identity(const host_reset_pick_t *k,
+                               const moq_data_reset_offer_t *o)
+{
+    return o->stream_ref._v == k->ref && o->owner._v == k->owner &&
+           o->error_code == k->code && o->reliable_size == k->reliable_size &&
+           o->cause == k->cause;
+}
+
+moq_result_t moq_session_offer_data_reset(const moq_session_t *s,
+    moq_data_reset_offer_t *out, size_t out_size, size_t *out_count)
+{
+    if (out_count) *out_count = 0;
+    if (!s || !out || !out_count || out_size < MOQ_DATA_RESET_OFFER_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    if (!s->tagged_output) return MOQ_ERR_WRONG_STATE;
+    if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
+    host_reset_pick_t k;
+    bool blocked = false;
+    if (!host_select_reset(s, &k, &blocked)) return MOQ_OK;
+    if (blocked) return MOQ_ERR_WOULD_BLOCK;
+    host_write_offer(&k, out, out_size);
+    *out_count = 1;
+    return MOQ_OK;
+}
+
+/* Remove the stream's queued actions: its data (header, barrier, objects,
+ * FIN) and, with with_reset, its queued reset too. Returns the data actions
+ * whose custody ended here. */
+uint32_t session_discard_stream_actions(moq_session_t *s, uint64_t ref,
+                                        bool with_reset, bool keep_header)
+{
+    uint32_t released = 0;
+    size_t dst = s->action_head;
+    const size_t tail = s->action_tail;
+    for (size_t src = s->action_head; src < tail; ++src) {
+        const size_t from = src % s->action_cap;
+        moq_action_t *a = &s->actions[from];
+        moq_stream_ref_t data_ref;
+        /* The stream's data and priority keys always; its queued reset only
+         * with with_reset (action_data_stream does not name a reset). */
+        const bool data = action_data_stream(a, &data_ref) && data_ref._v == ref;
+        const bool reset = with_reset && a->kind == MOQ_ACTION_RESET_DATA &&
+                           a->u.reset_data.stream_ref._v == ref;
+        if ((data || reset) &&
+            /* A kept opening keeps its priority key with its header. */
+            !(keep_header &&
+              (a->kind == MOQ_ACTION_SET_DATA_PRIORITY ||
+               (a->kind == MOQ_ACTION_SEND_DATA &&
+                (s->action_meta[from].stream_first ||
+                 s->action_meta[from].subgroup_header ||
+                 s->action_meta[from].opens_data))))) {
+            if (a->kind == MOQ_ACTION_SEND_DATA) released++;
+            session_action_dequeued(s, a, &s->action_meta[from]);
+            moq_action_cleanup(a);
+            continue;
+        }
+        const size_t to = dst++ % s->action_cap;
+        if (to != from) {
+            s->actions[to] = *a;
+            s->action_meta[to] = s->action_meta[from];
+        }
+    }
+    s->action_tail = dst;
+    for (; dst < tail; ++dst) {
+        memset(&s->actions[dst % s->action_cap], 0, sizeof(*s->actions));
+        memset(&s->action_meta[dst % s->action_cap], 0, sizeof(*s->action_meta));
+    }
+    return released;
+}
+
+static void host_write_claim(moq_data_reset_claim_t *out, size_t out_size,
+                             uint32_t flags, uint32_t released)
+{
+    const size_t copy = sizeof(moq_data_reset_claim_t) < out_size
+        ? sizeof(moq_data_reset_claim_t) : out_size;
+    moq_data_reset_claim_t c = {
+        .struct_size = (uint32_t)copy,
+        .flags = flags,
+        .released_data_actions = released,
+    };
+    memset(out, 0, out_size);
+    memcpy(out, &c, copy);
+}
+
+moq_result_t moq_session_claim_data_reset(moq_session_t *s,
+    const moq_data_reset_offer_t *offer, size_t offer_size,
+    moq_data_prefix_state_t prefix, moq_data_reset_claim_t *out, size_t out_size)
+{
+    if (!s || !out || out_size < MOQ_DATA_RESET_CLAIM_V0_SIZE ||
+        !host_offer_valid(offer, offer_size)) return MOQ_ERR_INVAL;
+    if (prefix != MOQ_DATA_PREFIX_HANDED && prefix != MOQ_DATA_PREFIX_HELD &&
+        prefix != MOQ_DATA_PREFIX_WAIVED && prefix != MOQ_DATA_PREFIX_UNOPENED)
+        return MOQ_ERR_INVAL;
+    if (!s->tagged_output) return MOQ_ERR_WRONG_STATE;
+    if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
+
+    /* Revalidate against the session as it is now, before any effect. */
+    host_reset_pick_t k;
+    bool blocked = false;
+    if (!host_select_reset(s, &k, &blocked) || !host_same_identity(&k, offer))
+        return MOQ_ERR_STALE_HANDLE;
+    if (k.state == MOQ_DATA_RESET_CLAIMED) return MOQ_ERR_WRONG_STATE;
+    const moq_pending_open_t *p = host_pending_open(s, k.ref);
+    const bool unresolved_handed = p && p->tagged_handed;
+    if (prefix == MOQ_DATA_PREFIX_UNOPENED) {
+        /* Only a subgroup that never had a transport stream: its header is
+         * still queued, or it was handed and its open is unresolved. A peer
+         * cannot stop a stream that was never opened. */
+        if (k.mode != MOQ_SCHED_MODE_SUBGROUP ||
+            (k.state != MOQ_DATA_RESET_UNOPENED && !unresolved_handed) ||
+            k.cause == MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING)
+            return MOQ_ERR_WRONG_STATE;
+    } else if (k.state != MOQ_DATA_RESET_READY) {
+        return MOQ_ERR_WRONG_STATE;
+    }
+    /* WAIVED stands for the peer's STOP, and proves the stream was opened:
+     * only a reset whose stream the session knows the peer stopped takes
+     * it. The reset keeps its own cause and code either way. */
+    if (prefix == MOQ_DATA_PREFIX_WAIVED && !host_reset_peer_stopped(s, &k))
+        return MOQ_ERR_WRONG_STATE;
+    if (blocked) return MOQ_ERR_WOULD_BLOCK;
+
+    uint32_t flags = 0, released;
+    if (prefix == MOQ_DATA_PREFIX_UNOPENED) {
+        /* No transport stream exists and none will: every queued action of
+         * the stream goes, its open is suppressed and its event commits. */
+        released = session_discard_stream_actions(s, k.ref, true, false);
+        if (p && bridge_session_resolve_data_open(s, moq_stream_ref_from_u64(k.ref),
+                                                  p->owner, MOQ_DATA_SUPPRESSED))
+            flags |= MOQ_DATA_RESET_CLAIM_OPEN_SUPPRESSED;
+        if (k.sg_slot >= 0) {
+            moq_sg_entry_t *sg = &s->subgroups[k.sg_slot];
+            if (sg->state == MOQ_SG_TERMINAL_OWED &&
+                sg_claim_terminal_reset(s, (size_t)k.sg_slot))
+                flags |= MOQ_DATA_RESET_CLAIM_EVENT_COMMITTED;
+            if (sg->state == MOQ_SG_RESET_OWED || sg->state == MOQ_SG_TERMINAL_OWED)
+                sg->state = MOQ_SG_RESETTING;
+        }
+        flags |= MOQ_DATA_RESET_CLAIM_SETTLED;
+        host_write_claim(out, out_size, flags, released);
+        session_action_poll_settled(s, true);
+        return MOQ_OK;
+    }
+
+    /* HANDED, HELD or WAIVED: the stream's obsolete data goes, an owed
+     * terminal event commits, and the reset stays the session's until the
+     * host commits it. */
+    released = session_discard_stream_actions(s, k.ref, false, false);
+    if (k.sg_slot >= 0 && s->subgroups[k.sg_slot].state == MOQ_SG_TERMINAL_OWED &&
+        sg_claim_terminal_reset(s, (size_t)k.sg_slot))
+        flags |= MOQ_DATA_RESET_CLAIM_EVENT_COMMITTED;
+    /* A handed prefix or a peer STOP proves the stream exists. A HELD
+     * prefix proves nothing yet: the open stays pending until the host
+     * reports it or commits the reset. */
+    if (unresolved_handed && prefix != MOQ_DATA_PREFIX_HELD)
+        (void)bridge_session_resolve_data_open(s, moq_stream_ref_from_u64(k.ref),
+                                               p->owner, MOQ_DATA_OPENED);
+    if (k.queued) {
+        /* The discard compacted the ring: find the reset again. */
+        for (size_t j = s->action_head; j < s->action_tail; j++) {
+            const moq_action_t *a = &s->actions[j % s->action_cap];
+            if (a->kind == MOQ_ACTION_RESET_DATA &&
+                a->u.reset_data.stream_ref._v == k.ref) {
+                s->action_meta[j % s->action_cap].reset_claimed = true;
+                break;
+            }
+        }
+    } else if (k.sg_slot >= 0) {
+        s->subgroups[k.sg_slot].reset_claimed = true;
+    }
+    s->host_claim.active = true;
+    s->host_claim.prefix = (uint8_t)prefix;
+    s->host_claim.ref = k.ref;
+    s->host_claim.owner = k.owner;
+    s->host_claim.code = k.code;
+    s->host_claim.reliable_size = k.reliable_size;
+    s->host_claim.cause = k.cause;
+    host_write_claim(out, out_size, flags, released);
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_commit_data_reset(moq_session_t *s,
+    const moq_data_reset_offer_t *claimed, size_t claimed_size)
+{
+    if (!s || !host_offer_valid(claimed, claimed_size)) return MOQ_ERR_INVAL;
+    if (claimed->state != MOQ_DATA_RESET_READY &&
+        claimed->state != MOQ_DATA_RESET_CLAIMED &&
+        claimed->state != MOQ_DATA_RESET_UNOPENED) return MOQ_ERR_INVAL;
+    if (!s->tagged_output) return MOQ_ERR_WRONG_STATE;
+    if (s->state == MOQ_SESS_CLOSED) return MOQ_ERR_CLOSED;
+    if (!s->host_claim.active) return MOQ_ERR_STALE_HANDLE;
+    host_reset_pick_t k = {
+        .ref = s->host_claim.ref, .owner = s->host_claim.owner,
+        .code = s->host_claim.code, .reliable_size = s->host_claim.reliable_size,
+        .cause = s->host_claim.cause,
+    };
+    /* Another stream or owner, or a duplicate after the claim settled:
+     * nothing settles and the claim stays. */
+    if (!host_same_identity(&k, claimed)) return MOQ_ERR_STALE_HANDLE;
+
+    bool settled = false;
+    for (size_t j = s->action_head; j < s->action_tail; j++) {
+        const moq_action_t *a = &s->actions[j % s->action_cap];
+        if (a->kind != MOQ_ACTION_RESET_DATA ||
+            a->u.reset_data.stream_ref._v != k.ref ||
+            !s->action_meta[j % s->action_cap].reset_claimed) continue;
+        moq_action_t taken;
+        action_take(s, j, &taken);
+        moq_action_cleanup(&taken);
+        settled = true;
+        break;
+    }
+    if (!settled) {
+        int32_t slot = host_sg_slot(s, k.ref);
+        if (slot >= 0 && s->subgroups[slot].reset_claimed) {
+            s->subgroups[slot].reset_claimed = false;
+            s->subgroups[slot].state = MOQ_SG_RESETTING;
+            settled = true;
+        }
+    }
+    /* The accepted reset proves the stream exists. */
+    if (s->host_claim.prefix == MOQ_DATA_PREFIX_HELD) {
+        const moq_pending_open_t *p = host_pending_open(s, k.ref);
+        if (p && p->tagged_handed)
+            (void)bridge_session_resolve_data_open(s, moq_stream_ref_from_u64(k.ref),
+                                                   p->owner, MOQ_DATA_OPENED);
+    }
+    s->host_claim.active = false;
+    if (!settled) return MOQ_ERR_INTERNAL;
+    session_action_poll_settled(s, true);
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_enable_tagged_output(moq_session_t *s)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    if (s->tagged_output) return MOQ_OK;
+    if (s->host_engaged || s->state != MOQ_SESS_IDLE || s->action_tail != 0 ||
+        s->transport_owner || s->virtual_observer || s->virtual_batch)
+        return MOQ_ERR_WRONG_STATE;
+    s->tagged_output = true;
+    return MOQ_OK;
+}
+
+bool moq_session_tagged_output(const moq_session_t *s)
+{
+    return s != NULL && s->tagged_output;
+}
+
+/* Whether [a, a + an) and [b, b + bn) share a byte; the ends are known not
+ * to wrap. */
+static bool ranges_overlap(uintptr_t a, size_t an, uintptr_t b, size_t bn)
+{
+    return a < b + bn && b < a + an;
+}
+
+moq_result_t moq_session_poll_actions_tagged(moq_session_t *s,
+    void *actions, size_t action_size, void *tags, size_t tag_size,
+    size_t cap, size_t *out_count)
+{
+    if (out_count) *out_count = 0;
+    if (!s || !out_count) return MOQ_ERR_INVAL;
+    if (cap != 0) {
+        if (!actions || !tags) return MOQ_ERR_INVAL;
+        if (action_size < offsetof(moq_action_t, u) ||
+            tag_size < MOQ_ACTION_TAG_V0_SIZE) return MOQ_ERR_INVAL;
+        if (cap > SIZE_MAX / action_size || cap > SIZE_MAX / tag_size)
+            return MOQ_ERR_INVAL;
+        const uintptr_t a = (uintptr_t)actions, t = (uintptr_t)tags;
+        const size_t an = cap * action_size, tn = cap * tag_size;
+        if (a > UINTPTR_MAX - an || t > UINTPTR_MAX - tn) return MOQ_ERR_INVAL;
+        if (ranges_overlap(a, an, t, tn)) return MOQ_ERR_INVAL;
+    }
+    if (!s->tagged_output) return MOQ_ERR_WRONG_STATE;
+    if (cap == 0) return MOQ_OK;
+    return session_poll_actions(s, actions, cap, action_size, out_count, NULL,
+                                NULL, tags, tag_size);
 }
 
 moq_result_t moq_core_internal_virtual_poll(moq_session_t *s,
@@ -5404,12 +6057,13 @@ moq_result_t moq_core_internal_virtual_poll(moq_session_t *s,
 {
     if (out_count) *out_count = 0;
     if (!s || !observer || !out_count) return MOQ_ERR_INVAL;
-    if (s->virtual_observer != observer || s->transport_owner || s->virtual_batch)
+    if (s->tagged_output || s->virtual_observer != observer ||
+        s->transport_owner || s->virtual_batch)
         return MOQ_ERR_WRONG_STATE;
     if (!cap) return MOQ_OK;
     if (!actions || !opens) return MOQ_ERR_INVAL;
     moq_result_t rc = session_poll_actions(s, actions, cap, sizeof(*actions),
-                                          out_count, observer, opens);
+                                          out_count, observer, opens, NULL, 0);
     if (*out_count) {
         s->virtual_batch = true;
         s->virtual_batch_epoch = s->borrow_epoch;

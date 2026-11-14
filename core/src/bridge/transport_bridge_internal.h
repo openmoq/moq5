@@ -34,7 +34,10 @@ extern unsigned long long moq_bridge_map_lookups;
 #define BRIDGE_DRAIN_BUDGET           256
 #define BRIDGE_DEFAULT_MAX_TOMBSTONES  64
 
-#define BRIDGE_INBOUND_REF_BASE (1ULL << 63)
+/* Peer-opened streams take refs from the upper range the session leaves
+ * to its host (MOQ_STREAM_REF_LOCAL_END); the session's own refs stay
+ * below it. */
+#define BRIDGE_INBOUND_REF_BASE MOQ_STREAM_REF_LOCAL_END
 
 /* Local hold-age policy (MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT): a peer stream
  * refused at admission is cancelled once it has waited this long since its
@@ -92,6 +95,38 @@ typedef enum {
                                    * stream, or a data stream the session has
                                    * dropped/refused (replaying would misparse) */
 } bridge_uni_disp_t;
+
+/*
+ * Custody of the end of a local FETCH response stream, recorded on its
+ * mapping when the stream opens for its FETCH header and kept until the
+ * stream's outstanding completion. The FETCH itself can end (its FIN
+ * queued, its native state freed) while that FIN still waits for the
+ * provider; a peer STOP_SENDING arriving then must still freeze the stream
+ * and be answered with one reset.
+ *
+ *   OPEN          the provider has not accepted the stream's FIN: it is
+ *                 queued in the session, held by this bridge, or not yet
+ *                 written. A STOP freezes the stream; its reset is the
+ *                 session's when one is queued or follows (a live FETCH's
+ *                 teardown), otherwise the bridge's own (fetch_reset_owed).
+ *   FIN_ACCEPTED  the provider accepted the FIN. Delivering the stream, and
+ *                 answering a later STOP, are the provider's duty now; this
+ *                 is not an acknowledgement, and the bridge resets nothing.
+ *                 Without MOQ_TRANSPORT_CAP_COMMIT_REPORT the mapping
+ *                 retires here and the record ends with it; with it the
+ *                 mapping waits for the commit report, the explicit all-ACKed
+ *                 completion, which ends the record.
+ *   RESET         a reset owns the stream: one the session queued (its
+ *                 teardown, an abort, a timeout) or the bridge's own answer
+ *                 to a STOP. Its first code stays; nothing else is written
+ *                 and no second reset follows.
+ */
+typedef enum {
+    BRIDGE_FETCH_END_NONE         = 0, /* not a local FETCH response stream */
+    BRIDGE_FETCH_END_OPEN         = 1,
+    BRIDGE_FETCH_END_FIN_ACCEPTED = 2,
+    BRIDGE_FETCH_END_RESET        = 3,
+} bridge_fetch_end_t;
 
 typedef struct {
     moq_stream_ref_t       ref;
@@ -177,6 +212,34 @@ typedef struct {
     uint8_t                classify_len;    /* retained leading bytes (< 9) */
     uint8_t                classify_buf[9];
     bool                   known_data_type; /* valid type, not topology alone */
+    /* A local FETCH response stream (bridge_fetch_end_t, above), and the
+     * length of the FETCH header it opened with: a reset of the bridge's
+     * own keeps that prefix, as the session's teardown does. */
+    uint8_t                fetch_end;
+    uint8_t                fetch_header_len;
+    /* The peer stopped this FETCH response stream after its FETCH had
+     * ended, so no native reset follows: the bridge owes the reset, with
+     * the first STOP's code (pending_stop_code, which a later STOP never
+     * replaces). Recorded where the STOP is answered; dispatched only by
+     * the service pass. */
+    bool                   fetch_reset_owed;
+    /* Drafts 18 and 22: the request stream of this stream's FETCH, taken
+     * from the FETCH header's private record when the stream opens and kept
+     * with the mapping until the stream's completion, so it survives the
+     * FETCH's native end. A STOP of this stream resets both (draft-18
+     * section 5.2, draft-22 section 3.2.4). */
+    moq_stream_ref_t       fetch_req_ref;
+    /* On that request stream's mapping: the peer stopped the FETCH's
+     * response stream while it was OPEN (the half's FIN, the FETCH's final
+     * message, is held until then), so the half's remaining output, FIN
+     * included, is obsolete and its reset is owed.
+     * It settles with the first reset of the half: the session's teardown
+     * or another native reset or abort that commits first, the answer to a
+     * peer STOP of the request, or, once no native FETCH holds the request
+     * and no native reset of it is queued, the bridge's own reset with
+     * CANCELLED (bridge_fetch_req_reset_owed, dispatched by service). Its
+     * receive half is untouched. */
+    bool                   fetch_req_stopped;
 } bridge_stream_entry_t;
 
 /* -- Held peer streams (MOQ_TRANSPORT_CAP_HOLD_BIDI_INPUT) ------------ *
@@ -355,6 +418,11 @@ struct moq_transport_bridge {
      * request cancellation (its owner ended, our half open): the service pass
      * decides. */
     bool     bidi_cancel_due;
+    /* Some FETCH response stream owes the bridge's own reset
+     * (fetch_reset_owed), or some request stream is frozen by its FETCH's
+     * data STOP and not yet settled: the service pass dispatches or
+     * rechecks it. */
+    bool     fetch_debt_due;
     /* Some stream entry may hold inbound work for the service pass (an
      * admission readiness mark, a retained retry, a deferred RESET or
      * STOP): set wherever one is marked, cleared only by the walk that
@@ -528,6 +596,13 @@ bool bridge_session_has_data_terminal(const moq_session_t *s, moq_stream_ref_t r
  * and reset obligations remain session-owned until ordinary settlement. */
 bool bridge_session_take_terminal_changes(moq_session_t *s);
 bool bridge_session_is_outgoing_subgroup(const moq_session_t *s, moq_stream_ref_t ref);
+bool bridge_session_is_outgoing_fetch(const moq_session_t *s, moq_stream_ref_t ref);
+/* Whether a FETCH this endpoint serves (live, its teardown possibly still
+ * to commit) holds request stream req; whether the session queues a reset
+ * or an abort of request stream ref. */
+bool bridge_session_fetch_request_live(const moq_session_t *s, moq_stream_ref_t req);
+bool bridge_session_has_queued_request_reset(const moq_session_t *s,
+                                             moq_stream_ref_t ref);
 /* Service only due outgoing subgroup work, including behind blocked output. */
 moq_result_t bridge_session_service_outgoing(moq_session_t *s, uint64_t now_us);
 

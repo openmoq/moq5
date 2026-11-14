@@ -1153,6 +1153,8 @@ moq_result_t moq_session_publish_namespace(moq_session_t *s,
     moq_announcement_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
+    if (moq_session_uses_request_streams(s) && session_local_ref_spent(s))
+        return MOQ_ERR_LIMIT;
     uint32_t cfg_size;
     memcpy(&cfg_size, cfg, sizeof(cfg_size));
     if (cfg_size < MOQ_PUBLISH_NAMESPACE_CFG_V0_SIZE)

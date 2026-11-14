@@ -1937,6 +1937,12 @@ static int rx_get_or_create_stream(moq_session_t *s, moq_stream_ref_t stream_ref
 
     /* Unknown stream. */
     if (len == 0 && !fin) { *out_rc = MOQ_OK; return -1; }
+    /* Tagged mode: every unidirectional stream that delivers bytes was
+     * opened by the peer, so its ref lies in the host's range. */
+    if (s->tagged_output && stream_ref._v < MOQ_STREAM_REF_LOCAL_END) {
+        *out_rc = MOQ_ERR_INVAL;
+        return -1;
+    }
     if (rx_is_finished(s, stream_ref._v)) {
         *out_rc = close_with_error(s, 0x3, "data after FIN");
         return -1;
@@ -3595,15 +3601,8 @@ void rx_fill_stopped(moq_session_t *s, moq_stream_ref_t ref)
  * counted once here exactly as the peer's terminal would have counted it; an
  * identity-only record lost its binding and counts nothing. A bound fill
  * child's stream is settled locally, keeping its cancellation's reason. */
-moq_result_t bridge_session_on_data_retired(moq_session_t *s,
-                                            moq_stream_ref_t ref,
-                                            uint64_t now_us)
+static moq_result_t rx_retire_stopped(moq_session_t *s, moq_stream_ref_t ref)
 {
-    if (!s) return MOQ_ERR_INVAL;
-    moq_result_t arc = session_advance_entry(s, now_us);
-    if (arc != MOQ_OK) return arc;
-    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
-
     int slot = rx_find_by_ref(s, ref);
     if (slot >= 0) {
         moq_rx_stream_t *rx = &s->rx_streams[slot];
@@ -3621,4 +3620,43 @@ moq_result_t bridge_session_on_data_retired(moq_session_t *s,
         return MOQ_OK;
     }
     return MOQ_ERR_STALE_HANDLE;
+}
+
+moq_result_t bridge_session_on_data_retired(moq_session_t *s,
+                                            moq_stream_ref_t ref,
+                                            uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    return rx_retire_stopped(s, ref);
+}
+
+/* True while the session's own STOP for this stream is still in the action
+ * queue: the caller has not polled it, so no transport can have accepted
+ * it yet. */
+static bool rx_stop_data_queued(const moq_session_t *s, moq_stream_ref_t ref)
+{
+    for (size_t i = s->action_head; i < s->action_tail; ++i) {
+        const moq_action_t *a = &s->actions[i % s->action_cap];
+        if (a->kind == MOQ_ACTION_STOP_DATA &&
+            a->u.stop_data.stream_ref._v == ref._v)
+            return true;
+    }
+    return false;
+}
+
+/* The public form of local receive retirement. It adds the one precondition
+ * the session can see for itself; the rest are the caller's to prove. */
+moq_result_t moq_session_on_data_stream_retired(moq_session_t *s,
+                                                moq_stream_ref_t stream_ref,
+                                                uint64_t now_us)
+{
+    if (!s) return MOQ_ERR_INVAL;
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    if (rx_stop_data_queued(s, stream_ref)) return MOQ_ERR_WRONG_STATE;
+    return rx_retire_stopped(s, stream_ref);
 }

@@ -112,6 +112,7 @@ static moq_result_t d18_start(moq_session_t *s)
     moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)s->profile_state;
     if (s->state != MOQ_SESS_IDLE)
         return MOQ_ERR_WRONG_STATE;
+    if (session_local_ref_spent(s)) return MOQ_ERR_LIMIT;
 
     size_t cap = 32;
     for (size_t i = 0; i < s->setup_token_count; i++)

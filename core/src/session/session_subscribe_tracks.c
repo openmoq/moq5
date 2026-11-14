@@ -569,6 +569,7 @@ moq_result_t moq_session_subscribe_tracks(moq_session_t *s,
     moq_track_sub_handle_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
+    if (session_local_ref_spent(s)) return MOQ_ERR_LIMIT;
 #define ST_CFG_MIN offsetof(moq_subscribe_tracks_cfg_t, has_forward)
     if (cfg->struct_size < ST_CFG_MIN) return MOQ_ERR_INVAL;
 #define ST_CFG_HAS(f) \

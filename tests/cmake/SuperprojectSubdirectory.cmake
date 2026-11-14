@@ -44,6 +44,11 @@ execute_process(
     RESULT_VARIABLE rc
     OUTPUT_VARIABLE out
     ERROR_VARIABLE out)
+# The nested configure's status and whole output are kept and shown even on
+# success, so its diagnostics can be judged after the work tree is gone.
+file(WRITE "${MOQ_WORK}/logs/superproject.configure.log" "${out}")
+file(WRITE "${MOQ_WORK}/logs/superproject.configure.status" "${rc}\n")
+message(STATUS "superproject configure exit ${rc}:\n${out}")
 if(NOT rc EQUAL 0)
     message(FATAL_ERROR "superproject configure failed (${rc}):\n${out}")
 endif()

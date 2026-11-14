@@ -280,6 +280,9 @@ typedef struct moq_pending_open {
     uint8_t mode;
     bool handed;
     bool virtual_handed; /* in existing padding; distinct from native handoff */
+    /* Handed by the tagged poll: the host reports the open, or a claim
+     * resolves it. Never resolved EXTERNAL at hand-out. */
+    bool tagged_handed;
 } moq_pending_open_t;
 
 typedef struct moq_sub_entry {
@@ -1352,6 +1355,14 @@ typedef struct moq_sg_entry {
     /* Bytes of the SUBGROUP_HEADER as encoded on this stream: the reliable
      * size of every reset the session sends on it. */
     uint8_t               header_len;
+    /* The host claimed this subgroup's owed reset (moq_session_claim_data_reset):
+     * the reset leaves only through the matching commit. */
+    bool                   reset_claimed;
+    /* The peer's STOP_SENDING of this stream was observed through
+     * moq_session_on_data_stop_ex: a delivery fact kept apart from the
+     * terminal's first cause, which it never replaces. The reset handed to
+     * the action queue carries it too. */
+    bool                   peer_stopped;
     moq_sg_state_t         state;
     uint32_t               generation;
     moq_subscription_t     sub;
@@ -2195,6 +2206,27 @@ struct moq_session {
     const void              *virtual_observer;
     bool                     virtual_batch;
     uint64_t                 virtual_batch_epoch;
+    /* The public tagged host mode (moq_session_enable_tagged_output):
+     * permanent once set, and exclusive with a transport owner and a virtual
+     * observer. Actions then leave only through the tagged poll, and a
+     * handed data-stream open stays pending until the host reports it. */
+    bool                     tagged_output;
+    /* Set by the first advancing call: the session is no longer pristine,
+     * so the tagged mode can no longer be enabled. */
+    bool                     host_engaged;
+    /* The one outstanding public reset claim (tagged mode): the offer's
+     * immutable identity and the prefix fact it was claimed with. The reset
+     * itself carries the private reset_claimed mark (queued action or
+     * subgroup entry). Cleared by its commit and by close. */
+    struct {
+        bool     active;
+        uint8_t  prefix;
+        uint64_t ref;
+        uint64_t owner;
+        uint64_t code;
+        uint64_t reliable_size;
+        uint32_t cause;
+    }                        host_claim;
     /* The registered owner's own next deadline (its local hold-age expiry),
      * folded into moq_session_next_deadline_us. moq_session_tick never
      * consumes it: only the owner's own service rearms or clears it. */
@@ -2736,6 +2768,15 @@ bool session_refuses_request(const moq_session_t *s, const moq_namespace_t *ns,
 
 void session_begin_advance(moq_session_t *s, uint64_t now_us);
 
+/* Whether the range of refs the session assigns to the streams it opens
+ * is spent: every local open then returns the permanent MOQ_ERR_LIMIT, so
+ * no local ref reaches the range of peer-opened refs. */
+static inline bool session_local_ref_spent(const moq_session_t *s)
+{
+    return s->next_stream_ref == 0 ||
+           s->next_stream_ref >= MOQ_STREAM_REF_LOCAL_END;
+}
+
 /* Advancing-call preamble for the service-reachable entry points. Returns
  * MOQ_SESSION_SUSPENDED only inside a budget context; the caller must then
  * return it without refreshing idle or running its own transition. */
@@ -3018,7 +3059,30 @@ bool sg_has_terminal_debt(const moq_session_t *s);
 bool bridge_session_take_terminal_changes(moq_session_t *s);
 /* Transfer a reset debt directly into a poll slot when the action ring is
  * full, publishing its event unless already claimed. Never overtakes its header. */
-bool sg_take_terminal_action(moq_session_t *s, moq_action_t *out);
+/* Remove a local data stream's queued actions (its data, and with
+ * with_reset its queued reset; with keep_header its opening header stays).
+ * Returns the SEND_DATA actions whose custody ended. */
+uint32_t session_discard_stream_actions(moq_session_t *s, uint64_t ref,
+                                        bool with_reset, bool keep_header);
+/* A peer STOP_SENDING on the response stream of a live FETCH this endpoint
+ * serves: the atomic teardown. MOQ_ERR_STALE_HANDLE when ref is no such
+ * stream; MOQ_ERR_WOULD_BLOCK, with nothing changed, while its reservation
+ * is short. *request_ended reports that the request stream resets too. */
+moq_result_t fetch_on_data_stop(moq_session_t *s, moq_stream_ref_t ref,
+                                uint64_t error_code, bool *request_ended,
+                                uint32_t *released);
+/* Whether ref is the response stream of a live FETCH this endpoint serves. */
+bool bridge_session_is_outgoing_fetch(const moq_session_t *s, moq_stream_ref_t ref);
+/* Whether a FETCH this endpoint serves still holds request stream req;
+ * whether a reset or abort of request stream ref is queued. */
+bool bridge_session_fetch_request_live(const moq_session_t *s, moq_stream_ref_t req);
+bool bridge_session_has_queued_request_reset(const moq_session_t *s,
+                                             moq_stream_ref_t ref);
+
+/* *owner, when not NULL, receives the subgroup's owner handle (its
+ * subscription or publication), read without resolving it. */
+bool sg_take_terminal_action(moq_session_t *s, moq_action_t *out,
+                             uint64_t *owner);
 /* An uncommitted terminal needs event credit; either terminal form must
  * remain behind its queued subgroup header/barrier. These checks are passive. */
 bool sg_terminal_reset_ready(const moq_session_t *s, const moq_sg_entry_t *sg);
@@ -3077,6 +3141,17 @@ moq_subgroup_handle_t sg_make_handle(moq_session_t *s, size_t slot);
 static inline uint32_t handle_pool_tag(uint64_t h)    { return (uint32_t)(h >> 60) & 0xFu; }
 static inline uint16_t handle_session_tag(uint64_t h) { return (uint16_t)(h >> 44); }
 static inline uint32_t handle_generation(uint64_t h)  { return (uint32_t)(h >> 16) & 0xFFFFFFFu; }
+
+/* Tagged mode: a request slot whose next live generation would leave the
+ * packed handle's 28-bit field is retired for the session's life. Its
+ * handle is the output-owner token, which must stay nonzero and never
+ * repeat while output tagged with it may still be held, so a generation
+ * never wraps there. Outside the mode the slot policy is unchanged. */
+static inline bool session_slot_generation_spent(const moq_session_t *s,
+                                                 uint32_t generation)
+{
+    return s->tagged_output && (generation | 1u) > 0xFFFFFFFu;
+}
 static inline uint32_t handle_slot(uint64_t h)        { return (uint32_t)(h) & 0xFFFFu; }
 
 /* The slot of a live subscription named by `h`, or -1. */

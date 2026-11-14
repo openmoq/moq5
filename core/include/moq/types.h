@@ -279,6 +279,14 @@ typedef struct moq_session moq_session_t;
 typedef struct moq_stream_ref { uint64_t _v; } moq_stream_ref_t;
 typedef struct moq_stream_id  { uint64_t _v; } moq_stream_id_t;
 
+/* Stream refs are split in two ranges. The session names the streams it
+ * opens with refs in [1, MOQ_STREAM_REF_LOCAL_END), never reusing one;
+ * once that range is spent, every call that would open a stream returns
+ * MOQ_ERR_LIMIT with no effect. A host names the streams its peer opens
+ * with refs in [MOQ_STREAM_REF_LOCAL_END, UINT64_MAX], each used once for
+ * the session's life. 0 is never a ref. Refs compare by their whole value. */
+#define MOQ_STREAM_REF_LOCAL_END (UINT64_C(1) << 63)
+
 #ifdef __cplusplus
 static inline moq_stream_ref_t moq_stream_ref_from_u64(uint64_t v) {
     return moq_stream_ref_t{v};

@@ -11,7 +11,9 @@
 static int sub_find_free(moq_session_t *s)
 {
     for (size_t i = 0; i < s->sub_cap; i++)
-        if (s->subs[i].state == MOQ_SUB_FREE) return (int)i;
+        if (s->subs[i].state == MOQ_SUB_FREE &&
+            !session_slot_generation_spent(s, s->subs[i].generation))
+            return (int)i;
     return -1;
 }
 
@@ -3917,6 +3919,9 @@ static moq_result_t sub_update_prepare(moq_session_t *s, size_t slot,
         p->fail_fill = fill_unserved_opens_stream(&p->feff, p->snap_has,
             p->snap_group, p->snap_object,
             !(v->valid ? v->forward : u->has_forward ? u->forward : e->forward));
+        /* A failed fill must open its stream: with the local ref range
+         * spent it never can, which retrying cannot change. */
+        if (p->fail_fill && session_local_ref_spent(s)) return MOQ_ERR_LIMIT;
         if (p->fail_fill && (action_queue_avail(s) < ok_actions + 2 ||
                             !session_open_credit(s)))
             return MOQ_ERR_WOULD_BLOCK;
@@ -4884,6 +4889,8 @@ moq_result_t moq_session_subscribe(moq_session_t *s,
                                     moq_subscription_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
+    if (moq_session_uses_request_streams(s) && session_local_ref_spent(s))
+        return MOQ_ERR_LIMIT;
 #define SUB_CFG_MIN offsetof(moq_subscribe_cfg_t, auth_tokens)
     if (cfg->struct_size < SUB_CFG_MIN) return MOQ_ERR_INVAL;
 #define SUB_CFG_HAS(f) \
@@ -5368,6 +5375,7 @@ moq_result_t session_accept_subscribe_receipt(moq_session_t *s,
     bool fail_fill = s->subs[slot].fill_unserved &&
         fill_unserved_opens_stream(&s->subs[slot].fill_unserved_input, snap_has,
                                    snap_g, snap_o, !s->subs[slot].forward);
+    if (fail_fill && session_local_ref_spent(s)) return MOQ_ERR_LIMIT;
     if (fail_fill && !session_open_credit(s)) return MOQ_ERR_WOULD_BLOCK;
 
     /* Reserve-before-mutate: SUBSCRIBE_OK (1 action + ok_len send bytes) PLUS the
@@ -5950,7 +5958,9 @@ moq_result_t moq_session_done_subscribe(
     const moq_done_subscribe_cfg_t *cfg,
     uint64_t now_us)
 {
-    return session_done_subscribe(s, sub, cfg, now_us, false);
+    /* Tagged mode: the session counts every stream it opened itself, so
+     * cfg->stream_count is not read. */
+    return session_done_subscribe(s, sub, cfg, now_us, s && s->tagged_output);
 }
 
 moq_result_t session_done_subscribe(moq_session_t *s, moq_subscription_t sub,

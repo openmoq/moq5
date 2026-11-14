@@ -78,6 +78,7 @@ static moq_result_t d22_start(moq_session_t *s)
     if (moq_binding_required_unbound(s)) return MOQ_ERR_WRONG_STATE;
     if (s->state != MOQ_SESS_IDLE)
         return MOQ_ERR_WRONG_STATE;
+    if (session_local_ref_spent(s)) return MOQ_ERR_LIMIT;
     const moq_transport_binding_t *binding = &s->binding.value;
     bool target = binding->kind == MOQ_BINDING_RAW_QUIC &&
                   s->perspective == MOQ_PERSPECTIVE_CLIENT;

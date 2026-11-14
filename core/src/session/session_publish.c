@@ -6,7 +6,9 @@
 int pub_find_free(moq_session_t *s)
 {
     for (size_t i = 0; i < s->pub_cap; i++)
-        if (s->publishes[i].state == MOQ_PUB_FREE) return (int)i;
+        if (s->publishes[i].state == MOQ_PUB_FREE &&
+            !session_slot_generation_spent(s, s->publishes[i].generation))
+            return (int)i;
     return -1;
 }
 
@@ -1383,6 +1385,8 @@ moq_result_t moq_session_publish(moq_session_t *s,
                                   moq_publication_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
+    if (moq_session_uses_request_streams(s) && session_local_ref_spent(s))
+        return MOQ_ERR_LIMIT;
 #define PUB_CFG_MIN offsetof(moq_publish_cfg_t, auth_tokens)
     if (cfg->struct_size < PUB_CFG_MIN) return MOQ_ERR_INVAL;
 #define PUB_CFG_HAS(f) \
@@ -2509,6 +2513,9 @@ static moq_result_t pub_inbound_update_prepare(moq_session_t *s, size_t slot,
         p->fail_fill = fill_unserved_opens_stream(&p->feff, p->snap_has,
             p->snap_group, p->snap_object,
             !(v->valid ? v->forward : u->has_forward ? u->forward : e->send_allowed));
+        /* A failed fill must open its stream: with the local ref range
+         * spent it never can, which retrying cannot change. */
+        if (p->fail_fill && session_local_ref_spent(s)) return MOQ_ERR_LIMIT;
         if (p->fail_fill && (action_queue_avail(s) < ok_actions + 2 ||
                             !session_open_credit(s)))
             return MOQ_ERR_WOULD_BLOCK;
@@ -3507,7 +3514,9 @@ moq_result_t moq_session_finish_publish(
     const moq_finish_publish_cfg_t *cfg,
     uint64_t now_us)
 {
-    return session_finish_publish(s, pub, cfg, now_us, false);
+    /* Tagged mode: the session counts every stream it opened itself, so
+     * cfg->stream_count is not read. */
+    return session_finish_publish(s, pub, cfg, now_us, s && s->tagged_output);
 }
 
 moq_result_t session_finish_publish(moq_session_t *s, moq_publication_t pub,
@@ -3647,6 +3656,7 @@ moq_result_t moq_session_open_pub_subgroup(
     moq_subgroup_handle_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
+    if (session_local_ref_spent(s)) return MOQ_ERR_LIMIT;
     if (cfg->struct_size < offsetof(moq_subgroup_cfg_t, publisher_priority) +
         sizeof(cfg->publisher_priority)) return MOQ_ERR_INVAL;
     if (cfg->group_id > s->profile->location_varint_max) return MOQ_ERR_INVAL;

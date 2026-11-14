@@ -163,6 +163,8 @@ void sg_free_entry(moq_session_t *s, size_t slot)
     entries[slot].ovr_has_object = entries[slot].ovr_has_subgroup = false;
     entries[slot].terminal_cause = MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE;
     entries[slot].terminal_code = 0;
+    entries[slot].reset_claimed = false;
+    entries[slot].peer_stopped = false;
     entries[slot].state = MOQ_SG_FREE;
     entries[slot].generation++;
     /* Clear ownership handles so a reused slot can never be matched by an
@@ -500,6 +502,8 @@ static void sg_queue_reset(moq_session_t *s, moq_sg_entry_t *sg, uint64_t code)
     a.u.reset_data.error_code = code;
     a.u.reset_data.reliable_size = sg->header_len;
     (void)push_action(s, &a);   /* the caller checked capacity */
+    if (sg->peer_stopped)
+        s->action_meta[(s->action_tail - 1) % s->action_cap].peer_stopped = true;
     if (sg->terminal_cause != MOQ_OUTGOING_SUBGROUP_TERMINAL_NONE) {
         /* A pressure claim already published the event. Its compact reset
          * still precedes the owner's DONE when action capacity returns. */
@@ -516,6 +520,16 @@ static void sg_queue_reset(moq_session_t *s, moq_sg_entry_t *sg, uint64_t code)
         }
         s->actions[at % s->action_cap] = a;
         s->action_meta[at % s->action_cap] = meta;
+    }
+    if (sg->reset_claimed) {
+        /* The host's claim moves with the reset onto its queued action. */
+        for (size_t j = s->action_head; j < s->action_tail; j++) {
+            const moq_action_t *q = &s->actions[j % s->action_cap];
+            if (q->kind == MOQ_ACTION_RESET_DATA &&
+                q->u.reset_data.stream_ref._v == sg->stream_ref._v)
+                s->action_meta[j % s->action_cap].reset_claimed = true;
+        }
+        sg->reset_claimed = false;
     }
     sg->state = MOQ_SG_RESETTING;
 }
@@ -675,13 +689,17 @@ bool sg_claim_terminal_reset(moq_session_t *s, size_t slot)
     return true;
 }
 
-bool sg_take_terminal_action(moq_session_t *s, moq_action_t *out)
+bool sg_take_terminal_action(moq_session_t *s, moq_action_t *out,
+                             uint64_t *owner)
 {
     if (!s->sg_reset_owed) return false;
     for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
         moq_sg_entry_t *sg = &s->subgroups[i];
         if (!sg_terminal_reset_ready(s, sg)) continue;
+        /* A reset the host claimed leaves only through its commit. */
+        if (sg->reset_claimed) continue;
         sg_terminal_action(s, sg, out);
+        if (owner) *owner = sg->sub._opaque ? sg->sub._opaque : sg->pub._opaque;
         if (sg->state == MOQ_SG_TERMINAL_OWED)
             sg_commit_terminal(s, (size_t)i);
         else
@@ -924,6 +942,7 @@ moq_result_t moq_session_open_subgroup(
     moq_subgroup_handle_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
+    if (session_local_ref_spent(s)) return MOQ_ERR_LIMIT;
     if (cfg->struct_size < offsetof(moq_subgroup_cfg_t, publisher_priority) +
         sizeof(cfg->publisher_priority)) return MOQ_ERR_INVAL;
     if (cfg->group_id > s->profile->location_varint_max) return MOQ_ERR_INVAL;
@@ -2405,11 +2424,18 @@ bool bridge_session_is_outgoing_subgroup(const moq_session_t *s, moq_stream_ref_
     return false;
 }
 
+/* What a data STOP did, for moq_session_on_data_stop_ex. */
+typedef struct data_stop_result {
+    bool fetch_teardown;
+    bool request_ended;
+} data_stop_result_t;
+
 static moq_result_t session_on_data_stop(moq_session_t *s,
                                          moq_stream_ref_t stream_ref,
                                          uint64_t error_code,
                                          uint64_t now_us,
-                                         uint8_t retained_header_len)
+                                         uint8_t retained_header_len,
+                                         data_stop_result_t *res)
 {
     if (!s) return MOQ_ERR_INVAL;
     if (error_code > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
@@ -2428,6 +2454,20 @@ static moq_result_t session_on_data_stop(moq_session_t *s,
 
     int slot = sg_find_by_stream_ref(s, stream_ref);
     if (slot < 0 && retained_header_len == 0) {
+        /* The response stream of a FETCH this endpoint serves: its atomic
+         * teardown (both streams reset, one FETCH_CANCELLED), or nothing
+         * at all while its reservation is short. */
+        bool request_ended = false;
+        uint32_t released = 0;
+        moq_result_t trc = fetch_on_data_stop(s, stream_ref, error_code,
+                                              &request_ended, &released);
+        if (trc != MOQ_ERR_STALE_HANDLE) {
+            if (trc == MOQ_OK && res) {
+                res->fetch_teardown = true;
+                res->request_ended = request_ended;
+            }
+            return trc;
+        }
         /* A fill stream answers the peer's STOP with its RESET and ends the
          * child; a stream nobody owns is nothing to act on. */
         moq_result_t frc = fill_on_data_stop(s, stream_ref, error_code);
@@ -2469,14 +2509,165 @@ moq_result_t moq_session_on_data_stop(moq_session_t *s,
                                        uint64_t error_code,
                                        uint64_t now_us)
 {
-    return session_on_data_stop(s, stream_ref, error_code, now_us, 0);
+    return session_on_data_stop(s, stream_ref, error_code, now_us, 0, NULL);
+}
+
+/* SEND_DATA of ref still queued, its opening header excluded. */
+static uint32_t queued_stream_data(const moq_session_t *s, uint64_t ref)
+{
+    uint32_t n = 0;
+    for (size_t j = s->action_head; j < s->action_tail; j++) {
+        const moq_action_t *a = &s->actions[j % s->action_cap];
+        const moq_action_meta_t *m = &s->action_meta[j % s->action_cap];
+        if (a->kind == MOQ_ACTION_SEND_DATA && a->u.send_data.stream_ref._v == ref &&
+            !m->subgroup_header && !m->opens_data && !m->stream_first)
+            n++;
+    }
+    return n;
+}
+
+/* Whether a reset of ref is the session's to emit: queued, owed on its
+ * subgroup, or owed by its fill. */
+static bool data_reset_follows(const moq_session_t *s, moq_stream_ref_t ref)
+{
+    for (size_t j = s->action_head; j < s->action_tail; j++) {
+        const moq_action_t *a = &s->actions[j % s->action_cap];
+        if (a->kind == MOQ_ACTION_RESET_DATA && a->u.reset_data.stream_ref._v == ref._v)
+            return true;
+    }
+    for (int32_t i = s->sg_occ_head; i >= 0; i = s->subgroups[i].occ_next) {
+        const moq_sg_entry_t *sg = &s->subgroups[i];
+        if (sg->stream_ref._v == ref._v &&
+            (sg->state == MOQ_SG_RESET_OWED || sg->state == MOQ_SG_TERMINAL_OWED))
+            return true;
+    }
+    for (size_t i = 0; s->fill_storage && i < s->fill_cap; i++) {
+        const moq_fill_entry_t *f = &s->fill_storage[i];
+        if (f->active && f->stream_bound && f->stream._v == ref._v && f->peer_stop)
+            return true;
+    }
+    return false;
+}
+
+static void write_end_result(moq_data_end_result_t *out, size_t out_size,
+                             moq_data_end_outcome_t outcome, uint32_t released,
+                             uint32_t flags, uint64_t host_reset_code)
+{
+    const size_t copy = sizeof(moq_data_end_result_t) < out_size
+        ? sizeof(moq_data_end_result_t) : out_size;
+    moq_data_end_result_t r = {
+        .struct_size = (uint32_t)copy,
+        .outcome = outcome,
+        .released_data_actions = released,
+        .flags = flags,
+        .host_reset_code = host_reset_code,
+    };
+    memset(out, 0, out_size);
+    memcpy(out, &r, copy);
+}
+
+/* After a STOP or expiry: RESET_FOLLOWS when a reset of the stream is the
+ * session's; otherwise NO_RESET, with every queued action of the stream
+ * removed, since no native output for it follows. */
+static void finish_data_end(moq_session_t *s, moq_stream_ref_t ref,
+                            uint32_t before, uint32_t flags, uint64_t host_code,
+                            moq_data_end_result_t *out, size_t out_size)
+{
+    uint32_t after = queued_stream_data(s, ref._v);
+    uint32_t released = before > after ? before - after : 0;
+    if (data_reset_follows(s, ref)) {
+        write_end_result(out, out_size, MOQ_DATA_END_RESET_FOLLOWS, released,
+                         flags, 0);
+        return;
+    }
+    released += session_discard_stream_actions(s, ref._v, false, false);
+    write_end_result(out, out_size, MOQ_DATA_END_NO_RESET, released, flags,
+                     host_code);
+}
+
+/* A STOP of ref the session took: recorded on every queued RESET_DATA of
+ * the stream and on its subgroup, wherever its reset is held. The reset
+ * keeps its first cause, code and terminal event; the record only lets the
+ * host claim it WAIVED. */
+static void note_data_stop(moq_session_t *s, moq_stream_ref_t ref)
+{
+    for (size_t j = s->action_head; j < s->action_tail; j++) {
+        const moq_action_t *a = &s->actions[j % s->action_cap];
+        if (a->kind == MOQ_ACTION_RESET_DATA && a->u.reset_data.stream_ref._v == ref._v)
+            s->action_meta[j % s->action_cap].peer_stopped = true;
+    }
+    int slot = sg_find_by_stream_ref(s, ref);
+    if (slot >= 0) s->subgroups[slot].peer_stopped = true;
+}
+
+moq_result_t moq_session_on_data_stop_ex(moq_session_t *s,
+    moq_stream_ref_t stream_ref, uint64_t error_code, uint64_t now_us,
+    moq_data_end_result_t *out, size_t out_size)
+{
+    if (!s || !out || out_size < MOQ_DATA_END_RESULT_V0_SIZE || !stream_ref._v)
+        return MOQ_ERR_INVAL;
+    if (error_code > MOQ_QUIC_VARINT_MAX) return MOQ_ERR_INVAL;
+    uint32_t before = queued_stream_data(s, stream_ref._v);
+    data_stop_result_t res = { false, false };
+    moq_result_t rc = session_on_data_stop(s, stream_ref, error_code, now_us, 0, &res);
+    if (rc == MOQ_ERR_WOULD_BLOCK) {
+        /* A live subgroup's STOP latched before anything could block: its
+         * reset follows once the event can commit. A fill stream's STOP is
+         * recorded as well, its RESET_DATA owed until an action slot frees;
+         * a FETCH whose teardown reservation is short changed nothing.
+         * Neither of those writes a result. */
+        int slot = sg_find_by_stream_ref(s, stream_ref);
+        if (slot < 0 || s->subgroups[slot].state != MOQ_SG_TERMINAL_OWED)
+            return rc;
+        rc = MOQ_OK;
+    }
+    if (rc != MOQ_OK) return rc;
+    note_data_stop(s, stream_ref);
+    finish_data_end(s, stream_ref, before,
+                    res.request_ended ? MOQ_DATA_END_REQUEST_ENDED : 0u,
+                    error_code, out, out_size);
+    return MOQ_OK;
+}
+
+moq_result_t moq_session_on_held_data_expired(moq_session_t *s,
+    moq_stream_ref_t stream_ref, uint64_t now_us,
+    moq_data_end_result_t *out, size_t out_size)
+{
+    if (!s || !out || out_size < MOQ_DATA_END_RESULT_V0_SIZE || !stream_ref._v)
+        return MOQ_ERR_INVAL;
+    if (moq_binding_required_unbound(s)) return MOQ_ERR_WRONG_STATE;
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    /* FETCH and fill output carries no delivery deadline, so no held byte
+     * of theirs can expire. */
+    if (bridge_session_is_outgoing_fetch(s, stream_ref)) return MOQ_ERR_WRONG_STATE;
+    for (size_t i = 0; s->fill_storage && i < s->fill_cap; i++) {
+        const moq_fill_entry_t *f = &s->fill_storage[i];
+        if (f->active && f->stream_bound && f->stream._v == stream_ref._v)
+            return MOQ_ERR_WRONG_STATE;
+    }
+    uint32_t before = queued_stream_data(s, stream_ref._v);
+    int slot = sg_find_by_stream_ref(s, stream_ref);
+    /* The latch only: an earlier STOP, reset or timeout stays the first
+     * cause, and no event commits and no reset transfers here. */
+    if (slot >= 0)
+        sg_latch_terminal(s, (size_t)slot,
+            MOQ_OUTGOING_SUBGROUP_TERMINAL_DELIVERY_TIMEOUT,
+            MOQ_RESET_DELIVERY_TIMEOUT, sg_first_output(s, stream_ref, true));
+    moq_result_t arc = session_advance_entry(s, now_us);
+    if (arc != MOQ_OK) return arc;
+    if (!session_is_active(s)) return MOQ_ERR_CLOSED;
+    sg_recompute_deadline(s);
+    finish_data_end(s, stream_ref, before, 0u, MOQ_RESET_DELIVERY_TIMEOUT,
+                    out, out_size);
+    return MOQ_OK;
 }
 
 moq_result_t bridge_session_on_subgroup_stop(
     moq_session_t *s, moq_stream_ref_t ref, uint64_t error_code,
     uint64_t now_us, uint8_t retained_header_len)
 {
-    return session_on_data_stop(s, ref, error_code, now_us, retained_header_len);
+    return session_on_data_stop(s, ref, error_code, now_us, retained_header_len,
+                                NULL);
 }
 
 moq_result_t moq_session_on_data_committed(moq_session_t *s,

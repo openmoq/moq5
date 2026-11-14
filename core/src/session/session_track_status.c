@@ -615,6 +615,8 @@ moq_result_t moq_session_track_status(moq_session_t *s,
     moq_track_status_handle_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
+    if (moq_session_uses_request_streams(s) && session_local_ref_spent(s))
+        return MOQ_ERR_LIMIT;
 #define TS_CFG_MIN offsetof(moq_track_status_cfg_t, auth_tokens)
     if (cfg->struct_size < TS_CFG_MIN) return MOQ_ERR_INVAL;
 #define TS_CFG_HAS(f) \

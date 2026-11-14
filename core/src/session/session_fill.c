@@ -773,6 +773,7 @@ static moq_result_t push_fill_header(moq_session_t *s, uint64_t initiating_id,
                                      const moq_action_meta_t *meta,
                                      moq_stream_ref_t *out_ref, uint8_t *out_len)
 {
+    if (session_local_ref_spent(s)) return MOQ_ERR_LIMIT;
     uint8_t hdr[32];
     moq_buf_writer_t hw;
     moq_buf_writer_init(&hw, hdr, sizeof(hdr));

@@ -804,6 +804,7 @@ moq_result_t moq_session_subscribe_namespace(
     moq_ns_sub_handle_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
+    if (session_local_ref_spent(s)) return MOQ_ERR_LIMIT;
     if (cfg->struct_size < MOQ_SUBSCRIBE_NAMESPACE_CFG_V0_SIZE) return MOQ_ERR_INVAL;
 #define NS_CFG_HAS(f) \
     (cfg->struct_size >= offsetof(moq_subscribe_namespace_cfg_t, f) + sizeof(cfg->f))

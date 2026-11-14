@@ -34,6 +34,11 @@ execute_process(
     RESULT_VARIABLE rc
     OUTPUT_VARIABLE out
     ERROR_VARIABLE out)
+# The nested configure's status and whole output are kept and shown even on
+# success, so its diagnostics can be judged after the work tree is gone.
+file(WRITE "${MOQ_WORK}/logs/sim_off.configure.log" "${out}")
+file(WRITE "${MOQ_WORK}/logs/sim_off.configure.status" "${rc}\n")
+message(STATUS "MOQ_BUILD_SIM=OFF configure exit ${rc}:\n${out}")
 if(NOT rc EQUAL 0)
     message(FATAL_ERROR "configure with MOQ_BUILD_SIM=OFF failed (${rc}):\n${out}")
 endif()

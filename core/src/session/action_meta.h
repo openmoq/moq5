@@ -24,8 +24,24 @@ typedef struct moq_action_meta {
      * outgoing terminal event and its replacement RESET_DATA commit. */
     bool terminal_barrier;
     bool outgoing_terminal;
+    /* The first action of a local data stream that is not parent-counted
+     * (a FETCH response header): the tagged poll marks it FIRST_OF_STREAM. */
+    bool stream_first;
+    /* The one reset claimed through moq_session_claim_data_reset: it leaves
+     * the ring only through the matching commit. */
+    bool reset_claimed;
+    /* The peer's STOP_SENDING of this RESET_DATA's stream is known: the
+     * reset answers it (a FETCH teardown), or the STOP was observed through
+     * moq_session_on_data_stop_ex while the reset was held, whatever its
+     * first cause. The peer saw the stream, so its open is proven. */
+    bool peer_stopped;
     uint64_t deadline_us;        /* UINT64_MAX = no object delivery deadline */
     uint64_t owner;              /* request handle; a fill uses its parent */
+    /* On a FETCH response header (drafts 18 and 22): the FETCH's request
+     * stream ref, carried with the action so the bridge can keep the pair
+     * through the stream's completion even when the FETCH ended natively
+     * before the header was handed over. 0 otherwise. */
+    uint64_t paired_request;
     uint64_t group_id;
     uint64_t subgroup_id;
     uint64_t object_id;

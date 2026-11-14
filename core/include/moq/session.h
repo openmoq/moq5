@@ -148,6 +148,9 @@ typedef uint32_t moq_request_terminal_cause_t;
  * (MOQ_REQUEST_ERROR_UNINTERESTED, every draft) and its PUBLISH_FINISHED
  * carries that code. */
 #define MOQ_REQUEST_TERMINAL_MALFORMED_TRACK     7u
+/* The peer stopped the FETCH response stream (STOP_SENDING on the data
+ * stream); stream_error_code is the peer's code. */
+#define MOQ_REQUEST_TERMINAL_PEER_STOP_DATA      8u
 
 /* This endpoint's side of the request the outcome names. */
 typedef uint32_t moq_request_role_t;
@@ -185,6 +188,8 @@ typedef struct moq_session_cfg {
     uint32_t           struct_size;
     const moq_alloc_t *alloc;        /* required; copied into session */
     moq_perspective_t  perspective;   /* CLIENT or SERVER */
+    /* Draft 16 only: advertise a request capacity in setup, with this
+     * initial value (see moq_session_peer_request_capacity). */
     bool               send_request_capacity;
     uint64_t           initial_request_capacity;
 
@@ -634,9 +639,18 @@ MOQ_API moq_result_t moq_session_process_pending(moq_session_t *s,
  *                       GOAWAY drain deadline had passed, the session is
  *                       now closed with MOQ_CLOSE_IDLE_TIMEOUT or
  *                       MOQ_CLOSE_GOAWAY_TIMEOUT.
- *   MOQ_ERR_WOULD_BLOCK a terminal the session owes on an outgoing
- *                       subgroup could not be queued yet. Drain actions
- *                       and events, then tick again.
+ *   MOQ_ERR_WOULD_BLOCK after the tick, an outgoing subgroup's terminal is
+ *                       still owed because the session could not queue
+ *                       it: its event finds no room in the event queue,
+ *                       or its reset none in the action queue. Poll events
+ *                       and actions; the session retries the terminal at
+ *                       its own retry deadline (included in
+ *                       moq_session_next_deadline_us()) and at later
+ *                       calls. This is not a refusal of the tick: time has
+ *                       advanced and the tick has already done whatever
+ *                       else was due, which may have changed the session
+ *                       (expired queued data, latched or retried
+ *                       terminals, moved its deadline) before this result.
  */
 MOQ_API moq_result_t moq_session_tick(moq_session_t *s, uint64_t now_us);
 
@@ -786,6 +800,16 @@ MOQ_API moq_result_t moq_session_on_data_reset(moq_session_t *s,
  * event queue admits it. While its obligation is pending, writes, end and
  * abort on it return MOQ_ERR_WRONG_STATE.
  *
+ * The response stream of a FETCH this endpoint serves: the STOP tears the
+ * FETCH down at once, or not at all. The stream's queued objects are
+ * removed, RESET_DATA follows with the peer's code and the header as its
+ * reliable size, on drafts 18 and 22 the request stream is reset with
+ * CANCELLED (0x1), and one MOQ_EVENT_FETCH_CANCELLED reports cause
+ * MOQ_REQUEST_TERMINAL_PEER_STOP_DATA with the peer's code. Later writes,
+ * end and abort of that FETCH return MOQ_ERR_STALE_HANDLE. A transport
+ * adapter stops writing that stream's payload when the STOP arrives, so
+ * nothing it then writes reaches the peer.
+ *
  *   MOQ_OK              committed, or nothing to act on: the stream was
  *                       already terminal, or the session does not own it,
  *                       which includes a subgroup it has already released.
@@ -798,7 +822,11 @@ MOQ_API moq_result_t moq_session_on_data_reset(moq_session_t *s,
  *                       first cause are already recorded, and draining
  *                       either queue retries it, so the stop need not be
  *                       delivered again; delivering it again is safe, as
- *                       the first cause is kept.
+ *                       the first cause is kept. For a FETCH response
+ *                       stream nothing changes: the FETCH is still live,
+ *                       its producer calls still succeed, and the caller
+ *                       delivers the STOP again once the queues have
+ *                       drained.
  *   MOQ_ERR_INVAL       NULL session or error_code greater than 2^62 - 1.
  *   MOQ_ERR_CLOSED      the session is closed, or its setup has not
  *                       completed.
@@ -952,9 +980,12 @@ typedef uint32_t moq_action_kind_t;
  * Unidirectional control actions. Some protocol profiles carry control
  * messages on a dedicated unidirectional stream that the local endpoint opens,
  * rather than on a single shared bidirectional stream. OPEN_UNI_CONTROL opens
- * that stream and writes its first bytes; SEND_UNI_CONTROL appends further
- * control bytes to the already-open stream. (Draft-16 carries control on a
- * shared bidirectional stream and emits neither of these.)
+ * that stream and writes its first bytes. Every later control message comes
+ * as SEND_CONTROL, which on these profiles the host writes on the stream
+ * OPEN_UNI_CONTROL opened. The session does not emit SEND_UNI_CONTROL; a host
+ * that receives one appends its bytes to that same stream, as for
+ * SEND_CONTROL. (Draft-16 carries control on a shared bidirectional stream and
+ * emits neither of these.)
  */
 #define MOQ_ACTION_OPEN_UNI_CONTROL  10u
 #define MOQ_ACTION_SEND_UNI_CONTROL  11u
@@ -3219,8 +3250,18 @@ MOQ_API void moq_event_cleanup(moq_event_t *event);
 
 /* -- Setup observation --------------------------------------------- */
 /*
- * Peer's request capacity as received in setup. Defaults to 0
- * if the peer did not advertise it. Observing.
+ * Request capacity is draft 16's: a limit each side advertises in setup
+ * (this side when moq_session_cfg_t::send_request_capacity is set) and
+ * raises later with a capacity update. Drafts 18 and 22 carry each request
+ * on its own bidirectional stream and have no such limit: both getters
+ * return 0, and moq_session_grant_request_capacity() returns MOQ_ERR_INVAL
+ * with no effect. The cfg fields are validated on every draft but sent only
+ * on draft 16.
+ */
+/*
+ * Peer's request capacity: on draft 16, its setup value raised by every
+ * capacity update it sent since, 0 if it advertised none. 0 on drafts 18
+ * and 22. Observing.
  */
 MOQ_API uint64_t moq_session_peer_request_capacity(const moq_session_t *s);
 
@@ -3229,7 +3270,9 @@ MOQ_API uint64_t moq_session_peer_request_capacity(const moq_session_t *s);
 MOQ_API uint64_t moq_session_peer_max_request_id(const moq_session_t *s); /* api-boundary-exempt */
 
 /*
- * Local request capacity as advertised in our setup. Observing.
+ * Local request capacity: on draft 16, as advertised in our setup and
+ * raised by moq_session_grant_request_capacity(). 0 on drafts 18 and 22.
+ * Observing.
  */
 MOQ_API uint64_t moq_session_local_request_capacity(const moq_session_t *s);
 
@@ -3237,14 +3280,17 @@ MOQ_API uint64_t moq_session_local_request_capacity(const moq_session_t *s);
 MOQ_API uint64_t moq_session_local_max_request_id(const moq_session_t *s); /* api-boundary-exempt */
 
 /*
- * Increase the local request capacity and notify the peer.
- * Advancing call.
+ * Increase the local request capacity and notify the peer with a capacity
+ * update (draft 16). Advancing call.
  *
  * new_capacity must be greater than the current local capacity.
  * Commits the new capacity only after the notification is
  * successfully queued.
  *
- * Returns MOQ_ERR_INVAL if new_capacity <= current capacity.
+ * Returns MOQ_ERR_INVAL if new_capacity <= current capacity, and on drafts
+ * 18 and 22, which have no request capacity, with nothing sent or changed.
+ * Returns MOQ_ERR_WRONG_STATE on draft 16 before the session is
+ * established or once it is closed.
  * Returns MOQ_ERR_WOULD_BLOCK if the action queue is full;
  * capacity is NOT advanced.
  */
@@ -3475,11 +3521,19 @@ MOQ_API moq_result_t moq_session_track_properties_add_delivery_timeouts(
     uint8_t *out, size_t out_cap, size_t *out_len);
 
 /*
- * REDIRECT (§10.6.1) target, set on a reject cfg only when
- * error_code == MOQ_REQUEST_ERROR_REDIRECT. All fields may be empty (an all-empty
- * Redirect reuses the current session URI and the original namespace/name). A
+ * REDIRECT target (draft-18 §10.6.1, draft-22 §9.4.1), set on a reject cfg
+ * only when error_code == MOQ_REQUEST_ERROR_REDIRECT, which always sends the
+ * structure. Only on the drafts with request streams: draft 16 has no
+ * Redirect structure, and a REDIRECT refusal there is MOQ_ERR_INVAL. Every
+ * field may be empty. An empty connect_uri means the current session's URI.
+ * What an empty namespace and name mean depends on the draft: on draft 18,
+ * both empty reuse the original request's namespace and name, and when
+ * either is not, both are the literal values to use; on draft 22 they are
+ * always the literal Redirect target, so empty values mean the empty
+ * namespace tuple and an empty track name, never the original ones. A
  * CLIENT must leave connect_uri empty; namespace-scoped families
- * (ANNOUNCEMENT, NS_SUB) must leave track_name empty. Bytes borrow for the call.
+ * (ANNOUNCEMENT, NS_SUB) must leave track_name empty. Bytes borrow for the
+ * call.
  */
 typedef struct moq_redirect_target {
     moq_bytes_t     connect_uri;
@@ -3633,6 +3687,13 @@ MOQ_API moq_result_t moq_session_unsubscribe(moq_session_t *s,
  * the profile's "unknown" sentinel (2^62-1 for draft-16/18 and 2^64-1 for
  * draft-22); passing that sentinel sends it unchanged, meaning the exact
  * count is not known.
+ *
+ * In the tagged host mode (moq_session_enable_tagged_output) stream_count
+ * is ignored: the session sends the count of every data stream it opened
+ * for the subscription, subgroups and fills alike, from the opens the host
+ * reported (moq_session_report_data_open) and the resets it claimed. It is
+ * 0 when none was opened, and the unknown sentinel only when the host
+ * reported an open as unknown.
  *
  * Valid for publisher-role subscriptions in ESTABLISHED state.
  * Returns MOQ_ERR_WOULD_BLOCK while an outgoing subgroup terminal event/reset
@@ -4260,6 +4321,10 @@ MOQ_API void moq_fetch_cfg_init_sized(moq_fetch_cfg_t *cfg, size_t cfg_size);
  *     MOQ_ERR_INVAL.
  *
  * Setting both, or neither, is MOQ_ERR_INVAL and mutates nothing.
+ * On a draft without the joining forms (draft 22: see
+ * moq_session_supports_joining_fetch()), is_joining is MOQ_ERR_UNSUPPORTED,
+ * checked before the joining fields, and mutates nothing; draft 22 joins a
+ * track with a fill instead.
  * Returns MOQ_ERR_REQUEST_BLOCKED if no request capacity.
  */
 MOQ_API moq_result_t moq_session_fetch(moq_session_t *s,
@@ -4411,8 +4476,12 @@ MOQ_API void moq_fetch_object_cfg_init_sized(
  * commits none of the requested operation.
  *
  * Publisher side, on a child surfaced by MOQ_EVENT_FILL_REQUEST: open_fill
- * opens the fill stream with its header; write_fill_object keeps the caller's
- * rcbuf ownership (queued actions hold their own refs); write_fill_range marks
+ * opens the fill stream with its header; write_fill_object borrows cfg's
+ * payload and properties (on MOQ_OK the queued actions hold their own refs;
+ * on every refusal, whether MOQ_ERR_INVAL, MOQ_ERR_CLOSED,
+ * MOQ_ERR_STALE_HANDLE, MOQ_ERR_WRONG_STATE, MOQ_ERR_WOULD_BLOCK or an
+ * encoding error, the session takes none; either way the caller keeps its
+ * own and releases them); write_fill_range marks
  * a gap; end_fill finishes the stream with a FIN; abort_fill resets it (an
  * unopened child is opened with its header first, then reset).
  *
@@ -4444,6 +4513,15 @@ MOQ_API moq_result_t moq_session_cancel_fill(moq_session_t *s, moq_fill_t fill,
  * Write a fetch object on an accepted fetch data stream.
  * Publisher side. Advancing call.
  * Serialization flags are computed internally from prior-object context.
+ *
+ * cfg->payload and cfg->properties are borrowed for the call; the caller
+ * always keeps its own references and releases them.
+ * - On MOQ_OK, the queued actions hold references of their own, which they
+ *   hand to the host with each action.
+ * - On every refusal the session takes no reference: MOQ_ERR_INVAL,
+ *   MOQ_ERR_CLOSED, MOQ_ERR_STALE_HANDLE, MOQ_ERR_WRONG_STATE (the fetch is
+ *   not accepted), MOQ_ERR_WOULD_BLOCK (the action queue lacks a slot for
+ *   each action), or an error from the profile's encoding.
  */
 MOQ_API moq_result_t moq_session_write_fetch_object(
     moq_session_t *s,
@@ -4996,6 +5074,13 @@ MOQ_API moq_result_t moq_session_cancel_publication(
  * properties/properties_len: optional per-object property bytes.
  * payload must be non-NULL with len > 0; use send_status_datagram
  * for zero-length / status objects.
+ *
+ * The payload's bytes are copied into the encoded datagram. The session
+ * never takes a reference to the rcbuf, so the caller keeps its own and may
+ * release it as soon as the call returns. That holds on MOQ_OK and on every
+ * refusal: MOQ_ERR_INVAL, MOQ_ERR_WRONG_STATE (a closed session included),
+ * MOQ_ERR_STALE_HANDLE, MOQ_ERR_WOULD_BLOCK (the action queue is full), or
+ * an error from the profile's encoding.
  */
 MOQ_API moq_result_t moq_session_send_object_datagram(
     moq_session_t *s,
@@ -5184,8 +5269,28 @@ MOQ_API void moq_cancel_namespace_cfg_init_sized(
     moq_cancel_namespace_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
- * Cancel an accepted namespace advertisement. Advancing call.
- * Cancels an accepted namespace advertisement. Only valid when established.
+ * Cancel an accepted namespace advertisement (the receiver's side).
+ * Advancing call. Only for an advertisement this side accepted that has
+ * not ended: otherwise MOQ_ERR_WRONG_STATE (MOQ_ERR_STALE_HANDLE for a
+ * handle no longer live, MOQ_ERR_CLOSED outside an established or
+ * draining session). MOQ_ERR_WOULD_BLOCK, with no effect, while the action
+ * queue (on draft 18 also the drain ring) has no room.
+ *
+ * On draft 16 the cancel message carries error_code and reason, and the
+ * announcer observes MOQ_EVENT_NAMESPACE_CANCELLED with both.
+ *
+ * On drafts 18 and 22 the cancellation is the request stream's, which
+ * carries only a stream error code: a nonempty reason is MOQ_ERR_INVAL
+ * with no effect, and error_code is checked against the draft's range but
+ * not sent; the stream is ended with CANCELLED (0x1) instead. On draft 18
+ * the stream is aborted (reset and STOP at once), and the announcer
+ * observes MOQ_EVENT_NAMESPACE_CANCELLED with no code and no reason. On
+ * draft 22 this side resets its direction and, unless the announcer's
+ * direction already ended, stops it, each as action capacity allows; an
+ * announcer still advertising observes MOQ_EVENT_NAMESPACE_TERMINATED with
+ * cause PEER_RESET_STREAM or PEER_STOP_SENDING, whichever its host reports
+ * first, and stream_error_code CANCELLED. This side reports no event for
+ * its own cancellation on any draft.
  */
 MOQ_API moq_result_t moq_session_cancel_namespace(moq_session_t *s,
     moq_announcement_t ann, const moq_cancel_namespace_cfg_t *cfg,
@@ -5926,6 +6031,17 @@ MOQ_API moq_result_t moq_session_open_subgroup(
     uint64_t now_us,
     moq_subgroup_handle_t *out_handle);
 
+/* Write one object on an open subgroup. Advancing call. payload is required
+ * and borrowed for the call; the caller always keeps its own reference and
+ * releases it.
+ * - On MOQ_OK, the queued object holds a reference of its own, handed to
+ *   the host with its action.
+ * - On every refusal the session takes no reference: MOQ_ERR_INVAL (a NULL
+ *   payload, an object id not above the last one, a payload too large for
+ *   the profile), MOQ_ERR_CLOSED, MOQ_ERR_STALE_HANDLE,
+ *   MOQ_ERR_WRONG_STATE, MOQ_ERR_WOULD_BLOCK (the subgroup's handle is
+ *   pending, or the action queue is full), or an error from the profile's
+ *   encoding or the subgroup's queue. */
 MOQ_API moq_result_t moq_session_write_object(
     moq_session_t *s,
     moq_subgroup_handle_t subgroup,
@@ -6096,7 +6212,8 @@ MOQ_API moq_result_t moq_session_update_publication(
  * stream_count follows moq_done_subscribe_cfg_t: the data streams the
  * APPLICATION opened for this publication; the session adds the fill
  * fetch streams it opened itself, saturating to the profile's "unknown"
- * sentinel, which an application may also pass directly.
+ * sentinel, which an application may also pass directly. In the tagged
+ * host mode it is ignored, as for moq_done_subscribe_cfg_t.
  */
 typedef struct moq_finish_publish_cfg {
     uint32_t    struct_size;
@@ -6209,6 +6326,15 @@ MOQ_API void moq_begin_object_cfg_init_sized(
  * object header. The application then writes exactly payload_length bytes
  * via write_object_data and calls end_object. payload_length is the
  * declared payload length, not including properties.
+ *
+ * MOQ_ERR_WOULD_BLOCK, while the subgroup's terminal event is owed (a STOP
+ * or an expiry latched before the event could be published) or while the
+ * action queue cannot take the object header and, with properties, their
+ * record: nothing is queued and the session takes no reference to
+ * cfg->properties, so the caller's reference is the only one the call
+ * leaves and the same buffer may be passed again. On success the session
+ * holds its own reference until the record leaves the queue. Other
+ * refusals give no such guarantee.
  */
 MOQ_API moq_result_t moq_session_begin_object_ex(
     moq_session_t *s,
@@ -6291,6 +6417,663 @@ MOQ_API bool moq_session_has_transport_stream(const moq_session_t *s,
  * Observing (does not invalidate borrows).
  */
 MOQ_API bool moq_session_can_admit_data_stream(const moq_session_t *s);
+
+/* -- Transport host operations ------------------------------------- */
+/*
+ * For a caller that owns the transport and drives the session itself, with
+ * the inputs and polls above. Each operation here reports a fact only the
+ * transport owner can know, or answers a question only the bound profile
+ * can. The session takes each report on trust: it cannot observe the
+ * transport, so the preconditions stated with each call are the caller's
+ * to prove.
+ */
+
+/* Fixed-width open route set for ABI stability. Values are never renumbered.
+ * MOQ_UNI_ROUTE_NONE is what a failed call leaves in its output; it is never
+ * an answer. A caller that reads a value this header does not list must
+ * treat the stream as unsupported and feed its bytes to no route. */
+typedef uint32_t moq_uni_route_t;
+#define MOQ_UNI_ROUTE_NONE          0u
+#define MOQ_UNI_ROUTE_NEED_MORE     1u
+#define MOQ_UNI_ROUTE_CONTROL       2u
+#define MOQ_UNI_ROUTE_DATA          3u
+#define MOQ_UNI_ROUTE_PADDING       4u
+#define MOQ_UNI_ROUTE_UNKNOWN_TYPE  5u
+
+/*
+ * Say where the bytes of a peer-opened unidirectional stream belong, from
+ * the bytes at its start.
+ *
+ * data/len are the stream's leading bytes, counted from its first byte, as
+ * far as the caller has them. They are borrowed for this call only. Nothing
+ * is consumed or remembered: the same bytes get the same answer however
+ * often the call is made, and the caller still feeds every one of them.
+ *
+ *   MOQ_UNI_ROUTE_NEED_MORE     the stream type is not complete. Keep the
+ *                               bytes and ask again, from the first byte,
+ *                               when more have arrived.
+ *   MOQ_UNI_ROUTE_CONTROL       the peer's control channel. Feed every
+ *                               byte, the leading ones included, to
+ *                               moq_session_on_control_bytes(). Each peer
+ *                               opens one; a second stream with this
+ *                               route is a protocol violation.
+ *   MOQ_UNI_ROUTE_DATA          an object stream. Feed every byte, the
+ *                               leading ones included, to
+ *                               moq_session_on_data_bytes() or
+ *                               moq_session_on_data_rcbuf().
+ *   MOQ_UNI_ROUTE_PADDING       a padding stream. Discard its bytes.
+ *   MOQ_UNI_ROUTE_UNKNOWN_TYPE  the stream type is complete and the bound
+ *                               profile does not define it. The session
+ *                               must be closed (draft-18 section 3.4,
+ *                               draft-22 section 6.4.1).
+ *
+ * The stream type is never stripped: the feed the bytes go to parses it
+ * again. A profile whose control channel is one bidirectional stream
+ * (draft-16) puts no control on unidirectional streams, and every input,
+ * an empty one included, is MOQ_UNI_ROUTE_DATA.
+ *
+ * A stream that ends while its type is still incomplete gets no route and
+ * is fed to no session input; it is never taken for the control channel.
+ * How it ended decides the rest. A RESET only ends it: a stream may be
+ * reset before its header (draft-22 sections 9.9 and 11.3.2), and the
+ * receiver recovers through its timeouts. A FIN after part of the type is
+ * a truncated stream type, which the session treats as a protocol
+ * violation where it parses a stream type itself:
+ * moq_session_on_data_bytes() closes with PROTOCOL_VIOLATION for one. A
+ * FIN after no byte at all carries no type and only ends the stream, as
+ * it does there. A complete type the profile does not define is the
+ * separate MOQ_UNI_ROUTE_UNKNOWN_TYPE case above.
+ *
+ * Returns MOQ_OK with *out_route set to one of the five routes.
+ * MOQ_ERR_INVAL: NULL session or out_route, or len > 0 with NULL data.
+ * MOQ_ERR_CLOSED: the session is closed; no stream is routed.
+ * MOQ_ERR_INTERNAL: the profile gave a classification this call cannot
+ * map; nothing is routed.
+ * A failed call leaves MOQ_UNI_ROUTE_NONE in *out_route.
+ *
+ * Needs no transport binding. Observing (does not invalidate borrows).
+ */
+MOQ_API moq_result_t moq_session_route_peer_uni(const moq_session_t *s,
+                                                const uint8_t *data,
+                                                size_t len,
+                                                moq_uni_route_t *out_route);
+
+/*
+ * Report that the transport has retired a peer data stream this session
+ * stopped, and that the peer's FIN or RESET will therefore never be
+ * delivered.
+ *
+ * The session keeps a stopped stream's identity until the peer's terminal
+ * so that late bytes are discarded as that stream's. Some transports drop
+ * the receive side once the stop is accepted and report nothing further
+ * from the peer. This call releases what the session holds for the stream.
+ * The caller must have established all of:
+ *   - it polled the MOQ_ACTION_STOP_DATA for stream_ref and the transport
+ *     accepted it;
+ *   - the transport then reported that it is finished with the stream and
+ *     will deliver nothing more on it. A FIN or a RESET from the peer is
+ *     not that report: deliver those with moq_session_on_data_bytes() and
+ *     moq_session_on_data_reset();
+ *   - it holds no bytes or FIN of the stream that it has not yet fed.
+ * The session cannot check the last two. Retiring a stream whose bytes are
+ * still to come makes those bytes start a new stream.
+ *
+ * Admission comes first. MOQ_ERR_INVAL for a NULL session. A session
+ * whose profile requires a transport binding it does not have
+ * (moq_session_binding_requirements()) is refused with
+ * MOQ_ERR_WRONG_STATE before anything runs: no pending work runs, no
+ * borrow is invalidated, and the answer is the same for every stream_ref.
+ * That holds in every state, a closed one included, such as a session
+ * closed through moq_session_on_control_stream_ended(), which needs no
+ * binding. A call admitted past that point is advancing: it runs the
+ * session's pending work and invalidates borrows, and only then chooses
+ * among the results below, in this order:
+ *
+ *   MOQ_ERR_CLOSED        the session is closed, or its setup has not
+ *                         completed.
+ *   MOQ_ERR_WRONG_STATE   the session holds the stream but has not let go
+ *                         of its stop: the stream is still live, its stop
+ *                         is still owed, or its MOQ_ACTION_STOP_DATA has
+ *                         not been polled. Nothing held for stream_ref
+ *                         changes.
+ *   MOQ_OK                released. A stream still bound to its
+ *                         subscription or publication counts once toward
+ *                         that binding's Stream Count, as the peer's
+ *                         terminal would have counted it; a stopped fill
+ *                         stream settles its fill with the cancellation it
+ *                         already had.
+ *   MOQ_ERR_STALE_HANDLE  the session holds nothing for stream_ref: it was
+ *                         never stopped here, or already ended or retired.
+ *
+ * No peer terminal is fabricated: no FIN, RESET or peer error code is
+ * recorded for the stream, and no event reports one for it
+ * (MOQ_EVENT_SUBGROUP_FINISHED, MOQ_EVENT_SUBGROUP_RESET or an object
+ * terminal). What the release itself completes is reported as usual, once.
+ * When the stream was the last one a received done was waiting for, that
+ * done's MOQ_EVENT_SUBSCRIBE_DONE or MOQ_EVENT_PUBLISH_FINISHED is queued by
+ * this call, or, when the event queue is full, by a later advancing call. A
+ * stopped fill stream's settlement is serviced, so a fill terminal still
+ * owed may be queued. Separately, the pending work an admitted call runs
+ * may queue what the session already owed, as on any advancing call.
+ *
+ * Advancing once admitted (see above): takes now_us.
+ */
+MOQ_API moq_result_t moq_session_on_data_stream_retired(
+    moq_session_t *s,
+    moq_stream_ref_t stream_ref,
+    uint64_t now_us);
+
+/*
+ * Report that the transport has retired a request stream this session
+ * aborted, and that the peer's FIN or RESET on it will therefore never be
+ * delivered.
+ *
+ * After the session ends its side of a request stream it keeps the stream's
+ * identity, so that what the peer still sends is absorbed and is not taken
+ * for a new request. That identity is normally released by the peer's
+ * terminal. The caller must have established all of:
+ *   - it polled the action that abandons the peer's half of stream_ref
+ *     (MOQ_ACTION_ABORT_BIDI_STREAM, or MOQ_ACTION_STOP_BIDI_STREAM) and
+ *     the transport accepted it;
+ *   - the transport then reported that it is finished with the stream and
+ *     will deliver nothing more on it. A FIN or a RESET from the peer is
+ *     not that report: deliver those with
+ *     moq_session_on_bidi_stream_bytes() and
+ *     moq_session_on_bidi_stream_reset();
+ *   - it holds no bytes or FIN of the stream that it has not yet fed, and
+ *     no output for the stream that it has not yet written.
+ * The session cannot check the last two.
+ *
+ * Admission comes first. MOQ_ERR_INVAL for a NULL session or a zero
+ * stream_ref. A session whose profile requires a transport binding it
+ * does not have is refused with MOQ_ERR_WRONG_STATE before anything runs,
+ * in every state, exactly as for moq_session_on_data_stream_retired(): no
+ * pending work runs and no borrow is invalidated. A call admitted past
+ * that point is advancing: it runs the session's pending work and
+ * invalidates borrows, and only then chooses among the results below, in
+ * this order. A session whose setup has not completed is admitted: a
+ * request stream can be abandoned before then.
+ *
+ *   MOQ_ERR_CLOSED        the session is closed.
+ *   MOQ_ERR_WRONG_STATE   a request still owns the stream, or an action
+ *                         for it is still queued. Nothing held for
+ *                         stream_ref changes; poll, then report again.
+ *   MOQ_OK                the stream's identity was released.
+ *   MOQ_ERR_STALE_HANDLE  the session holds no such identity: the stream
+ *                         is unknown, or already ended or retired.
+ *
+ * The release itself queues no event and records no FIN, RESET or peer
+ * error code: the identity it releases belongs to no request any more. The
+ * pending work an admitted call runs may queue what the session already
+ * owed, as on any advancing call.
+ *
+ * Advancing once admitted (see above): takes now_us.
+ */
+MOQ_API moq_result_t moq_session_on_bidi_stream_retired(
+    moq_session_t *s,
+    moq_stream_ref_t stream_ref,
+    uint64_t now_us);
+
+/*
+ * Report that a stream of the control channel of a live session was ended
+ * at the transport: the peer finished or reset the half it sends on, or
+ * told this side to stop sending on the half this side writes.
+ *
+ * The control channel stays open for the session's lifetime, and ending a
+ * stream of it closes the session as a protocol violation (draft-16
+ * section 3.3, draft-18 section 3.3, draft-22 section 6.3). The session
+ * closes with PROTOCOL_VIOLATION and queues both outputs of a local close:
+ * the MOQ_ACTION_CLOSE_SESSION that tells the caller to close the
+ * transport with that code, and the MOQ_EVENT_SESSION_CLOSED. The
+ * transport is still the caller's to close.
+ *
+ * This is for an end the peer caused while the session was alive. A
+ * stream notification the transport produces because the connection or
+ * the session is already going away is not one: report that through the
+ * close it belongs to (moq_session_on_transport_close(), or the close this
+ * side requested), not here.
+ *
+ * The idle timeout keeps its precedence, as for every peer input: when the
+ * session's idle deadline has passed at now_us, whether or not a tick was
+ * delivered at it, the session closes for the idle timeout
+ * (MOQ_CLOSE_IDLE_TIMEOUT) instead, with the same two outputs.
+ *
+ * A session that is already closed keeps the close it has, with its code
+ * and reason, and whatever of its close action and event is still queued.
+ * So does one that the pending work run at the start of this call closes.
+ * The call then changes nothing more.
+ *
+ * Returns MOQ_OK, including for a closed session. MOQ_ERR_INVAL: NULL
+ * session. Needs no transport binding.
+ *
+ * Advancing call: invalidates borrows, takes now_us.
+ */
+MOQ_API moq_result_t moq_session_on_control_stream_ended(moq_session_t *s,
+                                                         uint64_t now_us);
+
+/* ===================================================================
+ * Tagged host output
+ * ===================================================================
+ *
+ * A host that drives the transport itself can take each action together
+ * with its ownership facts, report the opens of the session's data
+ * streams, and take part in a data stream's reset as a transaction. All of
+ * it runs in one mode, enabled on a pristine session.
+ */
+
+/* An output-owner token. Equal nonzero values name the same request for
+ * as long as any output tagged with it is held, its final message
+ * included; 0 names no request. Compare the whole value; it is never
+ * decoded and is not a public handle. */
+typedef struct moq_output_owner { uint64_t _v; } moq_output_owner_t;
+
+/*
+ * Enable the tagged host mode.
+ *
+ * Call it on a pristine session. Before it, only these may run:
+ * moq_session_create() (with all of its configuration),
+ * moq_session_bind_transport(), and the queries that only read the
+ * session. Any call documented as an advancing call (moq_session_start(),
+ * every input and timer call, every application request) ends
+ * pristineness, as does a queued action. The mode is permanent; a second call returns
+ * MOQ_OK with no effect. A session that is attached to a transport adapter
+ * cannot enable it, and an adapter cannot attach to a session that has it.
+ *
+ * In the mode:
+ * - actions leave only through moq_session_poll_actions_tagged();
+ *   moq_session_poll_actions_ex() and the moq_session_poll_actions()
+ *   wrapper return MOQ_ERR_WRONG_STATE (the wrapper's count is 0) and
+ *   transfer nothing. Event polling is unchanged.
+ * - an open of a data stream whose Stream Count the session reports stays
+ *   pending until the host reports it (moq_session_report_data_open) or a
+ *   reset claim resolves it, so the count is exact.
+ *
+ * Returns MOQ_ERR_INVAL for NULL. Returns MOQ_ERR_WRONG_STATE, with no
+ * effect, once the session is no longer pristine or is attached.
+ */
+MOQ_API moq_result_t moq_session_enable_tagged_output(moq_session_t *s);
+
+/* Whether the tagged host mode is on. False for NULL. */
+MOQ_API bool moq_session_tagged_output(const moq_session_t *s);
+
+/*
+ * The facts that come with one polled action.
+ *
+ * struct_size: the bytes the session wrote into this element; a field is
+ *   valid only when struct_size covers it.
+ * flags: MOQ_ACTION_TAG_* bits. A host treats an unknown bit as a fault.
+ * owner: the request the action belongs to; 0 when it belongs to none
+ *   (session control, a request message with no data stream).
+ * final_for: nonzero when this action is that owner's final message (the
+ *   message that ends its subscription or publication, or the FIN of a
+ *   FETCH's request stream, which comes after its response stream's
+ *   header). The host hands it to the transport only after every data
+ *   stream tagged with that owner and FIRST_OF_STREAM has its FIN or reset
+ *   accepted, no reset claim of that owner is outstanding, and the host
+ *   holds no datagram of that owner.
+ * deadline_us: the delivery deadline of a subgroup object or datagram;
+ *   UINT64_MAX when there is none (every FETCH and fill action, every
+ *   control action).
+ */
+typedef struct moq_action_tag {
+    uint32_t           struct_size;
+    uint32_t           flags;
+    moq_output_owner_t owner;
+    moq_output_owner_t final_for;
+    uint64_t           deadline_us;
+} moq_action_tag_t;
+
+#define MOQ_ACTION_TAG_V0_SIZE \
+    (offsetof(moq_action_tag_t, deadline_us) + sizeof(uint64_t))
+
+/* The action opens a local data stream: a SEND_DATA whose header is the
+ * stream's reliable prefix (the bytes every reset of the stream delivers). */
+#define MOQ_ACTION_TAG_FIRST_OF_STREAM 0x1u
+/* With FIRST_OF_STREAM: the open counts toward the owner's Stream Count and
+ * is pending until reported (moq_session_report_data_open). Absent for a
+ * FETCH response stream, which is not counted. */
+#define MOQ_ACTION_TAG_OPEN_COUNTED    0x2u
+/* With FIRST_OF_STREAM and a nonzero owner: a FETCH response stream whose
+ * FETCH has a request stream (drafts 18 and 22; draft 16 has none, so never
+ * there). A STOP_SENDING of the response stream ends the FETCH, and the
+ * publisher resets both of its streams (draft-18 §5.2, draft-22 §3.2.4). The
+ * host keeps this policy with the stream until the stream's FIN or reset is
+ * accepted, past the FETCH's native end. A STOP it observes on the stream
+ * before then has two effects on the request stream:
+ * - The owner's final message (tag final_for) is never handed to the
+ *   transport, its FIN included, whether the host already holds it or
+ *   polls it later.
+ * - The request stream's send half is reset, never finished. The host
+ *   resets it with MOQ_STREAM_ERROR_CANCELLED in place of that final
+ *   message. Where the session ends the request with a reset of its own,
+ *   that reset stands, keeps its code, and no second one follows. That is
+ *   the case after MOQ_DATA_END_REQUEST_ENDED from the STOP, or for a reset
+ *   the session queued earlier, as moq_session_abort_fetch() does.
+ * The request stream's receive half is not affected. A STOP after the
+ * response stream's FIN or reset was accepted has none of these effects. */
+#define MOQ_ACTION_TAG_RESET_FINAL_ON_STOP 0x4u
+
+/*
+ * The reset transaction (tagged mode only).
+ *
+ * A reset of a local data stream that the session owns is taken in three
+ * steps, so the host never loses the reset or the stream's reliable
+ * prefix, and a reset whose stream was never opened needs no transport
+ * stream:
+ *   1. moq_session_offer_data_reset() names the next reset the host may
+ *      take, or the claim it already holds (state CLAIMED). It has no
+ *      effect: it writes no action, retries and expires nothing, and admits
+ *      no event.
+ *   2. moq_session_claim_data_reset() takes it with the host's fact about
+ *      the stream's prefix. The stream's queued data leaves the session, an
+ *      owed terminal event commits, and the reset stays the session's until
+ *      step 3 (it is never handed out by a poll meanwhile).
+ *   3. moq_session_commit_data_reset() after the transport accepted the
+ *      reset. An UNOPENED claim settles in step 2 and has no commit.
+ * At most one claim is outstanding. A refused transport reset keeps the
+ * claim; the host retries its reset and commits once it is accepted.
+ */
+typedef uint32_t moq_data_reset_state_t;   /* open set; never renumbered */
+/* Claimable: the stream's prefix has left the session (the host holds it
+ * or the transport accepted it). */
+#define MOQ_DATA_RESET_READY     1u
+/* The one outstanding claim, waiting for its commit. */
+#define MOQ_DATA_RESET_CLAIMED   2u
+/* A subgroup reset whose stream's header never left the session: no
+ * transport stream exists. */
+#define MOQ_DATA_RESET_UNOPENED  3u
+
+/*
+ * One offered reset. struct_size is the bytes the session wrote. The
+ * identity of a reset is stream_ref, owner, error_code, reliable_size and
+ * cause; state is a snapshot of its readiness and is not part of it.
+ *
+ * error_code: the reset's code, its first cause; a later STOP or expiry
+ *   never replaces it.
+ * reliable_size: the stream's header length, the bytes the reset still
+ *   delivers.
+ * owner: as in moq_action_tag_t.
+ * cause: the subgroup's latched terminal cause
+ *   (MOQ_OUTGOING_SUBGROUP_TERMINAL_*), NONE when no terminal event belongs
+ *   to the reset (an application reset, a cancellation, FETCH and fill).
+ */
+typedef struct moq_data_reset_offer {
+    uint32_t               struct_size;
+    moq_data_reset_state_t state;
+    moq_stream_ref_t       stream_ref;
+    uint64_t               error_code;
+    uint64_t               reliable_size;
+    moq_output_owner_t     owner;
+    moq_outgoing_subgroup_terminal_cause_t cause;
+    uint32_t               reserved;   /* zero */
+} moq_data_reset_offer_t;
+
+#define MOQ_DATA_RESET_OFFER_V0_SIZE \
+    (offsetof(moq_data_reset_offer_t, reserved) + sizeof(uint32_t))
+
+/*
+ * Offer the next reset. Writes min(out_size, its own size) bytes.
+ *
+ * The outstanding claim comes first, alone, as CLAIMED. Otherwise the
+ * selection is the session's own reset order: the first queued action that
+ * is not data decides, and a reset owed on a subgroup may precede its own
+ * owner's final message. A subgroup reset whose header is still queued is
+ * UNOPENED. A FETCH or fill reset behind its own queued header is not
+ * offered: the next poll hands that header out first. A terminal whose only
+ * queued action is its replacement barrier is READY, since that barrier
+ * orders none of the stream's payload; with earlier data of the stream
+ * still queued, the reset waits for it.
+ *
+ * Returns MOQ_OK with *out_count 1 (one stamped offer) or 0 (none now).
+ * MOQ_ERR_WOULD_BLOCK with *out_count 0 when the selected reset waits only
+ * for event capacity: poll events, then offer again. MOQ_ERR_INVAL first,
+ * for NULL or out_size below MOQ_DATA_RESET_OFFER_V0_SIZE. Then
+ * MOQ_ERR_WRONG_STATE outside the tagged mode, and MOQ_ERR_CLOSED.
+ *
+ * Observing.
+ */
+MOQ_API moq_result_t moq_session_offer_data_reset(const moq_session_t *s,
+    moq_data_reset_offer_t *out, size_t out_size, size_t *out_count);
+
+/* The host's fact about the stream's reliable prefix; open set. */
+typedef uint32_t moq_data_prefix_state_t;
+/* The transport accepted the first reliable_size bytes. */
+#define MOQ_DATA_PREFIX_HANDED   1u
+/* The host holds unsent prefix bytes and writes them before the reset. */
+#define MOQ_DATA_PREFIX_HELD     2u
+/* The peer stopped the stream; the unsent prefix is not sent. */
+#define MOQ_DATA_PREFIX_WAIVED   3u
+/* Subgroup only: no transport stream exists, and none will be opened. */
+#define MOQ_DATA_PREFIX_UNOPENED 4u
+
+typedef struct moq_data_reset_claim {
+    uint32_t struct_size;            /* bytes the session wrote */
+    uint32_t flags;                  /* MOQ_DATA_RESET_CLAIM_*; unknown bits are a fault */
+    /* Data actions of this stream whose custody ended in the claim: queued
+     * SEND_DATA (its header, a terminal barrier, objects) the host will
+     * never be handed. Reset and control actions are not counted. */
+    uint32_t released_data_actions;
+    uint32_t reserved;               /* zero */
+} moq_data_reset_claim_t;
+
+/* The claim committed the subgroup's terminal event. */
+#define MOQ_DATA_RESET_CLAIM_EVENT_COMMITTED 0x1u
+/* The reset is settled: nothing is owed at the transport and no commit
+ * follows (an UNOPENED claim). */
+#define MOQ_DATA_RESET_CLAIM_SETTLED         0x2u
+/* The stream's pending open was resolved as never opened. */
+#define MOQ_DATA_RESET_CLAIM_OPEN_SUPPRESSED 0x4u
+
+#define MOQ_DATA_RESET_CLAIM_V0_SIZE \
+    (offsetof(moq_data_reset_claim_t, reserved) + sizeof(uint32_t))
+
+/*
+ * Claim the offered reset with the host's prefix fact.
+ *
+ * offer is a record the session wrote (its struct_size must be at least
+ * MOQ_DATA_RESET_OFFER_V0_SIZE and at most offer_size). The session
+ * re-derives the current offer and requires the same identity, then
+ * checks the current state, never the record's.
+ *
+ * Allowed prefixes: for an UNOPENED reset, UNOPENED only; for a READY
+ * reset, HANDED or HELD, WAIVED as below, and UNOPENED for a subgroup whose
+ * header was polled but whose open the host has not reported (it holds the
+ * header and opened nothing). Never UNOPENED for FETCH or fill, whose reset
+ * must follow their header, nor after a peer STOP, which proves the stream
+ * was opened.
+ *
+ * WAIVED only for a READY reset of a stream whose STOP_SENDING the session
+ * knows: a subgroup reset whose cause is
+ * MOQ_OUTGOING_SUBGROUP_TERMINAL_PEER_STOP_SENDING, the reset of a FETCH
+ * torn down by that STOP, the reset of a fill the peer stopped, or any
+ * other reset of the stream once the host reported the STOP through
+ * moq_session_on_data_stop_ex() and the call returned MOQ_OK. The STOP is
+ * a delivery fact, apart from the reset's first cause: a reset with an
+ * earlier cause (an application reset, an expiry,
+ * moq_session_abort_fetch(), a refused update) keeps the offer's identity,
+ * its code and cause, and its terminal event; WAIVED only says the unsent
+ * prefix is not sent. A STOP the session did not take (never reported, a
+ * refused call, or another stream's) authorizes nothing: WAIVED is then
+ * MOQ_ERR_WRONG_STATE, with no effect. A claim already made is not changed
+ * by a later STOP.
+ *
+ * Effects. HANDED, HELD, WAIVED: the stream's queued data leaves the
+ * session; an owed terminal event commits; a pending open is resolved as
+ * opened for HANDED and WAIVED, and stays pending for HELD until the
+ * commit (the stream is proved to exist only once the transport accepts
+ * its prefix or its reset). UNOPENED: every queued action of the stream
+ * leaves, the reset included; the pending open is suppressed, so the
+ * owner's Stream Count stays exact; an owed event commits; the claim is
+ * SETTLED, with no transport call and no commit.
+ *
+ * Refusals consume nothing and write nothing, in this order:
+ * MOQ_ERR_INVAL (NULL, a size or stamp below its floor, an unknown
+ * prefix); MOQ_ERR_WRONG_STATE (not tagged) and MOQ_ERR_CLOSED;
+ * MOQ_ERR_STALE_HANDLE (no current offer with that identity: it was
+ * polled, retired, or replaced); MOQ_ERR_WRONG_STATE (already CLAIMED, or
+ * the prefix is not allowed); MOQ_ERR_WOULD_BLOCK (an owed terminal event
+ * has no capacity).
+ */
+MOQ_API moq_result_t moq_session_claim_data_reset(moq_session_t *s,
+    const moq_data_reset_offer_t *offer, size_t offer_size,
+    moq_data_prefix_state_t prefix, moq_data_reset_claim_t *out, size_t out_size);
+
+/*
+ * Commit the claimed reset after the transport accepted it.
+ *
+ * claimed is the offer that was claimed, or its later CLAIMED view; both
+ * carry the claim's identity. The reset leaves the session, the claim
+ * clears, and owed work is retried. Returns MOQ_ERR_STALE_HANDLE, with the
+ * claim kept and nothing settled, for another identity or a duplicate
+ * commit. MOQ_ERR_INVAL for NULL, a size or stamp below its floor, or an
+ * unknown state; MOQ_ERR_WRONG_STATE outside the tagged mode;
+ * MOQ_ERR_CLOSED once closed (closing drops the claim).
+ */
+MOQ_API moq_result_t moq_session_commit_data_reset(moq_session_t *s,
+    const moq_data_reset_offer_t *claimed, size_t claimed_size);
+
+/*
+ * What the session does after a STOP on, or the expiry of held data of, a
+ * local data stream.
+ *
+ * outcome RESET_FOLLOWS: the session owns the stream's end; exactly one
+ *   RESET_DATA for it comes (by the reset offer or a poll). The host stops
+ *   writing it and drops held bytes past its prefix.
+ * outcome NO_RESET: no native output for the stream follows (its FIN or its
+ *   reset already left the session). The host drops what it holds of the
+ *   stream. A reset the host already holds, owes or had accepted for it
+ *   keeps its own code (its first cause), and an outstanding reset claim of
+ *   the stream stays as it is: the host neither replaces nor repeats it.
+ *   Otherwise, unless every byte was acknowledged, the host resets the
+ *   stream with host_reset_code. The stream counts as open for the owner's
+ *   final message until its reset is accepted. NO_RESET is an outcome for a
+ *   local data stream only; the call does not classify other refs.
+ * released_data_actions: the stream's queued SEND_DATA removed by the call.
+ * flags MOQ_DATA_END_REQUEST_ENDED: a FETCH teardown; its request stream
+ *   is reset too.
+ */
+typedef uint32_t moq_data_end_outcome_t;       /* open set; never renumbered */
+#define MOQ_DATA_END_RESET_FOLLOWS 1u
+#define MOQ_DATA_END_NO_RESET      2u
+typedef struct moq_data_end_result {
+    uint32_t               struct_size;
+    moq_data_end_outcome_t outcome;
+    uint32_t               released_data_actions;
+    uint32_t               flags;
+    uint64_t               host_reset_code;
+} moq_data_end_result_t;
+#define MOQ_DATA_END_REQUEST_ENDED 0x1u
+#define MOQ_DATA_END_RESULT_V0_SIZE \
+    (offsetof(moq_data_end_result_t, host_reset_code) + sizeof(uint64_t))
+
+/*
+ * moq_session_on_data_stop() with its outcome. The same core: the effects,
+ * first-cause rules and the FETCH teardown are those of
+ * moq_session_on_data_stop(). A live subgroup's STOP latches before
+ * anything can block, so it returns MOQ_OK with RESET_FOLLOWS even while
+ * its event waits for capacity. MOQ_ERR_WOULD_BLOCK keeps the two meanings
+ * moq_session_on_data_stop() documents. A fill stream's STOP is recorded
+ * with its first cause, and its RESET_DATA stays owed until an action slot
+ * frees: the STOP need not be delivered again, and delivering it again is
+ * safe. A FETCH teardown that does not fit yet changes nothing: deliver
+ * the STOP again later. Neither writes a result. Only for the local
+ * unidirectional data streams; out_size at least
+ * MOQ_DATA_END_RESULT_V0_SIZE, else MOQ_ERR_INVAL.
+ *
+ * MOQ_OK also records the STOP for the reset of the stream the session
+ * still holds, whatever its first cause, so that reset may be claimed
+ * WAIVED (moq_session_claim_data_reset()); its code, cause and terminal
+ * event stay as they are. Only MOQ_OK records it for that claim and
+ * writes a result.
+ *
+ * Advancing call: invalidates borrows, takes now_us.
+ */
+MOQ_API moq_result_t moq_session_on_data_stop_ex(moq_session_t *s,
+    moq_stream_ref_t stream_ref, uint64_t error_code, uint64_t now_us,
+    moq_data_end_result_t *out, size_t out_size);
+
+/*
+ * The host holds undelivered bytes of a subgroup's data stream past their
+ * tag deadline. A live subgroup latches DELIVERY_TIMEOUT (its header is still
+ * the reset's reliable prefix) and returns RESET_FOLLOWS; its event commits
+ * when the reset is taken. An earlier STOP, reset or timeout stays the first
+ * cause. A subgroup that already left the session with nothing reset is
+ * NO_RESET with host_reset_code MOQ_RESET_DELIVERY_TIMEOUT. A FETCH or fill
+ * stream has no delivery deadline: MOQ_ERR_WRONG_STATE, nothing changed.
+ * Datagrams are never reported here; the host drops them itself.
+ *
+ * Advancing call: invalidates borrows, takes now_us.
+ */
+MOQ_API moq_result_t moq_session_on_held_data_expired(moq_session_t *s,
+    moq_stream_ref_t stream_ref, uint64_t now_us,
+    moq_data_end_result_t *out, size_t out_size);
+
+/*
+ * Report the open of a counted data stream (tagged mode only).
+ *
+ * stream_ref and owner are those of a FIRST_OF_STREAM action tagged
+ * OPEN_COUNTED. Report once per such stream:
+ * - MOQ_DATA_OPEN_OPENED when the transport accepted the stream's open. The
+ *   open counts even when its first write then blocks; for a transport that
+ *   opens a stream on its first write, that write's acceptance is the open.
+ * - MOQ_DATA_OPEN_UNKNOWN only when the host cannot tell whether the open
+ *   was accepted (for example a provider failure that hides it). The
+ *   owner's Stream Count then becomes the profile's unknown sentinel. A host
+ *   that knows the stream was never opened does not report it: it claims
+ *   the stream's reset as UNOPENED.
+ * The owner's DONE waits until each of its handed opens is resolved, and
+ * new counted opens wait while too many are pending.
+ *
+ * Returns MOQ_OK when resolved. MOQ_ERR_STALE_HANDLE when no unresolved
+ * open of exactly (stream_ref, owner) exists: a duplicate, a report after
+ * a reset claim resolved it, or a report after the owner ended; a stale
+ * ref never changes another owner's count. MOQ_ERR_INVAL for NULL, ref 0
+ * or an unknown outcome. MOQ_ERR_WRONG_STATE outside the tagged mode, or
+ * when the stream's opening action has not been polled.
+ */
+typedef uint32_t moq_data_open_outcome_t;  /* open set; never renumbered */
+#define MOQ_DATA_OPEN_OPENED  1u
+#define MOQ_DATA_OPEN_UNKNOWN 2u
+
+MOQ_API moq_result_t moq_session_report_data_open(moq_session_t *s,
+    moq_stream_ref_t stream_ref, moq_output_owner_t owner,
+    moq_data_open_outcome_t outcome);
+
+/*
+ * Drain actions with their tags (tagged mode only).
+ *
+ * Element i of tags describes element i of actions. action_size is the
+ * caller's moq_action_t element size, as for moq_session_poll_actions_ex;
+ * tag_size is the caller's moq_action_tag_t size and at least
+ * MOQ_ACTION_TAG_V0_SIZE. The session writes min(tag_size, its own size)
+ * bytes into each tag and zeroes the rest of the element. Writes use
+ * memcpy, so neither array needs more than byte alignment.
+ *
+ * Selection, custody, results, the SEND_DATA floor and cleanup are those of
+ * moq_session_poll_actions_ex(), with three differences:
+ * - a handed counted open (OPEN_COUNTED) stays pending until the host
+ *   reports it, instead of being resolved as unobservable;
+ * - a reset the host claimed, and a reset of a stream whose opening header
+ *   never left the session, are never handed out: such a reset stops the
+ *   batch like a terminal that waits, and only the reset claim takes it
+ *   (moq_session_offer_data_reset);
+ * - after the session closes, the call still drains the close output the
+ *   session queued itself. A session closed by the transport queues none,
+ *   and the host waits for none.
+ *
+ * Returns MOQ_ERR_INVAL, before anything else and with nothing transferred,
+ * for a NULL session or out_count, NULL arrays with cap != 0, a size below
+ * its floor, a cap whose array size overflows, or arrays that overlap.
+ * Returns MOQ_ERR_WRONG_STATE outside the tagged mode. cap == 0 is MOQ_OK
+ * with no effect. MOQ_ERR_WOULD_BLOCK with *out_count == 0 is either an
+ * event wait (as for moq_session_poll_actions_ex) or a reset only the
+ * claim can take; the reset offer tells them apart.
+ *
+ * Observing (does not invalidate borrows).
+ */
+MOQ_API moq_result_t moq_session_poll_actions_tagged(moq_session_t *s,
+    void *actions, size_t action_size, void *tags, size_t tag_size,
+    size_t cap, size_t *out_count);
 
 #ifdef __cplusplus
 }
