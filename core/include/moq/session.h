@@ -774,35 +774,37 @@ MOQ_API moq_result_t moq_session_on_data_reset(moq_session_t *s,
 
 /*
  * Notify the session that the peer sent STOP_SENDING on a data stream
- * we opened.
+ * we opened. Records the first STOP cause/code before attempting output.
  *
- * For an outgoing subgroup the session records the first STOP cause/code
- * and freezes that exact subgroup before attempting output, then queues
- * RESET_DATA together with OUTGOING_SUBGROUP_TERMINATED when both output
- * queues admit them. For a fill stream it records the first cause and
- * answers with that stream's reset.
+ * An outgoing subgroup: freezes that exact subgroup and queues RESET_DATA
+ * together with OUTGOING_SUBGROUP_TERMINATED when both output queues admit
+ * them. While its obligation is pending, writes, object end, close and
+ * reset on it return MOQ_ERR_WOULD_BLOCK without retaining payload refs.
+ *
+ * A fill stream: ends the fill with the peer's cause and queues RESET_DATA
+ * when the action queue admits it; FILL_TERMINAL follows the reset when the
+ * event queue admits it. While its obligation is pending, writes, end and
+ * abort on it return MOQ_ERR_WRONG_STATE.
  *
  *   MOQ_OK              committed, or nothing to act on: the stream was
  *                       already terminal, or the session does not own it,
  *                       which includes a subgroup it has already released.
  *                       MOQ_OK alone does not mean a RESET_DATA was
  *                       queued: for a stream the session does not own,
- *                       none is.
- *   MOQ_ERR_WOULD_BLOCK output capacity is missing. Drain actions and
- *                       events, then deliver the same stop again with the
- *                       same error_code. That is always safe: a subgroup's
- *                       obligation and identity are already recorded, its
- *                       first cause is kept, and draining either queue
- *                       retries it as well. It is required for a fill
- *                       stream, where a refused stop records nothing.
+ *                       none is. For a fill stream it owns, the stream's
+ *                       RESET_DATA is queued.
+ *   MOQ_ERR_WOULD_BLOCK output capacity is missing. For a subgroup or a
+ *                       fill stream, the obligation, its identity and its
+ *                       first cause are already recorded, and draining
+ *                       either queue retries it, so the stop need not be
+ *                       delivered again; delivering it again is safe, as
+ *                       the first cause is kept.
  *   MOQ_ERR_INVAL       NULL session or error_code greater than 2^62 - 1.
  *   MOQ_ERR_CLOSED      the session is closed, or its setup has not
  *                       completed.
  *
- * While a subgroup's obligation is pending, writes, object end, close and
- * reset on it return MOQ_ERR_WOULD_BLOCK without retaining payload refs,
- * and a later STOP/expiry/ACK cannot replace its cause. No caller payload
- * ownership is taken.
+ * A later STOP/expiry/ACK cannot replace a pending obligation's cause. No
+ * caller payload ownership is taken.
  *
  * Advancing call: invalidates borrows, takes now_us.
  */

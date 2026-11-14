@@ -680,18 +680,31 @@ moq_result_t fill_on_data_stop(moq_session_t *s, moq_stream_ref_t ref, uint64_t 
             e->stream._v != ref._v)
             continue;
         if (!stream_open(e)) return MOQ_OK;
-        if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
+        /* The stop and its cause are recorded before any capacity is looked
+         * for. The RESET it owes is then an obligation the table retains:
+         * fill_service queues it as soon as an action slot is free, whether
+         * or not the peer's stop is ever delivered again. The first cause
+         * wins, domain included: a repeated stop, or one that follows a
+         * cause already decided, changes neither the code nor the reason. */
+        moq_fill_ref_t child = ref_of(s, i);
         moq_fill_side_t *side = &s->fill_side[i];
-        if (side->error_domain == MOQ_FILL_ERROR_NONE) {
+        if (e->terminal_reason == MOQ_FILL_TERM_NONE &&
+            side->error_domain == MOQ_FILL_ERROR_NONE) {
             side->error_domain = MOQ_FILL_ERROR_STREAM;
             side->error_code = error_code;
         }
-        (void)moq_fill_peer_stop(&s->fills, ref_of(s, i), ref);
+        (void)moq_fill_peer_stop(&s->fills, child, ref);
         moq_fill_work_t w;
-        if (moq_fill_next(&s->fills, ref_of(s, i), &w) == MOQ_OK &&
+        if (!action_queue_full(s) &&
+            moq_fill_next(&s->fills, child, &w) == MOQ_OK &&
             w.action == MOQ_FILL_ACTION_RESET)
             push_stream_action(s, i, MOQ_FILL_ACTION_RESET);
         fill_service(s);
+        /* Still owed: the action queue had no slot. A child the service
+         * already reclaimed no longer answers to this reference. */
+        if (moq_fill_next(&s->fills, child, &w) == MOQ_OK &&
+            w.action == MOQ_FILL_ACTION_RESET)
+            return MOQ_ERR_WOULD_BLOCK;
         return MOQ_OK;
     }
     return MOQ_ERR_STALE_HANDLE;

@@ -24,7 +24,11 @@
  * anyway without closing the session; PUBLISH_DONE arriving ahead of the
  * fill data leaves exactly one subscription terminal; the publisher's fill
  * resets are queued ahead of its PUBLISH_DONE; a parent ended by PUBLISH_DONE
- * reports that cause on the child on both sides.
+ * reports that cause on the child on both sides; a peer STOP the publisher's
+ * action queue cannot answer yet is retained with its first cause and
+ * answered once the queue drains, with no second delivery from the peer;
+ * a subscription the publisher ends while that fill's terminal still waits
+ * leaves the reset and the terminal the stop's.
  */
 #include <moq/moq.h>
 #include <moq/sim.h>
@@ -2740,6 +2744,469 @@ static int test_fill_oversized_object(void)
     return failures;
 }
 
+/* -- A peer STOP on a fill stream the action queue cannot answer yet. ------ */
+
+typedef struct stop_rig {
+    count_alloc_t ca;
+    moq_alloc_t alloc;
+    moq_session_t *c, *sv;
+    moq_subscription_t ch, sh;
+    moq_fill_t sfill;
+    moq_stream_ref_t stream;   /* the publisher's fill stream */
+    uint8_t header_len;        /* its FETCH_HEADER: the reset's reliable prefix */
+} stop_rig_t;
+
+/* Destroy the pair and leave the rig without one. */
+static void stop_rig_drop(stop_rig_t *r)
+{
+    if (r->c) moq_session_destroy(r->c);
+    if (r->sv) moq_session_destroy(r->sv);
+    r->c = r->sv = NULL;
+}
+
+/* A hand-pumped pair whose publisher has one open fill stream, its header
+ * already polled. Each step needs the one before it, so the first that fails
+ * ends the fixture: the pair is destroyed and r->c and r->sv are left NULL,
+ * which is how a row learns it has nothing to run against. */
+static int stop_rig_open(stop_rig_t *r)
+{
+    int failures = 0;
+    memset(r, 0, sizeof(*r));
+    r->alloc = (moq_alloc_t){ &r->ca, ca_alloc, ca_realloc, ca_free };
+    if (!raw_pair_v_alloc(&r->c, &r->sv, MOQ_VERSION_DRAFT_22, 0, 0, 0, &r->alloc)) {
+        r->c = r->sv = NULL;
+        MOQ_TEST_CHECK(false);
+        return failures;
+    }
+    moq_location_filter_cfg_t loc = abs_start(3, 0);
+    moq_fill_cfg_t fill;
+    moq_fill_cfg_init(&fill);
+    fill.location = &loc;
+    bool established = raw_establish(r->c, r->sv, MOQ_SUBSCRIBE_FILTER_NEXT_GROUP, 0, &fill,
+                                     &r->ch, &r->sh);
+    MOQ_TEST_CHECK(established);
+    if (!established) { stop_rig_drop(r); return failures; }
+    drain(r->c);
+    moq_event_t ev;
+    bool requested = take(r->sv, MOQ_EVENT_FILL_REQUEST, &ev);
+    MOQ_TEST_CHECK(requested);
+    if (!requested) { stop_rig_drop(r); return failures; }
+    r->sfill = ev.u.fill_request.fill;
+    moq_event_cleanup(&ev);
+    moq_result_t opened = moq_session_open_fill(r->sv, r->sfill, 10);
+    MOQ_TEST_CHECK_EQ_INT((int)opened, (int)MOQ_OK);
+    if (opened != MOQ_OK) { stop_rig_drop(r); return failures; }
+    moq_action_t acts[8];
+    size_t n = poll_actions_into(r->sv, acts, 8);
+    for (size_t i = 0; i < n; i++) {
+        if (acts[i].kind == MOQ_ACTION_SEND_DATA && acts[i].u.send_data.header_len > 0 &&
+            r->header_len == 0) {
+            r->stream = acts[i].u.send_data.stream_ref;
+            r->header_len = acts[i].u.send_data.header_len;
+        }
+        moq_action_cleanup(&acts[i]);
+    }
+    MOQ_TEST_CHECK(r->header_len > 0);
+    if (r->header_len == 0) { stop_rig_drop(r); return failures; }
+    drain(r->sv);
+    return failures;
+}
+
+/* One fill object on the rig's fill. Its payload comes from the rig's
+ * counting allocator, so the balance stop_rig_close checks covers the
+ * payload buffers as well as the sessions. `keep`, when given, receives the
+ * caller's own reference to the payload of a write that was taken. */
+static moq_result_t stop_rig_write(stop_rig_t *r, uint64_t g, uint64_t o, const char *text,
+                                   uint64_t now, moq_rcbuf_t **keep)
+{
+    moq_rcbuf_t *payload = NULL;
+    moq_result_t rc = moq_rcbuf_create(&r->alloc, (const uint8_t *)text, strlen(text),
+                                       &payload);
+    if (rc != MOQ_OK) return rc;
+    moq_fetch_object_cfg_t oc;
+    moq_fetch_object_cfg_init(&oc);
+    oc.group_id = g;
+    oc.subgroup_id = 0;
+    oc.object_id = o;
+    oc.publisher_priority = 5;
+    oc.payload = payload;
+    rc = moq_session_write_fill_object(r->sv, r->sfill, &oc, now);
+    if (keep && rc == MOQ_OK) *keep = payload;
+    else moq_rcbuf_decref(payload);
+    return rc;
+}
+
+/* Write fill objects until the action queue refuses one. Bounded: the queue
+ * holds a few dozen actions. `first`, when given, receives a reference to
+ * the first queued payload. False when the queue did not end up full, which
+ * is what every row that calls this starts from. */
+static bool stop_rig_fill_queue(stop_rig_t *r, int *failures_out, moq_rcbuf_t **first)
+{
+    int failures = 0;
+    int written = 0;
+    moq_result_t rc = MOQ_OK;
+    for (int i = 0; i < 4096 && rc == MOQ_OK; i++) {
+        rc = stop_rig_write(r, 3, (uint64_t)i, "x", 11, written == 0 ? first : NULL);
+        if (rc == MOQ_OK) written++;
+    }
+    bool full = rc == MOQ_ERR_WOULD_BLOCK && written > 0 &&
+                queued_action_total(r->sv) == r->sv->action_cap;
+    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK(written > 0);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_action_total(r->sv), r->sv->action_cap);
+    *failures_out += failures;
+    return full;
+}
+
+/* Leave the publisher's event queue full of requests it has not read.
+ * Bounded: each round queues at most one event. False when the queue did
+ * not fill. */
+static bool stop_rig_fill_events(stop_rig_t *r, uint64_t now)
+{
+    bool full = r->sv->event_tail - r->sv->event_head >= r->sv->event_cap;
+    for (int i = 0; i < 64 && !full; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "t%02d", i);
+        moq_subscribe_cfg_t other;
+        moq_subscribe_cfg_init(&other);
+        other.track_namespace = (moq_namespace_t){ ns_parts, 1 };
+        other.track_name = (moq_bytes_t){ (const uint8_t *)name, strlen(name) };
+        moq_subscription_t osub;
+        if (moq_session_subscribe(r->c, &other, now, &osub) != MOQ_OK) break;
+        raw_run(r->c, r->sv, now);
+        full = r->sv->event_tail - r->sv->event_head >= r->sv->event_cap;
+    }
+    return full;
+}
+
+/* Destroy the pair and check the allocator's balance. Sessions and payloads
+ * share it, so zero means every one of them was released by the time both
+ * sessions were destroyed; it does not say at which step. */
+static void stop_rig_close(stop_rig_t *r, int *failures_out)
+{
+    int failures = 0;
+    stop_rig_drop(r);
+    MOQ_TEST_CHECK_EQ_U64(r->ca.live, 0);
+    *failures_out += failures;
+}
+
+/* Poll every action of `s`; count the RESET_DATA actions on `stream` and
+ * check each carries `code` and `reliable` as its reliable size. */
+static int drain_count_resets(moq_session_t *s, moq_stream_ref_t stream, uint64_t code,
+                              uint64_t reliable, int *failures_out)
+{
+    int failures = 0;
+    int resets = 0;
+    moq_action_t a;
+    /* Bounded by the queue: every poll removes one action, and the reset a
+     * drain releases is the only one a fill adds. */
+    for (int i = 0; i < 4096 && moq_session_poll_actions(s, &a, 1) > 0; i++) {
+        if (a.kind == MOQ_ACTION_RESET_DATA && a.u.reset_data.stream_ref._v == stream._v) {
+            resets++;
+            MOQ_TEST_CHECK_EQ_U64(a.u.reset_data.error_code, code);
+            MOQ_TEST_CHECK_EQ_U64(a.u.reset_data.reliable_size, reliable);
+        }
+        moq_action_cleanup(&a);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(queued_action_total(s), 0);
+    *failures_out += failures;
+    return resets;
+}
+
+/* The stop is refused for capacity, yet recorded: the fill takes no more
+ * writes, the reset is issued when the queue drains without the peer
+ * delivering the stop again, and both the reset and the one terminal carry
+ * the first stop's code. */
+static int test_fill_stop_retained_on_full_queue(void)
+{
+    int failures = 0;
+    stop_rig_t r;
+    failures += stop_rig_open(&r);
+    if (!r.sv) return failures;
+    if (!stop_rig_fill_queue(&r, &failures, NULL)) {
+        stop_rig_close(&r, &failures);
+        return failures;
+    }
+
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_stop(r.sv, r.stream, 0x51, 12),
+                          (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_actions(r.sv, MOQ_ACTION_RESET_DATA), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(r.sv, MOQ_EVENT_FILL_TERMINAL), 0);
+    /* A stopped fill refuses writes as stopped, not for capacity. */
+    MOQ_TEST_CHECK_EQ_INT((int)stop_rig_write(&r, 4, 0, "late", 12, NULL),
+                          (int)MOQ_ERR_WRONG_STATE);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_end_fill(r.sv, r.sfill, 12),
+                          (int)MOQ_ERR_WRONG_STATE);
+
+    /* The same stop with another code is still refused and replaces nothing. */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_stop(r.sv, r.stream, 0x52, 13),
+                          (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_actions(r.sv, MOQ_ACTION_RESET_DATA), 0);
+
+    /* Drain only: the peer delivers nothing more. */
+    int resets = drain_count_resets(r.sv, r.stream, 0x51, r.header_len, &failures);
+    MOQ_TEST_CHECK_EQ_INT(resets, 1);
+
+    moq_event_t ev;
+    int terms = count_kind(r.sv, MOQ_EVENT_FILL_TERMINAL, &ev);
+    MOQ_TEST_CHECK_EQ_INT(terms, 1);
+    if (terms) {
+        MOQ_TEST_CHECK(moq_fill_eq(ev.u.fill_terminal.fill, r.sfill));
+        MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.reason,
+                              (int)MOQ_FILL_PEER_CANCELLED_OR_RESET);
+        MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.error_domain,
+                              (int)MOQ_FILL_ERROR_STREAM);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.fill_terminal.error_code, 0x51);
+        moq_event_cleanup(&ev);
+    }
+
+    /* The child is reclaimed; a late stop finds nothing to act on. */
+    MOQ_TEST_CHECK_EQ_SIZE(r.sv->fills.live, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_stop(r.sv, r.stream, 0x53, 14),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_action_total(r.sv), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(r.sv, MOQ_EVENT_FILL_TERMINAL), 0);
+    MOQ_TEST_CHECK_EQ_INT((int)stop_rig_write(&r, 4, 1, "gone", 14, NULL),
+                          (int)MOQ_ERR_STALE_HANDLE);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(r.sv), (int)MOQ_SESS_ESTABLISHED);
+    stop_rig_close(&r, &failures);
+    return failures;
+}
+
+/* The subscriber's teardown arrives while the stop's reset is still owed.
+ * The full queue cannot take what the teardown itself has to queue, so it is
+ * refused: the subscription is marked cancelled and nothing else changes,
+ * the fill child included. Draining then issues the stop's reset and
+ * terminal and reclaims the child, so the teardown delivered again finds no
+ * fill: it ends the subscription and adds neither a reset nor a terminal.
+ * The teardown never acts on the stopped child here. */
+static int test_fill_stop_debt_refuses_parent_teardown(void)
+{
+    int failures = 0;
+    stop_rig_t r;
+    failures += stop_rig_open(&r);
+    if (!r.sv) return failures;
+    if (!stop_rig_fill_queue(&r, &failures, NULL)) {
+        stop_rig_close(&r, &failures);
+        return failures;
+    }
+
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_stop(r.sv, r.stream, 0x51, 12),
+                          (int)MOQ_ERR_WOULD_BLOCK);
+
+    moq_result_t unsub = moq_session_unsubscribe(r.c, r.ch, 13);
+    MOQ_TEST_CHECK_EQ_INT((int)unsub, (int)MOQ_OK);
+    moq_action_t cancel[8];
+    size_t nc = poll_actions_into(r.c, cancel, 8);
+    MOQ_TEST_CHECK(nc > 0);
+    if (unsub != MOQ_OK || nc == 0) {
+        for (size_t i = 0; i < nc; i++) moq_action_cleanup(&cancel[i]);
+        stop_rig_close(&r, &failures);
+        return failures;
+    }
+    for (size_t i = 0; i < nc; i++) deliver(r.sv, &cancel[i], false, 14);
+    /* Refused: no event, no reset, and the fill child still stands. */
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(r.sv, MOQ_EVENT_UNSUBSCRIBED), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_actions(r.sv, MOQ_ACTION_RESET_DATA), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(r.sv->fills.live, 1);
+
+    int resets = drain_count_resets(r.sv, r.stream, 0x51, r.header_len, &failures);
+    MOQ_TEST_CHECK_EQ_INT(resets, 1);
+    /* The drain alone settled the fill: its terminal is queued and the
+     * child is gone before the teardown comes back. */
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(r.sv, MOQ_EVENT_FILL_TERMINAL), 1);
+    MOQ_TEST_CHECK_EQ_SIZE(r.sv->fills.live, 0);
+
+    /* The same teardown, delivered again, now completes. */
+    for (size_t i = 0; i < nc; i++) deliver(r.sv, &cancel[i], false, 15);
+    for (size_t i = 0; i < nc; i++) moq_action_cleanup(&cancel[i]);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(r.sv, MOQ_EVENT_UNSUBSCRIBED), 1);
+    resets = drain_count_resets(r.sv, r.stream, 0x51, r.header_len, &failures);
+    MOQ_TEST_CHECK_EQ_INT(resets, 0);
+
+    moq_event_t ev;
+    int terms = count_kind(r.sv, MOQ_EVENT_FILL_TERMINAL, &ev);
+    MOQ_TEST_CHECK_EQ_INT(terms, 1);
+    if (terms) {
+        MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.reason,
+                              (int)MOQ_FILL_PEER_CANCELLED_OR_RESET);
+        MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.error_domain,
+                              (int)MOQ_FILL_ERROR_STREAM);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.fill_terminal.error_code, 0x51);
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(r.sv->fills.live, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(r.sv), (int)MOQ_SESS_ESTABLISHED);
+    stop_rig_close(&r, &failures);
+    return failures;
+}
+
+/* The publisher ends the subscription while a stopped fill's child still
+ * stands: the stop's reset has gone out, and its terminal waits because the
+ * event queue is full of requests nobody has read. Ending the subscription
+ * reaches that child and changes nothing it owes: no second reset, and the
+ * one terminal, once an event slot frees, still names the stop and its code
+ * rather than the subscription's end. */
+static int test_fill_parent_done_keeps_stopped_child_cause(void)
+{
+    int failures = 0;
+    stop_rig_t r;
+    failures += stop_rig_open(&r);
+    if (!r.sv) return failures;
+    bool events_full = stop_rig_fill_events(&r, 11);
+    MOQ_TEST_CHECK(events_full);
+    if (!events_full || !stop_rig_fill_queue(&r, &failures, NULL)) {
+        stop_rig_close(&r, &failures);
+        return failures;
+    }
+
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_stop(r.sv, r.stream, 0x51, 12),
+                          (int)MOQ_ERR_WOULD_BLOCK);
+    /* Draining the actions issues the reset; the terminal has no slot. */
+    int resets = drain_count_resets(r.sv, r.stream, 0x51, r.header_len, &failures);
+    MOQ_TEST_CHECK_EQ_INT(resets, 1);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(r.sv, MOQ_EVENT_FILL_TERMINAL), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(r.sv->fills.live, 1);
+
+    moq_done_subscribe_cfg_t dc;
+    moq_done_subscribe_cfg_init(&dc);
+    dc.status_code = 0; dc.stream_count = 0;   /* the session adds its fill */
+    moq_result_t done = moq_session_done_subscribe(r.sv, r.sh, &dc, 13);
+    MOQ_TEST_CHECK_EQ_INT((int)done, (int)MOQ_OK);
+    if (done != MOQ_OK) {
+        stop_rig_close(&r, &failures);
+        return failures;
+    }
+    /* The child outlives its subscription while its terminal waits. */
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(r.sv, MOQ_EVENT_FILL_TERMINAL), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(r.sv->fills.live, 1);
+
+    /* Reading the events frees the slot the terminal was waiting for. */
+    moq_event_t ev;
+    int terms = count_kind(r.sv, MOQ_EVENT_FILL_TERMINAL, &ev);
+    MOQ_TEST_CHECK_EQ_INT(terms, 1);
+    if (terms) {
+        MOQ_TEST_CHECK(moq_fill_eq(ev.u.fill_terminal.fill, r.sfill));
+        MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.reason,
+                              (int)MOQ_FILL_PEER_CANCELLED_OR_RESET);
+        MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.error_domain,
+                              (int)MOQ_FILL_ERROR_STREAM);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.fill_terminal.error_code, 0x51);
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(r.sv->fills.live, 0);
+    /* What ending the subscription queued holds no reset for the fill. */
+    resets = drain_count_resets(r.sv, r.stream, 0x51, r.header_len, &failures);
+    MOQ_TEST_CHECK_EQ_INT(resets, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(r.sv), (int)MOQ_SESS_ESTABLISHED);
+    stop_rig_close(&r, &failures);
+    return failures;
+}
+
+/* A fill that already ended is not reopened by a stop: nothing is reset and
+ * its terminal stays the one it had. First a fill whose child is gone, then
+ * one whose FIN is queued while its terminal still waits for an event slot. */
+static int test_fill_stop_after_end_changes_nothing(void)
+{
+    int failures = 0;
+    stop_rig_t r;
+    moq_event_t ev;
+    int terms;
+
+    failures += stop_rig_open(&r);
+    if (!r.sv) return failures;
+    moq_result_t wrote = stop_rig_write(&r, 3, 0, "a", 11, NULL);
+    MOQ_TEST_CHECK_EQ_INT((int)wrote, (int)MOQ_OK);
+    moq_result_t ended = moq_session_end_fill(r.sv, r.sfill, 11);
+    MOQ_TEST_CHECK_EQ_INT((int)ended, (int)MOQ_OK);
+    if (wrote != MOQ_OK || ended != MOQ_OK) {
+        stop_rig_close(&r, &failures);
+        return failures;
+    }
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_stop(r.sv, r.stream, 0x51, 12),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_actions(r.sv, MOQ_ACTION_RESET_DATA), 0);
+    terms = count_kind(r.sv, MOQ_EVENT_FILL_TERMINAL, &ev);
+    MOQ_TEST_CHECK_EQ_INT(terms, 1);
+    if (terms) {
+        MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.reason, (int)MOQ_FILL_COMPLETE);
+        MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.error_domain,
+                              (int)MOQ_FILL_ERROR_NONE);
+        moq_event_cleanup(&ev);
+    }
+    stop_rig_close(&r, &failures);
+
+    failures += stop_rig_open(&r);
+    if (!r.sv) return failures;
+    /* Requests the publisher has not read fill its event queue, so the
+     * terminal of the fill it then ends has to wait. */
+    bool full = stop_rig_fill_events(&r, 11);
+    MOQ_TEST_CHECK(full);
+    wrote = stop_rig_write(&r, 3, 0, "a", 12, NULL);
+    MOQ_TEST_CHECK_EQ_INT((int)wrote, (int)MOQ_OK);
+    ended = moq_session_end_fill(r.sv, r.sfill, 12);
+    MOQ_TEST_CHECK_EQ_INT((int)ended, (int)MOQ_OK);
+    if (!full || wrote != MOQ_OK || ended != MOQ_OK) {
+        stop_rig_close(&r, &failures);
+        return failures;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(r.sv, MOQ_EVENT_FILL_TERMINAL), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(r.sv->fills.live, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_stop(r.sv, r.stream, 0x51, 13),
+                          (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_actions(r.sv, MOQ_ACTION_RESET_DATA), 0);
+    terms = count_kind(r.sv, MOQ_EVENT_FILL_TERMINAL, &ev);
+    MOQ_TEST_CHECK_EQ_INT(terms, 1);
+    if (terms) {
+        MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.reason, (int)MOQ_FILL_COMPLETE);
+        MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.error_domain,
+                              (int)MOQ_FILL_ERROR_NONE);
+        MOQ_TEST_CHECK_EQ_U64(ev.u.fill_terminal.error_code, 0);
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(queued_actions(r.sv, MOQ_ACTION_RESET_DATA), 0);
+    stop_rig_close(&r, &failures);
+    return failures;
+}
+
+/* The session closes while the stop's reset is still owed: the debt goes
+ * with the session. The close is the only output and a later stop is
+ * refused as closed. The objects queued ahead of the owed reset go too: the
+ * row keeps its own reference to one of their payloads, and closing leaves
+ * that reference the only one. */
+static int test_fill_stop_debt_ends_with_session(void)
+{
+    int failures = 0;
+    stop_rig_t r;
+    failures += stop_rig_open(&r);
+    if (!r.sv) return failures;
+    moq_rcbuf_t *held = NULL;
+    if (!stop_rig_fill_queue(&r, &failures, &held) || !held) {
+        if (held) moq_rcbuf_decref(held);
+        stop_rig_close(&r, &failures);
+        return failures;
+    }
+    /* Queued, the object holds the second reference. */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(held), 2);
+
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_stop(r.sv, r.stream, 0x51, 12),
+                          (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(held), 2);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_close(r.sv, 0x2, "bye", 13), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(r.sv), (int)MOQ_SESS_CLOSED);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_rcbuf_refcount(held), 1);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_action_total(r.sv), 1);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_actions(r.sv, MOQ_ACTION_CLOSE_SESSION), 1);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_on_data_stop(r.sv, r.stream, 0x51, 14),
+                          (int)MOQ_ERR_CLOSED);
+    int resets = drain_count_resets(r.sv, r.stream, 0x51, r.header_len, &failures);
+    MOQ_TEST_CHECK_EQ_INT(resets, 0);
+    MOQ_TEST_CHECK_EQ_SIZE(queued_events(r.sv, MOQ_EVENT_FILL_TERMINAL), 0);
+    moq_rcbuf_decref(held);
+    stop_rig_close(&r, &failures);
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -2772,6 +3239,11 @@ int main(void)
     failures += test_stopped_subgroup_counts();
     failures += test_destroy_with_queued_objects();
     failures += test_tiny_queue_whole_flow();
+    failures += test_fill_stop_retained_on_full_queue();
+    failures += test_fill_stop_debt_refuses_parent_teardown();
+    failures += test_fill_parent_done_keeps_stopped_child_cause();
+    failures += test_fill_stop_after_end_changes_nothing();
+    failures += test_fill_stop_debt_ends_with_session();
     if (failures) { fprintf(stderr, "FAIL: test_fill_session (%d)\n", failures); return 1; }
     printf("PASS: test_fill_session\n");
     return 0;

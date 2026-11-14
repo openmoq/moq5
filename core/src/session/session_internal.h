@@ -4039,9 +4039,11 @@ void fill_rx_identity(const moq_session_t *s, const moq_rx_stream_t *rx,
                       moq_publication_t *pub, uint64_t *initiating_id);
 /* True when the child still accepts objects (not cancelled or ended). */
 bool fill_rx_delivering(const moq_session_t *s, const moq_rx_stream_t *rx);
-/* Publisher side: the peer's STOP_SENDING on a bound fill stream. Reserves the
- * RESET it owes (MOQ_ERR_WOULD_BLOCK with nothing changed when it cannot) and
- * returns MOQ_ERR_STALE_HANDLE when no child owns the stream. */
+/* Publisher side: the peer's STOP_SENDING on a bound fill stream. Records the
+ * stop and its first cause, then queues the RESET it owes. MOQ_ERR_WOULD_BLOCK
+ * when no action slot is free: the obligation is retained and fill_service
+ * queues the RESET once one is. MOQ_ERR_STALE_HANDLE when no child owns the
+ * stream. */
 moq_result_t fill_on_data_stop(moq_session_t *s, moq_stream_ref_t ref, uint64_t error_code);
 /* Receive-side helper (session_receive.c): put a bound fill stream into the
  * stopped/discard state after its STOP_DATA was queued. */

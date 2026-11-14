@@ -21,7 +21,11 @@
  *   - end to end over a pair whose transport abandons stream data a plain
  *     reset overtakes (RFC 9000 §3.1): a reset subgroup still counts toward
  *     PUBLISH_DONE's Stream Count and a fill failed on the wire still ends
- *     the subscriber's fill only when the reset is reliable.
+ *     the subscriber's fill only when the reset is reliable;
+ *   - a peer STOP on a fill stream that a full action queue cannot answer is
+ *     kept by the bridge and by the session: once the queue drains the fill
+ *     ends with one reset carrying the first STOP's code and the stream's
+ *     header as its reliable prefix, and nothing stays kept for the stream.
  */
 #include <moq/moq.h>
 #include <moq/transport_bridge.h>
@@ -165,8 +169,10 @@ static bool take(moq_session_t *s, moq_event_kind_t kind, moq_event_t *out)
     return false;
 }
 
-/* `reliable` declares reset_stream_at on the server (publisher) endpoint. */
-static bool pair_open(pair_t *p, moq_version_t v, bool reliable, uint32_t sv_fills)
+/* `reliable` declares reset_stream_at on the server (publisher) endpoint.
+ * `sv_actions` sizes the server session's action queue (0: the default). */
+static bool pair_open_sized(pair_t *p, moq_version_t v, bool reliable, uint32_t sv_fills,
+                            uint32_t sv_actions)
 {
     memset(p, 0, sizeof(*p));
     p->v = v;
@@ -179,6 +185,7 @@ static bool pair_open(pair_t *p, moq_version_t v, bool reliable, uint32_t sv_fil
     cc.initial_request_capacity = sc.initial_request_capacity = 64;
     cc.max_fills = 4;
     sc.max_fills = sv_fills;
+    sc.max_actions = sv_actions;
     if (moq_session_create(&cc, 0, &p->c) < 0) return false;
     if (moq_session_create(&sc, 0, &p->sv) < 0) return false;
     if (test_bind_if_required(p->c) < 0 || test_bind_if_required(p->sv) < 0) return false;
@@ -196,6 +203,11 @@ static bool pair_open(pair_t *p, moq_version_t v, bool reliable, uint32_t sv_fil
     drain_events(p->sv);
     return moq_session_state(p->c) == MOQ_SESS_ESTABLISHED &&
            moq_session_state(p->sv) == MOQ_SESS_ESTABLISHED;
+}
+
+static bool pair_open(pair_t *p, moq_version_t v, bool reliable, uint32_t sv_fills)
+{
+    return pair_open_sized(p, v, reliable, sv_fills, 0);
 }
 
 static void pair_close(pair_t *p)
@@ -574,6 +586,149 @@ static void test_failed_fill_reaches_subscriber(bool reliable)
     pair_close(&p);
 }
 
+/* One object of group 3 written straight into the publisher's session. */
+static moq_result_t write_fill_obj(pair_t *p, moq_fill_t f, uint64_t id)
+{
+    moq_rcbuf_t *b = NULL;
+    moq_result_t rc = moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)"payload", 7, &b);
+    if (rc != MOQ_OK) return rc;
+    moq_fetch_object_cfg_t oc;
+    moq_fetch_object_cfg_init(&oc);
+    oc.group_id = 3;
+    oc.object_id = id;
+    oc.publisher_priority = 5;
+    oc.payload = b;
+    rc = moq_session_write_fill_object(p->sv, f, &oc, p->now);
+    moq_rcbuf_decref(b);
+    return rc;
+}
+
+/* Streams of `b` holding inbound work the bridge kept for a retry. */
+static size_t inbound_kept(const moq_transport_bridge_t *b)
+{
+    size_t n = 0;
+    for (uint32_t i = 0; i < b->max_streams; i++)
+        if (b->streams[i].active && bridge_stream_has_inbound_pending(&b->streams[i])) n++;
+    return n;
+}
+
+/* A peer STOP on a fill stream that the publisher's full action queue cannot
+ * answer. The bridge keeps the STOP for a retry and the session keeps what
+ * the STOP decided, so the same STOP delivered again with another code
+ * changes nothing. Servicing then drains the queue and the fill ends exactly
+ * once: one reset, carrying the first code and the stream's header as its
+ * reliable prefix; one FILL_TERMINAL naming that code; nothing left kept for
+ * the stream; neither bridge fatal and both sessions established. */
+static void test_fill_stop_kept_through_full_queue(void)
+{
+    pair_t p;
+    if (!pair_open_sized(&p, MOQ_VERSION_DRAFT_22, true, 1, 8)) {
+        MOQ_TEST_CHECK(false); pair_close(&p); return;
+    }
+    moq_location_filter_cfg_t loc;
+    moq_location_filter_cfg_init(&loc);
+    loc.kind = MOQ_LOCATION_FILTER_ABSOLUTE_START;
+    loc.start_group = 3;
+    moq_fill_cfg_t fill;
+    moq_fill_cfg_init(&fill);
+    fill.location = &loc;
+    moq_subscription_t ch, sh;
+    moq_event_t ev;
+    if (!subscribe(&p, &fill, &ch, &sh) || !take(p.sv, MOQ_EVENT_FILL_REQUEST, &ev)) {
+        MOQ_TEST_CHECK(false); pair_close(&p); return;
+    }
+    moq_fill_t sfill = ev.u.fill_request.fill;
+    moq_event_cleanup(&ev);
+
+    /* Open the fill: its header is the first write on the new stream. */
+    uint64_t sid = p.sep.next_uni_id;
+    if (moq_session_open_fill(p.sv, sfill, p.now) != MOQ_OK) {
+        MOQ_TEST_CHECK(false); pair_close(&p); return;
+    }
+    held_bridge_service(p.sb, p.now);
+    size_t hdr = first_write_len(&p.sep, sid);
+    if (hdr == 0) { MOQ_TEST_CHECK(false); pair_close(&p); return; }
+    pump(&p);
+    drain_events(p.c);
+    drain_events(p.sv);
+
+    /* Objects written while the bridge is not serviced fill the session's
+     * action queue. Bounded: the queue holds eight. */
+    moq_result_t wrc = MOQ_OK;
+    size_t written = 0;
+    for (uint64_t i = 0; i < 64 && wrc == MOQ_OK; i++) {
+        wrc = write_fill_obj(&p, sfill, i);
+        if (wrc == MOQ_OK) written++;
+    }
+    if (wrc != MOQ_ERR_WOULD_BLOCK || written == 0 ||
+        p.sv->action_tail - p.sv->action_head != p.sv->action_cap) {
+        MOQ_TEST_CHECK(false); pair_close(&p); return;
+    }
+
+    /* The STOP finds no action slot: the bridge keeps it for a retry. */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_on_peer_stop_sending(p.sb, sid, 0x51, p.now),
+                          (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK(moq_transport_bridge_stream_has_pending(p.sb, sid));
+    MOQ_TEST_CHECK_EQ_SIZE(inbound_kept(p.sb), 1);
+    /* Delivered again with another code while it is kept: refused again. */
+    MOQ_TEST_CHECK_EQ_INT((int)moq_transport_bridge_on_peer_stop_sending(p.sb, sid, 0x52, p.now),
+                          (int)MOQ_ERR_WOULD_BLOCK);
+    MOQ_TEST_CHECK_EQ_SIZE(inbound_kept(p.sb), 1);
+    MOQ_TEST_CHECK_EQ_SIZE(count_kind(&p.sep, FAKE_OP_RESET_AT) + count_kind(&p.sep, FAKE_OP_RESET), 0);
+
+    /* Servicing drains the session's queue and retries what the bridge
+     * kept. Bounded: one pass is expected to leave nothing kept. */
+    for (int i = 0; i < 4 && moq_transport_bridge_stream_has_pending(p.sb, sid); i++)
+        held_bridge_service(p.sb, p.now);
+    MOQ_TEST_CHECK(!p.sep.overflowed);
+    MOQ_TEST_CHECK(!moq_transport_bridge_stream_has_pending(p.sb, sid));
+    MOQ_TEST_CHECK_EQ_SIZE(inbound_kept(p.sb), 0);
+    MOQ_TEST_CHECK_EQ_SIZE(count_kind(&p.sep, FAKE_OP_RESET_AT), 1);
+    MOQ_TEST_CHECK_EQ_SIZE(count_kind(&p.sep, FAKE_OP_RESET), 0);
+    int r = index_of(&p.sep, FAKE_OP_RESET_AT, sid);
+    MOQ_TEST_CHECK(r >= 0);
+    if (r >= 0) {
+        MOQ_TEST_CHECK_EQ_U64(p.sep.ops[r].error_code, 0x51);
+        MOQ_TEST_CHECK_EQ_U64(p.sep.ops[r].reliable_size, hdr);
+    }
+
+    /* Each later round's server output is counted before it is handed on:
+     * nothing adds a second reset. */
+    size_t later = 0;
+    deliver(&p, &p.sep, p.cb, false);
+    for (int i = 0; i < 16; i++) {
+        held_bridge_service(p.cb, p.now);
+        deliver(&p, &p.cep, p.sb, true);
+        held_bridge_service(p.sb, p.now);
+        later += count_kind(&p.sep, FAKE_OP_RESET_AT) + count_kind(&p.sep, FAKE_OP_RESET);
+        deliver(&p, &p.sep, p.cb, false);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(later, 0);
+    MOQ_TEST_CHECK_EQ_SIZE(inbound_kept(p.sb), 0);
+
+    size_t terminals = 0;
+    for (int i = 0; i < 64 && moq_session_poll_events(p.sv, &ev, 1) > 0; i++) {
+        if (ev.kind == MOQ_EVENT_FILL_TERMINAL) {
+            terminals++;
+            MOQ_TEST_CHECK(moq_fill_eq(ev.u.fill_terminal.fill, sfill));
+            MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.reason,
+                                  (int)MOQ_FILL_PEER_CANCELLED_OR_RESET);
+            MOQ_TEST_CHECK_EQ_INT((int)ev.u.fill_terminal.error_domain,
+                                  (int)MOQ_FILL_ERROR_STREAM);
+            MOQ_TEST_CHECK_EQ_U64(ev.u.fill_terminal.error_code, 0x51);
+        }
+        moq_event_cleanup(&ev);
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(terminals, 1);
+    MOQ_TEST_CHECK_EQ_SIZE(p.sv->fills.live, 0);
+
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.sb));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(p.cb));
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(p.sv), (int)MOQ_SESS_ESTABLISHED);
+    MOQ_TEST_CHECK_EQ_INT((int)moq_session_state(p.c), (int)MOQ_SESS_ESTABLISHED);
+    pair_close(&p);
+}
+
 int main(void)
 {
     static const moq_version_t all[] = {
@@ -594,6 +749,7 @@ int main(void)
     test_size_bounded_and_detail_gated();
     test_failed_fill_reaches_subscriber(true);
     test_failed_fill_reaches_subscriber(false);
+    test_fill_stop_kept_through_full_queue();
 
     if (failures) {
         fprintf(stderr, "test_bridge_reliable_reset: %d failure(s)\n", failures);
