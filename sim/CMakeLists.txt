@@ -31,6 +31,10 @@ install(TARGETS moq-sim
 install(FILES include/moq/sim.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moq)
 
+moq_install_tier_pc(libmoq-sim
+    "Deterministic simulation harness for the MoQ core"
+    "libmoq-core" "-lmoq-sim")
+
 target_compile_definitions(moq-sim PRIVATE MOQ_SIM_BUILDING)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")

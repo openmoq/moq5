@@ -1615,11 +1615,19 @@ moq_result_t moq_session_begin_object(
     return MOQ_OK;
 }
 
-void moq_begin_object_cfg_init(moq_begin_object_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_begin_object_cfg_init)(moq_begin_object_cfg_t *cfg)
+{
+    moq_begin_object_cfg_init_sized(cfg, MOQ_BEGIN_OBJECT_CFG_V0_SIZE);
+}
+
+void moq_begin_object_cfg_init_sized(moq_begin_object_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_begin_object_ex(
@@ -1627,7 +1635,7 @@ moq_result_t moq_session_begin_object_ex(
     const moq_begin_object_cfg_t *cfg, uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_begin_object_cfg_t)) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_BEGIN_OBJECT_CFG_V0_SIZE) return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;

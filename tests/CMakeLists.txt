@@ -869,6 +869,55 @@ add_executable(test_request_cancel_subgroups unit/test_request_cancel_subgroups.
 target_link_libraries(test_request_cancel_subgroups PRIVATE moq-core-test-internals)
 add_test(NAME request_cancel_subgroups COMMAND test_request_cancel_subgroups)
 
+add_executable(test_cfg_init_sized unit/test_cfg_init_sized.c)
+target_link_libraries(test_cfg_init_sized PRIVATE moq::core)
+add_test(NAME cfg_init_sized COMMAND test_cfg_init_sized)
+
+# The exported initializers stay frozen when a config grows. A private build
+# of the core sees two configs with one more field each: a generated copy of
+# session.h is read ahead of the real one by that build and by the test's
+# caller compiled against the grown header, and by nothing else. The v0 caller in the same program
+# is built against the header as it is.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang" AND NOT WIN32)
+    set(_growth_header
+        "${CMAKE_CURRENT_BINARY_DIR}/cfg-init-growth/moq/session.h")
+    add_custom_command(OUTPUT "${_growth_header}"
+        COMMAND ${CMAKE_COMMAND}
+            "-DINPUT=${PROJECT_SOURCE_DIR}/core/include/moq/session.h"
+            "-DINCLUDE_DIR=${PROJECT_SOURCE_DIR}/core/include"
+            "-DOUTPUT=${_growth_header}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GrowConfigHeader.cmake"
+        DEPENDS "${PROJECT_SOURCE_DIR}/core/include/moq/session.h"
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GrowConfigHeader.cmake"
+        VERBATIM)
+    add_custom_target(cfg-init-growth-header DEPENDS "${_growth_header}")
+
+    get_target_property(_growth_sources moq-core SOURCES)
+    get_target_property(_growth_source_dir moq-core SOURCE_DIR)
+    set(_growth_core "")
+    foreach(_growth_source IN LISTS _growth_sources)
+        list(APPEND _growth_core "${_growth_source_dir}/${_growth_source}")
+    endforeach()
+    add_library(moq-core-grown STATIC ${_growth_core})
+    add_dependencies(moq-core-grown cfg-init-growth-header)
+    target_include_directories(moq-core-grown
+        PUBLIC "${_growth_source_dir}/include")
+    target_compile_features(moq-core-grown PUBLIC c_std_11)
+    target_compile_options(moq-core-grown
+        PRIVATE "SHELL:-include \"${_growth_header}\"")
+    set_source_files_properties(${_growth_core} PROPERTIES
+        OBJECT_DEPENDS "${_growth_header}")
+
+    add_executable(test_cfg_init_growth
+        unit/test_cfg_init_growth.c unit/cfg_init_growth_new.c)
+    add_dependencies(test_cfg_init_growth cfg-init-growth-header)
+    set_source_files_properties(unit/cfg_init_growth_new.c PROPERTIES
+        COMPILE_OPTIONS "-include;${_growth_header}"
+        OBJECT_DEPENDS "${_growth_header}")
+    target_link_libraries(test_cfg_init_growth PRIVATE moq-core-grown)
+    add_test(NAME cfg_init_growth COMMAND test_cfg_init_growth)
+endif()
+
 add_executable(test_priority_layout unit/test_priority_layout.c)
 target_link_libraries(test_priority_layout PRIVATE moq::core)
 add_test(NAME priority_layout COMMAND test_priority_layout)
@@ -2133,3 +2182,77 @@ add_test(NAME cluster_session COMMAND test_cluster_session)
 add_executable(test_cluster_work test_cluster_work.c)
 target_link_libraries(test_cluster_work PRIVATE moq-core-test-internals)
 add_test(NAME cluster_work COMMAND test_cluster_work)
+
+# The tier pkg-config files. The controls pin the paths a tier file names for
+# each install layout and each refusal of the consumer test. The consumer test
+# installs this build into a stage, moves the SDK and requires that an external
+# C or C++ program needs nothing but one tier file. The registration controls
+# configure this checkout again and run the command registered below.
+if(UNIX)
+    add_test(NAME tier_pkgconfig_controls
+        COMMAND ${CMAKE_COMMAND}
+            "-DMOQ_SOURCE=${PROJECT_SOURCE_DIR}"
+            "-DMOQ_WORK=${CMAKE_CURRENT_BINARY_DIR}/tier-pkgconfig-controls"
+            "-DCTEST_COMMAND=${CMAKE_CTEST_COMMAND}"
+            "-DMOQ_GENERATOR=${CMAKE_GENERATOR}"
+            "-DMOQ_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TierPkgConfigControls.cmake")
+    set_tests_properties(tier_pkgconfig_controls PROPERTIES TIMEOUT 300)
+
+    find_program(MOQ_TIER_PKG_CONFIG NAMES pkg-config pkgconf)
+    if(MOQ_TIER_PKG_CONFIG)
+        set(_tier_packages "libmoq-core")
+        if(TARGET moq-sim)
+            string(APPEND _tier_packages ",libmoq-sim")
+        endif()
+        if(TARGET moq-loc AND TARGET moq-cmaf AND TARGET moq-mpeg2ts
+           AND TARGET moq-media-object AND TARGET moq-msf)
+            string(APPEND _tier_packages ",libmoq-media")
+        endif()
+        # The consumers are built for the producer's own target, with its
+        # compilers and its C, C++ and link flags kept apart.
+        set(_tier_context "${CMAKE_CURRENT_BINARY_DIR}/tier-pkgconfig-context.cmake")
+        moq_write_consumer_context("${_tier_context}")
+        # The destinations the install uses are read from this build's own
+        # install scripts when the test runs, before it installs anything.
+        # Lists cross the test command line joined with "|".
+        list(JOIN CMAKE_CROSSCOMPILING_EMULATOR "|" _tier_emulator_arg)
+        add_test(NAME tier_pkgconfig_consumers
+            COMMAND ${CMAKE_COMMAND}
+                "-DMOQ_BUILD=${PROJECT_BINARY_DIR}"
+                "-DMOQ_SOURCE=${PROJECT_SOURCE_DIR}"
+                "-DMOQ_WORK=${CMAKE_CURRENT_BINARY_DIR}/tier-pkgconfig-consumers"
+                "-DMOQ_LIBDIR=${CMAKE_INSTALL_LIBDIR}"
+                "-DMOQ_PKG_CONFIG=${MOQ_TIER_PKG_CONFIG}"
+                "-DMOQ_CONTEXT=${_tier_context}"
+                "-DMOQ_CONFIG=$<CONFIG>"
+                "-DMOQ_PACKAGES=${_tier_packages}"
+                "-DMOQ_SHARED=$<BOOL:${BUILD_SHARED_LIBS}>"
+                "-DMOQ_LIB_PREFIX=${CMAKE_SHARED_LIBRARY_PREFIX}"
+                "-DMOQ_SHARED_SUFFIX=${CMAKE_SHARED_LIBRARY_SUFFIX}"
+                "-DMOQ_STATIC_SUFFIX=${CMAKE_STATIC_LIBRARY_SUFFIX}"
+                "-DMOQ_CROSSCOMPILING=$<BOOL:${CMAKE_CROSSCOMPILING}>"
+                "-DMOQ_EMULATOR=${_tier_emulator_arg}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TierPkgConfigConsumer.cmake")
+        # A run that could not be carried out on this host or layout says so
+        # as its last line, and is reported as skipped, never as passed.
+        set_tests_properties(tier_pkgconfig_consumers PROPERTIES
+            TIMEOUT 600
+            SKIP_REGULAR_EXPRESSION "tier_pkgconfig_consumers: UNSUPPORTED:")
+        include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/RejectConsumerWarnings.cmake")
+        moq_test_reject_consumer_warnings(tier_pkgconfig_consumers)
+
+        add_test(NAME tier_pkgconfig_registration
+            COMMAND ${CMAKE_COMMAND}
+                "-DMOQ_SOURCE=${PROJECT_SOURCE_DIR}"
+                "-DMOQ_WORK=${CMAKE_CURRENT_BINARY_DIR}/tier-pkgconfig-registration"
+                "-DMOQ_CONTEXT=${_tier_context}"
+                "-DMOQ_GENERATOR=${CMAKE_GENERATOR}"
+                "-DMOQ_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+                "-DMOQ_PKG_CONFIG=${MOQ_TIER_PKG_CONFIG}"
+                "-DCTEST_COMMAND=${CMAKE_CTEST_COMMAND}"
+                "-DMOQ_CONFIG=$<CONFIG>"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TierPkgConfigRegistration.cmake")
+        set_tests_properties(tier_pkgconfig_registration PROPERTIES TIMEOUT 900)
+    endif()
+endif()

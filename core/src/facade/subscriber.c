@@ -946,11 +946,19 @@ moq_result_t moq_sub_poll_local_failure(moq_subscriber_t *sub,
 
 /* -- Public API ----------------------------------------------------- */
 
-void moq_sub_callbacks_init(moq_sub_callbacks_t *cb)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_sub_callbacks_init)(moq_sub_callbacks_t *cb)
+{
+    moq_sub_callbacks_init_sized(cb, MOQ_SUB_CALLBACKS_V0_SIZE);
+}
+
+void moq_sub_callbacks_init_sized(moq_sub_callbacks_t *cb, size_t cfg_size)
 {
     if (!cb) return;
-    memset(cb, 0, sizeof(*cb));
-    cb->struct_size = sizeof(*cb);
+    size_t n = cfg_size < sizeof(*cb) ? cfg_size : sizeof(*cb);
+    if (n < sizeof(cb->struct_size)) return;   /* too small to even stamp */
+    memset(cb, 0, n);
+    cb->struct_size = (uint32_t)n;
 }
 
 /* Frozen v0 prefix size: the layout before the first appended field
@@ -2690,11 +2698,19 @@ void moq_sub_object_cleanup(moq_sub_object_t *obj)
     if (obj->properties) { moq_rcbuf_decref(obj->properties); obj->properties = NULL; }
 }
 
-void moq_sub_status_cfg_init(moq_sub_status_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_sub_status_cfg_init)(moq_sub_status_cfg_t *cfg)
+{
+    moq_sub_status_cfg_init_sized(cfg, MOQ_SUB_STATUS_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT);
+}
+
+void moq_sub_status_cfg_init_sized(moq_sub_status_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_sub_track_status(moq_subscriber_t *sub,
@@ -2704,8 +2720,7 @@ moq_result_t moq_sub_track_status(moq_subscriber_t *sub,
 {
     if (!sub || !cfg || !out) return MOQ_ERR_INVAL;
     *out = NULL;
-#define SSCFG_MIN offsetof(moq_sub_status_cfg_t, auth_tokens)
-    if (cfg->struct_size < SSCFG_MIN) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_SUB_STATUS_CFG_V0_SIZE) return MOQ_ERR_INVAL;
 #define SSCFG_HAS(f) \
     (cfg->struct_size >= offsetof(moq_sub_status_cfg_t, f) + sizeof(cfg->f))
     if (sub->closed) return MOQ_ERR_CLOSED;
@@ -2722,7 +2737,6 @@ moq_result_t moq_sub_track_status(moq_subscriber_t *sub,
         scfg.auth_token_count = cfg->auth_token_count;
     }
 #undef SSCFG_HAS
-#undef SSCFG_MIN
 
     moq_track_status_handle_t h;
     moq_result_t rc = moq_session_track_status(sub->session, &scfg, now_us, &h);
@@ -2840,11 +2854,19 @@ bool moq_sub_track_get_error(const moq_sub_track_t *track,
 
 /* -- Fetch ---------------------------------------------------------- */
 
-void moq_sub_fetch_cfg_init(moq_sub_fetch_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_sub_fetch_cfg_init)(moq_sub_fetch_cfg_t *cfg)
+{
+    moq_sub_fetch_cfg_init_sized(cfg, MOQ_SUB_FETCH_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT);
+}
+
+void moq_sub_fetch_cfg_init_sized(moq_sub_fetch_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_sub_fetch(moq_subscriber_t *sub,
@@ -2854,8 +2876,7 @@ moq_result_t moq_sub_fetch(moq_subscriber_t *sub,
 {
     if (!sub || !cfg || !out) return MOQ_ERR_INVAL;
     *out = NULL;
-#define SFCFG_MIN offsetof(moq_sub_fetch_cfg_t, auth_tokens)
-    if (cfg->struct_size < SFCFG_MIN) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_SUB_FETCH_CFG_V0_SIZE) return MOQ_ERR_INVAL;
 #define SFCFG_HAS(f) \
     (cfg->struct_size >= offsetof(moq_sub_fetch_cfg_t, f) + sizeof(cfg->f))
     if (sub->closed) return MOQ_ERR_CLOSED;
@@ -2882,7 +2903,6 @@ moq_result_t moq_sub_fetch(moq_subscriber_t *sub,
         fcfg.auth_token_count = cfg->auth_token_count;
     }
 #undef SFCFG_HAS
-#undef SFCFG_MIN
 
     moq_fetch_t h;
     moq_result_t rc = moq_session_fetch(sub->session, &fcfg, now_us, &h);

@@ -1674,11 +1674,19 @@ void moq_fetch_cfg_init_sized(moq_fetch_cfg_t *cfg, size_t cfg_size)
     cfg->struct_size = (uint32_t)n;
 }
 
-void moq_accept_fetch_cfg_init(moq_accept_fetch_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_accept_fetch_cfg_init)(moq_accept_fetch_cfg_t *cfg)
+{
+    moq_accept_fetch_cfg_init_sized(cfg, MOQ_ACCEPT_FETCH_CFG_SIZE_THROUGH_TRACK_PROPERTIES);
+}
+
+void moq_accept_fetch_cfg_init_sized(moq_accept_fetch_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_accept_fetch_cfg_t);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 /* Order of two Locations. */
@@ -1763,8 +1771,7 @@ moq_result_t moq_session_accept_fetch(
     uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-#define ACCEPT_FETCH_CFG_MIN offsetof(moq_accept_fetch_cfg_t, track_properties)
-    if (cfg->struct_size < ACCEPT_FETCH_CFG_MIN) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_ACCEPT_FETCH_CFG_V0_SIZE) return MOQ_ERR_INVAL;
 #define ACCEPT_FETCH_HAS(f) \
     (cfg->struct_size >= offsetof(moq_accept_fetch_cfg_t, f) + sizeof(cfg->f))
 
@@ -1784,7 +1791,6 @@ moq_result_t moq_session_accept_fetch(
      * Properties are still present in the message, but they SHOULD be
      * empty". Applied once the handle resolves, below. */
 #undef ACCEPT_FETCH_HAS
-#undef ACCEPT_FETCH_CFG_MIN
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -1996,11 +2002,19 @@ moq_result_t moq_session_accept_fetch(
     return MOQ_OK;
 }
 
-void moq_reject_fetch_cfg_init(moq_reject_fetch_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_reject_fetch_cfg_init)(moq_reject_fetch_cfg_t *cfg)
+{
+    moq_reject_fetch_cfg_init_sized(cfg, MOQ_REJECT_FETCH_CFG_SIZE_THROUGH_REDIRECT);
+}
+
+void moq_reject_fetch_cfg_init_sized(moq_reject_fetch_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_reject_fetch_cfg_t);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_fetch(moq_session_t *s,
@@ -2336,7 +2350,7 @@ moq_result_t moq_session_reject_fetch(
     uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < offsetof(moq_reject_fetch_cfg_t, redirect))
+    if (cfg->struct_size < MOQ_REJECT_FETCH_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;   /* pre-redirect minimum; older callers still work */
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
     if (cfg->can_retry && cfg->retry_after_ms >= MOQ_QUIC_VARINT_MAX)
@@ -2503,18 +2517,26 @@ static moq_result_t fetch_request_bidi_cancel_ex(moq_session_t *s, int slot,
     return MOQ_OK;
 }
 
-void moq_fetch_update_cfg_init(moq_fetch_update_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_fetch_update_cfg_init)(moq_fetch_update_cfg_t *cfg)
+{
+    moq_fetch_update_cfg_init_sized(cfg, MOQ_FETCH_UPDATE_CFG_V0_SIZE);
+}
+
+void moq_fetch_update_cfg_init_sized(moq_fetch_update_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = (uint32_t)sizeof(*cfg);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_update_fetch(moq_session_t *s, moq_fetch_t fetch,
                                       const moq_fetch_update_cfg_t *cfg,
                                       uint64_t now_us)
 {
-    if (!s || !cfg || cfg->struct_size < sizeof(moq_fetch_update_cfg_t))
+    if (!s || !cfg || cfg->struct_size < MOQ_FETCH_UPDATE_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
     if (!cfg->has_subscriber_priority && cfg->auth_token_count == 0)
         return MOQ_ERR_INVAL;
@@ -2822,11 +2844,19 @@ bool fetch_abort_tomb_consume(moq_session_t *s, uint64_t request_id)
 
 /* -- Publisher write APIs ------------------------------------------ */
 
-void moq_fetch_object_cfg_init(moq_fetch_object_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_fetch_object_cfg_init)(moq_fetch_object_cfg_t *cfg)
+{
+    moq_fetch_object_cfg_init_sized(cfg, MOQ_FETCH_OBJECT_CFG_V0_SIZE);
+}
+
+void moq_fetch_object_cfg_init_sized(moq_fetch_object_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_fetch_object_cfg_t);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_write_fetch_object(
@@ -2836,7 +2866,7 @@ moq_result_t moq_session_write_fetch_object(
     uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_fetch_object_cfg_t)) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_FETCH_OBJECT_CFG_V0_SIZE) return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -3238,7 +3268,7 @@ moq_result_t moq_session_request_goaway_fetch(
     const moq_request_goaway_cfg_t *cfg, uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_request_goaway_cfg_t)) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_REQUEST_GOAWAY_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     if (cfg->new_session_uri.len > 0 && !cfg->new_session_uri.data)
         return MOQ_ERR_INVAL;
     session_begin_advance(s, now_us);

@@ -111,8 +111,8 @@ component not installed fails configuration. Headers have C++ linkage guards;
 there is no separate C++ relay API.
 
 The matching pkg-config modules are `libmoq-relay-core` and `libmoq-relay`.
-They use an additive minimal `libmoq-core.pc`, installed with the relay SDK,
-instead of the existing enabled-component aggregate `libmoq.pc`. Use
+They require the minimal `libmoq-core.pc`, which every SDK install provides,
+instead of the enabled-component aggregate `libmoq.pc`. Use
 `pkg-config --static` for the complete static link closure. Shared-library
 loader search policy remains the consuming application's responsibility.
 

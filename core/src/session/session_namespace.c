@@ -1406,11 +1406,19 @@ moq_result_t moq_session_publish_namespace_done(moq_session_t *s,
 
 /* -- Public API: accept_namespace ----------------------------------- */
 
-void moq_accept_namespace_cfg_init(moq_accept_namespace_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_accept_namespace_cfg_init)(moq_accept_namespace_cfg_t *cfg)
+{
+    moq_accept_namespace_cfg_init_sized(cfg, MOQ_ACCEPT_NAMESPACE_CFG_V0_SIZE);
+}
+
+void moq_accept_namespace_cfg_init_sized(moq_accept_namespace_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_accept_namespace_cfg_t);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_accept_namespace(moq_session_t *s,
@@ -1418,7 +1426,7 @@ moq_result_t moq_session_accept_namespace(moq_session_t *s,
     uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_accept_namespace_cfg_t))
+    if (cfg->struct_size < MOQ_ACCEPT_NAMESPACE_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
 
     session_begin_advance(s, now_us);
@@ -1457,11 +1465,19 @@ moq_result_t moq_session_accept_namespace(moq_session_t *s,
 
 /* -- Public API: reject_namespace ----------------------------------- */
 
-void moq_reject_namespace_cfg_init(moq_reject_namespace_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_reject_namespace_cfg_init)(moq_reject_namespace_cfg_t *cfg)
+{
+    moq_reject_namespace_cfg_init_sized(cfg, MOQ_REJECT_NAMESPACE_CFG_SIZE_THROUGH_REDIRECT);
+}
+
+void moq_reject_namespace_cfg_init_sized(moq_reject_namespace_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_reject_namespace_cfg_t);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_reject_namespace(moq_session_t *s,
@@ -1469,7 +1485,7 @@ moq_result_t moq_session_reject_namespace(moq_session_t *s,
     uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < offsetof(moq_reject_namespace_cfg_t, redirect))
+    if (cfg->struct_size < MOQ_REJECT_NAMESPACE_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;   /* pre-redirect minimum; older callers still work */
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
     /* A retry is sent as milliseconds + 1 (d16 Section 9.8, d18 Section
@@ -1561,11 +1577,19 @@ moq_result_t moq_session_reject_namespace(moq_session_t *s,
 
 /* -- Public API: cancel_namespace ----------------------------------- */
 
-void moq_cancel_namespace_cfg_init(moq_cancel_namespace_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_cancel_namespace_cfg_init)(moq_cancel_namespace_cfg_t *cfg)
+{
+    moq_cancel_namespace_cfg_init_sized(cfg, MOQ_CANCEL_NAMESPACE_CFG_V0_SIZE);
+}
+
+void moq_cancel_namespace_cfg_init_sized(moq_cancel_namespace_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_cancel_namespace_cfg_t);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_cancel_namespace(moq_session_t *s,
@@ -1573,7 +1597,7 @@ moq_result_t moq_session_cancel_namespace(moq_session_t *s,
     uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_cancel_namespace_cfg_t))
+    if (cfg->struct_size < MOQ_CANCEL_NAMESPACE_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
     /* The code must be representable in THIS profile's wire encoding; refuse
@@ -1643,7 +1667,7 @@ moq_result_t moq_session_request_goaway_namespace(
     const moq_request_goaway_cfg_t *cfg, uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_request_goaway_cfg_t)) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_REQUEST_GOAWAY_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     if (cfg->new_session_uri.len > 0 && !cfg->new_session_uri.data)
         return MOQ_ERR_INVAL;
     session_begin_advance(s, now_us);

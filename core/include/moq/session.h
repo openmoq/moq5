@@ -527,6 +527,30 @@ MOQ_API moq_result_t moq_session_note_object_published(
 /* -- Inputs (advancing calls) -------------------------------------- */
 
 /*
+ * Results every input call in this header shares, unless its own comment
+ * says otherwise:
+ *
+ *   MOQ_ERR_INVAL        NULL session, or a nonzero length with a NULL
+ *                        buffer. Nothing was consumed.
+ *   MOQ_ERR_WRONG_STATE  the profile requires a transport binding and the
+ *                        session has none yet (see moq_session_start()).
+ *                        Nothing was consumed.
+ *   MOQ_ERR_CLOSED       the session is already closed. Nothing was
+ *                        consumed.
+ *
+ * A peer protocol violation is not a call failure. The call returns MOQ_OK
+ * with the session closed, and the close reaches the caller through the
+ * MOQ_ACTION_CLOSE_SESSION action and the MOQ_EVENT_SESSION_CLOSED event.
+ * The same holds once the session's idle deadline has passed: the next
+ * call that feeds bytes, a datagram, a stream reset, a bidi stop or a tick
+ * closes the session with MOQ_CLOSE_IDLE_TIMEOUT and does not handle its
+ * input.
+ *
+ * moq_session_close() and moq_session_on_transport_close() need no
+ * transport binding and succeed on a closed session.
+ */
+
+/*
  * Begin the setup handshake. Transitions IDLE -> SETUP_SENT.
  *
  * Draft-16 is client only. Under draft-18 and draft-22 both perspectives
@@ -551,6 +575,33 @@ MOQ_API moq_result_t moq_session_start(moq_session_t *s, uint64_t now_us);
  * Calling with buf == NULL and len == 0 is valid: it processes any
  * already-buffered input without feeding new bytes. Prefer
  * moq_session_process_pending() for clarity.
+ *
+ * Results, beside those every input shares (see the head of this section):
+ *   MOQ_OK              every byte was copied into the session's control
+ *                       buffer and each complete message was handled. An
+ *                       incomplete message stays buffered for later bytes.
+ *   MOQ_ERR_WOULD_BLOCK every byte was copied, but a message could not be
+ *                       handled until outputs are drained. That message
+ *                       and everything after it stay buffered: drain
+ *                       actions and events, then call
+ *                       moq_session_process_pending(). Do not feed the
+ *                       same bytes again. Any other negative result from
+ *                       handling a message leaves the bytes buffered the
+ *                       same way.
+ *   MOQ_ERR_BUFFER      the bytes do not fit the control buffer now;
+ *                       nothing was copied. Room returns only as buffered
+ *                       messages are handled. The result does not prove
+ *                       an oversized message: a refused delivery can hold
+ *                       several valid messages, and buffered input may
+ *                       still be handled and make room. A single
+ *                       incomplete message that fills the buffer can
+ *                       never complete, so a retry with no new bytes makes
+ *                       no progress. A caller that cannot show that
+ *                       handling buffered input will make room ends the
+ *                       session for its own resource limit; that is not a
+ *                       protocol violation by the peer.
+ *
+ * Advancing call: invalidates borrows, takes now_us.
  */
 MOQ_API moq_result_t moq_session_on_control_bytes(moq_session_t *s,
                                                    const uint8_t *buf,
@@ -560,6 +611,9 @@ MOQ_API moq_result_t moq_session_on_control_bytes(moq_session_t *s,
 /*
  * Process already-buffered control input without feeding new bytes.
  * Use after draining outputs to retry a previously blocked operation.
+ * Results are those of moq_session_on_control_bytes() with no new bytes:
+ * MOQ_OK when the buffered messages were handled, or none was buffered;
+ * MOQ_ERR_WOULD_BLOCK when the blocked message still cannot be handled.
  * Advancing call: invalidates borrows, takes now_us.
  */
 MOQ_API moq_result_t moq_session_process_pending(moq_session_t *s,
@@ -574,6 +628,15 @@ MOQ_API moq_result_t moq_session_process_pending(moq_session_t *s,
  *
  * The adapter should call this when moq_session_next_deadline_us()
  * returns a value <= current time.
+ *
+ * Results, beside those every input shares:
+ *   MOQ_OK              time advanced. When the idle deadline or the
+ *                       GOAWAY drain deadline had passed, the session is
+ *                       now closed with MOQ_CLOSE_IDLE_TIMEOUT or
+ *                       MOQ_CLOSE_GOAWAY_TIMEOUT.
+ *   MOQ_ERR_WOULD_BLOCK a terminal the session owes on an outgoing
+ *                       subgroup could not be queued yet. Drain actions
+ *                       and events, then tick again.
  */
 MOQ_API moq_result_t moq_session_tick(moq_session_t *s, uint64_t now_us);
 
@@ -588,14 +651,33 @@ MOQ_API moq_result_t moq_session_tick(moq_session_t *s, uint64_t now_us);
  *
  * Returns MOQ_ERR_WOULD_BLOCK in two distinguishable cases:
  *   - the session OWNS the stream (moq_session_has_transport_stream is
- *     true): the bytes (and FIN) were retained; drain the full queue and
- *     retry with
+ *     true): the delivery needs nothing more from the caller. Its bytes
+ *     and FIN were retained, or the session is stopping the stream and
+ *     discarded the bytes on purpose, keeping the FIN. Either way do not
+ *     deliver it again: drain the full queue and retry with
  *       moq_session_on_data_bytes(s, stream_ref, NULL, 0, false, now_us)
- *     which resumes the pending emission for the stream;
+ *     which resumes what is pending for the stream;
  *   - the session does NOT own the stream (a new stream it could not
  *     admit): nothing was retained; the caller must redeliver the SAME
  *     bytes and FIN later (an empty retry on an unknown ref is a no-op).
  *     moq_session_can_admit_data_stream() says when that is worthwhile.
+ *
+ * Other results, beside those every input shares:
+ *   MOQ_OK          the delivery was consumed. That includes a stream the
+ *                   session has stopped: whatever the peer still sends on
+ *                   it is discarded until its FIN or RESET.
+ *   MOQ_ERR_CLOSED  the session is closed, or its setup has not completed
+ *                   yet. Nothing was consumed; the caller still holds the
+ *                   delivery. Also returned when failing a FETCH whose
+ *                   response made its track malformed closes the session.
+ *   MOQ_ERR_NOMEM   an allocation failed. The session owns the stream, but
+ *                   the result does not say whether this delivery was
+ *                   retained: some allocations fail before the bytes are
+ *                   staged and others after, and
+ *                   moq_session_has_transport_stream() is true in both
+ *                   cases. The caller therefore cannot choose between
+ *                   delivering it again and an empty retry, and ends the
+ *                   session.
  *
  * Advancing call: invalidates borrows, takes now_us.
  */
@@ -632,6 +714,13 @@ MOQ_API moq_result_t moq_session_on_data_bytes(moq_session_t *s,
  * events', stays under the rcbuf shard rule (rcbuf.h).
  *
  * data may be NULL for zero-length or retry calls.
+ *
+ * Results, and what the caller does after each, are those of
+ * moq_session_on_data_bytes(). The session never releases the caller's
+ * reference, in any result: when it retains data it adds its own reference
+ * or slice (the cases above) or copies. After a MOQ_ERR_WOULD_BLOCK on a
+ * stream the session does not own, the caller still holds the same rcbuf
+ * and delivers it again.
  *
  * Advancing call: invalidates borrows, takes now_us.
  */
@@ -670,6 +759,12 @@ MOQ_API moq_result_t moq_session_on_data_rcbuf(moq_session_t *s,
  * reported, and a retry passing a different code does not replace it --
  * pass the original anyway, rather than relying on that.
  *
+ * Other results, beside those every input shares: MOQ_OK when the closure
+ * was queued and the stream released, when the stream is one the session
+ * had stopped (it is released with no event), and when stream_ref is
+ * unknown; MOQ_ERR_CLOSED when the session is closed or its setup has not
+ * completed.
+ *
  * Advancing call: invalidates borrows, takes now_us.
  */
 MOQ_API moq_result_t moq_session_on_data_reset(moq_session_t *s,
@@ -679,16 +774,35 @@ MOQ_API moq_result_t moq_session_on_data_reset(moq_session_t *s,
 
 /*
  * Notify the session that the peer sent STOP_SENDING on a data stream
- * we opened. Records the first STOP cause/code and freezes that exact outgoing
- * subgroup before attempting output. Queues RESET_DATA together with
- * OUTGOING_SUBGROUP_TERMINATED when both output queues admit them. MOQ_OK means
- * committed (or already terminal/unknown); MOQ_ERR_WOULD_BLOCK retains the
- * obligation and its identity, even though no action/event has committed yet.
- * Writes, object end, close and reset on the pending subgroup return
- * MOQ_ERR_WOULD_BLOCK without retaining payload refs. Draining either queue
- * retries the obligation; a later STOP/expiry/ACK cannot replace its cause.
- * MOQ_ERR_INVAL: NULL session or error_code greater than 2^62 - 1.
- * MOQ_ERR_CLOSED: inactive session. No caller payload ownership is taken.
+ * we opened.
+ *
+ * For an outgoing subgroup the session records the first STOP cause/code
+ * and freezes that exact subgroup before attempting output, then queues
+ * RESET_DATA together with OUTGOING_SUBGROUP_TERMINATED when both output
+ * queues admit them. For a fill stream it records the first cause and
+ * answers with that stream's reset.
+ *
+ *   MOQ_OK              committed, or nothing to act on: the stream was
+ *                       already terminal, or the session does not own it,
+ *                       which includes a subgroup it has already released.
+ *                       MOQ_OK alone does not mean a RESET_DATA was
+ *                       queued: for a stream the session does not own,
+ *                       none is.
+ *   MOQ_ERR_WOULD_BLOCK output capacity is missing. Drain actions and
+ *                       events, then deliver the same stop again with the
+ *                       same error_code. That is always safe: a subgroup's
+ *                       obligation and identity are already recorded, its
+ *                       first cause is kept, and draining either queue
+ *                       retries it as well. It is required for a fill
+ *                       stream, where a refused stop records nothing.
+ *   MOQ_ERR_INVAL       NULL session or error_code greater than 2^62 - 1.
+ *   MOQ_ERR_CLOSED      the session is closed, or its setup has not
+ *                       completed.
+ *
+ * While a subgroup's obligation is pending, writes, object end, close and
+ * reset on it return MOQ_ERR_WOULD_BLOCK without retaining payload refs,
+ * and a later STOP/expiry/ACK cannot replace its cause. No caller payload
+ * ownership is taken.
  *
  * Advancing call: invalidates borrows, takes now_us.
  */
@@ -709,6 +823,9 @@ MOQ_API moq_result_t moq_session_on_data_stop(moq_session_t *s,
  * stream changes nothing and returns MOQ_OK. A recognized STOP or delivery
  * expiry retains its reset obligation even if this report arrives before
  * event/action capacity permits committing it.
+ *
+ * MOQ_ERR_CLOSED on a closed session; MOQ_ERR_WRONG_STATE while a required
+ * transport binding is missing.
  */
 MOQ_API moq_result_t moq_session_on_data_committed(moq_session_t *s,
                                                     moq_stream_ref_t stream_ref,
@@ -718,8 +835,46 @@ MOQ_API moq_result_t moq_session_on_data_committed(moq_session_t *s,
  * Feed a received QUIC datagram to the session.
  *
  * The session decodes the datagram and emits an OBJECT_RECEIVED
- * event with datagram=true. buf is borrowed for the duration of the
- * call only.
+ * event with datagram=true. data is borrowed for the duration of the
+ * call only. The session never retains the datagram by reference: what it
+ * keeps, it copies.
+ *
+ * Results, beside those every input shares:
+ *   MOQ_OK              the object was queued as an event, or the datagram
+ *                       needed none: padding, an object a paused
+ *                       (Forward 0) binding does not take, an object no
+ *                       subscription sharing its alias accepts, an object
+ *                       that failed its track, or a track alias the
+ *                       session does not know. A datagram for an unknown
+ *                       alias is copied into a small bounded holding area
+ *                       while a forwarding subscription is still pending,
+ *                       and delivered once its alias is established;
+ *                       otherwise it is dropped. The area evicts its
+ *                       oldest datagram to make room and drops one it
+ *                       cannot hold. The result does not say which.
+ *   MOQ_ERR_WOULD_BLOCK the object was not delivered and nothing of the
+ *                       datagram is retained. Two kinds of refusal return
+ *                       it, and the result does not say which.
+ *                       Permanent for this datagram: its payload exceeds
+ *                       the object payload limit, or the object is larger
+ *                       than the whole receive budget. The same datagram
+ *                       is never accepted.
+ *                       Pressure: the receive budget is in use, or the
+ *                       event queue is full now. The same datagram can be
+ *                       delivered again when there is room. When the event
+ *                       queue was the reason, the track's received-object
+ *                       history was already advanced; delivering the
+ *                       datagram again does not advance it twice.
+ *                       A datagram is unreliable, so dropping it is always
+ *                       correct: the rule that a refused stream delivery
+ *                       must be offered again does not apply. A caller
+ *                       that does offer it again bounds its attempts.
+ *   MOQ_ERR_NOMEM       an allocation failed; nothing is retained. History
+ *                       may already have been advanced, as above.
+ *   MOQ_ERR_WRONG_STATE the session's setup has not completed, or a
+ *                       required transport binding is missing.
+ *   MOQ_ERR_CLOSED      the session is closed, including when an object
+ *                       that failed its track closed it.
  *
  * Advancing call: invalidates borrows, takes now_us.
  */
@@ -730,7 +885,10 @@ MOQ_API moq_result_t moq_session_on_datagram(moq_session_t *s,
 /*
  * Notify the session that the transport has closed externally.
  * Queues SESSION_CLOSED event without queuing a CLOSE_SESSION action
- * (the transport is already gone). Advancing call.
+ * (the transport is already gone). Everything still queued is dropped
+ * first, and queued payload references are released. On an already-closed
+ * session it changes nothing. Returns MOQ_OK in both cases, and
+ * MOQ_ERR_INVAL for a NULL session. Advancing call.
  */
 MOQ_API moq_result_t moq_session_on_transport_close(moq_session_t *s,
                                                       uint64_t code,
@@ -948,6 +1106,60 @@ typedef struct moq_send_uni_control_action {
  * Inline detail capacity frozen at v1.
  */
 #define MOQ_ACTION_DETAIL_MAX 80
+
+/* -- Action detail floors -------------------------------------------------
+ * The frozen prefix of each action detail, named by the last field it
+ * holds: the layout the record has had since it last changed shape. This
+ * library never reports a smaller detail_size for that kind. A field after
+ * the prefix was appended; read it only when detail_size covers it wholly.
+ * A smaller detail_size comes from an older library, whose record may have
+ * had another shape: the floor promises nothing about it.
+ */
+#define MOQ_SEND_CONTROL_ACTION_V0_SIZE \
+    (offsetof(moq_send_control_action_t, len) + \
+     sizeof(((const moq_send_control_action_t *)0)->len))
+#define MOQ_CLOSE_SESSION_ACTION_V0_SIZE \
+    (offsetof(moq_close_session_action_t, reason) + \
+     sizeof(((const moq_close_session_action_t *)0)->reason))
+#define MOQ_SEND_DATA_ACTION_V0_SIZE \
+    (offsetof(moq_send_data_action_t, fin) + \
+     sizeof(((const moq_send_data_action_t *)0)->fin))
+#define MOQ_RESET_DATA_ACTION_V0_SIZE \
+    (offsetof(moq_reset_data_action_t, error_code) + \
+     sizeof(((const moq_reset_data_action_t *)0)->error_code))
+#define MOQ_STOP_DATA_ACTION_V0_SIZE \
+    (offsetof(moq_stop_data_action_t, error_code) + \
+     sizeof(((const moq_stop_data_action_t *)0)->error_code))
+#define MOQ_OPEN_BIDI_STREAM_ACTION_V0_SIZE \
+    (offsetof(moq_open_bidi_stream_action_t, fin) + \
+     sizeof(((const moq_open_bidi_stream_action_t *)0)->fin))
+#define MOQ_SEND_BIDI_STREAM_ACTION_V0_SIZE \
+    (offsetof(moq_send_bidi_stream_action_t, fin) + \
+     sizeof(((const moq_send_bidi_stream_action_t *)0)->fin))
+#define MOQ_CLOSE_BIDI_STREAM_ACTION_V0_SIZE \
+    (offsetof(moq_close_bidi_stream_action_t, stream_ref) + \
+     sizeof(((const moq_close_bidi_stream_action_t *)0)->stream_ref))
+#define MOQ_SEND_DATAGRAM_ACTION_V0_SIZE \
+    (offsetof(moq_send_datagram_action_t, len) + \
+     sizeof(((const moq_send_datagram_action_t *)0)->len))
+#define MOQ_OPEN_UNI_CONTROL_ACTION_V0_SIZE \
+    (offsetof(moq_open_uni_control_action_t, len) + \
+     sizeof(((const moq_open_uni_control_action_t *)0)->len))
+#define MOQ_SEND_UNI_CONTROL_ACTION_V0_SIZE \
+    (offsetof(moq_send_uni_control_action_t, fin) + \
+     sizeof(((const moq_send_uni_control_action_t *)0)->fin))
+#define MOQ_RESET_BIDI_STREAM_ACTION_V0_SIZE \
+    (offsetof(moq_reset_bidi_stream_action_t, error_code) + \
+     sizeof(((const moq_reset_bidi_stream_action_t *)0)->error_code))
+#define MOQ_STOP_BIDI_STREAM_ACTION_V0_SIZE \
+    (offsetof(moq_stop_bidi_stream_action_t, error_code) + \
+     sizeof(((const moq_stop_bidi_stream_action_t *)0)->error_code))
+#define MOQ_ABORT_BIDI_STREAM_ACTION_V0_SIZE \
+    (offsetof(moq_abort_bidi_stream_action_t, error_code) + \
+     sizeof(((const moq_abort_bidi_stream_action_t *)0)->error_code))
+#define MOQ_SET_DATA_PRIORITY_ACTION_V0_SIZE \
+    (offsetof(moq_set_data_priority_action_t, priority) + \
+     sizeof(((const moq_set_data_priority_action_t *)0)->priority))
 
 typedef struct moq_action {
     moq_action_kind_t kind;
@@ -2709,6 +2921,197 @@ typedef struct moq_fetch_gap_event {
  */
 #define MOQ_EVENT_DETAIL_MAX 128
 
+/* -- Event detail floors --------------------------------------------------
+ * The frozen prefix of each event detail, named by the last field it
+ * holds: the layout the record has had since it last changed shape. This
+ * library never reports a smaller detail_size for that kind. A field after
+ * the prefix was appended; read it only when detail_size covers it wholly.
+ * A smaller detail_size comes from an older library, whose record may have
+ * had another shape: the floor promises nothing about it.
+ * The fill events and OUTGOING_SUBGROUP_TERMINATED define theirs beside
+ * their records.
+ */
+#define MOQ_SETUP_COMPLETE_EVENT_V0_SIZE \
+    (offsetof(moq_setup_complete_event_t, token_count) + \
+     sizeof(((const moq_setup_complete_event_t *)0)->token_count))
+#define MOQ_SESSION_CLOSED_EVENT_V0_SIZE \
+    (offsetof(moq_session_closed_event_t, reason) + \
+     sizeof(((const moq_session_closed_event_t *)0)->reason))
+#define MOQ_SUBSCRIBE_REQUEST_EVENT_V0_SIZE \
+    (offsetof(moq_subscribe_request_event_t, new_group_request) + \
+     sizeof(((const moq_subscribe_request_event_t *)0)->new_group_request))
+#define MOQ_SUBSCRIBE_OK_EVENT_V0_SIZE \
+    (offsetof(moq_subscribe_ok_event_t, dynamic_groups) + \
+     sizeof(((const moq_subscribe_ok_event_t *)0)->dynamic_groups))
+#define MOQ_SUBSCRIBE_ERROR_EVENT_V0_SIZE \
+    (offsetof(moq_subscribe_error_event_t, reason) + \
+     sizeof(((const moq_subscribe_error_event_t *)0)->reason))
+#define MOQ_REQUEST_READY_EVENT_V0_SIZE \
+    (offsetof(moq_request_ready_event_t, available_requests) + \
+     sizeof(((const moq_request_ready_event_t *)0)->available_requests))
+#define MOQ_OBJECT_RECEIVED_EVENT_V0_SIZE \
+    (offsetof(moq_object_received_event_t, prior_object_gap) + \
+     sizeof(((const moq_object_received_event_t *)0)->prior_object_gap))
+#define MOQ_NAMESPACE_PUBLISHED_EVENT_V0_SIZE \
+    (offsetof(moq_namespace_published_event_t, token_count) + \
+     sizeof(((const moq_namespace_published_event_t *)0)->token_count))
+#define MOQ_NAMESPACE_DONE_EVENT_V0_SIZE \
+    (offsetof(moq_namespace_done_event_t, ann) + \
+     sizeof(((const moq_namespace_done_event_t *)0)->ann))
+#define MOQ_NAMESPACE_REJECTED_EVENT_V0_SIZE \
+    (offsetof(moq_namespace_rejected_event_t, reason) + \
+     sizeof(((const moq_namespace_rejected_event_t *)0)->reason))
+#define MOQ_NAMESPACE_ACCEPTED_EVENT_V0_SIZE \
+    (offsetof(moq_namespace_accepted_event_t, ann) + \
+     sizeof(((const moq_namespace_accepted_event_t *)0)->ann))
+#define MOQ_NAMESPACE_CANCELLED_EVENT_V0_SIZE \
+    (offsetof(moq_namespace_cancelled_event_t, reason) + \
+     sizeof(((const moq_namespace_cancelled_event_t *)0)->reason))
+#define MOQ_GOAWAY_EVENT_V0_SIZE \
+    (offsetof(moq_goaway_event_t, new_session_uri) + \
+     sizeof(((const moq_goaway_event_t *)0)->new_session_uri))
+#define MOQ_REQUEST_REDIRECT_EVENT_V0_SIZE \
+    (offsetof(moq_request_redirect_event_t, reason) + \
+     sizeof(((const moq_request_redirect_event_t *)0)->reason))
+#define MOQ_REQUEST_GOAWAY_EVENT_V0_SIZE \
+    (offsetof(moq_request_goaway_event_t, timeout_ms) + \
+     sizeof(((const moq_request_goaway_event_t *)0)->timeout_ms))
+#define MOQ_UNSUBSCRIBED_EVENT_V0_SIZE \
+    (offsetof(moq_unsubscribed_event_t, sub) + \
+     sizeof(((const moq_unsubscribed_event_t *)0)->sub))
+#define MOQ_SUBSCRIBE_DONE_EVENT_V0_SIZE \
+    (offsetof(moq_subscribe_done_event_t, reason) + \
+     sizeof(((const moq_subscribe_done_event_t *)0)->reason))
+#define MOQ_SUBSCRIBE_UPDATED_EVENT_V0_SIZE \
+    (offsetof(moq_subscribe_updated_event_t, new_group_request) + \
+     sizeof(((const moq_subscribe_updated_event_t *)0)->new_group_request))
+#define MOQ_OBJECT_CHUNK_EVENT_V0_SIZE \
+    (offsetof(moq_object_chunk_event_t, prior_object_gap) + \
+     sizeof(((const moq_object_chunk_event_t *)0)->prior_object_gap))
+#define MOQ_NS_SUB_REQUEST_EVENT_V0_SIZE \
+    (offsetof(moq_ns_sub_request_event_t, token_count) + \
+     sizeof(((const moq_ns_sub_request_event_t *)0)->token_count))
+#define MOQ_NS_SUB_OK_EVENT_V0_SIZE \
+    (offsetof(moq_ns_sub_ok_event_t, handle) + \
+     sizeof(((const moq_ns_sub_ok_event_t *)0)->handle))
+#define MOQ_NS_SUB_ERROR_EVENT_V0_SIZE \
+    (offsetof(moq_ns_sub_error_event_t, reason) + \
+     sizeof(((const moq_ns_sub_error_event_t *)0)->reason))
+#define MOQ_NAMESPACE_FOUND_EVENT_V0_SIZE \
+    (offsetof(moq_namespace_found_event_t, track_namespace_suffix) + \
+     sizeof(((const moq_namespace_found_event_t *)0)->track_namespace_suffix))
+#define MOQ_NAMESPACE_GONE_EVENT_V0_SIZE \
+    (offsetof(moq_namespace_gone_event_t, track_namespace_suffix) + \
+     sizeof(((const moq_namespace_gone_event_t *)0)->track_namespace_suffix))
+#define MOQ_FETCH_REQUEST_EVENT_V0_SIZE \
+    (offsetof(moq_fetch_request_event_t, token_count) + \
+     sizeof(((const moq_fetch_request_event_t *)0)->token_count))
+#define MOQ_FETCH_ERROR_EVENT_V0_SIZE \
+    (offsetof(moq_fetch_error_event_t, reason) + \
+     sizeof(((const moq_fetch_error_event_t *)0)->reason))
+#define MOQ_FETCH_CANCELLED_EVENT_V0_SIZE \
+    (offsetof(moq_fetch_cancelled_event_t, fetch) + \
+     sizeof(((const moq_fetch_cancelled_event_t *)0)->fetch))
+#define MOQ_FETCH_OK_EVENT_V0_SIZE \
+    (offsetof(moq_fetch_ok_event_t, track_properties) + \
+     sizeof(((const moq_fetch_ok_event_t *)0)->track_properties))
+#define MOQ_FETCH_COMPLETE_EVENT_V0_SIZE \
+    (offsetof(moq_fetch_complete_event_t, fetch) + \
+     sizeof(((const moq_fetch_complete_event_t *)0)->fetch))
+#define MOQ_FETCH_OBJECT_EVENT_V0_SIZE \
+    (offsetof(moq_fetch_object_event_t, properties) + \
+     sizeof(((const moq_fetch_object_event_t *)0)->properties))
+#define MOQ_FETCH_GAP_EVENT_V0_SIZE \
+    (offsetof(moq_fetch_gap_event_t, object_id) + \
+     sizeof(((const moq_fetch_gap_event_t *)0)->object_id))
+#define MOQ_PUBLISH_REQUEST_EVENT_V0_SIZE \
+    (offsetof(moq_publish_request_event_t, expires_ms) + \
+     sizeof(((const moq_publish_request_event_t *)0)->expires_ms))
+#define MOQ_PUBLISH_OK_EVENT_V0_SIZE \
+    (offsetof(moq_publish_ok_event_t, new_group_request) + \
+     sizeof(((const moq_publish_ok_event_t *)0)->new_group_request))
+#define MOQ_PUBLISH_ERROR_EVENT_V0_SIZE \
+    (offsetof(moq_publish_error_event_t, reason) + \
+     sizeof(((const moq_publish_error_event_t *)0)->reason))
+#define MOQ_PUBLISH_FINISHED_EVENT_V0_SIZE \
+    (offsetof(moq_publish_finished_event_t, reason) + \
+     sizeof(((const moq_publish_finished_event_t *)0)->reason))
+#define MOQ_PUBLISH_UNSUBSCRIBED_EVENT_V0_SIZE \
+    (offsetof(moq_publish_unsubscribed_event_t, pub) + \
+     sizeof(((const moq_publish_unsubscribed_event_t *)0)->pub))
+#define MOQ_PUBLISH_UPDATED_EVENT_V0_SIZE \
+    (offsetof(moq_publish_updated_event_t, new_group_request) + \
+     sizeof(((const moq_publish_updated_event_t *)0)->new_group_request))
+#define MOQ_SUBSCRIPTION_UPDATE_OK_EVENT_V0_SIZE \
+    (offsetof(moq_subscription_update_ok_event_t, expires_ms) + \
+     sizeof(((const moq_subscription_update_ok_event_t *)0)->expires_ms))
+#define MOQ_PUBLICATION_UPDATE_OK_EVENT_V0_SIZE \
+    (offsetof(moq_publication_update_ok_event_t, expires_ms) + \
+     sizeof(((const moq_publication_update_ok_event_t *)0)->expires_ms))
+#define MOQ_TRACK_STATUS_REQUEST_EVENT_V0_SIZE \
+    (offsetof(moq_track_status_request_event_t, token_count) + \
+     sizeof(((const moq_track_status_request_event_t *)0)->token_count))
+#define MOQ_TRACK_STATUS_OK_EVENT_V0_SIZE \
+    (offsetof(moq_track_status_ok_event_t, track_properties) + \
+     sizeof(((const moq_track_status_ok_event_t *)0)->track_properties))
+#define MOQ_TRACK_STATUS_ERROR_EVENT_V0_SIZE \
+    (offsetof(moq_track_status_error_event_t, reason) + \
+     sizeof(((const moq_track_status_error_event_t *)0)->reason))
+#define MOQ_SUBSCRIBE_TRACKS_REQUEST_EVENT_V0_SIZE \
+    (offsetof(moq_subscribe_tracks_request_event_t, token_count) + \
+     sizeof(((const moq_subscribe_tracks_request_event_t *)0)->token_count))
+#define MOQ_SUBSCRIBE_TRACKS_OK_EVENT_V0_SIZE \
+    (offsetof(moq_subscribe_tracks_ok_event_t, handle) + \
+     sizeof(((const moq_subscribe_tracks_ok_event_t *)0)->handle))
+#define MOQ_SUBSCRIBE_TRACKS_ERROR_EVENT_V0_SIZE \
+    (offsetof(moq_subscribe_tracks_error_event_t, reason) + \
+     sizeof(((const moq_subscribe_tracks_error_event_t *)0)->reason))
+#define MOQ_PUBLISH_BLOCKED_EVENT_V0_SIZE \
+    (offsetof(moq_publish_blocked_event_t, track_name) + \
+     sizeof(((const moq_publish_blocked_event_t *)0)->track_name))
+#define MOQ_SUBSCRIBE_TRACKS_CANCELLED_EVENT_V0_SIZE \
+    (offsetof(moq_subscribe_tracks_cancelled_event_t, handle) + \
+     sizeof(((const moq_subscribe_tracks_cancelled_event_t *)0)->handle))
+#define MOQ_SUBGROUP_FINISHED_EVENT_V0_SIZE \
+    (offsetof(moq_subgroup_finished_event_t, _pad) + \
+     sizeof(((const moq_subgroup_finished_event_t *)0)->_pad))
+#define MOQ_SUBGROUP_RESET_EVENT_V0_SIZE \
+    (offsetof(moq_subgroup_reset_event_t, _pad) + \
+     sizeof(((const moq_subgroup_reset_event_t *)0)->_pad))
+#define MOQ_FETCH_RESET_EVENT_V0_SIZE \
+    (offsetof(moq_fetch_reset_event_t, _pad) + \
+     sizeof(((const moq_fetch_reset_event_t *)0)->_pad))
+#define MOQ_TRACK_STATUS_TERMINATED_EVENT_V0_SIZE \
+    (offsetof(moq_track_status_terminated_event_t, stream_error_code) + \
+     sizeof(((const moq_track_status_terminated_event_t *)0)->stream_error_code))
+#define MOQ_NAMESPACE_TERMINATED_EVENT_V0_SIZE \
+    (offsetof(moq_namespace_terminated_event_t, stream_error_code) + \
+     sizeof(((const moq_namespace_terminated_event_t *)0)->stream_error_code))
+#define MOQ_NS_SUBSCRIPTION_TERMINATED_EVENT_V0_SIZE \
+    (offsetof(moq_ns_subscription_terminated_event_t, stream_error_code) + \
+     sizeof(((const moq_ns_subscription_terminated_event_t *)0)->stream_error_code))
+#define MOQ_PUBLISH_STATE_EVENT_V0_SIZE \
+    (offsetof(moq_publish_state_event_t, location) + \
+     sizeof(((const moq_publish_state_event_t *)0)->location))
+#define MOQ_NAMESPACE_UPDATE_REQUEST_EVENT_V0_SIZE \
+    (offsetof(moq_namespace_update_request_event_t, update) + \
+     sizeof(((const moq_namespace_update_request_event_t *)0)->update))
+#define MOQ_NS_SUB_UPDATE_REQUEST_EVENT_V0_SIZE \
+    (offsetof(moq_ns_sub_update_request_event_t, update) + \
+     sizeof(((const moq_ns_sub_update_request_event_t *)0)->update))
+#define MOQ_SUBSCRIBE_TRACKS_UPDATE_REQUEST_EVENT_V0_SIZE \
+    (offsetof(moq_subscribe_tracks_update_request_event_t, update) + \
+     sizeof(((const moq_subscribe_tracks_update_request_event_t *)0)->update))
+#define MOQ_NAMESPACE_UPDATE_RESULT_EVENT_V0_SIZE \
+    (offsetof(moq_namespace_update_result_event_t, expires_ms) + \
+     sizeof(((const moq_namespace_update_result_event_t *)0)->expires_ms))
+#define MOQ_NS_SUB_UPDATE_RESULT_EVENT_V0_SIZE \
+    (offsetof(moq_ns_sub_update_result_event_t, expires_ms) + \
+     sizeof(((const moq_ns_sub_update_result_event_t *)0)->expires_ms))
+#define MOQ_SUBSCRIBE_TRACKS_UPDATE_RESULT_EVENT_V0_SIZE \
+    (offsetof(moq_subscribe_tracks_update_result_event_t, expires_ms) + \
+     sizeof(((const moq_subscribe_tracks_update_result_event_t *)0)->expires_ms))
+
 typedef struct moq_event {
     moq_event_kind_t kind;
     uint32_t         detail_size;  /* meaningful bytes in u */
@@ -2980,7 +3383,23 @@ typedef struct moq_accept_subscribe_cfg {
     moq_bytes_t track_properties;  /* borrowed for the call; empty = none */
 } moq_accept_subscribe_cfg_t;
 
+/* MOQ_ACCEPT_SUBSCRIBE_CFG_V0_SIZE is the layout through `track_properties`.
+ * It is what the symbol clears and stamps, and the smallest stamp the
+ * consuming call accepts. A caller built against this header reaches the
+ * whole struct: the same-name macro passes its sizeof to
+ * moq_accept_subscribe_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current) and touches nothing when cfg_size cannot hold
+ * struct_size. A binding that calls the symbol instead of compiling the macro
+ * reaches no later field; it calls the sized form with the size of its
+ * struct. */
+#define MOQ_ACCEPT_SUBSCRIBE_CFG_V0_SIZE \
+    (offsetof(moq_accept_subscribe_cfg_t, track_properties) + \
+     sizeof(((const moq_accept_subscribe_cfg_t *)0)->track_properties))
 MOQ_API void moq_accept_subscribe_cfg_init(moq_accept_subscribe_cfg_t *cfg);
+MOQ_API void moq_accept_subscribe_cfg_init_sized(
+    moq_accept_subscribe_cfg_t *cfg, size_t cfg_size);
+#define moq_accept_subscribe_cfg_init(cfg) \
+    moq_accept_subscribe_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * The group order in effect for a subscription (MOQT 7.1): the subscriber's,
@@ -3105,7 +3524,26 @@ typedef struct moq_reject_subscribe_cfg {
     moq_redirect_target_t redirect;    /* ABI-safe append; REDIRECT only */
 } moq_reject_subscribe_cfg_t;
 
+/* MOQ_REJECT_SUBSCRIBE_CFG_V0_SIZE is the smallest stamp the consuming call
+ * accepts: the layout before `redirect`.
+ * MOQ_REJECT_SUBSCRIBE_CFG_SIZE_THROUGH_REDIRECT is the layout through
+ * `redirect`, which the symbol clears and stamps. A caller built against this
+ * header reaches the whole struct: the same-name macro passes its sizeof to
+ * moq_reject_subscribe_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current) and touches nothing when cfg_size cannot hold
+ * struct_size. A binding that calls the symbol instead of compiling the macro
+ * reaches no later field; it calls the sized form with the size of its
+ * struct. */
+#define MOQ_REJECT_SUBSCRIBE_CFG_V0_SIZE \
+    offsetof(moq_reject_subscribe_cfg_t, redirect)
+#define MOQ_REJECT_SUBSCRIBE_CFG_SIZE_THROUGH_REDIRECT \
+    (offsetof(moq_reject_subscribe_cfg_t, redirect) + \
+     sizeof(((const moq_reject_subscribe_cfg_t *)0)->redirect))
 MOQ_API void moq_reject_subscribe_cfg_init(moq_reject_subscribe_cfg_t *cfg);
+MOQ_API void moq_reject_subscribe_cfg_init_sized(
+    moq_reject_subscribe_cfg_t *cfg, size_t cfg_size);
+#define moq_reject_subscribe_cfg_init(cfg) \
+    moq_reject_subscribe_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /* -- Subscribe operations ------------------------------------------ */
 
@@ -3214,7 +3652,22 @@ typedef struct moq_done_subscribe_cfg {
     moq_bytes_t reason;
 } moq_done_subscribe_cfg_t;
 
+/* MOQ_DONE_SUBSCRIBE_CFG_V0_SIZE is the layout through `reason`. It is what
+ * the symbol clears and stamps, and the smallest stamp the consuming call
+ * accepts. A caller built against this header reaches the whole struct: the
+ * same-name macro passes its sizeof to moq_done_subscribe_cfg_init_sized(),
+ * which clears and stamps min(cfg_size, sizeof current) and touches nothing
+ * when cfg_size cannot hold struct_size. A binding that calls the symbol
+ * instead of compiling the macro reaches no later field; it calls the sized
+ * form with the size of its struct. */
+#define MOQ_DONE_SUBSCRIBE_CFG_V0_SIZE \
+    (offsetof(moq_done_subscribe_cfg_t, reason) + \
+     sizeof(((const moq_done_subscribe_cfg_t *)0)->reason))
 MOQ_API void moq_done_subscribe_cfg_init(moq_done_subscribe_cfg_t *cfg);
+MOQ_API void moq_done_subscribe_cfg_init_sized(
+    moq_done_subscribe_cfg_t *cfg, size_t cfg_size);
+#define moq_done_subscribe_cfg_init(cfg) \
+    moq_done_subscribe_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 MOQ_API moq_result_t moq_session_done_subscribe(
     moq_session_t *s,
@@ -3826,7 +4279,26 @@ typedef struct moq_accept_fetch_cfg {
     moq_bytes_t track_properties;
 } moq_accept_fetch_cfg_t;
 
+/* MOQ_ACCEPT_FETCH_CFG_V0_SIZE is the smallest stamp the consuming call
+ * accepts: the layout before `track_properties`.
+ * MOQ_ACCEPT_FETCH_CFG_SIZE_THROUGH_TRACK_PROPERTIES is the layout through
+ * `track_properties`, which the symbol clears and stamps. A caller built
+ * against this header reaches the whole struct: the same-name macro passes
+ * its sizeof to moq_accept_fetch_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current) and touches nothing when cfg_size cannot hold
+ * struct_size. A binding that calls the symbol instead of compiling the macro
+ * reaches no later field; it calls the sized form with the size of its
+ * struct. */
+#define MOQ_ACCEPT_FETCH_CFG_V0_SIZE \
+    offsetof(moq_accept_fetch_cfg_t, track_properties)
+#define MOQ_ACCEPT_FETCH_CFG_SIZE_THROUGH_TRACK_PROPERTIES \
+    (offsetof(moq_accept_fetch_cfg_t, track_properties) + \
+     sizeof(((const moq_accept_fetch_cfg_t *)0)->track_properties))
 MOQ_API void moq_accept_fetch_cfg_init(moq_accept_fetch_cfg_t *cfg);
+MOQ_API void moq_accept_fetch_cfg_init_sized(
+    moq_accept_fetch_cfg_t *cfg, size_t cfg_size);
+#define moq_accept_fetch_cfg_init(cfg) \
+    moq_accept_fetch_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Accept an incoming fetch (publisher side). Advancing call.
@@ -3871,7 +4343,25 @@ typedef struct moq_reject_fetch_cfg {
     moq_redirect_target_t redirect;    /* ABI-safe append; REDIRECT only */
 } moq_reject_fetch_cfg_t;
 
+/* MOQ_REJECT_FETCH_CFG_V0_SIZE is the smallest stamp the consuming call
+ * accepts: the layout before `redirect`.
+ * MOQ_REJECT_FETCH_CFG_SIZE_THROUGH_REDIRECT is the layout through
+ * `redirect`, which the symbol clears and stamps. A caller built against this
+ * header reaches the whole struct: the same-name macro passes its sizeof to
+ * moq_reject_fetch_cfg_init_sized(), which clears and stamps min(cfg_size,
+ * sizeof current) and touches nothing when cfg_size cannot hold struct_size.
+ * A binding that calls the symbol instead of compiling the macro reaches no
+ * later field; it calls the sized form with the size of its struct. */
+#define MOQ_REJECT_FETCH_CFG_V0_SIZE \
+    offsetof(moq_reject_fetch_cfg_t, redirect)
+#define MOQ_REJECT_FETCH_CFG_SIZE_THROUGH_REDIRECT \
+    (offsetof(moq_reject_fetch_cfg_t, redirect) + \
+     sizeof(((const moq_reject_fetch_cfg_t *)0)->redirect))
 MOQ_API void moq_reject_fetch_cfg_init(moq_reject_fetch_cfg_t *cfg);
+MOQ_API void moq_reject_fetch_cfg_init_sized(
+    moq_reject_fetch_cfg_t *cfg, size_t cfg_size);
+#define moq_reject_fetch_cfg_init(cfg) \
+    moq_reject_fetch_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Reject an incoming fetch (publisher side). Advancing call.
@@ -3897,7 +4387,22 @@ typedef struct moq_fetch_object_cfg {
     moq_rcbuf_t *properties;  /* NULL if none */
 } moq_fetch_object_cfg_t;
 
+/* MOQ_FETCH_OBJECT_CFG_V0_SIZE is the layout through `properties`. It is what
+ * the symbol clears and stamps, and the smallest stamp the consuming call
+ * accepts. A caller built against this header reaches the whole struct: the
+ * same-name macro passes its sizeof to moq_fetch_object_cfg_init_sized(),
+ * which clears and stamps min(cfg_size, sizeof current) and touches nothing
+ * when cfg_size cannot hold struct_size. A binding that calls the symbol
+ * instead of compiling the macro reaches no later field; it calls the sized
+ * form with the size of its struct. */
+#define MOQ_FETCH_OBJECT_CFG_V0_SIZE \
+    (offsetof(moq_fetch_object_cfg_t, properties) + \
+     sizeof(((const moq_fetch_object_cfg_t *)0)->properties))
 MOQ_API void moq_fetch_object_cfg_init(moq_fetch_object_cfg_t *cfg);
+MOQ_API void moq_fetch_object_cfg_init_sized(
+    moq_fetch_object_cfg_t *cfg, size_t cfg_size);
+#define moq_fetch_object_cfg_init(cfg) \
+    moq_fetch_object_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Fill children (see fill.h). Advancing, single-owner operations; a refusal
@@ -4110,7 +4615,22 @@ typedef struct moq_fetch_update_cfg {
     size_t                  auth_token_count;
 } moq_fetch_update_cfg_t;
 
+/* MOQ_FETCH_UPDATE_CFG_V0_SIZE is the layout through `auth_token_count`. It
+ * is what the symbol clears and stamps, and the smallest stamp the consuming
+ * call accepts. A caller built against this header reaches the whole struct:
+ * the same-name macro passes its sizeof to moq_fetch_update_cfg_init_sized(),
+ * which clears and stamps min(cfg_size, sizeof current) and touches nothing
+ * when cfg_size cannot hold struct_size. A binding that calls the symbol
+ * instead of compiling the macro reaches no later field; it calls the sized
+ * form with the size of its struct. */
+#define MOQ_FETCH_UPDATE_CFG_V0_SIZE \
+    (offsetof(moq_fetch_update_cfg_t, auth_token_count) + \
+     sizeof(((const moq_fetch_update_cfg_t *)0)->auth_token_count))
 MOQ_API void moq_fetch_update_cfg_init(moq_fetch_update_cfg_t *cfg);
+MOQ_API void moq_fetch_update_cfg_init_sized(
+    moq_fetch_update_cfg_t *cfg, size_t cfg_size);
+#define moq_fetch_update_cfg_init(cfg) \
+    moq_fetch_update_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 MOQ_API moq_result_t moq_session_update_fetch(moq_session_t *s,
                                               moq_fetch_t fetch,
@@ -4140,7 +4660,22 @@ typedef struct moq_request_goaway_cfg {
     uint64_t    timeout_ms;        /* graceful-migration hint; 0 = unspecified */
 } moq_request_goaway_cfg_t;
 
+/* MOQ_REQUEST_GOAWAY_CFG_V0_SIZE is the layout through `timeout_ms`. It is
+ * what the symbol clears and stamps, and the smallest stamp the consuming
+ * call accepts. A caller built against this header reaches the whole struct:
+ * the same-name macro passes its sizeof to
+ * moq_request_goaway_cfg_init_sized(), which clears and stamps min(cfg_size,
+ * sizeof current) and touches nothing when cfg_size cannot hold struct_size.
+ * A binding that calls the symbol instead of compiling the macro reaches no
+ * later field; it calls the sized form with the size of its struct. */
+#define MOQ_REQUEST_GOAWAY_CFG_V0_SIZE \
+    (offsetof(moq_request_goaway_cfg_t, timeout_ms) + \
+     sizeof(((const moq_request_goaway_cfg_t *)0)->timeout_ms))
 MOQ_API void moq_request_goaway_cfg_init(moq_request_goaway_cfg_t *cfg);
+MOQ_API void moq_request_goaway_cfg_init_sized(
+    moq_request_goaway_cfg_t *cfg, size_t cfg_size);
+#define moq_request_goaway_cfg_init(cfg) \
+    moq_request_goaway_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 MOQ_API moq_result_t moq_session_request_goaway_subscribe(
     moq_session_t *s, moq_subscription_t sub,
@@ -4375,7 +4910,22 @@ typedef struct moq_reject_publish_cfg {
     uint64_t            retry_after_ms;
 } moq_reject_publish_cfg_t;
 
+/* MOQ_REJECT_PUBLISH_CFG_V0_SIZE is the layout through `retry_after_ms`. It
+ * is what the symbol clears and stamps, and the smallest stamp the consuming
+ * call accepts. A caller built against this header reaches the whole struct:
+ * the same-name macro passes its sizeof to
+ * moq_reject_publish_cfg_init_sized(), which clears and stamps min(cfg_size,
+ * sizeof current) and touches nothing when cfg_size cannot hold struct_size.
+ * A binding that calls the symbol instead of compiling the macro reaches no
+ * later field; it calls the sized form with the size of its struct. */
+#define MOQ_REJECT_PUBLISH_CFG_V0_SIZE \
+    (offsetof(moq_reject_publish_cfg_t, retry_after_ms) + \
+     sizeof(((const moq_reject_publish_cfg_t *)0)->retry_after_ms))
 MOQ_API void moq_reject_publish_cfg_init(moq_reject_publish_cfg_t *cfg);
+MOQ_API void moq_reject_publish_cfg_init_sized(
+    moq_reject_publish_cfg_t *cfg, size_t cfg_size);
+#define moq_reject_publish_cfg_init(cfg) \
+    moq_reject_publish_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * The filter in effect on a publication as this side knows it: the initial
@@ -4548,7 +5098,23 @@ typedef struct moq_accept_namespace_cfg {
     uint32_t struct_size;
 } moq_accept_namespace_cfg_t;
 
+/* MOQ_ACCEPT_NAMESPACE_CFG_V0_SIZE is the layout through `struct_size`. It is
+ * what the symbol clears and stamps, and the smallest stamp the consuming
+ * call accepts. A caller built against this header reaches the whole struct:
+ * the same-name macro passes its sizeof to
+ * moq_accept_namespace_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current) and touches nothing when cfg_size cannot hold
+ * struct_size. A binding that calls the symbol instead of compiling the macro
+ * reaches no later field; it calls the sized form with the size of its
+ * struct. */
+#define MOQ_ACCEPT_NAMESPACE_CFG_V0_SIZE \
+    (offsetof(moq_accept_namespace_cfg_t, struct_size) + \
+     sizeof(((const moq_accept_namespace_cfg_t *)0)->struct_size))
 MOQ_API void moq_accept_namespace_cfg_init(moq_accept_namespace_cfg_t *cfg);
+MOQ_API void moq_accept_namespace_cfg_init_sized(
+    moq_accept_namespace_cfg_t *cfg, size_t cfg_size);
+#define moq_accept_namespace_cfg_init(cfg) \
+    moq_accept_namespace_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 MOQ_API moq_result_t moq_session_accept_namespace(moq_session_t *s,
     moq_announcement_t ann, const moq_accept_namespace_cfg_t *cfg,
@@ -4563,7 +5129,26 @@ typedef struct moq_reject_namespace_cfg {
     moq_redirect_target_t redirect;    /* ABI-safe append; REDIRECT only (track_name empty) */
 } moq_reject_namespace_cfg_t;
 
+/* MOQ_REJECT_NAMESPACE_CFG_V0_SIZE is the smallest stamp the consuming call
+ * accepts: the layout before `redirect`.
+ * MOQ_REJECT_NAMESPACE_CFG_SIZE_THROUGH_REDIRECT is the layout through
+ * `redirect`, which the symbol clears and stamps. A caller built against this
+ * header reaches the whole struct: the same-name macro passes its sizeof to
+ * moq_reject_namespace_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current) and touches nothing when cfg_size cannot hold
+ * struct_size. A binding that calls the symbol instead of compiling the macro
+ * reaches no later field; it calls the sized form with the size of its
+ * struct. */
+#define MOQ_REJECT_NAMESPACE_CFG_V0_SIZE \
+    offsetof(moq_reject_namespace_cfg_t, redirect)
+#define MOQ_REJECT_NAMESPACE_CFG_SIZE_THROUGH_REDIRECT \
+    (offsetof(moq_reject_namespace_cfg_t, redirect) + \
+     sizeof(((const moq_reject_namespace_cfg_t *)0)->redirect))
 MOQ_API void moq_reject_namespace_cfg_init(moq_reject_namespace_cfg_t *cfg);
+MOQ_API void moq_reject_namespace_cfg_init_sized(
+    moq_reject_namespace_cfg_t *cfg, size_t cfg_size);
+#define moq_reject_namespace_cfg_init(cfg) \
+    moq_reject_namespace_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Reject a pending incoming namespace advertisement. Advancing call.
@@ -4579,7 +5164,22 @@ typedef struct moq_cancel_namespace_cfg {
     moq_bytes_t         reason;
 } moq_cancel_namespace_cfg_t;
 
+/* MOQ_CANCEL_NAMESPACE_CFG_V0_SIZE is the layout through `reason`. It is what
+ * the symbol clears and stamps, and the smallest stamp the consuming call
+ * accepts. A caller built against this header reaches the whole struct: the
+ * same-name macro passes its sizeof to moq_cancel_namespace_cfg_init_sized(),
+ * which clears and stamps min(cfg_size, sizeof current) and touches nothing
+ * when cfg_size cannot hold struct_size. A binding that calls the symbol
+ * instead of compiling the macro reaches no later field; it calls the sized
+ * form with the size of its struct. */
+#define MOQ_CANCEL_NAMESPACE_CFG_V0_SIZE \
+    (offsetof(moq_cancel_namespace_cfg_t, reason) + \
+     sizeof(((const moq_cancel_namespace_cfg_t *)0)->reason))
 MOQ_API void moq_cancel_namespace_cfg_init(moq_cancel_namespace_cfg_t *cfg);
+MOQ_API void moq_cancel_namespace_cfg_init_sized(
+    moq_cancel_namespace_cfg_t *cfg, size_t cfg_size);
+#define moq_cancel_namespace_cfg_init(cfg) \
+    moq_cancel_namespace_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Cancel an accepted namespace advertisement. Advancing call.
@@ -4687,7 +5287,26 @@ typedef struct moq_reject_track_status_cfg {
     moq_redirect_target_t redirect;    /* REDIRECT only */
 } moq_reject_track_status_cfg_t;
 
+/* MOQ_REJECT_TRACK_STATUS_CFG_V0_SIZE is the smallest stamp the consuming
+ * call accepts: the layout before `reason`.
+ * MOQ_REJECT_TRACK_STATUS_CFG_SIZE_THROUGH_REDIRECT is the layout through
+ * `redirect`, which the symbol clears and stamps. A caller built against this
+ * header reaches the whole struct: the same-name macro passes its sizeof to
+ * moq_reject_track_status_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current) and touches nothing when cfg_size cannot hold
+ * struct_size. A binding that calls the symbol instead of compiling the macro
+ * reaches no later field; it calls the sized form with the size of its
+ * struct. */
+#define MOQ_REJECT_TRACK_STATUS_CFG_V0_SIZE \
+    offsetof(moq_reject_track_status_cfg_t, reason)
+#define MOQ_REJECT_TRACK_STATUS_CFG_SIZE_THROUGH_REDIRECT \
+    (offsetof(moq_reject_track_status_cfg_t, redirect) + \
+     sizeof(((const moq_reject_track_status_cfg_t *)0)->redirect))
 MOQ_API void moq_reject_track_status_cfg_init(moq_reject_track_status_cfg_t *cfg);
+MOQ_API void moq_reject_track_status_cfg_init_sized(
+    moq_reject_track_status_cfg_t *cfg, size_t cfg_size);
+#define moq_reject_track_status_cfg_init(cfg) \
+    moq_reject_track_status_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Reject a track status request (publisher side). Advancing call.
@@ -4712,7 +5331,25 @@ typedef struct moq_subscribe_namespace_cfg {
     size_t                  auth_token_count;
 } moq_subscribe_namespace_cfg_t;
 
+/* The v0 size below is the smallest stamp the consuming call accepts: the
+ * layout before `auth_tokens`. The size through `auth_token_count` is the
+ * layout the symbol clears and stamps. A caller built against this header
+ * reaches the whole struct: the same-name macro passes its sizeof to
+ * moq_subscribe_namespace_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current) and touches nothing when cfg_size cannot
+ * hold struct_size. A binding that calls the symbol instead of compiling the
+ * macro reaches no later field; it calls the sized form with the size of its
+ * struct. */
+#define MOQ_SUBSCRIBE_NAMESPACE_CFG_V0_SIZE \
+    offsetof(moq_subscribe_namespace_cfg_t, auth_tokens)
+#define MOQ_SUBSCRIBE_NAMESPACE_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT \
+    (offsetof(moq_subscribe_namespace_cfg_t, auth_token_count) + \
+     sizeof(((const moq_subscribe_namespace_cfg_t *)0)->auth_token_count))
 MOQ_API void moq_subscribe_namespace_cfg_init(moq_subscribe_namespace_cfg_t *cfg);
+MOQ_API void moq_subscribe_namespace_cfg_init_sized(
+    moq_subscribe_namespace_cfg_t *cfg, size_t cfg_size);
+#define moq_subscribe_namespace_cfg_init(cfg) \
+    moq_subscribe_namespace_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Subscribe to namespace discovery via bidi stream. Advancing call.
@@ -4729,12 +5366,45 @@ MOQ_API moq_result_t moq_session_subscribe_namespace(
     moq_ns_sub_handle_t *out_handle);
 
 /*
- * Feed bytes from a bidi stream request half.
+ * Feed bytes from the peer's half of a bidirectional stream.
  *
- * Parses bidi stream bytes and emits NS_SUB_REQUEST.
- * Returns MOQ_ERR_WOULD_BLOCK if the event queue is full after
- * a complete parse. Retry with buf=NULL, len=0 after draining
- * events. process_pending() is control-stream only.
+ * buf is borrowed for the duration of this call only. fin == true means
+ * the peer closed its half after these bytes. process_pending() is
+ * control-stream only: a blocked bidi stream is retried through this call.
+ *
+ * Draft-16: the stream carries a namespace subscription request. The session
+ * buffers its bytes and, after a complete parse, emits NS_SUB_REQUEST.
+ *   MOQ_ERR_WOULD_BLOCK, stream owned (moq_session_has_transport_stream()
+ *     is true): the event queue is full after a complete parse. The bytes
+ *     were retained. Drain events, then retry with buf=NULL, len=0.
+ *   MOQ_ERR_WOULD_BLOCK, stream not owned: a new request arrived and no
+ *     namespace-subscription entry is free. Nothing was retained. The
+ *     caller delivers the same bytes and FIN again later; an empty retry
+ *     on that ref does nothing.
+ *   MOQ_ERR_BUFFER: the bytes of this call do not fit the request's
+ *     receive buffer; none were copied.
+ *   MOQ_ERR_WRONG_STATE: the session's setup has not completed.
+ *
+ * Draft-18 and draft-22: every request has its own bidirectional stream,
+ * and this call feeds requests, their responses and later messages alike.
+ * Bytes that arrive before setup completes are buffered and handled once
+ * it has.
+ *   MOQ_ERR_WOULD_BLOCK: capacity is missing (an event, an action or a
+ *     drain reference). The session owns the stream
+ *     (moq_session_has_transport_stream() is true) and keeps what it
+ *     needs: drain actions and events, then retry with buf=NULL, len=0.
+ *     Do not deliver the bytes again.
+ *   A new request the session has no room for is refused on that stream
+ *     alone: with a request error and FIN once setup has completed, with
+ *     STOP_SENDING and RESET_STREAM before. The call returns MOQ_OK, or
+ *     MOQ_ERR_WOULD_BLOCK as above while the refusal cannot be queued.
+ *     When the session cannot hold even that pending refusal, it stops
+ *     and resets the stream at once if that fits its queues, and
+ *     otherwise closes the session. Both return MOQ_OK.
+ *
+ * On every draft, MOQ_OK means the bytes were consumed. For a stream the
+ * session does not know, an empty call without FIN does nothing, and a FIN
+ * with no bytes is a protocol violation.
  *
  * Advancing call: invalidates borrows, takes now_us.
  */
@@ -4748,7 +5418,22 @@ typedef struct moq_accept_ns_sub_cfg {
     uint32_t struct_size;
 } moq_accept_ns_sub_cfg_t;
 
+/* MOQ_ACCEPT_NS_SUB_CFG_V0_SIZE is the layout through `struct_size`. It is
+ * what the symbol clears and stamps, and the smallest stamp the consuming
+ * call accepts. A caller built against this header reaches the whole struct:
+ * the same-name macro passes its sizeof to
+ * moq_accept_ns_sub_cfg_init_sized(), which clears and stamps min(cfg_size,
+ * sizeof current) and touches nothing when cfg_size cannot hold struct_size.
+ * A binding that calls the symbol instead of compiling the macro reaches no
+ * later field; it calls the sized form with the size of its struct. */
+#define MOQ_ACCEPT_NS_SUB_CFG_V0_SIZE \
+    (offsetof(moq_accept_ns_sub_cfg_t, struct_size) + \
+     sizeof(((const moq_accept_ns_sub_cfg_t *)0)->struct_size))
 MOQ_API void moq_accept_ns_sub_cfg_init(moq_accept_ns_sub_cfg_t *cfg);
+MOQ_API void moq_accept_ns_sub_cfg_init_sized(
+    moq_accept_ns_sub_cfg_t *cfg, size_t cfg_size);
+#define moq_accept_ns_sub_cfg_init(cfg) \
+    moq_accept_ns_sub_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Accept a namespace subscription request. Advancing call.
@@ -4771,7 +5456,25 @@ typedef struct moq_reject_ns_sub_cfg {
     moq_redirect_target_t redirect;    /* REDIRECT only */
 } moq_reject_ns_sub_cfg_t;
 
+/* MOQ_REJECT_NS_SUB_CFG_V0_SIZE is the smallest stamp the consuming call
+ * accepts: the layout before `can_retry`.
+ * MOQ_REJECT_NS_SUB_CFG_SIZE_THROUGH_REDIRECT is the layout through
+ * `redirect`, which the symbol clears and stamps. A caller built against this
+ * header reaches the whole struct: the same-name macro passes its sizeof to
+ * moq_reject_ns_sub_cfg_init_sized(), which clears and stamps min(cfg_size,
+ * sizeof current) and touches nothing when cfg_size cannot hold struct_size.
+ * A binding that calls the symbol instead of compiling the macro reaches no
+ * later field; it calls the sized form with the size of its struct. */
+#define MOQ_REJECT_NS_SUB_CFG_V0_SIZE \
+    offsetof(moq_reject_ns_sub_cfg_t, can_retry)
+#define MOQ_REJECT_NS_SUB_CFG_SIZE_THROUGH_REDIRECT \
+    (offsetof(moq_reject_ns_sub_cfg_t, redirect) + \
+     sizeof(((const moq_reject_ns_sub_cfg_t *)0)->redirect))
 MOQ_API void moq_reject_ns_sub_cfg_init(moq_reject_ns_sub_cfg_t *cfg);
+MOQ_API void moq_reject_ns_sub_cfg_init_sized(
+    moq_reject_ns_sub_cfg_t *cfg, size_t cfg_size);
+#define moq_reject_ns_sub_cfg_init(cfg) \
+    moq_reject_ns_sub_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Reject a namespace subscription request. Advancing call.
@@ -4888,8 +5591,23 @@ typedef struct moq_accept_subscribe_tracks_cfg {
     uint32_t struct_size;
 } moq_accept_subscribe_tracks_cfg_t;
 
-MOQ_API void moq_accept_subscribe_tracks_cfg_init(
-    moq_accept_subscribe_tracks_cfg_t *cfg);
+/* MOQ_ACCEPT_SUBSCRIBE_TRACKS_CFG_V0_SIZE is the layout through
+ * `struct_size`. It is what the symbol clears and stamps, and the smallest
+ * stamp the consuming call accepts. A caller built against this header
+ * reaches the whole struct: the same-name macro passes its sizeof to
+ * moq_accept_subscribe_tracks_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current) and touches nothing when cfg_size cannot hold
+ * struct_size. A binding that calls the symbol instead of compiling the macro
+ * reaches no later field; it calls the sized form with the size of its
+ * struct. */
+#define MOQ_ACCEPT_SUBSCRIBE_TRACKS_CFG_V0_SIZE \
+    (offsetof(moq_accept_subscribe_tracks_cfg_t, struct_size) + \
+     sizeof(((const moq_accept_subscribe_tracks_cfg_t *)0)->struct_size))
+MOQ_API void moq_accept_subscribe_tracks_cfg_init(moq_accept_subscribe_tracks_cfg_t *cfg);
+MOQ_API void moq_accept_subscribe_tracks_cfg_init_sized(
+    moq_accept_subscribe_tracks_cfg_t *cfg, size_t cfg_size);
+#define moq_accept_subscribe_tracks_cfg_init(cfg) \
+    moq_accept_subscribe_tracks_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Accept a SUBSCRIBE_TRACKS request (publisher side). Advancing call.
@@ -4908,8 +5626,23 @@ typedef struct moq_reject_subscribe_tracks_cfg {
     moq_bytes_t         reason;
 } moq_reject_subscribe_tracks_cfg_t;
 
-MOQ_API void moq_reject_subscribe_tracks_cfg_init(
-    moq_reject_subscribe_tracks_cfg_t *cfg);
+/* MOQ_REJECT_SUBSCRIBE_TRACKS_CFG_V0_SIZE is the layout through `reason`. It
+ * is what the symbol clears and stamps, and the smallest stamp the consuming
+ * call accepts. A caller built against this header reaches the whole struct:
+ * the same-name macro passes its sizeof to
+ * moq_reject_subscribe_tracks_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current) and touches nothing when cfg_size cannot hold
+ * struct_size. A binding that calls the symbol instead of compiling the macro
+ * reaches no later field; it calls the sized form with the size of its
+ * struct. */
+#define MOQ_REJECT_SUBSCRIBE_TRACKS_CFG_V0_SIZE \
+    (offsetof(moq_reject_subscribe_tracks_cfg_t, reason) + \
+     sizeof(((const moq_reject_subscribe_tracks_cfg_t *)0)->reason))
+MOQ_API void moq_reject_subscribe_tracks_cfg_init(moq_reject_subscribe_tracks_cfg_t *cfg);
+MOQ_API void moq_reject_subscribe_tracks_cfg_init_sized(
+    moq_reject_subscribe_tracks_cfg_t *cfg, size_t cfg_size);
+#define moq_reject_subscribe_tracks_cfg_init(cfg) \
+    moq_reject_subscribe_tracks_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Reject a SUBSCRIBE_TRACKS request (publisher side). Advancing call.
@@ -5109,6 +5842,9 @@ MOQ_API moq_result_t moq_session_subscribe_tracks_owed_update(moq_session_t *s,
  * have queued RESET_DATA (CANCELLED) for some of its subgroups. Delivering it
  * again resumes without repeating them; MOQ_EVENT_UNSUBSCRIBED follows the
  * last of them, once. moq_session_on_bidi_stream_stop() behaves the same.
+ *
+ * MOQ_ERR_CLOSED on a closed session. No bytes are passed, so there is
+ * nothing for the session to retain in any result.
  */
 MOQ_API moq_result_t moq_session_on_bidi_stream_reset(
     moq_session_t *s,
@@ -5367,7 +6103,22 @@ typedef struct moq_finish_publish_cfg {
     moq_bytes_t reason;
 } moq_finish_publish_cfg_t;
 
+/* MOQ_FINISH_PUBLISH_CFG_V0_SIZE is the layout through `reason`. It is what
+ * the symbol clears and stamps, and the smallest stamp the consuming call
+ * accepts. A caller built against this header reaches the whole struct: the
+ * same-name macro passes its sizeof to moq_finish_publish_cfg_init_sized(),
+ * which clears and stamps min(cfg_size, sizeof current) and touches nothing
+ * when cfg_size cannot hold struct_size. A binding that calls the symbol
+ * instead of compiling the macro reaches no later field; it calls the sized
+ * form with the size of its struct. */
+#define MOQ_FINISH_PUBLISH_CFG_V0_SIZE \
+    (offsetof(moq_finish_publish_cfg_t, reason) + \
+     sizeof(((const moq_finish_publish_cfg_t *)0)->reason))
 MOQ_API void moq_finish_publish_cfg_init(moq_finish_publish_cfg_t *cfg);
+MOQ_API void moq_finish_publish_cfg_init_sized(
+    moq_finish_publish_cfg_t *cfg, size_t cfg_size);
+#define moq_finish_publish_cfg_init(cfg) \
+    moq_finish_publish_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Finish a publisher-initiated subscription. Advancing call.
@@ -5432,7 +6183,22 @@ typedef struct moq_begin_object_cfg {
     moq_rcbuf_t *properties;  /* NULL or zero-length = none; non-empty requires object_properties=true */
 } moq_begin_object_cfg_t;
 
+/* MOQ_BEGIN_OBJECT_CFG_V0_SIZE is the layout through `properties`. It is what
+ * the symbol clears and stamps, and the smallest stamp the consuming call
+ * accepts. A caller built against this header reaches the whole struct: the
+ * same-name macro passes its sizeof to moq_begin_object_cfg_init_sized(),
+ * which clears and stamps min(cfg_size, sizeof current) and touches nothing
+ * when cfg_size cannot hold struct_size. A binding that calls the symbol
+ * instead of compiling the macro reaches no later field; it calls the sized
+ * form with the size of its struct. */
+#define MOQ_BEGIN_OBJECT_CFG_V0_SIZE \
+    (offsetof(moq_begin_object_cfg_t, properties) + \
+     sizeof(((const moq_begin_object_cfg_t *)0)->properties))
 MOQ_API void moq_begin_object_cfg_init(moq_begin_object_cfg_t *cfg);
+MOQ_API void moq_begin_object_cfg_init_sized(
+    moq_begin_object_cfg_t *cfg, size_t cfg_size);
+#define moq_begin_object_cfg_init(cfg) \
+    moq_begin_object_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Begin a streamed object with optional properties. Advancing call.
@@ -5502,13 +6268,12 @@ MOQ_API uint64_t moq_session_next_deadline_us(const moq_session_t *s);
  * call this after MOQ_ERR_WOULD_BLOCK to distinguish post-retention
  * (the bytes were retained; an empty retry is safe) from pre-retention
  * (nothing retained). What an unowned refusal means depends on the input.
- * For a peer uni data stream the session will never parse that stream
- * (its receive entries and stopped-identity records are exhausted); the
- * transport bridge discards the stream's remainder until the peer's
- * FIN/RESET. That is the current measured behaviour, not a lifecycle
- * guarantee: a discarded stream answering a live FETCH leaves the request
- * without a terminal. For a bidi request stream the bridge treats it as
- * fatal. Control bytes are always retained by the session on WOULD_BLOCK.
+ * For a new peer uni data stream the session consumed neither the bytes
+ * nor the FIN: the caller keeps that exact delivery and offers it again
+ * once moq_session_can_admit_data_stream() is true. Discarding it instead
+ * would leave a live FETCH it answers without a terminal. For a bidi
+ * request stream the bridge treats it as fatal. Control bytes are always
+ * retained by the session on WOULD_BLOCK.
  * Observing (does not invalidate borrows).
  */
 MOQ_API bool moq_session_has_transport_stream(const moq_session_t *s,

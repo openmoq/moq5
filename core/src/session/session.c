@@ -2433,11 +2433,19 @@ moq_result_t queue_request_error_bidi(moq_session_t *s, moq_stream_ref_t ref,
     return rc;
 }
 
-void moq_request_goaway_cfg_init(moq_request_goaway_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_request_goaway_cfg_init)(moq_request_goaway_cfg_t *cfg)
+{
+    moq_request_goaway_cfg_init_sized(cfg, MOQ_REQUEST_GOAWAY_CFG_V0_SIZE);
+}
+
+void moq_request_goaway_cfg_init_sized(moq_request_goaway_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_request_goaway_cfg_t);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 bool session_namespace_reserved(const moq_namespace_t *ns)

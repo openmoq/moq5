@@ -75,8 +75,11 @@ EXEMPT='api-boundary-exempt|MOQ_D16_|moq_d16_|fuzz_|MOQ_EVENT_|moq_publish_ok|mo
 # case-sensitive grep so they don't false-positive on public API
 # identifiers (e.g. moq_publish_ok_event_t, moq_request_error_t).
 FORBIDDEN_WIRE_MSG='SUBSCRIBE_NAMESPACE|PUBLISH_NAMESPACE|PUBLISH_NAMESPACE_CANCEL|REQUEST_OK([^_]|$)|REQUEST_ERROR([^_]|$)|REQUEST_UPDATE([^_]|$)|PUBLISH_OK([^_]|$)|PUBLISH_DONE([^_]|$)|FETCH_OK([^_]|$)|FETCH_CANCEL([^_]|$)|NAMESPACE_DONE([^_]|$)|(^|[^a-z_])UNSUBSCRIBE([^_D]|$)|OBJECT_DATAGRAM'
-# These two definitions describe public config sizes, not wire messages.
-PUBLIC_CFG_SIZES='^[0-9]+:[[:space:]]*#define[[:space:]]+MOQ_PUBLISH_NAMESPACE_CFG_(V0|LEGACY)_SIZE[[:space:]]+\\$'
+# Public size floors named after their public types (moq_publish_namespace_cfg_t,
+# moq_subscribe_namespace_cfg_t, moq_fetch_cancelled_event_t), not wire
+# messages. Only these exact multi-line #define lines are exempt; any other
+# use of the names in a stable surface is still a violation.
+PUBLIC_CFG_SIZES='^[0-9]+:[[:space:]]*#define[[:space:]]+(MOQ_PUBLISH_NAMESPACE_CFG_(V0|LEGACY)_SIZE|MOQ_SUBSCRIBE_NAMESPACE_CFG_(V0_SIZE|SIZE_THROUGH_AUTH_TOKEN_COUNT)|MOQ_FETCH_CANCELLED_EVENT_V0_SIZE)[[:space:]]+\\$'
 
 violations=0
 

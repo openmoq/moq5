@@ -12,6 +12,12 @@
  * and stamp detail_size with the current detail sizeof, so an event built
  * that way is injected here directly, with a distinct byte in every position
  * of the detail.
+ *
+ * The poll never refuses an ordinary event for a short element: an element
+ * shorter than the event's frozen prefix still receives a truncated copy.
+ * What a reader may use from it is bounded twice, by the bytes its element
+ * holds and by detail_size. The last section checks both the permitted
+ * truncation and that bound.
  */
 #include <moq/moq.h>
 #include "test_support.h"
@@ -142,6 +148,158 @@ static int check_kind(moq_session_t *s, const grown_t *g)
     return failures;
 }
 
+/* -- Truncation is permitted; reading past what was given is not ---------- */
+
+typedef struct floor_row {
+    const char *name;
+    uint32_t    kind;
+    size_t      detail;     /* current sizeof */
+    size_t      floor;      /* the published frozen prefix */
+    size_t      tail_end;   /* end of the first field appended after it */
+} floor_row_t;
+
+#define FLOOR_ROW(K, T, V0, tail) \
+    { #K, MOQ_EVENT_##K, sizeof(T), (V0), FIELD_END(T, tail) }
+
+static const floor_row_t floor_rows[] = {
+    FLOOR_ROW(UNSUBSCRIBED, moq_unsubscribed_event_t,
+              MOQ_UNSUBSCRIBED_EVENT_V0_SIZE, cause),
+    FLOOR_ROW(GOAWAY, moq_goaway_event_t,
+              MOQ_GOAWAY_EVENT_V0_SIZE, has_timeout),
+    FLOOR_ROW(PUBLISH_FINISHED, moq_publish_finished_event_t,
+              MOQ_PUBLISH_FINISHED_EVENT_V0_SIZE, cause),
+    FLOOR_ROW(SUBSCRIBE_UPDATED, moq_subscribe_updated_event_t,
+              MOQ_SUBSCRIBE_UPDATED_EVENT_V0_SIZE, has_filter),
+    FLOOR_ROW(FETCH_CANCELLED, moq_fetch_cancelled_event_t,
+              MOQ_FETCH_CANCELLED_EVENT_V0_SIZE, cause),
+};
+
+/* Queue one event whose detail holds `fill` patterned bytes and whose
+ * producer reports `reported` of them. */
+static void inject_reported(moq_session_t *s, uint32_t kind, size_t fill,
+                            uint32_t reported)
+{
+    moq_event_t e;
+    memset(&e, 0, sizeof(e));
+    e.kind = kind;
+    e.detail_size = reported;
+    e.borrow_epoch = s->borrow_epoch;
+    for (size_t i = 0; i < fill; i++)
+        ((unsigned char *)&e.u)[i] = pattern(i);
+    (void)push_event(s, &e);
+}
+
+/* The detail bytes a reader may use from one polled element: no more than
+ * the element holds, and no more than the producer wrote. */
+static size_t usable_detail(size_t element, uint32_t detail_size)
+{
+    const size_t held = element - offsetof(moq_event_t, u);
+    return held < detail_size ? held : (size_t)detail_size;
+}
+
+/* Poll one event into the first `elem` bytes of buf. Returns the failure
+ * count; `head` receives the event prefix. A queue the poll did not empty is
+ * drained, so one refused row cannot feed its event to the next. */
+static int poll_one(moq_session_t *s, const floor_row_t *r, size_t elem,
+                    unsigned char *buf, size_t buf_size, moq_event_t *head)
+{
+    int failures = 0;
+    const size_t prefix = offsetof(moq_event_t, u);
+    size_t n = 99;
+
+    memset(buf, FILL, buf_size);
+    memset(head, 0, sizeof(*head));
+    MOQ_TEST_CHECK(moq_session_poll_events_ex(s, buf, 1, elem, &n) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(n, 1);
+    if (n != 1) {
+        fprintf(stderr, "FAIL: %s: not delivered into a %zu-byte element\n",
+                r->name, elem);
+        moq_event_t drop;
+        for (int guard = 0; guard < 8 &&
+             moq_session_poll_events(s, &drop, 1) == 1; guard++) { }
+        return failures;
+    }
+    memcpy(head, buf, prefix);
+    MOQ_TEST_CHECK(head->kind == r->kind);
+    for (size_t i = elem; i < buf_size; i++) {
+        if (buf[i] != FILL) {
+            fprintf(stderr, "FAIL: %s: wrote byte %zu past a %zu-byte element\n",
+                    r->name, i, elem);
+            failures++;
+            break;
+        }
+    }
+    return failures;
+}
+
+static int check_floor(moq_session_t *s, const floor_row_t *r)
+{
+    int failures = 0;
+    const size_t prefix = offsetof(moq_event_t, u);
+    unsigned char buf[sizeof(moq_event_t) + GUARD];
+    moq_event_t head;
+    size_t usable;
+
+    MOQ_TEST_CHECK(r->floor >= 1 && r->floor < r->tail_end);
+    MOQ_TEST_CHECK(r->tail_end <= r->detail);
+    MOQ_TEST_CHECK(r->detail <= MOQ_EVENT_DETAIL_MAX);
+
+    /* One byte short of the frozen prefix: delivered all the same, and
+     * detail_size is the producer's extent, not the bytes copied. Nothing
+     * of the record is usable to a reader that requires its prefix. */
+    inject_reported(s, r->kind, r->detail, (uint32_t)r->detail);
+    size_t elem = prefix + r->floor - 1;
+    failures += poll_one(s, r, elem, buf, sizeof(buf), &head);
+    MOQ_TEST_CHECK_EQ_SIZE((size_t)head.detail_size, r->detail);
+    MOQ_TEST_CHECK((size_t)head.detail_size > elem - prefix);
+    usable = usable_detail(elem, head.detail_size);
+    MOQ_TEST_CHECK_EQ_SIZE(usable, r->floor - 1);
+    MOQ_TEST_CHECK(usable < r->floor);
+
+    /* Exactly the frozen prefix: every byte of it arrives. The producer
+     * wrote the appended field too, but this element does not hold it. */
+    inject_reported(s, r->kind, r->detail, (uint32_t)r->detail);
+    elem = prefix + r->floor;
+    failures += poll_one(s, r, elem, buf, sizeof(buf), &head);
+    for (size_t i = 0; i < r->floor; i++) {
+        if (buf[prefix + i] != pattern(i)) {
+            fprintf(stderr, "FAIL: %s: prefix byte %zu lost\n", r->name, i);
+            failures++;
+            break;
+        }
+    }
+    usable = usable_detail(elem, head.detail_size);
+    MOQ_TEST_CHECK_EQ_SIZE(usable, r->floor);
+    MOQ_TEST_CHECK((size_t)head.detail_size >= r->tail_end);
+    MOQ_TEST_CHECK(r->tail_end > usable);
+
+    /* A producer that reports only the frozen prefix, polled with the full
+     * event: the element holds bytes past the prefix, yet none of them is a
+     * field that producer wrote. */
+    inject_reported(s, r->kind, r->detail, (uint32_t)r->floor);
+    failures += poll_one(s, r, sizeof(moq_event_t), buf, sizeof(buf), &head);
+    MOQ_TEST_CHECK_EQ_SIZE((size_t)head.detail_size, r->floor);
+    usable = usable_detail(sizeof(moq_event_t), head.detail_size);
+    MOQ_TEST_CHECK_EQ_SIZE(usable, r->floor);
+    MOQ_TEST_CHECK(r->tail_end > usable);
+
+    /* The full event from a producer that wrote the appended field: it is
+     * covered both ways and arrives intact. */
+    inject_reported(s, r->kind, r->detail, (uint32_t)r->detail);
+    failures += poll_one(s, r, sizeof(moq_event_t), buf, sizeof(buf), &head);
+    usable = usable_detail(sizeof(moq_event_t), head.detail_size);
+    MOQ_TEST_CHECK(r->tail_end <= usable);
+    for (size_t i = 0; i < r->tail_end; i++) {
+        if (buf[prefix + i] != pattern(i)) {
+            fprintf(stderr, "FAIL: %s: byte %zu of the appended field lost\n",
+                    r->name, i);
+            failures++;
+            break;
+        }
+    }
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
@@ -150,6 +308,8 @@ int main(void)
     if (s) {
         for (size_t i = 0; i < sizeof(grown) / sizeof(grown[0]); i++)
             failures += check_kind(s, &grown[i]);
+        for (size_t i = 0; i < sizeof(floor_rows) / sizeof(floor_rows[0]); i++)
+            failures += check_floor(s, &floor_rows[i]);
         moq_event_t ev;
         MOQ_TEST_CHECK(moq_session_poll_events(s, &ev, 1) == 0);   /* drained */
         moq_session_destroy(s);

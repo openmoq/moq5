@@ -925,11 +925,19 @@ moq_result_t moq_session_accept_track_status(moq_session_t *s,
 
 /* -- Reject track-status request ----------------------------------- */
 
-void moq_reject_track_status_cfg_init(moq_reject_track_status_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_reject_track_status_cfg_init)(moq_reject_track_status_cfg_t *cfg)
+{
+    moq_reject_track_status_cfg_init_sized(cfg, MOQ_REJECT_TRACK_STATUS_CFG_SIZE_THROUGH_REDIRECT);
+}
+
+void moq_reject_track_status_cfg_init_sized(moq_reject_track_status_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_reject_track_status_cfg_t);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_reject_track_status(moq_session_t *s,
@@ -938,7 +946,7 @@ moq_result_t moq_session_reject_track_status(moq_session_t *s,
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
     /* Pre-redirect minimum: the original cfg was {struct_size, error_code}. */
-    if (cfg->struct_size < offsetof(moq_reject_track_status_cfg_t, reason))
+    if (cfg->struct_size < MOQ_REJECT_TRACK_STATUS_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
     /* The code must be representable in THIS profile's wire encoding; refuse
      * before any mutation rather than truncate (draft-16 encodes a QUIC
@@ -1022,7 +1030,7 @@ moq_result_t moq_session_request_goaway_track_status(
     const moq_request_goaway_cfg_t *cfg, uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_request_goaway_cfg_t)) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_REQUEST_GOAWAY_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     if (cfg->new_session_uri.len > 0 && !cfg->new_session_uri.data)
         return MOQ_ERR_INVAL;
     session_begin_advance(s, now_us);

@@ -582,7 +582,22 @@ typedef struct moq_pub_publish_cfg {
     size_t                  auth_token_count;
 } moq_pub_publish_cfg_t;
 
+/* MOQ_PUB_PUBLISH_CFG_V0_SIZE is the layout through `auth_token_count`. It is
+ * what the symbol clears and stamps, and the smallest stamp the consuming
+ * call accepts. A caller built against this header reaches the whole struct:
+ * the same-name macro passes its sizeof to moq_pub_publish_cfg_init_sized(),
+ * which clears and stamps min(cfg_size, sizeof current) and touches nothing
+ * when cfg_size cannot hold struct_size. A binding that calls the symbol
+ * instead of compiling the macro reaches no later field; it calls the sized
+ * form with the size of its struct. */
+#define MOQ_PUB_PUBLISH_CFG_V0_SIZE \
+    (offsetof(moq_pub_publish_cfg_t, auth_token_count) + \
+     sizeof(((const moq_pub_publish_cfg_t *)0)->auth_token_count))
 MOQ_API void moq_pub_publish_cfg_init(moq_pub_publish_cfg_t *cfg);
+MOQ_API void moq_pub_publish_cfg_init_sized(
+    moq_pub_publish_cfg_t *cfg, size_t cfg_size);
+#define moq_pub_publish_cfg_init(cfg) \
+    moq_pub_publish_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 /*
  * Send PUBLISH for an existing track (publisher-initiated). The track's
@@ -772,8 +787,23 @@ typedef struct moq_pub_retained_group_cfg {
     size_t   object_count;
 } moq_pub_retained_group_cfg_t;
 
-MOQ_API void moq_pub_retained_group_cfg_init(
-    moq_pub_retained_group_cfg_t *cfg);
+/* MOQ_PUB_RETAINED_GROUP_CFG_V0_SIZE is the layout through `object_count`. It
+ * is what the symbol clears and stamps, and the smallest stamp the consuming
+ * call accepts. A caller built against this header reaches the whole struct:
+ * the same-name macro passes its sizeof to
+ * moq_pub_retained_group_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current) and touches nothing when cfg_size cannot hold
+ * struct_size. A binding that calls the symbol instead of compiling the macro
+ * reaches no later field; it calls the sized form with the size of its
+ * struct. */
+#define MOQ_PUB_RETAINED_GROUP_CFG_V0_SIZE \
+    (offsetof(moq_pub_retained_group_cfg_t, object_count) + \
+     sizeof(((const moq_pub_retained_group_cfg_t *)0)->object_count))
+MOQ_API void moq_pub_retained_group_cfg_init(moq_pub_retained_group_cfg_t *cfg);
+MOQ_API void moq_pub_retained_group_cfg_init_sized(
+    moq_pub_retained_group_cfg_t *cfg, size_t cfg_size);
+#define moq_pub_retained_group_cfg_init(cfg) \
+    moq_pub_retained_group_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 MOQ_API moq_result_t moq_pub_set_retained_group(
     moq_publisher_t *pub,

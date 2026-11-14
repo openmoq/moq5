@@ -1362,11 +1362,19 @@ void moq_accept_publish_cfg_init_sized(moq_accept_publish_cfg_t *cfg,
     cfg->struct_size = (uint32_t)n;
 }
 
-void moq_reject_publish_cfg_init(moq_reject_publish_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_reject_publish_cfg_init)(moq_reject_publish_cfg_t *cfg)
+{
+    moq_reject_publish_cfg_init_sized(cfg, MOQ_REJECT_PUBLISH_CFG_V0_SIZE);
+}
+
+void moq_reject_publish_cfg_init_sized(moq_reject_publish_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_reject_publish_cfg_t);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_publish(moq_session_t *s,
@@ -2050,7 +2058,7 @@ moq_result_t moq_session_reject_publish(
     uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_reject_publish_cfg_t))
+    if (cfg->struct_size < MOQ_REJECT_PUBLISH_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
     /* REDIRECT answers PUBLISH only where the profile allows it. */
@@ -3478,11 +3486,19 @@ moq_result_t moq_session_update_publication(
 
 /* -- Finish publish (publisher side) ------------------------------- */
 
-void moq_finish_publish_cfg_init(moq_finish_publish_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_finish_publish_cfg_init)(moq_finish_publish_cfg_t *cfg)
+{
+    moq_finish_publish_cfg_init_sized(cfg, MOQ_FINISH_PUBLISH_CFG_V0_SIZE);
+}
+
+void moq_finish_publish_cfg_init_sized(moq_finish_publish_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(moq_finish_publish_cfg_t);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_session_finish_publish(
@@ -3498,7 +3514,7 @@ moq_result_t session_finish_publish(moq_session_t *s, moq_publication_t pub,
     const moq_finish_publish_cfg_t *cfg, uint64_t now_us, bool owned_count)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_finish_publish_cfg_t))
+    if (cfg->struct_size < MOQ_FINISH_PUBLISH_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
 
@@ -3769,7 +3785,7 @@ moq_result_t moq_session_request_goaway_publish(
     const moq_request_goaway_cfg_t *cfg, uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_request_goaway_cfg_t)) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_REQUEST_GOAWAY_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     if (cfg->new_session_uri.len > 0 && !cfg->new_session_uri.data)
         return MOQ_ERR_INVAL;
     session_begin_advance(s, now_us);

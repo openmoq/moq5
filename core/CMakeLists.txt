@@ -74,6 +74,8 @@ install(DIRECTORY include/moq
     FILES_MATCHING PATTERN "*.h"
     PATTERN "transport_bridge.h" EXCLUDE)
 
+moq_install_tier_pc(libmoq-core "Sans-I/O MoQ protocol core" "" "-lmoq-core")
+
 target_compile_definitions(moq-core PRIVATE MOQ_BUILDING)
 if(NOT BUILD_SHARED_LIBS)
     target_compile_definitions(moq-core PUBLIC MOQ_STATIC)

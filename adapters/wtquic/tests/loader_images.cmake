@@ -184,8 +184,12 @@ function(loader_require_images images expected owned label out)
     set(${out} "${_why}" PARENT_SCOPE)
 endfunction()
 
-# Only known loader record classes are allowed. Optional fourth argument permits
-# one exact ASan info class on an instrumented lane, with its runtime image.
+# Only known loader record classes are allowed. Optional fourth argument marks
+# an instrumented lane, which permits the sanitizer runtime's own records and
+# nothing else: on Darwin, one exact ASan info class with its runtime image; on
+# Linux, the runtime's failed lookups of functions the C library does not
+# define (interceptors it resolves while the program's preinit runs), each
+# named for the program whose preinit is running.
 function(loader_only_image_records text platform out)
     set(_why "")
     if(platform STREQUAL "ImageList")
@@ -243,14 +247,24 @@ function(loader_only_image_records text platform out)
                 endif()
             endif()
         elseif(platform STREQUAL "Linux")
-            if(_s MATCHES "^[ \t]*[0-9]+:[ \t]*(.*)$")
-                set(_rest "${CMAKE_MATCH_1}")
+            if(_s MATCHES "^[ \t]*([0-9]+):[ \t]*(.*)$")
+                set(_pid "${CMAKE_MATCH_1}")
+                set(_rest "${CMAKE_MATCH_2}")
+                set(_lookup "")
+                if(ARGV3 AND NOT "${_preinit_${_pid}}" STREQUAL "" AND _rest MATCHES
+                   "^(/.+): error: symbol lookup error: undefined symbol: [^ ,]+(, version [^ ]+)? \\(fatal\\)$")
+                    set(_lookup "${CMAKE_MATCH_1}")
+                endif()
                 if(_rest MATCHES "^calling init:[ \t]+/")
                     set(_kind "image")
-                elseif(_rest MATCHES "^calling preinit:[ \t]+/")
+                    set(_preinit_${_pid} "")
+                elseif(_rest MATCHES "^calling preinit:[ \t]+(/.*)$")
                     set(_kind "preinit")
+                    set(_preinit_${_pid} "${CMAKE_MATCH_1}")
                 elseif(_rest STREQUAL "")
                     set(_kind "trace")
+                elseif(NOT _lookup STREQUAL "" AND _lookup STREQUAL "${_preinit_${_pid}}")
+                    set(_kind "sanitizer-runtime-lookup")
                 else()
                     foreach(_k "find library=" "trying file=" "binding file"
                                "calling fini:" "initialize program:"

@@ -1,0 +1,14 @@
+# One tier of the SDK. The three paths come from moq_tier_pc_paths(): with a
+# relative library directory the prefix is derived from this file's location
+# (<prefix>/<libdir>/pkgconfig), as in libmoq.pc, and the package moves with
+# its directory; an absolute library or include directory is named as it is.
+prefix=@MOQ_TIER_PC_PREFIX@
+libdir=@MOQ_TIER_PC_LIBDIR@
+includedir=@MOQ_TIER_PC_INCLUDEDIR@
+
+Name: @MOQ_TIER_PC_NAME@
+Description: @MOQ_TIER_PC_DESCRIPTION@
+Version: @PROJECT_VERSION@
+Requires: @MOQ_TIER_PC_REQUIRES@
+Libs: -L${libdir} @MOQ_TIER_PC_LIBS@
+Cflags: -I${includedir}@MOQ_TIER_PC_DEFINES@

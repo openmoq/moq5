@@ -308,6 +308,36 @@ loader_require_images("${_asan_imgs};/wrong/libwtquic.dylib"
     "/p/lib;/q/lib" wrong _why)
 expect_nonempty("ASan info cannot excuse a wrong provider image" "${_why}")
 
+# The Linux sanitizer lane: the runtime linked into the program resolves its
+# interceptors while the program's preinit runs, and LD_DEBUG reports each
+# function the C library does not define as a failed lookup by the program.
+set(_lprog "/w/tier consumers/consumer-core-C")
+set(_lpre "      77:\tcalling preinit: ${_lprog}")
+set(_llookup "      77:\t${_lprog}: error: symbol lookup error: undefined symbol: __isoc99_printf (fatal)")
+set(_lversioned "      77:\t${_lprog}: error: symbol lookup error: undefined symbol: regexec, version GLIBC_2.3.4 (fatal)")
+set(_linit "      77:\tcalling init: /lib/libc.so.6")
+set(_ltrace "${_lpre}\n      77:\t\n${_llookup}\n${_lversioned}\n${_linit}")
+loader_only_image_records("${_ltrace}" Linux _why TRUE)
+expect_empty("runtime lookups during the program's preinit accepted on the sanitizer lane" "${_why}")
+loader_only_image_records("${_ltrace}" Linux _why FALSE)
+expect_nonempty("runtime lookups refused on an ordinary lane" "${_why}")
+loader_only_image_records("${_llookup}" Linux _why TRUE)
+expect_nonempty("a lookup with no preinit running refused" "${_why}")
+loader_only_image_records("${_lpre}\n${_linit}\n${_llookup}" Linux _why TRUE)
+expect_nonempty("a lookup after the preinit ended refused" "${_why}")
+string(REPLACE "      77:" "      78:" _l_other_pid "${_llookup}")
+loader_only_image_records("${_lpre}\n${_l_other_pid}" Linux _why TRUE)
+expect_nonempty("a lookup by another process refused" "${_why}")
+foreach(_injected
+    "      77:\t/w/lib/libmoq-core.so: error: symbol lookup error: undefined symbol: moq_session_create (fatal)"
+    "      77:\t${_lprog}: error: symbol lookup error: undefined symbol: __isoc99_printf (fatal) trailing"
+    "      77:\t${_lprog}: error while loading shared libraries: libmoq-core.so: cannot open shared object file"
+    "      77:\terror: symbol lookup error: undefined symbol: __isoc99_printf (fatal)"
+    "      77:\tw/tier consumers/consumer-core-C: error: symbol lookup error: undefined symbol: __isoc99_printf (fatal)")
+    loader_only_image_records("${_lpre}\n${_injected}" Linux _why TRUE)
+    expect_nonempty("sanitizer lane rejects injected record: ${_injected}" "${_why}")
+endforeach()
+
 # -- the named pre-main discriminator ---------------------------------------
 loader_is_missing_library(133
 "dyld[1]: Library not loaded: @rpath/libmoq-core.dylib

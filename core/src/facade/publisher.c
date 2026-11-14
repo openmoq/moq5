@@ -4237,11 +4237,19 @@ static moq_result_t track_install_retained(moq_pub_track_t *t, uint64_t group_id
     return MOQ_OK;
 }
 
-void moq_pub_retained_group_cfg_init(moq_pub_retained_group_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_pub_retained_group_cfg_init)(moq_pub_retained_group_cfg_t *cfg)
+{
+    moq_pub_retained_group_cfg_init_sized(cfg, MOQ_PUB_RETAINED_GROUP_CFG_V0_SIZE);
+}
+
+void moq_pub_retained_group_cfg_init_sized(moq_pub_retained_group_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 moq_result_t moq_pub_set_retained_group(moq_publisher_t *pub,
@@ -4251,7 +4259,7 @@ moq_result_t moq_pub_set_retained_group(moq_publisher_t *pub,
     if (!pub || !track || !cfg) return MOQ_ERR_INVAL;
     if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_pub_retained_group_cfg_t))
+    if (cfg->struct_size < MOQ_PUB_RETAINED_GROUP_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
     if (track->ended) return MOQ_ERR_WRONG_STATE;
     if (!cfg->objects || cfg->object_count == 0) return MOQ_ERR_INVAL;
@@ -6423,13 +6431,25 @@ bool moq_pub_namespace_accepted(const moq_publisher_t *pub,
            track->ns_entry->state == PUB_NS_ACCEPTED;
 }
 
-void moq_pub_publish_cfg_init(moq_pub_publish_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_pub_publish_cfg_init)(moq_pub_publish_cfg_t *cfg)
+{
+    moq_pub_publish_cfg_init_sized(cfg, MOQ_PUB_PUBLISH_CFG_V0_SIZE);
+}
+
+void moq_pub_publish_cfg_init_sized(moq_pub_publish_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
-    cfg->has_forward = true;
-    cfg->forward = true;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
+    /* Forwarding defaults to on. Set it only when the caller's struct
+     * holds the field. */
+    if (n >= offsetof(moq_pub_publish_cfg_t, forward) + sizeof(cfg->forward)) {
+        cfg->has_forward = true;
+        cfg->forward = true;
+    }
 }
 
 moq_result_t moq_pub_publish_track(moq_publisher_t *pub,
@@ -6440,7 +6460,7 @@ moq_result_t moq_pub_publish_track(moq_publisher_t *pub,
     if (!pub || !track || !cfg) return MOQ_ERR_INVAL;
     if (pub->in_fill_callback) return MOQ_ERR_WRONG_STATE;
     if (track->pub != pub) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_pub_publish_cfg_t)) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_PUB_PUBLISH_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     if (pub->closed) return MOQ_ERR_CLOSED;
     if (track->ended) return MOQ_ERR_WRONG_STATE;
     if (track->publish_requested) return MOQ_OK;   /* idempotent */

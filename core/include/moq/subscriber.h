@@ -41,7 +41,22 @@ typedef struct moq_sub_callbacks {
     void (*on_closed)(void *ctx, uint64_t error_code);
 } moq_sub_callbacks_t;
 
+/* MOQ_SUB_CALLBACKS_V0_SIZE is the layout through `on_closed`. It is what the
+ * symbol clears and stamps, and the smallest stamp the consuming call
+ * accepts. A caller built against this header reaches the whole struct: the
+ * same-name macro passes its sizeof to moq_sub_callbacks_init_sized(), which
+ * clears and stamps min(cfg_size, sizeof current) and touches nothing when
+ * cfg_size cannot hold struct_size. A binding that calls the symbol instead
+ * of compiling the macro reaches no later field; it calls the sized form with
+ * the size of its struct. */
+#define MOQ_SUB_CALLBACKS_V0_SIZE \
+    (offsetof(moq_sub_callbacks_t, on_closed) + \
+     sizeof(((const moq_sub_callbacks_t *)0)->on_closed))
 MOQ_API void moq_sub_callbacks_init(moq_sub_callbacks_t *cb);
+MOQ_API void moq_sub_callbacks_init_sized(
+    moq_sub_callbacks_t *cb, size_t cfg_size);
+#define moq_sub_callbacks_init(cfg) \
+    moq_sub_callbacks_init_sized((cfg), sizeof(*(cfg)))
 
 /* The peer accepted an outbound subscription update . Produced by the
  * library and BORROWED for the duration of the on_update_ok callback --
@@ -675,7 +690,26 @@ typedef struct moq_sub_status_cfg {
     size_t                  auth_token_count;
 } moq_sub_status_cfg_t;
 
+/* MOQ_SUB_STATUS_CFG_V0_SIZE is the smallest stamp the consuming call
+ * accepts: the layout before `auth_tokens`.
+ * MOQ_SUB_STATUS_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT is the layout through
+ * `auth_token_count`, which the symbol clears and stamps. A caller built
+ * against this header reaches the whole struct: the same-name macro passes
+ * its sizeof to moq_sub_status_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current) and touches nothing when cfg_size cannot hold
+ * struct_size. A binding that calls the symbol instead of compiling the macro
+ * reaches no later field; it calls the sized form with the size of its
+ * struct. */
+#define MOQ_SUB_STATUS_CFG_V0_SIZE \
+    offsetof(moq_sub_status_cfg_t, auth_tokens)
+#define MOQ_SUB_STATUS_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT \
+    (offsetof(moq_sub_status_cfg_t, auth_token_count) + \
+     sizeof(((const moq_sub_status_cfg_t *)0)->auth_token_count))
 MOQ_API void moq_sub_status_cfg_init(moq_sub_status_cfg_t *cfg);
+MOQ_API void moq_sub_status_cfg_init_sized(
+    moq_sub_status_cfg_t *cfg, size_t cfg_size);
+#define moq_sub_status_cfg_init(cfg) \
+    moq_sub_status_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 MOQ_API moq_result_t moq_sub_track_status(
     moq_subscriber_t *sub,
@@ -785,7 +819,26 @@ typedef struct moq_sub_fetch_cfg {
     size_t                  auth_token_count;
 } moq_sub_fetch_cfg_t;
 
+/* MOQ_SUB_FETCH_CFG_V0_SIZE is the smallest stamp the consuming call accepts:
+ * the layout before `auth_tokens`.
+ * MOQ_SUB_FETCH_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT is the layout through
+ * `auth_token_count`, which the symbol clears and stamps. A caller built
+ * against this header reaches the whole struct: the same-name macro passes
+ * its sizeof to moq_sub_fetch_cfg_init_sized(), which clears and stamps
+ * min(cfg_size, sizeof current) and touches nothing when cfg_size cannot hold
+ * struct_size. A binding that calls the symbol instead of compiling the macro
+ * reaches no later field; it calls the sized form with the size of its
+ * struct. */
+#define MOQ_SUB_FETCH_CFG_V0_SIZE \
+    offsetof(moq_sub_fetch_cfg_t, auth_tokens)
+#define MOQ_SUB_FETCH_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT \
+    (offsetof(moq_sub_fetch_cfg_t, auth_token_count) + \
+     sizeof(((const moq_sub_fetch_cfg_t *)0)->auth_token_count))
 MOQ_API void moq_sub_fetch_cfg_init(moq_sub_fetch_cfg_t *cfg);
+MOQ_API void moq_sub_fetch_cfg_init_sized(
+    moq_sub_fetch_cfg_t *cfg, size_t cfg_size);
+#define moq_sub_fetch_cfg_init(cfg) \
+    moq_sub_fetch_cfg_init_sized((cfg), sizeof(*(cfg)))
 
 MOQ_API moq_result_t moq_sub_fetch(
     moq_subscriber_t *sub,

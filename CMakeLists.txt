@@ -143,6 +143,7 @@ if(MSVC)
 endif()
 
 # -- Core (always built) -------------------------------------------
+include(cmake/MoqTierPkgConfig.cmake)
 add_subdirectory(core)
 
 # -- Simulation -----------------------------------------------------
@@ -198,6 +199,18 @@ endif()
 # -- MSF catalog parser ---------------------------------------------
 if(MOQ_BUILD_MSF)
     add_subdirectory(media/msf)
+endif()
+
+# -- Media tier package ---------------------------------------------
+# The media tier is the five parsers together. It is offered only when all of
+# them are built, so the file never names a subset. Static linking wants
+# dependents before dependencies.
+if(TARGET moq-loc AND TARGET moq-cmaf AND TARGET moq-mpeg2ts
+   AND TARGET moq-media-object AND TARGET moq-msf)
+    moq_install_tier_pc(libmoq-media
+        "MoQ media parsers: LOC, CMAF, MPEG-TS, media object and MSF catalog"
+        "libmoq-core"
+        "-lmoq-msf -lmoq-media-object -lmoq-cmaf -lmoq-mpeg2ts -lmoq-loc")
 endif()
 
 # -- moq_media_probe (black-box catalog-parse probe) ----------------

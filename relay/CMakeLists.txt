@@ -122,20 +122,8 @@ if(MOQ_BUILD_RELAY_TOOL OR MOQ_BUILD_TESTS)
 endif()
 
 # A minimal .pc avoids inheriting the enabled-component aggregate libmoq.pc.
+# libmoq-core.pc, which relay-core requires, is installed by the root build.
 file(RELATIVE_PATH MOQR_PC_UP "/${CMAKE_INSTALL_LIBDIR}/pkgconfig" "/")
-set(MOQR_PC_DEFINES "")
-if(NOT BUILD_SHARED_LIBS AND WIN32)
-    set(MOQR_PC_DEFINES "-DMOQ_STATIC")
-endif()
-set(MOQR_PC_NAME libmoq-core)
-set(MOQR_PC_DESCRIPTION "Sans-I/O MoQ protocol core")
-set(MOQR_PC_REQUIRES "")
-set(MOQR_PC_LIBRARY moq-core)
-set(MOQR_PC_PRIVATE "")
-configure_file(cmake/libmoq-relay.pc.in libmoq-core.pc @ONLY)
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/libmoq-core.pc"
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
-
 foreach(component IN ITEMS relay-core relay)
     if(component STREQUAL "relay" AND NOT MOQ_BUILD_RELAY_RUNTIME)
         continue()

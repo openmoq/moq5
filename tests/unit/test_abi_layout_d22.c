@@ -23,6 +23,7 @@
 #include <moq/transport_bridge.h>
 #include <moq/control_d18.h>
 #include "publisher_old_layout.h"
+#include "cfg_init_frozen_layout.h"
 
 #if defined(__has_include)
 #  if __has_include(<moq/loc.h>)
@@ -1219,6 +1220,571 @@ _Static_assert(offsetof(moq_media_track_cfg_t, track_properties) ==
                                   mpeg2ts_forward_before_random_access),
                "moq_media_track_cfg_t.track_properties: at the MPEG2TS-era sizeof");
 #endif
+
+/* Config initializers. Each exported symbol stamps one frozen layout, named
+ * here by its last field; an appended field must not move that boundary. Where
+ * the consuming call accepts an older, shorter layout, that floor is pinned to
+ * the field it ends before and may not exceed what the symbol stamps. */
+#define PIN_INIT(T, EXTENT, last)                                              \
+    _Static_assert((EXTENT) == ABI_FIELD_END(T, last),                         \
+                   #T ": the initializer symbol's layout ends at " #last);     \
+    _Static_assert((EXTENT) <= sizeof(T),                                      \
+                   #T ": the initializer symbol's layout exceeds the struct")
+#define PIN_INIT_FLOOR(T, V0, EXTENT, later)                                   \
+    _Static_assert((V0) == offsetof(T, later),                                 \
+                   #T ": the accepted floor ends before " #later);             \
+    _Static_assert((V0) <= (EXTENT),                                           \
+                   #T ": the accepted floor exceeds the symbol's stamp")
+PIN_INIT(moq_accept_subscribe_cfg_t,
+         MOQ_ACCEPT_SUBSCRIBE_CFG_V0_SIZE, track_properties);
+PIN_INIT(moq_reject_subscribe_cfg_t,
+         MOQ_REJECT_SUBSCRIBE_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_INIT_FLOOR(moq_reject_subscribe_cfg_t,
+               MOQ_REJECT_SUBSCRIBE_CFG_V0_SIZE,
+               MOQ_REJECT_SUBSCRIBE_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_INIT(moq_done_subscribe_cfg_t,
+         MOQ_DONE_SUBSCRIBE_CFG_V0_SIZE, reason);
+PIN_INIT(moq_accept_fetch_cfg_t,
+         MOQ_ACCEPT_FETCH_CFG_SIZE_THROUGH_TRACK_PROPERTIES, track_properties);
+PIN_INIT_FLOOR(moq_accept_fetch_cfg_t,
+               MOQ_ACCEPT_FETCH_CFG_V0_SIZE,
+               MOQ_ACCEPT_FETCH_CFG_SIZE_THROUGH_TRACK_PROPERTIES, track_properties);
+PIN_INIT(moq_reject_fetch_cfg_t,
+         MOQ_REJECT_FETCH_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_INIT_FLOOR(moq_reject_fetch_cfg_t,
+               MOQ_REJECT_FETCH_CFG_V0_SIZE,
+               MOQ_REJECT_FETCH_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_INIT(moq_fetch_object_cfg_t,
+         MOQ_FETCH_OBJECT_CFG_V0_SIZE, properties);
+PIN_INIT(moq_fetch_update_cfg_t,
+         MOQ_FETCH_UPDATE_CFG_V0_SIZE, auth_token_count);
+PIN_INIT(moq_request_goaway_cfg_t,
+         MOQ_REQUEST_GOAWAY_CFG_V0_SIZE, timeout_ms);
+PIN_INIT(moq_reject_publish_cfg_t,
+         MOQ_REJECT_PUBLISH_CFG_V0_SIZE, retry_after_ms);
+PIN_INIT(moq_accept_namespace_cfg_t,
+         MOQ_ACCEPT_NAMESPACE_CFG_V0_SIZE, struct_size);
+PIN_INIT(moq_reject_namespace_cfg_t,
+         MOQ_REJECT_NAMESPACE_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_INIT_FLOOR(moq_reject_namespace_cfg_t,
+               MOQ_REJECT_NAMESPACE_CFG_V0_SIZE,
+               MOQ_REJECT_NAMESPACE_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_INIT(moq_cancel_namespace_cfg_t,
+         MOQ_CANCEL_NAMESPACE_CFG_V0_SIZE, reason);
+PIN_INIT(moq_reject_track_status_cfg_t,
+         MOQ_REJECT_TRACK_STATUS_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_INIT_FLOOR(moq_reject_track_status_cfg_t,
+               MOQ_REJECT_TRACK_STATUS_CFG_V0_SIZE,
+               MOQ_REJECT_TRACK_STATUS_CFG_SIZE_THROUGH_REDIRECT, reason);
+PIN_INIT(moq_subscribe_namespace_cfg_t,
+         MOQ_SUBSCRIBE_NAMESPACE_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT, auth_token_count);
+PIN_INIT_FLOOR(moq_subscribe_namespace_cfg_t,
+               MOQ_SUBSCRIBE_NAMESPACE_CFG_V0_SIZE,
+               MOQ_SUBSCRIBE_NAMESPACE_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT, auth_tokens);
+PIN_INIT(moq_accept_ns_sub_cfg_t,
+         MOQ_ACCEPT_NS_SUB_CFG_V0_SIZE, struct_size);
+PIN_INIT(moq_reject_ns_sub_cfg_t,
+         MOQ_REJECT_NS_SUB_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_INIT_FLOOR(moq_reject_ns_sub_cfg_t,
+               MOQ_REJECT_NS_SUB_CFG_V0_SIZE,
+               MOQ_REJECT_NS_SUB_CFG_SIZE_THROUGH_REDIRECT, can_retry);
+PIN_INIT(moq_accept_subscribe_tracks_cfg_t,
+         MOQ_ACCEPT_SUBSCRIBE_TRACKS_CFG_V0_SIZE, struct_size);
+PIN_INIT(moq_reject_subscribe_tracks_cfg_t,
+         MOQ_REJECT_SUBSCRIBE_TRACKS_CFG_V0_SIZE, reason);
+PIN_INIT(moq_finish_publish_cfg_t,
+         MOQ_FINISH_PUBLISH_CFG_V0_SIZE, reason);
+PIN_INIT(moq_begin_object_cfg_t,
+         MOQ_BEGIN_OBJECT_CFG_V0_SIZE, properties);
+PIN_INIT(moq_pub_publish_cfg_t,
+         MOQ_PUB_PUBLISH_CFG_V0_SIZE, auth_token_count);
+PIN_INIT(moq_pub_retained_group_cfg_t,
+         MOQ_PUB_RETAINED_GROUP_CFG_V0_SIZE, object_count);
+PIN_INIT(moq_sub_callbacks_t,
+         MOQ_SUB_CALLBACKS_V0_SIZE, on_closed);
+PIN_INIT(moq_sub_status_cfg_t,
+         MOQ_SUB_STATUS_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT, auth_token_count);
+PIN_INIT_FLOOR(moq_sub_status_cfg_t,
+               MOQ_SUB_STATUS_CFG_V0_SIZE,
+               MOQ_SUB_STATUS_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT, auth_tokens);
+PIN_INIT(moq_sub_fetch_cfg_t,
+         MOQ_SUB_FETCH_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT, auth_token_count);
+PIN_INIT_FLOOR(moq_sub_fetch_cfg_t,
+               MOQ_SUB_FETCH_CFG_V0_SIZE,
+               MOQ_SUB_FETCH_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT, auth_tokens);
+
+/* Config initializers against frozen declarations. cfg_init_frozen_layout.h
+ * declares each config, and each record or scalar it embeds, in plain C
+ * types as a binary built at that size declares it. A field that moves or
+ * changes width, an embedded record or typedef that changes, a frozen size
+ * that ends at a different field of that declaration, or a symbol
+ * that would write past such a caller's struct breaks one of these. */
+_Static_assert(sizeof(size_t) == sizeof(void *), "size_t is pointer-wide");
+#define PIN_FROZEN_FIELD(T, M, f)                                              \
+    _Static_assert(offsetof(T, f) == offsetof(M, f),                           \
+                   #T "." #f ": moved from its frozen offset");                \
+    _Static_assert(sizeof(((T *)0)->f) == sizeof(((M *)0)->f),                 \
+                   #T "." #f ": changed width")
+#define PIN_FROZEN_RECORD(T, M)                                                \
+    _Static_assert(sizeof(T) == sizeof(M), #T ": embedded record changed size"); \
+    _Static_assert(_Alignof(T) == _Alignof(M),                                 \
+                   #T ": embedded record changed alignment")
+#define PIN_FROZEN_EXTENT(T, M, EXTENT, last)                                  \
+    _Static_assert((EXTENT) == ABI_FIELD_END(M, last),                         \
+                   #T ": the symbol's size left the frozen " #last);           \
+    _Static_assert((EXTENT) <= sizeof(M),                                      \
+                   #T ": the symbol writes past a frozen caller's struct");    \
+    _Static_assert(sizeof(T) >= sizeof(M), #T ": shrank below its frozen layout"); \
+    _Static_assert(_Alignof(T) >= _Alignof(M), #T ": lost alignment")
+#define PIN_FROZEN_FLOOR(T, M, V0, later)                                      \
+    _Static_assert((V0) == offsetof(M, later),                                 \
+                   #T ": the accepted floor left the frozen " #later)
+
+PIN_FROZEN_FIELD(moq_bytes_t, test_frozen_bytes_t, data);
+PIN_FROZEN_FIELD(moq_bytes_t, test_frozen_bytes_t, len);
+PIN_FROZEN_RECORD(moq_bytes_t, test_frozen_bytes_t);
+_Static_assert(sizeof(test_frozen_bytes_t) == 2 * sizeof(void *),
+               "a byte span is a pointer and a length");
+PIN_FROZEN_FIELD(moq_namespace_t, test_frozen_namespace_t, parts);
+PIN_FROZEN_FIELD(moq_namespace_t, test_frozen_namespace_t, count);
+PIN_FROZEN_RECORD(moq_namespace_t, test_frozen_namespace_t);
+_Static_assert(sizeof(test_frozen_namespace_t) == 2 * sizeof(void *),
+               "a namespace is a pointer and a count");
+PIN_FROZEN_FIELD(moq_redirect_target_t, test_frozen_redirect_t, connect_uri);
+PIN_FROZEN_FIELD(moq_redirect_target_t, test_frozen_redirect_t, track_namespace);
+PIN_FROZEN_FIELD(moq_redirect_target_t, test_frozen_redirect_t, track_name);
+PIN_FROZEN_RECORD(moq_redirect_target_t, test_frozen_redirect_t);
+_Static_assert(sizeof(test_frozen_redirect_t) == 6 * sizeof(void *),
+               "a redirect target is three two-word records");
+_Static_assert(sizeof(moq_request_error_t) == sizeof(uint64_t),
+               "request error code width");
+_Static_assert(sizeof(moq_group_order_t) == sizeof(uint32_t), "group order width");
+_Static_assert(sizeof(moq_namespace_interest_t) == sizeof(uint32_t),
+               "namespace interest width");
+
+PIN_FROZEN_FIELD(moq_accept_subscribe_cfg_t, test_frozen_accept_subscribe_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_accept_subscribe_cfg_t,
+                 test_frozen_accept_subscribe_cfg_t, has_track_alias);
+PIN_FROZEN_FIELD(moq_accept_subscribe_cfg_t, test_frozen_accept_subscribe_cfg_t, track_alias);
+PIN_FROZEN_FIELD(moq_accept_subscribe_cfg_t, test_frozen_accept_subscribe_cfg_t, has_largest);
+PIN_FROZEN_FIELD(moq_accept_subscribe_cfg_t, test_frozen_accept_subscribe_cfg_t, largest_group);
+PIN_FROZEN_FIELD(moq_accept_subscribe_cfg_t,
+                 test_frozen_accept_subscribe_cfg_t, largest_object);
+PIN_FROZEN_FIELD(moq_accept_subscribe_cfg_t, test_frozen_accept_subscribe_cfg_t, has_expires);
+PIN_FROZEN_FIELD(moq_accept_subscribe_cfg_t, test_frozen_accept_subscribe_cfg_t, expires_ms);
+PIN_FROZEN_FIELD(moq_accept_subscribe_cfg_t,
+                 test_frozen_accept_subscribe_cfg_t, track_properties);
+PIN_FROZEN_EXTENT(moq_accept_subscribe_cfg_t, test_frozen_accept_subscribe_cfg_t,
+                  MOQ_ACCEPT_SUBSCRIBE_CFG_V0_SIZE, track_properties);
+PIN_FROZEN_FIELD(moq_reject_subscribe_cfg_t, test_frozen_reject_subscribe_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_reject_subscribe_cfg_t, test_frozen_reject_subscribe_cfg_t, error_code);
+PIN_FROZEN_FIELD(moq_reject_subscribe_cfg_t, test_frozen_reject_subscribe_cfg_t, reason);
+PIN_FROZEN_FIELD(moq_reject_subscribe_cfg_t, test_frozen_reject_subscribe_cfg_t, can_retry);
+PIN_FROZEN_FIELD(moq_reject_subscribe_cfg_t,
+                 test_frozen_reject_subscribe_cfg_t, retry_after_ms);
+PIN_FROZEN_FIELD(moq_reject_subscribe_cfg_t, test_frozen_reject_subscribe_cfg_t, redirect);
+PIN_FROZEN_EXTENT(moq_reject_subscribe_cfg_t, test_frozen_reject_subscribe_cfg_t,
+                  MOQ_REJECT_SUBSCRIBE_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_FROZEN_FLOOR(moq_reject_subscribe_cfg_t, test_frozen_reject_subscribe_cfg_t,
+                 MOQ_REJECT_SUBSCRIBE_CFG_V0_SIZE, redirect);
+PIN_FROZEN_FIELD(moq_done_subscribe_cfg_t, test_frozen_done_subscribe_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_done_subscribe_cfg_t, test_frozen_done_subscribe_cfg_t, status_code);
+PIN_FROZEN_FIELD(moq_done_subscribe_cfg_t, test_frozen_done_subscribe_cfg_t, stream_count);
+PIN_FROZEN_FIELD(moq_done_subscribe_cfg_t, test_frozen_done_subscribe_cfg_t, reason);
+PIN_FROZEN_EXTENT(moq_done_subscribe_cfg_t, test_frozen_done_subscribe_cfg_t,
+                  MOQ_DONE_SUBSCRIBE_CFG_V0_SIZE, reason);
+PIN_FROZEN_FIELD(moq_accept_fetch_cfg_t, test_frozen_accept_fetch_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_accept_fetch_cfg_t, test_frozen_accept_fetch_cfg_t, end_of_track);
+PIN_FROZEN_FIELD(moq_accept_fetch_cfg_t, test_frozen_accept_fetch_cfg_t, end_group);
+PIN_FROZEN_FIELD(moq_accept_fetch_cfg_t, test_frozen_accept_fetch_cfg_t, end_object);
+PIN_FROZEN_FIELD(moq_accept_fetch_cfg_t, test_frozen_accept_fetch_cfg_t, empty);
+PIN_FROZEN_FIELD(moq_accept_fetch_cfg_t, test_frozen_accept_fetch_cfg_t, track_properties);
+PIN_FROZEN_EXTENT(moq_accept_fetch_cfg_t, test_frozen_accept_fetch_cfg_t,
+                  MOQ_ACCEPT_FETCH_CFG_SIZE_THROUGH_TRACK_PROPERTIES, track_properties);
+PIN_FROZEN_FLOOR(moq_accept_fetch_cfg_t, test_frozen_accept_fetch_cfg_t,
+                 MOQ_ACCEPT_FETCH_CFG_V0_SIZE, track_properties);
+PIN_FROZEN_FIELD(moq_reject_fetch_cfg_t, test_frozen_reject_fetch_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_reject_fetch_cfg_t, test_frozen_reject_fetch_cfg_t, error_code);
+PIN_FROZEN_FIELD(moq_reject_fetch_cfg_t, test_frozen_reject_fetch_cfg_t, reason);
+PIN_FROZEN_FIELD(moq_reject_fetch_cfg_t, test_frozen_reject_fetch_cfg_t, can_retry);
+PIN_FROZEN_FIELD(moq_reject_fetch_cfg_t, test_frozen_reject_fetch_cfg_t, retry_after_ms);
+PIN_FROZEN_FIELD(moq_reject_fetch_cfg_t, test_frozen_reject_fetch_cfg_t, redirect);
+PIN_FROZEN_EXTENT(moq_reject_fetch_cfg_t, test_frozen_reject_fetch_cfg_t,
+                  MOQ_REJECT_FETCH_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_FROZEN_FLOOR(moq_reject_fetch_cfg_t, test_frozen_reject_fetch_cfg_t,
+                 MOQ_REJECT_FETCH_CFG_V0_SIZE, redirect);
+PIN_FROZEN_FIELD(moq_fetch_object_cfg_t, test_frozen_fetch_object_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_fetch_object_cfg_t, test_frozen_fetch_object_cfg_t, group_id);
+PIN_FROZEN_FIELD(moq_fetch_object_cfg_t, test_frozen_fetch_object_cfg_t, subgroup_id);
+PIN_FROZEN_FIELD(moq_fetch_object_cfg_t, test_frozen_fetch_object_cfg_t, object_id);
+PIN_FROZEN_FIELD(moq_fetch_object_cfg_t, test_frozen_fetch_object_cfg_t, publisher_priority);
+PIN_FROZEN_FIELD(moq_fetch_object_cfg_t, test_frozen_fetch_object_cfg_t, datagram);
+PIN_FROZEN_FIELD(moq_fetch_object_cfg_t, test_frozen_fetch_object_cfg_t, _pad);
+PIN_FROZEN_FIELD(moq_fetch_object_cfg_t, test_frozen_fetch_object_cfg_t, payload);
+PIN_FROZEN_FIELD(moq_fetch_object_cfg_t, test_frozen_fetch_object_cfg_t, properties);
+PIN_FROZEN_EXTENT(moq_fetch_object_cfg_t, test_frozen_fetch_object_cfg_t,
+                  MOQ_FETCH_OBJECT_CFG_V0_SIZE, properties);
+PIN_FROZEN_FIELD(moq_fetch_update_cfg_t, test_frozen_fetch_update_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_fetch_update_cfg_t,
+                 test_frozen_fetch_update_cfg_t, has_subscriber_priority);
+PIN_FROZEN_FIELD(moq_fetch_update_cfg_t, test_frozen_fetch_update_cfg_t, subscriber_priority);
+PIN_FROZEN_FIELD(moq_fetch_update_cfg_t, test_frozen_fetch_update_cfg_t, _reserved);
+PIN_FROZEN_FIELD(moq_fetch_update_cfg_t, test_frozen_fetch_update_cfg_t, auth_tokens);
+PIN_FROZEN_FIELD(moq_fetch_update_cfg_t, test_frozen_fetch_update_cfg_t, auth_token_count);
+PIN_FROZEN_EXTENT(moq_fetch_update_cfg_t, test_frozen_fetch_update_cfg_t,
+                  MOQ_FETCH_UPDATE_CFG_V0_SIZE, auth_token_count);
+PIN_FROZEN_FIELD(moq_request_goaway_cfg_t, test_frozen_request_goaway_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_request_goaway_cfg_t, test_frozen_request_goaway_cfg_t, new_session_uri);
+PIN_FROZEN_FIELD(moq_request_goaway_cfg_t, test_frozen_request_goaway_cfg_t, timeout_ms);
+PIN_FROZEN_EXTENT(moq_request_goaway_cfg_t, test_frozen_request_goaway_cfg_t,
+                  MOQ_REQUEST_GOAWAY_CFG_V0_SIZE, timeout_ms);
+PIN_FROZEN_FIELD(moq_reject_publish_cfg_t, test_frozen_reject_publish_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_reject_publish_cfg_t, test_frozen_reject_publish_cfg_t, error_code);
+PIN_FROZEN_FIELD(moq_reject_publish_cfg_t, test_frozen_reject_publish_cfg_t, reason);
+PIN_FROZEN_FIELD(moq_reject_publish_cfg_t, test_frozen_reject_publish_cfg_t, can_retry);
+PIN_FROZEN_FIELD(moq_reject_publish_cfg_t, test_frozen_reject_publish_cfg_t, retry_after_ms);
+PIN_FROZEN_EXTENT(moq_reject_publish_cfg_t, test_frozen_reject_publish_cfg_t,
+                  MOQ_REJECT_PUBLISH_CFG_V0_SIZE, retry_after_ms);
+PIN_FROZEN_FIELD(moq_accept_namespace_cfg_t, test_frozen_accept_namespace_cfg_t, struct_size);
+PIN_FROZEN_EXTENT(moq_accept_namespace_cfg_t, test_frozen_accept_namespace_cfg_t,
+                  MOQ_ACCEPT_NAMESPACE_CFG_V0_SIZE, struct_size);
+PIN_FROZEN_FIELD(moq_reject_namespace_cfg_t, test_frozen_reject_namespace_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_reject_namespace_cfg_t, test_frozen_reject_namespace_cfg_t, error_code);
+PIN_FROZEN_FIELD(moq_reject_namespace_cfg_t, test_frozen_reject_namespace_cfg_t, reason);
+PIN_FROZEN_FIELD(moq_reject_namespace_cfg_t, test_frozen_reject_namespace_cfg_t, can_retry);
+PIN_FROZEN_FIELD(moq_reject_namespace_cfg_t,
+                 test_frozen_reject_namespace_cfg_t, retry_after_ms);
+PIN_FROZEN_FIELD(moq_reject_namespace_cfg_t, test_frozen_reject_namespace_cfg_t, redirect);
+PIN_FROZEN_EXTENT(moq_reject_namespace_cfg_t, test_frozen_reject_namespace_cfg_t,
+                  MOQ_REJECT_NAMESPACE_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_FROZEN_FLOOR(moq_reject_namespace_cfg_t, test_frozen_reject_namespace_cfg_t,
+                 MOQ_REJECT_NAMESPACE_CFG_V0_SIZE, redirect);
+PIN_FROZEN_FIELD(moq_cancel_namespace_cfg_t, test_frozen_cancel_namespace_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_cancel_namespace_cfg_t, test_frozen_cancel_namespace_cfg_t, error_code);
+PIN_FROZEN_FIELD(moq_cancel_namespace_cfg_t, test_frozen_cancel_namespace_cfg_t, reason);
+PIN_FROZEN_EXTENT(moq_cancel_namespace_cfg_t, test_frozen_cancel_namespace_cfg_t,
+                  MOQ_CANCEL_NAMESPACE_CFG_V0_SIZE, reason);
+PIN_FROZEN_FIELD(moq_reject_track_status_cfg_t,
+                 test_frozen_reject_track_status_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_reject_track_status_cfg_t,
+                 test_frozen_reject_track_status_cfg_t, error_code);
+PIN_FROZEN_FIELD(moq_reject_track_status_cfg_t, test_frozen_reject_track_status_cfg_t, reason);
+PIN_FROZEN_FIELD(moq_reject_track_status_cfg_t,
+                 test_frozen_reject_track_status_cfg_t, can_retry);
+PIN_FROZEN_FIELD(moq_reject_track_status_cfg_t,
+                 test_frozen_reject_track_status_cfg_t, retry_after_ms);
+PIN_FROZEN_FIELD(moq_reject_track_status_cfg_t,
+                 test_frozen_reject_track_status_cfg_t, redirect);
+PIN_FROZEN_EXTENT(moq_reject_track_status_cfg_t, test_frozen_reject_track_status_cfg_t,
+                  MOQ_REJECT_TRACK_STATUS_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_FROZEN_FLOOR(moq_reject_track_status_cfg_t, test_frozen_reject_track_status_cfg_t,
+                 MOQ_REJECT_TRACK_STATUS_CFG_V0_SIZE, reason);
+PIN_FROZEN_FIELD(moq_subscribe_namespace_cfg_t,
+                 test_frozen_subscribe_namespace_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_subscribe_namespace_cfg_t,
+                 test_frozen_subscribe_namespace_cfg_t, track_namespace_prefix);
+PIN_FROZEN_FIELD(moq_subscribe_namespace_cfg_t,
+                 test_frozen_subscribe_namespace_cfg_t, namespace_interest);
+PIN_FROZEN_FIELD(moq_subscribe_namespace_cfg_t,
+                 test_frozen_subscribe_namespace_cfg_t, auth_tokens);
+PIN_FROZEN_FIELD(moq_subscribe_namespace_cfg_t,
+                 test_frozen_subscribe_namespace_cfg_t, auth_token_count);
+PIN_FROZEN_EXTENT(moq_subscribe_namespace_cfg_t, test_frozen_subscribe_namespace_cfg_t,
+                  MOQ_SUBSCRIBE_NAMESPACE_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT, auth_token_count);
+PIN_FROZEN_FLOOR(moq_subscribe_namespace_cfg_t, test_frozen_subscribe_namespace_cfg_t,
+                 MOQ_SUBSCRIBE_NAMESPACE_CFG_V0_SIZE, auth_tokens);
+PIN_FROZEN_FIELD(moq_accept_ns_sub_cfg_t, test_frozen_accept_ns_sub_cfg_t, struct_size);
+PIN_FROZEN_EXTENT(moq_accept_ns_sub_cfg_t, test_frozen_accept_ns_sub_cfg_t,
+                  MOQ_ACCEPT_NS_SUB_CFG_V0_SIZE, struct_size);
+PIN_FROZEN_FIELD(moq_reject_ns_sub_cfg_t, test_frozen_reject_ns_sub_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_reject_ns_sub_cfg_t, test_frozen_reject_ns_sub_cfg_t, error_code);
+PIN_FROZEN_FIELD(moq_reject_ns_sub_cfg_t, test_frozen_reject_ns_sub_cfg_t, reason);
+PIN_FROZEN_FIELD(moq_reject_ns_sub_cfg_t, test_frozen_reject_ns_sub_cfg_t, can_retry);
+PIN_FROZEN_FIELD(moq_reject_ns_sub_cfg_t, test_frozen_reject_ns_sub_cfg_t, retry_after_ms);
+PIN_FROZEN_FIELD(moq_reject_ns_sub_cfg_t, test_frozen_reject_ns_sub_cfg_t, redirect);
+PIN_FROZEN_EXTENT(moq_reject_ns_sub_cfg_t, test_frozen_reject_ns_sub_cfg_t,
+                  MOQ_REJECT_NS_SUB_CFG_SIZE_THROUGH_REDIRECT, redirect);
+PIN_FROZEN_FLOOR(moq_reject_ns_sub_cfg_t, test_frozen_reject_ns_sub_cfg_t,
+                 MOQ_REJECT_NS_SUB_CFG_V0_SIZE, can_retry);
+PIN_FROZEN_FIELD(moq_accept_subscribe_tracks_cfg_t,
+                 test_frozen_accept_subscribe_tracks_cfg_t, struct_size);
+PIN_FROZEN_EXTENT(moq_accept_subscribe_tracks_cfg_t, test_frozen_accept_subscribe_tracks_cfg_t,
+                  MOQ_ACCEPT_SUBSCRIBE_TRACKS_CFG_V0_SIZE, struct_size);
+PIN_FROZEN_FIELD(moq_reject_subscribe_tracks_cfg_t,
+                 test_frozen_reject_subscribe_tracks_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_reject_subscribe_tracks_cfg_t,
+                 test_frozen_reject_subscribe_tracks_cfg_t, error_code);
+PIN_FROZEN_FIELD(moq_reject_subscribe_tracks_cfg_t,
+                 test_frozen_reject_subscribe_tracks_cfg_t, reason);
+PIN_FROZEN_EXTENT(moq_reject_subscribe_tracks_cfg_t, test_frozen_reject_subscribe_tracks_cfg_t,
+                  MOQ_REJECT_SUBSCRIBE_TRACKS_CFG_V0_SIZE, reason);
+PIN_FROZEN_FIELD(moq_finish_publish_cfg_t, test_frozen_finish_publish_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_finish_publish_cfg_t, test_frozen_finish_publish_cfg_t, status_code);
+PIN_FROZEN_FIELD(moq_finish_publish_cfg_t, test_frozen_finish_publish_cfg_t, stream_count);
+PIN_FROZEN_FIELD(moq_finish_publish_cfg_t, test_frozen_finish_publish_cfg_t, reason);
+PIN_FROZEN_EXTENT(moq_finish_publish_cfg_t, test_frozen_finish_publish_cfg_t,
+                  MOQ_FINISH_PUBLISH_CFG_V0_SIZE, reason);
+PIN_FROZEN_FIELD(moq_begin_object_cfg_t, test_frozen_begin_object_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_begin_object_cfg_t, test_frozen_begin_object_cfg_t, object_id);
+PIN_FROZEN_FIELD(moq_begin_object_cfg_t, test_frozen_begin_object_cfg_t, payload_length);
+PIN_FROZEN_FIELD(moq_begin_object_cfg_t, test_frozen_begin_object_cfg_t, properties);
+PIN_FROZEN_EXTENT(moq_begin_object_cfg_t, test_frozen_begin_object_cfg_t,
+                  MOQ_BEGIN_OBJECT_CFG_V0_SIZE, properties);
+PIN_FROZEN_FIELD(moq_pub_publish_cfg_t, test_frozen_pub_publish_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_pub_publish_cfg_t, test_frozen_pub_publish_cfg_t, has_track_alias);
+PIN_FROZEN_FIELD(moq_pub_publish_cfg_t, test_frozen_pub_publish_cfg_t, track_alias);
+PIN_FROZEN_FIELD(moq_pub_publish_cfg_t, test_frozen_pub_publish_cfg_t, has_forward);
+PIN_FROZEN_FIELD(moq_pub_publish_cfg_t, test_frozen_pub_publish_cfg_t, forward);
+PIN_FROZEN_FIELD(moq_pub_publish_cfg_t, test_frozen_pub_publish_cfg_t, track_properties);
+PIN_FROZEN_FIELD(moq_pub_publish_cfg_t, test_frozen_pub_publish_cfg_t, auth_tokens);
+PIN_FROZEN_FIELD(moq_pub_publish_cfg_t, test_frozen_pub_publish_cfg_t, auth_token_count);
+PIN_FROZEN_EXTENT(moq_pub_publish_cfg_t, test_frozen_pub_publish_cfg_t,
+                  MOQ_PUB_PUBLISH_CFG_V0_SIZE, auth_token_count);
+PIN_FROZEN_FIELD(moq_pub_retained_group_cfg_t,
+                 test_frozen_pub_retained_group_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_pub_retained_group_cfg_t, test_frozen_pub_retained_group_cfg_t, group_id);
+PIN_FROZEN_FIELD(moq_pub_retained_group_cfg_t, test_frozen_pub_retained_group_cfg_t, objects);
+PIN_FROZEN_FIELD(moq_pub_retained_group_cfg_t,
+                 test_frozen_pub_retained_group_cfg_t, object_count);
+PIN_FROZEN_EXTENT(moq_pub_retained_group_cfg_t, test_frozen_pub_retained_group_cfg_t,
+                  MOQ_PUB_RETAINED_GROUP_CFG_V0_SIZE, object_count);
+PIN_FROZEN_FIELD(moq_sub_callbacks_t, test_frozen_sub_callbacks_t, struct_size);
+PIN_FROZEN_FIELD(moq_sub_callbacks_t, test_frozen_sub_callbacks_t, ctx);
+PIN_FROZEN_FIELD(moq_sub_callbacks_t, test_frozen_sub_callbacks_t, on_subscribed);
+PIN_FROZEN_FIELD(moq_sub_callbacks_t, test_frozen_sub_callbacks_t, on_subscribe_error);
+PIN_FROZEN_FIELD(moq_sub_callbacks_t, test_frozen_sub_callbacks_t, on_draining);
+PIN_FROZEN_FIELD(moq_sub_callbacks_t, test_frozen_sub_callbacks_t, on_closed);
+PIN_FROZEN_EXTENT(moq_sub_callbacks_t, test_frozen_sub_callbacks_t,
+                  MOQ_SUB_CALLBACKS_V0_SIZE, on_closed);
+PIN_FROZEN_FIELD(moq_sub_status_cfg_t, test_frozen_sub_status_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_sub_status_cfg_t, test_frozen_sub_status_cfg_t, track_namespace);
+PIN_FROZEN_FIELD(moq_sub_status_cfg_t, test_frozen_sub_status_cfg_t, track_name);
+PIN_FROZEN_FIELD(moq_sub_status_cfg_t, test_frozen_sub_status_cfg_t, auth_tokens);
+PIN_FROZEN_FIELD(moq_sub_status_cfg_t, test_frozen_sub_status_cfg_t, auth_token_count);
+PIN_FROZEN_EXTENT(moq_sub_status_cfg_t, test_frozen_sub_status_cfg_t,
+                  MOQ_SUB_STATUS_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT, auth_token_count);
+PIN_FROZEN_FLOOR(moq_sub_status_cfg_t, test_frozen_sub_status_cfg_t,
+                 MOQ_SUB_STATUS_CFG_V0_SIZE, auth_tokens);
+PIN_FROZEN_FIELD(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t, struct_size);
+PIN_FROZEN_FIELD(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t, track_namespace);
+PIN_FROZEN_FIELD(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t, track_name);
+PIN_FROZEN_FIELD(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t, start_group);
+PIN_FROZEN_FIELD(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t, start_object);
+PIN_FROZEN_FIELD(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t, end_group);
+PIN_FROZEN_FIELD(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t, end_object);
+PIN_FROZEN_FIELD(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t, group_order);
+PIN_FROZEN_FIELD(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t, has_subscriber_priority);
+PIN_FROZEN_FIELD(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t, subscriber_priority);
+PIN_FROZEN_FIELD(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t, auth_tokens);
+PIN_FROZEN_FIELD(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t, auth_token_count);
+PIN_FROZEN_EXTENT(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t,
+                  MOQ_SUB_FETCH_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT, auth_token_count);
+PIN_FROZEN_FLOOR(moq_sub_fetch_cfg_t, test_frozen_sub_fetch_cfg_t,
+                 MOQ_SUB_FETCH_CFG_V0_SIZE, auth_tokens);
+
+/* Event and action detail floors. Each names the last field of the frozen
+ * prefix; the first appended field starts at or after it. */
+#define PIN_DETAIL_FLOOR(T, V0, last)                                          \
+    _Static_assert((V0) == ABI_FIELD_END(T, last),                             \
+                   #T ": the frozen detail prefix ends at " #last);            \
+    _Static_assert((V0) <= sizeof(T), #T ": the frozen prefix exceeds the record")
+#define PIN_DETAIL_TAIL(T, V0, first)                                          \
+    _Static_assert(offsetof(T, first) >= (V0),                                 \
+                   #T ": " #first " starts inside the frozen prefix")
+PIN_DETAIL_FLOOR(moq_setup_complete_event_t,
+                 MOQ_SETUP_COMPLETE_EVENT_V0_SIZE, token_count);
+PIN_DETAIL_FLOOR(moq_session_closed_event_t,
+                 MOQ_SESSION_CLOSED_EVENT_V0_SIZE, reason);
+PIN_DETAIL_FLOOR(moq_subscribe_request_event_t,
+                 MOQ_SUBSCRIBE_REQUEST_EVENT_V0_SIZE, new_group_request);
+PIN_DETAIL_TAIL(moq_subscribe_request_event_t,
+                MOQ_SUBSCRIBE_REQUEST_EVENT_V0_SIZE, options);
+PIN_DETAIL_FLOOR(moq_subscribe_ok_event_t,
+                 MOQ_SUBSCRIBE_OK_EVENT_V0_SIZE, dynamic_groups);
+PIN_DETAIL_TAIL(moq_subscribe_ok_event_t,
+                MOQ_SUBSCRIBE_OK_EVENT_V0_SIZE, publisher_group_order);
+PIN_DETAIL_FLOOR(moq_subscribe_error_event_t,
+                 MOQ_SUBSCRIBE_ERROR_EVENT_V0_SIZE, reason);
+PIN_DETAIL_FLOOR(moq_request_ready_event_t,
+                 MOQ_REQUEST_READY_EVENT_V0_SIZE, available_requests);
+PIN_DETAIL_FLOOR(moq_object_received_event_t,
+                 MOQ_OBJECT_RECEIVED_EVENT_V0_SIZE, prior_object_gap);
+PIN_DETAIL_FLOOR(moq_namespace_published_event_t,
+                 MOQ_NAMESPACE_PUBLISHED_EVENT_V0_SIZE, token_count);
+PIN_DETAIL_TAIL(moq_namespace_published_event_t,
+                MOQ_NAMESPACE_PUBLISHED_EVENT_V0_SIZE, cluster);
+PIN_DETAIL_FLOOR(moq_namespace_done_event_t,
+                 MOQ_NAMESPACE_DONE_EVENT_V0_SIZE, ann);
+PIN_DETAIL_FLOOR(moq_namespace_rejected_event_t,
+                 MOQ_NAMESPACE_REJECTED_EVENT_V0_SIZE, reason);
+PIN_DETAIL_FLOOR(moq_namespace_accepted_event_t,
+                 MOQ_NAMESPACE_ACCEPTED_EVENT_V0_SIZE, ann);
+PIN_DETAIL_FLOOR(moq_namespace_cancelled_event_t,
+                 MOQ_NAMESPACE_CANCELLED_EVENT_V0_SIZE, reason);
+PIN_DETAIL_FLOOR(moq_goaway_event_t,
+                 MOQ_GOAWAY_EVENT_V0_SIZE, new_session_uri);
+PIN_DETAIL_TAIL(moq_goaway_event_t,
+                MOQ_GOAWAY_EVENT_V0_SIZE, has_timeout);
+PIN_DETAIL_FLOOR(moq_request_redirect_event_t,
+                 MOQ_REQUEST_REDIRECT_EVENT_V0_SIZE, reason);
+PIN_DETAIL_FLOOR(moq_request_goaway_event_t,
+                 MOQ_REQUEST_GOAWAY_EVENT_V0_SIZE, timeout_ms);
+PIN_DETAIL_FLOOR(moq_unsubscribed_event_t,
+                 MOQ_UNSUBSCRIBED_EVENT_V0_SIZE, sub);
+PIN_DETAIL_TAIL(moq_unsubscribed_event_t,
+                MOQ_UNSUBSCRIBED_EVENT_V0_SIZE, cause);
+PIN_DETAIL_FLOOR(moq_subscribe_done_event_t,
+                 MOQ_SUBSCRIBE_DONE_EVENT_V0_SIZE, reason);
+PIN_DETAIL_FLOOR(moq_subscribe_updated_event_t,
+                 MOQ_SUBSCRIBE_UPDATED_EVENT_V0_SIZE, new_group_request);
+PIN_DETAIL_TAIL(moq_subscribe_updated_event_t,
+                MOQ_SUBSCRIBE_UPDATED_EVENT_V0_SIZE, has_filter);
+PIN_DETAIL_FLOOR(moq_object_chunk_event_t,
+                 MOQ_OBJECT_CHUNK_EVENT_V0_SIZE, prior_object_gap);
+PIN_DETAIL_FLOOR(moq_ns_sub_request_event_t,
+                 MOQ_NS_SUB_REQUEST_EVENT_V0_SIZE, token_count);
+PIN_DETAIL_FLOOR(moq_ns_sub_ok_event_t,
+                 MOQ_NS_SUB_OK_EVENT_V0_SIZE, handle);
+PIN_DETAIL_FLOOR(moq_ns_sub_error_event_t,
+                 MOQ_NS_SUB_ERROR_EVENT_V0_SIZE, reason);
+PIN_DETAIL_FLOOR(moq_namespace_found_event_t,
+                 MOQ_NAMESPACE_FOUND_EVENT_V0_SIZE, track_namespace_suffix);
+PIN_DETAIL_TAIL(moq_namespace_found_event_t,
+                MOQ_NAMESPACE_FOUND_EVENT_V0_SIZE, cluster);
+PIN_DETAIL_FLOOR(moq_namespace_gone_event_t,
+                 MOQ_NAMESPACE_GONE_EVENT_V0_SIZE, track_namespace_suffix);
+PIN_DETAIL_FLOOR(moq_fetch_request_event_t,
+                 MOQ_FETCH_REQUEST_EVENT_V0_SIZE, token_count);
+PIN_DETAIL_TAIL(moq_fetch_request_event_t,
+                MOQ_FETCH_REQUEST_EVENT_V0_SIZE, joining_pub);
+PIN_DETAIL_FLOOR(moq_fetch_error_event_t,
+                 MOQ_FETCH_ERROR_EVENT_V0_SIZE, reason);
+PIN_DETAIL_FLOOR(moq_fetch_cancelled_event_t,
+                 MOQ_FETCH_CANCELLED_EVENT_V0_SIZE, fetch);
+PIN_DETAIL_TAIL(moq_fetch_cancelled_event_t,
+                MOQ_FETCH_CANCELLED_EVENT_V0_SIZE, cause);
+PIN_DETAIL_FLOOR(moq_fetch_ok_event_t,
+                 MOQ_FETCH_OK_EVENT_V0_SIZE, track_properties);
+PIN_DETAIL_FLOOR(moq_fetch_complete_event_t,
+                 MOQ_FETCH_COMPLETE_EVENT_V0_SIZE, fetch);
+PIN_DETAIL_FLOOR(moq_fetch_object_event_t,
+                 MOQ_FETCH_OBJECT_EVENT_V0_SIZE, properties);
+PIN_DETAIL_TAIL(moq_fetch_object_event_t,
+                MOQ_FETCH_OBJECT_EVENT_V0_SIZE, has_prior_group_gap);
+PIN_DETAIL_FLOOR(moq_fetch_gap_event_t,
+                 MOQ_FETCH_GAP_EVENT_V0_SIZE, object_id);
+PIN_DETAIL_FLOOR(moq_publish_request_event_t,
+                 MOQ_PUBLISH_REQUEST_EVENT_V0_SIZE, expires_ms);
+PIN_DETAIL_FLOOR(moq_publish_ok_event_t,
+                 MOQ_PUBLISH_OK_EVENT_V0_SIZE, new_group_request);
+PIN_DETAIL_TAIL(moq_publish_ok_event_t,
+                MOQ_PUBLISH_OK_EVENT_V0_SIZE, has_filter);
+PIN_DETAIL_FLOOR(moq_publish_error_event_t,
+                 MOQ_PUBLISH_ERROR_EVENT_V0_SIZE, reason);
+PIN_DETAIL_FLOOR(moq_publish_finished_event_t,
+                 MOQ_PUBLISH_FINISHED_EVENT_V0_SIZE, reason);
+PIN_DETAIL_TAIL(moq_publish_finished_event_t,
+                MOQ_PUBLISH_FINISHED_EVENT_V0_SIZE, cause);
+PIN_DETAIL_FLOOR(moq_publish_unsubscribed_event_t,
+                 MOQ_PUBLISH_UNSUBSCRIBED_EVENT_V0_SIZE, pub);
+PIN_DETAIL_TAIL(moq_publish_unsubscribed_event_t,
+                MOQ_PUBLISH_UNSUBSCRIBED_EVENT_V0_SIZE, cause);
+PIN_DETAIL_FLOOR(moq_publish_updated_event_t,
+                 MOQ_PUBLISH_UPDATED_EVENT_V0_SIZE, new_group_request);
+PIN_DETAIL_TAIL(moq_publish_updated_event_t,
+                MOQ_PUBLISH_UPDATED_EVENT_V0_SIZE, has_filter);
+PIN_DETAIL_FLOOR(moq_subscription_update_ok_event_t,
+                 MOQ_SUBSCRIPTION_UPDATE_OK_EVENT_V0_SIZE, expires_ms);
+PIN_DETAIL_FLOOR(moq_publication_update_ok_event_t,
+                 MOQ_PUBLICATION_UPDATE_OK_EVENT_V0_SIZE, expires_ms);
+PIN_DETAIL_FLOOR(moq_track_status_request_event_t,
+                 MOQ_TRACK_STATUS_REQUEST_EVENT_V0_SIZE, token_count);
+PIN_DETAIL_FLOOR(moq_track_status_ok_event_t,
+                 MOQ_TRACK_STATUS_OK_EVENT_V0_SIZE, track_properties);
+PIN_DETAIL_FLOOR(moq_track_status_error_event_t,
+                 MOQ_TRACK_STATUS_ERROR_EVENT_V0_SIZE, reason);
+PIN_DETAIL_FLOOR(moq_subscribe_tracks_request_event_t,
+                 MOQ_SUBSCRIBE_TRACKS_REQUEST_EVENT_V0_SIZE, token_count);
+PIN_DETAIL_TAIL(moq_subscribe_tracks_request_event_t,
+                MOQ_SUBSCRIBE_TRACKS_REQUEST_EVENT_V0_SIZE, options);
+PIN_DETAIL_FLOOR(moq_subscribe_tracks_ok_event_t,
+                 MOQ_SUBSCRIBE_TRACKS_OK_EVENT_V0_SIZE, handle);
+PIN_DETAIL_FLOOR(moq_subscribe_tracks_error_event_t,
+                 MOQ_SUBSCRIBE_TRACKS_ERROR_EVENT_V0_SIZE, reason);
+PIN_DETAIL_FLOOR(moq_publish_blocked_event_t,
+                 MOQ_PUBLISH_BLOCKED_EVENT_V0_SIZE, track_name);
+PIN_DETAIL_FLOOR(moq_subscribe_tracks_cancelled_event_t,
+                 MOQ_SUBSCRIBE_TRACKS_CANCELLED_EVENT_V0_SIZE, handle);
+PIN_DETAIL_TAIL(moq_subscribe_tracks_cancelled_event_t,
+                MOQ_SUBSCRIBE_TRACKS_CANCELLED_EVENT_V0_SIZE, cause);
+PIN_DETAIL_FLOOR(moq_subgroup_finished_event_t,
+                 MOQ_SUBGROUP_FINISHED_EVENT_V0_SIZE, _pad);
+PIN_DETAIL_TAIL(moq_subgroup_finished_event_t,
+                MOQ_SUBGROUP_FINISHED_EVENT_V0_SIZE, has_last_object);
+PIN_DETAIL_FLOOR(moq_subgroup_reset_event_t,
+                 MOQ_SUBGROUP_RESET_EVENT_V0_SIZE, _pad);
+PIN_DETAIL_TAIL(moq_subgroup_reset_event_t,
+                MOQ_SUBGROUP_RESET_EVENT_V0_SIZE, has_last_object);
+PIN_DETAIL_FLOOR(moq_fetch_reset_event_t,
+                 MOQ_FETCH_RESET_EVENT_V0_SIZE, _pad);
+PIN_DETAIL_TAIL(moq_fetch_reset_event_t,
+                MOQ_FETCH_RESET_EVENT_V0_SIZE, cause);
+PIN_DETAIL_FLOOR(moq_track_status_terminated_event_t,
+                 MOQ_TRACK_STATUS_TERMINATED_EVENT_V0_SIZE, stream_error_code);
+PIN_DETAIL_FLOOR(moq_namespace_terminated_event_t,
+                 MOQ_NAMESPACE_TERMINATED_EVENT_V0_SIZE, stream_error_code);
+PIN_DETAIL_FLOOR(moq_ns_subscription_terminated_event_t,
+                 MOQ_NS_SUBSCRIPTION_TERMINATED_EVENT_V0_SIZE, stream_error_code);
+PIN_DETAIL_FLOOR(moq_publish_state_event_t,
+                 MOQ_PUBLISH_STATE_EVENT_V0_SIZE, location);
+PIN_DETAIL_FLOOR(moq_namespace_update_request_event_t,
+                 MOQ_NAMESPACE_UPDATE_REQUEST_EVENT_V0_SIZE, update);
+PIN_DETAIL_FLOOR(moq_ns_sub_update_request_event_t,
+                 MOQ_NS_SUB_UPDATE_REQUEST_EVENT_V0_SIZE, update);
+PIN_DETAIL_FLOOR(moq_subscribe_tracks_update_request_event_t,
+                 MOQ_SUBSCRIBE_TRACKS_UPDATE_REQUEST_EVENT_V0_SIZE, update);
+PIN_DETAIL_FLOOR(moq_namespace_update_result_event_t,
+                 MOQ_NAMESPACE_UPDATE_RESULT_EVENT_V0_SIZE, expires_ms);
+PIN_DETAIL_TAIL(moq_namespace_update_result_event_t,
+                MOQ_NAMESPACE_UPDATE_RESULT_EVENT_V0_SIZE, cluster);
+PIN_DETAIL_FLOOR(moq_ns_sub_update_result_event_t,
+                 MOQ_NS_SUB_UPDATE_RESULT_EVENT_V0_SIZE, expires_ms);
+PIN_DETAIL_FLOOR(moq_subscribe_tracks_update_result_event_t,
+                 MOQ_SUBSCRIBE_TRACKS_UPDATE_RESULT_EVENT_V0_SIZE, expires_ms);
+PIN_DETAIL_FLOOR(moq_send_control_action_t,
+                 MOQ_SEND_CONTROL_ACTION_V0_SIZE, len);
+PIN_DETAIL_FLOOR(moq_close_session_action_t,
+                 MOQ_CLOSE_SESSION_ACTION_V0_SIZE, reason);
+PIN_DETAIL_FLOOR(moq_send_data_action_t,
+                 MOQ_SEND_DATA_ACTION_V0_SIZE, fin);
+PIN_DETAIL_TAIL(moq_send_data_action_t,
+                MOQ_SEND_DATA_ACTION_V0_SIZE, scheduling_priority);
+PIN_DETAIL_FLOOR(moq_reset_data_action_t,
+                 MOQ_RESET_DATA_ACTION_V0_SIZE, error_code);
+PIN_DETAIL_TAIL(moq_reset_data_action_t,
+                MOQ_RESET_DATA_ACTION_V0_SIZE, reliable_size);
+PIN_DETAIL_FLOOR(moq_stop_data_action_t,
+                 MOQ_STOP_DATA_ACTION_V0_SIZE, error_code);
+PIN_DETAIL_FLOOR(moq_open_bidi_stream_action_t,
+                 MOQ_OPEN_BIDI_STREAM_ACTION_V0_SIZE, fin);
+PIN_DETAIL_FLOOR(moq_send_bidi_stream_action_t,
+                 MOQ_SEND_BIDI_STREAM_ACTION_V0_SIZE, fin);
+PIN_DETAIL_FLOOR(moq_close_bidi_stream_action_t,
+                 MOQ_CLOSE_BIDI_STREAM_ACTION_V0_SIZE, stream_ref);
+PIN_DETAIL_FLOOR(moq_send_datagram_action_t,
+                 MOQ_SEND_DATAGRAM_ACTION_V0_SIZE, len);
+PIN_DETAIL_FLOOR(moq_open_uni_control_action_t,
+                 MOQ_OPEN_UNI_CONTROL_ACTION_V0_SIZE, len);
+PIN_DETAIL_FLOOR(moq_send_uni_control_action_t,
+                 MOQ_SEND_UNI_CONTROL_ACTION_V0_SIZE, fin);
+PIN_DETAIL_FLOOR(moq_reset_bidi_stream_action_t,
+                 MOQ_RESET_BIDI_STREAM_ACTION_V0_SIZE, error_code);
+PIN_DETAIL_FLOOR(moq_stop_bidi_stream_action_t,
+                 MOQ_STOP_BIDI_STREAM_ACTION_V0_SIZE, error_code);
+PIN_DETAIL_FLOOR(moq_abort_bidi_stream_action_t,
+                 MOQ_ABORT_BIDI_STREAM_ACTION_V0_SIZE, error_code);
+PIN_DETAIL_FLOOR(moq_set_data_priority_action_t,
+                 MOQ_SET_DATA_PRIORITY_ACTION_V0_SIZE, priority);
 
 int main(void)
 {

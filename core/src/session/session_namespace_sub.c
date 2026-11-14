@@ -750,25 +750,49 @@ void ns_sub_destroy_all(moq_session_t *s)
 
 /* -- Config init --------------------------------------------------- */
 
-void moq_subscribe_namespace_cfg_init(moq_subscribe_namespace_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_subscribe_namespace_cfg_init)(moq_subscribe_namespace_cfg_t *cfg)
 {
-    if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    moq_subscribe_namespace_cfg_init_sized(cfg, MOQ_SUBSCRIBE_NAMESPACE_CFG_SIZE_THROUGH_AUTH_TOKEN_COUNT);
 }
 
-void moq_accept_ns_sub_cfg_init(moq_accept_ns_sub_cfg_t *cfg)
+void moq_subscribe_namespace_cfg_init_sized(moq_subscribe_namespace_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
-void moq_reject_ns_sub_cfg_init(moq_reject_ns_sub_cfg_t *cfg)
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_accept_ns_sub_cfg_init)(moq_accept_ns_sub_cfg_t *cfg)
+{
+    moq_accept_ns_sub_cfg_init_sized(cfg, MOQ_ACCEPT_NS_SUB_CFG_V0_SIZE);
+}
+
+void moq_accept_ns_sub_cfg_init_sized(moq_accept_ns_sub_cfg_t *cfg, size_t cfg_size)
 {
     if (!cfg) return;
-    memset(cfg, 0, sizeof(*cfg));
-    cfg->struct_size = sizeof(*cfg);
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
+}
+
+/* Parenthesized: defines the symbol, not the header's sized macro. */
+void (moq_reject_ns_sub_cfg_init)(moq_reject_ns_sub_cfg_t *cfg)
+{
+    moq_reject_ns_sub_cfg_init_sized(cfg, MOQ_REJECT_NS_SUB_CFG_SIZE_THROUGH_REDIRECT);
+}
+
+void moq_reject_ns_sub_cfg_init_sized(moq_reject_ns_sub_cfg_t *cfg, size_t cfg_size)
+{
+    if (!cfg) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    if (n < sizeof(cfg->struct_size)) return;   /* too small to even stamp */
+    memset(cfg, 0, n);
+    cfg->struct_size = (uint32_t)n;
 }
 
 /* -- Subscriber: subscribe_namespace ------------------------------- */
@@ -780,8 +804,7 @@ moq_result_t moq_session_subscribe_namespace(
     moq_ns_sub_handle_t *out_handle)
 {
     if (!s || !cfg || !out_handle) return MOQ_ERR_INVAL;
-#define NS_CFG_MIN offsetof(moq_subscribe_namespace_cfg_t, auth_tokens)
-    if (cfg->struct_size < NS_CFG_MIN) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_SUBSCRIBE_NAMESPACE_CFG_V0_SIZE) return MOQ_ERR_INVAL;
 #define NS_CFG_HAS(f) \
     (cfg->struct_size >= offsetof(moq_subscribe_namespace_cfg_t, f) + sizeof(cfg->f))
     *out_handle = MOQ_NS_SUB_HANDLE_INVALID;
@@ -796,7 +819,6 @@ moq_result_t moq_session_subscribe_namespace(
                                  s->profile->auth_token_type_max) < 0)
         return MOQ_ERR_INVAL;
 #undef NS_CFG_HAS
-#undef NS_CFG_MIN
 
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_WRONG_STATE;
@@ -1687,7 +1709,7 @@ moq_result_t moq_session_accept_ns_sub(
     uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_accept_ns_sub_cfg_t))
+    if (cfg->struct_size < MOQ_ACCEPT_NS_SUB_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
@@ -1726,7 +1748,7 @@ moq_result_t moq_session_reject_ns_sub(
     uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < offsetof(moq_reject_ns_sub_cfg_t, can_retry))
+    if (cfg->struct_size < MOQ_REJECT_NS_SUB_CFG_V0_SIZE)
         return MOQ_ERR_INVAL;   /* pre-redirect minimum; older callers still work */
     if (cfg->reason.len > 0 && !cfg->reason.data) return MOQ_ERR_INVAL;
     /* The code must be representable in THIS profile's wire encoding; refuse
@@ -2847,7 +2869,7 @@ moq_result_t moq_session_request_goaway_ns_sub(
     const moq_request_goaway_cfg_t *cfg, uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_request_goaway_cfg_t)) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_REQUEST_GOAWAY_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     if (cfg->new_session_uri.len > 0 && !cfg->new_session_uri.data)
         return MOQ_ERR_INVAL;
     session_begin_advance(s, now_us);

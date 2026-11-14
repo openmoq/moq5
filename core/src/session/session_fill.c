@@ -904,7 +904,7 @@ moq_result_t moq_session_write_fill_object(moq_session_t *s, moq_fill_t fill,
                                            uint64_t now_us)
 {
     if (!s || !cfg) return MOQ_ERR_INVAL;
-    if (cfg->struct_size < sizeof(moq_fetch_object_cfg_t)) return MOQ_ERR_INVAL;
+    if (cfg->struct_size < MOQ_FETCH_OBJECT_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     session_begin_advance(s, now_us);
     if (!session_is_active(s)) return MOQ_ERR_CLOSED;
     size_t slot;
