@@ -3,7 +3,8 @@
 
 use std::fmt;
 
-use crate::error::{Error, Result};
+use moq5_core::{Error, Result};
+
 use crate::types::TimeDomain;
 use crate::{ffi, sys};
 
@@ -16,8 +17,11 @@ pub struct Marking {
 }
 
 impl Marking {
-    /// A marking of `bytes`; anything but one to four bytes is
-    /// [`Error::INVAL`], since the record cannot carry it.
+    /// A marking of `bytes`.
+    ///
+    /// # Errors
+    /// [`Error::INVAL`] for anything but one to four bytes, since the record
+    /// cannot carry it.
     pub fn new(bytes: &[u8]) -> Result<Marking> {
         if bytes.is_empty() || bytes.len() > 4 {
             return Err(Error::INVAL);
@@ -44,8 +48,8 @@ impl fmt::Debug for Marking {
     }
 }
 
-/// The LOC-04 metadata written with one draft-22 RAW object
-/// ([`SendObject::metadata`]): the wire input itself, every field as raw
+/// The LOC-04 metadata written with one draft-22 RAW object (the service
+/// crate's `SendObject::metadata`): the wire input itself, every field as raw
 /// LOC values. The timestamp is required. With a timescale it is
 /// application media time in those units per second; without one it is
 /// Unix-epoch microseconds. Configuration bytes present here, even empty
@@ -54,8 +58,6 @@ impl fmt::Debug for Marking {
 /// It is the application's record, so it is not `#[non_exhaustive]`; the
 /// service validates it at the write (an unusable time or invalid LOC input
 /// is [`Error::INVAL`]) and copies what it keeps.
-///
-/// [`SendObject::metadata`]: crate::SendObject::metadata
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LocMetadata {
     /// Timestamp, raw ticks.
@@ -73,9 +75,12 @@ pub struct LocMetadata {
 }
 
 impl LocMetadata {
-    /// The full-sized C record, borrowing the configuration bytes from
-    /// `self` (valid while `self` is).
-    pub(crate) fn raw(&self) -> sys::moq_media_metadata_t {
+    /// The full-sized C record, its LOC record built by the library's sized
+    /// initializer. Its configuration spans borrow `self`, so the record is
+    /// valid while `self` is alive and unchanged. Producing it is safe;
+    /// passing it to libmoq is the caller's `unsafe` call.
+    #[must_use]
+    pub fn as_raw(&self) -> sys::moq_media_metadata_t {
         let mut loc = sys::moq_loc_metadata_t::default();
         // SAFETY: a writable struct of exactly the size passed.
         unsafe { sys::moq_loc_metadata_init_sized(&mut loc, std::mem::size_of_val(&loc)) };
@@ -124,9 +129,14 @@ pub struct ObjectMetadata<'object> {
 }
 
 impl<'object> ObjectMetadata<'object> {
-    /// A view of `raw`, when its stamp covers the frozen record (zero is a
+    /// A view of `raw`, when its stamps cover the frozen records (zero is a
     /// legacy object's: no metadata).
-    pub(crate) fn from_raw(raw: &'object sys::moq_media_metadata_t) -> Option<Self> {
+    ///
+    /// # Safety
+    /// The configuration spans of `raw.loc` must be valid for reads for
+    /// `'object` wherever their presence bits are set.
+    #[must_use]
+    pub unsafe fn from_raw(raw: &'object sys::moq_media_metadata_t) -> Option<Self> {
         let reported = ffi::covers(raw.struct_size, sys::MOQ_MEDIA_METADATA_V0_SIZE)
             && ffi::covers(raw.loc.struct_size, sys::MOQ_LOC_METADATA_V0_SIZE);
         reported.then_some(ObjectMetadata { raw })
@@ -139,7 +149,7 @@ impl<'object> ObjectMetadata<'object> {
     /// The clock [`time_us`](ObjectMetadata::time_us) is in.
     #[must_use]
     pub fn time_domain(&self) -> TimeDomain {
-        TimeDomain::from_raw(self.raw.time_domain)
+        TimeDomain::from_code(self.raw.time_domain)
     }
     /// The timestamp in microseconds of its domain, when it converts; a raw
     /// zero or an overflowing value stays only in
@@ -187,8 +197,7 @@ impl<'object> ObjectMetadata<'object> {
         if !self.has(sys::MOQ_LOC_METADATA_HAS_VIDEO_CONFIG) {
             return None;
         }
-        // SAFETY: the span borrows the object's properties, owned by the
-        // object for 'object.
+        // SAFETY: valid for 'object by from_raw's contract.
         Some(unsafe { ffi::bytes(self.raw.loc.video_config) })
     }
     /// Audio decoder configuration (present may be empty).
@@ -244,7 +253,7 @@ mod tests {
             video_config: Some(vec![]),
             audio_config: Some(vec![1, 2]),
         };
-        let raw = metadata.raw();
+        let raw = metadata.as_raw();
         assert_eq!(
             raw.struct_size as usize,
             std::mem::size_of::<sys::moq_media_metadata_t>()
@@ -262,7 +271,7 @@ mod tests {
         assert_eq!((raw.loc.marking_len, raw.loc.marking[0]), (1, 0x20));
         assert_eq!(raw.loc.video_config.len, 0, "present and empty");
         assert_eq!(raw.loc.audio_config.len, 2);
-        let empty = LocMetadata::default().raw();
+        let empty = LocMetadata::default().as_raw();
         assert_eq!(empty.loc.present, 0);
     }
 
@@ -273,11 +282,12 @@ mod tests {
             audio_level: Some(0x85),
             ..LocMetadata::default()
         }
-        .raw();
+        .as_raw();
         raw.time_domain = sys::MOQ_MEDIA_TIME_DOMAIN_UNIX_US;
         raw.has_time_us = 1;
         raw.time_us = 5;
-        let view = ObjectMetadata::from_raw(&raw).expect("a full record");
+        // SAFETY: the record borrows no configuration bytes.
+        let view = unsafe { ObjectMetadata::from_raw(&raw) }.expect("a full record");
         assert_eq!(view.time_domain(), TimeDomain::UnixMicros);
         assert_eq!(view.time_us(), Some(5));
         assert_eq!(view.timestamp(), Some(5));
@@ -286,16 +296,17 @@ mod tests {
         assert_eq!(view.independent(), None);
         assert_eq!(view.video_config(), None);
         let legacy = sys::moq_media_metadata_t::default();
-        assert!(
-            ObjectMetadata::from_raw(&legacy).is_none(),
-            "zero is legacy"
-        );
+        // SAFETY: a zeroed record.
+        let view = unsafe { ObjectMetadata::from_raw(&legacy) };
+        assert!(view.is_none(), "zero is legacy");
         // A stamp short of either frozen record is not read.
         let mut short = raw;
         short.struct_size = (sys::MOQ_MEDIA_METADATA_V0_SIZE - 1) as u32;
-        assert!(ObjectMetadata::from_raw(&short).is_none());
+        // SAFETY: as above.
+        assert!(unsafe { ObjectMetadata::from_raw(&short) }.is_none());
         let mut short_loc = raw;
         short_loc.loc.struct_size = (sys::MOQ_LOC_METADATA_V0_SIZE - 1) as u32;
-        assert!(ObjectMetadata::from_raw(&short_loc).is_none());
+        // SAFETY: as above.
+        assert!(unsafe { ObjectMetadata::from_raw(&short_loc) }.is_none());
     }
 }

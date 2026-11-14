@@ -347,7 +347,7 @@ sim/            moq-sim: SimPair deterministic simulation + fault injection
 adapters/       picoquic, pico_wt, mvfst, msquic, wtquic, proxygen (+ shared helpers)
 bindings/cpp/   moq-cpp: header-only C++20 binding
 bindings/python/ CPython endpoint, receiver and sender over the installed service SDK
-bindings/rust/  moq5-sys (raw FFI) and moq5 (safe API) over the installed service SDK
+bindings/rust/  moq5-sys (raw FFI by tier), moq5-core, moq5-media, moq5 (service)
 media/          loc, cmaf, mpeg2ts, msf catalog, media object, playback (parse helpers)
 tests/          unit, scenario, simulation, and adapter conformance tests
 fuzz/           fuzz targets and corpus
@@ -362,10 +362,14 @@ media receiver and media sender APIs over the installed service SDK. See its
 support statement for the available surface and qualification limits; asyncio
 remains separate follow-up work.
 
-The [Rust bindings](bindings/rust/README.md) are two crates: `moq5-sys`, raw
-FFI generated from the installed headers, and `moq5`, a safe API over the
-service tier (endpoint, media sender and receiver, CMAF parsing) whose types
-enforce the C API's ownership, teardown and threading rules.
+The [Rust bindings](bindings/rust/README.md) follow the C tiers. `moq5-sys`
+is the raw FFI generated from the installed headers, with one feature per
+tier. `moq5-core` wraps the sans-I/O session for an application that owns its
+transport: binding, input custody, actions and events, with a transport-host
+example. `moq5-media` holds the media parsers (CMAF, LOC, the MPEG-TS
+catalog). `moq5` is the safe service-tier API (endpoint, media sender and
+receiver, player). Their types enforce the C API's ownership, teardown and
+threading rules.
 
 ## Author
 

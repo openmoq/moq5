@@ -4,7 +4,8 @@
 
 use std::{fmt, mem, ptr};
 
-use crate::error::{Error, Result};
+use moq5_core::{Error, Result};
+
 use crate::types::SapType;
 use crate::{ffi, sys};
 
@@ -177,10 +178,16 @@ pub struct CmafInit {
 // SAFETY: the info's spans point into `data`, a heap buffer that moves with
 // it and is never mutated.
 unsafe impl Send for CmafInit {}
+// SAFETY: as for Send: every method reads only.
 unsafe impl Sync for CmafInit {}
 
 impl CmafInit {
     /// Parse `data`, keeping it.
+    ///
+    /// # Errors
+    /// [`Error::PROTO`] for a segment that does not parse, and
+    /// [`Error::ABI_MISMATCH`] when the library stamps the parsed record
+    /// outside its size contract.
     pub fn parse(data: impl Into<Box<[u8]>>) -> Result<CmafInit> {
         let data = data.into();
         let mut raw = sys::moq_cmaf_init_info_t::default();
@@ -250,11 +257,14 @@ impl CmafSample {
         self.flags & 0x0001_0000 == 0
     }
 
-    /// View a C sample table.
+    /// View a C sample table (`moq_cmaf_sample_t`, whose layout this type
+    /// has) without copying it; a null table or a zero length is empty.
     ///
     /// # Safety
-    /// `ptr..ptr+len` must be valid for `'a`.
-    pub(crate) unsafe fn table<'a>(
+    /// When `ptr` is not null, `ptr..ptr+len` must be valid for reads for
+    /// `'a` and not written while the view lives.
+    #[must_use]
+    pub unsafe fn from_raw_parts<'a>(
         ptr: *const sys::moq_cmaf_sample_t,
         len: usize,
     ) -> &'a [CmafSample] {
@@ -298,6 +308,10 @@ impl Fragment<'_> {
 }
 
 /// Parse a moof+mdat fragment, sizing the sample table to fit.
+///
+/// # Errors
+/// [`Error::PROTO`] for a fragment that does not parse, or the code the
+/// library reported.
 pub fn parse_fragment(fragment: &[u8]) -> Result<Fragment<'_>> {
     let mut samples = vec![CmafSample::default(); 64];
     let mut info = sys::moq_cmaf_fragment_info_t::default();
@@ -374,7 +388,11 @@ pub struct ObjectReport {
 
 /// Check one object payload against CMSF 3.3 object packaging, and, with
 /// `init`, its track_ID against the init segment's. A failing object is an
-/// `Ok` report with `valid` false; an error is a refused input.
+/// `Ok` report with `valid` false.
+///
+/// # Errors
+/// A refused input: the code the library reported other than
+/// `MOQ_ERR_PROTO` (which is a failing object, reported).
 pub fn validate_object(init: Option<InitInfo<'_>>, object: &[u8]) -> Result<ObjectReport> {
     let mut report = sys::moq_cmaf_object_report_t::default();
     let init = init.map_or(ptr::null(), |info| {
@@ -393,7 +411,7 @@ pub fn validate_object(init: Option<InitInfo<'_>>, object: &[u8]) -> Result<Obje
         chunk_count: report.chunk_count,
         track_id: report.track_id,
         starts_with_sync: report.starts_with_sync,
-        sap_type: SapType::from_raw(report.sap_type),
+        sap_type: SapType::from_code(report.sap_type),
         valid: report.valid,
         reason: match report.reason {
             sys::MOQ_CMAF_OK => Validity::Ok,
@@ -414,7 +432,7 @@ pub fn validate_object(init: Option<InitInfo<'_>>, object: &[u8]) -> Result<Obje
 #[must_use]
 pub fn sap_from_sample_flags(flags: u32) -> SapType {
     // SAFETY: a pure function.
-    SapType::from_raw(unsafe { sys::moq_cmaf_sap_from_sample_flags(flags) })
+    SapType::from_code(unsafe { sys::moq_cmaf_sap_from_sample_flags(flags) })
 }
 
 #[cfg(test)]
@@ -534,7 +552,10 @@ mod tests {
 
     #[test]
     fn rejects_garbage() {
-        assert_eq!(CmafInit::parse(vec![0u8; 16]).unwrap_err(), Error::PROTO);
+        assert_eq!(
+            CmafInit::parse(vec![0u8; 16]).expect_err("not a segment"),
+            Error::PROTO
+        );
         assert!(parse_fragment(&[0u8; 16]).is_err());
         let report = validate_object(None, &[0u8; 16]).expect("a report, not a refusal");
         assert!(!report.valid);

@@ -80,13 +80,11 @@ use std::ptr::{self, NonNull};
 use std::time::Duration;
 
 use crate::endpoint::Endpoint;
-use crate::error::{Error, Result};
 use crate::receiver::{
     ContentProtectionRef, Receiver, ReceiverConfig, ReceiverInfo, ReceiverStats, StartMode,
     StreamTerminalKind, TimeMode, Track, TrackDescription, TrackState,
 };
-use crate::types::{Location, MediaType, Packaging, TimeDomain};
-use crate::{ffi, sys};
+use crate::{ffi, sys, Error, Location, MediaType, Packaging, Result, TimeDomain};
 
 // -- configuration --------------------------------------------------------------
 
@@ -1017,12 +1015,12 @@ impl<'output> DecoderConfig<'output> {
     /// The media type.
     #[must_use]
     pub fn media_type(&self) -> Option<MediaType> {
-        MediaType::from_raw(self.0.media_type)
+        MediaType::from_code(self.0.media_type)
     }
     /// The packaging.
     #[must_use]
     pub fn packaging(&self) -> Option<Packaging> {
-        Packaging::from_raw(self.0.packaging)
+        Packaging::from_code(self.0.packaging)
     }
     /// The codec string, e.g. `avc1.42e01e`.
     #[must_use]
@@ -1220,7 +1218,7 @@ pub struct Timeline {
 impl Timeline {
     fn from_raw(raw: &sys::moq_media_timeline_t) -> Timeline {
         Timeline {
-            domain: TimeDomain::from_raw(raw.domain),
+            domain: TimeDomain::from_code(raw.domain),
             timeline_id: raw.timeline_id,
             timeline_epoch: raw.timeline_epoch,
             anchor_media_us: raw.anchor_media_us,

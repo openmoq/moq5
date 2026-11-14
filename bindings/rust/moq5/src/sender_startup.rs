@@ -8,9 +8,8 @@ use std::mem;
 use std::sync::{Arc, Mutex, TryLockError};
 
 use crate::endpoint::{Endpoint, WeakEndpoint};
-use crate::error::{Error, Result};
 use crate::sender::{SendTrack, SendTrackConfig, Sender, SenderConfig};
-use crate::{ffi, sys};
+use crate::{ffi, sys, Error, Result};
 
 type Attached = (Sender, Vec<SendTrack>);
 

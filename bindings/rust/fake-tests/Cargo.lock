@@ -121,6 +121,15 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 name = "moq5"
 version = "0.1.0"
 dependencies = [
+ "moq5-core",
+ "moq5-media",
+ "moq5-sys",
+]
+
+[[package]]
+name = "moq5-core"
+version = "0.1.0"
+dependencies = [
  "moq5-sys",
 ]
 
@@ -130,6 +139,14 @@ version = "0.0.0"
 dependencies = [
  "cc",
  "moq5",
+ "moq5-sys",
+]
+
+[[package]]
+name = "moq5-media"
+version = "0.1.0"
+dependencies = [
+ "moq5-core",
  "moq5-sys",
 ]
 

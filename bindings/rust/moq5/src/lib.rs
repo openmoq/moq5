@@ -89,21 +89,27 @@
 //! # Linking
 //!
 //! `moq5-sys` finds the installed SDK through pkg-config (`libmoq-service`);
-//! see its documentation for `MOQ_PREFIX` and the supported SDK builds.
+//! see its documentation for `MOQ_PREFIX`, the tier features and the
+//! supported SDK builds.
 
 #![warn(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub use moq5_sys as sys;
 
-mod buffer;
-pub mod cmaf;
+pub use moq5_core::{
+    libmoq_version, Buffer, Error, GroupOrder, Location, LocationFilter, Namespace, ObjectStatus,
+    Result, SliceError, Version,
+};
+pub use moq5_media::{
+    cmaf, CompanionProfile, LocMetadata, Marking, MediaType, Mpeg2tsKeys, Mpeg2tsMode,
+    Mpeg2tsRecord, Mpeg2tsRecordRef, Mpeg2tsTimestampMode, ObjectMetadata, Packaging, SapType,
+    TimeDomain, TrackExtension,
+};
+
 mod endpoint;
-mod error;
 mod ffi;
-mod metadata;
 mod mpeg2ts;
-mod namespace;
 #[cfg(feature = "player")]
 pub mod player;
 mod receiver;
@@ -111,18 +117,11 @@ mod sender;
 mod sender_startup;
 mod types;
 
-pub use buffer::{Buffer, SliceError};
 pub use endpoint::{
     AuthToken, Backend, Endpoint, EndpointConfig, EndpointState, Protocol, Terminal,
     TerminalReason, UriMode, VersionOffer, WtProfile,
 };
-pub use error::{Error, Result};
-pub use metadata::{LocMetadata, Marking, ObjectMetadata};
-pub use mpeg2ts::{
-    Mpeg2tsInput, Mpeg2tsKeys, Mpeg2tsMode, Mpeg2tsRecord, Mpeg2tsRecordRef, Mpeg2tsTimestampMode,
-    Mpeg2tsTrackStats, Mpeg2tsWriteError, TrackExtension,
-};
-pub use namespace::Namespace;
+pub use mpeg2ts::{Mpeg2tsInput, Mpeg2tsTrackStats, Mpeg2tsWriteError};
 pub use receiver::{
     ContentProtectionRef, FillError, FillLoss, FillOptions, FillReason, FillTerminal, LossReport,
     MediaObject, MediaTemplate, ObjectIdentity, OverflowPolicy, ParseDrop, ParseDropClass,
@@ -135,7 +134,4 @@ pub use sender::{
     Sender, SenderConfig, SenderStats, TrackStats, WriteError,
 };
 pub use sender_startup::SenderStartup;
-pub use types::{
-    libmoq_version, CompanionProfile, DeliveryOrigin, GroupOrder, Location, LocationFilter,
-    MediaType, ObjectStatus, Packaging, SapType, TimeDomain, Version, WaitResult,
-};
+pub use types::{DeliveryOrigin, WaitResult};

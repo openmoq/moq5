@@ -1,5 +1,6 @@
 # What an installed SDK carries beyond the service -- the player
-# (<moq/media_player.h>) and MPEG-TS (<moq/mpeg2ts.h>) -- read from its own
+# (<moq/media_player.h>), MPEG-TS (<moq/mpeg2ts.h>) and the simulator
+# (<moq/sim.h>) -- read from its own
 # pkg-config metadata: libmoq-service's includedir, found in the SDK's
 # lib/pkgconfig (or lib64/pkgconfig) directory, with the dependency
 # directories its closure spans searched after it. Never a fixed path, and
@@ -8,18 +9,19 @@
 #
 #   include(sdk_features.cmake)
 #   moq_rust_sdk_carries(<prefix> <pkg-config> <dependency pc path>
-#                        <player var> <mpeg2ts var> <includedir var>)
+#                        <player var> <mpeg2ts var> <sim var> <includedir var>)
 #
 # What pkg-config prints on its error stream is never discarded: it is a
 # CMake warning, each of its lines as printed. Run as a script, the same
 # call for one SDK prints that warning, if any, and then the answer:
 #   cmake -DPREFIX=<prefix> -DPKG_CONFIG=<pkg-config> [-DPC_PATH=<a : list>]
 #         -P sdk_features.cmake
-#   -> player=ON|OFF mpeg2ts=ON|OFF includedir=<directory, or empty>
+#   -> player=ON|OFF mpeg2ts=ON|OFF sim=ON|OFF includedir=<directory, or empty>
 
-function(moq_rust_sdk_carries prefix pkg_config pc_path out_player out_mpeg2ts out_includedir)
+function(moq_rust_sdk_carries prefix pkg_config pc_path out_player out_mpeg2ts out_sim out_includedir)
     set(player OFF)
     set(mpeg2ts OFF)
+    set(sim OFF)
     set(includedir "")
     set(pcdir "")
     foreach(d lib/pkgconfig lib64/pkgconfig)
@@ -53,9 +55,13 @@ function(moq_rust_sdk_carries prefix pkg_config pc_path out_player out_mpeg2ts o
         if(EXISTS "${includedir}/moq/mpeg2ts.h")
             set(mpeg2ts ON)
         endif()
+        if(EXISTS "${includedir}/moq/sim.h")
+            set(sim ON)
+        endif()
     endif()
     set(${out_player} ${player} PARENT_SCOPE)
     set(${out_mpeg2ts} ${mpeg2ts} PARENT_SCOPE)
+    set(${out_sim} ${sim} PARENT_SCOPE)
     set(${out_includedir} "${includedir}" PARENT_SCOPE)
 endfunction()
 
@@ -68,6 +74,6 @@ if(CMAKE_SCRIPT_MODE_FILE STREQUAL CMAKE_CURRENT_LIST_FILE)
     if(NOT DEFINED PC_PATH)
         set(PC_PATH "")
     endif()
-    moq_rust_sdk_carries("${PREFIX}" "${PKG_CONFIG}" "${PC_PATH}" _player _mpeg2ts _includedir)
-    message("player=${_player} mpeg2ts=${_mpeg2ts} includedir=${_includedir}")
+    moq_rust_sdk_carries("${PREFIX}" "${PKG_CONFIG}" "${PC_PATH}" _player _mpeg2ts _sim _includedir)
+    message("player=${_player} mpeg2ts=${_mpeg2ts} sim=${_sim} includedir=${_includedir}")
 endif()

@@ -1,8 +1,8 @@
-/* The headers the `player` feature binds, generated apart from wrapper.h:
- * the player's declarations and the playback engine configuration it takes.
- * Everything they reference is in the base bindings. As in wrapper.h, the
- * values bindgen cannot evaluate are restated as MOQ5_SYSVAL_ statics whose
- * prefix the build script strips. */
+/* The player tier (`player` feature), generated apart from the lower
+ * tiers: the player's declarations and the playback engine configuration
+ * it takes. Everything they reference is in the lower tiers' bindings. As
+ * in wrapper_core.h, the values bindgen cannot evaluate are restated as
+ * MOQ5_SYSVAL_ statics whose prefix the build script strips. */
 
 #include <moq/playback.h>
 #include <moq/media_player.h>

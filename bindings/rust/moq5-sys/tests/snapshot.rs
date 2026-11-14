@@ -1,11 +1,11 @@
-//! The docs.rs snapshot matches a fresh generation: `docs/bindings.rs`, past
-//! its provenance header, holds what the build script generated from the
-//! installed headers on this target, and `docs/preambles.md` the header
-//! preambles it extracted. With the `player` feature, so do
-//! `docs/bindings_player.rs` and `docs/preambles_player.md`; the base pair
-//! is the same with the feature and without it. The row runs on every
-//! qualified target, which is what lets the manifests restrict docs.rs to
-//! them.
+//! The docs.rs snapshots match a fresh generation, tier by tier:
+//! `docs/bindings_<tier>.rs`, past its provenance header, holds what the
+//! build script generated from the installed headers on this target, and
+//! `docs/preambles_<tier>.md` the header preambles it extracted. The core's
+//! pair is checked in every build, and each other tier's under its feature;
+//! a tier's generation is the same whichever other tiers are enabled. The
+//! row runs on every qualified target, which is what lets the manifests
+//! restrict docs.rs to them.
 //!
 //! The bindings match line for line: every declaration, attribute and
 //! layout assertion, and every documentation attribute, with one exception.
@@ -14,18 +14,12 @@
 //! the macro under `-fparse-all-comments`, and earlier releases attach none,
 //! so no snapshot can equal both generations byte for byte. Where both sides
 //! document such a constant, the text must agree. The build script lists the
-//! constants each generation made from macros (`macros.txt` and
-//! `macros_player.txt` beside the bindings), and the list is held to name
-//! no declaration. The preambles match byte for byte.
+//! constants each generation made from macros (`macros_<tier>.txt` beside
+//! the bindings), and the list is held to name no declaration. The preambles
+//! match byte for byte.
 
 use std::collections::BTreeSet;
 
-const GENERATED: &str = include_str!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-const SNAPSHOT: &str = include_str!("../docs/bindings.rs");
-const MACROS: &str = include_str!(concat!(env!("OUT_DIR"), "/macros.txt"));
-const WRAPPER: &str = include_str!("../wrapper.h");
-const GENERATED_PREAMBLES: &str = include_str!(concat!(env!("OUT_DIR"), "/preambles.md"));
-const SNAPSHOT_PREAMBLES: &str = include_str!("../docs/preambles.md");
 const LIBCLANG: &str = include_str!(concat!(env!("OUT_DIR"), "/libclang.txt"));
 
 /// A snapshot without its leading `//` provenance lines and the blank line
@@ -157,8 +151,8 @@ fn assert_bindings_match(
             "docs/{name} differs from the generated bindings beyond a macro constant's \
              documentation:\n\n{difference}\nThe snapshot was generated on {}; this build used \
              {LIBCLANG} and wrote {}/{generated_file}. Regenerate the snapshot with \
-             scripts/update_snapshot.sh <sdk-prefix> once the difference is one the headers \
-             or the generator should make.",
+             scripts/update_snapshot.sh <sdk-prefix> [tier...] once the difference is one the \
+             headers or the generator should make.",
             provenance(snapshot),
             env!("OUT_DIR"),
         );
@@ -221,75 +215,84 @@ fn assert_preambles_equal(name: &str, snapshot: &str, generated: &str) {
             );
         panic!(
             "docs/{name} differs from the generated preambles at line {line}; \
-             regenerate it with scripts/update_snapshot.sh <sdk-prefix>"
+             regenerate it with scripts/update_snapshot.sh <sdk-prefix> [tier...]"
         );
     }
 }
 
-#[test]
-fn snapshot_matches_the_generated_bindings() {
-    assert_bindings_match("bindings.rs", SNAPSHOT, GENERATED, "bindings.rs", MACROS);
+/// The three rows of one tier: its bindings and preambles equal the fresh
+/// generation, and its macro list names only macro constants, `$expected`
+/// among them.
+macro_rules! tier {
+    ($tier:literal, $expected:expr) => {
+        const GENERATED: &str = include_str!(concat!(env!("OUT_DIR"), "/bindings_", $tier, ".rs"));
+        const SNAPSHOT: &str = include_str!(concat!("../docs/bindings_", $tier, ".rs"));
+        const MACROS: &str = include_str!(concat!(env!("OUT_DIR"), "/macros_", $tier, ".txt"));
+        const WRAPPER: &str = include_str!(concat!("../wrapper_", $tier, ".h"));
+        const GENERATED_PREAMBLES: &str =
+            include_str!(concat!(env!("OUT_DIR"), "/preambles_", $tier, ".md"));
+        const SNAPSHOT_PREAMBLES: &str = include_str!(concat!("../docs/preambles_", $tier, ".md"));
+
+        #[test]
+        fn snapshot_matches_the_generated_bindings() {
+            super::assert_bindings_match(
+                concat!("bindings_", $tier, ".rs"),
+                SNAPSHOT,
+                GENERATED,
+                concat!("bindings_", $tier, ".rs"),
+                MACROS,
+            );
+        }
+
+        #[test]
+        fn the_macro_list_names_only_macro_constants() {
+            super::assert_macro_list(MACROS, GENERATED, WRAPPER, $expected);
+        }
+
+        #[test]
+        fn snapshot_preambles_match_the_generated_preambles() {
+            super::assert_preambles_equal(
+                concat!("preambles_", $tier, ".md"),
+                SNAPSHOT_PREAMBLES,
+                GENERATED_PREAMBLES,
+            );
+        }
+    };
 }
 
-#[test]
-fn the_macro_list_names_only_macro_constants() {
-    assert_macro_list(
-        MACROS,
-        GENERATED,
-        WRAPPER,
+mod core_tier {
+    tier!(
+        "core",
         &[
             "MOQ_OK",
             "MOQ_ERR_INTERRUPTED",
             "MOQ_HANDLE_POOL_SUBSCRIPTION",
             "MOQ_VERSION_STRING",
-        ],
+        ]
     );
 }
 
-#[test]
-fn snapshot_preambles_match_the_generated_preambles() {
-    assert_preambles_equal("preambles.md", SNAPSHOT_PREAMBLES, GENERATED_PREAMBLES);
+#[cfg(feature = "sim")]
+mod sim {
+    tier!("sim", &["MOQ_SIM_FAULT_DROP_CONTROL"]);
+}
+
+#[cfg(feature = "media")]
+mod media {
+    tier!(
+        "media",
+        &["MOQ_MSF_EXT_MPEG2TS", "MOQ_MEDIA_PACKAGING_CMAF"]
+    );
+}
+
+#[cfg(feature = "service")]
+mod service {
+    tier!("service", &["MOQ_MEDIA_DELIVERY_LIVE"]);
 }
 
 #[cfg(feature = "player")]
 mod player {
-    const GENERATED: &str = include_str!(concat!(env!("OUT_DIR"), "/bindings_player.rs"));
-    const SNAPSHOT: &str = include_str!("../docs/bindings_player.rs");
-    const MACROS: &str = include_str!(concat!(env!("OUT_DIR"), "/macros_player.txt"));
-    const WRAPPER: &str = include_str!("../wrapper_player.h");
-    const GENERATED_PREAMBLES: &str =
-        include_str!(concat!(env!("OUT_DIR"), "/preambles_player.md"));
-    const SNAPSHOT_PREAMBLES: &str = include_str!("../docs/preambles_player.md");
-
-    #[test]
-    fn snapshot_matches_the_generated_player_bindings() {
-        super::assert_bindings_match(
-            "bindings_player.rs",
-            SNAPSHOT,
-            GENERATED,
-            "bindings_player.rs",
-            MACROS,
-        );
-    }
-
-    #[test]
-    fn the_player_macro_list_names_only_macro_constants() {
-        super::assert_macro_list(
-            MACROS,
-            GENERATED,
-            WRAPPER,
-            &["MOQ_PLAYBACK_EVENT_GAP_CONTINUED"],
-        );
-    }
-
-    #[test]
-    fn snapshot_preambles_match_the_generated_player_preambles() {
-        super::assert_preambles_equal(
-            "preambles_player.md",
-            SNAPSHOT_PREAMBLES,
-            GENERATED_PREAMBLES,
-        );
-    }
+    tier!("player", &["MOQ_PLAYBACK_EVENT_GAP_CONTINUED"]);
 }
 
 /// The comparison itself, on small bindings: only a macro constant's

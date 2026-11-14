@@ -762,7 +762,7 @@ fn push_object(receiver: &Receiver) {
     let object = sys::moq_media_object_t {
         track: raw_track(receiver, 0),
         packaging: sys::MOQ_MEDIA_PACKAGING_CMAF,
-        status: 3,
+        status: sys::MOQ_OBJECT_END_OF_GROUP,
         end_of_group: true,
         keyframe: true,
         has_capture_time: true,

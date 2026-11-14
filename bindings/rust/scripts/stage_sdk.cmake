@@ -1,6 +1,6 @@
 # The SDK the Rust rows consume: install the build tree into a fresh,
 # test-owned prefix (or, with EXISTING=ON, take the named prefix as it is),
-# and require the service pkg-config file in it.
+# and require the service and core pkg-config files in it.
 #   cmake -DBUILD=<tree> -DPREFIX=<prefix> [-DCONFIG=<cfg>] [-DEXISTING=ON]
 #         -P stage_sdk.cmake
 foreach(_v BUILD PREFIX)
@@ -35,5 +35,11 @@ if(NOT EXISTS "${PREFIX}/lib/pkgconfig/libmoq-service.pc" AND
         "the staged SDK has no libmoq-service.pc: the service was built with a backend "
         "that has no pkg-config representation (mvfst, proxygen or the direct MsQuic "
         "managed backend), which the Rust binding does not link")
+endif()
+if(NOT EXISTS "${PREFIX}/lib/pkgconfig/libmoq-core.pc" AND
+   NOT EXISTS "${PREFIX}/lib64/pkgconfig/libmoq-core.pc")
+    message(FATAL_ERROR
+        "the staged SDK has no libmoq-core.pc: the core tier, which moq5-sys links by "
+        "default, has no package (an SDK older than the tier packages)")
 endif()
 message(STATUS "staged SDK: ${PREFIX}")

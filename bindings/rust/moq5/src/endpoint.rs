@@ -3,9 +3,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 use std::{mem, ptr};
 
-use crate::error::{Error, Result};
-use crate::types::{Version, WaitResult};
-use crate::{ffi, sys};
+use crate::{ffi, sys, Error, Result, Version, WaitResult};
 
 /// How the endpoint reaches the relay (`moq_transport_protocol_t`).
 #[non_exhaustive]
@@ -427,8 +425,8 @@ impl Endpoint {
         };
         let versions: Vec<sys::moq_version_t> = match &config.versions {
             VersionOffer::Auto => Vec::new(),
-            VersionOffer::List(list) => list.iter().map(|version| version.raw()).collect(),
-            VersionOffer::Exact(version) => vec![version.raw()],
+            VersionOffer::List(list) => list.iter().map(|version| version.as_raw()).collect(),
+            VersionOffer::Exact(version) => vec![version.as_raw()],
         };
         let mut tokens: Vec<sys::moq_auth_token_t> =
             Vec::with_capacity(config.setup_auth_tokens.len());
@@ -465,7 +463,7 @@ impl Endpoint {
             raw_config.setup_auth_token_count = tokens.len();
         }
         raw_config.uri_mode = config.uri_mode.code();
-        raw_config.preferred_version = config.preferred_version.map_or(0, Version::raw);
+        raw_config.preferred_version = config.preferred_version.map_or(0, Version::as_raw);
 
         let mut raw = ptr::null_mut();
         // SAFETY: every pointer in raw_config points into config, versions or

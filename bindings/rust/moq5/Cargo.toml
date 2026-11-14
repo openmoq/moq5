@@ -18,11 +18,15 @@ publish = false
 player = ["moq5-sys/player"]
 
 [dependencies]
-moq5-sys = { version = "0.1.0", path = "../moq5-sys" }
+moq5-core = { version = "0.1.0", path = "../moq5-core" }
+moq5-media = { version = "0.1.0", path = "../moq5-media" }
+# The service tier of the bindings: libmoq-service.pc, whose closure brings
+# the core and the media libraries.
+moq5-sys = { version = "0.1.0", path = "../moq5-sys", features = ["service"] }
 
 [package.metadata.docs.rs]
-# Documented from moq5-sys's cfg(docsrs) snapshot, on the targets that
-# snapshot is verified on (see moq5-sys/Cargo.toml), with the player.
+# Documented from moq5-sys's cfg(docsrs) snapshots, on the targets those
+# snapshots are verified on (see moq5-sys/Cargo.toml), with the player.
 features = ["player"]
 default-target = "x86_64-unknown-linux-gnu"
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]

@@ -7,29 +7,41 @@ use crate::error::{Error, Result};
 use crate::{ffi, sys};
 
 /// An owned reference to a libmoq refcounted byte buffer (`moq_rcbuf_t`):
-/// the payload type [`Sender::write`](crate::Sender::write) takes.
+/// the payload type the session and the service tier take.
 ///
 /// libmoq's refcounts are not atomic, so this type never shares a buffer:
 /// there is no `Clone`, and the reference it owns is the only one. It can
-/// move to another thread for that same reason, and a successful write
-/// transfers it to the service.
+/// move to another thread for that same reason, and a call that accepts it
+/// takes that one reference.
 ///
 /// The bytes come from a copy ([`copy_from`](Buffer::copy_from)) or from a
 /// container this crate adopts ([`from_vec`](Buffer::from_vec),
 /// [`from_boxed`](Buffer::from_boxed) and their range forms; also
 /// `TryFrom`). The release that runs when the last reference goes only
 /// deallocates that container. It runs on whichever thread drops the final
-/// reference, an application thread or the service's network thread, and is
-/// correct on both: it runs no application code, reaches no endpoint, and
-/// cannot unwind.
+/// reference, an application thread or a native thread such as the service
+/// tier's network thread, and is correct on all of them: it runs no
+/// application code, reaches no libmoq object, and cannot unwind.
 ///
 /// [`slice`](Buffer::slice) narrows a buffer to a range of its bytes without
 /// copying. It consumes the buffer, so the slice is again the only
 /// reference to the storage.
+///
+/// A buffer adopted from native code ([`from_raw`](Buffer::from_raw)) or
+/// wrapping external bytes ([`wrap_raw`](Buffer::wrap_raw)) keeps these
+/// properties only because its unsafe contract requires them of everything
+/// its final release reaches.
 pub struct Buffer(NonNull<sys::moq_rcbuf_t>);
 
-// SAFETY: a Buffer is the only reference to its rcbuf, so moving it moves
-// sole ownership; nothing touches the refcount through a shared reference.
+// SAFETY: a Buffer owns its rcbuf's whole ownership graph: the only
+// reference to the rcbuf and, for a slice, to the root it holds, so moving
+// it moves sole ownership and nothing touches a refcount through a shared
+// reference. Its final release frees each header with the allocator it was
+// created with and runs the root's release callback. The safe constructors
+// use the static default allocator and callbacks that only free storage
+// this crate owns, all valid on any thread; `wrap_raw` (whose header uses
+// the default allocator) and `from_raw` require the same of every allocator,
+// context and callback they bring.
 unsafe impl Send for Buffer {}
 
 unsafe extern "C" fn release_vec(context: *mut c_void, _data: *const u8, _len: usize) {
@@ -54,6 +66,9 @@ fn checked(range: &Range<usize>, len: usize) -> Result<()> {
 
 impl Buffer {
     /// A buffer holding a copy of `data`.
+    ///
+    /// # Errors
+    /// [`Error::NOMEM`] when the copy cannot be allocated.
     pub fn copy_from(data: &[u8]) -> Result<Buffer> {
         let mut raw = ptr::null_mut();
         // SAFETY: data is valid for the call; the default allocator is
@@ -70,14 +85,22 @@ impl Buffer {
     }
 
     /// Adopt `data` without copying.
+    ///
+    /// # Errors
+    /// [`Error::NOMEM`] when the buffer record cannot be allocated; `data`
+    /// is then dropped.
     pub fn from_vec(data: Vec<u8>) -> Result<Buffer> {
         let len = data.len();
         Buffer::from_vec_range(data, 0..len)
     }
 
     /// Adopt `range` of `data` without copying, for instance to skip a
-    /// header the container still holds. A range outside `data` is
-    /// [`Error::INVAL`].
+    /// header the container still holds.
+    ///
+    /// # Errors
+    /// [`Error::INVAL`] for a range outside `data`, and [`Error::NOMEM`]
+    /// when the buffer record cannot be allocated; `data` is dropped either
+    /// way.
     pub fn from_vec_range(data: Vec<u8>, range: Range<usize>) -> Result<Buffer> {
         checked(&range, data.len())?;
         let owner = Box::new(data);
@@ -98,13 +121,21 @@ impl Buffer {
     }
 
     /// Adopt `data` without copying.
+    ///
+    /// # Errors
+    /// [`Error::NOMEM`] when the buffer record cannot be allocated; `data`
+    /// is then dropped.
     pub fn from_boxed(data: Box<[u8]>) -> Result<Buffer> {
         let len = data.len();
         Buffer::from_boxed_range(data, 0..len)
     }
 
-    /// Adopt `range` of `data` without copying. A range outside `data` is
-    /// [`Error::INVAL`].
+    /// Adopt `range` of `data` without copying.
+    ///
+    /// # Errors
+    /// [`Error::INVAL`] for a range outside `data`, and [`Error::NOMEM`]
+    /// when the buffer record cannot be allocated; `data` is dropped either
+    /// way.
     pub fn from_boxed_range(data: Box<[u8]>, range: Range<usize>) -> Result<Buffer> {
         checked(&range, data.len())?;
         let owner = Box::new(data);
@@ -122,6 +153,9 @@ impl Buffer {
     }
 
     /// `moq_rcbuf_wrap` with the default allocator.
+    ///
+    /// # Errors
+    /// What `moq_rcbuf_wrap` reports; `release` is then not called.
     ///
     /// # Safety
     /// As for [`wrap_raw`](Buffer::wrap_raw).
@@ -149,16 +183,26 @@ impl Buffer {
 
     /// Wrap external bytes without copying (`moq_rcbuf_wrap`). `release`,
     /// when given, runs exactly once with `context` when the last reference
-    /// goes; on failure it is not called and `context` is still the
-    /// caller's.
+    /// goes.
+    ///
+    /// # Errors
+    /// [`Error::NOMEM`] when the buffer record cannot be allocated, or
+    /// another code `moq_rcbuf_wrap` reports; `release` is then not called
+    /// and `context` is still the caller's.
+    ///
+    /// The buffer record itself is allocated with the static default
+    /// allocator.
     ///
     /// # Safety
     /// `data` must stay valid and unmodified for `len` bytes until `release`
-    /// runs (or forever, without one). `release` must meet what the safe
-    /// constructors guarantee: it may run on any thread that drops the final
-    /// reference, including the service's network thread; it must not
-    /// re-enter any object of this crate or any endpoint; it must not
-    /// unwind. A buffer adopted this way is outside the crate's
+    /// runs (or forever, without one). `release` and `context` must meet
+    /// what the safe constructors guarantee: `release` may run on any thread
+    /// that drops the final reference, including a native thread such as the
+    /// service tier's network thread, so it and `context` must be valid
+    /// there, and any state `context` shares with other code must tolerate
+    /// that concurrent use; it must not re-enter any libmoq object; it must
+    /// not unwind. `context` must stay valid until `release` runs. A buffer
+    /// adopted this way is outside the bindings'
     /// no-application-code-on-native-threads invariant: the caller
     /// re-establishes it.
     pub unsafe fn wrap_raw(
@@ -179,9 +223,10 @@ impl Buffer {
     /// several ranges of one container, copy each range or adopt each
     /// container separately.
     ///
+    /// # Errors
     /// A range outside the buffer is [`Error::INVAL`] and a failed
     /// allocation of the slice [`Error::NOMEM`]; either way the buffer comes
-    /// back in the error, unchanged.
+    /// back in the [`SliceError`], unchanged.
     pub fn slice(self, range: Range<usize>) -> std::result::Result<Buffer, SliceError> {
         if let Err(error) = checked(&range, self.len()) {
             return Err(SliceError {
@@ -262,9 +307,23 @@ impl Buffer {
     /// Take ownership of one reference.
     ///
     /// # Safety
-    /// `raw` must be a live rcbuf reference the caller owns exclusively: no
-    /// other reference may share it, and its release (if any) must meet the
-    /// contract of [`wrap_raw`](Buffer::wrap_raw).
+    /// `raw` must be a live rcbuf reference whose whole ownership graph the
+    /// caller hands over:
+    ///
+    /// - No other reference to `raw`, or to any rcbuf it holds (the root a
+    ///   slice was taken from), exists or will be made.
+    /// - Every allocator a header in that graph was created with, and its
+    ///   context, stays valid until the last of those headers is freed, and
+    ///   frees correctly on whichever thread drops the buffer, a native
+    ///   thread included. State a context shares with other allocations
+    ///   must tolerate that concurrent use.
+    /// - Every release callback in the graph, with its context, meets the
+    ///   contract of [`wrap_raw`](Buffer::wrap_raw), and the bytes stay
+    ///   valid and unmodified until it runs.
+    ///
+    /// A thread-affine or arena allocator, or a context only one thread may
+    /// touch, does not meet this: [`Buffer`] is `Send`, and safe code may
+    /// drop it on any thread.
     ///
     /// # Panics
     /// If `raw` is null.
@@ -370,16 +429,16 @@ mod tests {
             .expect("TryFrom<Box>");
         assert_eq!(buffer.as_slice(), [6]);
         assert_eq!(
-            Buffer::from_vec_range(vec![1, 2], 1..3).unwrap_err(),
+            Buffer::from_vec_range(vec![1, 2], 1..3).expect_err("past the end"),
             Error::INVAL
         );
         let (start, end) = (2, 1);
         assert_eq!(
-            Buffer::from_vec_range(vec![1, 2], start..end).unwrap_err(),
+            Buffer::from_vec_range(vec![1, 2], start..end).expect_err("a reversed range"),
             Error::INVAL
         );
         assert_eq!(
-            Buffer::from_boxed_range(vec![1u8].into_boxed_slice(), 0..2).unwrap_err(),
+            Buffer::from_boxed_range(vec![1u8].into_boxed_slice(), 0..2).expect_err("past the end"),
             Error::INVAL
         );
         assert_eq!(
@@ -394,12 +453,10 @@ mod tests {
         let start = buffer.as_slice().as_ptr();
         let slice = buffer.slice(2..8).expect("a range within the buffer");
         assert_eq!(slice.as_slice(), b"234567");
-        // SAFETY: only compared, never dereferenced.
-        assert_eq!(
-            slice.as_slice().as_ptr(),
-            unsafe { start.add(2) },
-            "no copy"
-        );
+        // SAFETY: within the copy's ten bytes; only compared, never
+        // dereferenced.
+        let third = unsafe { start.add(2) };
+        assert_eq!(slice.as_slice().as_ptr(), third, "no copy");
         // A slice of a slice refers to the same storage.
         let inner = slice.slice(1..3).expect("a range within the slice");
         assert_eq!(inner.as_slice(), b"34");
@@ -415,12 +472,15 @@ mod tests {
     fn a_refused_slice_returns_the_buffer() {
         let buffer = Buffer::copy_from(b"abc").expect("a copy");
         let raw = buffer.as_ptr();
-        let failure = buffer.slice(1..4).unwrap_err();
+        let failure = buffer.slice(1..4).expect_err("past the end");
         assert_eq!(failure.error, Error::INVAL);
         assert_eq!(failure.buffer.as_ptr(), raw, "the same buffer");
         assert_eq!(failure.buffer.as_slice(), b"abc");
         let (start, end) = (2, 1);
-        let failure = failure.buffer.slice(start..end).unwrap_err();
+        let failure = failure
+            .buffer
+            .slice(start..end)
+            .expect_err("a reversed range");
         assert_eq!(failure.error, Error::INVAL);
         assert_eq!(Error::from(failure), Error::INVAL);
     }

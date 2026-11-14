@@ -5,14 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::{fmt, mem, ptr};
 
-use crate::buffer::Buffer;
 use crate::endpoint::Endpoint;
-use crate::error::{Error, Result};
-use crate::metadata::LocMetadata;
-use crate::mpeg2ts::{Mpeg2tsInput, Mpeg2tsRecord, Mpeg2tsTrackStats, Mpeg2tsWriteError};
-use crate::namespace::Namespace;
-use crate::types::{CompanionProfile, MediaType, Packaging, SapType, WaitResult};
-use crate::{ffi, sys};
+use crate::mpeg2ts::{Mpeg2tsInput, Mpeg2tsTrackStats, Mpeg2tsWriteError};
+use crate::{
+    ffi, sys, Buffer, CompanionProfile, Error, LocMetadata, MediaType, Mpeg2tsRecord, Namespace,
+    Packaging, Result, SapType, WaitResult,
+};
 
 /// Distinguishes the senders and receivers of this process, so a track
 /// handle can be checked against the object it came from.
@@ -784,7 +782,7 @@ impl Sender {
             }
         }
         raw_config.endpoint = ptr::null(); // attach: the endpoint is given
-        raw_config.namespace_ = config.namespace.raw();
+        raw_config.namespace_ = config.namespace.as_raw();
         raw_config.catalog_track = ffi::optional_span(config.catalog_track.as_deref());
         if let Some(policy) = config.backpressure {
             raw_config.backpressure = policy.raw();
@@ -817,7 +815,7 @@ impl Sender {
             raw_config.catalog_refresh_interval_us = interval_us;
         }
         if let Some(profile) = config.companion_profile {
-            raw_config.companion_profile = profile.raw();
+            raw_config.companion_profile = profile.code();
         }
         if let Some(group_id) = config.initial_group_id {
             raw_config.has_initial_group_id = true;
@@ -913,8 +911,8 @@ impl Sender {
             sys::moq_media_track_cfg_init_sized(&mut raw_config, mem::size_of_val(&raw_config))
         };
         raw_config.name = ffi::span(config.name.as_bytes());
-        raw_config.media_type = config.media_type.raw();
-        raw_config.packaging = config.packaging.raw();
+        raw_config.media_type = config.media_type.code();
+        raw_config.packaging = config.packaging.code();
         raw_config.codec = ffi::span(config.codec.as_bytes());
         raw_config.timescale = config.timescale;
         raw_config.init_data = ffi::span(&config.init_data);
@@ -970,11 +968,7 @@ impl Sender {
         }
         // The MPEG-TS record and its extension entry, alive for the call;
         // add_track deep-copies both.
-        let mut si_pids: Vec<u32> = config
-            .mpeg2ts
-            .as_ref()
-            .and_then(|(mpeg2ts, _)| mpeg2ts.si_pids.clone())
-            .unwrap_or_default();
+        let mut si_pids: Vec<u32> = Vec::new();
         let mut record = None;
         if let Some((mpeg2ts, input)) = &config.mpeg2ts {
             let (app_objects, object_packets, min_group_ms, forward) = input.raw()?;
@@ -982,7 +976,7 @@ impl Sender {
             raw_config.mpeg2ts_object_packets = object_packets;
             raw_config.mpeg2ts_min_group_ms = min_group_ms;
             raw_config.mpeg2ts_forward_before_random_access = forward;
-            record = Some(mpeg2ts.raw(&mut si_pids));
+            record = Some(mpeg2ts.as_raw(&mut si_pids));
         }
         let extension = record.as_ref().map(|record| sys::moq_msf_track_ext_t {
             kind: sys::MOQ_MSF_EXT_MPEG2TS,
@@ -1042,7 +1036,7 @@ impl Sender {
             Err(error) => return Err(WriteError { error, object }),
         };
         // Borrows the object's metadata for the call; the service copies it.
-        let metadata = object.metadata.as_ref().map(LocMetadata::raw);
+        let metadata = object.metadata.as_ref().map(LocMetadata::as_raw);
         let loc_ext = object
             .codec_string
             .as_ref()
@@ -1062,7 +1056,7 @@ impl Sender {
             has_capture_time: object.capture_time_us.is_some(),
             capture_time_us: object.capture_time_us.unwrap_or(0),
             has_sap_type: object.sap_type.is_some(),
-            sap_type: object.sap_type.map_or(sys::MOQ_SAP_NONE, SapType::raw),
+            sap_type: object.sap_type.map_or(sys::MOQ_SAP_NONE, SapType::code),
             metadata: metadata
                 .as_ref()
                 .map_or(ptr::null(), |metadata| metadata as *const _),

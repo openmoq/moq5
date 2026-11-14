@@ -46,14 +46,14 @@ impl Error {
     pub const ABI_MISMATCH: Error = Error(sys::MOQ_ERR_ABI_MISMATCH);
     /// The peer sent GOAWAY.
     pub const GOAWAY: Error = Error(sys::MOQ_ERR_GOAWAY);
-    /// The endpoint's interrupt latch is set (see
-    /// [`Endpoint::set_interrupted`](crate::Endpoint::set_interrupted)). Not
-    /// terminal: calls block normally again once the latch clears.
+    /// A service endpoint's interrupt latch is set. Not terminal: calls
+    /// block normally again once the latch clears.
     pub const INTERRUPTED: Error = Error(sys::MOQ_ERR_INTERRUPTED);
     /// This build of libmoq cannot serve the request.
     pub const UNSUPPORTED: Error = Error(sys::MOQ_ERR_UNSUPPORTED);
-    /// Transport-bridge inbound data was not consumed; the adapter redelivers
-    /// it. Never produced by the service tier this crate wraps.
+    /// Transport-bridge inbound data only: the adapter's chunk was not
+    /// consumed, and the adapter redelivers it. The bridge is not bound by
+    /// these crates, so none of their calls reports it.
     pub const INPUT_NOT_CONSUMED: Error = Error(sys::MOQ_ERR_INPUT_NOT_CONSUMED);
     /// A non-replenishable implementation limit was reached; retrying
     /// unchanged cannot succeed.
@@ -63,7 +63,8 @@ impl Error {
     /// Internal error.
     pub const INTERNAL: Error = Error(sys::MOQ_ERR_INTERNAL);
 
-    /// Wrap a libmoq result code. `code` should not be `MOQ_OK`.
+    /// Wrap a libmoq result code, known or not. `code` should not be
+    /// `MOQ_OK`.
     pub const fn from_code(code: i32) -> Error {
         Error(code)
     }

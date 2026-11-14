@@ -4,9 +4,7 @@
 use std::slice;
 use std::time::Duration;
 
-use crate::error::{Error, Result};
-use crate::sys;
-use crate::types::WaitResult;
+use crate::{sys, Error, Result, WaitResult};
 
 /// Borrow `bytes` as a libmoq byte span. An empty slice becomes the null
 /// span, which libmoq reads as "absent".

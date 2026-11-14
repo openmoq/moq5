@@ -1,39 +1,3 @@
-# Header preambles
-
-The leading comment of each header this crate binds, verbatim: what a header states for all of its declarations at once rather than for one of them (rcbuf's shard and overflow contract among them), which clang attaches to no single item.
-
-## moq/types.h
-
-(no leading comment)
-
-## moq/rcbuf.h
-
-```text
-Refcounted byte buffer for zero-copy relay forwarding.
-
-Shard / threading contract: refcount operations (incref/decref) are
-NOT atomic. All references to a given rcbuf must stay within one
-shard — a single executor-affinity domain (a thread, executor, or run
-loop). Sharing rcbuf ownership across shards via incref/decref is NOT
-supported by libmoq's engine model. To hand bytes to another shard,
-make an independent copy with moq_rcbuf_clone() using an allocator
-valid for the destination shard. (Legacy/manual external
-synchronization may protect raw calls in single-buffer use, but it is
-not the shard model and must not be used by engine/adapter/fan-out
-code to share ownership across shards.)
-
-Overflow protection: incref aborts if the refcount reaches
-UINT32_MAX. This is a hard safety trap, not a recoverable error.
-
-The allocator vtable is copied into the rcbuf at creation so the
-last decref frees with the correct allocator regardless of which
-session holds the final reference.
-```
-
-## moq/version.h
-
-(no leading comment)
-
 ## moq/endpoint.h
 
 ```text
@@ -70,57 +34,9 @@ sender attachment per endpoint; while attached, moq_endpoint_stop() is gated
 by the endpoint attachment count.
 ```
 
-## moq/cmaf.h
+## moq/media_auth.h
 
-```text
-CMAF (Common Media Application Format) segment parser.
-
-Parse-only: extracts codec configuration from init segments
-(ftyp+moov) and sample tables from media fragments (moof+mdat).
-No muxer, no decoder, no session integration.
-
-All string/byte fields in parsed output borrow from the input
-buffer. The input must remain valid while the output is in use.
-Parsing never allocates.
-
-Link against moq::cmaf (depends only on moq::core).
-```
-
-## moq/msf.h
-
-```text
-MSF (MOQT Streaming Format) catalog parser and encoder.
-
-Converts between MSF catalog JSON documents and typed C structs.
-No network, no sessions.
-
-Link against moq::msf (depends on moq::core; when built with
-moq::media-object and moq::cmaf, also provides the
-moq_msf_track_to_media_info_sized() helper via <moq/msf_media.h>).
-
-Lifetime: string fields in the parsed catalog borrow from the
-internal JSON DOM, which itself is allocated via the caller's
-moq_alloc_t. All borrows are valid until moq_msf_catalog_cleanup()
-is called. The original JSON input need not be kept alive after
-moq_msf_catalog_parse() returns.
-
-@see draft-ietf-moq-msf-01
-```
-
-## moq/media_object.h
-
-```text
-Stateless MoQ media object normalizer.
-
-Parses one MoQ media object into timing, keyframe, and payload
-metadata. Handles RAW (LOC properties), CMAF (fragment parsing) and, in a
-build with moq::mpeg2ts, MPEG-2 TS packaging. No state, no heap allocation, no retained
-refs — output spans borrow from input rcbufs.
-
-Usable standalone by downstream integrations without requiring
-moq_playback_t. Link against moq::media-object (depends on
-moq::core, moq::loc, moq::cmaf).
-```
+(no leading comment)
 
 ## moq/media_sender.h
 

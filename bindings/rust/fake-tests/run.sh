@@ -6,7 +6,10 @@
 #
 # The provider is substituted for the SDK's service library through pkg-config
 # alone: a generated libmoq-service.pc names the fake archive in Libs and the
-# real libmoq in Requires, and PKG_CONFIG_PATH puts its directory ahead of the
+# real libmoq in Requires, at the SDK's own version, beside copies of every
+# other SDK-owned package (libmoq.pc and libmoq-*.pc, still describing the
+# SDK's files), so the whole SDK-owned metadata the build checks is one
+# directory and one version; PKG_CONFIG_PATH puts that directory ahead of the
 # SDK's. moq5-sys and moq5 are built unchanged. The test binaries run with
 # the loader path of the SDK's closure, which a shared SDK needs.
 #
@@ -106,11 +109,14 @@ esac
 rm -f "$WORK/libmoq5-fake-service.a"
 "$AR" rcs "$WORK/libmoq5-fake-service.a" "$WORK/fake_service.o"
 
+rm -f "$WORK/pkgconfig"/*.pc
+moq5_sdk_owned_view "$PREFIX" "$WORK/pkgconfig" libmoq-service
+sdk_version=$(moq5_sdk_version "$PREFIX")
 cat > "$WORK/pkgconfig/libmoq-service.pc" <<EOF
 # The scripted provider standing in for libmoq-service (moq5 fake tests).
 Name: libmoq-service
 Description: moq5 fake service provider
-Version: 0.0.0
+Version: $sdk_version
 Requires: libmoq
 Libs: $provider_libs
 Cflags: -I$SDK_INCLUDE

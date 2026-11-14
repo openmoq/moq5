@@ -7,15 +7,11 @@ use std::{fmt, mem, ptr};
 
 use crate::cmaf::{CmafSample, InitInfo};
 use crate::endpoint::Endpoint;
-use crate::error::{Error, Result};
-use crate::metadata::ObjectMetadata;
-use crate::mpeg2ts::{Mpeg2tsRecordRef, TrackExtension};
-use crate::namespace::Namespace;
-use crate::types::{
-    CompanionProfile, DeliveryOrigin, GroupOrder, Location, LocationFilter, MediaType,
-    ObjectStatus, Packaging, SapType, Version, WaitResult,
+use crate::{
+    ffi, sender, sys, CompanionProfile, DeliveryOrigin, Error, GroupOrder, Location,
+    LocationFilter, MediaType, Mpeg2tsRecordRef, Namespace, ObjectMetadata, ObjectStatus,
+    Packaging, Result, SapType, TrackExtension, Version, WaitResult,
 };
-use crate::{ffi, sender, sys};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReceiverPreset {
@@ -378,13 +374,13 @@ impl<'receiver> TrackDescription<'receiver> {
     /// Media type, when derived from the catalog.
     #[must_use]
     pub fn media_type(&self) -> Option<MediaType> {
-        MediaType::from_raw(self.raw.info.media_type)
+        MediaType::from_code(self.raw.info.media_type)
     }
     /// Media packaging, when derived. Non-media tracks (timelines) have
     /// none; see [`packaging_name`](TrackDescription::packaging_name).
     #[must_use]
     pub fn packaging(&self) -> Option<Packaging> {
-        Packaging::from_raw(self.raw.info.packaging)
+        Packaging::from_code(self.raw.info.packaging)
     }
     /// The catalog packaging string, verbatim: `cmaf`, `loc`,
     /// `eventtimeline`, `mediatimeline`, ...
@@ -573,7 +569,11 @@ impl<'receiver> TrackDescription<'receiver> {
         } else {
             &[]
         };
-        entries.iter().map(TrackExtension::from_raw)
+        // SAFETY: each entry and the MPEG-TS record it points to are owned
+        // by the track handle, valid for the receiver's life.
+        entries
+            .iter()
+            .map(|entry| unsafe { TrackExtension::from_raw(entry) })
     }
     /// The track's MPEG-TS record (`moq_msf_ext_mpeg2ts`): the catalog's
     /// mpeg2ts keys as parsed. `None` when the track carries none, or the
@@ -1099,7 +1099,7 @@ impl MediaObject {
     /// Its packaging.
     #[must_use]
     pub fn packaging(&self) -> Option<Packaging> {
-        Packaging::from_raw(self.raw.packaging)
+        Packaging::from_code(self.raw.packaging)
     }
     /// A random-access point.
     #[must_use]
@@ -1120,7 +1120,7 @@ impl MediaObject {
     /// object carries media.
     #[must_use]
     pub fn status(&self) -> ObjectStatus {
-        ObjectStatus::from_raw(self.raw.status)
+        ObjectStatus::from_code(self.raw.status)
     }
     /// Reserved; always 0 today.
     #[must_use]
@@ -1174,7 +1174,7 @@ impl MediaObject {
     #[must_use]
     pub fn samples(&self) -> &[CmafSample] {
         // SAFETY: owned by the object until cleanup.
-        unsafe { CmafSample::table(self.raw.samples, self.raw.sample_count) }
+        unsafe { CmafSample::from_raw_parts(self.raw.samples, self.raw.sample_count) }
     }
     /// The object's wire identity; `None` when the library did not report
     /// it (never "absent").
@@ -1249,7 +1249,9 @@ impl MediaObject {
         if !reported {
             return None;
         }
-        ObjectMetadata::from_raw(&self.raw.metadata)
+        // SAFETY: the metadata's spans borrow the object's properties,
+        // owned by the object until cleanup.
+        unsafe { ObjectMetadata::from_raw(&self.raw.metadata) }
     }
     /// The effective LOC-05 Codec String (the object's own, else its
     /// track's), borrowed from the object: exact bytes the library has
@@ -1778,7 +1780,7 @@ impl Receiver {
             }
         }
         raw_config.endpoint = ptr::null(); // attach: the endpoint is given
-        raw_config.namespace_ = config.namespace.raw();
+        raw_config.namespace_ = config.namespace.as_raw();
         raw_config.catalog_track = ffi::optional_span(config.catalog_track.as_deref());
         if let Some(auto) = config.auto_subscribe {
             raw_config.auto_subscribe = auto;
@@ -1796,7 +1798,7 @@ impl Receiver {
             raw_config.max_track_events = depth;
         }
         if let Some(profile) = config.companion_profile {
-            raw_config.companion_profile = profile.raw();
+            raw_config.companion_profile = profile.code();
         }
         if let Some(max) = config.stream_terminals {
             raw_config.surface_stream_terminals = true;
@@ -2000,7 +2002,7 @@ impl Receiver {
                 group_id: record.group,
                 object_id: record.object,
             },
-            sap_type: SapType::from_raw(record.sap_type),
+            sap_type: SapType::from_code(record.sap_type),
             ept_ms: record.ept_ms,
         }))
     }
@@ -2048,11 +2050,11 @@ impl Receiver {
     pub fn subscribe_track(&self, track: Track, options: Option<SubscribeOptions>) -> Result<()> {
         let track = self.own(track)?;
         // The nested records the options point at, alive through the call.
-        let location = options.and_then(|o| o.location).map(LocationFilter::raw);
+        let location = options.and_then(|o| o.location).map(LocationFilter::as_raw);
         let fill_options = options.and_then(|o| o.fill);
         let fill_location = fill_options
             .and_then(|fill| fill.location)
-            .map(LocationFilter::raw);
+            .map(LocationFilter::as_raw);
         let fill = match fill_options {
             Some(fill) => Some(raw_fill(&fill, fill_location.as_ref())?),
             None => None,
@@ -2110,7 +2112,7 @@ impl Receiver {
     /// option; [`Error::CLOSED`] for a terminal receiver or endpoint.
     pub fn fill_track(&self, track: Track, fill: FillOptions) -> Result<()> {
         let track = self.own(track)?;
-        let location = fill.location.map(LocationFilter::raw);
+        let location = fill.location.map(LocationFilter::as_raw);
         let raw = raw_fill(&fill, location.as_ref())?;
         // SAFETY: a live receiver and one of its handles; the fill and its
         // location are borrowed for the call and copied by the service.
@@ -2269,7 +2271,7 @@ impl Receiver {
             stream_terminals: info
                 .surface_stream_terminals
                 .then_some(info.max_stream_terminals),
-            companion_profile: CompanionProfile::from_raw(info.companion_profile),
+            companion_profile: CompanionProfile::from_code(info.companion_profile),
             transport_version: (info.transport_version != 0)
                 .then(|| Version::from_draft(info.transport_version)),
             track_events_polled: info.track_events_polled,

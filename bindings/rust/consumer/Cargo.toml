@@ -13,4 +13,7 @@ player = ["moq5/player"]
 [dependencies]
 moq5 = { path = "../moq5" }
 
+# The core-only consumer is a member of its own: built alone (`-p
+# moq5-core-consumer`), its graph asks for the core tier and nothing else.
 [workspace]
+members = ["core"]

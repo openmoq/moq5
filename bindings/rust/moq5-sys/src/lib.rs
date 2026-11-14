@@ -1,19 +1,46 @@
-//! Raw, bindgen-generated bindings to the libmoq service tier.
+//! Raw, bindgen-generated bindings to libmoq, by tier.
+//!
+//! The default is the core tier: the sans-I/O session, its vocabulary, and
+//! the publisher and subscriber facades. The features add tiers, each
+//! generated into its own file so a tier's declarations are the same
+//! whichever others are enabled:
+//!
+//! - `sim`: the deterministic simulator (`sim.h`; an SDK built with
+//!   `MOQ_BUILD_SIM=ON`);
+//! - `media`: the LOC, CMAF, media-object and MSF parsers;
+//! - `service` (implies `media`): the managed endpoint, media sender and
+//!   media receiver;
+//! - `player` (implies `service`): the media player and the playback engine
+//!   configuration it takes (an SDK built with `MOQ_BUILD_PLAYBACK=ON`).
 //!
 //! The declarations come from the installed headers at build time, so they
 //! match the SDK this crate links against; `cfg(docsrs)` compiles the
-//! committed snapshot in `docs/` instead. The header comments are the
-//! contract: each declaration's comment is its item's documentation, and the
-//! leading comment of each header follows below, since what a header states
-//! for all of its declarations (the rcbuf shard and overflow rules) is
-//! attached to no single item.
+//! committed snapshot of each enabled tier in `docs/` instead. The header
+//! comments are the contract: each declaration's comment is its item's
+//! documentation, and the leading comment of each header follows below,
+//! since what a header states for all of its declarations (the rcbuf shard
+//! and overflow rules) is attached to no single item.
 //!
-//! The `player` feature adds the media player (`media_player.h`) and the
-//! playback engine configuration it takes; it needs an SDK built with the
-//! player (`MOQ_BUILD_PLAYBACK=ON`).
-//!
-#![cfg_attr(not(docsrs), doc = include_str!(concat!(env!("OUT_DIR"), "/preambles.md")))]
-#![cfg_attr(docsrs, doc = include_str!("../docs/preambles.md"))]
+#![cfg_attr(not(docsrs), doc = include_str!(concat!(env!("OUT_DIR"), "/preambles_core.md")))]
+#![cfg_attr(docsrs, doc = include_str!("../docs/preambles_core.md"))]
+#![cfg_attr(
+    all(not(docsrs), feature = "sim"),
+    doc = include_str!(concat!(env!("OUT_DIR"), "/preambles_sim.md"))
+)]
+#![cfg_attr(all(docsrs, feature = "sim"), doc = include_str!("../docs/preambles_sim.md"))]
+#![cfg_attr(
+    all(not(docsrs), feature = "media"),
+    doc = include_str!(concat!(env!("OUT_DIR"), "/preambles_media.md"))
+)]
+#![cfg_attr(all(docsrs, feature = "media"), doc = include_str!("../docs/preambles_media.md"))]
+#![cfg_attr(
+    all(not(docsrs), feature = "service"),
+    doc = include_str!(concat!(env!("OUT_DIR"), "/preambles_service.md"))
+)]
+#![cfg_attr(
+    all(docsrs, feature = "service"),
+    doc = include_str!("../docs/preambles_service.md")
+)]
 #![cfg_attr(
     all(not(docsrs), feature = "player"),
     doc = include_str!(concat!(env!("OUT_DIR"), "/preambles_player.md"))
@@ -27,10 +54,28 @@
 #![allow(rustdoc::all)]
 
 #[cfg(not(docsrs))]
-include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+include!(concat!(env!("OUT_DIR"), "/bindings_core.rs"));
 
 #[cfg(docsrs)]
-include!("../docs/bindings.rs");
+include!("../docs/bindings_core.rs");
+
+#[cfg(all(not(docsrs), feature = "sim"))]
+include!(concat!(env!("OUT_DIR"), "/bindings_sim.rs"));
+
+#[cfg(all(docsrs, feature = "sim"))]
+include!("../docs/bindings_sim.rs");
+
+#[cfg(all(not(docsrs), feature = "media"))]
+include!(concat!(env!("OUT_DIR"), "/bindings_media.rs"));
+
+#[cfg(all(docsrs, feature = "media"))]
+include!("../docs/bindings_media.rs");
+
+#[cfg(all(not(docsrs), feature = "service"))]
+include!(concat!(env!("OUT_DIR"), "/bindings_service.rs"));
+
+#[cfg(all(docsrs, feature = "service"))]
+include!("../docs/bindings_service.rs");
 
 #[cfg(all(not(docsrs), feature = "player"))]
 include!(concat!(env!("OUT_DIR"), "/bindings_player.rs"));

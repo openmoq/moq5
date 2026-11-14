@@ -1,13 +1,14 @@
 //! The headers' comments are the raw API's documentation: the lifecycle,
 //! threading and ownership contracts the C headers state reach the generated
-//! items, and the contracts a header states for all of its declarations at
-//! once (rcbuf's shard and overflow rules) reach the crate documentation's
-//! header preambles -- in the fresh generation and in the docs.rs snapshot.
+//! items of each tier, and the contracts a header states for all of its
+//! declarations at once (rcbuf's shard and overflow rules) reach the crate
+//! documentation's header preambles -- in the fresh generation and in the
+//! docs.rs snapshot.
 
-const GENERATED: &str = include_str!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-const SNAPSHOT: &str = include_str!("../docs/bindings.rs");
-const GENERATED_PREAMBLES: &str = include_str!(concat!(env!("OUT_DIR"), "/preambles.md"));
-const SNAPSHOT_PREAMBLES: &str = include_str!("../docs/preambles.md");
+const GENERATED: &str = include_str!(concat!(env!("OUT_DIR"), "/bindings_core.rs"));
+const SNAPSHOT: &str = include_str!("../docs/bindings_core.rs");
+const GENERATED_PREAMBLES: &str = include_str!(concat!(env!("OUT_DIR"), "/preambles_core.md"));
+const SNAPSHOT_PREAMBLES: &str = include_str!("../docs/preambles_core.md");
 
 /// The documentation attached to `fn <name>(`: the text between the item's
 /// `extern "C" {` opener and its declaration.
@@ -23,6 +24,7 @@ fn function_doc<'bindings>(bindings: &'bindings str, name: &str) -> &'bindings s
 }
 
 /// The documentation attached to field `<field>` of `struct <record>`.
+#[cfg(feature = "service")]
 fn field_doc<'bindings>(bindings: &'bindings str, record: &str, field: &str) -> &'bindings str {
     let declaration = format!("pub struct {record} {{");
     let start = bindings
@@ -40,19 +42,29 @@ fn field_doc<'bindings>(bindings: &'bindings str, record: &str, field: &str) -> 
     &body[previous_field..field_at]
 }
 
-/// Representative contracts, one per family: endpoint lifecycle (teardown
-/// precondition and the refusal with live attachments), buffer ownership
-/// on the error path, and the cross-shard copy's reference to the header's
-/// threading contract.
+/// Representative core contracts: buffer ownership on the error path, the
+/// cross-shard copy's reference to the header's threading contract, the
+/// session's ownership, the public host operation that routes a peer
+/// stream, and both facades' event dispatch.
 const CONTRACTS: &[(&str, &str)] = &[
-    (
-        "moq_endpoint_destroy",
-        "Precondition: no live attachments and",
-    ),
-    ("moq_endpoint_stop", "MOQ_ERR_WRONG_STATE with live"),
     ("moq_rcbuf_wrap", "does not call `release`"),
-    ("moq_endpoint_connect", "handshake complete asynchronously"),
     ("moq_rcbuf_clone", "blessed way to cross a shard boundary"),
+    (
+        "moq_session_create",
+        "Ownership: caller owns *out until moq_session_destroy()",
+    ),
+    (
+        "moq_session_route_peer_uni",
+        "Say where the bytes of a peer-opened unidirectional stream belong",
+    ),
+    (
+        "moq_pub_tick",
+        "Process session events and retry pending operations.",
+    ),
+    (
+        "moq_sub_tick",
+        "Process session events. Dispatches subscribe, object, fetch,",
+    ),
 ];
 
 /// What rcbuf.h states for every rcbuf operation in its preamble: the
@@ -78,20 +90,6 @@ fn function_contracts_reach_the_generated_documentation() {
 }
 
 #[test]
-fn field_contracts_reach_the_generated_documentation() {
-    // bindgen names the struct by its C tag; the `_t` typedef aliases it.
-    let phrase = "the track ended because its subscription completed";
-    assert!(
-        field_doc(GENERATED, "moq_media_track_event", "has_done_status").contains(phrase),
-        "the generated `has_done_status` carries its header comment"
-    );
-    assert!(
-        field_doc(SNAPSHOT, "moq_media_track_event", "has_done_status").contains(phrase),
-        "the snapshot's `has_done_status` carries its header comment"
-    );
-}
-
-#[test]
 fn header_preambles_reach_the_crate_documentation() {
     for preambles in [GENERATED_PREAMBLES, SNAPSHOT_PREAMBLES] {
         assert!(
@@ -102,6 +100,90 @@ fn header_preambles_reach_the_crate_documentation() {
             assert!(
                 preambles.contains(phrase),
                 "the rcbuf.h preamble reaches the crate documentation ({phrase:?})"
+            );
+        }
+    }
+}
+
+/// The simulator's preamble, in its own generation and snapshot: the
+/// harness is separate from the production core.
+#[cfg(feature = "sim")]
+mod sim {
+    const GENERATED_PREAMBLES: &str = include_str!(concat!(env!("OUT_DIR"), "/preambles_sim.md"));
+    const SNAPSHOT_PREAMBLES: &str = include_str!("../docs/preambles_sim.md");
+
+    #[test]
+    fn sim_preambles_reach_the_crate_documentation() {
+        for preambles in [GENERATED_PREAMBLES, SNAPSHOT_PREAMBLES] {
+            assert!(preambles.contains("## moq/sim.h"));
+            assert!(
+                preambles.contains("Deterministic simulation helpers for libmoq."),
+                "the sim.h preamble reaches the crate documentation"
+            );
+        }
+    }
+}
+
+/// A media parser's sized-output contract, in the media tier's generation
+/// and snapshot.
+#[cfg(feature = "media")]
+mod media {
+    const GENERATED: &str = include_str!(concat!(env!("OUT_DIR"), "/bindings_media.rs"));
+    const SNAPSHOT: &str = include_str!("../docs/bindings_media.rs");
+
+    #[test]
+    fn media_contracts_reach_the_generated_documentation() {
+        let (name, phrase) = (
+            "moq_cmaf_parse_init_sized",
+            "Parse the first trak from a CMAF init segment",
+        );
+        for (bindings, which) in [(GENERATED, "generated"), (SNAPSHOT, "snapshot")] {
+            assert!(
+                super::function_doc(bindings, name).contains(phrase),
+                "the {which} `{name}` carries its header comment ({phrase:?})"
+            );
+        }
+    }
+}
+
+/// The service tier's contracts, in its own generation and snapshot:
+/// endpoint lifecycle (teardown precondition and the refusal with live
+/// attachments) and a receiver record's field.
+#[cfg(feature = "service")]
+mod service {
+    const GENERATED: &str = include_str!(concat!(env!("OUT_DIR"), "/bindings_service.rs"));
+    const SNAPSHOT: &str = include_str!("../docs/bindings_service.rs");
+
+    const CONTRACTS: &[(&str, &str)] = &[
+        (
+            "moq_endpoint_destroy",
+            "Precondition: no live attachments and",
+        ),
+        ("moq_endpoint_stop", "MOQ_ERR_WRONG_STATE with live"),
+        ("moq_endpoint_connect", "handshake complete asynchronously"),
+    ];
+
+    #[test]
+    fn service_contracts_reach_the_generated_documentation() {
+        for (name, phrase) in CONTRACTS {
+            for (bindings, which) in [(GENERATED, "generated"), (SNAPSHOT, "snapshot")] {
+                assert!(
+                    super::function_doc(bindings, name).contains(phrase),
+                    "the {which} `{name}` carries its header comment ({phrase:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn field_contracts_reach_the_generated_documentation() {
+        // bindgen names the struct by its C tag; the `_t` typedef aliases it.
+        let phrase = "the track ended because its subscription completed";
+        for (bindings, which) in [(GENERATED, "generated"), (SNAPSHOT, "snapshot")] {
+            assert!(
+                super::field_doc(bindings, "moq_media_track_event", "has_done_status")
+                    .contains(phrase),
+                "the {which} `has_done_status` carries its header comment"
             );
         }
     }

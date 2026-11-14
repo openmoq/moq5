@@ -12,7 +12,15 @@ lane, SAP and media timeline records, location and fill subscriptions,
 MPEG-TS records, the effective configuration), `Buffer::slice`, and CMAF
 parsing. With the `player` feature, `moq5::player` plays a receiver's
 tracks for the application's decoders. The raw C API is re-exported as
-`moq5::sys` (the `moq5-sys` crate); its header comments are the contract.
+`moq5::sys` (the `moq5-sys` crate, with its service tier); its header
+comments are the contract.
+
+The vocabulary shared with the lower tiers lives in the crates of those
+tiers and is re-exported here under the same names, so code written against
+`moq5` alone compiles unchanged: `Buffer`, `Error`, `Namespace`, `Version`,
+locations and object statuses from [`moq5-core`](../moq5-core); `cmaf`, the
+LOC metadata, the MPEG-TS catalog records and the media value types from
+[`moq5-media`](../moq5-media).
 
 ```rust,no_run
 use moq5::{

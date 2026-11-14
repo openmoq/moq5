@@ -1,0 +1,19 @@
+[package]
+name = "moq5-core-consumer"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "An out-of-tree consumer of moq5-core alone against an installed SDK"
+
+[dependencies]
+moq5-core = { path = "../../moq5-core" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+unwrap_used = "warn"

@@ -4,12 +4,14 @@
 # selection on static-only, shared-only and dual prefixes; the exact
 # link-search assertion against a prefix-of-path, an outside directory and
 # the real directory; a failing helper failing a row; a row refusing a
-# player or MPEG-TS statement the SDK contradicts, or none, and passing one
-# it matches; a row stating the SDK's link mode to its builds with the
+# player, MPEG-TS or simulator statement the SDK contradicts, or none, and
+# passing one it matches; a row stating the SDK's link mode to its builds with the
 # opposite mode inherited; and, with real cargo runs, a build script's
 # printed diagnostic and a package step's warning failing their gates
 # beside clean runs that pass, a rebuilt static archive making `cargo check`
-# compile moq5-sys again where an unchanged one leaves it fresh, an SDK
+# compile moq5-sys again where an unchanged one leaves it fresh, the
+# snapshot updater reading its own build's generation after builds of two
+# feature sets in one target directory, an SDK
 # whose headers its metadata places outside include/ found by the
 # configure defaults, the statement check, a build and the fake provider,
 # and the player feature refused by the build script itself on an SDK
@@ -177,7 +179,7 @@ check link-search-no-line fail moq5_sdk_assert_link_search "$WORK/search-none.lo
 # -- a failing helper fails a row ------------------------------------------
 check row-fails-on-missing-sdk fail env MOQ5_RUST_SDK=$WORK/no-such-prefix MOQ5_RUST_WORK=$WORK/row-work \
     bash "$HERE/scripts/ctest_row.sh" fmt
-grep -q 'no libmoq-service.pc under' "$WORK/row-fails-on-missing-sdk.out" && echo "ok   row-fails-with-the-helper's-reason" ||
+grep -q 'no libmoq-service.pc or libmoq-core.pc under' "$WORK/row-fails-on-missing-sdk.out" && echo "ok   row-fails-with-the-helper's-reason" ||
     { echo "FAIL row-fails-with-the-helper's-reason"; failures=$((failures + 1)); }
 
 # -- the real SDK's metadata ------------------------------------------------
@@ -195,6 +197,7 @@ onoff_has() {   # onoff_has <include dir> <header>: ON when the directory holds 
 }
 real_player=$(onoff_has "$real_include" media_player.h)
 real_mpeg2ts=$(onoff_has "$real_include" mpeg2ts.h)
+real_sim=$(onoff_has "$real_include" sim.h)
 
 # -- a row checks what the SDK is stated to carry ---------------------------
 # A view of the real SDK whose include directory holds only the headers
@@ -219,11 +222,14 @@ EOF
     echo "$view"
 }
 real_pc=$(moq5_sdk_pkgconfig "$PREFIX")
+# The simulator a statement states: none for the views above (they hold no
+# sim.h), the real SDK's for its relocated views below.
+STATEMENT_SIM=0
 statement() {   # statement <label> <pass|fail> <view> <player> <mpeg2ts> [phrase]
     local label=$1 expected=$2 view=$3 player=$4 mpeg2ts=$5 phrase=${6:-}
     check "$label" "$expected" env "MOQ5_RUST_SDK=$view" "MOQ5_RUST_WORK=$WORK/$label-work" \
         "MOQ5_SDK_PKG_CONFIG_PATH=$real_pc" "MOQ5_RUST_PLAYER=$player" "MOQ5_RUST_MPEG2TS=$mpeg2ts" \
-        bash "$HERE/scripts/ctest_row.sh" fmt
+        "MOQ5_RUST_SIM=$STATEMENT_SIM" bash "$HERE/scripts/ctest_row.sh" fmt
     if [ -n "$phrase" ]; then
         grep -q -F "$phrase" "$WORK/$label.out" && echo "ok   $label-with-the-reason" ||
             { echo "FAIL $label-with-the-reason (expected: $phrase)"; failures=$((failures + 1)); }
@@ -237,9 +243,12 @@ statement statement-mpeg2ts-the-sdk-lacks fail "$bare" 0 1 "has no MPEG-TS"
 statement statement-refusal-of-carried-mpeg2ts fail "$ts_only" 0 0 "states a refusal"
 statement statement-matching-the-sdk pass "$both" 1 1
 statement statement-player-left-out pass "$both" 0 1 "its rows are left out"
+STATEMENT_SIM=1
+statement statement-sim-the-sdk-lacks fail "$both" 1 1 "has no simulator"
+STATEMENT_SIM=0
 statement statement-not-1-or-0 fail "$both" yes 1 "MOQ5_RUST_PLAYER must state 1 or 0"
 check statement-unstated fail env -u MOQ5_RUST_MPEG2TS "MOQ5_RUST_SDK=$both" "MOQ5_RUST_WORK=$WORK/unstated-work" \
-    "MOQ5_SDK_PKG_CONFIG_PATH=$real_pc" MOQ5_RUST_PLAYER=1 bash "$HERE/scripts/ctest_row.sh" fmt
+    "MOQ5_SDK_PKG_CONFIG_PATH=$real_pc" MOQ5_RUST_PLAYER=1 MOQ5_RUST_SIM=0 bash "$HERE/scripts/ctest_row.sh" fmt
 grep -q -F "MOQ5_RUST_MPEG2TS must state 1 or 0" "$WORK/statement-unstated.out" &&
     echo "ok   statement-unstated-with-the-reason" ||
     { echo "FAIL statement-unstated-with-the-reason"; failures=$((failures + 1)); }
@@ -295,18 +304,23 @@ build_archive() {   # build_archive <a C function body>
     "${AR:-ar}" rcs "$watch/lib/libmoq5-gate-archive.a" "$watch/probe.o"
 }
 build_archive 'return 1;'
+# One SDK's metadata: copies of the SDK's own packages and the scratch
+# service package at the SDK's version, in one directory, so the build's
+# one-SDK check holds and the archive is the only substitution.
+moq5_sdk_owned_view "$PREFIX" "$watch/pc" libmoq-service
 cat > "$watch/pc/libmoq-service.pc" <<EOF
 Name: libmoq-service
 Description: gate control archive
-Version: 0.0.0
+Version: $(moq5_sdk_version "$PREFIX")
 Requires: libmoq
 Libs: -L$watch/lib -lmoq5-gate-archive
 Cflags: -I$real_include
 EOF
 watch_pc="$watch/pc:$(moq5_sdk_pkgconfig "$PREFIX")"
 archive_check() {   # archive_check <name>: the crate's artifact record of a check
+    # The service tier: its package is the one the scratch archive stands in for.
     env -u MOQ_PREFIX PKG_CONFIG_PATH="$watch_pc" CARGO_TARGET_DIR="$watch/target" \
-        "${CARGO:-cargo}" check --manifest-path "$HERE/Cargo.toml" -p moq5-sys --locked \
+        "${CARGO:-cargo}" check --manifest-path "$HERE/Cargo.toml" -p moq5-sys --features service --locked \
         --message-format=json > "$WORK/$1.json" 2> "$WORK/$1.err"
     grep '"reason":"compiler-artifact"' "$WORK/$1.json" | grep -F '/moq5-sys#' | grep '"kind":\["lib"\]'
 }
@@ -323,6 +337,77 @@ archive_fresh archive-first-compiles-the-crate archive-first false
 archive_fresh archive-unchanged-leaves-the-crate-fresh archive-unchanged true
 build_archive 'return 2;'
 archive_fresh archive-rebuilt-rebuilds-the-crate archive-rebuilt false
+
+# -- the snapshot updater reads its own build --------------------------------
+# Two feature sets built in one target directory, the core alone last (its
+# generation the newest there): the updater asked for the union must take
+# the union's generation, which cargo's record of its own build names, and
+# the updater asked for the core alone the core's. Each writes into a
+# scratch directory, never the committed snapshots.
+snapshot_target=$(dirname "$WORK")/gate-controls-snapshot-target
+sys_out_dir() {   # sys_out_dir <cargo json>: the out_dir of the one moq5-sys build-script record
+    "${PYTHON:-python3}" -I -c '
+import json, sys
+dirs = []
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    if line.startswith("{"):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        package = record.get("package_id", "")
+        if record.get("reason") == "build-script-executed" and (
+                "/moq5-sys#" in package or "#moq5-sys@" in package):
+            dirs.append(record["out_dir"])
+if len(dirs) != 1:
+    sys.exit(f"{len(dirs)} moq5-sys build-script records")
+print(dirs[0])
+' "$1"
+}
+union_features=service; union_tiers=(core service)
+if [ "$real_sim" = ON ]; then union_features=service,sim; union_tiers+=(sim); fi
+snapshot_build() {   # snapshot_build <name> [cargo args...]: moq5-sys built in the shared scratch target
+    local name=$1; shift
+    MOQ_PREFIX=$PREFIX CARGO_TARGET_DIR=$snapshot_target "${CARGO:-cargo}" build \
+        --manifest-path "$HERE/Cargo.toml" -p moq5-sys --locked --message-format=json "$@" \
+        > "$WORK/$name.json" 2> "$WORK/$name.err"
+}
+snapshot_update() {   # snapshot_update <name> <tier...>: the updater into its own scratch directory
+    local name=$1; shift
+    MOQ5_SNAPSHOT_DIR=$WORK/$name CARGO_TARGET_DIR=$snapshot_target \
+        bash "$HERE/scripts/update_snapshot.sh" "$PREFIX" "$@" > "$WORK/$name.log" 2>&1
+}
+union_dir=""; core_dir=""
+if snapshot_build snapshot-union-build --features "$union_features" &&
+    snapshot_build snapshot-core-build && union_dir=$(sys_out_dir "$WORK/snapshot-union-build.json") &&
+    core_dir=$(sys_out_dir "$WORK/snapshot-core-build.json") && [ "$union_dir" != "$core_dir" ]; then
+    echo "ok   snapshot-interleaved-builds (union $union_dir, then the core alone $core_dir)"
+else
+    echo "FAIL snapshot-interleaved-builds (see $WORK/snapshot-union-build.err, $WORK/snapshot-core-build.err)"
+    failures=$((failures + 1))
+fi
+# body <file>: a snapshot past its provenance header, or a generation whole.
+body() { sed -n '/^\/\* automatically generated by rust-bindgen/,$p' "$1"; }
+snapshot_from() {   # snapshot_from <label> <name> <generation dir> <SDK phrase> <tier...>
+    local label=$1 name=$2 generation=$3 phrase=$4 tier ok=yes; shift 4
+    check "$label" pass snapshot_update "$name" "$@"
+    grep -q -x -F "update_snapshot.sh: this build's moq5-sys generation is $generation" "$WORK/$name.log" || ok=no
+    for tier in "$@"; do
+        cmp -s <(body "$WORK/$name/bindings_$tier.rs") "$generation/bindings_$tier.rs" || ok=no
+        cmp -s "$WORK/$name/preambles_$tier.md" "$generation/preambles_$tier.md" || ok=no
+    done
+    grep -q -F "// SDK: $phrase" "$WORK/$name/bindings_core.rs" || ok=no
+    if [ "$ok" = yes ]; then
+        echo "ok   $label-reads-its-own-generation ($generation)"
+    else
+        echo "FAIL $label-reads-its-own-generation (expected $generation; see $WORK/$name.log)"
+        failures=$((failures + 1))
+    fi
+}
+if [ -n "$union_dir" ] && [ -n "$core_dir" ]; then
+    snapshot_from snapshot-updater-union-after-core snapshot-union "$union_dir" "libmoq-service.pc" "${union_tiers[@]}"
+    snapshot_from snapshot-updater-core-after-union snapshot-core "$core_dir" "libmoq-core.pc Requires: (none)" core
+fi
 
 # -- headers where the SDK's metadata places them ---------------------------
 # Views of the real SDK: its libraries linked in, its pkg-config files
@@ -400,7 +485,7 @@ warning_pkg_config=$(warning_tool pkg-config "$(command -v "${PKG_CONFIG:-pkg-co
 # check and a real build all find the headers through the metadata, so a
 # fixed include/ would find nothing.
 relocated=$(real_view relocated headers)
-relocated_answer="player=$real_player mpeg2ts=$real_mpeg2ts includedir=$relocated/headers"
+relocated_answer="player=$real_player mpeg2ts=$real_mpeg2ts sim=$real_sim includedir=$relocated/headers"
 probe_defaults() {   # probe_defaults <name> <pkg-config>: the defaults, which print their answer and nothing else
     local name=$1 pc=${2:-${PKG_CONFIG:-pkg-config}}
     cmake -DPREFIX="$relocated" "-DPKG_CONFIG=$pc" "-DPC_PATH=${MOQ5_SDK_PKG_CONFIG_PATH:-}" \
@@ -419,6 +504,7 @@ gated_pair relocated-headers-configure-defaults probe_defaults "$warning_pkg_con
 stated_player=0; stated_mpeg2ts=0
 if [ "$real_player" = ON ]; then stated_player=1; fi
 if [ "$real_mpeg2ts" = ON ]; then stated_mpeg2ts=1; fi
+if [ "$real_sim" = ON ]; then STATEMENT_SIM=1; fi
 statement relocated-headers-statement-matching pass "$relocated" "$stated_player" "$stated_mpeg2ts"
 if [ "$stated_mpeg2ts" = 1 ]; then
     statement relocated-headers-statement-refusal-of-carried-mpeg2ts fail "$relocated" "$stated_player" 0 \

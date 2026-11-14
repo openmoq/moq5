@@ -1,23 +1,35 @@
-//! Link the installed libmoq service tier and generate its bindings.
+//! Link the installed libmoq tiers a dependency graph asks for and generate
+//! their bindings.
 //!
-//! The SDK is found through pkg-config on `libmoq-service`, whose `Requires`
-//! closure carries every library the service was built with (core, the media
-//! helpers, and the managed providers the SDK expresses through pkg-config).
-//! Nothing is reconstructed here: an SDK whose service component has no
-//! pkg-config file is reported, not guessed at.
+//! The tiers are additive features: none (the core, with the publisher and
+//! subscriber facades), `sim`, `media`, `service` (which implies `media`)
+//! and `player` (which implies `service`). Cargo unifies features across the
+//! graph, so this script builds the union, from one source: the installed
+//! SDK, found through pkg-config. There is no other source and no fallback:
+//! each tier links through its own package (`libmoq-core`, `libmoq-sim`,
+//! `libmoq-media`, or `libmoq-service`, whose `Requires` closure carries the
+//! core, the media parsers and the managed providers the SDK expresses
+//! through pkg-config), every package the graph needs must resolve, and all
+//! of them from one SDK. `libmoq.pc` is never probed for a lower tier: it
+//! names every component the SDK was built with, adapters included. The
+//! script prints which tiers it bound, from which SDK and why (and writes the
+//! same lines to `provenance.txt` beside the bindings); a missing package or
+//! a graph split across SDKs fails the build with the reason.
 //!
 //! Environment, host builds:
 //! - `MOQ_PREFIX`: a convenience that puts `<prefix>/lib/pkgconfig` (and
 //!   `lib64/pkgconfig`, `share/pkgconfig` when present) in front of the
 //!   search variable the probe reads (`PKG_CONFIG_PATH`, or the host-specific
 //!   spelling of it when one is set).
-//! - `LIBMOQ_SERVICE_STATIC` / `LIBMOQ_SERVICE_DYNAMIC` and the
+//! - `LIBMOQ_CORE_STATIC`, `LIBMOQ_SIM_STATIC`, `LIBMOQ_MEDIA_STATIC`,
+//!   `LIBMOQ_SERVICE_STATIC` (each with its `_DYNAMIC` form) and the
 //!   `PKG_CONFIG_ALL_*` forms: the `pkg-config` crate's own static/shared
-//!   selection for this probe. Unset, the installed libraries decide.
+//!   selection for each probe. Unset, the installed libraries decide.
 //! - `BINDGEN_EXTRA_CLANG_ARGS`: extra arguments for libclang, for instance
 //!   the include directory of a libclang installed without its resource
 //!   headers. The host C compiler's headers are never substituted for them.
-//! - `DOCS_RS`: no SDK is probed; the crate compiles the committed snapshot.
+//! - `DOCS_RS`: no SDK is probed; the crate compiles the committed snapshot
+//!   of each enabled tier.
 //!
 //! Cross builds (`--target` differs from the host) are resolved once, before
 //! anything is probed, into one target search configuration and one sysroot.
@@ -44,22 +56,23 @@
 //! `PKG_CONFIG_ALLOW_CROSS` on its own is not support and does not admit a
 //! host SDK.
 //!
-//! Beside the bindings, the leading comment of every bound header is written
-//! to `preambles.md` and compiled into the crate documentation: the contracts
-//! a header states for all of its declarations at once (rcbuf's shard and
-//! overflow rules) are not attached to any one item by clang.
-//!
-//! The `player` feature binds the media player (`media_player.h`, with the
-//! playback engine configuration it takes from `playback.h`), which an SDK
-//! carries only when it was built with `MOQ_BUILD_PLAYBACK`. Its declarations
-//! are generated into a file of their own, `bindings_player.rs`, with their
-//! preambles in `preambles_player.md`, so the base bindings are the same with
-//! the feature and without it. With the feature, an SDK without the player
-//! headers fails the build; without it, they are never read.
+//! Each tier is generated into a file of its own (`bindings_<tier>.rs`, with
+//! its constants made from macros in `macros_<tier>.txt`), in tier order:
+//! every libmoq header outside the tier is blocklisted, so what a tier
+//! references from a lower one is in that tier's bindings, and the traits
+//! bindgen asks about for those types are answered from the lower tiers'
+//! generated text (`build_tiers.rs`). A tier's bindings are therefore the
+//! same whichever other tiers the graph enables. Beside them, the leading
+//! comment of every bound header is written to `preambles_<tier>.md` and
+//! compiled into the crate documentation: the contracts a header states for
+//! all of its declarations at once (rcbuf's shard and overflow rules) are not
+//! attached to any one item by clang. A tier whose headers the SDK lacks
+//! fails the build with the remedy; a tier that is not enabled is never read.
 
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -67,28 +80,12 @@ use bindgen::callbacks::{IntKind, ItemInfo, ParseCallbacks};
 
 #[path = "build_sysroot.rs"]
 mod sysroot;
+#[path = "build_tiers.rs"]
+mod tiers;
 
-const PROBE: &str = "libmoq-service";
-
-/// The prefix of the statics wrapper.h restates values under, stripped from
-/// their generated names.
+/// The prefix of the statics the wrappers restate values under, stripped
+/// from their generated names.
 const SYSVAL_PREFIX: &str = "MOQ5_SYSVAL_";
-
-/// The headers the safe crate wraps, in dependency order.
-const HEADERS: &[&str] = &[
-    "moq/types.h",
-    "moq/rcbuf.h",
-    "moq/version.h",
-    "moq/endpoint.h",
-    "moq/cmaf.h",
-    "moq/msf.h",
-    "moq/media_object.h",
-    "moq/media_sender.h",
-    "moq/media_receiver.h",
-];
-
-/// The headers the `player` feature binds, in dependency order.
-const PLAYER_HEADERS: &[&str] = &["moq/playback.h", "moq/media_player.h"];
 
 /// The pkg-config search configuration of a cross build, kept for the
 /// diagnostics.
@@ -100,11 +97,32 @@ struct Cross {
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(docsrs)");
-    println!("cargo:rerun-if-env-changed=MOQ_PREFIX");
-    println!("cargo:rerun-if-env-changed=DOCS_RS");
-    println!("cargo:rerun-if-env-changed=RUSTFMT");
+    for var in [
+        "MOQ_PREFIX",
+        "DOCS_RS",
+        "RUSTFMT",
+        "LIBCLANG_PATH",
+        "BINDGEN_EXTRA_CLANG_ARGS",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+    let features = tiers::Features::from_enabled(|name| {
+        env::var_os(format!("CARGO_FEATURE_{}", name.to_ascii_uppercase())).is_some()
+    });
+    let mut report = Report::default();
+    report.line(format!(
+        "moq5-sys: tiers {} (enabled tier features: {})",
+        features.describe(),
+        features.enabled()
+    ));
     if env::var_os("DOCS_RS").is_some() {
         println!("cargo:rustc-cfg=docsrs");
+        report.line(
+            "moq5-sys: DOCS_RS is set: no SDK is probed or linked; the committed snapshot of \
+             each enabled tier is compiled"
+                .to_owned(),
+        );
+        report.print();
         return;
     }
 
@@ -116,14 +134,33 @@ fn main() {
         apply_moq_prefix(&host);
         None
     };
-    let lib = match pkg_config::Config::new().probe(PROBE) {
-        Ok(lib) => lib,
-        Err(e) => panic!("{}", diagnose(&e, cross.as_ref())),
-    };
-    // pkg-config emitted the link-search and link-lib lines for the whole
-    // closure. Dependents get the include directories through DEP_MOQ_INCLUDE.
-    let include: Vec<String> = lib
-        .include_paths
+    let packages = features.packages();
+    report.line(format!(
+        "moq5-sys: native source: the installed SDK, found through pkg-config (this crate has \
+         no other source); packages for these tiers: {}",
+        packages.join(", ")
+    ));
+    let mut libs = Vec::new();
+    for package in &packages {
+        match pkg_config::Config::new().probe(package) {
+            Ok(lib) => libs.push((*package, lib)),
+            Err(e) => panic!("{}", diagnose(&e, package, features, cross.as_ref())),
+        }
+    }
+    check_one_sdk(features, &mut report);
+    // pkg-config emitted the link-search and link-lib lines for each
+    // closure; rustc keeps one mention of a library named twice, the last,
+    // which keeps the core after every tier that needs it. Dependents get
+    // the include directories through DEP_MOQ_INCLUDE.
+    let mut include_paths: Vec<PathBuf> = Vec::new();
+    for (_, lib) in &libs {
+        for dir in &lib.include_paths {
+            if !include_paths.contains(dir) {
+                include_paths.push(dir.clone());
+            }
+        }
+    }
+    let include: Vec<String> = include_paths
         .iter()
         .map(|p| p.display().to_string())
         .collect();
@@ -132,28 +169,29 @@ fn main() {
     // compiled, so cargo is told to watch every archive the link names: an
     // SDK rebuilt in place then rebuilds the crate instead of linking the
     // copy bundled earlier.
-    for archive in lib
-        .link_files
-        .iter()
-        .cloned()
-        .chain(lib.link_paths.iter().flat_map(|dir| {
-            lib.libs
-                .iter()
-                .map(move |name| dir.join(format!("lib{name}.a")))
-        }))
-    {
-        if archive.is_file() {
-            println!("cargo:rerun-if-changed={}", archive.display());
+    for (_, lib) in &libs {
+        for archive in lib
+            .link_files
+            .iter()
+            .cloned()
+            .chain(lib.link_paths.iter().flat_map(|dir| {
+                lib.libs
+                    .iter()
+                    .map(move |name| dir.join(format!("lib{name}.a")))
+            }))
+        {
+            if archive.is_file() {
+                println!("cargo:rerun-if-changed={}", archive.display());
+            }
         }
     }
 
-    let mut clang_args: Vec<String> = lib
-        .include_paths
+    let mut clang_args: Vec<String> = include_paths
         .iter()
         .map(|dir| format!("-I{}", dir.display()))
         .collect();
     if let Some(cross) = &cross {
-        // The target SDK's headers come from its pkg-config file; the
+        // The target SDK's headers come from its pkg-config files; the
         // sysroot from the resolved input, unless BINDGEN_EXTRA_CLANG_ARGS
         // for the target carries it (bindgen appends those itself). Nothing
         // of the host is added.
@@ -167,23 +205,18 @@ fn main() {
     // directory through BINDGEN_EXTRA_CLANG_ARGS. The host C compiler's
     // headers are never substituted: a GCC stddef.h does not parse under
     // clang.
-    let player = env::var_os("CARGO_FEATURE_PLAYER").is_some();
-    let mut required = HEADERS.to_vec();
-    if player {
-        required.extend_from_slice(PLAYER_HEADERS);
-    }
-    for h in required {
-        if !lib.include_paths.iter().any(|d| d.join(h).exists()) {
-            let remedy = if PLAYER_HEADERS.contains(&h) {
-                "the `player` feature needs an SDK built with MOQ_BUILD_PLAYBACK=ON"
-            } else {
-                "the SDK is incomplete or older than this crate requires"
-            };
-            panic!(
-                "moq5-sys: `{h}` is not in the include directories pkg-config reported \
-                 ({}); {remedy}",
-                include.join(", ")
-            );
+    let tiers = features.tiers();
+    for tier in &tiers {
+        for h in tier.headers {
+            if !include_paths.iter().any(|d| d.join(h).exists()) {
+                panic!(
+                    "moq5-sys: `{h}` (the {} tier) is not in the include directories \
+                     pkg-config reported ({}); {}",
+                    tier.name,
+                    include.join(", "),
+                    tier.missing_header
+                );
+            }
         }
     }
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
@@ -192,55 +225,239 @@ fn main() {
         &out_dir.join("libclang.txt"),
         &bindgen::clang_version().full,
     );
+    let installed = installed_headers(&include_paths);
+    let mut lower = tiers::Derives::default();
+    for tier in &tiers {
+        let text = generate(tier, &clang_args, &installed, &lower, &out_dir);
+        lower.extend(tiers::Derives::scan(&text));
+        write_preambles(
+            &include_paths,
+            tier.headers,
+            (tier.name == "core").then_some(PREAMBLES_INTRO),
+            &out_dir.join(format!("preambles_{}.md", tier.name)),
+        );
+        report.line(format!(
+            "moq5-sys: generated the {} tier from {} into bindings_{}.rs",
+            tier.name, tier.wrapper, tier.name
+        ));
+    }
+    write_file(&out_dir.join("provenance.txt"), &report.text);
+    report.print();
+}
+
+/// The lines that say what the build chose and why: printed on the build
+/// script's output (shown by `cargo build -vv`) and written beside the
+/// bindings.
+#[derive(Default)]
+struct Report {
+    text: String,
+}
+
+impl Report {
+    fn line(&mut self, line: String) {
+        self.text.push_str(&line);
+        self.text.push('\n');
+    }
+
+    fn print(&self) {
+        print!("{}", self.text);
+    }
+}
+
+/// Every SDK-owned package the graph's metadata depends on -- the packages
+/// probed and the SDK-owned packages their `Requires` and
+/// `Requires.private` name, transitively (the service's aggregate `libmoq`
+/// and its managed adapters' packages among them) -- resolves from one
+/// pkg-config directory and reports one version: one SDK, never a mix.
+/// External providers keep their own prefixes and versions. The metadata
+/// is read through the same search configuration as the probes and emits
+/// nothing for cargo.
+fn check_one_sdk(features: tiers::Features, report: &mut Report) {
+    let unresolved = |package: &str, e: String| -> String {
+        format!(
+            "moq5-sys: `{package}.pc`, which the {} tiers' metadata requires, does not resolve on \
+             the search path the probes used: {e}",
+            features.describe()
+        )
+    };
+    let closure = tiers::owned_closure(&features.packages(), |package| {
+        let mut names = Vec::new();
+        for query in ["--print-requires", "--print-requires-private"] {
+            let output = pkg_config_query(&[query, package]).map_err(|e| unresolved(package, e))?;
+            names.extend(tiers::required_names(&output));
+        }
+        Ok(names)
+    })
+    .unwrap_or_else(|why| panic!("{why}"));
+    let mut resolved: Vec<(String, String)> = Vec::new();
+    let mut versions: Vec<(String, String)> = Vec::new();
+    for package in &closure {
+        let dir = pkg_config_query(&["--variable=pcfiledir", package])
+            .unwrap_or_else(|e| panic!("{}", unresolved(package, e)));
+        let canonical = Path::new(&dir)
+            .canonicalize()
+            .map_or(dir.clone(), |path| path.display().to_string());
+        resolved.push((package.clone(), canonical));
+        let version = pkg_config_query(&["--modversion", package])
+            .unwrap_or_else(|e| panic!("{}", unresolved(package, e)));
+        versions.push((package.clone(), version));
+    }
+    if resolved.iter().any(|(_, dir)| *dir != resolved[0].1) {
+        panic!("{}", tiers::mixed_provenance(features, &resolved));
+    }
+    if versions
+        .iter()
+        .any(|(_, version)| *version != versions[0].1)
+    {
+        panic!("{}", tiers::mixed_versions(features, &versions));
+    }
+    let mut line = String::from("moq5-sys: one SDK:");
+    for (package, dir) in &resolved {
+        let _ = write!(line, " {package}.pc in {dir};");
+    }
+    let _ = write!(line, " version {}", versions[0].1);
+    report.line(line);
+}
+
+/// The value of a pkg-config variable as the `pkg-config` crate reads it:
+/// `<VAR>_<target>`, `<VAR>_<target with _>`, `HOST_<VAR>` (`TARGET_<VAR>`
+/// for a cross build), then `<VAR>`.
+fn targeted_env(var: &str) -> Option<OsString> {
+    let target = env::var("TARGET").unwrap_or_default();
+    let host = env::var("HOST").unwrap_or_default();
+    let kind = if host == target { "HOST" } else { "TARGET" };
+    [
+        format!("{var}_{target}"),
+        format!("{var}_{}", target.replace('-', "_")),
+        format!("{kind}_{var}"),
+        var.to_owned(),
+    ]
+    .iter()
+    .find_map(env::var_os)
+}
+
+/// `<package>.pc` in a directory of the search configuration the probes
+/// read (`PKG_CONFIG_PATH`, then `PKG_CONFIG_LIBDIR`, as the `pkg-config`
+/// crate spells them), if one holds it.
+fn package_file(package: &str) -> Option<PathBuf> {
+    ["PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR"]
+        .iter()
+        .filter_map(|var| targeted_env(var))
+        .flat_map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .map(|dir| dir.join(format!("{package}.pc")))
+        .find(|file| file.is_file())
+}
+
+/// One metadata query (`--print-requires`, `--variable=...`,
+/// `--modversion`), run as the `pkg-config` crate runs its probes: the same
+/// executable (`PKG_CONFIG`, else `pkg-config`, else `pkgconf`) and the
+/// same search configuration. It prints nothing for cargo. The output is
+/// trimmed; a failure is the command's stderr.
+fn pkg_config_query(args: &[&str]) -> Result<String, String> {
+    let configured = targeted_env("PKG_CONFIG");
+    let run = |exe: &OsString| {
+        let mut command = std::process::Command::new(exe);
+        command.args(args);
+        for var in [
+            "PKG_CONFIG_PATH",
+            "PKG_CONFIG_LIBDIR",
+            "PKG_CONFIG_SYSROOT_DIR",
+        ] {
+            if let Some(value) = targeted_env(var) {
+                command.env(var, value);
+            }
+        }
+        command
+            .env("PKG_CONFIG_ALLOW_SYSTEM_LIBS", "1")
+            .env("PKG_CONFIG_ALLOW_SYSTEM_CFLAGS", "1")
+            .output()
+    };
+    let output = match &configured {
+        Some(exe) => run(exe),
+        None => run(&OsString::from("pkg-config")).or_else(|_| run(&OsString::from("pkgconf"))),
+    }
+    .map_err(|e| format!("pkg-config could not be run: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+/// Every libmoq header the SDK installed, as `moq/<name>.h`.
+fn installed_headers(include_dirs: &[PathBuf]) -> Vec<String> {
+    let mut names: Vec<String> = include_dirs
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir.join("moq")).ok())
+        .flatten()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".h"))
+        .map(|name| format!("moq/{name}"))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// A pattern for every installed libmoq header outside `own`.
+fn other_headers_pattern(installed: &[String], own: &[&str]) -> String {
+    let names: Vec<String> = installed
+        .iter()
+        .filter(|header| !own.contains(&header.as_str()))
+        .map(|header| {
+            header
+                .trim_start_matches("moq/")
+                .trim_end_matches(".h")
+                .replace('.', "\\.")
+        })
+        .collect();
+    format!(".*/moq/({})\\.h", names.join("|"))
+}
+
+/// Generate one tier's bindings and its list of macro constants, returning
+/// the bindings' text. Every installed libmoq header outside the tier is
+/// blocklisted, and so is every type the lower tiers declare; the traits of
+/// those types come from `lower`.
+fn generate(
+    tier: &tiers::Tier,
+    clang_args: &[String],
+    installed: &[String],
+    lower: &tiers::Derives,
+    out_dir: &Path,
+) -> String {
     let macros = MacroNames::default();
-    let bindings = generator(&clang_args)
-        .header("wrapper.h")
-        .allowlist_function("moq_.*")
-        .allowlist_type("moq_.*")
-        .allowlist_var("MOQ_.*")
-        .allowlist_var("MOQ5_SYSVAL_.*")
-        .blocklist_file(".*/moq/control\\.h")
-        // After every other callback, as MacroNames requires.
-        .parse_callbacks(Box::new(macros.clone()))
-        .generate()
-        .expect("bindgen failed on the libmoq headers");
-    write_bindings(&bindings, &out_dir.join("bindings.rs"));
-    macros.write(&out_dir.join("macros.txt"));
-    write_preambles(
-        &lib.include_paths,
-        HEADERS,
-        Some(PREAMBLES_INTRO),
-        &out_dir.join("preambles.md"),
-    );
-    if player {
-        // The player's own declarations and the playback configuration they
-        // take. Every other libmoq header is blocklisted: what the player
-        // references from them is in the base bindings, which the crate
-        // includes beside these, and bindgen still sees those types, so the
-        // derives it can prove for them hold here too.
-        let macros = MacroNames::default();
-        let bindings = generator(&clang_args)
-            .header("wrapper_player.h")
-            .blocklist_file(base_headers_pattern(&lib.include_paths))
-            .parse_callbacks(Box::new(BaseDerives))
+    let mut builder = generator(clang_args)
+        .header(tier.wrapper)
+        .blocklist_file(other_headers_pattern(installed, tier.headers))
+        .parse_callbacks(Box::new(TierDerives(lower.clone())));
+    for name in lower.type_names() {
+        builder = builder.blocklist_type(name);
+    }
+    let builder = if tier.name == "player" {
+        // The player's own declarations and the playback engine
+        // configuration they take, not the whole playback engine.
+        builder
             .allowlist_file(".*/moq/media_player\\.h")
             .allowlist_type("moq_playback_cfg(_t)?")
             .allowlist_function("moq_playback_cfg_init_sized")
             .allowlist_var("MOQ_PLAYBACK_.*")
-            .allowlist_var("MOQ5_SYSVAL_.*")
-            // After every other callback, as MacroNames requires.
-            .parse_callbacks(Box::new(macros.clone()))
-            .generate()
-            .expect("bindgen failed on the libmoq player headers");
-        write_bindings(&bindings, &out_dir.join("bindings_player.rs"));
-        macros.write(&out_dir.join("macros_player.txt"));
-        write_preambles(
-            &lib.include_paths,
-            PLAYER_HEADERS,
-            None,
-            &out_dir.join("preambles_player.md"),
-        );
-    }
+    } else {
+        builder
+            .allowlist_function("moq_.*")
+            .allowlist_type("moq_.*")
+            .allowlist_var("MOQ_.*")
+    };
+    let bindings = builder
+        .allowlist_var("MOQ5_SYSVAL_.*")
+        // After every other callback, as MacroNames requires.
+        .parse_callbacks(Box::new(macros.clone()))
+        .generate()
+        .unwrap_or_else(|e| panic!("bindgen failed on the libmoq {} headers: {e}", tier.name));
+    let out = out_dir.join(format!("bindings_{}.rs", tier.name));
+    write_bindings(&bindings, &out);
+    macros.write(&out_dir.join(format!("macros_{}.txt", tier.name)));
+    std::fs::read_to_string(&out)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", out.display()))
 }
 
 /// A bindgen run over the SDK's headers with the settings every generation
@@ -269,23 +486,6 @@ fn generator(clang_args: &[String]) -> bindgen::Builder {
         .formatter(bindgen::Formatter::Rustfmt)
         .parse_callbacks(Box::new(ResultCodes))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-}
-
-/// A pattern for every installed libmoq header except the player's, as the
-/// SDK's include directories hold them.
-fn base_headers_pattern(include_dirs: &[PathBuf]) -> String {
-    let mut names: Vec<String> = include_dirs
-        .iter()
-        .filter_map(|dir| std::fs::read_dir(dir.join("moq")).ok())
-        .flatten()
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| name.ends_with(".h"))
-        .filter(|name| !PLAYER_HEADERS.contains(&format!("moq/{name}").as_str()))
-        .map(|name| name.trim_end_matches(".h").replace('.', "\\."))
-        .collect();
-    names.sort();
-    names.dedup();
-    format!(".*/moq/({})\\.h", names.join("|"))
 }
 
 fn write_bindings(bindings: &bindgen::Bindings, out: &Path) {
@@ -480,7 +680,12 @@ fn configure_cross(host: &str, target: &str) -> Cross {
 }
 
 /// What was observed, and the remedies, never a guessed build configuration.
-fn diagnose(err: &pkg_config::Error, cross: Option<&Cross>) -> String {
+fn diagnose(
+    err: &pkg_config::Error,
+    package: &str,
+    features: tiers::Features,
+    cross: Option<&Cross>,
+) -> String {
     let searched = match cross {
         Some(cross) => cross
             .search
@@ -488,8 +693,15 @@ fn diagnose(err: &pkg_config::Error, cross: Option<&Cross>) -> String {
             .map(|d| d.display().to_string())
             .collect::<Vec<_>>()
             .join(":"),
-        None => env::var("PKG_CONFIG_PATH").unwrap_or_else(|_| "(unset)".into()),
+        None => {
+            let path = env::var("PKG_CONFIG_PATH").unwrap_or_else(|_| "(unset)".into());
+            match env::var("PKG_CONFIG_LIBDIR") {
+                Ok(libdir) => format!("PKG_CONFIG_PATH {path}, PKG_CONFIG_LIBDIR {libdir}"),
+                Err(_) => path,
+            }
+        }
     };
+    let found = package_file(package).map(|file| file.display().to_string());
     match err {
         pkg_config::Error::Command { command, cause } => format!(
             "moq5-sys: pkg-config could not be run ({command}: {cause}); install \
@@ -503,38 +715,28 @@ fn diagnose(err: &pkg_config::Error, cross: Option<&Cross>) -> String {
         pkg_config::Error::EnvNoPkgConfig(var) => {
             format!("moq5-sys: {var} is set, so pkg-config was not consulted and no SDK was found")
         }
+        // The package is there, but what it requires is not.
+        other if found.is_some() => format!(
+            "{}\n{other}",
+            tiers::unresolved_requirements(package, features, &found.unwrap_or_default())
+        ),
         other if cross.is_some() => format!(
             "moq5-sys: the target search configuration ({searched}) has no \
-             {PROBE}.pc: it is the only configuration a cross build consults (no host \
+             {package}.pc: it is the only configuration a cross build consults (no host \
              variable, no default directory). Point MOQ_PREFIX_<target> at the target \
              SDK's install prefix.\n{other}"
         ),
         other => {
-            let core = pkg_config::Config::new()
+            let libmoq = pkg_config::Config::new()
                 .cargo_metadata(false)
                 .env_metadata(false)
                 .print_system_libs(false)
                 .probe("libmoq")
                 .is_ok();
-            if core {
-                format!(
-                    "moq5-sys: `libmoq.pc` resolves but `{PROBE}.pc` does not \
-                     (PKG_CONFIG_PATH searched: {searched}). Either the service \
-                     component was not installed into that prefix, or the service was \
-                     built with a backend that has no pkg-config representation \
-                     (mvfst, proxygen or the direct MsQuic managed backend), which this \
-                     crate does not support. Remedies: install the SDK with \
-                     MOQ_BUILD_SERVICE=ON, point MOQ_PREFIX or PKG_CONFIG_PATH at the \
-                     prefix that has it, or use a pkg-config-expressible service \
-                     build.\n{other}"
-                )
-            } else {
-                format!(
-                    "moq5-sys: no libmoq SDK on PKG_CONFIG_PATH ({searched}); set \
-                     MOQ_PREFIX to an install prefix holding lib/pkgconfig/{PROBE}.pc, or \
-                     add that directory to PKG_CONFIG_PATH.\n{other}"
-                )
-            }
+            format!(
+                "{}\n{other}",
+                tiers::missing_package(package, features, &searched, libmoq)
+            )
         }
     }
 }
@@ -549,7 +751,8 @@ const PREAMBLES_INTRO: &str =
 /// The leading comment of each of `headers` (the first block comment of the
 /// file), written as sections of the crate documentation's "Header
 /// preambles": the contracts a header states for all of its declarations at
-/// once. `intro` opens the section; the player's preambles continue it.
+/// once. `intro` opens the section (the core's); each later tier's
+/// preambles continue it.
 fn write_preambles(include_dirs: &[PathBuf], headers: &[&str], intro: Option<&str>, out: &Path) {
     let mut text = String::from(intro.unwrap_or_default());
     for h in headers {
@@ -598,39 +801,39 @@ fn header_preamble(source: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
 }
 
-/// What the base bindings derive for the base types the player's records
-/// hold by value, which bindgen does not see in the player run (they are
-/// blocklisted there): the span derives `Debug` and `Copy` and implements
-/// `Default` by hand (it holds a pointer), and the two codes are plain
-/// integers. Without it, the records' unions would not be `Copy`, and bindgen
-/// would emit them as structs of placeholder fields.
+/// The traits of the lower tiers' types, which a tier's generation
+/// blocklists and references by name: what those tiers' generated bindings
+/// derive or implement, read from their text. Without it, bindgen would
+/// assume none, and a record holding a span by value would lose `Copy`.
 #[derive(Debug)]
-struct BaseDerives;
+struct TierDerives(tiers::Derives);
 
-impl bindgen::callbacks::ParseCallbacks for BaseDerives {
+impl ParseCallbacks for TierDerives {
     fn blocklisted_type_implements_trait(
         &self,
         name: &str,
         derive_trait: bindgen::callbacks::DeriveTrait,
     ) -> Option<bindgen::callbacks::ImplementsTrait> {
         use bindgen::callbacks::{DeriveTrait, ImplementsTrait};
-        match (name, derive_trait) {
-            ("moq_bytes_t" | "moq_bytes", DeriveTrait::Copy | DeriveTrait::Debug) => {
-                Some(ImplementsTrait::Yes)
-            }
-            ("moq_bytes_t" | "moq_bytes", DeriveTrait::Default) => Some(ImplementsTrait::Manually),
-            ("moq_media_time_domain_t" | "moq_media_stream_terminal_kind_t", _) => {
-                Some(ImplementsTrait::Yes)
-            }
-            _ => None,
-        }
+        let wanted = match derive_trait {
+            DeriveTrait::Copy => tiers::Trait::Copy,
+            DeriveTrait::Debug => tiers::Trait::Debug,
+            DeriveTrait::Default => tiers::Trait::Default,
+            DeriveTrait::Hash => tiers::Trait::Hash,
+            DeriveTrait::PartialEqOrPartialOrd => tiers::Trait::PartialEq,
+        };
+        self.0.answer(name, wanted).map(|answer| match answer {
+            tiers::Answer::Yes => ImplementsTrait::Yes,
+            tiers::Answer::Manually => ImplementsTrait::Manually,
+            tiers::Answer::No => ImplementsTrait::No,
+        })
     }
 }
 
 /// Two spellings bindgen gets wrong on its own: `MOQ_OK`/`MOQ_DONE` are
 /// positive `#define`s it would type as `u32`, while every result code is a
-/// `moq_result_t` (`int`) in C; and the `MOQ5_SYSVAL_` statics of wrapper.h
-/// carry the C names they restate.
+/// `moq_result_t` (`int`) in C; and the `MOQ5_SYSVAL_` statics of the
+/// wrappers carry the C names they restate.
 #[derive(Debug)]
 struct ResultCodes;
 
@@ -656,9 +859,9 @@ impl bindgen::callbacks::ParseCallbacks for ResultCodes {
 /// blocklisted headers' included; it reports no floating-point or character
 /// macro (no bound constant is one), so a constant made from one would be
 /// held to its documentation. A reported name a `MOQ5_SYSVAL_` static
-/// restates is left out: wrapper.h restates control.h's object statuses,
-/// whose macros bindgen evaluates but the blocklist drops, so those
-/// constants are declarations. The callbacks only observe, and bindgen asks
+/// restates is left out: the static is a declaration, whatever bindgen made
+/// of the macro (it reports a blocklisted header's macros too, which the
+/// blocklist then drops). The callbacks only observe, and bindgen asks
 /// the last registered callback first and stops at the first answer, so this
 /// one is registered after every other.
 #[derive(Clone, Debug, Default)]

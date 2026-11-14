@@ -1,0 +1,33 @@
+[package]
+name = "moq5-media"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Safe Rust API for the libmoq (MOQ5) media parsers: CMAF, LOC metadata, MPEG-TS catalog records"
+repository = "https://github.com/openmoq/moq5"
+readme = "README.md"
+keywords = ["moq", "media-over-quic", "cmaf", "loc", "mpeg-ts"]
+categories = ["api-bindings", "multimedia", "parser-implementations"]
+publish = false
+
+[dependencies]
+moq5-core = { version = "0.1.0", path = "../moq5-core" }
+# The media tier of the bindings: libmoq-media.pc, the parsers and the core.
+moq5-sys = { version = "0.1.0", path = "../moq5-sys", features = ["media"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+unwrap_used = "warn"
+
+[package.metadata.docs.rs]
+# Documented from moq5-sys's cfg(docsrs) core and media snapshots, on the
+# targets those snapshots are verified on (see moq5-sys/Cargo.toml).
+default-target = "x86_64-unknown-linux-gnu"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]

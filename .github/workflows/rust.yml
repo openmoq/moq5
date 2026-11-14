@@ -57,8 +57,9 @@ jobs:
           rustup default stable
           cargo --version && rustup run 1.85 cargo --version
 
-      # The service SDK the binding links: no adapters, with the player and
-      # MPEG-TS (both stated, so a tree without them fails to configure),
+      # The service SDK the binding links: no adapters, with the player,
+      # MPEG-TS and the simulator (all stated, so a tree without them fails
+      # to configure; the simulator tier's Rust rows need moq-sim),
       # warnings as errors, the tree's library type (the consumer row that
       # matches it runs). The cross-build row runs where the tree can build
       # the other architecture (macOS); Linux runs the refusal row only.
@@ -71,7 +72,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug -DBUILD_SHARED_LIBS="$SDK_SHARED" \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_SKIP_INSTALL_RPATH=ON \
             -DMOQ_WARNINGS_AS_ERRORS=ON \
-            -DMOQ_BUILD_TESTS=ON -DMOQ_BUILD_SIM=OFF -DMOQ_BUILD_EXAMPLES=OFF \
+            -DMOQ_BUILD_TESTS=ON -DMOQ_BUILD_SIM=ON -DMOQ_BUILD_EXAMPLES=OFF \
             -DMOQ_BUILD_MSF=ON -DMOQ_BUILD_MEDIA_OBJECT=ON -DMOQ_BUILD_SERVICE=ON \
             -DMOQ_BUILD_PLAYBACK=ON -DMOQ_BUILD_MPEG2TS=ON \
             -DMOQ_BUILD_RUST_BINDING=ON -DMOQ_RUST_RELAY_ROWS=OFF \
@@ -103,8 +104,8 @@ jobs:
             build/rust/bindings/rust/work/*.stderr
             build/rust/bindings/rust/work/gate-controls/*.out
             build/rust/bindings/rust/work/gate-controls/*.inv
-            build/rust/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.rs
-            build/rust/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.txt
+            build/rust/bindings/rust/work/target/debug/build/moq5-sys*/**/out/*.rs
+            build/rust/bindings/rust/work/target/debug/build/moq5-sys*/**/out/*.txt
 
   rows-macos:
     name: Rows (${{ matrix.os }}, shared=${{ matrix.shared }})
@@ -240,8 +241,8 @@ jobs:
             build/rust-relay/bindings/rust/work/live-work/**/relay.log
             build/rust-relay/bindings/rust/work/live-work/**/peer.log
             build/rust-relay/bindings/rust/work/peer-verdict-*.log
-            build/rust-relay/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.rs
-            build/rust-relay/bindings/rust/work/target/debug/build/moq5-sys-*/out/*.txt
+            build/rust-relay/bindings/rust/work/target/debug/build/moq5-sys*/**/out/*.rs
+            build/rust-relay/bindings/rust/work/target/debug/build/moq5-sys*/**/out/*.txt
             build/rust-relay/bindings/rust/work/*.diagnostics.txt
 
   relay-rows-macos:
