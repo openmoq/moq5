@@ -114,6 +114,14 @@ wtq_result_t wtq_stream_resume_receive(wtq_stream_t *st)
 { ++st->owner->effects; return WTQ_OK; }
 wtq_receive_pause_mode_t wtq_stream_receive_pause_mode(const wtq_stream_t *st)
 { (void)st; return WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED; }
+#include "wtquic_abort_fake.h"
+void wtq_session_events_init_ex(wtq_session_events_t *e, size_t size)
+{
+    if (!e || size < sizeof(e->struct_size)) return;
+    size_t n = size < sizeof(*e) ? size : sizeof(*e);
+    memset(e, 0, n);
+    e->struct_size = (uint32_t)n;
+}
 wtq_send_commit_mode_t wtq_session_send_commit_mode(const wtq_session_t *s)
 { (void)s; return WTQ_SEND_COMMIT_UNSUPPORTED; }
 wtq_result_t wtq_stream_enable_send_commit(wtq_stream_t *st)

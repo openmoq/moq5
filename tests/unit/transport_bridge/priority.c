@@ -161,8 +161,9 @@ int test_priority_survives_closed_subgroup(bool fail, bool legacy, bool d18,
 
 
 /* A draft-22 pair: the subgroup's delivery timer runs from its FIN and awaits
- * the transport's commit report. */
-int d22_pair_init(test_pair_t *tp)
+ * the transport's commit report. A nonzero `client_max_events` bounds the
+ * client's event queue. */
+int d22_pair_init_events(test_pair_t *tp, uint32_t client_max_events)
 {
     memset(tp, 0, sizeof(*tp));
     moq_session_cfg_t ccfg;
@@ -170,6 +171,7 @@ int d22_pair_init(test_pair_t *tp)
     ccfg.version = MOQ_VERSION_DRAFT_22;
     ccfg.send_request_capacity = true;
     ccfg.initial_request_capacity = 10;
+    if (client_max_events) ccfg.max_events = client_max_events;
     moq_session_cfg_t scfg;
     moq_session_cfg_init_sized(&scfg, sizeof(scfg), moq_alloc_default(), MOQ_PERSPECTIVE_SERVER);
     scfg.version = MOQ_VERSION_DRAFT_22;
@@ -192,4 +194,10 @@ int d22_pair_init(test_pair_t *tp)
         moq_session_destroy(tp->server); moq_session_destroy(tp->client); return -1;
     }
     return 0;
+}
+
+
+int d22_pair_init(test_pair_t *tp)
+{
+    return d22_pair_init_events(tp, 0);
 }

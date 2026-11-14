@@ -972,46 +972,108 @@ static void test_stop_sending_on_real_request_bidi(void)
  * sending on the other half of a bidi must not lose inbound bytes. Driving that
  * end-to-end would need a request bidi carrying bulk peer payload, which
  * draft-18 does not produce (fetch data rides a separate unidirectional
- * stream). So the invariant is pinned structurally: a paused bidi entry holding
- * retained bytes is placed in the adapter's table, the SAME production callback
- * is invoked, and the entry must survive as a live receive entry whose bytes
- * leave only by replay -- see the invariant note at the assertions below, which
- * explains why "unchanged" is NOT the requirement.
+ * stream). So the invariant is pinned structurally, on a real stream: the
+ * client of a draft-18 pair opens a request bidi by subscribing, a paused
+ * receive entry holding retained bytes is placed in the adapter's table for
+ * that stream, the SAME production callback is invoked with a STOP_SENDING
+ * that carries a WebTransport application code, and the entry must survive as
+ * a live receive entry whose bytes leave only by replay -- see the invariant
+ * note at the assertions below, which explains why "unchanged" is NOT the
+ * requirement.
+ *
+ * Draft-18 is used because its control channel is a pair of unidirectional
+ * streams: a bidi is never the MoQ control stream there, and the test asserts
+ * that this one is neither that nor the CONNECT stream before relying on it.
+ * The callback's own stop count shows that the ordinary stop path ran.
  *
  * Reusing the RESET path here would discard inbound data on a stream the peer
  * may still be sending on, and fails this test.
  */
+
+/* Mark a STOP_SENDING with `wt_code` as received on `sid`, as the provider
+ * records it before calling back (only where the stop code is readable). */
+static void record_peer_stop(picoquic_cnx_t *cnx, uint64_t sid, uint64_t wt_code)
+{
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+    picoquic_stream_head_t *pst = picoquic_find_stream(cnx, sid);
+    CHECK(pst != NULL);
+    if (pst != NULL) {
+        pst->stop_sending_received = 1;
+        pst->remote_stop_error = wt_code;
+    }
+#else
+    (void)cnx; (void)sid; (void)wt_code;
+#endif
+}
+
+/* A draft-18 pair whose client has opened one request bidi by subscribing.
+ * Returns that stream, or UINT64_MAX. */
+static uint64_t d18_request_bidi(pico_wt_harness_t *h, uint8_t cid)
+{
+    pico_wt_harness_cfg_t cfg = { .cid_byte = cid, .request_capacity = 10,
+                                  .version = MOQ_VERSION_DRAFT_18 };
+    if (pico_wt_harness_setup(h, &cfg) != 0 ||
+        pico_wt_harness_handshake(h) != 0)
+        return UINT64_MAX;
+    moq_pico_wt_conn_t *c = h->client_conn;
+    CHECK(moq_transport_bridge_uses_uni_control(c->bridge));
+    CHECK(c->opened_bidi_count == 0);
+
+    moq_subscribe_cfg_t sc;
+    moq_subscribe_cfg_init(&sc);
+    moq_bytes_t ns[] = { {(const uint8_t *)"stop", 4} };
+    sc.track_namespace.parts = ns;
+    sc.track_namespace.count = 1;
+    sc.track_name = (moq_bytes_t){(const uint8_t *)"t", 1};
+    sc.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+    moq_subscription_t sub;
+    if (moq_session_subscribe(h->client_session, &sc, h->now, &sub) < 0)
+        return UINT64_MAX;
+    moq_pico_wt_service(c, h->now);
+    if (pico_wt_harness_pump(h, 300) != 0) return UINT64_MAX;
+    if (c->opened_bidi_count != 1) return UINT64_MAX;
+    return c->last_opened_bidi_id;
+}
+
 static void test_stop_sending_preserves_retained_bidi_state(void)
 {
     pico_wt_harness_t h;
-    pico_wt_harness_cfg_t cfg = { .cid_byte = 0x38, .request_capacity = 10 };
-    if (pico_wt_harness_setup(&h, &cfg) != 0 ||
-        pico_wt_harness_handshake(&h) != 0) {
-        CHECK(0);
-        pico_wt_harness_cleanup(&h);
-        return;
-    }
+    uint64_t sid = d18_request_bidi(&h, 0x38);
+    CHECK(sid != UINT64_MAX);
+    if (sid == UINT64_MAX) { pico_wt_harness_cleanup(&h); return; }
     install_acct(h.client_conn);
 
     moq_pico_wt_conn_t *c = h.client_conn;
+    /* An ordinary request stream: not the CONNECT stream, not MoQ control,
+     * and live in both the provider and the session. */
+    CHECK(PICOQUIC_IS_BIDIR_STREAM_ID(sid));
+    CHECK(sid != c->control_stream_id);
+    CHECK(sid != c->moq_control_stream_id);
+    CHECK(!moq_transport_bridge_stream_is_control(c->bridge, sid));
+    CHECK(moq_transport_bridge_find_ref(c->bridge, sid)._v != 0);
+    CHECK(picoquic_find_stream(h.test_ctx->cnx_client, sid) != NULL);
+    h3zero_stream_ctx_t *sctx = h3zero_find_stream(h.client_h3_ctx, sid);
+    CHECK(sctx != NULL);
+    if (sctx == NULL) { pico_wt_harness_cleanup(&h); return; }
+
     pw_rx_stream_t *saved_rx = c->rx;
     size_t saved_count = c->rx_count, saved_cap = c->rx_cap;
 
-    /* A paused bidi entry with retained bytes, allocated through the
-     * connection's own allocator so release is accounted. */
-    static const uint8_t RETAINED[] = "retained-inbound-bytes-on-a-bidi";
-    const size_t rlen = sizeof(RETAINED) - 1;
+    /* A paused receive entry for that stream, holding retained bytes,
+     * allocated through the connection's own allocator so release is
+     * accounted. The byte is the first byte of a two-byte message type: if
+     * it is replayed, the session can only wait for the rest. */
+    static const uint8_t RETAINED[] = { 0x40 };
+    const size_t rlen = sizeof(RETAINED);
     pw_rx_stream_t probe;
     memset(&probe, 0, sizeof(probe));
     probe.active = true;
     probe.app_fc = true;
     probe.kind = PW_RX_BIDI;
-    probe.stream_id = 4;                 /* client-initiated bidi */
-    CHECK((probe.stream_id & 2) == 0);
+    probe.stream_id = sid;
     probe.budget = 65535;
-    probe.delivered = 1024;
+    probe.delivered = rlen;
     probe.granted = 65535;
-    probe.blocked = 512;
     probe.paused = true;
     probe.buf_cap = rlen;
     probe.buf_len = rlen;
@@ -1022,24 +1084,20 @@ static void test_stop_sending_preserves_retained_bidi_state(void)
 
     c->rx = &probe; c->rx_count = 1; c->rx_cap = 1;
     size_t live_before = g_acct.live;
+    size_t stops_before = c->stop_sending_count;
 
-    h3zero_stream_ctx_t sctx;
-    memset(&sctx, 0, sizeof(sctx));
-    sctx.stream_id = probe.stream_id;
-#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
-    /* The provider records a peer STOP_SENDING on its stream before it calls
-     * back, and the adapter reads the exact code from there. */
-    picoquic_stream_head_t *pst =
-        picoquic_create_stream(h.test_ctx->cnx_client, probe.stream_id);
-    CHECK(pst != NULL);
-    if (pst != NULL) {
-        pst->stop_sending_received = 1;
-        pst->remote_stop_error = 0;
-    }
-#endif
+    /* The peer stops our half with a genuine WebTransport application code:
+     * MoQ's CANCELLED (0x1). Where the provider cannot report the code the
+     * stop carries none, and the stream is still an ordinary one. */
+    uint64_t wt = 0;
+    CHECK(pico_wt_moq_err_to_wt(0x1, &wt));
+    record_peer_stop(h.test_ctx->cnx_client, sid, wt);
     int rc = moq_pico_wt_callback(h.test_ctx->cnx_client, NULL, 0,
-                                  picohttp_callback_stop_sending, &sctx, c);
+                                  picohttp_callback_stop_sending, sctx, c);
     CHECK(rc == 0);
+    /* the ordinary stop path ran: it alone counts the stop */
+    CHECK(c->stop_sending_count == stops_before + 1);
+    CHECK(c->last_stop_sending_stream_id == sid);
 
     /*
      * The invariant is NOT "nothing moved": this same callback services the
@@ -1053,8 +1111,10 @@ static void test_stop_sending_preserves_retained_bidi_state(void)
      */
     CHECK(probe.active);                 /* not retired: the RESET path would */
     CHECK(probe.kind == PW_RX_BIDI);
-    CHECK(probe.delivered >= 1024);      /* receive accounting not rewound */
+    CHECK(probe.stream_id == sid);
+    CHECK(probe.delivered >= rlen);      /* receive accounting not rewound */
     CHECK(!moq_pico_wt_conn_is_fatal(c));
+    CHECK(!moq_pico_wt_conn_is_closed(c));
 
     if (probe.buf != NULL) {
         /* Still retained: byte-for-byte intact. */
@@ -1070,6 +1130,50 @@ static void test_stop_sending_preserves_retained_bidi_state(void)
     if (probe.buf != NULL)
         c->alloc.free(probe.buf, probe.buf_cap, c->alloc.ctx);
     c->rx = saved_rx; c->rx_count = saved_count; c->rx_cap = saved_cap;
+    pico_wt_harness_cleanup(&h);
+}
+
+/*
+ * Control row for the above: WT_SESSION_GONE on the MoQ control channel. The
+ * code says the peer's WebTransport session terminated
+ * (draft-ietf-webtrans-http3-16 section 6), so the stop decides nothing: the
+ * WebTransport session terminal will. The ordinary stop path does not run,
+ * and the MoQ session stays established. Where the provider cannot report the
+ * stop code, the outcome is the same for a weaker reason -- no code at all --
+ * and the row shows only that limitation.
+ */
+static void test_stop_sending_session_gone_on_control_decides_nothing(void)
+{
+    pico_wt_harness_t h;
+    pico_wt_harness_cfg_t cfg = { .cid_byte = 0x3D, .request_capacity = 10,
+                                  .version = MOQ_VERSION_DRAFT_18 };
+    if (pico_wt_harness_setup(&h, &cfg) != 0 ||
+        pico_wt_harness_handshake(&h) != 0) {
+        CHECK(0);
+        pico_wt_harness_cleanup(&h);
+        return;
+    }
+    moq_pico_wt_conn_t *c = h.client_conn;
+    /* the client's own unidirectional control stream: the one a peer STOP
+     * refuses */
+    CHECK(c->opened_uni_count == 1);
+    uint64_t sid = c->last_opened_uni_id;
+    CHECK(sid != UINT64_MAX && !PICOQUIC_IS_BIDIR_STREAM_ID(sid));
+    CHECK(sid != c->control_stream_id);
+    CHECK(moq_transport_bridge_stream_is_control(c->bridge, sid));
+    h3zero_stream_ctx_t *sctx = h3zero_find_stream(h.client_h3_ctx, sid);
+    CHECK(sctx != NULL);
+    if (sctx == NULL) { pico_wt_harness_cleanup(&h); return; }
+
+    size_t stops_before = c->stop_sending_count;
+    record_peer_stop(h.test_ctx->cnx_client, sid, 0x170d7b68);
+    CHECK(moq_pico_wt_callback(h.test_ctx->cnx_client, NULL, 0,
+                               picohttp_callback_stop_sending, sctx, c) == 0);
+    CHECK(c->stop_sending_count == stops_before);
+    CHECK(moq_pico_wt_service(c, h.now) == 0);
+    CHECK(!moq_pico_wt_conn_is_fatal(c));
+    CHECK(!moq_pico_wt_conn_is_closed(c));
+    CHECK(moq_session_state(h.client_session) == MOQ_SESS_ESTABLISHED);
     pico_wt_harness_cleanup(&h);
 }
 
@@ -1471,6 +1575,7 @@ int main(void)
     test_reset_while_paused();
     test_stop_sending_on_real_request_bidi();
     test_stop_sending_preserves_retained_bidi_state();
+    test_stop_sending_session_gone_on_control_decides_nothing();
     test_teardown_while_paused();
     test_retained_control_fin_stops_sweep();
     test_direct_control_fin_does_not_sweep();

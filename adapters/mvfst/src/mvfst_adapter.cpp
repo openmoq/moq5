@@ -296,6 +296,206 @@ static void capture_keepalive(moq_mvfst_keepalive_probe &out,
 }
 #endif
 
+#ifdef MOQ_MVFST_TESTING
+static std::atomic<const moq_mvfst_test_evb_probe *> evb_probe{nullptr};
+#endif
+
+/* An EventBase that threads other than its owner may use for one call at a
+ * time.
+ *
+ * Folly's cross-thread EventBase methods are safe to call from any thread
+ * only while the EventBase is alive: entering one after destruction has begun
+ * is undefined. The owner publishes the EventBase once it is live and retires
+ * it before destroying it. A borrow either finds nothing published and does
+ * nothing, or keeps the EventBase alive until its single call returns:
+ * retire() unpublishes the EventBase and then waits for every borrow already
+ * granted. Destruction itself stays with the owner.
+ *
+ * Borrowers only enqueue a callback, request that the loop terminate, or ask
+ * whether they run on the loop thread. None of those blocks or calls back into
+ * this object, so the retire wait is bounded by their duration. No lock is held
+ * while a borrower uses the EventBase. The owner's own code, on the thread
+ * that will destroy the EventBase, keeps using its own pointer. */
+class evb_lease {
+public:
+    explicit evb_lease(int kind) : kind_(kind) {}
+    evb_lease(const evb_lease &) = delete;
+    evb_lease &operator=(const evb_lease &) = delete;
+
+    void publish(folly::EventBase *e) {
+        std::lock_guard<std::mutex> lk(mu_);
+        evb_ = e;
+    }
+
+    /* Whether an EventBase is published now; a hint only (a later borrow can
+     * still find it retired). */
+    bool published() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return evb_ != nullptr;
+    }
+
+    /* Run use(evb) on the published EventBase, which stays alive until use
+     * returns. True when use ran; false when nothing was published. */
+    template <class F> bool borrow(int site, F &&use) {
+        folly::EventBase *e;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            e = evb_;
+            if (!e) return false;
+            ++borrows_;
+        }
+        /* The borrow ends even if use throws, so retirement cannot wait on
+         * a borrow that will never end. */
+        struct end_guard {
+            evb_lease *lease;
+            int site;
+            ~end_guard() { lease->end_borrow(site); }
+        } guard{this, site};
+        if (!test_borrowed(site)) return false;
+        use(e);
+        return true;
+    }
+
+    /* Owner: unpublish, then wait until no granted borrow remains. After it
+     * returns no other thread uses the EventBase. Idempotent. */
+    void retire() {
+        unsigned granted;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            evb_ = nullptr;
+            granted = borrows_;
+        }
+        test_retire_begin(granted);
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            idle_.wait(lk, [this] { return borrows_ == 0; });
+        }
+        test_retired();
+    }
+
+private:
+    void end_borrow(int site) {
+        /* Reported before the count drops, so retirement is never observed
+         * ahead of the end of a borrow it waited for. */
+        test_borrow_end(site);
+        std::lock_guard<std::mutex> lk(mu_);
+        if (--borrows_ == 0 && !evb_) idle_.notify_all();
+    }
+
+#ifdef MOQ_MVFST_TESTING
+    bool test_borrowed(int site) {
+        const auto *p = evb_probe.load(std::memory_order_acquire);
+        return !(p && p->borrowed) || p->borrowed(p->ctx, kind_, site);
+    }
+    void test_borrow_end(int site) {
+        const auto *p = evb_probe.load(std::memory_order_acquire);
+        if (p && p->borrow_end) p->borrow_end(p->ctx, kind_, site);
+    }
+    void test_retire_begin(unsigned granted) {
+        const auto *p = evb_probe.load(std::memory_order_acquire);
+        if (p && p->retire_begin) p->retire_begin(p->ctx, kind_, granted);
+    }
+    void test_retired() {
+        const auto *p = evb_probe.load(std::memory_order_acquire);
+        if (p && p->retired) p->retired(p->ctx, kind_);
+    }
+#else
+    static bool test_borrowed(int) { return true; }
+    static void test_borrow_end(int) {}
+    static void test_retire_begin(unsigned) {}
+    static void test_retired() {}
+#endif
+
+    [[maybe_unused]] const int kind_;
+    std::mutex mu_;
+    std::condition_variable idle_;
+    folly::EventBase *evb_ = nullptr;
+    unsigned borrows_ = 0;
+};
+
+/* Borrow sites (the testing probe reports which one). */
+enum : int {
+    EVB_SITE_ENQUEUE = 1,       /* queue one pump callback */
+    EVB_SITE_NOTIFY = 2,        /* ask the loop to terminate */
+    EVB_SITE_THREAD_CHECK = 3   /* is the caller the loop thread? */
+};
+enum : int { EVB_LEASE_CLIENT = 1, EVB_LEASE_SERVER = 2 };
+
+#ifdef MOQ_MVFST_TESTING
+static void test_drain_begin(folly::EventBase *e)
+{
+    const auto *p = evb_probe.load(std::memory_order_acquire);
+    if (p && p->drain_begin) p->drain_begin(p->ctx, e);
+}
+static bool test_drain_fails()
+{
+    const auto *p = evb_probe.load(std::memory_order_acquire);
+    return p && p->drain_fails && p->drain_fails(p->ctx);
+}
+static void test_destroy_begin(folly::EventBase *e, bool transport_released)
+{
+    const auto *p = evb_probe.load(std::memory_order_acquire);
+    if (p && p->destroy_begin) p->destroy_begin(p->ctx, e, transport_released);
+}
+#else
+static void test_drain_begin(folly::EventBase *) {}
+static bool test_drain_fails() { return false; }
+static void test_destroy_begin(folly::EventBase *, bool) {}
+#endif
+
+/* Owner thread, once the client loop has exited and its lease is retired:
+ * run the work teardown left on the client EventBase, then destroy it.
+ *
+ * Teardown closes the transport, which leaves mvfst's close and drain work
+ * (callbacks and timers) on this EventBase. That work has to run here, while
+ * the EventBase and its backend are alive: the destructor cancels any timer
+ * still pending only after its backend is gone, and mvfst's drain timeout
+ * treats a cancellation as expiry and re-registers its socket.
+ *
+ * A terminateLoopSoon() that reached the EventBase after its loop had exited
+ * is still pending, and folly documents that it makes the next call to loop
+ * terminate soon after starting. The non-blocking loopOnce() below is that
+ * next call: it returns at once with nothing processed when a stop is
+ * pending, and otherwise runs only what is already ready. Folly documents
+ * that a later restart processes pending events normally, so loop() then runs
+ * until no events remain. No other stop can be requested by then: the lease
+ * is retired, so no other thread reaches the EventBase, and the pump body and
+ * deadline timer are gone, so nothing left on it asks the loop to terminate.
+ *
+ * The closed transport is what leaves work on the EventBase, and it owns
+ * itself until that work is done: QuicClientTransport::newClient makes it
+ * self-owning, and only its drain timeout's expiry (drainTimeoutExpired:
+ * close the UDP socket, then unbindConnection) drops that self reference.
+ * The facade keeps its own reference until here. After a full drain the
+ * timeout has run. A false result from either loop call is an event-loop
+ * error, not completion: the timeout may still be pending. On that path
+ * only, the transport is closed at once on this, its owner thread:
+ * closeNow() cancels a drain timeout left by the earlier close and expires
+ * it, which closes the socket and drops the self reference while the
+ * backend lives. A non-blocking loopOnce() then runs what that made ready;
+ * its result is not taken as completion either. In both cases the facade's
+ * reference is released before the EventBase is destroyed, so no transport
+ * work outlives it. The failure is returned. */
+static bool finish_client_evb(std::unique_ptr<folly::EventBase> &evb,
+                              std::shared_ptr<quic::QuicClientTransport> transport)
+{
+    if (!evb) return true;
+    test_drain_begin(evb.get());
+    bool ok = evb->loopOnce(EVLOOP_NONBLOCK);
+    ok = !test_drain_fails() && evb->loop() && ok;
+    if (!ok && transport) {
+        transport->closeNow(quic::QuicError(
+            quic::QuicErrorCode(quic::LocalErrorCode::SHUTTING_DOWN),
+            std::string("event loop failed during the final drain")));
+        (void)evb->loopOnce(EVLOOP_NONBLOCK);
+    }
+    std::weak_ptr<quic::QuicClientTransport> released = transport;
+    transport.reset();
+    test_destroy_begin(evb.get(), released.expired());
+    evb.reset();
+    return ok;
+}
+
 class managed_server_factory : public quic::QuicServerTransportFactory {
 public:
     managed_server_factory(moq_mvfst_managed *owner,
@@ -447,19 +647,21 @@ struct moq_mvfst_managed {
     std::unique_ptr<moq::mvfst::adapter> adapter_ptr;
 
     /* Server: QuicServer + per-connection state. server_evb is the QuicServer
-     * worker EventBase (owned by QuicServer, not us). Published by the manager
-     * thread during setup and cleared at teardown, but read from cross-thread
-     * wake paths (server_schedule_pump), so it is atomic with release stores /
-     * acquire loads -- mirroring client_evb. */
+     * worker EventBase, owned by QuicServer, which the manager thread owns in
+     * turn: the manager sets server_evb during setup, reads it, and destroys
+     * the worker by resetting `server` at teardown. server_evb is read on the
+     * manager thread only. Every other thread reaches the worker EventBase
+     * through server_evb_lease, which the manager retires before the server
+     * is shut down. */
     std::string key_path;
     std::shared_ptr<quic::QuicServer> server;
-    std::atomic<folly::EventBase *> server_evb{nullptr};
-    /* Client mode: the EventBase the managed thread owns and runs. Published by
-     * the managed thread when the pump loop starts and cleared when it exits;
-     * read from app/credit/write-ready threads in wake_pump/request_pump/
-     * notify_shutdown, so it is atomic (release on store, acquire on load).
-     * Null in server mode (where server_evb is a foreign worker thread). */
-    std::atomic<folly::EventBase *> client_evb{nullptr};
+    folly::EventBase *server_evb = nullptr;
+    evb_lease server_evb_lease{EVB_LEASE_SERVER};
+    /* Client mode: the EventBase the managed thread owns, runs and destroys.
+     * Published while its pump loop runs and retired when the loop exits,
+     * before teardown and destruction; app, credit and write-ready threads
+     * reach it only through this lease. Never published in server mode. */
+    evb_lease client_evb_lease{EVB_LEASE_CLIENT};
     std::atomic<uint16_t> local_port{0};
     std::vector<std::unique_ptr<moq_mvfst_conn>> conns;
     size_t max_connections = MOQ_MVFST_DEFAULT_MAX_CONNECTIONS;
@@ -516,9 +718,15 @@ struct moq_mvfst_managed {
                network_tid == std::this_thread::get_id();
     }
 
+    /* While the worker EventBase is published, the network thread is its loop
+     * thread; otherwise it is the managed thread. Callable from any thread. */
     bool is_network_thread() {
-        if (auto *e = server_evb.load(std::memory_order_acquire))
-            return e->isInEventBaseThread();
+        bool on_worker = false;
+        if (server_evb_lease.borrow(EVB_SITE_THREAD_CHECK,
+                [&on_worker](folly::EventBase *e) {
+                    on_worker = e->isInEventBaseThread();
+                }))
+            return on_worker;
         return is_managed_thread();
     }
 
@@ -570,6 +778,13 @@ struct moq_mvfst_managed {
         fatal_code_val.store(code);
     }
 
+    /* A failure found during shutdown: recorded unless an earlier one is. */
+    void note_failure(uint64_t code) {
+        bool was = false;
+        if (fatal.compare_exchange_strong(was, true))
+            fatal_code_val.store(code);
+    }
+
     void signal_activity() {
         activity_flag.store(true);
         wait_cv.notify_all();
@@ -598,8 +813,12 @@ struct moq_mvfst_managed {
      * keeps pump_tick non-reentrant. */
     void schedule_pump() {
         if (pump_scheduled.exchange(true)) return;   /* already queued */
-        folly::EventBase *evb = client_evb.load(std::memory_order_acquire);
-        if (!evb) { pump_scheduled.store(false); return; }
+        if (!client_evb_lease.borrow(EVB_SITE_ENQUEUE,
+                [this](folly::EventBase *evb) { enqueue_pump(evb); }))
+            pump_scheduled.store(false);
+    }
+
+    void enqueue_pump(folly::EventBase *evb) {
         evb->runInEventBaseThreadAlwaysEnqueue([this]() {
             pump_scheduled.store(false);
             if (pump_run) pump_run();
@@ -651,8 +870,12 @@ struct moq_mvfst_managed {
     void server_schedule_pump() {
         if (!server_pump_enabled.load(std::memory_order_acquire)) return;
         if (server_pump_scheduled.exchange(true)) return;
-        folly::EventBase *evb = server_evb.load(std::memory_order_acquire);
-        if (!evb) { server_pump_scheduled.store(false); return; }
+        if (!server_evb_lease.borrow(EVB_SITE_ENQUEUE,
+                [this](folly::EventBase *evb) { server_enqueue_pump(evb); }))
+            server_pump_scheduled.store(false);
+    }
+
+    void server_enqueue_pump(folly::EventBase *evb) {
         evb->runInEventBaseThreadAlwaysEnqueue([this]() {
             server_pump_scheduled.store(false);
             if (!server_pump_enabled.load(std::memory_order_acquire)) return;
@@ -677,7 +900,7 @@ struct moq_mvfst_managed {
      * EventBase. The condvar fallback only applies before the pump machinery is
      * live (e.g. during startup) or on a handle with neither evb. */
     void wake_pump() {
-        if (client_evb.load(std::memory_order_acquire)) {
+        if (client_evb_lease.published()) {
             request_pump();
         } else if (server_pump_enabled.load(std::memory_order_acquire)) {
             server_request_pump();
@@ -695,10 +918,12 @@ struct moq_mvfst_managed {
         server_pump_enabled.store(false, std::memory_order_release);
         wake_cv.notify_all();
         wait_cv.notify_all();
-        /* Break the client pump loop. terminateLoopSoon is thread-safe;
-         * harmless if the loop has already exited. */
-        if (auto *evb = client_evb.load(std::memory_order_acquire))
-            evb->terminateLoopSoon();
+        /* Break the client pump loop. A stop that lands after the loop has
+         * exited, before retirement, stays pending until the owner's final
+         * drain consumes it (finish_client_evb); once the client EventBase is
+         * retired this borrows nothing and does nothing. */
+        client_evb_lease.borrow(EVB_SITE_NOTIFY,
+            [](folly::EventBase *evb) { evb->terminateLoopSoon(); });
     }
 
     /* Turn on managed-only outbound stream-credit gating for the client
@@ -710,6 +935,14 @@ struct moq_mvfst_managed {
      * callbacks schedule the server pump. Defined out-of-line (needs the
      * complete adapter::impl); the friend grant on adapter exposes impl_. */
     void wire_conn_server_pump(moq::mvfst::adapter *adp);
+
+    /* Report a local close the owner has just completed (transport->close()
+     * returned) to the adapter's session, on the owning thread and outside
+     * every socket callback, before the owner removes or destroys the
+     * adapter. close() removes the connection callbacks first, so nothing
+     * else will. A terminal the session already has is kept. Defined
+     * out-of-line (needs the complete adapter::impl). */
+    static void settle_local_close(moq::mvfst::adapter *adp, uint64_t now);
 
 #ifdef MOQ_MVFST_TESTING
     /* Test-only telemetry (compiled into the test-internals object lib, not the
@@ -953,11 +1186,21 @@ moq_result_t moq_mvfst_managed_create(
         sizeof(cfg->on_lane_pump))
         return MOQ_ERR_INVAL;
 
-    /* Validate perspective. */
-    moq_perspective_t persp = CFG_HAS(cfg, perspective)
-        ? cfg->perspective : static_cast<moq_perspective_t>(0);
-    if (persp != MOQ_PERSPECTIVE_CLIENT && persp != MOQ_PERSPECTIVE_SERVER)
+    /* Validate perspective from its representation. A C caller's storage
+     * can hold any value of the enum's underlying integer type, and one that
+     * names no perspective must be refused without ever being read as the
+     * C++ enum: copy the bytes into that integer type, compare them with
+     * the two perspectives, and only then form the enum. */
+    using persp_rep_t = std::underlying_type<moq_perspective_t>::type;
+    static_assert(sizeof(persp_rep_t) == sizeof(cfg->perspective),
+                  "perspective is stored as its underlying integer type");
+    persp_rep_t persp_rep = 0;
+    if (CFG_HAS(cfg, perspective))
+        std::memcpy(&persp_rep, &cfg->perspective, sizeof(persp_rep));
+    if (persp_rep != static_cast<persp_rep_t>(MOQ_PERSPECTIVE_CLIENT) &&
+        persp_rep != static_cast<persp_rep_t>(MOQ_PERSPECTIVE_SERVER))
         return MOQ_ERR_INVAL;
+    const moq_perspective_t persp = static_cast<moq_perspective_t>(persp_rep);
 
     /* on_lane_pump is required. */
     if (!CFG_HAS(cfg, on_lane_pump) || !cfg->on_lane_pump)
@@ -1118,7 +1361,8 @@ moq_result_t moq_mvfst_managed_create(
      * Destroys adapter, transport and server; retains the client session
      * until handle destruction. Safe with nulls.
      */
-    auto teardown = [](moq_mvfst_managed_t *h) {
+    auto teardown = [](moq_mvfst_managed_t *h)
+            -> std::shared_ptr<quic::QuicClientTransport> {
         /* Gate server pump scheduling: new schedule sites and already-queued
          * callbacks bail on this, so the server_evb barrier below owns the
          * timer/conn teardown with no pump work racing it. Idempotent with
@@ -1133,11 +1377,17 @@ moq_result_t moq_mvfst_managed_create(
         if (h->transport) {
             h->transport->close(
                 quic::QuicError(quic::ApplicationErrorCode(0)));
+            /* close() removed the connection callbacks before closing, and
+             * the pump is gone: the session learns of this close here, while
+             * its adapter still exists. */
+            moq_mvfst_managed::settle_local_close(h->adapter_ptr.get(),
+                                                  managed_now_us());
         }
         h->adapter_ptr.reset();
-        if (h->transport) {
-            h->transport.reset();
-        }
+        /* The closed client transport leaves the facade here, still draining:
+         * the caller hands it to finish_client_evb, which owns it until the
+         * EventBase work it left is settled. */
+        std::shared_ptr<quic::QuicClientTransport> closing = std::move(h->transport);
         /* The client session is NOT destroyed here. It outlives the network
          * thread until moq_mvfst_managed_destroy(), as it does on the
          * picoquic facades: the service tier's media sender keeps a pointer
@@ -1149,7 +1399,7 @@ moq_result_t moq_mvfst_managed_create(
          * on this thread touches the session after adapter_ptr is gone, and
          * moq_mvfst_managed_session() only hands it out inside the pump
          * window. */
-        if (auto *sevb = h->server_evb.load(std::memory_order_acquire)) {
+        if (auto *sevb = h->server_evb) {
             /* Barrier on server_evb: any in-flight pump callback has already
              * completed (FIFO), and scheduling is gated off, so it is safe to
              * cancel/destroy the deadline timer, drop the pump body, and
@@ -1169,13 +1419,19 @@ moq_result_t moq_mvfst_managed_create(
             h->conns.clear();
             h->conn_count.store(0);
         }
+        /* Retire the worker EventBase before the server can destroy it: once
+         * this returns, no other thread is inside a call on it, and none can
+         * start one. shutdown() and reset() then release the worker (the
+         * server's last reference may be this one). */
+        h->server_evb_lease.retire();
         if (h->server) {
             h->server->shutdown();
             h->server.reset();
-            h->server_evb.store(nullptr, std::memory_order_release);
         }
+        h->server_evb = nullptr;
         h->thread_exited.store(true);
         h->notify_shutdown();
+        return closing;
     };
 
     try {
@@ -1243,7 +1499,8 @@ moq_result_t moq_mvfst_managed_create(
                 auto evbs = m->server->getWorkerEvbs();
                 if (evbs.empty())
                     throw std::runtime_error("no worker evb");
-                m->server_evb.store(evbs[0], std::memory_order_release);
+                m->server_evb = evbs[0];
+                m->server_evb_lease.publish(evbs[0]);
 
             } catch (...) {
                 signal_init(m, MOQ_ERR_INTERNAL);
@@ -1367,8 +1624,9 @@ moq_result_t moq_mvfst_managed_create(
                         capture_keepalive(*keepalive_probe,
                                           m->transport->getTransportSettings());
                         signal_init(m, MOQ_OK);
-                        teardown(m);
-                        if (evb_ptr) { evb_ptr->loop(); evb_ptr.reset(); }
+                        auto closing = teardown(m);
+                        if (!finish_client_evb(evb_ptr, std::move(closing)))
+                            m->note_failure(0x1);
                         return; /* no start(), socket bind, or packet send */
                     }
 #endif
@@ -1403,8 +1661,9 @@ moq_result_t moq_mvfst_managed_create(
             } catch (...) {
 
                 signal_init(m, MOQ_ERR_INTERNAL);
-                teardown(m);
-                if (evb_ptr) { evb_ptr->loop(); evb_ptr.reset(); }
+                auto closing = teardown(m);
+                if (!finish_client_evb(evb_ptr, std::move(closing)))
+                    m->note_failure(0x1);
                 return;
             }
         }
@@ -1462,6 +1721,27 @@ moq_result_t moq_mvfst_managed_create(
                 else if (c->adp->is_closed()) c->close_requested = true;
             }
 
+            /* Latch the negotiated version once a session is ESTABLISHED.
+             * EXACT-VERSION adapter: the version is fixed at create, so this
+             * just flips negotiated_version() from 0 to cfg_version at the
+             * handshake/setup boundary (parity with the picoquic helper).
+             * It runs before the app's pump, so a pump that sees
+             * SETUP_COMPLETE already reads the version, as the header
+             * promises once the session is ESTABLISHED. Runs on the network
+             * thread, where session access is valid. */
+            if (h->negotiated.load(std::memory_order_relaxed) == 0) {
+                moq_session_t *cs = h->session.load();
+                bool est = cs && moq_session_state(cs) == MOQ_SESS_ESTABLISHED;
+                for (auto &c : h->conns) {
+                    if (est) break;
+                    if (c->session &&
+                        moq_session_state(c->session) == MOQ_SESS_ESTABLISHED)
+                        est = true;
+                }
+                if (est)
+                    h->negotiated.store((int)h->cfg_version);
+            }
+
             h->in_lane_pump = true;
             int pump_rc = h->on_lane_pump(h, &h->lane, now, h->user_ctx);
             h->in_lane_pump = false;
@@ -1498,24 +1778,6 @@ moq_result_t moq_mvfst_managed_create(
             }
             h->conn_count.store(h->conns.size());
 
-            /* Latch the negotiated version once a session is ESTABLISHED.
-             * EXACT-VERSION adapter: the version is fixed at create, so this
-             * just flips negotiated_version() from 0 to cfg_version at the
-             * handshake/setup boundary (parity with the picoquic helper).
-             * Runs on the network thread, where session access is valid. */
-            if (h->negotiated.load(std::memory_order_relaxed) == 0) {
-                moq_session_t *cs = h->session.load();
-                bool est = cs && moq_session_state(cs) == MOQ_SESS_ESTABLISHED;
-                for (auto &c : h->conns) {
-                    if (est) break;
-                    if (c->session &&
-                        moq_session_state(c->session) == MOQ_SESS_ESTABLISHED)
-                        est = true;
-                }
-                if (est)
-                    h->negotiated.store((int)h->cfg_version);
-            }
-
             /* Earliest deadline (min of session deadlines + the live app
              * deadline) on the correct thread — server conns live on the worker
              * EventBase. Drives both the client deadline_to and the server
@@ -1537,8 +1799,8 @@ moq_result_t moq_mvfst_managed_create(
                  * (app, credit, write-ready, inbound data) request a pump; a
                  * one-shot AsyncTimeout requests one at the next MoQ session
                  * deadline. Zero idle spin, prompt pumping, live QUIC timers. */
-                m->client_evb.store(evb_ptr.get(),
-                                    std::memory_order_release);
+                folly::EventBase *own_evb = evb_ptr.get();
+                m->client_evb_lease.publish(own_evb);
                 auto deadline_to = folly::AsyncTimeout::make(
                     *evb_ptr, [m]() noexcept { m->request_pump(); });
 
@@ -1546,16 +1808,14 @@ moq_result_t moq_mvfst_managed_create(
                  * request_pump(). Reschedules the deadline timer from the MoQ
                  * session's next deadline (mvfst's own timers are independent
                  * and keep running regardless). */
-                m->pump_run = [m, &pump_tick, &deadline_to]() {
+                m->pump_run = [m, &pump_tick, &deadline_to, own_evb]() {
                     pump_result pr = pump_tick(m);
                     if (m->on_activity)
                         m->on_activity(m, m->user_ctx);
                     m->signal_activity();
                     if (!pr.ok) {
                         m->running.store(false);
-                        if (auto *e = m->client_evb.load(
-                                std::memory_order_acquire))
-                            e->terminateLoopSoon();
+                        own_evb->terminateLoopSoon();   /* owner thread */
                         return;
                     }
                     deadline_to->cancelTimeout();
@@ -1588,9 +1848,8 @@ moq_result_t moq_mvfst_managed_create(
 
                 m->pump_run = nullptr;  /* stop dispatching before locals die */
                 deadline_to->cancelTimeout();
-                m->client_evb.store(nullptr, std::memory_order_release);
-            } else if (folly::EventBase *sevb =
-                           m->server_evb.load(std::memory_order_acquire)) {
+                m->client_evb_lease.retire();
+            } else if (folly::EventBase *sevb = m->server_evb) {
                 /* SERVER: event-driven pump scheduled onto the QuicServer
                  * worker EventBase -- no 5ms poll. The manager thread wires the
                  * pump body + deadline timer, kicks one initial pump, then
@@ -1675,18 +1934,23 @@ moq_result_t moq_mvfst_managed_create(
             m->set_fatal(0x1);
             m->running.store(false);
         }
+        /* Every exit from the loop, an exception included: stop dispatching the
+         * pump body (it refers to locals of the loop scope) and retire the
+         * client EventBase before teardown and its destruction below. Both are
+         * no-ops when the loop exited normally. */
+        m->pump_run = nullptr;
+        m->client_evb_lease.retire();
 
-        teardown(m);
-        /* One-shot drain (loop(), not loopForever): teardown(m) closed the
-         * client transport, which posts mvfst's close/destroy callbacks onto
-         * this EventBase. Run the loop to completion so those callbacks fire
-         * before evb_ptr is destroyed; with no registered events left it
-         * returns on its own. The durable loopForever above has already exited
-         * via terminateLoopSoon by this point. */
-        if (evb_ptr) {
-            evb_ptr->loop();
-            evb_ptr.reset();
-        }
+        auto closing = teardown(m);
+        /* teardown(m) closed the client transport, leaving mvfst's close and
+         * drain work on this EventBase: run it to completion while the
+         * EventBase lives, then destroy it here, on its owner thread. The
+         * lease is retired and the pump body and deadline timer are gone, so
+         * no stop can be requested during this drain (finish_client_evb). The
+         * early-exit paths above are the same, before the EventBase was ever
+         * published. */
+        if (!finish_client_evb(evb_ptr, std::move(closing)))
+            m->note_failure(0x1);
     });
     } catch (...) {
         m->~moq_mvfst_managed_t();
@@ -1822,9 +2086,16 @@ moq_result_t moq_mvfst_conn_close(moq_mvfst_conn_t *conn,
     if (!conn->parent || !conn->parent->in_pump_window())
         return MOQ_ERR_INVAL;
     conn->close_requested = true;
-    if (conn->transport)
+    if (conn->transport) {
         conn->transport->close(quic::QuicError(
             quic::ApplicationErrorCode(error_code)));
+        /* Both service loops skip a connection whose close was requested,
+         * and close() removed its connection callbacks: the session learns
+         * of the close now, so on_lane_pump can still observe it before the
+         * connection is removed. */
+        moq_mvfst_managed::settle_local_close(conn->adp.get(),
+                                              managed_now_us());
+    }
     return MOQ_OK;
 }
 
@@ -1903,6 +2174,8 @@ moq_version_t moq_mvfst_managed_negotiated_version(
 
 namespace moq::mvfst {
 
+unsupported_socket::~unsupported_socket() = default;
+
 static uint64_t now_us_from_clock()
 {
     auto now = std::chrono::steady_clock::now();
@@ -1959,6 +2232,51 @@ enum {
 };
 #endif
 
+/* The socket's own notice that its connection has begun to close. mvfst
+ * tells every attached observer closeStarted() at the start of a close,
+ * before it reflects the connection's error onto the read callbacks of the
+ * streams still open and before the connection callback
+ * (QuicTransportBaseLite::closeImpl). A read error that arrives after it is
+ * that close; one that arrives without it is a RESET_STREAM from the peer.
+ * ManagedObserver detaches itself when destroyed. */
+struct __attribute__((visibility("hidden"))) close_started_observer
+    : public quic::QuicSocket::ManagedObserver
+{
+    bool started = false;
+    /* What settlement needs of the error the close was started with
+     * (close()/closeNow()'s argument, or the peer's or transport's): whether
+     * it was an application error and, if so, its code -- 0 included. Plain
+     * scalars, copied without allocating: the notice is noexcept, and the
+     * error's message is never kept. */
+    bool app_reason = false;
+    uint64_t app_code = 0;
+    /* Told of each close notice; it only schedules work, never runs it. */
+    void (*notify)(void *ctx) = nullptr;
+    void *ctx = nullptr;
+
+    void closeStarted(
+        quic::QuicSocketLite *,
+        const quic::SocketObserverInterface::CloseStartedEvent &ev) noexcept
+        override {
+        started = true;
+        app_reason = false;
+        app_code = 0;
+        if (ev.maybeCloseReason) {
+            if (auto *app = ev.maybeCloseReason->code.asApplicationErrorCode()) {
+                app_reason = true;
+                app_code = static_cast<uint64_t>(*app);
+            }
+        }
+        if (notify) notify(ctx);
+    }
+
+    void closing(quic::QuicSocketLite *,
+                 const quic::SocketObserverInterface::ClosingEvent &) noexcept
+        override {
+        if (notify) notify(ctx);
+    }
+};
+
 struct __attribute__((visibility("hidden"))) adapter::impl
     : public quic::QuicSocket::ConnectionSetupCallback
     , public quic::QuicSocket::ConnectionCallback
@@ -1969,6 +2287,9 @@ struct __attribute__((visibility("hidden"))) adapter::impl
 {
     moq_session_t *session;
     std::shared_ptr<quic::QuicSocket> socket;
+    /* Registered on `socket` before the adapter is attached; declared after
+     * it so it is destroyed, and detached, while the socket still exists. */
+    std::unique_ptr<close_started_observer> close_obs;
 
     /* Armed while a connection-write-ready notification is outstanding. Set
      * when a service leaves the bridge with pending writes the transport could
@@ -2181,8 +2502,40 @@ struct __attribute__((visibility("hidden"))) adapter::impl
     }
 
     ~impl() {
+        if (close_obs) close_obs->detach();
         teardown_callbacks();
         moq_transport_bridge_destroy(shared_bridge);
+    }
+
+    bool close_started() const {
+        return close_obs && close_obs->started;
+    }
+
+    static void on_close_notice(void *ctx) {
+        static_cast<impl *>(ctx)->wake_managed_pump();
+    }
+
+    /* mvfst removes the connection callbacks when its own user closes the
+     * socket -- close() before its close begins, closeGracefully() before it
+     * reflects anything (QuicTransportBaseLite::close,
+     * QuicTransportBase::closeGracefully) -- and only then. So a close that
+     * has begun, has run to completion (this runs outside every socket
+     * callback), and has left the session without its terminal is that local
+     * close: it is reported as the orderly close it is, with the application
+     * code it carried, if any. A close the session decided first keeps its
+     * event; a close the adapter dispatched has already closed the bridge. */
+    void settle_local_close(uint64_t now) {
+        if (!close_started() || is_terminal()) return;
+        uint64_t code = close_obs->app_reason ? close_obs->app_code : 0;
+        moq_transport_bridge_on_transport_close(shared_bridge, code, now);
+    }
+
+    /* Drop a stream's read-callback bookkeeping without calling the socket:
+     * for a socket that is removing its read callbacks itself. */
+    void forget_read_cb(quic::StreamId id) {
+        read_cb_streams.erase(id);
+        paused_read_streams.erase(id);
+        local_bidi_ids.erase(id);
     }
 
     moq_perspective_t local_perspective() const {
@@ -2275,6 +2628,11 @@ struct __attribute__((visibility("hidden"))) adapter::impl
             drop_all_held(MOQ_MVFST_TEST_HOLD_DROPPED_TEARDOWN);
             return is_fatal() ? MOQ_ERR_INTERNAL : MOQ_OK;
         }
+        /* The connection's close has begun: mvfst takes no more output once
+         * it has (it marks the connection closed before it reflects anything
+         * onto the streams), so nothing is serviced, written, replayed or
+         * resumed until the close's terminal reaches the bridge. */
+        if (close_started()) return MOQ_OK;
 
         moq_result_t rc = moq_transport_bridge_service(shared_bridge, now);
 
@@ -2629,29 +2987,61 @@ struct __attribute__((visibility("hidden"))) adapter::impl
 
             uint64_t now = now_us_from_clock();
 
-            /* Bidi-control profiles: a control stream reset is a protocol
-             * violation; route through on_transport_error because the
-             * bridge does not special-case the BIDI control stream. (In
-             * uni-control-pair mode these ids are never set; a peer reset
-             * of its uni control channel falls through to
-             * on_peer_stream_reset, where the bridge terminates the
-             * session itself.) */
+            /* Close provenance comes first, for every stream: control or
+             * data, bidirectional or unidirectional. */
+            if (close_started()) {
+                /* The connection's close, reflected onto this stream. The
+                 * socket is removing its read callbacks itself and takes no
+                 * more work; the connection callback reports the close, or
+                 * settle_local_close() does where the close removed it. */
+                forget_read_cb(id);
+                wake_managed_pump();
+                return;
+            }
+            if (auto *local = error.code.asLocalErrorCode();
+                local && *local == quic::LocalErrorCode::NO_ERROR) {
+                /* The socket's graceful local shutdown: closeGracefully()
+                 * removes the connection callbacks and reflects
+                 * LocalErrorCode::NO_ERROR onto every stream before any close
+                 * begins, and nothing else reflects that code before one
+                 * has. No connection callback follows, so the orderly local
+                 * close is reported here. A close the session decided first
+                 * keeps its event. */
+                forget_read_cb(id);
+                moq_transport_bridge_on_transport_close(shared_bridge, 0, now);
+                wake_managed_pump();
+                return;
+            }
+
+            /* Bidi-control profiles: this callback has two sources. mvfst
+             * calls it for a RESET_STREAM frame from the peer, with that
+             * frame's application error code, and it calls it for every
+             * stream that still has a read callback when the connection
+             * closes, with the connection's error -- after the socket's
+             * close-started notice and before onConnectionEnd or
+             * onConnectionError. The notice tells them apart; the code
+             * never does. (In uni-control-pair mode these ids are never
+             * set; a peer reset of its uni control channel falls through to
+             * on_peer_stream_reset, where the bridge terminates the session
+             * itself.) */
             if (id == local_control_stream_id ||
                 id == peer_control_stream_id) {
-                /* A control-stream read error during connection teardown. mvfst
-                 * reflects a peer CONNECTION_CLOSE onto every stream (including
-                 * the control stream) as a readError, and this can arrive
-                 * BEFORE onConnectionEnd. A clean close (application error code
-                 * 0 / no error) must land as a graceful transport close, not a
-                 * fatal error -- otherwise a peer that closes normally leaves
-                 * the local session fatal. A non-zero code is a genuine
-                 * control-stream reset (a protocol violation) and stays fatal. */
-                if (code == 0)
-                    moq_transport_bridge_on_transport_close(
-                        shared_bridge, 0, now);
-                else
+                if (error.code.asApplicationErrorCode()) {
+                    /* The peer reset the control stream while the
+                     * connection is open, with an application code, zero
+                     * included: the control stream has ended (the bridge
+                     * closes an open session as a protocol violation and
+                     * leaves an already decided close as it is). */
+                    drop_held(id, MOQ_MVFST_TEST_HOLD_DROPPED_RESET);
+                    moq_transport_bridge_on_peer_stream_reset(
+                        shared_bridge, id, code, now);
+                } else {
+                    /* A local or transport error on the control stream of an
+                     * open connection is a transport failure, never a clean
+                     * close. */
                     moq_transport_bridge_on_transport_error(
-                        shared_bridge, code, now);
+                        shared_bridge, 0x1, now);
+                }
                 unregister_read_cb(id);
                 service_all(now);
                 wake_managed_pump();
@@ -2713,9 +3103,19 @@ adapter::adapter(config cfg,
             "adapter: config perspective must match session perspective");
     if (!socket)
         throw std::invalid_argument("adapter: socket must not be null");
+    /* Close provenance first, before the adapter keeps the socket, installs a
+     * callback or can send a byte: a socket that cannot report the start of
+     * its close is refused as it was given. If anything below throws, the
+     * observer is destroyed on the way out and detaches itself. */
+    auto obs = std::make_unique<close_started_observer>();
+    if (!socket->addObserver(obs.get()))
+        throw unsupported_socket();
     impl_ = std::make_unique<struct impl>(
         session, std::move(socket),
         cfg.local_perspective == MOQ_PERSPECTIVE_CLIENT);
+    impl_->close_obs = std::move(obs);
+    impl_->close_obs->ctx = impl_.get();
+    impl_->close_obs->notify = &impl::on_close_notice;
     impl_->install_callbacks();
 }
 
@@ -2750,6 +3150,7 @@ quic::QuicSocket &adapter::socket() const noexcept {
 
 moq_result_t adapter::service(uint64_t now_us) {
     try {
+        impl_->settle_local_close(now_us);
         return impl_->service_all(now_us);
     } catch (const std::bad_alloc &) {
         moq_transport_bridge_on_transport_error(
@@ -2806,6 +3207,12 @@ void moq_mvfst_managed::enable_credit_gating()
     im->pump_wake = [self]() {
         self->request_pump();
     };
+}
+
+void moq_mvfst_managed::settle_local_close(moq::mvfst::adapter *adp,
+                                           uint64_t now)
+{
+    if (adp) adp->impl_->settle_local_close(now);
 }
 
 void moq_mvfst_managed::wire_conn_server_pump(moq::mvfst::adapter *adp)
@@ -2892,10 +3299,29 @@ extern "C" bool moq_mvfst_managed_test_has_client_session(
     return m ? m->has_client_session() : false;
 }
 
+extern "C" moq_session_t *moq_mvfst_managed_test_client_session(
+    moq_mvfst_managed_t *m)
+{
+    return m ? m->session.load(std::memory_order_acquire) : nullptr;
+}
+
 extern "C" void moq_mvfst_managed_test_set_keepalive_probe(
     moq_mvfst_keepalive_probe *probe)
 {
     keepalive_probe = probe;
+}
+
+static_assert(int(MOQ_MVFST_TEST_EVB_CLIENT) == int(EVB_LEASE_CLIENT) &&
+              int(MOQ_MVFST_TEST_EVB_SERVER) == int(EVB_LEASE_SERVER),
+              "lease names reported to the probe");
+static_assert(int(MOQ_MVFST_TEST_EVB_ENQUEUE) == int(EVB_SITE_ENQUEUE) &&
+              int(MOQ_MVFST_TEST_EVB_NOTIFY) == int(EVB_SITE_NOTIFY) &&
+              int(MOQ_MVFST_TEST_EVB_THREAD_CHECK) == int(EVB_SITE_THREAD_CHECK),
+              "borrow sites reported to the probe");
+
+extern "C" void moq_mvfst_test_set_evb_probe(const moq_mvfst_test_evb_probe *probe)
+{
+    evb_probe.store(probe, std::memory_order_release);
 }
 
 /* No listening socket or packet input. Drive the production registration and

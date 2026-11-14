@@ -29,6 +29,7 @@
 #include "../src/mvfst_managed_testing.h"
 
 #include <quic/QuicConstants.h>
+#include <quic/congestion_control/CongestionControllerFactory.h>
 #include <quic/server/QuicServer.h>
 #include <quic/server/QuicServerTransport.h>
 
@@ -178,7 +179,9 @@ private:
 
 class srv_factory : public quic::QuicServerTransportFactory {
 public:
-    srv_factory(server_env &s, srv_cb &cb) : s_(s), cb_(cb) {}
+    srv_factory(server_env &s, srv_cb &cb,
+                std::shared_ptr<quic::CongestionControllerFactory> cc)
+        : s_(s), cb_(cb), cc_(std::move(cc)) {}
     quic::QuicServerTransport::Ptr make(
         folly::EventBase *evb,
         std::unique_ptr<quic::FollyAsyncUDPSocketAlias> sock,
@@ -187,6 +190,10 @@ public:
     {
         s_.evb.store(evb);
         auto t = quic::QuicServerTransport::make(evb, std::move(sock), &cb_, &cb_, std::move(ctx));
+        /* Settings create the congestion controller before the server's
+         * worker installs its factory: give the transport the server's
+         * own factory first, so both stages use the same one. */
+        t->setCongestionControllerFactory(cc_);
         auto ts = t->getTransportSettings();
         ts.advertisedInitialMaxStreamsBidi = 100;
         /* The knob under test: starve the client's outbound uni-stream
@@ -200,6 +207,7 @@ public:
 private:
     server_env &s_;
     srv_cb &cb_;
+    std::shared_ptr<quic::CongestionControllerFactory> cc_;
 };
 
 static void service_server(server_env &sv) {
@@ -377,8 +385,13 @@ static void test_managed_stream_credit()
     server_env sv;
     srv_cb scb(sv);
     auto server = quic::QuicServer::createQuicServer();
+    /* One congestion-controller factory for the server: QuicServer
+     * hands it to its worker, and the transport factory gives it to each
+     * transport before that transport's settings are applied. */
+    auto cc = std::make_shared<quic::DefaultCongestionControllerFactory>();
+    server->setCongestionControllerFactory(cc);
     server->setFizzContext(sctx);
-    server->setQuicServerTransportFactory(std::make_unique<srv_factory>(sv, scb));
+    server->setQuicServerTransportFactory(std::make_unique<srv_factory>(sv, scb, cc));
     server->start(folly::SocketAddress("127.0.0.1", 0), 1);
     server->waitUntilInitialized();
     auto bound = server->getAddress();
@@ -432,6 +445,31 @@ static void test_managed_stream_credit()
     MVFST_CHECK(blocks <= (uint64_t)(4 * K_SUBGROUPS));
 
     MVFST_CHECK(moq_mvfst_managed_stop(m) == MOQ_OK);
+    /* Stop closed the client's transport and then destroyed its adapter.
+     * close() removes the connection callbacks before it closes, so the
+     * retained session hears of that close only because the facade settles
+     * it before the adapter goes: exactly one SESSION_CLOSED, carrying the
+     * stop's application code 0. */
+    {
+        moq_session_t *cs_s = moq_mvfst_managed_test_client_session(m);
+        MVFST_CHECK(cs_s != nullptr);
+        if (cs_s) {
+            MVFST_CHECK(moq_session_state(cs_s) == MOQ_SESS_CLOSED);
+            int closed = 0;
+            uint64_t code = UINT64_MAX;
+            moq_event_t ev;
+            for (int i = 0; i < 4096 && moq_session_poll_events(cs_s, &ev, 1) > 0;
+                 i++) {
+                if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
+                    closed++;
+                    code = ev.u.closed.code;
+                }
+                moq_event_cleanup(&ev);
+            }
+            MVFST_CHECK(closed == 1);
+            MVFST_CHECK(code == 0);
+        }
+    }
     moq_mvfst_managed_destroy(m);
 
     auto *evb = sv.evb.load();

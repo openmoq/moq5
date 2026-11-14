@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 
 namespace quic {
 class QuicSocket;
@@ -66,8 +67,36 @@ namespace moq::mvfst {
  * wrapping; chain-aware receive is a future optimization.
  * Control/bidi/datagram receive always use the copy path.
  *
- * v1 limitation: bidi STOP_SENDING from the peer is ignored.
- * Uni-stream STOP_SENDING is handled via moq_session_on_data_stop.
+ * Close provenance: the socket must accept a socket observer
+ * (quic::QuicSocket::addObserver returns true). mvfst's full transports,
+ * quic::QuicClientTransport and quic::QuicServerTransport, do; the Lite
+ * transports have no observer container and do not. The adapter registers
+ * one observer, before it keeps the socket or installs any callback, to
+ * learn when the connection's close begins: a read error on the MoQ control
+ * stream before that notice is a peer RESET_STREAM and ends the control
+ * stream (a protocol violation while the session is open); one after it is
+ * the connection's close and decides nothing. While a close is in progress
+ * the adapter asks nothing of the socket: no output, replay or resumed reads.
+ *
+ * Closing the socket yourself: after closeNow(), as after a peer or transport
+ * close, the connection callback reports the close to the session. close()
+ * and closeGracefully() remove the adapter's connection callbacks first, so
+ * the adapter reports those itself, as an orderly close: closeGracefully()
+ * when mvfst reflects its LocalErrorCode::NO_ERROR onto the streams, and
+ * otherwise -- close(), or closeGracefully() with no stream to reflect onto
+ * -- at the next service(), with the application error code the close
+ * carried (0 if none). A close the session had already decided keeps its own
+ * event.
+ *
+ * A socket without an observer
+ * container is refused: the constructor throws unsupported_socket, whose
+ * code() is MOQ_ERR_UNSUPPORTED, and leaves the socket as it was -- no
+ * callback installed, no observer left registered, nothing sent, not
+ * closed. The observer is detached when the adapter is destroyed.
+ *
+ * Peer STOP_SENDING on the MoQ control stream ends that stream (a protocol
+ * violation while the session is open). Uni-stream STOP_SENDING is handled
+ * via moq_session_on_data_stop.
  *
  * moq_rcbuf_t refcounts are intentionally non-atomic, so all
  * incref/decref must be confined to a single thread.
@@ -86,6 +115,22 @@ namespace moq::mvfst {
  * before moq_session_start() so its setup names it. The adapter itself never
  * binds or starts the session; the managed facade in <moq/mvfst.h> does.
  */
+/*
+ * Thrown by the adapter constructor for a socket that cannot report the start
+ * of its close (see "Close provenance" above). code() is MOQ_ERR_UNSUPPORTED.
+ * The destructor is defined in the library, so the class's vtable and type
+ * information are emitted there once and exported with it.
+ */
+class MOQ_API unsupported_socket : public std::runtime_error {
+public:
+    unsupported_socket()
+        : std::runtime_error(
+              "moq::mvfst::adapter: the socket cannot report the start of "
+              "its close (no socket observer container)") {}
+    ~unsupported_socket() override;
+    moq_result_t code() const noexcept { return MOQ_ERR_UNSUPPORTED; }
+};
+
 class MOQ_API adapter {
 public:
     /*

@@ -40,6 +40,27 @@
  *   local-UNI ACK-through-FIN/resettable contract. Other backends keep their
  *   existing behavior. This does not imply reliable-prefix reset support.
  *
+ * STREAM ABORTS
+ *   The MoQ control stream must stay open for the session's lifetime, while
+ *   every stream is aborted when the WebTransport session terminates. The
+ *   adapter tells the two apart with wtquic's classified abort event
+ *   (on_stream_abort): an application code (0 included) or another protocol
+ *   code on the control stream ends it -- a protocol violation while the MoQ
+ *   session is open -- and WT_SESSION_GONE or an unknown origin leaves the
+ *   outcome to the WebTransport session terminal.
+ *   Requirements, checked by moq_wtquic_conn_create() before anything is
+ *   allocated, installed, sent or owned (MOQ_ERR_UNSUPPORTED otherwise):
+ *     - a wtquic whose wtq_session_events_init_ex() covers on_stream_abort;
+ *     - wtq_session_abort_observability() reporting RESET_CODE, STOP_EVENT
+ *       and STOP_CODE for the session's backend. A backend that cannot
+ *       report every peer STOP_SENDING with its code (Network.framework
+ *       today) is refused: the control-stream STOP it may not report could
+ *       end the MoQ session unseen.
+ *   wtq_session_abort_observability() is a link-time dependency: this
+ *   adapter needs that wtquic or newer at build, link and load time.
+ *   Forward on_stream_abort with the rest of the event table; a caller that
+ *   forwards only the reset and stop events gets their handling.
+ *
  * LIFETIME
  *   The moq session must outlive the conn. Destroy the conn only after
  *   the wtquic side is fully torn down (after wtq_msquic_env_close

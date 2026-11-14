@@ -1423,6 +1423,14 @@ static void mm_on_stream_stop(wtq_session_t *s, wtq_stream_t *st,
         c->m->fwd->on_stream_stop(s, st, app_code, c->adapter);
 }
 
+static void mm_on_stream_abort(wtq_session_t *s, wtq_stream_t *st,
+                               const wtq_stream_abort_t *rec, void *user)
+{
+    moq_wtquic_msquic_managed_conn_t *c = user;
+    if (c->adapter != NULL)
+        c->m->fwd->on_stream_abort(s, st, rec, c->adapter);
+}
+
 static void mm_on_stream_closed(wtq_session_t *s, wtq_stream_t *st, void *user)
 {
     moq_wtquic_msquic_managed_conn_t *c = user;
@@ -1488,6 +1496,7 @@ static const wtq_session_events_t g_mm_events = {
     .on_datagram = mm_on_datagram,
     .on_stream_writable = mm_on_stream_writable,
     .on_stream_send_committed = mm_on_stream_committed,
+    .on_stream_abort = mm_on_stream_abort,
 };
 
 /*

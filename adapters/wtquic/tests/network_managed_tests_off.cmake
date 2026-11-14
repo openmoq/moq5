@@ -17,23 +17,40 @@ if(CONSUMER_CONTEXT)
 endif()
 file(REMOVE_RECURSE "${_tree}")
 
-execute_process(
-    COMMAND ${CMAKE_COMMAND} ${_context} -S "${SRC}" -B "${_tree}"
+# Run one nested step. Its exit status and complete output are printed
+# whether or not it succeeds, and kept in WORK/<name>.log, so the test log
+# carries every configure, compiler and linker diagnostic of a passing run
+# too. The caller gets <name>_rc and <name>_out to judge the step by.
+function(_nested_step name)
+    execute_process(COMMAND ${ARGN}
+        RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
+    file(WRITE "${WORK}/${name}.log" "${_out}")
+    message(STATUS "${name}: exit ${_rc}; complete output follows "
+                   "(also ${WORK}/${name}.log)")
+    if(NOT _out STREQUAL "")
+        message(NOTICE "${_out}")
+    endif()
+    message(STATUS "${name}: end of output")
+    set(${name}_rc "${_rc}" PARENT_SCOPE)
+    set(${name}_out "${_out}" PARENT_SCOPE)
+endfunction()
+
+_nested_step(network_managed_tests_off_configure
+    ${CMAKE_COMMAND} ${_context} -S "${SRC}" -B "${_tree}"
         -DMOQ_BUILD_TESTS=OFF
         -DMOQ_BUILD_ADAPTER_WTQUIC=ON
         -DMOQ_BUILD_WTQUIC_NETWORK_MANAGED=ON
-        "-DCMAKE_PREFIX_PATH=${WTQUIC_PREFIX}"
-    RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
-if(NOT _rc EQUAL 0)
-    message(FATAL_ERROR "tests-off configure failed:\n${_out}")
+        "-DCMAKE_PREFIX_PATH=${WTQUIC_PREFIX}")
+if(NOT network_managed_tests_off_configure_rc EQUAL 0)
+    message(FATAL_ERROR "tests-off configure failed")
 endif()
 
-execute_process(
-    COMMAND ${CMAKE_COMMAND} --build "${_tree}"
-        --target moq-adapter-wtquic-network-managed
-    RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _out)
-if(NOT _rc EQUAL 0)
-    message(FATAL_ERROR "tests-off component build failed:\n${_out}")
+# One job, whatever the nested generator or environment would choose.
+_nested_step(network_managed_tests_off_build
+    ${CMAKE_COMMAND} --build "${_tree}" --parallel 1
+        --target moq-adapter-wtquic-network-managed)
+if(NOT network_managed_tests_off_build_rc EQUAL 0)
+    message(FATAL_ERROR "tests-off component build failed")
 endif()
 
 message(STATUS "network_managed_tests_off: OK")

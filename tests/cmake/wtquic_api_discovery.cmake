@@ -62,6 +62,18 @@ function(keepalive_cause name text)
         message(FATAL_ERROR "${name}: refusal does not name ${text}: ${probe}")
     endif()
 endfunction()
+# A refused core probe's own build output names the missing entry point.
+function(api_cause name text)
+    set(log "${WORK}/${name}/CMakeFiles/moq-wtquic-api/output.log")
+    if(NOT EXISTS "${log}")
+        message(FATAL_ERROR "${name}: no probe output at ${log}")
+    endif()
+    file(READ "${log}" probe)
+    string(FIND "${probe}" "${text}" at)
+    if(at EQUAL -1)
+        message(FATAL_ERROR "${name}: refusal does not name ${text}: ${probe}")
+    endif()
+endfunction()
 file(MAKE_DIRECTORY "${WORK}")
 # Exercise the same context builder/function boundary on every host without
 # requiring that host's compiler to support multiple target architectures.
@@ -87,7 +99,7 @@ run(arguments-nested pass "${CMAKE_COMMAND}" "-DMOQ_SOURCE=${MOQ_SOURCE}"
     "-DRECEIPT=${WORK}/arguments-nested-command.log"
     -P "${MOQ_SOURCE}/tests/cmake/wtquic_api_diagnostic.cmake")
 probe_context(C context)
-foreach(kind old query admission flush-mode flush-query flush new)
+foreach(kind old query admission flush-mode flush-query flush new abort-missing)
     run("${kind}-configure" pass "${CMAKE_COMMAND}" -G "${GENERATOR}"
         -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_fixture" -B "${WORK}/${kind}"
         "-DAPI_KIND=${kind}" "-DPROBE_CONFIG=${CONFIG}" ${context})
@@ -98,7 +110,7 @@ foreach(lang C CXX)
     probe_context("${lang}" context)
     foreach(kind old query admission flush-mode flush-query flush new mixed
                  missing-flush-mode-library missing-flush-query-library
-                 missing-budget-library)
+                 missing-budget-library abort-missing missing-abort-library)
         set(headers "${kind}")
         set(library "${kind}")
         set(expected fail)
@@ -114,6 +126,9 @@ foreach(lang C CXX)
         elseif(kind STREQUAL "missing-budget-library")
             set(headers new)
             set(library flush)
+        elseif(kind STREQUAL "missing-abort-library")
+            set(headers new)
+            set(library abort-missing)
         elseif(kind STREQUAL "new")
             set(expected pass)
         endif()
@@ -135,6 +150,15 @@ foreach(lang C CXX)
         -B "${WORK}/${lang}-new" "-DFIXTURE_LIBRARY=${lib_new}")
     run("${lang}-stale-budget" fail "${CMAKE_COMMAND}" -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe"
         -B "${WORK}/${lang}-new" "-DFIXTURE_LIBRARY=${lib_flush}")
+    # A wtquic without classified stream aborts is refused at configure, by
+    # its header and by its library alone, naming the missing entry point.
+    api_cause("${lang}-abort-missing" "wtq_session_abort_observability")
+    api_cause("${lang}-missing-abort-library" "wtq_session_abort_observability")
+    run("${lang}-stale-abort" fail "${CMAKE_COMMAND}" -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe"
+        -B "${WORK}/${lang}-new" "-DFIXTURE_LIBRARY=${lib_abort-missing}")
+    api_cause("${lang}-new" "wtq_session_abort_observability")
+    run("${lang}-restored-abort" pass "${CMAKE_COMMAND}" -S "${MOQ_SOURCE}/tests/cmake/wtquic_api_probe"
+        -B "${WORK}/${lang}-new" "-DFIXTURE_LIBRARY=${lib_new}")
 endforeach()
 # MsQuic managed component: header field/initializer and link refusals over
 # the complete current core fixture. Base and Network-only discovery above
@@ -254,4 +278,4 @@ foreach(diagnostic clean warning deprecation)
         message(FATAL_ERROR "nested ${diagnostic} escaped complete-output guard: ${out}${err}")
     endif()
 endforeach()
-message(STATUS "WT API discovery: C/C++ receive/admission/budget/flush declaration and symbol refusals, MsQuic component field/initializer/link refusals, stale-library refusals, API-only pass, warning/no-language diagnostics")
+message(STATUS "WT API discovery: C/C++ receive/admission/budget/flush/abort-classification declaration and symbol refusals, MsQuic component field/initializer/link refusals, stale-library refusals, API-only pass, warning/no-language diagnostics")

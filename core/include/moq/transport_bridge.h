@@ -562,9 +562,17 @@ MOQ_API moq_result_t moq_transport_bridge_service(
  */
 
 /*
- * Control stream bytes. bool fin signals that the peer has FIN'd
- * the control stream (which the MoQ spec treats as a protocol
- * violation — the bridge routes it to the session which will close).
+ * Control stream bytes, for a profile whose control channel is one
+ * bidirectional stream (draft-16). bool fin signals that the peer has FIN'd
+ * the control stream. That stream must stay open for the session's lifetime
+ * (draft-16 section 3.3), so its FIN closes a session that is still open as
+ * a protocol violation, with the same code whether or not earlier control
+ * input was still being processed.
+ *
+ * A session that has already closed keeps the close it decided first. Until
+ * the transport has taken that close, control input, the FIN included, is
+ * accepted and not delivered (MOQ_OK), and changes neither the close nor its
+ * event.
  */
 MOQ_API moq_result_t moq_transport_bridge_on_peer_control_bytes(
     moq_transport_bridge_t *brg, uint64_t stream_id,
@@ -617,6 +625,13 @@ MOQ_API moq_result_t moq_transport_bridge_on_peer_bidi_bytes(
     moq_transport_bridge_t *brg, uint64_t stream_id,
     const uint8_t *data, size_t len, bool fin, uint64_t now_us);
 
+/*
+ * Report a peer RESET_STREAM. A reset of a control stream closes a session
+ * that is still open as a protocol violation: the peer's unidirectional
+ * control stream, or the bidirectional control stream once the bridge knows
+ * which stream it is (this side opened it, or control input was delivered on
+ * it). A session that has already closed keeps the close it decided first.
+ */
 MOQ_API moq_result_t moq_transport_bridge_on_peer_stream_reset(
     moq_transport_bridge_t *brg, uint64_t stream_id,
     uint64_t error_code, uint64_t now_us);
@@ -695,9 +710,10 @@ MOQ_API moq_result_t moq_transport_bridge_on_local_stream_committed(
  * Every other stream class keeps its existing handling and is NOT part of the
  * queued-reset path above: an unknown or already retired stream is a no-op; a
  * peer-origin unidirectional stream has no local send half and is a no-op; a
- * unidirectional control stream takes its own fatal teardown; and any other
- * local-origin unidirectional stream continues through the session's data-stop
- * path.
+ * control stream, unidirectional or bidirectional, closes a session that is
+ * still open as a protocol violation, and leaves a session that has already
+ * closed with the close it decided first; and any other local-origin
+ * unidirectional stream continues through the session's data-stop path.
  */
 MOQ_API moq_result_t moq_transport_bridge_on_peer_stop_sending(
     moq_transport_bridge_t *brg, uint64_t stream_id,

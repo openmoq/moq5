@@ -74,6 +74,34 @@ static inline bool pico_wt_wt_err_to_moq(uint64_t h3_code, uint64_t *out)
     return true;
 }
 
+/* What the code of an inbound RESET_STREAM or STOP_SENDING on a WebTransport
+ * stream says. The three readable kinds are different facts
+ * (draft-ietf-webtrans-http3-16 sections 4.4 and 6):
+ *   - an application error code, zero included: the peer's application
+ *     aborted this stream;
+ *   - WT_SESSION_GONE: the peer's WebTransport session terminated, and it
+ *     aborts every stream of that session with this code;
+ *   - any other code: the stream is aborted all the same, with no application
+ *     error code, and nothing says the session terminated.
+ * A code the provider cannot report is none of them. */
+typedef enum {
+    PICO_WT_ABORT_APPLICATION = 0,
+    PICO_WT_ABORT_SESSION_GONE,
+    PICO_WT_ABORT_PROTOCOL,
+    PICO_WT_ABORT_UNREADABLE
+} pico_wt_abort_t;
+
+/* Classify a readable code. *app_code is set only for an application code. */
+static inline pico_wt_abort_t pico_wt_classify_abort(uint64_t h3_code,
+                                                     uint64_t *app_code)
+{
+    if (pico_wt_wt_err_to_moq(h3_code, app_code))
+        return PICO_WT_ABORT_APPLICATION;
+    if (h3_code == H3ZERO_WEBTRANSPORT_SESSION_GONE)
+        return PICO_WT_ABORT_SESSION_GONE;
+    return PICO_WT_ABORT_PROTOCOL;
+}
+
 /* A reset accepted from the bridge whose reliable prefix picoquic has not
  * sent yet: the WebTransport stream preamble alone (a plain stream reset), or
  * the preamble plus the MoQ stream header (a MoQ reliable reset). */

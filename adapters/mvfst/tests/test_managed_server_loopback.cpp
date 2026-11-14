@@ -162,6 +162,8 @@ static moq_result_t write_buf(moq_session_t *s,
 
 struct server_state {
     std::atomic<bool> setup_complete{false};
+    /* negotiated_version() as the pump read it when it saw SETUP_COMPLETE */
+    std::atomic<int> version_at_setup{-1};
     std::atomic<bool> sub_accepted{false};
     std::atomic<bool> may_write{false};
     std::atomic<bool> single_written{false};
@@ -170,6 +172,9 @@ struct server_state {
     std::atomic<bool> may_close{false};
     std::atomic<bool> close_sent{false};
     std::atomic<bool> error{false};
+    /* SESSION_CLOSED events the closing pump saw right after its own close */
+    std::atomic<int> closed_events{0};
+    std::atomic<uint64_t> closed_code{UINT64_MAX};
     moq_subscription_t sub_handle = {};
 };
 
@@ -187,8 +192,11 @@ static int server_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
         moq_event_t ev[16]; size_t ne;
         moq_session_poll_events_ex(s, ev, 16, sizeof(moq_event_t), &ne);
         for (size_t i = 0; i < ne; i++) {
-            if (ev[i].kind == MOQ_EVENT_SETUP_COMPLETE)
+            if (ev[i].kind == MOQ_EVENT_SETUP_COMPLETE) {
+                ss->version_at_setup.store(
+                    (int)moq_mvfst_managed_negotiated_version(m));
                 ss->setup_complete.store(true);
+            }
             if (ev[i].kind == MOQ_EVENT_SUBSCRIBE_REQUEST &&
                 !ss->sub_accepted.load()) {
                 auto &req = ev[i].u.subscribe_request;
@@ -264,6 +272,19 @@ static int server_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
             !ss->close_sent.load()) {
             moq_mvfst_conn_close(conn, 0);
             ss->close_sent.store(true);
+            /* The close is observable inside this pump, before the
+             * connection is removed: its SESSION_CLOSED is already queued
+             * (close() removed the connection callbacks, and both service
+             * loops skip a closing connection). */
+            moq_event_t cev[16]; size_t cne = 0;
+            moq_session_poll_events_ex(s, cev, 16, sizeof(moq_event_t), &cne);
+            for (size_t i = 0; i < cne; i++) {
+                if (cev[i].kind == MOQ_EVENT_SESSION_CLOSED) {
+                    ss->closed_events.fetch_add(1);
+                    ss->closed_code.store(cev[i].u.closed.code);
+                }
+                moq_event_cleanup(&cev[i]);
+            }
         }
     }
     return 0;
@@ -280,6 +301,8 @@ struct recv_obj {
 
 struct client_state {
     std::atomic<bool> setup_complete{false};
+    /* negotiated_version() as the pump read it when it saw SETUP_COMPLETE */
+    std::atomic<int> version_at_setup{-1};
     std::atomic<bool> subscribed{false};
     std::atomic<bool> sub_ok{false};
     std::atomic<bool> error{false};
@@ -288,6 +311,9 @@ struct client_state {
     std::vector<recv_obj> stream_objects;
     recv_obj dg_obj;
     std::atomic<bool> dg_received{false};
+    /* the session terminal the client saw after the server closed */
+    std::atomic<int> closed_events{0};
+    std::atomic<uint64_t> closed_code{UINT64_MAX};
 };
 
 static int client_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
@@ -319,10 +345,17 @@ static int client_pump(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
     moq_event_t ev[16]; size_t ne;
     moq_session_poll_events_ex(s, ev, 16, sizeof(moq_event_t), &ne);
     for (size_t i = 0; i < ne; i++) {
-        if (ev[i].kind == MOQ_EVENT_SETUP_COMPLETE)
+        if (ev[i].kind == MOQ_EVENT_SETUP_COMPLETE) {
+            cs->version_at_setup.store(
+                (int)moq_mvfst_managed_negotiated_version(m));
             cs->setup_complete.store(true);
+        }
         if (ev[i].kind == MOQ_EVENT_SUBSCRIBE_OK)
             cs->sub_ok.store(true);
+        if (ev[i].kind == MOQ_EVENT_SESSION_CLOSED) {
+            cs->closed_events.fetch_add(1);
+            cs->closed_code.store(ev[i].u.closed.code);
+        }
         if (ev[i].kind == MOQ_EVENT_OBJECT_RECEIVED) {
             auto &o = ev[i].u.object_received;
             recv_obj ro;
@@ -449,6 +482,10 @@ static void test_managed_server_client_flow()
     MVFST_CHECK(!cs.error.load());
     MVFST_CHECK(moq_mvfst_managed_negotiated_version(cli) == g_version);
     MVFST_CHECK(moq_mvfst_managed_negotiated_version(srv) == g_version);
+    /* The version is published before either pump can see SETUP_COMPLETE:
+     * each pump already read it there, on the network thread. */
+    MVFST_CHECK(cs.version_at_setup.load() == (int)g_version);
+    MVFST_CHECK(ss.version_at_setup.load() == (int)g_version);
 
     /* --- Phase 2: subscribe --- */
     MVFST_CHECK(wait_for(srv, cli, ss, cs, [&]() {
@@ -521,6 +558,21 @@ static void test_managed_server_client_flow()
     MVFST_CHECK(moq_mvfst_managed_conn_count(srv) == 0);
     MVFST_CHECK(!moq_mvfst_managed_is_fatal(srv));
     MVFST_CHECK(ss.close_sent.load());
+    MVFST_CHECK(ss.closed_events.load() == 1);
+    MVFST_CHECK(ss.closed_code.load() == 0);
+    /* The client side of the same close, through the linked provider: the
+     * peer's CONNECTION_CLOSE starts the client's close (observers told),
+     * then reflects the close onto the control stream, then runs the
+     * connection callback. In that order the reflected error decides
+     * nothing and the client's session ends with the close's code 0. Were
+     * the reflection to come before the close-start notice, the adapter would
+     * read it as the peer resetting the control stream and close with
+     * PROTOCOL_VIOLATION (0x3) instead. */
+    MVFST_CHECK(wait_for(srv, cli, ss, cs, [&]() {
+        return cs.closed_events.load() >= 1;
+    }));
+    MVFST_CHECK(cs.closed_events.load() == 1);
+    MVFST_CHECK(cs.closed_code.load() == 0);
     MVFST_CHECK(!ss.error.load());
 
     /* --- Clean shutdown --- */

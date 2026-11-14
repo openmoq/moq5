@@ -36,6 +36,19 @@
 #include "../../core/src/session/session_outbound_internal.h"
 
 #define MOQ_WTQ_RECEIVE_QUANTUM 65535u
+
+/* The MoQ control stream must stay open for the session's lifetime
+ * (draft-ietf-moq-transport-16 section 3.3, -18 section 3.3, -22 section 6.3),
+ * while every stream is aborted when the WebTransport session terminates. To
+ * tell the two apart for each peer abort of the control stream, the adapter
+ * needs the classified abort event and a backend that reports every peer
+ * RESET_STREAM and STOP_SENDING with its code. */
+#if !defined(WTQ_HAVE_SESSION_ABORT_OBSERVABILITY)
+#error "this adapter needs a wtquic that classifies stream aborts (wtq_session_abort_observability)"
+#endif
+#define MOQ_WTQ_REQUIRED_ABORT_FACTS                                        \
+    (WTQ_ABORT_OBSERVES_RESET_CODE | WTQ_ABORT_OBSERVES_STOP_EVENT |       \
+     WTQ_ABORT_OBSERVES_STOP_CODE)
 /* The provider's accepted stream-plan bounds (wtquic_msquic.h): native peer
  * grants U+B <= 1024 and local reservations L <= 1024, so api_capacity =
  * U+B+L <= 2048. A snapshot outside them is refused, never truncated. */
@@ -975,6 +988,60 @@ static void ev_stream_stop(wtq_session_t *s, wtq_stream_t *st,
     conn_service(c);
 }
 
+/* A classified peer abort (wtq_stream_abort_t), delivered instead of the two
+ * events above. On the MoQ control channel -- the latched draft-16 control
+ * bidi, or either stream of the unidirectional pair once the bridge knows it
+ * -- the origin decides: an application code (0 included) or another
+ * protocol code ends the control stream while the WebTransport session runs,
+ * and the bridge closes an open MoQ session as that protocol violation and
+ * leaves a close it already decided; WT_SESSION_GONE is the WebTransport
+ * session terminating and an unknown origin proves nothing, so both leave the
+ * outcome to the session terminal (on_closed). Every other stream is handled
+ * as the two events above handle it, with the application code, or 0 when
+ * there is none. The stream-state effects are those of the replaced event. */
+static void ev_stream_abort(wtq_session_t *s, wtq_stream_t *st,
+                            const wtq_stream_abort_t *rec, void *user)
+{
+    moq_wtquic_conn_t *c = user;
+    struct moq_wtq_stream *ms = stream_find_by_handle(c, st);
+
+    if (!callback_matches(c, s)) return;
+    if (ms == NULL || rec == NULL)
+        return;
+    uint32_t direction = 0, origin = WTQ_STREAM_ABORT_ORIGIN_UNKNOWN;
+    uint32_t app_code = 0;
+    if (rec->struct_size >= WTQ_STREAM_ABORT_V0_SIZE) {
+        direction = rec->direction;
+        origin = rec->origin;
+        if (origin == WTQ_STREAM_ABORT_ORIGIN_APPLICATION)
+            app_code = rec->app_code;
+    }
+    bool control = (c->ctrl_latched && ms->id == c->ctrl_id) ||
+                   moq_transport_bridge_stream_is_control(c->bridge, ms->id);
+    bool decides = !control ||
+                   origin == WTQ_STREAM_ABORT_ORIGIN_APPLICATION ||
+                   origin == WTQ_STREAM_ABORT_ORIGIN_PROTOCOL;
+
+    if (direction == WTQ_STREAM_ABORT_RESET) {
+        ms->receive_reset = true;
+        ms->held = false;
+        ms->held_len = 0;
+        if (!decides)
+            return;
+        (void)moq_transport_bridge_on_peer_stream_reset(c->bridge, ms->id,
+                                                        app_code, now_us());
+        conn_service(c);
+    } else if (direction == WTQ_STREAM_ABORT_STOP) {
+        if (decides && !ms->stop_seen && !ms->committed &&
+            !ms->send_cancelled) {
+            ms->stop_seen = true;
+            ms->send_cancelled = true;
+            stream_enqueue(c, ms, STREAM_EVENT_STOP, app_code);
+        }
+        conn_service(c);
+    }
+}
+
 static void ev_stream_closed(wtq_session_t *s, wtq_stream_t *st,
                              void *user)
 {
@@ -1080,6 +1147,7 @@ static const wtq_session_events_t adapter_event_table = {
     .on_datagram = ev_datagram,
     .on_stream_writable = ev_stream_writable,
     .on_stream_send_committed = ev_stream_committed,
+    .on_stream_abort = ev_stream_abort,
 };
 
 const wtq_session_events_t *moq_wtquic_conn_events(void)
@@ -1144,6 +1212,19 @@ moq_result_t moq_wtquic_conn_create(const moq_wtquic_conn_cfg_t *cfg,
     if (cfg->struct_size < offsetof(moq_wtquic_conn_cfg_t, wt_session) +
                            sizeof(cfg->wt_session) || !cfg->wt_session)
         return MOQ_ERR_UNSUPPORTED;
+    /* Abort provenance, before anything is allocated, installed, sent or
+     * owned: the library must deliver the classified abort event, and this
+     * session's backend must report every peer RESET_STREAM and STOP_SENDING
+     * with its code. */
+    {
+        wtq_session_events_t probe;
+        wtq_session_events_init_ex(&probe, sizeof(probe));
+        if (!WTQ_SESSION_EVENTS_COVERS(&probe, on_stream_abort))
+            return MOQ_ERR_UNSUPPORTED;
+        if ((wtq_session_abort_observability(cfg->wt_session) &
+             MOQ_WTQ_REQUIRED_ABORT_FACTS) != MOQ_WTQ_REQUIRED_ABORT_FACTS)
+            return MOQ_ERR_UNSUPPORTED;
+    }
     size_t quantum = 0;
     wtq_receive_pause_mode_t mode = WTQ_RECEIVE_PAUSE_UNSUPPORTED;
     if (wtq_session_receive_contract(cfg->wt_session, &quantum, &mode) != WTQ_OK ||

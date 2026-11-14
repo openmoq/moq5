@@ -67,6 +67,49 @@ static int pump_forever(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
     return 0;
 }
 
+/* -- Effect counters: a refused create must touch none of these ------ */
+
+static int effect_alloc_calls;
+static int effect_pump_calls;
+static int effect_activity_calls;
+
+static void *effect_alloc(size_t size, void *ctx)
+{
+    (void)ctx;
+    effect_alloc_calls++;
+    return moq_alloc_default()->alloc(size, moq_alloc_default()->ctx);
+}
+
+static void *effect_realloc(void *ptr, size_t old_size, size_t new_size,
+                            void *ctx)
+{
+    (void)ctx;
+    effect_alloc_calls++;
+    return moq_alloc_default()->realloc(ptr, old_size, new_size,
+                                        moq_alloc_default()->ctx);
+}
+
+static void effect_free(void *ptr, size_t size, void *ctx)
+{
+    (void)ctx;
+    effect_alloc_calls++;
+    moq_alloc_default()->free(ptr, size, moq_alloc_default()->ctx);
+}
+
+static int pump_effect(moq_mvfst_managed_t *m, moq_mvfst_managed_lane_t *lane,
+                       uint64_t now, void *ctx)
+{
+    (void)m; (void)lane; (void)now; (void)ctx;
+    effect_pump_calls++;
+    return 1;
+}
+
+static void activity_effect(moq_mvfst_managed_t *m, void *ctx)
+{
+    (void)m; (void)ctx;
+    effect_activity_calls++;
+}
+
 static moq_mvfst_managed_cfg_t make_cfg(moq_mvfst_lane_pump_fn fn, void *ctx)
 {
     moq_mvfst_managed_cfg_t cfg;
@@ -324,6 +367,48 @@ static void test_invalid_config(void)
     cfg = make_cfg(pump_exit, NULL);
     cfg.perspective = 99;
     MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_ERR_INVAL);
+
+    /* A perspective field holding a value that names no perspective is
+     * refused before any effect: the output is cleared, and neither the
+     * allocator nor a callback is called. Each value is written as the
+     * caller's storage would hold it: 0 and 3 lie just outside the two
+     * perspectives, 99 well outside, and every bit set is the widest
+     * representation of the field. The same counters on a valid create
+     * (lifecycle-only) see its allocation, so they can observe one. */
+    {
+        moq_alloc_t counting = {NULL, effect_alloc, effect_realloc,
+                                effect_free};
+        static const int unsupported[] = {0, 3, 99};
+        unsigned char every_bit[sizeof(cfg.perspective)];
+        size_t i;
+        memset(every_bit, 0xFF, sizeof(every_bit));
+        for (i = 0; i <= sizeof(unsupported) / sizeof(unsupported[0]); i++) {
+            moq_mvfst_managed_t *out = (moq_mvfst_managed_t *)&cfg;
+            cfg = make_cfg(pump_effect, NULL);
+            cfg.alloc = &counting;
+            cfg.on_activity = activity_effect;
+            if (i < sizeof(unsupported) / sizeof(unsupported[0]))
+                cfg.perspective = (moq_perspective_t)unsupported[i];
+            else
+                memcpy(&cfg.perspective, every_bit, sizeof(every_bit));
+            effect_alloc_calls = effect_pump_calls = effect_activity_calls = 0;
+            MVFST_CHECK(moq_mvfst_managed_create(&cfg, &out) == MOQ_ERR_INVAL);
+            MVFST_CHECK(out == NULL);
+            MVFST_CHECK(effect_alloc_calls == 0);
+            MVFST_CHECK(effect_pump_calls == 0);
+            MVFST_CHECK(effect_activity_calls == 0);
+        }
+
+        cfg = make_cfg(pump_effect, NULL);
+        cfg.alloc = &counting;
+        cfg.on_activity = activity_effect;
+        effect_alloc_calls = 0;
+        MVFST_CHECK(moq_mvfst_managed_create(&cfg, &m) == MOQ_OK);
+        MVFST_CHECK(m != NULL);
+        MVFST_CHECK(effect_alloc_calls > 0);
+        moq_mvfst_managed_destroy(m);
+        m = NULL;
+    }
 
     /* Old struct_size excluding on_activity/user_ctx with dirty
      * trailing memory. Must succeed without reading past struct_size. */

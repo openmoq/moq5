@@ -2,11 +2,14 @@
  * Data-stream resets over real mvfst on localhost (attach adapter, one
  * QuicServer per process), observed from the receiving application.
  *
- * Each round the publisher opens a subgroup, writes an object, resets the
- * subgroup and ends the subscription with PUBLISH_DONE counting that one
- * stream -- all in one pass, so the stream header is still unsent when the
- * reset is asked for. The subscriber surfaces the done promptly only when it
- * received the header (it can then account for the reset stream).
+ * Each round the publisher opens a subgroup, writes an object and resets the
+ * subgroup in one pass, before the adapter is serviced, so the stream header
+ * is still unsent when the reset is asked for. It then ends the subscription
+ * with PUBLISH_DONE counting that one stream: the session owes that
+ * completion (MOQ_ERR_WOULD_BLOCK) until the transport has decided the
+ * stream's open, so it is retried as the adapter is serviced. The subscriber
+ * surfaces the done promptly only when it received the header (it can then
+ * account for the reset stream).
  *
  * The mvfst revision this adapter builds against closes the connection when
  * it receives RESET_STREAM_AT, so neither end advertises reliable stream
@@ -68,13 +71,28 @@ static int run_round(loopback_pair &lp, int round)
     sc.track_name = {(const uint8_t *)track.data(), track.size()};
     sc.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
     moq_subscription_t csub;
-    if (moq_session_subscribe(lp.client_session, &sc, 0, &csub) < 0) return -1;
+    moq_result_t sub_rc = moq_session_subscribe(lp.client_session, &sc, 0, &csub);
+    MVFST_CHECK(sub_rc >= 0);
+    if (sub_rc < 0) {
+        std::fprintf(stderr, "round %d: subscribe %d\n", round, (int)sub_rc);
+        return -1;
+    }
     lp.pump_client();
     bool sub_ok = false;
-    if (!lp.wait_for([&]() { return (sub_ok |= client_saw(lp, MOQ_EVENT_SUBSCRIBE_OK)); }))
-        return -1;
+    bool answered = lp.wait_for([&]() {
+        return (sub_ok |= client_saw(lp, MOQ_EVENT_SUBSCRIBE_OK));
+    });
+    MVFST_CHECK(answered);
+    if (!answered) return -1;
 
-    std::atomic<bool> ok{true};
+    /* Each publisher call's own result, so a refusal names its call. Open,
+     * write and reset are made in one pass before the adapter is serviced;
+     * the completion is asked for in the same pass and then retried. */
+    moq_result_t open_rc = MOQ_OK, write_rc = MOQ_OK, reset_rc = MOQ_OK;
+    moq_result_t done_rc = MOQ_ERR_WOULD_BLOCK;
+    moq_done_subscribe_cfg_t dc; moq_done_subscribe_cfg_init(&dc);
+    dc.status_code = 0x2;
+    dc.stream_count = 1;
     lp.run_on_server([&]() {
         moq_session_t *s = lp.ss.session;
         moq_subgroup_cfg_t sg; moq_subgroup_cfg_init(&sg);
@@ -82,18 +100,41 @@ static int run_round(loopback_pair &lp, int round)
         moq_subgroup_handle_t h;
         moq_rcbuf_t *b = nullptr;
         moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)"object", 6, &b);
-        moq_done_subscribe_cfg_t dc; moq_done_subscribe_cfg_init(&dc);
-        dc.status_code = 0x2;
-        dc.stream_count = 1;
-        if (moq_session_open_subgroup(s, lp.ss.sub_handle, &sg, 0, &h) < 0 ||
-            moq_session_write_object(s, h, 0, b, 0) < 0 ||
-            moq_session_reset_subgroup(s, h, 0x1, 0) < 0 ||
-            moq_session_done_subscribe(s, lp.ss.sub_handle, &dc, 0) < 0)
-            ok.store(false);
+        open_rc = moq_session_open_subgroup(s, lp.ss.sub_handle, &sg, 0, &h);
+        if (open_rc >= 0) write_rc = moq_session_write_object(s, h, 0, b, 0);
+        if (open_rc >= 0 && write_rc >= 0)
+            reset_rc = moq_session_reset_subgroup(s, h, 0x1, 0);
+        if (open_rc >= 0 && write_rc >= 0 && reset_rc >= 0)
+            done_rc = moq_session_done_subscribe(s, lp.ss.sub_handle, &dc, 0);
         moq_rcbuf_decref(b);
         lp.service_server();
     });
-    if (!ok.load()) return -1;
+    MVFST_CHECK(open_rc >= 0);
+    MVFST_CHECK(write_rc >= 0);
+    MVFST_CHECK(reset_rc >= 0);
+    if (open_rc < 0 || write_rc < 0 || reset_rc < 0) {
+        std::fprintf(stderr, "round %d: open %d, write %d, reset %d\n",
+                     round, (int)open_rc, (int)write_rc, (int)reset_rc);
+        return -1;
+    }
+    /* MOQ_ERR_WOULD_BLOCK: the completion waits for the transport's decision
+     * on the subgroup's stream open. The pair's wait services the adapter on
+     * its server thread between attempts. */
+    if (done_rc == MOQ_ERR_WOULD_BLOCK) {
+        lp.wait_for([&]() {
+            lp.run_on_server([&]() {
+                done_rc = moq_session_done_subscribe(lp.ss.session,
+                                                     lp.ss.sub_handle, &dc, 0);
+                if (done_rc >= 0) lp.service_server();
+            });
+            return done_rc != MOQ_ERR_WOULD_BLOCK;
+        });
+    }
+    MVFST_CHECK(done_rc >= 0);
+    if (done_rc < 0) {
+        std::fprintf(stderr, "round %d: done_subscribe %d\n", round, (int)done_rc);
+        return -1;
+    }
     bool done = false;
     lp.wait_for([&]() { return (done |= client_saw(lp, MOQ_EVENT_SUBSCRIBE_DONE)); }, 500);
     return done ? 1 : 0;

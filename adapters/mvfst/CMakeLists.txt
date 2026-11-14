@@ -113,6 +113,23 @@ if(MOQ_BUILD_TESTS)
     target_link_libraries(test_mvfst_cxx_smoke PRIVATE moq::adapter-mvfst mvfst::mvfst)
     add_test(NAME mvfst_cxx_smoke COMMAND test_mvfst_cxx_smoke)
 
+    # Close provenance on the control stream: the attach adapter's real
+    # callbacks driven in mvfst's own order over mvfst's MockQuicSocket (with a
+    # real observer container), and refusal of a socket without one. Needs
+    # googletest's gmock, which the mock is written against. Without it the
+    # test is not built, and says so at configure time.
+    find_package(GTest CONFIG QUIET)
+    if(TARGET GTest::gmock)
+        add_executable(test_mvfst_close_provenance tests/test_close_provenance.cpp)
+        target_link_libraries(test_mvfst_close_provenance PRIVATE
+            moq::adapter-mvfst mvfst::mvfst GTest::gmock)
+        add_test(NAME mvfst_close_provenance COMMAND test_mvfst_close_provenance)
+        set_tests_properties(mvfst_close_provenance PROPERTIES TIMEOUT 30)
+    else()
+        message(STATUS "mvfst_close_provenance: GTest::gmock not found, "
+                       "test not built")
+    endif()
+
     # Old mvfst_bridge_conformance removed — replaced by shared
     # bridge_conformance_pair in core tests (13/13 scenarios).
 
@@ -321,6 +338,28 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME mvfst_managed_client_contract
         COMMAND test_mvfst_managed_client_contract)
     set_tests_properties(mvfst_managed_client_contract PROPERTIES TIMEOUT 30)
+
+    # Managed EventBase lifetime: an application call into a published
+    # EventBase (wake, stop, the thread check) never overlaps that EventBase's
+    # retirement and destruction. Observed through the test-internals lease
+    # probe; one case per process (one QuicServer per process).
+    add_executable(test_mvfst_managed_evb_lifetime
+        tests/test_managed_evb_lifetime.cpp)
+    target_link_libraries(test_mvfst_managed_evb_lifetime PRIVATE
+        moq-adapter-mvfst-test-internals mvfst::mvfst)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_mvfst_managed_evb_lifetime PRIVATE
+            -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    foreach(_case client-enqueue client-notify client-drain client-live
+                  client-after server-enqueue server-thread
+                  client-notify-cleanup client-live-cleanup client-drain-error
+                  client-early-setup client-early-keepalive)
+        add_test(NAME mvfst_managed_evb_lifetime_${_case}
+            COMMAND test_mvfst_managed_evb_lifetime ${_case})
+        set_tests_properties(mvfst_managed_evb_lifetime_${_case}
+            PROPERTIES TIMEOUT 60)
+    endforeach()
 
     # Managed keepalive: keep_alive_interval_ms reaches the QUIC settings the
     # facade's connections carry; 0 and prefix-sized callers leave it off.

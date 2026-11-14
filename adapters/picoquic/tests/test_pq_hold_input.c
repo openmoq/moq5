@@ -183,8 +183,24 @@ static void check_stop(uint64_t sid, uint64_t code, int expected, bool accepted)
     }
     CHECK(count == expected);
 }
-int picoquic_close(picoquic_cnx_t *c, uint64_t ec) { (void)c; (void)ec; return 0; }
-int picoquic_close_ex(picoquic_cnx_t *c, uint64_t ec, const char *r) { (void)c; (void)ec; (void)r; return 0; }
+/* The connection closes the adapter asked the provider for: how many, and the
+ * code and reason of the last. */
+static int g_close_n = 0;
+static uint64_t g_close_code = 0;
+static char g_close_reason[64];
+int picoquic_close(picoquic_cnx_t *c, uint64_t ec)
+{
+    (void)c;
+    g_close_n++; g_close_code = ec; g_close_reason[0] = 0;
+    return 0;
+}
+int picoquic_close_ex(picoquic_cnx_t *c, uint64_t ec, const char *r)
+{
+    (void)c;
+    g_close_n++; g_close_code = ec;
+    snprintf(g_close_reason, sizeof(g_close_reason), "%s", r ? r : "");
+    return 0;
+}
 uint64_t picoquic_get_application_error(picoquic_cnx_t *c) { (void)c; return 0; }
 int picoquic_queue_datagram_frame(picoquic_cnx_t *c, size_t len, const uint8_t *d)
     { (void)c; (void)len; (void)d; return 0; }
@@ -1777,6 +1793,100 @@ static int row_terminals(moq_version_t v)
     return failures - before;
 }
 
+/* The MoQ control stream must stay open for the session's lifetime; closing
+ * it closes the session as a PROTOCOL_VIOLATION, 0x3 (draft-16 section 3.3,
+ * draft-18 section 3.3, draft-22 section 6.3).
+ *
+ * picoquic reports the peer's FIN, RESET_STREAM and STOP_SENDING on the stream
+ * each concerns, and the adapter hands all three to the bridge for a control
+ * stream as for any other. Each way of ending the fetcher's control channel
+ * -- FIN or RESET of the stream the publisher sends control on, STOP_SENDING
+ * of the stream the fetcher sends it on -- closes an open session with 0x3:
+ * one terminal event, and one connection close carrying 0x3, whatever code
+ * the peer's signal carried. A session the application has already closed
+ * keeps that close: the connection close carries the application's code and
+ * reason, and a repeated signal adds nothing. */
+#define CONTROL_END_PEER_CODE  0x55u
+#define CONTROL_END_FIRST_CODE 0x2u
+
+typedef enum { CONTROL_END_FIN, CONTROL_END_RESET, CONTROL_END_STOP } control_end_t;
+
+static int control_end_deliver(rig_t *r, control_end_t how)
+{
+    bool pair = r->version != MOQ_VERSION_DRAFT_16;
+    uint64_t peer_sid = pair ? r->unis[0].sid : 0;   /* the publisher's control */
+    uint64_t own_sid = pair ? 2 : 0;                 /* the fetcher's control */
+
+    if (how == CONTROL_END_FIN)
+        return deliver(r, peer_sid, NULL, 0, true);
+    g_reset_code = CONTROL_END_PEER_CODE;
+    g_peer_stop_code = CONTROL_END_PEER_CODE;
+    if (how == CONTROL_END_RESET)
+        return moq_pq_callback(NULL, peer_sid, NULL, 0,
+                               picoquic_callback_stream_reset, r->ad, NULL);
+    return moq_pq_callback(NULL, own_sid, NULL, 0,
+                           picoquic_callback_stop_sending, r->ad, NULL);
+}
+
+static int row_control_end(moq_version_t v)
+{
+    static const char *const names[] = { "fin", "reset", "stop" };
+    int before = failures;
+    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : v == MOQ_VERSION_DRAFT_18 ? "v18" : "v22";
+
+    for (int how = CONTROL_END_FIN; how <= CONTROL_END_STOP; how++) {
+        for (int closed_first = 0; closed_first < 2; closed_first++) {
+            int row_before = failures;
+            rig_t r;
+            if (!rig_up(&r, v)) {
+                CHECK(false && "rig setup");
+                rig_down(&r);
+                return failures - before;
+            }
+            uint64_t expect = closed_first ? CONTROL_END_FIRST_CODE : 0x3u;
+            /* a stream delivers its FIN once; a RESET or STOP is repeated */
+            int times = how == CONTROL_END_FIN ? 1 : 2;
+            int closed_events = 0;
+            uint64_t closed_code = UINT64_MAX;
+            moq_event_t ev;
+
+            CHECK(v == MOQ_VERSION_DRAFT_16 || r.n_unis >= 1);
+            g_close_n = 0; g_close_code = UINT64_MAX; g_close_reason[0] = 0;
+            if (closed_first)
+                CHECK(moq_session_close(r.c, CONTROL_END_FIRST_CODE, "first", 0) == MOQ_OK);
+            for (int i = 0; i < times; i++)
+                CHECK(control_end_deliver(&r, (control_end_t)how) == 0);
+            CHECK(!moq_pq_conn_is_fatal(r.ad));
+            CHECK(moq_pq_service(r.ad, g_time) == 0);
+            CHECK(moq_pq_service(r.ad, g_time) == 0);
+
+            CHECK(moq_pq_conn_is_closed(r.ad));
+            CHECK(!moq_pq_conn_is_fatal(r.ad));
+            CHECK(moq_pq_conn_close_code(r.ad) == expect);
+            CHECK(g_close_n == 1);
+            CHECK(g_close_code == expect);
+            CHECK(strcmp(g_close_reason, closed_first ? "first" : "") == 0);
+            while (moq_session_poll_events(r.c, &ev, 1) > 0) {
+                if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
+                    closed_events++;
+                    closed_code = ev.u.closed.code;
+                }
+                moq_event_cleanup(&ev);
+            }
+            CHECK(closed_events == 1);
+            CHECK(closed_code == expect);
+            if (failures != row_before)
+                fprintf(stderr, "FAILED: pq control end %s %s %s\n", lbl, names[how],
+                        closed_first ? "after the application's close" : "session open");
+            rig_down(&r);
+        }
+    }
+    g_reset_code = 0;
+    g_peer_stop_code = 0;
+    if (failures == before) printf("PASS: pq control end %s\n", lbl);
+    return failures - before;
+}
+
 /* Allocation failure while retaining the refused chunk, and the exact budget
  * boundary. Both report the adapter's explicit failure contract (a transport
  * error on the bridge, the connection torn down), never acceptance; the
@@ -2350,6 +2460,7 @@ int main(void)
         (void)row_retained_and_deferred_fin(versions[i], true);
         (void)row_retained_and_deferred_fin(versions[i], false);
         (void)row_terminals(versions[i]);
+        (void)row_control_end(versions[i]);
         (void)row_alloc_and_budget(versions[i]);
         (void)row_required_hold(versions[i]);
         for (int t = TC_HELD_FIN; t <= TC_LIVE_REFUSED; t++)

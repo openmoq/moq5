@@ -2137,9 +2137,11 @@ static void t_control_output_loss(moq_version_t version, unsigned mode)
     } else if (mode == 2) {
         stream_event(st, QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED, false);
     }
-    /* Uni-control peer STOP already closes D18/D22 in the real bridge. D16's
-     * control has no ordinary-stream mapping; loss must still not be exempt. */
-    bool terminal = mode == 2 && version != MOQ_VERSION_DRAFT_16;
+    /* A peer STOP of a session's control stream closes the session in the
+     * real bridge on every draft: that stream must stay open for the
+     * session's lifetime. Control output lost any other way is reported; it
+     * is never exempt. */
+    bool terminal = mode == 2;
     check_query(r, terminal ? MOQ_ERR_CLOSED : MOQ_DONE);
     REQUIRE(fake_msq_deliver_send_complete(&r->client->fake, true));
     CHECK(ms->acked_total == 0 && ms->send_canceled && r->adapter->pending_sends == 0);

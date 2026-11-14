@@ -1348,24 +1348,47 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
          * (draft-ietf-webtrans-http3-15 §4.4), so it is never reported as a
          * MoQ code. */
         uint64_t error_code = 0;
-        bool has_code = pico_wt_wt_err_to_moq(
+        pico_wt_abort_t abort_kind = pico_wt_classify_abort(
             picoquic_get_remote_stream_error(cnx, sid), &error_code);
+        bool has_code = abort_kind == PICO_WT_ABORT_APPLICATION;
         if (sid == c->control_stream_id) {
             /* The CONNECT stream reset: the WebTransport session ended
              * abruptly, with neither a close capsule nor a clean FIN (§6).
              * That is a transport-origin failure with no MoQ code. */
             moq_transport_bridge_on_transport_error(c->bridge, 0x1, now);
         } else if (pw_is_moq_control(c, sid)) {
-            /* A WebTransport application code on the MoQ control stream is a
-             * MoQ-level abort of it. Without one -- typically WT_SESSION_GONE,
-             * which a peer resets every stream with as its session ends (§6),
-             * possibly overtaking its close capsule -- the outcome belongs to
-             * the session terminal on the CONNECT stream: a close capsule
-             * stays authoritative, a clean FIN is a close with code 0, and a
-             * reset or connection loss is a transport failure. */
-            if (has_code)
+            /* The MoQ control stream must stay open for the session's
+             * lifetime (draft-ietf-moq-transport-16 section 3.3, -18 section
+             * 3.3, -22 section 6.3).
+             *
+             * WT_SESSION_GONE is the one code that says the peer's
+             * WebTransport session terminated: a peer resets every stream
+             * with it as its session ends (§6), possibly overtaking its close
+             * capsule. It decides nothing here; the outcome belongs to the
+             * session terminal on the CONNECT stream -- a close capsule stays
+             * authoritative, a clean FIN is a close with code 0, and a reset
+             * or connection loss is a transport failure.
+             *
+             * Every other code resets this stream while the WebTransport
+             * session runs, with an application error code or without one
+             * (§4.4). The control stream has then ended: the bridge closes an
+             * open MoQ session as that protocol violation, and leaves one
+             * that has already closed with the close it decided. */
+            if (abort_kind == PICO_WT_ABORT_SESSION_GONE) {
+                /* the session terminal decides */
+            } else if (moq_transport_bridge_stream_is_control(c->bridge, sid)) {
+                pw_rx_drop(c, sid);
+                moq_transport_bridge_on_peer_stream_reset(
+                    c->bridge, sid,
+                    has_code ? error_code : PICO_WT_RESET_NO_APP_CODE, now);
+                if (!moq_transport_bridge_is_terminal(c->bridge))
+                    pw_service_bridge(c, now);
+            } else if (has_code) {
+                /* A control stream the bridge has not been shown yet: the
+                 * abort is reported as a failure carrying the peer's code. */
                 moq_transport_bridge_on_transport_error(
                     c->bridge, error_code ? error_code : 0x1, now);
+            }
         } else {
             /* RESET_STREAM aborts the PEER's sending direction: nothing more
              * will arrive, so abandon retained inbound bytes and stop granting
@@ -1383,24 +1406,31 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
 
     case picohttp_callback_stop_sending: {
         if (!stream_ctx) break;
-        /* The STOP_SENDING's application code is read through the provider's
-         * terminal-observation contract where it has one; a code outside the
-         * WebTransport application-error space, or no getter at all, carries
-         * no application code. On the MoQ control channel a STOP_SENDING
-         * without one is no MoQ-level verdict: like a control reset without
-         * one, the outcome belongs to the WebTransport session terminal (a
-         * close capsule, a clean CONNECT FIN, a CONNECT reset or the loss of
-         * the connection). */
+        /* The STOP_SENDING's code is read through the provider's
+         * terminal-observation contract where it has one, and classified as
+         * a reset's is. Without that contract the code cannot be read at
+         * all: nothing is known about why the peer stopped the stream.
+         *
+         * On the MoQ control channel two kinds decide nothing here, and the
+         * outcome stays with the WebTransport session terminal (a close
+         * capsule, a clean CONNECT FIN, a CONNECT reset or the loss of the
+         * connection): WT_SESSION_GONE, which is that session ending, and a
+         * code that could not be read, which proves nothing. Any other code
+         * stops the control stream while the session runs, and the bridge
+         * closes an open MoQ session as that protocol violation. */
         uint64_t error_code = PICO_WT_RESET_NO_APP_CODE;
-        bool has_code = false;
+        pico_wt_abort_t abort_kind = PICO_WT_ABORT_UNREADABLE;
 #if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
         uint64_t wt_stop_code = 0;
         if (picoquic_get_remote_stop_error(cnx, sid, &wt_stop_code) != 0)
             return -1;
-        has_code = pico_wt_wt_err_to_moq(wt_stop_code, &error_code);
-        if (!has_code) error_code = PICO_WT_RESET_NO_APP_CODE;
+        abort_kind = pico_wt_classify_abort(wt_stop_code, &error_code);
+        if (abort_kind != PICO_WT_ABORT_APPLICATION)
+            error_code = PICO_WT_RESET_NO_APP_CODE;
 #endif
-        if (!has_code && sid != c->control_stream_id && pw_is_moq_control(c, sid))
+        if ((abort_kind == PICO_WT_ABORT_SESSION_GONE ||
+             abort_kind == PICO_WT_ABORT_UNREADABLE) &&
+            sid != c->control_stream_id && pw_is_moq_control(c, sid))
             break;
         if (sid != c->control_stream_id) {
             /* STOP_SENDING aborts OUR sending direction only. On a bidi stream
@@ -1416,7 +1446,10 @@ int moq_pico_wt_callback(picoquic_cnx_t *cnx,
             }
             if (!moq_transport_bridge_is_terminal(c->bridge))
                 pw_service_bridge(c, now);
-            if (moq_transport_bridge_is_terminal(c->bridge)) {
+            /* A session the bridge closed in this pass ended by its normal
+             * close: the stop was handled, and the provider is told so. Only
+             * a failed bridge is reported as a failed callback. */
+            if (moq_transport_bridge_is_fatal(c->bridge)) {
                 PW_OBSERVE_CALLBACK(c, event, sid, 1);
                 return -1;
             }

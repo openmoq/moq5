@@ -132,6 +132,7 @@ void wtq_session_events_init_ex(wtq_session_events_t *e, size_t size)
     memset(e, 0, n);
     e->struct_size = (uint32_t)n;
 }
+#include "wtquic_abort_fake.h"
 wtq_send_commit_mode_t wtq_session_send_commit_mode(const wtq_session_t *s)
 { (void)s; return WTQ_SEND_COMMIT_UNSUPPORTED; }
 wtq_local_flush_mode_t wtq_session_local_flush_mode(const wtq_session_t *s)

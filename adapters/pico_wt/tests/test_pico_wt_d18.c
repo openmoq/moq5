@@ -691,6 +691,122 @@ static void run_version(uint8_t cid_byte, moq_version_t version)
     pico_wt_harness_cleanup(&h);
 }
 
+/* -- The MoQ control stream may not end --------------------------------- *
+ * The MoQ control stream must stay open for the session's lifetime; closing
+ * it closes the session as a PROTOCOL_VIOLATION, 0x3
+ * (draft-ietf-moq-transport-16 section 3.3, -18 section 3.3, -22 section
+ * 6.3). A reset that carries a WebTransport application code is the peer
+ * ending that stream while its WebTransport session runs.
+ *
+ * Three orderings, on the client, for the stream the server sends MoQ control
+ * on (the control bidi of draft-16, the server's own unidirectional control
+ * stream afterwards):
+ *   - the session is open: it closes with 0x3, and the close capsule the
+ *     server receives carries 0x3, whatever code the reset carried;
+ *   - the application closed the session at the entry of the reset's
+ *     callback, so the close is decided and not yet dispatched: the capsule
+ *     carries the application's code;
+ *   - the application's close was already dispatched: the reset trails it
+ *     and changes nothing.
+ * In every case the session reports exactly one terminal, with the code its
+ * capsule carried. */
+#define CTRL_RESET_PEER_CODE  0x55u   /* never the code of either close */
+#define CTRL_RESET_FIRST_CODE 0x2u    /* the application's own close */
+
+typedef enum {
+    CTRL_RESET_OPEN,
+    CTRL_RESET_CLOSE_QUEUED,
+    CTRL_RESET_CLOSE_SENT
+} ctrl_reset_case_t;
+
+static pico_wt_harness_t *g_ctrl_h;
+static uint64_t g_ctrl_sid;
+static int g_ctrl_closes;
+
+static void ctrl_close_observer(moq_pico_wt_conn_t *c, int event, uint64_t sid, int phase)
+{
+    if (event != (int)picohttp_callback_reset || phase != 0) return;
+    if (c != g_ctrl_h->client_conn || sid != g_ctrl_sid) return;
+    if (moq_session_close(g_ctrl_h->client_session, CTRL_RESET_FIRST_CODE,
+                          "first", g_ctrl_h->now) == MOQ_OK)
+        g_ctrl_closes++;
+}
+
+static void run_control_reset(uint8_t cid_byte, moq_version_t version,
+                              ctrl_reset_case_t which)
+{
+    scenario = which == CTRL_RESET_OPEN ? "control-reset-open"
+             : which == CTRL_RESET_CLOSE_QUEUED ? "control-reset-close-queued"
+             : "control-reset-close-sent";
+
+    pico_wt_harness_t h;
+    pico_wt_harness_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.cid_byte = cid_byte;
+    cfg.version = version;
+
+    CHECK(pico_wt_harness_setup(&h, &cfg) == 0);
+    if (h.client_conn && h.server_conn && pico_wt_harness_handshake(&h) == 0) {
+        moq_pico_wt_conn_t *c = h.client_conn;
+        uint64_t expect = which == CTRL_RESET_OPEN ? 0x3u : CTRL_RESET_FIRST_CODE;
+        uint64_t sid = version == MOQ_VERSION_DRAFT_16
+            ? c->moq_control_stream_id : h.server_conn->last_opened_uni_id;
+        uint64_t raw = 0;
+        int closed_events = 0;
+        uint64_t closed_code = UINT64_MAX;
+        moq_event_t ev;
+
+        CHECK(moq_session_state(h.client_session) == MOQ_SESS_ESTABLISHED);
+        CHECK(sid != UINT64_MAX);
+        CHECK(moq_transport_bridge_stream_is_control(c->bridge, sid));
+        CHECK(pico_wt_moq_err_to_wt(CTRL_RESET_PEER_CODE, &raw));
+
+        if (which == CTRL_RESET_CLOSE_SENT) {
+            CHECK(moq_session_close(h.client_session, CTRL_RESET_FIRST_CODE,
+                                    "first", h.now) == MOQ_OK);
+            CHECK(moq_pico_wt_service(c, h.now) == 0);
+            CHECK(moq_pico_wt_conn_is_closed(c));
+        }
+        if (which == CTRL_RESET_CLOSE_QUEUED) {
+            g_ctrl_h = &h;
+            g_ctrl_sid = sid;
+            g_ctrl_closes = 0;
+            pw_test_callback_observer = ctrl_close_observer;
+        }
+        CHECK(picoquic_reset_stream(h.test_ctx->cnx_server, sid, raw) == 0);
+        CHECK(pico_wt_harness_pump(&h, 300) == 0);
+        pw_test_callback_observer = NULL;
+        g_ctrl_h = NULL;
+        if (which == CTRL_RESET_CLOSE_QUEUED)
+            CHECK(g_ctrl_closes == 1);
+
+        CHECK(moq_pico_wt_conn_is_closed(c));
+        CHECK(!moq_pico_wt_conn_is_fatal(c));
+        CHECK(moq_pico_wt_conn_close_code(c) == expect);
+
+        /* the capsule the server received carries the same code */
+        pico_wt_harness_pump_until_closed(&h, 5000, h.server_conn);
+        CHECK(moq_pico_wt_conn_is_closed(h.server_conn));
+        CHECK(!moq_pico_wt_conn_is_fatal(h.server_conn));
+        CHECK(moq_pico_wt_conn_close_code(h.server_conn) == expect);
+
+        while (moq_session_poll_events(h.client_session, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
+                closed_events++;
+                closed_code = ev.u.closed.code;
+            }
+            moq_event_cleanup(&ev);
+        }
+        CHECK(closed_events == 1);
+        CHECK(closed_code == expect);
+    } else {
+        CHECK(0);
+    }
+    pw_test_callback_observer = NULL;
+    g_ctrl_h = NULL;
+    pico_wt_harness_cleanup(&h);
+}
+
 /*
  * WebTransport §4.4 error-code mapping boundaries (pure helper coverage, no
  * transport). An additive base is only correct below the first reserved
@@ -764,6 +880,17 @@ int main(void)
     /* Symmetric uni-control establish + request-bidi routing + subgroup
      * data delivery. */
     run_version(0x18, MOQ_VERSION_DRAFT_18);
+
+    /* The MoQ control stream reset by the peer, on each control topology. */
+    for (int which = CTRL_RESET_OPEN; which <= CTRL_RESET_CLOSE_SENT; which++) {
+        run_control_reset((uint8_t)(0x50 + which), MOQ_VERSION_DRAFT_16,
+                          (ctrl_reset_case_t)which);
+        run_control_reset((uint8_t)(0x58 + which), MOQ_VERSION_DRAFT_18,
+                          (ctrl_reset_case_t)which);
+        if (WT_HAVE_D22)
+            run_control_reset((uint8_t)(0x60 + which), MOQ_VERSION_DRAFT_22,
+                              (ctrl_reset_case_t)which);
+    }
 
     /* Resets that wait for their WebTransport preamble. */
     run_deferred_reset_failure(0);

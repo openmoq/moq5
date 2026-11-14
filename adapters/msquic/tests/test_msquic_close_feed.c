@@ -1318,6 +1318,194 @@ static void t_peer_closed_refusal_ops(void)
         printf("PASS: peer_closed_refusal_ops\n");
 }
 
+/* --- V: the MoQ control stream may not end --------------------------------- */
+
+/*
+ * Draft-16 section 3.3: the control stream must not be closed at the
+ * transport layer during the session's lifetime; doing so closes the session
+ * as a PROTOCOL_VIOLATION (0x3, section 3.4).
+ *
+ * MsQuic reports the peer's FIN as PEER_SEND_SHUTDOWN, its RESET_STREAM as
+ * PEER_SEND_ABORTED and its STOP_SENDING as PEER_RECEIVE_ABORTED, each on the
+ * stream it concerns. The adapter hands all three to the bridge for the
+ * control stream as for any other, so each ends an open session as that
+ * violation: the session's one terminal carries 0x3, and the connection is
+ * shut down once, with 0x3, as an orderly local close.
+ *
+ * A session that has already closed keeps the close it decided first: the
+ * connection is shut down with that close's code, whichever way the control
+ * stream ends afterwards.
+ */
+
+/* The peer's own stream code, chosen so a close that merely echoed it could
+ * not be mistaken for the protocol violation. */
+#define CONTROL_END_PEER_CODE 0x55u
+
+static const struct control_end {
+    QUIC_STREAM_EVENT_TYPE type;
+    const char *name;
+} k_control_ends[] = {
+    { QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN,    "fin" },
+    { QUIC_STREAM_EVENT_PEER_SEND_ABORTED,     "reset" },
+    { QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED,  "stop" },
+};
+#define CONTROL_END_COUNT (sizeof(k_control_ends) / sizeof(k_control_ends[0]))
+
+/* The client's control stream is the first stream it starts. */
+static fake_msq_stream_t *control_stream(struct rig *r)
+{
+    fake_msq_stream_t *st = fake_msq_stream_at(&r->fake, 0);
+
+    CHECK(st != NULL);
+    if (st == NULL)
+        return NULL;
+    CHECK(!st->uni);
+    CHECK(!moq_transport_bridge_uses_uni_control(r->conn->bridge));
+    CHECK(moq_transport_bridge_stream_is_control(r->conn->bridge, st->id));
+    return st;
+}
+
+static void deliver_control_end(fake_msq_stream_t *st,
+                                QUIC_STREAM_EVENT_TYPE type)
+{
+    QUIC_STREAM_EVENT ev;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.Type = type;
+    if (type == QUIC_STREAM_EVENT_PEER_SEND_ABORTED)
+        ev.PEER_SEND_ABORTED.ErrorCode = CONTROL_END_PEER_CODE;
+    if (type == QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED)
+        ev.PEER_RECEIVE_ABORTED.ErrorCode = CONTROL_END_PEER_CODE;
+    st->cb((HQUIC)st, st->ctx, &ev);
+}
+
+/* V1: the control stream ends while the session is open. */
+static void t_control_end_is_violation(void)
+{
+    for (size_t i = 0; i < CONTROL_END_COUNT; i++) {
+        int before = failures;
+        struct rig r;
+        struct drained d;
+        fake_msq_stream_t *st;
+        char tag[48];
+
+        snprintf(tag, sizeof(tag), "control_end.%s", k_control_ends[i].name);
+        CHECK(rig_up(&r, NULL, NULL) == 0);
+        printf("CONTROL-END-IS-VIOLATION (%s):\n", k_control_ends[i].name);
+        deliver_conn_event(&r, QUIC_CONNECTION_EVENT_CONNECTED);
+        (void)drain_events(&r);
+        st = control_stream(&r);
+        CHECKN(tag, moq_session_state(r.session) != MOQ_SESS_CLOSED);
+        CHECKN(tag, r.fake.conn_shutdowns == 0);
+
+        if (st != NULL)
+            deliver_control_end(st, k_control_ends[i].type);
+        print_state("after-control-end", &r);
+        d = drain_events(&r);
+
+        CHECKN(tag, d.closed == 1);
+        CHECKN(tag, d.close_code == 0x3);
+        CHECKN(tag, moq_session_state(r.session) == MOQ_SESS_CLOSED);
+        CHECKN(tag, r.fake.conn_shutdowns == 1);
+        CHECKN(tag, r.fake.last_conn_shutdown_code == 0x3);
+
+        /* the peer's own connection close, arriving after the violation,
+         * does not replace it */
+        deliver_peer_close(&r, PEER_CLOSE_CODE);
+        check_local_settles(&r, tag, 0x3);
+
+        rig_down(&r);
+        if (failures == before)
+            printf("PASS: control_end_is_violation (%s)\n",
+                   k_control_ends[i].name);
+    }
+}
+
+/* V2: the application closed the session first; the control stream ends
+ * before the connection has been told. The first close stands, and a
+ * repeated signal adds nothing. */
+static void t_control_end_after_local_close(void)
+{
+    for (size_t i = 0; i < CONTROL_END_COUNT; i++) {
+        int before = failures;
+        struct rig r;
+        struct drained d;
+        fake_msq_stream_t *st;
+        char tag[48];
+
+        snprintf(tag, sizeof(tag), "control_end_after_local.%s",
+                 k_control_ends[i].name);
+        CHECK(rig_up(&r, NULL, NULL) == 0);
+        printf("CONTROL-END-AFTER-LOCAL-CLOSE (%s):\n",
+               k_control_ends[i].name);
+        deliver_conn_event(&r, QUIC_CONNECTION_EVENT_CONNECTED);
+        (void)drain_events(&r);
+        st = control_stream(&r);
+
+        /* decided, and not yet serviced: the close is still the session's */
+        CHECK(moq_session_close(r.session, LOCAL_CLOSE_CODE, NULL,
+                                TEST_NOW_US) == MOQ_OK);
+        CHECKN(tag, r.fake.conn_shutdowns == 0);
+
+        if (st != NULL) {
+            deliver_control_end(st, k_control_ends[i].type);
+            deliver_control_end(st, k_control_ends[i].type);
+        }
+        print_state("after-control-end", &r);
+        d = drain_events(&r);
+
+        CHECKN(tag, d.closed == 1);
+        CHECKN(tag, d.close_code == LOCAL_CLOSE_CODE);
+        CHECKN(tag, !moq_msquic_conn_is_fatal(r.conn));
+        CHECKN(tag, r.fake.conn_shutdowns == 1);
+        CHECKN(tag, r.fake.last_conn_shutdown_code == LOCAL_CLOSE_CODE);
+        check_local_settles(&r, tag, LOCAL_CLOSE_CODE);
+
+        rig_down(&r);
+        if (failures == before)
+            printf("PASS: control_end_after_local_close (%s)\n",
+                   k_control_ends[i].name);
+    }
+}
+
+/* V3: the peer closed the connection first. A control-stream signal that
+ * trails that close finds the session already told, and changes nothing. */
+static void t_control_end_after_peer_close(void)
+{
+    for (size_t i = 0; i < CONTROL_END_COUNT; i++) {
+        int before = failures;
+        struct rig r;
+        struct drained d;
+        fake_msq_stream_t *st;
+
+        CHECK(rig_up(&r, NULL, NULL) == 0);
+        printf("CONTROL-END-AFTER-PEER-CLOSE (%s):\n",
+               k_control_ends[i].name);
+        deliver_conn_event(&r, QUIC_CONNECTION_EVENT_CONNECTED);
+        (void)drain_events(&r);
+        st = control_stream(&r);
+
+        deliver_peer_close(&r, PEER_CLOSE_CODE);
+        if (st != NULL)
+            deliver_control_end(st, k_control_ends[i].type);
+        deliver_conn_event(&r, QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE);
+        print_state("after-peer-close", &r);
+        d = drain_events(&r);
+
+        check_told_once(&r, d, PEER_CLOSE_CODE);
+        CHECK(moq_transport_bridge_is_closed(r.conn->bridge));
+        CHECK(moq_transport_bridge_close_code(r.conn->bridge) ==
+              PEER_CLOSE_CODE);
+        CHECK(!moq_msquic_conn_is_fatal(r.conn));
+        check_no_second_terminal(&r);
+
+        rig_down(&r);
+        if (failures == before)
+            printf("PASS: control_end_after_peer_close (%s)\n",
+                   k_control_ends[i].name);
+    }
+}
+
 int main(void)
 {
     t_internal_fatal_then_transport_error();
@@ -1345,6 +1533,10 @@ int main(void)
     t_peer_closed_refusal_then_peer_close();
     t_peer_closed_refusal_then_transport_close();
     t_peer_closed_refusal_ops();
+
+    t_control_end_is_violation();
+    t_control_end_after_local_close();
+    t_control_end_after_peer_close();
 
     if (failures == 0)
         printf("PASS: msquic_close_feed\n");

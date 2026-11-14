@@ -993,17 +993,30 @@ static void test_reset_session_gone_then_connect_reset(void)
     pico_wt_harness_cleanup(&h);
 }
 
-/* Control: a genuine WebTransport application code on the MoQ control stream
- * still carries its MoQ code (the existing behaviour). */
+/* The code a peer resets or stops the MoQ control stream with in these rows:
+ * a WebTransport application code that is not the code the session must
+ * close with, so a close that merely echoed it would be told apart. */
+#define CONTROL_ABORT_PEER_CODE 0x55u
+
+/* A WebTransport application reset of the MoQ control stream ends a stream
+ * that must stay open for the session's lifetime
+ * (draft-ietf-moq-transport-16 section 3.3): the open session closes as a
+ * PROTOCOL_VIOLATION (0x3) with a close capsule of its own, whatever code the
+ * reset carried, and the peer receives that code. */
 static void test_reset_mapped_code_on_control(void)
 {
     pico_wt_harness_t h;
     if (reset_setup(&h, 0x74) != 0) return;
     uint64_t wt = 0;
-    CHECK(pico_wt_moq_err_to_wt(0x3, &wt));
+    CHECK(pico_wt_moq_err_to_wt(CONTROL_ABORT_PEER_CODE, &wt));
     reset_moq_control(&h, wt);
-    CHECK(moq_pico_wt_conn_is_fatal(h.client_conn));
-    CHECK(moq_transport_bridge_fatal_code(h.client_conn->bridge) == 0x3);
+    CHECK(moq_pico_wt_conn_is_closed(h.client_conn));
+    CHECK(!moq_pico_wt_conn_is_fatal(h.client_conn));
+    CHECK(moq_pico_wt_conn_close_code(h.client_conn) == 0x3);
+    pico_wt_harness_pump_until_closed(&h, 5000, h.server_conn);
+    CHECK(moq_pico_wt_conn_is_closed(h.server_conn));
+    CHECK(!moq_pico_wt_conn_is_fatal(h.server_conn));
+    CHECK(moq_pico_wt_conn_close_code(h.server_conn) == 0x3);
     pico_wt_harness_cleanup(&h);
 }
 
@@ -1214,10 +1227,10 @@ static const char *arb_name(arb_t *a, moq_version_t v)
     ARB_CHECK(a, v, !moq_pico_wt_conn_is_closed((a)->rcv)); \
     ARB_CHECK(a, v, moq_transport_bridge_fatal_code((a)->rcv->bridge) == (code)); } while (0)
 
-/* A RESET without a WebTransport application code (WT_SESSION_GONE, which a
- * peer resets every stream with as its session ends) or a STOP_SENDING (whose
- * code is not readable here) on the MoQ control channel decides nothing: the
- * WebTransport session terminal does. Both receivers get the close capsule
+/* A RESET or STOP_SENDING with WT_SESSION_GONE (which a peer aborts every
+ * stream with as its session ends) on the MoQ control channel decides
+ * nothing, and neither does a STOP_SENDING whose code the provider cannot
+ * report: the WebTransport session terminal does. Both receivers get the close capsule
  * (h3zero's server delivers CONNECT-stream body bytes to the adapter). A bare
  * CONNECT FIN with no capsule reaches only a client: h3zero's server passes
  * a zero-length FIN on the CONNECT stream to no callback.
@@ -1231,8 +1244,8 @@ static void test_control_arbitration(moq_version_t v, bool recv_server)
 {
     uint8_t base = (uint8_t)(0x80 + (v == MOQ_VERSION_DRAFT_18 ? 0x20 : 0) + (recv_server ? 0x10 : 0));
     arb_t a;
-    uint64_t mapped3 = 0;
-    CHECK(pico_wt_moq_err_to_wt(0x3, &mapped3));
+    uint64_t mapped = 0;
+    CHECK(pico_wt_moq_err_to_wt(CONTROL_ABORT_PEER_CODE, &mapped));
 
     for (int stop = 0; stop < 2; stop++) {
         /* GONE reset of the sender's control half, or STOP of the receiver's:
@@ -1284,11 +1297,12 @@ static void test_control_arbitration(moq_version_t v, bool recv_server)
         ARB_CLOSED(&a, v, 7);
         pico_wt_harness_cleanup(&a.h);
     }
-    /* Control: a WebTransport application code on the control stream is
-     * still a MoQ-level abort carrying its code. */
+    /* A WebTransport application code on the control stream is the peer
+     * ending it while the session runs: the receiver closes the session as a
+     * PROTOCOL_VIOLATION, whatever code the reset carried. */
     if (arb_setup(&a, v, recv_server, base + 7) == 0) {
-        arb_reset_ctrl(&a, mapped3);
-        ARB_FATAL(&a, v, 0x3);
+        arb_reset_ctrl(&a, mapped);
+        ARB_CLOSED(&a, v, 0x3);
         pico_wt_harness_cleanup(&a.h);
     }
     /* Control: on draft-18 a GONE reset of an ordinary request stream is a

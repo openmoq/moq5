@@ -147,9 +147,19 @@ void picowt_deregister(picoquic_cnx_t *cnx, h3zero_callback_ctx_t *h3_ctx, h3zer
 int picowt_receive_capsule(picoquic_cnx_t *cnx, const uint8_t *bytes, const uint8_t *bytes_max, picowt_capsule_t *capsule)
     { (void)cnx; (void)bytes; (void)bytes_max; (void)capsule; return 0; }
 void picowt_release_capsule(picowt_capsule_t *capsule) { (void)capsule; }
+/* The close capsules the adapter asked the provider for: how many, and the
+ * code and message of the last. */
+static int g_wt_close_n = 0;
+static uint32_t g_wt_close_code = 0;
+static char g_wt_close_msg[64];
 int picowt_send_close_session_message(picoquic_cnx_t *cnx, h3zero_stream_ctx_t *control_stream_ctx, uint32_t picowt_err,
                                       const char *err_msg)
-    { (void)cnx; (void)control_stream_ctx; (void)picowt_err; (void)err_msg; return 0; }
+{
+    (void)cnx; (void)control_stream_ctx;
+    g_wt_close_n++; g_wt_close_code = picowt_err;
+    snprintf(g_wt_close_msg, sizeof(g_wt_close_msg), "%s", err_msg ? err_msg : "");
+    return 0;
+}
 picosplay_node_t *picosplay_first(picosplay_tree_t *tree) { (void)tree; return NULL; }
 picosplay_node_t *picosplay_next(picosplay_node_t *node) { (void)node; return NULL; }
 
@@ -2132,6 +2142,130 @@ static int row_terminals(moq_version_t v)
     return failures - before;
 }
 
+
+/* A peer RESET_STREAM or STOP_SENDING on the MoQ control channel, by what its
+ * code says (draft-ietf-webtrans-http3-16 sections 4.4 and 6). The MoQ control
+ * stream must stay open for the session's lifetime (draft-ietf-moq-transport-16
+ * section 3.3, -18 section 3.3, -22 section 6.3).
+ *
+ *   - An application error code, zero included, or any other code that is not
+ *     WT_SESSION_GONE: the stream ended while the WebTransport session runs.
+ *     An open session closes as PROTOCOL_VIOLATION (0x3) with one close
+ *     capsule carrying 0x3; a session the application already closed keeps
+ *     its close, capsule code and message included.
+ *   - WT_SESSION_GONE: the peer's WebTransport session terminated. Nothing is
+ *     decided; the session terminal on the CONNECT stream will.
+ *   - A STOP_SENDING whose code the provider cannot report: nothing is known,
+ *     so nothing is decided.
+ * In every case the callback succeeds: a close the adapter completed is not a
+ * callback failure. */
+#if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
+#define STOP_CODE_READABLE 1
+#else
+#define STOP_CODE_READABLE 0
+#endif
+#define CONTROL_ABORT_FIRST_CODE 0x2u
+
+static int row_control_abort(moq_version_t v)
+{
+    static const struct {
+        const char *name;
+        bool application;
+        bool session_gone;
+        uint64_t code;      /* application code, or the raw HTTP/3 code */
+    } codes[] = {
+        { "application code",    true,  false, 0x55 },
+        { "application code 0",  true,  false, 0 },
+        { "WT_SESSION_GONE",     false, true,  0x170d7b68ull },
+        { "another HTTP/3 code", false, false, 0x10cull },
+    };
+    int before = failures;
+    const char *lbl = v == MOQ_VERSION_DRAFT_16 ? "v16" : v == MOQ_VERSION_DRAFT_18 ? "v18" : "v22";
+
+    for (size_t n = 0; n < 2 * 4 * 2; n++) {
+        const bool stop = (n & 1u) != 0;
+        const bool closed_first = (n & 2u) != 0;
+        const size_t k = n / 4;
+        int row_before = failures;
+        rig_t r;
+        if (!rig_up(&r, v)) {
+            CHECK(false && "rig setup");
+            rig_down(&r);
+            return failures - before;
+        }
+        const bool pair = v != MOQ_VERSION_DRAFT_16;
+        /* RESET ends the stream the publisher sends control on; STOP_SENDING
+         * refuses the stream the fetcher sends it on. */
+        CHECK(!pair || r.n_unis >= 1);
+        const uint64_t sid = !pair ? r.ad->moq_control_stream_id
+                           : stop ? r.ad->last_opened_uni_id : r.unis[0].sid;
+        const bool readable = !stop || STOP_CODE_READABLE;
+        const bool decides = readable && !codes[k].session_gone;
+        const uint64_t expect = closed_first ? CONTROL_ABORT_FIRST_CODE : 0x3u;
+        uint64_t raw = codes[k].code;
+        int closed_events = 0;
+        uint64_t closed_code = UINT64_MAX;
+        moq_event_t ev;
+
+        CHECK(sid != UINT64_MAX);
+        CHECK(moq_transport_bridge_stream_is_control(r.ad->bridge, sid));
+        if (codes[k].application)
+            CHECK(pico_wt_moq_err_to_wt(codes[k].code, &raw));
+        g_reset_code = raw;
+        g_peer_stop_code = raw;
+        g_wt_close_n = 0; g_wt_close_code = UINT32_MAX; g_wt_close_msg[0] = 0;
+
+        if (closed_first)
+            CHECK(moq_session_close(r.c, CONTROL_ABORT_FIRST_CODE, "first", 0) == MOQ_OK);
+        for (int i = 0; i < 2; i++)
+            CHECK(moq_pico_wt_callback(CNX, NULL, 0,
+                      stop ? picohttp_callback_stop_sending : picohttp_callback_reset,
+                      sc_get(sid), r.ad) == 0);
+        CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
+        if (decides) {
+            /* decided inside the callback, which also completed the close */
+            CHECK(moq_pico_wt_conn_is_closed(r.ad));
+            CHECK(g_wt_close_n == 1);
+        } else {
+            CHECK(!moq_pico_wt_conn_is_closed(r.ad));
+            CHECK(g_wt_close_n == 0);
+        }
+        CHECK(moq_pico_wt_service(r.ad, g_time) == 0);
+        CHECK(!moq_pico_wt_conn_is_fatal(r.ad));
+
+        while (moq_session_poll_events(r.c, &ev, 1) > 0) {
+            if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
+                closed_events++;
+                closed_code = ev.u.closed.code;
+            }
+            moq_event_cleanup(&ev);
+        }
+        if (decides || closed_first) {
+            CHECK(moq_pico_wt_conn_is_closed(r.ad));
+            CHECK(moq_pico_wt_conn_close_code(r.ad) == expect);
+            CHECK(g_wt_close_n == 1);
+            CHECK(g_wt_close_code == (uint32_t)expect);
+            CHECK(strcmp(g_wt_close_msg, closed_first ? "first" : "") == 0);
+            CHECK(closed_events == 1);
+            CHECK(closed_code == expect);
+        } else {
+            CHECK(!moq_pico_wt_conn_is_closed(r.ad));
+            CHECK(g_wt_close_n == 0);
+            CHECK(closed_events == 0);
+            CHECK(moq_session_state(r.c) == MOQ_SESS_ESTABLISHED);
+        }
+        if (failures != row_before)
+            fprintf(stderr, "FAILED: pico_wt control abort %s %s %s, %s\n", lbl,
+                    stop ? "STOP_SENDING" : "RESET", codes[k].name,
+                    closed_first ? "after the application's close" : "session open");
+        rig_down(&r);
+    }
+    g_reset_code = 0;
+    g_peer_stop_code = 0;
+    if (failures == before) printf("PASS: pico_wt control abort %s\n", lbl);
+    return failures - before;
+}
+
 /* Allocation failure while retaining the refused chunk, and the exact budget
  * boundary. Both report the adapter's explicit failure contract (a transport
  * error on the bridge, the connection torn down), never acceptance; the
@@ -2907,6 +3041,7 @@ int main(void)
         (void)row_retained_and_deferred_fin(versions[i], true);
         (void)row_retained_and_deferred_fin(versions[i], false);
         (void)row_terminals(versions[i]);
+        (void)row_control_abort(versions[i]);
         (void)row_alloc_and_budget(versions[i]);
         (void)row_required_hold(versions[i]);
         for (int t = TC_HELD_FIN; t <= TC_LIVE_REFUSED; t++)

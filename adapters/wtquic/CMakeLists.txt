@@ -621,6 +621,25 @@ int main(void) { return p == 0; }
 
     # Real adapter/core dispatch with a bounded fake WT provider. Native peer
     # ACK semantics are qualified separately against the selected WT backend.
+    # Classified stream aborts: attach refusal before any effect, and routing
+    # on the MoQ control stream and on request streams, drafts 16/18/22;
+    # real adapter, bridge and sessions over a fake WT provider.
+    add_executable(test_wtquic_abort tests/test_wtquic_abort.c)
+    target_link_libraries(test_wtquic_abort PRIVATE moq::core)
+    target_include_directories(test_wtquic_abort PRIVATE
+        ${PROJECT_SOURCE_DIR}/core/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        $<TARGET_PROPERTY:wtq::wtquic,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_compile_definitions(test_wtquic_abort PRIVATE MOQ_BUILDING WTQ_STATIC)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(test_wtquic_abort PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME wtquic_abort COMMAND test_wtquic_abort)
+    set_tests_properties(wtquic_abort PROPERTIES
+        LABELS "wtquic;lifecycle" TIMEOUT 30)
+
     add_executable(test_wtquic_commit tests/test_wtquic_commit.c)
     target_link_libraries(test_wtquic_commit PRIVATE moq::core)
     target_include_directories(test_wtquic_commit PRIVATE

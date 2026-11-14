@@ -65,6 +65,10 @@ int test_deferred_close_clears_ordinary_pending(void);
 
 int test_close_retry_would_block(void);
 
+int test_bidi_control_stream_end_is_violation(void);
+
+int test_control_stream_end_keeps_first_close(void);
+
 #ifdef MOQ_BRIDGE_TEST_INJECT
 
 int test_deferred_close_keeps_its_own_code(void);

@@ -873,6 +873,47 @@ static void bridge_on_local_ctrl_uni_fin(moq_transport_bridge_t *b,
         b->local_ctrl_uni_open = false;
 }
 
+/* The bidirectional control stream (draft-16): one stream carries both
+ * directions for the session's lifetime. It has no stream entry, so it is
+ * recognised by its transport key: the one this side opened or adopted for
+ * its control output, or the one the peer's control bytes arrived on. */
+static bool bridge_is_bidi_control(const moq_transport_bridge_t *b,
+                                   uint64_t stream_id)
+{
+    if (b->control_mode != BRIDGE_CONTROL_BIDI) return false;
+    return (b->control_open && b->control_stream_id == stream_id) ||
+           (b->peer_control_open && b->peer_control_stream_id == stream_id);
+}
+
+/* The session has reached its terminal decision. Its close is then queued in
+ * the session or retained by this bridge with its own code and reason, and
+ * its terminal event carries the same. */
+static bool bridge_session_closed(const moq_transport_bridge_t *b)
+{
+    return moq_session_state(b->session) == MOQ_SESS_CLOSED;
+}
+
+/* The transport ended a direction of a control stream: the one bidirectional
+ * stream of draft-16, or either unidirectional stream of the later drafts. A
+ * control stream must stay open for the session's lifetime, so a session that
+ * is still open closes as a protocol violation (PROTOCOL_VIOLATION, 0x3),
+ * whichever of FIN, RESET_STREAM or STOP_SENDING ended the stream (draft-16
+ * section 3.3, draft-18 section 3.3, draft-22 section 6.3). The session learns
+ * now; the next service pass closes the transport.
+ *
+ * The first terminal decision stands. When the session has already closed, a
+ * control stream that ends afterwards changes neither the close the transport
+ * will be given nor the session's event: both keep the code and reason of the
+ * decision that came first. */
+static void bridge_control_stream_ended(moq_transport_bridge_t *b,
+                                        uint64_t now_us)
+{
+    if (bridge_session_closed(b)) return;
+    moq_session_on_transport_close(b->session, 0x3, now_us);
+    b->needs_close = true;
+    b->needs_close_code = 0x3;
+}
+
 /* -- Inbound peer unidirectional stream routing (decision only) ----- */
 
 bridge_uni_route_t bridge_route_peer_uni(
@@ -5361,15 +5402,12 @@ static bridge_inbound_outcome_t bridge_retry_inbound_pending(
             }
             if (b->pending_control_fin) {
                 b->pending_control_fin = false;
-                /* Close code must match the immediate (non-blocked) control-FIN
-                 * path so it does not depend on whether processing blocked:
-                 * uni-control-pair treats a control-stream FIN as a protocol
-                 * violation (0x3); bidi-control keeps its existing code (0x1). */
-                uint64_t fin_code =
-                    (b->control_mode == BRIDGE_CONTROL_UNI_PAIR) ? 0x3 : 0x1;
-                moq_session_on_transport_close(b->session, fin_code, now_us);
-                b->needs_close = true;
-                b->needs_close_code = fin_code;
+                /* The FIN follows the input it was retained behind. What it
+                 * earns must not depend on whether processing blocked first:
+                 * in both control topologies it is what the immediate path
+                 * reports. When handling that input closed the session, the
+                 * session's own close stands. */
+                bridge_control_stream_ended(b, now_us);
             }
         }
     }
@@ -5865,6 +5903,11 @@ moq_result_t moq_transport_bridge_on_peer_control_bytes(
     if (!b || b->fatal || b->closed) return MOQ_ERR_CLOSED;
     if (!b->in_service) b->now_us = now_us;
 
+    /* The session has already closed and its close has not reached the
+     * transport yet. Control input that arrives in between, the stream's FIN
+     * included, is not delivered: the close that was decided first stands. */
+    if (bridge_session_closed(b)) return MOQ_OK;
+
     if (b->pending_control) {
         if (len > 0) {
             bridge_set_fatal(b, 0x3);
@@ -5897,11 +5940,9 @@ moq_result_t moq_transport_bridge_on_peer_control_bytes(
         return rc;
     }
 
-    if (fin) {
-        moq_session_on_transport_close(b->session, 0x1, now_us);
-        b->needs_close = true;
-        b->needs_close_code = 0x1;
-    }
+    /* A FIN closes the peer's half of the control stream. When the bytes it
+     * came with closed the session, the session's own close stands. */
+    if (fin) bridge_control_stream_ended(b, now_us);
 
     return MOQ_OK;
 }
@@ -5918,6 +5959,10 @@ static moq_result_t bridge_feed_peer_control(
     moq_transport_bridge_t *b, uint64_t stream_id,
     const uint8_t *data, size_t len, bool fin, uint64_t now_us)
 {
+    /* As on the bidirectional control stream: after the session has closed,
+     * control input is not delivered and the first close stands. */
+    if (bridge_session_closed(b)) return MOQ_OK;
+
     moq_result_t rc = MOQ_OK;
     if (len > 0)
         rc = moq_session_on_control_bytes(b->session, data, len, now_us);
@@ -5932,11 +5977,7 @@ static moq_result_t bridge_feed_peer_control(
         bridge_set_fatal(b, 0x1);
         return rc;
     }
-    if (fin) {
-        moq_session_on_transport_close(b->session, 0x3, now_us);
-        b->needs_close = true;
-        b->needs_close_code = 0x3;
-    }
+    if (fin) bridge_control_stream_ended(b, now_us);
     return MOQ_OK;
 }
 
@@ -6005,9 +6046,16 @@ static moq_result_t bridge_uni_pair_inbound(
     /* Retained control input blocks session delivery, not bounded prefix
      * collection or classified placement. Held-stream adapters establish
      * map/H ownership before deferral; legacy callers retain the earlier
-     * whole-chunk refusal. No current bytes or FIN are taken on that refusal. */
+     * whole-chunk refusal. No current bytes or FIN are taken on that refusal.
+     *
+     * A session that has already closed takes no more control input: on the
+     * control stream whose input is retained here, later bytes are accepted
+     * and not delivered, and a FIN adds no debt. The close decided first
+     * stands, and the retained state stays as it is until that close is
+     * taken. Every other stream keeps the handling below. */
     if (b->pending_control) {
         if (stream_id == b->pending_control_stream_id) {
+            if (bridge_session_closed(b)) return MOQ_OK;
             if (fin) b->pending_control_fin = true;
             return MOQ_ERR_WOULD_BLOCK;
         }
@@ -6585,6 +6633,13 @@ moq_result_t moq_transport_bridge_on_peer_stream_reset(
     if (!b || b->fatal || b->closed) return MOQ_ERR_CLOSED;
     if (!b->in_service) b->now_us = now_us;
 
+    /* A RESET closes the peer's half of the bidirectional control stream. It
+     * has no stream entry, so it must not pass as an unknown stream's reset. */
+    if (bridge_is_bidi_control(b, stream_id)) {
+        bridge_control_stream_ended(b, now_us);
+        return MOQ_OK;
+    }
+
     if (bridge_is_tombstoned(b, stream_id)) {
         bridge_remove_tombstone(b, stream_id);
         return MOQ_OK;
@@ -6635,9 +6690,7 @@ moq_result_t moq_transport_bridge_on_peer_stream_reset(
      * Mirrors the control-channel FIN handling in bridge_feed_peer_control. */
     if (e->kind == BRIDGE_STREAM_UNI &&
         e->uni_disp == BRIDGE_UNI_DISP_CONTROL) {
-        moq_session_on_transport_close(b->session, 0x3, now_us);
-        b->needs_close = true;
-        b->needs_close_code = 0x3;
+        bridge_control_stream_ended(b, now_us);
         return MOQ_OK;
     }
 
@@ -6722,6 +6775,15 @@ moq_result_t moq_transport_bridge_on_peer_stop_sending(
     if (!b || b->fatal || b->closed) return MOQ_ERR_CLOSED;
     if (!b->in_service) b->now_us = now_us;
 
+    /* A STOP_SENDING refuses this side's half of the bidirectional control
+     * stream: the peer no longer reads control output on a stream that must
+     * stay usable for the session's lifetime. It has no stream entry, so it
+     * must not pass as an unknown stream's stop. */
+    if (bridge_is_bidi_control(b, stream_id)) {
+        bridge_control_stream_ended(b, now_us);
+        return MOQ_OK;
+    }
+
     bridge_stream_entry_t *e = bridge_find_by_id(b, stream_id);
     if (!e) return MOQ_OK;
 
@@ -6740,9 +6802,7 @@ moq_result_t moq_transport_bridge_on_peer_stop_sending(
      * Mirrors the peer-control RESET handling in on_peer_stream_reset. */
     if (e->kind == BRIDGE_STREAM_UNI &&
         e->uni_disp == BRIDGE_UNI_DISP_CONTROL) {
-        moq_session_on_transport_close(b->session, 0x3, now_us);
-        b->needs_close = true;
-        b->needs_close_code = 0x3;
+        bridge_control_stream_ended(b, now_us);
         return MOQ_OK;
     }
 

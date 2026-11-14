@@ -40,6 +40,13 @@ uint64_t moq_mvfst_managed_credit_grant_count(const moq_mvfst_managed_t *m);
 bool moq_mvfst_managed_test_has_client_session(const moq_mvfst_managed_t *m);
 
 /*
+ * The client session the facade retains after stop(), for reading its queued
+ * events once the network thread has been joined. NULL if m is NULL or holds
+ * none. Read only after stop() returns.
+ */
+moq_session_t *moq_mvfst_managed_test_client_session(moq_mvfst_managed_t *m);
+
+/*
  * Copy the mvfst client's configured QUIC version offer as raw uint32_t values.
  * Returns the total number configured; copies min(total, cap) values into out.
  * A NULL facade returns 0.
@@ -102,6 +109,59 @@ typedef void (*moq_mvfst_test_hold_cb)(void *ctx, uint64_t stream_id,
                                         moq_result_t result, bool pending);
 void moq_mvfst_test_set_hold_input(int mode);
 void moq_mvfst_test_set_hold_observer(moq_mvfst_test_hold_cb cb, void *ctx);
+
+/*
+ * EventBase lease observation. A managed facade publishes its client EventBase
+ * (client mode) or the QuicServer worker EventBase (server mode) to other
+ * threads only through a lease: a borrow keeps the EventBase alive for one call
+ * into it, and the owner retires the lease before the EventBase is destroyed.
+ *
+ * One process-wide probe; set it before creating a facade and clear it (NULL)
+ * after destroying it. Callbacks run on the borrowing or retiring thread with
+ * no lease lock held:
+ *  - borrowed: a borrow was granted, before the borrower uses the EventBase.
+ *    Return false to make that borrower skip its use (the borrow still ends).
+ *  - borrow_end: that borrow is over, after its use or its skip, and before
+ *    the lease stops counting it.
+ *  - retire_begin: the owner has unpublished the EventBase (no new borrow can
+ *    be granted) and is about to wait for the `granted` borrows the lease
+ *    still counts.
+ *  - retired: the owner's retirement returned; from here on the owner may
+ *    destroy the EventBase.
+ *  - drain_begin: client mode, on the owner thread: teardown has closed the
+ *    transport and the final drain of the client EventBase (`eventbase`, a
+ *    folly::EventBase *) is about to run; work queued on it now belongs to
+ *    that drain.
+ *  - drain_fails: client mode, on the owner thread, after the non-blocking
+ *    restart: return true to make the final drain fail as an event-loop error
+ *    would, without running it (pending work stays pending).
+ *  - destroy_begin: client mode, on the owner thread: the final drain has
+ *    returned (after a failure, the transport was closed at once), the
+ *    facade's transport reference is released, and the client EventBase
+ *    (`eventbase`) is about to be destroyed; it and its backend are still
+ *    alive. `transport_released` says whether the transport object is gone.
+ * Any callback may be NULL. `evb` names the lease, `site` the borrow.
+ */
+enum {
+    MOQ_MVFST_TEST_EVB_CLIENT = 1,
+    MOQ_MVFST_TEST_EVB_SERVER = 2
+};
+enum {
+    MOQ_MVFST_TEST_EVB_ENQUEUE = 1,      /* queue one pump callback */
+    MOQ_MVFST_TEST_EVB_NOTIFY = 2,       /* ask the loop to terminate */
+    MOQ_MVFST_TEST_EVB_THREAD_CHECK = 3  /* is the caller the loop thread? */
+};
+typedef struct moq_mvfst_test_evb_probe {
+    void *ctx;
+    bool (*borrowed)(void *ctx, int evb, int site);
+    void (*borrow_end)(void *ctx, int evb, int site);
+    void (*retire_begin)(void *ctx, int evb, unsigned granted);
+    void (*retired)(void *ctx, int evb);
+    void (*drain_begin)(void *ctx, void *eventbase);
+    bool (*drain_fails)(void *ctx);
+    void (*destroy_begin)(void *ctx, void *eventbase, bool transport_released);
+} moq_mvfst_test_evb_probe;
+void moq_mvfst_test_set_evb_probe(const moq_mvfst_test_evb_probe *probe);
 
 /*
  * Allocation-failure injection: the next allocation at the named point fails

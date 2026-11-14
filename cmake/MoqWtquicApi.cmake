@@ -1,9 +1,13 @@
 # API availability only, not backend qualification or a warning-clean configure.
+# The core probe covers what the wtquic adapter compiles and links against,
+# including the classified stream-abort surface, so a wtquic without it is
+# refused at configure with the contract message; the adapter's #error stays
+# as the compile-time guard.
 # try_compile exposes build output here; its configure diagnostics go directly
 # to the caller. Qualification drivers must inspect the complete CMake output.
 function(moq_check_wtquic_api result reason)
     set(${result} FALSE PARENT_SCOPE)
-    set(_why "wtquic public API compile/link contract requires wtq_session_receive_contract, wtq_session_service_stream_admission, wtq_session_stream_budget, wtq_session_local_flush_mode and wtq_session_local_flush (wtquic_DIR='${wtquic_DIR}').")
+    set(_why "wtquic public API compile/link contract requires wtq_session_receive_contract, wtq_session_service_stream_admission, wtq_session_stream_budget, wtq_session_local_flush_mode, wtq_session_local_flush and classified stream aborts (on_stream_abort, wtq_session_abort_observability) (wtquic_DIR='${wtquic_DIR}').")
     if(NOT TARGET wtq::wtquic)
         set(${reason} "${_why} Imported target wtq::wtquic is unavailable." PARENT_SCOPE)
         return()
@@ -20,7 +24,12 @@ function(moq_check_wtquic_api result reason)
     set(_dir "${CMAKE_BINARY_DIR}/CMakeFiles/moq-wtquic-api")
     file(MAKE_DIRECTORY "${_dir}")
     file(WRITE "${_dir}/probe.${_extension}" [=[
+#include <stddef.h>
+#include <stdint.h>
 #include <wtquic/session.h>
+#if !defined(WTQ_HAVE_SESSION_ABORT_OBSERVABILITY)
+#error "wtquic does not classify stream aborts (wtq_session_abort_observability)"
+#endif
 static wtq_result_t (*volatile receive_contract)(const wtq_session_t *,
     size_t *, wtq_receive_pause_mode_t *) = wtq_session_receive_contract;
 static wtq_result_t (*volatile service_admission)(wtq_session_t *) =
@@ -31,12 +40,34 @@ static wtq_local_flush_mode_t (*volatile local_flush_mode)(const wtq_session_t *
     wtq_session_local_flush_mode;
 static wtq_result_t (*volatile local_flush)(const wtq_session_t *) =
     wtq_session_local_flush;
+static uint32_t (*volatile abort_observability)(const wtq_session_t *) =
+    wtq_session_abort_observability;
+static volatile uint32_t abort_code;
+static void on_abort(wtq_session_t *session, wtq_stream_t *stream,
+                     const wtq_stream_abort_t *rec, void *user) {
+    (void)session;
+    (void)stream;
+    (void)user;
+    if (rec->struct_size >= WTQ_STREAM_ABORT_V0_SIZE &&
+        (rec->direction == WTQ_STREAM_ABORT_RESET ||
+         rec->direction == WTQ_STREAM_ABORT_STOP) &&
+        (rec->origin == WTQ_STREAM_ABORT_ORIGIN_APPLICATION ||
+         rec->origin == WTQ_STREAM_ABORT_ORIGIN_PROTOCOL ||
+         rec->origin == WTQ_STREAM_ABORT_ORIGIN_UNKNOWN))
+        abort_code = rec->app_code;
+}
 int main(void) {
     wtq_stream_budget_t budget = WTQ_STREAM_BUDGET_INIT;
+    wtq_session_events_t events = WTQ_SESSION_EVENTS_INIT;
+    volatile uint32_t facts = WTQ_ABORT_OBSERVES_RESET_CODE |
+        WTQ_ABORT_OBSERVES_STOP_EVENT | WTQ_ABORT_OBSERVES_STOP_CODE;
+    events.on_stream_abort = on_abort;
     return budget.struct_size < WTQ_STREAM_BUDGET_V1_SIZE ||
            budget.api_capacity != 0 || stream_budget == 0 ||
            receive_contract == 0 || service_admission == 0 ||
-           local_flush_mode == 0 || local_flush == 0;
+           local_flush_mode == 0 || local_flush == 0 ||
+           abort_observability == 0 || facts == 0 ||
+           !WTQ_SESSION_EVENTS_COVERS(&events, on_stream_abort);
 }
 ]=])
     # Function scope restores caller state, including a STATIC_LIBRARY override.
@@ -165,7 +196,7 @@ macro(moq_wtquic_component_preflight component)
         moq_check_wtquic_api(_libmoq_wt_api_ok _libmoq_wt_api_reason)
         if(NOT wtquic_FOUND)
             set(_libmoq_wt_api_ok FALSE)
-            set(_libmoq_wt_api_reason "wtquic public API compile/link contract requires wtq_session_receive_contract, wtq_session_service_stream_admission, wtq_session_stream_budget, wtq_session_local_flush_mode and wtq_session_local_flush; package lookup failed (wtquic_DIR='${wtquic_DIR}'). ${wtquic_NOT_FOUND_MESSAGE}")
+            set(_libmoq_wt_api_reason "wtquic public API compile/link contract requires wtq_session_receive_contract, wtq_session_service_stream_admission, wtq_session_stream_budget, wtq_session_local_flush_mode, wtq_session_local_flush and classified stream aborts (on_stream_abort, wtq_session_abort_observability); package lookup failed (wtquic_DIR='${wtquic_DIR}'). ${wtquic_NOT_FOUND_MESSAGE}")
         endif()
         # Only a consumer that actually needs the MsQuic managed facade (the
         # component itself, or a service built with it) pays this check;

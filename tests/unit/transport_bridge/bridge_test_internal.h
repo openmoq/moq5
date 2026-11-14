@@ -358,6 +358,7 @@ int test_pair_init_stream(test_pair_t *tp, uint32_t client_max_events,
                           bool client_streaming);
 
 int test_pair_init_pub_cap(test_pair_t *tp, uint32_t server_max_actions);
+int test_pair_init_server_events(test_pair_t *tp, uint32_t server_max_events);
 
 int test_pair_init_ex(test_pair_t *tp, uint32_t client_max_events);
 
@@ -473,6 +474,7 @@ int hol_budget_case(uint32_t cap, unsigned *out_first,
 void priority_pump(test_pair_t *tp, bool d18, uint64_t now);
 
 int d22_pair_init(test_pair_t *tp);
+int d22_pair_init_events(test_pair_t *tp, uint32_t client_max_events);
 
 void hb_close(hb_rig_t *r);
 

@@ -349,15 +349,45 @@ static void test_server_event_driven_no_wakes()
     moq_mvfst_managed_destroy(srv);
 }
 
+/* mvfst's QuicServer hands its host id -- zero unless the application sets
+ * one, as this facade does not -- to each worker it creates, and
+ * QuicServerWorker::setHostId logs this WARNING and returns when the worker
+ * already holds that id. It is expected upstream output for this server, so
+ * the sink accepts it, and only it: the exact severity, source file, line and
+ * whole message. Any other provider warning, error or fatal record fails the
+ * test. */
+static bool known_upstream_record(google::LogSeverity severity,
+                                  const char *file, int line,
+                                  const char *message, size_t len)
+{
+    static const char kFile[] = "QuicServerWorker.cpp";
+    static const int kLine = 1346;
+    static const char kMessage[] = "HostId is already set to 0";
+    return severity == google::GLOG_WARNING && file != nullptr &&
+           std::strcmp(file, kFile) == 0 && line == kLine &&
+           len == sizeof(kMessage) - 1 &&
+           std::memcmp(message, kMessage, len) == 0;
+}
+
 class warning_sink : public google::LogSink {
 public:
-    std::atomic<unsigned> count{0};
+    explicit warning_sink(bool echo = true) : echo_(echo) {}
+    std::atomic<unsigned> count{0};      /* failing records */
+    std::atomic<unsigned> upstream{0};   /* the known upstream record */
     std::atomic<unsigned> client_factory{0};
     std::atomic<unsigned> server_factory{0};
     void send(google::LogSeverity severity, const char *, const char *file,
               int line, const google::LogMessageTime &, const char *message,
               size_t len) override {
         if (severity < google::GLOG_WARNING) return;
+        if (known_upstream_record(severity, file, line, message, len)) {
+            upstream.fetch_add(1);
+            if (echo_)
+                std::fprintf(stderr,
+                             "accepted upstream diagnostic %s:%d: %.*s\n",
+                             file, line, static_cast<int>(len), message);
+            return;
+        }
         count.fetch_add(1);
         const char *missing_factory = "A congestion controller factory is not set. "
                                       "Using a default per-transport instance.";
@@ -368,14 +398,61 @@ public:
             if (std::strcmp(file, "QuicServerTransport.cpp") == 0)
                 server_factory.fetch_add(1);
         }
-        std::fprintf(stderr, "provider diagnostic %s:%d: %.*s\n",
-                     file, line, static_cast<int>(len), message);
+        if (echo_)
+            std::fprintf(stderr, "provider diagnostic %s:%d: %.*s\n",
+                         file, line, static_cast<int>(len), message);
     }
+
+private:
+    bool echo_;
 };
+
+/* The sink's policy on synthetic records, through a sink that glog does not
+ * know and that prints nothing: only the exact known upstream record is
+ * accepted; a changed file, line or message, a higher severity and the
+ * congestion-factory records all count as failures, and INFO is ignored. */
+static void test_warning_sink_policy()
+{
+    static const char kHost[] = "HostId is already set to 0";
+    static const char kHostOther[] = "HostId is already set to 1";
+    static const char kHostLonger[] = "HostId is already set to 0 ";
+    static const char kFactory[] = "A congestion controller factory is not set. "
+                                   "Using a default per-transport instance.";
+    const google::LogMessageTime when;
+    warning_sink probe(false);
+    auto send = [&](google::LogSeverity sev, const char *file, int line,
+                    const char *msg, size_t len) {
+        probe.send(sev, "", file, line, when, msg, len);
+    };
+    send(google::GLOG_WARNING, "QuicServerWorker.cpp", 1346, kHost, sizeof(kHost) - 1);
+    MVFST_CHECK(probe.upstream.load() == 1 && probe.count.load() == 0);
+    send(google::GLOG_INFO, "QuicServerWorker.cpp", 1346, kHost, sizeof(kHost) - 1);
+    MVFST_CHECK(probe.upstream.load() == 1 && probe.count.load() == 0);
+    send(google::GLOG_WARNING, "QuicServer.cpp", 1346, kHost, sizeof(kHost) - 1);
+    MVFST_CHECK(probe.upstream.load() == 1 && probe.count.load() == 1);
+    send(google::GLOG_WARNING, "QuicServerWorker.cpp", 1347, kHost, sizeof(kHost) - 1);
+    MVFST_CHECK(probe.upstream.load() == 1 && probe.count.load() == 2);
+    send(google::GLOG_WARNING, "QuicServerWorker.cpp", 1346, kHostOther, sizeof(kHostOther) - 1);
+    MVFST_CHECK(probe.upstream.load() == 1 && probe.count.load() == 3);
+    send(google::GLOG_WARNING, "QuicServerWorker.cpp", 1346, kHostLonger, sizeof(kHostLonger) - 1);
+    MVFST_CHECK(probe.upstream.load() == 1 && probe.count.load() == 4);
+    send(google::GLOG_WARNING, "QuicServerWorker.cpp", 1346, kHost, sizeof(kHost) - 2);
+    MVFST_CHECK(probe.upstream.load() == 1 && probe.count.load() == 5);
+    send(google::GLOG_ERROR, "QuicServerWorker.cpp", 1346, kHost, sizeof(kHost) - 1);
+    MVFST_CHECK(probe.upstream.load() == 1 && probe.count.load() == 6);
+    send(google::GLOG_FATAL, "QuicServerWorker.cpp", 1346, kHost, sizeof(kHost) - 1);
+    MVFST_CHECK(probe.upstream.load() == 1 && probe.count.load() == 7);
+    send(google::GLOG_WARNING, "QuicClientTransportLite.cpp", 1, kFactory, sizeof(kFactory) - 1);
+    MVFST_CHECK(probe.count.load() == 8 && probe.client_factory.load() == 1);
+    send(google::GLOG_WARNING, "QuicServerTransport.cpp", 1, kFactory, sizeof(kFactory) - 1);
+    MVFST_CHECK(probe.count.load() == 9 && probe.server_factory.load() == 1);
+    MVFST_CHECK(probe.upstream.load() == 1);
+}
 
 int main(int, char **argv)
 {
     google::InitGoogleLogging(argv[0]);
+    test_warning_sink_policy();
     warning_sink warnings;
     google::AddLogSink(&warnings);
     test_server_event_driven_no_wakes();
@@ -383,6 +460,8 @@ int main(int, char **argv)
     MVFST_CHECK(warnings.client_factory.load() == 0);
     MVFST_CHECK(warnings.server_factory.load() == 0);
     MVFST_CHECK(warnings.count.load() == 0);
+    std::fprintf(stderr, "accepted upstream diagnostics: %u\n",
+                 warnings.upstream.load());
     std::printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

@@ -13,11 +13,12 @@ const moq_alloc_t *g_server_alloc_override;
 uint32_t g_client_rx_capacity;
 
 
-int test_pair_init_full(test_pair_t *tp, uint32_t client_max_events,
-                        bool client_streaming,
-                        uint32_t client_max_actions,
-                        uint64_t client_idle_us,
-                        uint32_t server_max_actions)
+static int test_pair_init_caps(test_pair_t *tp, uint32_t client_max_events,
+                               bool client_streaming,
+                               uint32_t client_max_actions,
+                               uint64_t client_idle_us,
+                               uint32_t server_max_actions,
+                               uint32_t server_max_events)
 {
     memset(tp, 0, sizeof(*tp));
 
@@ -48,6 +49,9 @@ int test_pair_init_full(test_pair_t *tp, uint32_t client_max_events,
     /* The publisher's action queue. Raising it above the bridge's drain
      * budget is what lets a fixture reach the budget at all. 0 = default. */
     if (server_max_actions) scfg.max_actions = server_max_actions;
+    /* A tiny server event queue forces the same receive backpressure on the
+     * side that accepted the control stream. 0 = default. */
+    if (server_max_events) scfg.max_events = server_max_events;
 
     if (moq_session_create(&ccfg, 0, &tp->client) < 0) return -1;
     if (moq_session_create(&scfg, 0, &tp->server) < 0) {
@@ -78,6 +82,25 @@ int test_pair_init_full(test_pair_t *tp, uint32_t client_max_events,
     }
 
     return 0;
+}
+
+
+int test_pair_init_full(test_pair_t *tp, uint32_t client_max_events,
+                        bool client_streaming,
+                        uint32_t client_max_actions,
+                        uint64_t client_idle_us,
+                        uint32_t server_max_actions)
+{
+    return test_pair_init_caps(tp, client_max_events, client_streaming,
+                               client_max_actions, client_idle_us,
+                               server_max_actions, 0);
+}
+
+
+/* Same pair, with the SERVER's event queue bounded. */
+int test_pair_init_server_events(test_pair_t *tp, uint32_t server_max_events)
+{
+    return test_pair_init_caps(tp, 0, false, 0, 0, 0, server_max_events);
 }
 
 

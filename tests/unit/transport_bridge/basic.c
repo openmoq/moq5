@@ -377,6 +377,839 @@ int test_close_retry_would_block(void)
     return failures;
 }
 
+
+/* -- A control stream may not end ----------------------------------- *
+ *
+ * Draft-16 section 3.3: the control stream must not be closed at the
+ * transport layer during the session's lifetime; doing so closes the session
+ * as a PROTOCOL_VIOLATION (0x3, section 3.4). The peer can end a half of it
+ * three ways: a FIN or a RESET_STREAM of its own half, or a STOP_SENDING of
+ * ours. Each closes a session that is still open with that code, on the side
+ * that opened the stream and on the side that accepted it, whether or not
+ * control input was still retained when it happened.
+ *
+ * A session that has already closed keeps the close it decided first. Its
+ * code and reason reach the transport, and its one terminal event carries the
+ * same, however the control stream ends afterwards.
+ */
+
+typedef enum {
+    CTRL_END_FIN = 0,
+    CTRL_END_RESET,
+    CTRL_END_STOP
+} ctrl_end_t;
+
+static const char *const ctrl_end_names[] = { "FIN", "RESET", "STOP_SENDING" };
+
+/* The peer's own stream code, chosen so a close that merely echoed it could
+ * not be mistaken for the protocol violation. */
+#define CTRL_END_PEER_CODE 0x55u
+
+/* The pair's one control stream is the client's first bidirectional stream,
+ * which both endpoints key as 2000. */
+#define CTRL_END_STREAM 2000u
+
+/* The close an application decides first in these rows. */
+#define CTRL_END_FIRST_CODE 0x2u
+static const char ctrl_end_first_reason[] = "first";
+
+static moq_result_t ctrl_end_deliver(moq_transport_bridge_t *b, uint64_t sid,
+                                     ctrl_end_t how)
+{
+    switch (how) {
+    case CTRL_END_FIN:
+        return moq_transport_bridge_on_peer_control_bytes(
+            b, sid, NULL, 0, true, 0);
+    case CTRL_END_RESET:
+        return held_bridge_reset(b, sid, CTRL_END_PEER_CODE, 0);
+    case CTRL_END_STOP:
+    default:
+        return moq_transport_bridge_on_peer_stop_sending(
+            b, sid, CTRL_END_PEER_CODE, 0);
+    }
+}
+
+typedef struct {
+    size_t   closed_events;
+    uint64_t code;
+    size_t   reason_len;
+    uint8_t  reason[64];
+} ctrl_end_terminal_t;
+
+/* Takes every event the session still holds and keeps its terminal: how many
+ * SESSION_CLOSED events there were, and the code and reason of the last. */
+static void ctrl_end_drain_events(moq_session_t *s, ctrl_end_terminal_t *t)
+{
+    moq_event_t ev;
+
+    memset(t, 0, sizeof(*t));
+    t->code = UINT64_MAX;
+    while (moq_session_poll_events(s, &ev, 1) > 0) {
+        if (ev.kind == MOQ_EVENT_SESSION_CLOSED) {
+            t->closed_events++;
+            t->code = ev.u.closed.code;
+            t->reason_len = ev.u.closed.reason.len;
+            if (t->reason_len > sizeof(t->reason))
+                t->reason_len = sizeof(t->reason);
+            if (t->reason_len > 0)
+                memcpy(t->reason, ev.u.closed.reason.data, t->reason_len);
+        }
+        moq_event_cleanup(&ev);
+    }
+}
+
+typedef enum {
+    CTRL_REASON_NONE = 0,   /* no reason phrase: the bridge's own close */
+    CTRL_REASON_GIVEN,      /* exactly the given phrase */
+    CTRL_REASON_SESSION     /* the session's own phrase, which is not empty */
+} ctrl_reason_t;
+
+/* One decision, told the same way twice: the session's single terminal event
+ * and the transport's single close carry this code and this reason, the
+ * bridge ended closed rather than fatal with nothing left pending, and a
+ * later service pass adds neither a close nor an event. */
+static int ctrl_end_expect_close(moq_session_t *s, moq_transport_bridge_t *b,
+                                 fake_endpoint_t *ep, uint64_t code,
+                                 ctrl_reason_t kind, const char *reason,
+                                 const char *what)
+{
+    int failures = 0;
+    ctrl_end_terminal_t t;
+    const fake_op_t *op;
+    size_t want_len = kind == CTRL_REASON_GIVEN ? strlen(reason) : 0;
+
+    MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_CLOSED);
+    ctrl_end_drain_events(s, &t);
+    MOQ_TEST_CHECK_EQ_SIZE(t.closed_events, (size_t)1);
+    MOQ_TEST_CHECK_EQ_U64(t.code, code);
+    if (kind == CTRL_REASON_SESSION) {
+        MOQ_TEST_CHECK(t.reason_len > 0);
+        want_len = t.reason_len;
+        reason = (const char *)t.reason;
+    }
+    MOQ_TEST_CHECK_EQ_SIZE(t.reason_len, want_len);
+    if (t.reason_len == want_len && want_len > 0)
+        MOQ_TEST_CHECK(memcmp(t.reason, reason, want_len) == 0);
+
+    MOQ_TEST_CHECK(moq_transport_bridge_is_closed(b));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(b));
+    MOQ_TEST_CHECK(!moq_transport_bridge_has_pending(b));
+    MOQ_TEST_CHECK_EQ_U64(moq_transport_bridge_close_code(b), code);
+    MOQ_TEST_CHECK_EQ_SIZE(fake_endpoint_count_kind(ep, FAKE_OP_CLOSE),
+                           (size_t)1);
+    op = fake_endpoint_find(ep, FAKE_OP_CLOSE);
+    MOQ_TEST_CHECK(op != NULL);
+    if (op) {
+        MOQ_TEST_CHECK_EQ_U64(op->error_code, code);
+        MOQ_TEST_CHECK_EQ_SIZE(op->data_len, want_len);
+        if (op->data_len == want_len && want_len > 0)
+            MOQ_TEST_CHECK(memcmp(op->data, reason, want_len) == 0);
+    }
+    MOQ_TEST_CHECK(!ep->overflowed);
+    MOQ_TEST_CHECK(!ep->truncated);
+
+    MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(b, 0), (int)MOQ_OK);
+    MOQ_TEST_CHECK_EQ_SIZE(fake_endpoint_count_kind(ep, FAKE_OP_CLOSE),
+                           (size_t)1);
+    ctrl_end_drain_events(s, &t);
+    MOQ_TEST_CHECK_EQ_SIZE(t.closed_events, (size_t)0);
+
+    if (failures) fprintf(stderr, "CTRLEND: %s\n", what);
+    return failures;
+}
+
+/* The control stream's end has just been delivered to a session that was
+ * still open: the session is closed, the bridge owes the transport the
+ * protocol-violation close, and one service pass performs it. */
+static int ctrl_end_expect_owed_violation(moq_session_t *s,
+                                          moq_transport_bridge_t *b,
+                                          fake_endpoint_t *ep,
+                                          const char *what)
+{
+    int failures = 0;
+
+    MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_CLOSED);
+    MOQ_TEST_CHECK(b->needs_close);
+    MOQ_TEST_CHECK_EQ_U64(b->needs_close_code, 0x3);
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(b));
+    MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(b));
+    fake_endpoint_clear_ops(ep);
+    MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(b, 0), (int)MOQ_OK);
+    if (failures) fprintf(stderr, "CTRLEND: %s\n", what);
+    return failures +
+           ctrl_end_expect_close(s, b, ep, 0x3, CTRL_REASON_NONE, NULL, what);
+}
+
+/* A pair in which one side has a single event slot, still holding its own
+ * SETUP_COMPLETE: the next control message that needs an event blocks in
+ * that side's session, and its bridge retains the control retry. */
+static int ctrl_end_retaining_pair(test_pair_t *tp, bool server)
+{
+    moq_event_t ev;
+    moq_session_t *other;
+
+    if ((server ? test_pair_init_server_events(tp, 1)
+                : test_pair_init_ex(tp, 1)) < 0)
+        return -1;
+    moq_session_start(tp->client, 0);
+    pump_until_quiescent(tp, 20, 0);
+    other = server ? tp->client : tp->server;
+    while (moq_session_poll_events(other, &ev, 1) > 0)
+        moq_event_cleanup(&ev);
+    return 0;
+}
+
+/* The peer's GOAWAY as its bridge writes it: the bytes and the stream they
+ * travel on. */
+static bool ctrl_end_peer_goaway(test_pair_t *tp, bool server, uint8_t *out,
+                                 size_t cap, size_t *len, uint64_t *sid)
+{
+    moq_session_t *peer = server ? tp->client : tp->server;
+    moq_transport_bridge_t *pb = server ? tp->client_bridge : tp->server_bridge;
+    fake_endpoint_t *pep = server ? &tp->client_ep : &tp->server_ep;
+    bool found = false;
+
+    if (moq_session_goaway(peer, NULL, 0, 0) != MOQ_OK) return false;
+    if (held_bridge_service(pb, 0) != MOQ_OK) return false;
+    for (size_t i = 0; i < pep->count; i++) {
+        const fake_op_t *o = &pep->ops[i];
+        if (o->kind != FAKE_OP_WRITE || o->data_len == 0 || o->data_len > cap)
+            continue;
+        memcpy(out, o->data, o->data_len);
+        *len = o->data_len;
+        *sid = o->stream_id;
+        found = true;
+    }
+    fake_endpoint_clear_ops(pep);
+    return found;
+}
+
+/* The drafts whose control channel is a pair of unidirectional streams. */
+static const int ctrl_end_uni_drafts[] = { 18, 22 };
+#define CTRL_END_UNI_DRAFTS \
+    (sizeof(ctrl_end_uni_drafts) / sizeof(ctrl_end_uni_drafts[0]))
+/* The ways a control stream can end: FIN, RESET, STOP_SENDING. */
+#define CTRL_END_WAYS ((size_t)(CTRL_END_STOP - CTRL_END_FIN + 1))
+
+/* An established pair of one of those drafts, the client's events drained. */
+static int ctrl_end_uni_pair(test_pair_t *tp, int draft)
+{
+    moq_event_t ev;
+
+    if ((draft == 22 ? d22_pair_init(tp) : d18_pair_init(tp, 0)) < 0)
+        return -1;
+    moq_session_start(tp->client, 0);
+    moq_session_start(tp->server, 0);
+    if (draft == 22)
+        priority_pump(tp, true, 0);
+    else
+        d18_shuttle_until_quiescent(tp, 30, 0);
+    while (moq_session_poll_events(tp->client, &ev, 1) > 0)
+        moq_event_cleanup(&ev);
+    return 0;
+}
+
+/* An established pair of one of those drafts whose client has a single event
+ * slot, still holding its own SETUP_COMPLETE: the next control message that
+ * needs an event blocks in the client's session, and its bridge retains the
+ * control retry. */
+static int ctrl_end_uni_retaining_pair(test_pair_t *tp, int draft)
+{
+    moq_event_t ev;
+
+    if ((draft == 22 ? d22_pair_init_events(tp, 1) : d18_pair_init(tp, 1)) < 0)
+        return -1;
+    moq_session_start(tp->client, 0);
+    moq_session_start(tp->server, 0);
+    if (draft == 22)
+        priority_pump(tp, true, 0);
+    else
+        d18_shuttle_until_quiescent(tp, 30, 0);
+    while (moq_session_poll_events(tp->server, &ev, 1) > 0)
+        moq_event_cleanup(&ev);
+    return 0;
+}
+
+/* Control input as the transport delivers it: on the bidirectional control
+ * stream of draft-16, or on the peer's unidirectional control stream. */
+static moq_result_t ctrl_end_feed(moq_transport_bridge_t *b, bool uni,
+                                  uint64_t sid, const uint8_t *data,
+                                  size_t len, bool fin)
+{
+    return uni ? held_bridge_uni_bytes(b, sid, data, len, fin, 0)
+               : moq_transport_bridge_on_peer_control_bytes(b, sid, data, len,
+                                                            fin, 0);
+}
+
+int test_bidi_control_stream_end_is_violation(void)
+{
+    int failures = 0;
+    char what[96];
+
+    /* Each way of ending the stream, on each side, with nothing retained. */
+    for (int server = 0; server < 2; server++) {
+        for (int how = CTRL_END_FIN; how <= CTRL_END_STOP; how++) {
+            test_pair_t tp;
+            if (test_pair_init(&tp) < 0) return failures + 1;
+            if (!setup_handshake(&tp)) {
+                test_pair_destroy(&tp);
+                return failures + 1;
+            }
+            moq_session_t *s = server ? tp.server : tp.client;
+            moq_transport_bridge_t *b =
+                server ? tp.server_bridge : tp.client_bridge;
+            fake_endpoint_t *ep = server ? &tp.server_ep : &tp.client_ep;
+            snprintf(what, sizeof(what), "%s side, peer %s",
+                     server ? "accepting" : "opening", ctrl_end_names[how]);
+
+            MOQ_TEST_CHECK(!moq_transport_bridge_uses_uni_control(b));
+            MOQ_TEST_CHECK(moq_transport_bridge_stream_is_control(
+                b, CTRL_END_STREAM));
+            MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+            MOQ_TEST_CHECK(!b->needs_close);
+
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)ctrl_end_deliver(b, CTRL_END_STREAM, (ctrl_end_t)how),
+                (int)MOQ_OK);
+            failures += ctrl_end_expect_owed_violation(s, b, ep, what);
+            test_pair_destroy(&tp);
+        }
+    }
+
+    /* The stream is recognised by either identity alone. The opening side
+     * knows it from its own output before any control input arrives; the
+     * accepting side knows it from the peer's first control bytes before it
+     * has written anything. A RESET or a STOP then closes the session. */
+    for (int server = 0; server < 2; server++) {
+        for (int how = CTRL_END_RESET; how <= CTRL_END_STOP; how++) {
+            test_pair_t tp;
+            const fake_op_t *setup;
+
+            if (test_pair_init(&tp) < 0) return failures + 1;
+            moq_session_t *s = server ? tp.server : tp.client;
+            moq_transport_bridge_t *b =
+                server ? tp.server_bridge : tp.client_bridge;
+            fake_endpoint_t *ep = server ? &tp.server_ep : &tp.client_ep;
+            snprintf(what, sizeof(what), "%s side, %s identity only, peer %s",
+                     server ? "accepting" : "opening",
+                     server ? "peer-input" : "local-output",
+                     ctrl_end_names[how]);
+
+            moq_session_start(tp.client, 0);
+            MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(tp.client_bridge, 0),
+                                  (int)MOQ_OK);
+            setup = fake_endpoint_find(&tp.client_ep, FAKE_OP_WRITE);
+            MOQ_TEST_CHECK(setup != NULL && setup->data_len > 1);
+            if (server && setup) {
+                /* One byte of the client's setup: an incomplete message,
+                 * which the accepting side buffers without answering. */
+                MOQ_TEST_CHECK_EQ_INT(
+                    (int)moq_transport_bridge_on_peer_control_bytes(
+                        b, setup->stream_id, setup->data, 1, false, 0),
+                    (int)MOQ_OK);
+                MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(b, 0),
+                                      (int)MOQ_OK);
+                MOQ_TEST_CHECK(b->peer_control_open);
+                MOQ_TEST_CHECK(!b->control_open);
+            } else {
+                MOQ_TEST_CHECK(b->control_open);
+                MOQ_TEST_CHECK(!b->peer_control_open);
+            }
+            MOQ_TEST_CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
+            MOQ_TEST_CHECK(!b->needs_close);
+
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)ctrl_end_deliver(b, CTRL_END_STREAM, (ctrl_end_t)how),
+                (int)MOQ_OK);
+            failures += ctrl_end_expect_owed_violation(s, b, ep, what);
+            test_pair_destroy(&tp);
+        }
+    }
+
+    /* The same three while control input is retained, on each side. That
+     * side's single event slot stays occupied by its own SETUP_COMPLETE, so
+     * the peer's GOAWAY blocks in the session and the bridge holds a control
+     * retry. */
+    for (int server = 0; server < 2; server++) {
+        for (int how = CTRL_END_FIN; how <= CTRL_END_STOP; how++) {
+            test_pair_t tp;
+            moq_event_t ev;
+            uint8_t goaway[128];
+            size_t goaway_len = 0;
+            uint64_t sid = 0;
+
+            if (ctrl_end_retaining_pair(&tp, server != 0) < 0)
+                return failures + 1;
+            moq_session_t *s = server ? tp.server : tp.client;
+            moq_transport_bridge_t *b =
+                server ? tp.server_bridge : tp.client_bridge;
+            fake_endpoint_t *ep = server ? &tp.server_ep : &tp.client_ep;
+            snprintf(what, sizeof(what),
+                     "%s side, control input retained, peer %s",
+                     server ? "accepting" : "opening", ctrl_end_names[how]);
+
+            MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+            MOQ_TEST_CHECK(s->event_head != s->event_tail);
+            MOQ_TEST_CHECK(ctrl_end_peer_goaway(&tp, server != 0, goaway,
+                                                sizeof(goaway), &goaway_len,
+                                                &sid));
+            /* The FIN row ends the stream with the bytes that block. */
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_transport_bridge_on_peer_control_bytes(
+                    b, sid, goaway, goaway_len, how == CTRL_END_FIN, 0),
+                (int)MOQ_ERR_WOULD_BLOCK);
+            MOQ_TEST_CHECK(b->pending_control);
+            MOQ_TEST_CHECK(!b->needs_close);
+            MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+            MOQ_TEST_CHECK(!s->goaway_received);
+
+            if (how == CTRL_END_FIN) {
+                /* A retained FIN is delivered after the input it followed:
+                 * free the slot, and one service pass handles the GOAWAY,
+                 * then the FIN, and closes. */
+                MOQ_TEST_CHECK(b->pending_control_fin);
+                MOQ_TEST_CHECK(moq_session_poll_events(s, &ev, 1) == 1);
+                moq_event_cleanup(&ev);
+                fake_endpoint_clear_ops(ep);
+                MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(b, 0),
+                                      (int)MOQ_OK);
+                MOQ_TEST_CHECK(!b->pending_control);
+                MOQ_TEST_CHECK(s->goaway_received);
+                failures += ctrl_end_expect_close(s, b, ep, 0x3,
+                                                  CTRL_REASON_NONE, NULL, what);
+            } else {
+                /* A RESET or a STOP does not wait for the retained input. */
+                MOQ_TEST_CHECK(!b->pending_control_fin);
+                MOQ_TEST_CHECK_EQ_INT(
+                    (int)ctrl_end_deliver(b, sid, (ctrl_end_t)how),
+                    (int)MOQ_OK);
+                MOQ_TEST_CHECK(!s->goaway_received);
+                failures += ctrl_end_expect_owed_violation(s, b, ep, what);
+            }
+            test_pair_destroy(&tp);
+        }
+    }
+
+    /* The transport's own report that it is done with the stream is local
+     * bookkeeping, not a peer signal: it closes nothing. */
+    for (int server = 0; server < 2; server++) {
+        test_pair_t tp;
+        if (test_pair_init(&tp) < 0) return failures + 1;
+        if (!setup_handshake(&tp)) {
+            test_pair_destroy(&tp);
+            return failures + 1;
+        }
+        moq_session_t *s = server ? tp.server : tp.client;
+        moq_transport_bridge_t *b =
+            server ? tp.server_bridge : tp.client_bridge;
+
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_on_peer_stream_terminal(
+                b, CTRL_END_STREAM, 0),
+            (int)MOQ_OK);
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        MOQ_TEST_CHECK(!b->needs_close);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(b));
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(b));
+        test_pair_destroy(&tp);
+    }
+
+    /* A unidirectional control stream of a later draft is unaffected: its FIN
+     * was, and remains, the same protocol violation. */
+    for (size_t d = 0; d < CTRL_END_UNI_DRAFTS; d++) {
+        test_pair_t tp;
+
+        if (ctrl_end_uni_pair(&tp, ctrl_end_uni_drafts[d]) < 0)
+            return failures + 1;
+        snprintf(what, sizeof(what),
+                 "draft-%d unidirectional control stream, peer FIN",
+                 ctrl_end_uni_drafts[d]);
+        MOQ_TEST_CHECK(moq_transport_bridge_uses_uni_control(tp.client_bridge));
+        MOQ_TEST_CHECK(moq_session_state(tp.client) == MOQ_SESS_ESTABLISHED);
+        MOQ_TEST_CHECK(tp.client_bridge->peer_ctrl_uni_open);
+
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)held_bridge_uni_bytes(
+                tp.client_bridge, tp.client_bridge->peer_ctrl_uni_stream_id,
+                NULL, 0, true, 0),
+            (int)MOQ_OK);
+        failures += ctrl_end_expect_owed_violation(
+            tp.client, tp.client_bridge, &tp.client_ep, what);
+        test_pair_destroy(&tp);
+    }
+
+    return failures;
+}
+
+
+/* Delivers the control stream's end twice to a session that has already
+ * closed. Neither delivery may arm a close of its own or turn the bridge
+ * fatal. */
+static int ctrl_end_deliver_late(moq_transport_bridge_t *b, uint64_t sid,
+                                 ctrl_end_t how, const char *what)
+{
+    int failures = 0;
+
+    for (int again = 0; again < 2; again++) {
+        MOQ_TEST_CHECK_EQ_INT((int)ctrl_end_deliver(b, sid, how), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!b->needs_close);
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(b));
+        MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(b));
+    }
+    if (failures) fprintf(stderr, "CTRLEND: %s (late delivery)\n", what);
+    return failures;
+}
+
+int test_control_stream_end_keeps_first_close(void)
+{
+    int failures = 0;
+    char what[112];
+
+    /* The application closed the session, and the control stream ends before
+     * the bridge has given that close to the transport. */
+    for (int server = 0; server < 2; server++) {
+        for (int how = CTRL_END_FIN; how <= CTRL_END_STOP; how++) {
+            test_pair_t tp;
+            if (test_pair_init(&tp) < 0) return failures + 1;
+            if (!setup_handshake(&tp)) {
+                test_pair_destroy(&tp);
+                return failures + 1;
+            }
+            moq_session_t *s = server ? tp.server : tp.client;
+            moq_transport_bridge_t *b =
+                server ? tp.server_bridge : tp.client_bridge;
+            fake_endpoint_t *ep = server ? &tp.server_ep : &tp.client_ep;
+            snprintf(what, sizeof(what),
+                     "%s side, local close queued, then peer %s",
+                     server ? "accepting" : "opening", ctrl_end_names[how]);
+
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_close(s, CTRL_END_FIRST_CODE,
+                                       ctrl_end_first_reason, 0),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_CLOSED);
+            MOQ_TEST_CHECK(!b->needs_close);
+            MOQ_TEST_CHECK_EQ_SIZE((size_t)b->pending_count, (size_t)0);
+
+            failures += ctrl_end_deliver_late(b, CTRL_END_STREAM,
+                                              (ctrl_end_t)how, what);
+            fake_endpoint_clear_ops(ep);
+            MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(b, 0), (int)MOQ_OK);
+            failures += ctrl_end_expect_close(
+                s, b, ep, CTRL_END_FIRST_CODE, CTRL_REASON_GIVEN,
+                ctrl_end_first_reason, what);
+            test_pair_destroy(&tp);
+        }
+    }
+
+    /* The same, after the transport refused that close: the bridge retains
+     * it with its code and reason, and the control stream ends while it is
+     * retained. The refusal is backpressure, so the pass that met it still
+     * reports success. */
+    for (int server = 0; server < 2; server++) {
+        for (int how = CTRL_END_FIN; how <= CTRL_END_STOP; how++) {
+            test_pair_t tp;
+            if (test_pair_init(&tp) < 0) return failures + 1;
+            if (!setup_handshake(&tp)) {
+                test_pair_destroy(&tp);
+                return failures + 1;
+            }
+            moq_session_t *s = server ? tp.server : tp.client;
+            moq_transport_bridge_t *b =
+                server ? tp.server_bridge : tp.client_bridge;
+            fake_endpoint_t *ep = server ? &tp.server_ep : &tp.client_ep;
+            snprintf(what, sizeof(what),
+                     "%s side, local close refused, then peer %s",
+                     server ? "accepting" : "opening", ctrl_end_names[how]);
+
+            ep->block_close = true;
+            ep->block_count = 0;
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_session_close(s, CTRL_END_FIRST_CODE,
+                                       ctrl_end_first_reason, 0),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(b, 0), (int)MOQ_OK);
+            MOQ_TEST_CHECK(ep->block_count > 0);
+            MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(b));
+            MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(b));
+            MOQ_TEST_CHECK(!b->needs_close);
+            MOQ_TEST_CHECK_EQ_SIZE((size_t)b->pending_count, (size_t)1);
+            if (b->pending_count == 1) {
+                MOQ_TEST_CHECK(b->pending[0].kind == PENDING_CLOSE_TRANSPORT);
+                MOQ_TEST_CHECK_EQ_U64(b->pending[0].error_code,
+                                      CTRL_END_FIRST_CODE);
+            }
+
+            failures += ctrl_end_deliver_late(b, CTRL_END_STREAM,
+                                              (ctrl_end_t)how, what);
+            MOQ_TEST_CHECK_EQ_SIZE((size_t)b->pending_count, (size_t)1);
+            if (b->pending_count == 1) {
+                MOQ_TEST_CHECK(b->pending[0].kind == PENDING_CLOSE_TRANSPORT);
+                MOQ_TEST_CHECK_EQ_U64(b->pending[0].error_code,
+                                      CTRL_END_FIRST_CODE);
+            }
+
+            ep->block_close = false;
+            fake_endpoint_clear_ops(ep);
+            MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(b, 0), (int)MOQ_OK);
+            failures += ctrl_end_expect_close(
+                s, b, ep, CTRL_END_FIRST_CODE, CTRL_REASON_GIVEN,
+                ctrl_end_first_reason, what);
+            test_pair_destroy(&tp);
+        }
+    }
+
+    /* The session closed itself over a peer protocol error (a second GOAWAY),
+     * with its own code and reason, and the control stream ends before that
+     * close has been given to the transport. */
+    for (int server = 0; server < 2; server++) {
+        for (int how = CTRL_END_FIN; how <= CTRL_END_STOP; how++) {
+            test_pair_t tp;
+            uint8_t goaway[128];
+            size_t goaway_len = 0;
+            uint64_t sid = 0;
+
+            if (test_pair_init(&tp) < 0) return failures + 1;
+            if (!setup_handshake(&tp)) {
+                test_pair_destroy(&tp);
+                return failures + 1;
+            }
+            moq_session_t *s = server ? tp.server : tp.client;
+            moq_transport_bridge_t *b =
+                server ? tp.server_bridge : tp.client_bridge;
+            fake_endpoint_t *ep = server ? &tp.server_ep : &tp.client_ep;
+            snprintf(what, sizeof(what),
+                     "%s side, protocol-error close queued, then peer %s",
+                     server ? "accepting" : "opening", ctrl_end_names[how]);
+
+            MOQ_TEST_CHECK(ctrl_end_peer_goaway(&tp, server != 0, goaway,
+                                                sizeof(goaway), &goaway_len,
+                                                &sid));
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_transport_bridge_on_peer_control_bytes(
+                    b, sid, goaway, goaway_len, false, 0),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK(s->goaway_received);
+            MOQ_TEST_CHECK(moq_session_state(s) != MOQ_SESS_CLOSED);
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)moq_transport_bridge_on_peer_control_bytes(
+                    b, sid, goaway, goaway_len, false, 0),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_CLOSED);
+            MOQ_TEST_CHECK(!b->needs_close);
+
+            failures += ctrl_end_deliver_late(b, sid, (ctrl_end_t)how, what);
+            fake_endpoint_clear_ops(ep);
+            MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(b, 0), (int)MOQ_OK);
+            failures += ctrl_end_expect_close(s, b, ep, 0x3,
+                                              CTRL_REASON_SESSION, NULL, what);
+            test_pair_destroy(&tp);
+        }
+    }
+
+    /* A retained FIN whose retained input closes the session by itself. Two
+     * GOAWAYs and the FIN arrive together while no event can be queued; once
+     * one can, the retry handles the first GOAWAY and meets the protocol
+     * error in the second. The session's own close stands, with its reason;
+     * the FIN that follows adds nothing. */
+    for (int server = 0; server < 2; server++) {
+        test_pair_t tp;
+        moq_event_t ev;
+        uint8_t goaway[128];
+        uint8_t twice[256];
+        size_t goaway_len = 0;
+        uint64_t sid = 0;
+
+        if (ctrl_end_retaining_pair(&tp, server != 0) < 0)
+            return failures + 1;
+        moq_session_t *s = server ? tp.server : tp.client;
+        moq_transport_bridge_t *b =
+            server ? tp.server_bridge : tp.client_bridge;
+        fake_endpoint_t *ep = server ? &tp.server_ep : &tp.client_ep;
+        snprintf(what, sizeof(what),
+                 "%s side, retained input ends in a protocol error, then its "
+                 "FIN", server ? "accepting" : "opening");
+
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        MOQ_TEST_CHECK(s->event_head != s->event_tail);
+        MOQ_TEST_CHECK(ctrl_end_peer_goaway(&tp, server != 0, goaway,
+                                            sizeof(goaway), &goaway_len, &sid));
+        memcpy(twice, goaway, goaway_len);
+        memcpy(twice + goaway_len, goaway, goaway_len);
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_transport_bridge_on_peer_control_bytes(
+                b, sid, twice, 2 * goaway_len, true, 0),
+            (int)MOQ_ERR_WOULD_BLOCK);
+        MOQ_TEST_CHECK(b->pending_control);
+        MOQ_TEST_CHECK(b->pending_control_fin);
+        MOQ_TEST_CHECK(!b->needs_close);
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+
+        MOQ_TEST_CHECK(moq_session_poll_events(s, &ev, 1) == 1);
+        moq_event_cleanup(&ev);
+        fake_endpoint_clear_ops(ep);
+        MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(b, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!b->pending_control);
+        MOQ_TEST_CHECK(!b->pending_control_fin);
+        MOQ_TEST_CHECK(s->goaway_received);
+        failures += ctrl_end_expect_close(s, b, ep, 0x3, CTRL_REASON_SESSION,
+                                          NULL, what);
+        test_pair_destroy(&tp);
+    }
+
+    /* Control input is already retained when the application closes the
+     * session. Later input on that control stream, bytes with or without a
+     * FIN, is accepted and not delivered, and its FIN adds no debt; the
+     * retained input and the close decided first stay as they are until the
+     * transport takes that close. Each control topology, with the close still
+     * queued and with the close refused by the transport. */
+    for (size_t n = 0; n < 4 * 4; n++) {
+        static const struct {
+            int draft;
+            bool server;
+            const char *name;
+        } where[4] = {
+            { 16, false, "draft-16 opening side" },
+            { 16, true,  "draft-16 accepting side" },
+            { 18, false, "draft-18 client" },
+            { 22, false, "draft-22 client" },
+        };
+        const int draft = where[n / 4].draft;
+        const bool server = where[n / 4].server;
+        const bool uni = draft != 16;
+        const bool refused = (n & 1u) != 0;
+        const bool late_fin = (n & 2u) != 0;
+        test_pair_t tp;
+        uint8_t goaway[128];
+        size_t goaway_len = 0;
+        uint64_t sid = 0;
+
+        if ((uni ? ctrl_end_uni_retaining_pair(&tp, draft)
+                 : ctrl_end_retaining_pair(&tp, server)) < 0)
+            return failures + 1;
+        moq_session_t *s = server ? tp.server : tp.client;
+        moq_transport_bridge_t *b =
+            server ? tp.server_bridge : tp.client_bridge;
+        fake_endpoint_t *ep = server ? &tp.server_ep : &tp.client_ep;
+        snprintf(what, sizeof(what),
+                 "%s, control input retained, close %s, late bytes%s",
+                 where[n / 4].name, refused ? "refused" : "queued",
+                 late_fin ? " with FIN" : "");
+
+        MOQ_TEST_CHECK(moq_session_state(s) == MOQ_SESS_ESTABLISHED);
+        MOQ_TEST_CHECK(s->event_head != s->event_tail);
+        MOQ_TEST_CHECK(ctrl_end_peer_goaway(&tp, server, goaway,
+                                            sizeof(goaway), &goaway_len, &sid));
+        if (uni) {
+            MOQ_TEST_CHECK(b->peer_ctrl_uni_open);
+            MOQ_TEST_CHECK_EQ_U64(b->peer_ctrl_uni_stream_id, sid);
+        }
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)ctrl_end_feed(b, uni, sid, goaway, goaway_len, false),
+            (int)MOQ_ERR_WOULD_BLOCK);
+        MOQ_TEST_CHECK(b->pending_control);
+        MOQ_TEST_CHECK_EQ_U64(b->pending_control_stream_id, sid);
+        MOQ_TEST_CHECK(!b->pending_control_fin);
+        MOQ_TEST_CHECK(!s->goaway_received);
+
+        if (refused) {
+            ep->block_close = true;
+            ep->block_count = 0;
+        }
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_close(s, CTRL_END_FIRST_CODE,
+                                   ctrl_end_first_reason, 0),
+            (int)MOQ_OK);
+        if (refused) {
+            MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(b, 0), (int)MOQ_OK);
+            MOQ_TEST_CHECK(ep->block_count > 0);
+            MOQ_TEST_CHECK_EQ_SIZE((size_t)b->pending_count, (size_t)1);
+            MOQ_TEST_CHECK(b->pending_control);
+        }
+
+        /* The late input is a GOAWAY too: delivered, it would be a second
+         * one, and the session would have to answer it. */
+        for (int again = 0; again < 2; again++) {
+            MOQ_TEST_CHECK_EQ_INT(
+                (int)ctrl_end_feed(b, uni, sid, goaway, goaway_len, late_fin),
+                (int)MOQ_OK);
+            MOQ_TEST_CHECK(b->pending_control);
+            MOQ_TEST_CHECK_EQ_U64(b->pending_control_stream_id, sid);
+            MOQ_TEST_CHECK(!b->pending_control_fin);
+            MOQ_TEST_CHECK(!b->needs_close);
+            MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(b));
+            MOQ_TEST_CHECK(!moq_transport_bridge_is_closed(b));
+            MOQ_TEST_CHECK(!s->goaway_received);
+        }
+        if (refused) {
+            MOQ_TEST_CHECK_EQ_SIZE((size_t)b->pending_count, (size_t)1);
+            if (b->pending_count == 1) {
+                MOQ_TEST_CHECK(b->pending[0].kind == PENDING_CLOSE_TRANSPORT);
+                MOQ_TEST_CHECK_EQ_U64(b->pending[0].error_code,
+                                      CTRL_END_FIRST_CODE);
+            }
+            ep->block_close = false;
+        }
+
+        fake_endpoint_clear_ops(ep);
+        MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(b, 0), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!s->goaway_received);
+        failures += ctrl_end_expect_close(
+            s, b, ep, CTRL_END_FIRST_CODE, CTRL_REASON_GIVEN,
+            ctrl_end_first_reason, what);
+        test_pair_destroy(&tp);
+    }
+
+    /* The later drafts share the rule: a unidirectional control stream that
+     * ends after the session's own close changes nothing either. */
+    for (size_t n = 0; n < CTRL_END_UNI_DRAFTS * CTRL_END_WAYS; n++) {
+        int draft = ctrl_end_uni_drafts[n / CTRL_END_WAYS];
+        int how = CTRL_END_FIN + (int)(n % CTRL_END_WAYS);
+        test_pair_t tp;
+        moq_transport_bridge_t *b;
+        moq_result_t rc;
+
+        if (ctrl_end_uni_pair(&tp, draft) < 0) return failures + 1;
+        b = tp.client_bridge;
+        snprintf(what, sizeof(what),
+                 "draft-%d unidirectional control, local close queued, "
+                 "then peer %s",
+                 draft, ctrl_end_names[how]);
+        MOQ_TEST_CHECK(moq_transport_bridge_uses_uni_control(b));
+        MOQ_TEST_CHECK(moq_session_state(tp.client) == MOQ_SESS_ESTABLISHED);
+        MOQ_TEST_CHECK(b->peer_ctrl_uni_open);
+        MOQ_TEST_CHECK(b->local_ctrl_uni_open);
+
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_session_close(tp.client, CTRL_END_FIRST_CODE,
+                                   ctrl_end_first_reason, 0),
+            (int)MOQ_OK);
+        MOQ_TEST_CHECK(!b->needs_close);
+        for (int again = 0; again < 2; again++) {
+            if (how == CTRL_END_FIN)
+                rc = held_bridge_uni_bytes(b, b->peer_ctrl_uni_stream_id,
+                                           NULL, 0, true, 0);
+            else if (how == CTRL_END_RESET)
+                rc = held_bridge_reset(b, b->peer_ctrl_uni_stream_id,
+                                       CTRL_END_PEER_CODE, 0);
+            else
+                rc = moq_transport_bridge_on_peer_stop_sending(
+                    b, b->local_ctrl_uni_stream_id, CTRL_END_PEER_CODE, 0);
+            MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+            MOQ_TEST_CHECK(!b->needs_close);
+            MOQ_TEST_CHECK(!moq_transport_bridge_is_fatal(b));
+        }
+        fake_endpoint_clear_ops(&tp.client_ep);
+        MOQ_TEST_CHECK_EQ_INT((int)held_bridge_service(b, 0), (int)MOQ_OK);
+        failures += ctrl_end_expect_close(
+            tp.client, b, &tp.client_ep, CTRL_END_FIRST_CODE,
+            CTRL_REASON_GIVEN, ctrl_end_first_reason, what);
+        test_pair_destroy(&tp);
+    }
+
+    return failures;
+}
+
 #ifdef MOQ_BRIDGE_TEST_INJECT
 
 

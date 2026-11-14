@@ -102,6 +102,14 @@ wtq_result_t wtq_session_receive_contract(const wtq_session_t *s, size_t *n,
     *n = 65535; *mode = WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED;
     return WTQ_OK;
 }
+#include "wtquic_abort_fake.h"
+void wtq_session_events_init_ex(wtq_session_events_t *e, size_t size)
+{
+    if (!e || size < sizeof(e->struct_size)) return;
+    size_t n = size < sizeof(*e) ? size : sizeof(*e);
+    memset(e, 0, n);
+    e->struct_size = (uint32_t)n;
+}
 wtq_send_commit_mode_t wtq_session_send_commit_mode(const wtq_session_t *s)
 { return s ? s->mode : WTQ_SEND_COMMIT_UNSUPPORTED; }
 wtq_local_flush_mode_t wtq_session_local_flush_mode(const wtq_session_t *s)

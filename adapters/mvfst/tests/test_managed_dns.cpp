@@ -12,6 +12,7 @@
 #include <moq/session.h>
 
 #include <quic/QuicConstants.h>
+#include <quic/congestion_control/CongestionControllerFactory.h>
 #include <quic/server/QuicServer.h>
 #include <quic/server/QuicServerTransport.h>
 
@@ -154,8 +155,11 @@ public:
 class cert_srv_factory : public quic::QuicServerTransportFactory {
     cert_server &s_;
     cert_srv_cb &cb_;
+    std::shared_ptr<quic::CongestionControllerFactory> cc_;
 public:
-    cert_srv_factory(cert_server &s, cert_srv_cb &cb) : s_(s), cb_(cb) {}
+    cert_srv_factory(cert_server &s, cert_srv_cb &cb,
+                     std::shared_ptr<quic::CongestionControllerFactory> cc)
+        : s_(s), cb_(cb), cc_(std::move(cc)) {}
     quic::QuicServerTransport::Ptr make(
         folly::EventBase *evb,
         std::unique_ptr<quic::FollyAsyncUDPSocketAlias> sock,
@@ -165,6 +169,10 @@ public:
         s_.evb.store(evb);
         auto t = quic::QuicServerTransport::make(
             evb, std::move(sock), &cb_, &cb_, std::move(ctx));
+        /* Settings create the congestion controller before the server's
+         * worker installs its factory: give the transport the server's
+         * own factory first, so both stages use the same one. */
+        t->setCongestionControllerFactory(cc_);
         auto ts = t->getTransportSettings();
         ts.advertisedInitialMaxStreamsBidi = 100;
         ts.advertisedInitialMaxStreamsUni = 100;
@@ -236,9 +244,14 @@ static void test_dns_loopback()
     cert_server csv;
     cert_srv_cb cscb(csv);
     auto server = quic::QuicServer::createQuicServer();
+    /* One congestion-controller factory for the server: QuicServer
+     * hands it to its worker, and the transport factory gives it to each
+     * transport before that transport's settings are applied. */
+    auto cc = std::make_shared<quic::DefaultCongestionControllerFactory>();
+    server->setCongestionControllerFactory(cc);
     server->setFizzContext(sctx);
     server->setQuicServerTransportFactory(
-        std::make_unique<cert_srv_factory>(csv, cscb));
+        std::make_unique<cert_srv_factory>(csv, cscb, cc));
     folly::SocketAddress addr("localhost", 0, true);
     server->start(addr, 1);
     server->waitUntilInitialized();

@@ -5152,6 +5152,45 @@ static void test_commit_table_dispatch(void)
     if (g_fail == before) puts("PASS: msquic managed commit table dispatch");
 }
 
+static const wtq_stream_abort_t *abort_rec;
+static unsigned abort_calls;
+static void record_managed_abort(wtq_session_t *session, wtq_stream_t *stream,
+                                 const wtq_stream_abort_t *rec, void *user)
+{
+    CHECK(session == commit_session);
+    CHECK(stream == commit_stream);
+    CHECK(rec == abort_rec);
+    CHECK(user == commit_adapter);
+    ++abort_calls;
+}
+/* The facade forwards the classified abort, record unchanged, to the
+ * adapter it serves, and to no one when there is none. */
+static void test_abort_table_dispatch(void)
+{
+    unsigned char session_tag, stream_tag, adapter_tag;
+    wtq_stream_abort_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.struct_size = (uint32_t)sizeof(rec);
+    rec.direction = WTQ_STREAM_ABORT_RESET;
+    rec.origin = WTQ_STREAM_ABORT_ORIGIN_APPLICATION;
+    commit_session = (wtq_session_t *)&session_tag;
+    commit_stream = (wtq_stream_t *)&stream_tag;
+    commit_adapter = &adapter_tag;
+    abort_rec = &rec;
+    abort_calls = 0;
+    const wtq_session_events_t forward = {
+        .struct_size = sizeof(forward),
+        .on_stream_abort = record_managed_abort,
+    };
+    int before = g_fail;
+    wtq_test_forward_table_t result = wtq_test_msquic_abort_dispatch(
+        &forward, commit_session, commit_stream, &rec, commit_adapter);
+    CHECK(result.table_size == sizeof(wtq_session_events_t));
+    CHECK(result.installed);
+    CHECK(abort_calls == 1);
+    if (g_fail == before) puts("PASS: msquic managed abort table dispatch");
+}
+
 /* --- the stream-resource block: ABI gating, bounds, forwarding ---------- *
  *
  * max_local_streams reaches the native client/listener config the callee is
@@ -5336,6 +5375,7 @@ static void test_stream_resource_forwarding(void)
 int main(int argc, char **argv)
 {
     test_commit_table_dispatch();
+    test_abort_table_dispatch();
     if (argc == 2 && strcmp(argv[1], "--commit-forwarding") == 0)
         return g_fail ? 1 : 0;
     if (argc != 1) return 2;

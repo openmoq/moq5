@@ -69,6 +69,8 @@ int main(void)
     failures += test_close_retry_after_blocked_control();
     failures += test_deferred_close_clears_ordinary_pending();
     failures += test_close_retry_would_block();
+    failures += test_bidi_control_stream_end_is_violation();
+    failures += test_control_stream_end_keeps_first_close();
 #ifdef MOQ_BRIDGE_TEST_INJECT
     failures += test_deferred_close_keeps_its_own_code();
 #endif

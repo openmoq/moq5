@@ -9,7 +9,7 @@ elseif(NOT PROBE_CONFIG IN_LIST CMAKE_CONFIGURATION_TYPES)
     message(FATAL_ERROR "Fixture configuration '${PROBE_CONFIG}' is unavailable")
 endif()
 # Deliberately tiny ABI fixtures, not provider implementations or qualification.
-set(_api_kinds old query admission flush-mode flush-query flush new)
+set(_api_kinds old query admission flush-mode flush-query flush new abort-missing)
 set(_msquic_kinds msquic-old msquic-new msquic-missing msquic-keepalive-old
     msquic-keepalive-missing)
 if(API_KIND IN_LIST _msquic_kinds)
@@ -48,7 +48,7 @@ if(API_KIND IN_LIST _msquic_kinds)
         "wtq_result_t wtq_msquic_client_connect(wtq_msquic_env_t *, const wtq_msquic_client_cfg_t *, wtq_session_t **);\n"
         "wtq_result_t wtq_msquic_listener_start(wtq_msquic_env_t *, const wtq_msquic_listener_cfg_t *, wtq_msquic_listener_t **);\n"
         "#ifdef __cplusplus\n}\n#endif\n")
-    set(source "#include <wtquic/wtquic_msquic.h>\n"
+    string(CONCAT source "#include <wtquic/wtquic_msquic.h>\n"
         "void wtq_msquic_client_cfg_init_ex(wtq_msquic_client_cfg_t *c, size_t n) { (void)c; (void)n; }\n"
         "void wtq_msquic_listener_cfg_init_ex(wtq_msquic_listener_cfg_t *c, size_t n) { (void)c; (void)n; }\n"
         "wtq_result_t wtq_msquic_client_connect(wtq_msquic_env_t *e, const wtq_msquic_client_cfg_t *c, wtq_session_t **s) { (void)e; (void)c; (void)s; return -1; }\n")
@@ -73,21 +73,28 @@ set(_has_admission FALSE)
 set(_has_flush_mode FALSE)
 set(_has_flush_query FALSE)
 set(_has_budget FALSE)
-if(API_KIND MATCHES "^(admission|flush-mode|flush-query|flush|new)$")
+if(API_KIND MATCHES "^(admission|flush-mode|flush-query|flush|new|abort-missing)$")
     set(_has_admission TRUE)
 endif()
-if(API_KIND MATCHES "^(flush-mode|flush|new)$")
+if(API_KIND MATCHES "^(flush-mode|flush|new|abort-missing)$")
     set(_has_flush_mode TRUE)
 endif()
-if(API_KIND MATCHES "^(flush-query|flush|new)$")
+if(API_KIND MATCHES "^(flush-query|flush|new|abort-missing)$")
     set(_has_flush_query TRUE)
 endif()
-if(API_KIND MATCHES "^(flush-mode|flush-query|new)$")
+if(API_KIND MATCHES "^(flush-mode|flush-query|new|abort-missing)$")
     set(_has_budget TRUE)
+endif()
+# Classified stream aborts: in every kind but the oldest and abort-missing,
+# which is new without them (header and library). The discovery test's
+# missing-library rows therefore each still lack exactly one entry point.
+set(_has_abort TRUE)
+if(API_KIND MATCHES "^(old|abort-missing)$")
+    set(_has_abort FALSE)
 endif()
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/include/wtquic")
 # Guarded: the MsQuic component fixture's header includes this one too.
-set(header "#ifndef WTQ_API_FIXTURE_SESSION_H\n#define WTQ_API_FIXTURE_SESSION_H\n#include <stddef.h>\n#ifdef __cplusplus\nextern \"C\" {\n#endif\ntypedef struct wtq_session wtq_session_t;\ntypedef int wtq_result_t;\ntypedef enum { WTQ_PAUSE_NONE } wtq_receive_pause_mode_t;\n")
+set(header "#ifndef WTQ_API_FIXTURE_SESSION_H\n#define WTQ_API_FIXTURE_SESSION_H\n#include <stddef.h>\n#include <stdint.h>\n#ifdef __cplusplus\nextern \"C\" {\n#endif\ntypedef struct wtq_session wtq_session_t;\ntypedef int wtq_result_t;\ntypedef enum { WTQ_PAUSE_NONE } wtq_receive_pause_mode_t;\n")
 if(NOT API_KIND STREQUAL "old")
     string(APPEND header "wtq_result_t wtq_session_receive_contract(const wtq_session_t *, size_t *, wtq_receive_pause_mode_t *);\n")
 endif()
@@ -106,6 +113,20 @@ endif()
 if(_has_flush_query)
     string(APPEND header "wtq_result_t wtq_session_local_flush(const wtq_session_t *);\n")
 endif()
+if(_has_abort)
+    string(APPEND header "typedef struct wtq_stream wtq_stream_t;\n"
+        "typedef struct wtq_stream_abort { uint32_t struct_size; uint32_t direction; uint32_t origin; uint32_t app_code; uint64_t wire_code; } wtq_stream_abort_t;\n"
+        "#define WTQ_STREAM_ABORT_V0_SIZE (offsetof(wtq_stream_abort_t, wire_code) + sizeof(uint64_t))\n"
+        "#define WTQ_STREAM_ABORT_RESET 1u\n#define WTQ_STREAM_ABORT_STOP 2u\n"
+        "#define WTQ_STREAM_ABORT_ORIGIN_UNKNOWN 0u\n#define WTQ_STREAM_ABORT_ORIGIN_APPLICATION 1u\n"
+        "#define WTQ_STREAM_ABORT_ORIGIN_SESSION_GONE 2u\n#define WTQ_STREAM_ABORT_ORIGIN_PROTOCOL 3u\n"
+        "typedef struct wtq_session_events { uint32_t struct_size; void (*on_stream_abort)(wtq_session_t *, wtq_stream_t *, const wtq_stream_abort_t *, void *); } wtq_session_events_t;\n"
+        "#define WTQ_SESSION_EVENTS_INIT { (uint32_t)sizeof(wtq_session_events_t), 0 }\n"
+        "#define WTQ_SESSION_EVENTS_COVERS(events, member) ((size_t)(events)->struct_size >= offsetof(wtq_session_events_t, member) + sizeof(((const wtq_session_events_t *)0)->member))\n"
+        "#define WTQ_HAVE_SESSION_ABORT_OBSERVABILITY 1\n"
+        "#define WTQ_ABORT_OBSERVES_RESET_CODE 1u\n#define WTQ_ABORT_OBSERVES_STOP_EVENT 2u\n#define WTQ_ABORT_OBSERVES_STOP_CODE 4u\n"
+        "uint32_t wtq_session_abort_observability(const wtq_session_t *);\n")
+endif()
 string(APPEND header "#ifdef __cplusplus\n}\n#endif\n#endif\n")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/include/wtquic/session.h" "${header}")
 set(source "#include <wtquic/session.h>\nint fixture_anchor(void) { return 0; }\n")
@@ -123,6 +144,9 @@ if(_has_flush_mode)
 endif()
 if(_has_flush_query)
     string(APPEND source "wtq_result_t wtq_session_local_flush(const wtq_session_t *s) { (void)s; return -1; }\n")
+endif()
+if(_has_abort)
+    string(APPEND source "uint32_t wtq_session_abort_observability(const wtq_session_t *s) { (void)s; return 0; }\n")
 endif()
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/fixture.c" "${source}")
 add_library(fixture STATIC "${CMAKE_CURRENT_BINARY_DIR}/fixture.c")

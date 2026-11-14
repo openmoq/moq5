@@ -17,6 +17,7 @@
 #include <moq/rcbuf.h>
 
 #include <quic/QuicConstants.h>
+#include <quic/congestion_control/CongestionControllerFactory.h>
 #include <quic/server/QuicServer.h>
 #include <quic/server/QuicServerTransport.h>
 
@@ -165,7 +166,9 @@ private:
 
 class srv_factory : public quic::QuicServerTransportFactory {
 public:
-    srv_factory(server_env &s, srv_cb &cb) : s_(s), cb_(cb) {}
+    srv_factory(server_env &s, srv_cb &cb,
+                std::shared_ptr<quic::CongestionControllerFactory> cc)
+        : s_(s), cb_(cb), cc_(std::move(cc)) {}
     quic::QuicServerTransport::Ptr make(
         folly::EventBase *evb,
         std::unique_ptr<quic::FollyAsyncUDPSocketAlias> sock,
@@ -174,6 +177,10 @@ public:
     {
         s_.evb.store(evb);
         auto t = quic::QuicServerTransport::make(evb, std::move(sock), &cb_, &cb_, std::move(ctx));
+        /* Settings create the congestion controller before the server's
+         * worker installs its factory: give the transport the server's
+         * own factory first, so both stages use the same one. */
+        t->setCongestionControllerFactory(cc_);
         auto ts = t->getTransportSettings();
         ts.advertisedInitialMaxStreamsBidi = 100;
         ts.advertisedInitialMaxStreamsUni = 100;
@@ -185,6 +192,7 @@ public:
 private:
     server_env &s_;
     srv_cb &cb_;
+    std::shared_ptr<quic::CongestionControllerFactory> cc_;
 };
 
 static void service_server(server_env &sv) {
@@ -353,9 +361,14 @@ static void test_managed_client_loopback()
     server_env sv;
     srv_cb scb(sv);
     auto server = quic::QuicServer::createQuicServer();
+    /* One congestion-controller factory for the server: QuicServer
+     * hands it to its worker, and the transport factory gives it to each
+     * transport before that transport's settings are applied. */
+    auto cc = std::make_shared<quic::DefaultCongestionControllerFactory>();
+    server->setCongestionControllerFactory(cc);
     server->setFizzContext(sctx);
     server->setQuicServerTransportFactory(
-        std::make_unique<srv_factory>(sv, scb));
+        std::make_unique<srv_factory>(sv, scb, cc));
     folly::SocketAddress addr("127.0.0.1", 0);
     server->start(addr, 1);
     server->waitUntilInitialized();
