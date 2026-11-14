@@ -553,10 +553,11 @@ public final class Subscriber {
 
 /// A fill meaningful only to its issuing Subscriber. Stale once its slot is
 /// released; local notices and native retirement can pin it after terminal
-/// polling. Never reused within one linked core library instance, even across
-/// Subscriber lifetimes. Other library copies, unload/reload and processes have
-/// separate domains: do not persist or interchange their tokens. Issuance safety
-/// does not make a Subscriber thread-safe.
+/// polling. Unique within one Subscriber and never reused by it; a fill from
+/// another Subscriber, or from a destroyed one, is refused by its instance tag
+/// as any other handle is (probabilistic, with a core handle's odds). Do not
+/// persist or interchange tokens across Subscribers, library copies,
+/// unload/reload or processes. Issuance does not make a Subscriber thread-safe.
 public struct SubscriberFill: Sendable, Hashable {
     internal let raw: moq_sub_fill_t
 

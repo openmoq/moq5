@@ -2,9 +2,6 @@
 #include <moq/sim.h>
 #include "test_support.h"
 #include "test_alloc_support.h"
-#if defined(MOQ_TEST_PTHREADS)
-#include <pthread.h>
-#endif
 #include <string.h>
 
 static int failures;
@@ -16,6 +13,10 @@ static bool expect(bool ok, const char *expression, int line)
 }
 
 #define EXPECT(expression) expect((expression), #expression, __LINE__)
+
+/* A token's instance tag and sequence, as the facade packs them. */
+static uint64_t tag_of(moq_sub_fill_t fill) { return fill._opaque >> 48; }
+static uint64_t seq_of(moq_sub_fill_t fill) { return fill._opaque & ((UINT64_C(1) << 48) - 1); }
 
 typedef struct {
     test_alloc_state_t memory;
@@ -44,6 +45,9 @@ static bool close_fixture(fixture_t *f)
     return f->memory.balance == 0;
 }
 
+/* The pair's creation clock; a session's tag hashes it. */
+static uint64_t g_initial_now_us = 1000;
+
 static bool open_fixture(fixture_t *f, moq_version_t version,
                          const moq_alloc_t *sub_alloc)
 {
@@ -53,7 +57,7 @@ static bool open_fixture(fixture_t *f, moq_version_t version,
     cfg.alloc = &f->alloc;
     cfg.version = version;
     cfg.seed = 7;
-    cfg.initial_now_us = 1000;
+    cfg.initial_now_us = g_initial_now_us;
     cfg.client_send_request_capacity = true;
     cfg.client_initial_request_capacity = 16;
     cfg.server_send_request_capacity = true;
@@ -217,12 +221,19 @@ static void *reuse_realloc(void *ptr, size_t old_size, size_t new_size, void *ct
     return next;
 }
 
+/* Session and subscriber destroyed and created again at the exact same
+ * addresses. An exact replay of every tag input (address, the session's own
+ * tag, the facade serial) repeats the tag, as a core handle's would; a real
+ * host's clock differs, so each owner's session is created at a later clock
+ * (bounded retries, since the tag is a 15-bit hash). The new owner's sequence
+ * restarts at 1 and refuses the earlier owners' tokens by tag. */
 static bool owner_address_reuse(void)
 {
     reuse_memory_t memory = {0};
     moq_alloc_t alloc = { &memory, reuse_alloc, reuse_realloc, reuse_free };
     moq_sub_fill_t children[3] = {{0}, {0}, {0}};
     uintptr_t owner_address = 0;
+    uint64_t clock = 1000;
     bool ok = true;
     for (unsigned i = 0; i < 3 && ok; ++i) {
         fixture_t f;
@@ -230,20 +241,30 @@ static bool owner_address_reuse(void)
         moq_location_filter_cfg_t location;
         moq_fill_cfg_t fill;
         init_fill(&fill, &location);
-        ok = open_fixture(&f, MOQ_VERSION_DRAFT_22, &alloc);
-        if (ok && i == 0) owner_address = (uintptr_t)f.sub;
-        if (ok) ok = (uintptr_t)f.sub == owner_address;
-        if (ok) ok = subscribe(&f, &fill, &track) == MOQ_OK && track != NULL;
-        if (ok) {
-            children[i] = moq_sub_track_fill(track);
-            ok = moq_sub_fill_is_valid(children[i]) && accept_request(&f, true, true);
+        for (unsigned attempt = 0; ok; ++attempt) {
+            g_initial_now_us = clock;
+            clock += 1000;
+            ok = open_fixture(&f, MOQ_VERSION_DRAFT_22, &alloc);
+            if (ok && i == 0) owner_address = (uintptr_t)f.sub;
+            if (ok) ok = (uintptr_t)f.sub == owner_address;
+            if (ok) ok = subscribe(&f, &fill, &track) == MOQ_OK && track != NULL;
+            if (ok) {
+                children[i] = moq_sub_track_fill(track);
+                ok = moq_sub_fill_is_valid(children[i]) && accept_request(&f, true, true);
+            }
+            bool distinct = true;
+            for (unsigned j = 0; j < i; ++j)
+                if (tag_of(children[i]) == tag_of(children[j])) distinct = false;
+            if (!ok || distinct || attempt >= 8) break;
+            ok = cancel_and_retire(&f, children[i]) && close_fixture(&f);
         }
+        if (ok) ok = EXPECT(seq_of(children[i]) == 1);
         for (unsigned j = 0; j < i && ok; ++j) {
             moq_result_t foreign = moq_sub_cancel_fill(f.sub, children[j], now(&f));
             printf("ORACLE exact_owner_address_reuse old=%llu new=%llu result=%d\n",
                    (unsigned long long)children[j]._opaque,
                    (unsigned long long)children[i]._opaque, (int)foreign);
-            ok = EXPECT(children[i]._opaque > children[j]._opaque &&
+            ok = EXPECT(tag_of(children[i]) != tag_of(children[j]) &&
                         foreign == MOQ_ERR_STALE_HANDLE);
         }
         /* Cover both an unretired child at destruction and a polled terminal. */
@@ -252,6 +273,7 @@ static bool owner_address_reuse(void)
         for (size_t j = 0; j < memory.count; ++j)
             ok = !memory.blocks[j].busy && ok;
     }
+    g_initial_now_us = 1000;
     for (size_t i = 0; i < memory.count; ++i) free(memory.blocks[i].ptr);
     return ok && !memory.bad_free;
 }
@@ -322,99 +344,123 @@ static bool legacy_no_identity(moq_version_t version)
     return close_fixture(&f) && ok;
 }
 
-#if defined(MOQ_TEST_PTHREADS)
-enum { WORKERS = 4, ISSUES_PER_WORKER = 32 };
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t condition;
-    unsigned ready;
-    bool go;
-} start_gate_t;
-
-typedef struct {
-    start_gate_t *gate;
-    uint64_t identities[ISSUES_PER_WORKER];
-    bool ok;
-} worker_t;
-
-static void *issue_independently(void *ctx)
+/* One fill-bearing request on a fresh track, then two through updates of
+ * that track; each is cancelled and retired before the next. Returns the
+ * three tokens. */
+static bool issue_three(fixture_t *f, moq_sub_fill_t out[3])
 {
-    worker_t *worker = ctx;
-    pthread_mutex_lock(&worker->gate->mutex);
-    ++worker->gate->ready;
-    pthread_cond_broadcast(&worker->gate->condition);
-    while (!worker->gate->go)
-        pthread_cond_wait(&worker->gate->condition, &worker->gate->mutex);
-    pthread_mutex_unlock(&worker->gate->mutex);
-    worker->ok = true;
-    for (unsigned i = 0; i < ISSUES_PER_WORKER && worker->ok; ++i) {
-        fixture_t f;
-        moq_sub_track_t *track = NULL;
-        moq_fill_cfg_t fill;
-        moq_location_filter_cfg_t location;
-        init_fill(&fill, &location);
-        worker->ok = open_fixture(&f, MOQ_VERSION_DRAFT_22, NULL);
-        if (worker->ok) worker->ok = subscribe(&f, &fill, &track) == MOQ_OK && track &&
-                                    accept_request(&f, true, true);
-        if (worker->ok) {
-            moq_sub_fill_t child = moq_sub_track_fill(track);
-            worker->identities[i] = child._opaque;
-            worker->ok = moq_sub_fill_is_valid(child) && cancel_and_retire(&f, child);
-        }
-        worker->ok = close_fixture(&f) && worker->ok;
+    moq_location_filter_cfg_t location;
+    moq_fill_cfg_t fill;
+    init_fill(&fill, &location);
+    moq_sub_track_t *track = NULL;
+    bool ok = subscribe(f, &fill, &track) == MOQ_OK && track &&
+              accept_request(f, true, true);
+    if (ok) {
+        out[0] = moq_sub_track_fill(track);
+        ok = moq_sub_fill_is_valid(out[0]) && cancel_and_retire(f, out[0]);
     }
-    return NULL;
-}
-
-static int compare_identity(const void *left, const void *right)
-{
-    uint64_t a = *(const uint64_t *)left, b = *(const uint64_t *)right;
-    return a < b ? -1 : a > b;
-}
-
-static bool concurrent_owners(void)
-{
-    start_gate_t gate = { .mutex = PTHREAD_MUTEX_INITIALIZER,
-                          .condition = PTHREAD_COND_INITIALIZER };
-    worker_t workers[WORKERS] = {0};
-    pthread_t threads[WORKERS];
-    unsigned started = 0;
-    for (; started < WORKERS; ++started) {
-        workers[started].gate = &gate;
-        if (pthread_create(&threads[started], NULL, issue_independently,
-                           &workers[started]) != 0) break;
-    }
-    pthread_mutex_lock(&gate.mutex);
-    while (gate.ready != started) pthread_cond_wait(&gate.condition, &gate.mutex);
-    gate.go = true;
-    pthread_cond_broadcast(&gate.condition);
-    pthread_mutex_unlock(&gate.mutex);
-    bool ok = started == WORKERS;
-    unsigned completed = 0;
-    uint64_t all[WORKERS * ISSUES_PER_WORKER] = {0};
-    for (unsigned i = 0; i < started; ++i) {
-        ok = pthread_join(threads[i], NULL) == 0 && ok;
-        ok = workers[i].ok && ok;
-        if (workers[i].ok) ++completed;
-        for (unsigned j = 0; j < ISSUES_PER_WORKER; ++j) {
-            all[i * ISSUES_PER_WORKER + j] = workers[i].identities[j];
-            ok = workers[i].identities[j] != 0 && ok;
-            if (j) ok = workers[i].identities[j] > workers[i].identities[j - 1] && ok;
+    for (unsigned i = 1; i < 3 && ok; ++i) {
+        moq_sub_update_cfg_t update;
+        moq_sub_update_cfg_init_sized(&update, sizeof(update));
+        update.fill = &fill;
+        ok = moq_sub_update_subscription(f->sub, track, &update, now(f)) == MOQ_OK &&
+             accept_request(f, false, true);
+        if (ok) {
+            out[i] = moq_sub_track_fill(track);
+            ok = moq_sub_fill_is_valid(out[i]) && cancel_and_retire(f, out[i]);
         }
     }
-    qsort(all, WORKERS * ISSUES_PER_WORKER, sizeof(all[0]), compare_identity);
-    unsigned distinct = 1;
-    for (unsigned i = 1; i < WORKERS * ISSUES_PER_WORKER; ++i) {
-        ok = all[i] > all[i - 1] && ok;
-        if (all[i] != all[i - 1]) ++distinct;
-    }
-    printf("ORACLE concurrent started=%u completed=%u identities=%u distinct=%u\n",
-           started, completed, WORKERS * ISSUES_PER_WORKER, distinct);
-    ok = pthread_cond_destroy(&gate.condition) == 0 && ok;
-    ok = pthread_mutex_destroy(&gate.mutex) == 0 && ok;
     return ok;
 }
-#endif
+
+/* Two live subscribers each issue the sequence 1, 2, 3 under their own tag;
+ * neither sees the other's tokens. */
+static bool independent_instances(void)
+{
+    fixture_t f[2];
+    moq_sub_fill_t tokens[2][3] = {{{0}, {0}, {0}}, {{0}, {0}, {0}}};
+    bool ok = open_fixture(&f[0], MOQ_VERSION_DRAFT_22, NULL);
+    ok = open_fixture(&f[1], MOQ_VERSION_DRAFT_22, NULL) && ok;
+    for (unsigned i = 0; i < 2 && ok; ++i) ok = EXPECT(issue_three(&f[i], tokens[i]));
+    if (ok) {
+        printf("ORACLE independent_instances a=%llu,%llu,%llu b=%llu,%llu,%llu\n",
+               (unsigned long long)tokens[0][0]._opaque, (unsigned long long)tokens[0][1]._opaque,
+               (unsigned long long)tokens[0][2]._opaque, (unsigned long long)tokens[1][0]._opaque,
+               (unsigned long long)tokens[1][1]._opaque, (unsigned long long)tokens[1][2]._opaque);
+        for (unsigned i = 0; i < 2 && ok; ++i)
+            for (unsigned k = 0; k < 3 && ok; ++k)
+                ok = EXPECT(seq_of(tokens[i][k]) == k + 1 &&
+                            tag_of(tokens[i][k]) == tag_of(tokens[i][0]));
+        ok = EXPECT(tag_of(tokens[0][0]) != tag_of(tokens[1][0])) && ok;
+        /* A retired token is stale to its owner and foreign to the other. */
+        for (unsigned i = 0; i < 2 && ok; ++i)
+            ok = EXPECT(moq_sub_cancel_fill(f[i].sub, tokens[i][2], now(&f[i])) == MOQ_ERR_STALE_HANDLE &&
+                        moq_sub_cancel_fill(f[1 - i].sub, tokens[i][2], now(&f[1 - i])) == MOQ_ERR_STALE_HANDLE);
+    }
+    ok = close_fixture(&f[1]) && ok;
+    return close_fixture(&f[0]) && ok;
+}
+
+/* The same session, a subscriber destroyed and created again at the exact
+ * same address: its live token is refused by the new subscriber, whose own
+ * sequence restarts at 1. The tag hashes the session's facade serial, so a
+ * recreation has a new input; a 15-bit collision is possible, so the fixture
+ * recreates until the tags differ (bounded) rather than relying on one draw. */
+static bool stale_after_recreate(void)
+{
+    reuse_memory_t memory = {0};
+    moq_alloc_t alloc = { &memory, reuse_alloc, reuse_realloc, reuse_free };
+    fixture_t f;
+    bool ok = open_fixture(&f, MOQ_VERSION_DRAFT_22, &alloc);
+    moq_subscriber_t *first = f.sub;
+    moq_location_filter_cfg_t location;
+    moq_fill_cfg_t fill;
+    init_fill(&fill, &location);
+    moq_sub_track_t *track = NULL;
+    moq_sub_fill_t stale = {0};
+    if (ok) ok = subscribe(&f, &fill, &track) == MOQ_OK && track &&
+                 accept_request(&f, true, true);
+    if (ok) {
+        stale = moq_sub_track_fill(track);
+        ok = moq_sub_fill_is_valid(stale) && seq_of(stale) == 1;
+    }
+    moq_sub_cfg_t sub_cfg;
+    moq_sub_cfg_init_sized(&sub_cfg, sizeof(sub_cfg));
+    sub_cfg.max_tracks = 2;
+    sub_cfg.max_fills = 1;
+    sub_cfg.max_fill_items = 2;
+    sub_cfg.max_fetch_items = 2;
+    sub_cfg.max_objects = 2;
+    unsigned recreations = 0;
+    moq_sub_fill_t fresh = {0};
+    while (ok) {
+        moq_sub_destroy(f.sub);
+        f.sub = NULL;
+        drain_events(moq_simpair_client(f.pair));
+        drain_events(moq_simpair_server(f.pair));
+        ok = moq_sub_create(moq_simpair_client(f.pair), &alloc, &sub_cfg, &f.sub) == MOQ_OK &&
+             (uintptr_t)f.sub == (uintptr_t)first;
+        ++recreations;
+        if (!ok) break;
+        track = NULL;
+        ok = subscribe(&f, &fill, &track) == MOQ_OK && track && accept_request(&f, true, true);
+        if (!ok) break;
+        fresh = moq_sub_track_fill(track);
+        ok = moq_sub_fill_is_valid(fresh) && seq_of(fresh) == 1;
+        if (!ok || tag_of(fresh) != tag_of(stale) || recreations >= 8) break;
+    }
+    if (ok) {
+        moq_result_t refused = moq_sub_cancel_fill(f.sub, stale, now(&f));
+        printf("ORACLE stale_after_recreate stale=%llu fresh=%llu recreations=%u result=%d\n",
+               (unsigned long long)stale._opaque, (unsigned long long)fresh._opaque,
+               recreations, (int)refused);
+        ok = EXPECT(tag_of(fresh) != tag_of(stale) && refused == MOQ_ERR_STALE_HANDLE &&
+                    cancel_and_retire(&f, fresh));
+    }
+    ok = close_fixture(&f) && ok;
+    for (size_t i = 0; i < memory.count; ++i) free(memory.blocks[i].ptr);
+    return ok && !memory.bad_free;
+}
 
 static void check_case(const char *name, bool ok)
 {
@@ -428,11 +474,8 @@ int main(void)
     check_case("invalid_reservations_and_single_slot_reuse", reservation_rollback());
     check_case("d16_fill_refused_without_effects", legacy_no_identity(MOQ_VERSION_DRAFT_16));
     check_case("d18_fill_refused_without_effects", legacy_no_identity(MOQ_VERSION_DRAFT_18));
-#if defined(MOQ_TEST_PTHREADS)
-    check_case("concurrent_independent_owners_128_identities", concurrent_owners());
-#else
-    printf("UNQUALIFIED: concurrent independent owners (MOQ_TEST_PTHREADS not enabled)\n");
-#endif
+    check_case("independent_instances_issue_1_2_3", independent_instances());
+    check_case("stale_token_after_recreate_refused", stale_after_recreate());
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

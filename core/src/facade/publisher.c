@@ -558,6 +558,8 @@ struct moq_publisher {
     pub_pending_fill_t *pending_fills;
     size_t              pending_fill_cap;
     uint64_t            fill_bytes;
+    uint64_t            fill_last_seq; /* token sequences issued; tokens are tagged */
+    uint16_t            fill_tag;
     bool                in_fill_callback;
     moq_pub_deferred_t  deferred;
     /* One answer per eligible session owner, in arrival order. */
@@ -566,7 +568,6 @@ struct moq_publisher {
     size_t              owed_cap;
 };
 
-static sub_fill_identity_allocator_t pub_fill_identities = SUB_FILL_IDENTITY_ALLOCATOR_INIT;
 
 /* -- Subscriber slot helpers (fan-out boundary) ------------------- */
 
@@ -2554,10 +2555,10 @@ static moq_result_t pending_fill_reserve(moq_publisher_t *pub, moq_pub_track_t *
     if (cost > pub->cfg.max_fill_snapshot_bytes) permanent = true;
     if (!permanent && cost > pub->cfg.max_fill_snapshot_bytes - pub->fill_bytes)
         return MOQ_ERR_WOULD_BLOCK;
-    uint64_t identity;
-    if (!sub_fill_identity_next(&pub_fill_identities, &identity)) return MOQ_ERR_LIMIT;
+    uint64_t seq;
+    if (!facade_fill_next(&pub->fill_last_seq, &seq)) return MOQ_ERR_LIMIT;
     pf->active = true;
-    pf->token._opaque = identity;
+    pf->token._opaque = facade_fill_pack(pub->fill_tag, seq);
     pf->track = track;
     pf->group_id = track->retained_group_id;
     pf->priority = track->priority;
@@ -3565,6 +3566,8 @@ moq_result_t moq_pub_create(moq_session_t *session,
     if (!p) return MOQ_ERR_NOMEM;
     memset(p, 0, sizeof(*p));
     p->session = session;
+    p->fill_tag = facade_fill_tag(p, session->session_tag, ++session->facade_serial,
+                                  FACADE_FILL_KIND_PUBLISHER);
     p->alloc = *alloc;
     p->cfg.struct_size = sizeof(moq_pub_cfg_t);
     p->cfg.accept_mode = cfg->accept_mode;

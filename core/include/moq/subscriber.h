@@ -989,14 +989,15 @@ MOQ_API void moq_sub_fetch_item_cleanup(moq_sub_fetch_item_t *item);
  * different fill or restart the failed one.
  * Compare handles with moq_sub_fill_eq (FFI: compare the 64-bit values).
  * A handle is meaningful only to the subscriber that issued it.
- * Identities are never reused within one linked core library instance, even
- * after subscriber/address reuse. Separate library copies, unload/reload and
- * processes are separate domains; do not interchange or persist their tokens.
- * Exhausting the non-wrapping identity space returns MOQ_ERR_LIMIT from a
+ * Identities are unique within one subscriber instance and never reused by
+ * it. A handle from another subscriber, or from a destroyed one, is refused
+ * by its instance tag as any other handle is (probabilistic, with the odds of
+ * a core handle's session tag); do not interchange or persist tokens across
+ * subscribers, library copies, unload/reload or processes. Exhausting the
+ * instance's non-wrapping identity space returns MOQ_ERR_LIMIT from a
  * fill-bearing subscribe/update before owner or wire effects. Temporary full
- * request slots still return MOQ_ERR_WOULD_BLOCK. Issuance is thread-safe across
- * independent subscribers, not wait-free or signal/ISR-safe; it does not make
- * concurrent access to a single subscriber safe.
+ * request slots still return MOQ_ERR_WOULD_BLOCK. Issuance touches no shared
+ * state; it does not make concurrent access to a single subscriber safe.
  */
 typedef struct moq_sub_fill { uint64_t _opaque; } moq_sub_fill_t;
 

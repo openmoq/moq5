@@ -256,8 +256,11 @@ MOQ_API void moq_pub_callbacks_init_sized(moq_pub_callbacks_t *cb,
 /* -- Configuration ------------------------------------------------ */
 
 /* Facade-local value identity. Never convert to a core fill handle. Tokens are
- * not reused within one linked library instance; a foreign/stale token is
- * STALE_HANDLE. Exhaustion is LIMIT, distinct from temporary job pressure. */
+ * unique within one publisher instance and never reused by it; a token from
+ * another publisher, or from a destroyed one, is refused by its instance tag
+ * as any other handle is (probabilistic, with the odds of a core handle's
+ * session tag): STALE_HANDLE. Do not interchange or persist tokens. Exhaustion
+ * is LIMIT, distinct from temporary job pressure. */
 typedef struct moq_pub_fill { uint64_t _opaque; } moq_pub_fill_t;
 #ifdef __cplusplus
 #define MOQ_PUB_FILL_INVALID moq_pub_fill_t{0}

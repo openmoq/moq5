@@ -1196,6 +1196,11 @@ static void test_d22_foreign_fill_handle(void)
         if (!ready || failures != before) goto done;
         settle(&rigs[i]);
     }
+    /* Both subscribers issue sequence 1; only the instance tag tells the
+     * tokens apart, and the second subscriber refuses the first's by it. */
+    MOQ_TEST_CHECK((children[0]._opaque & 0xFFFFFFFFFFFFull) == 1 &&
+                   (children[1]._opaque & 0xFFFFFFFFFFFFull) == 1);
+    MOQ_TEST_CHECK((children[0]._opaque >> 48) != (children[1]._opaque >> 48));
     moq_result_t foreign = moq_sub_cancel_fill(rigs[1].sub, children[0], now(&rigs[1]));
     printf("ORACLE foreign_fill_handle a=%llu b=%llu result=%d\n",
            (unsigned long long)children[0]._opaque,

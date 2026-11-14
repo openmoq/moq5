@@ -3,6 +3,7 @@
 #include "fill_identity_internal.h"
 #include "migration_internal.h"
 #include "../session/session_event_admission.h"
+#include "../session/session_internal.h"   /* session tag and facade serial */
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -80,7 +81,6 @@ struct moq_sub_fetch_req {
 
 #define SUB_DEFAULT_MAX_FILLS      16
 
-static sub_fill_identity_allocator_t fill_identities = SUB_FILL_IDENTITY_ALLOCATOR_INIT;
 
 typedef enum {
     SUB_HISTORY_FREE = 0,
@@ -119,9 +119,10 @@ typedef enum {
 
 typedef struct moq_sub_fill_req moq_sub_fill_req_t;
 
-/* `seq` is also the request's public handle (moq_sub_fill_t): never zero or
- * reused within this linked core instance, even after owner destruction.
- * Ordering uses only comparisons, so gaps from other owners or refusals are OK. */
+/* `seq` is the request's identity within its subscriber, never zero or reused
+ * by that subscriber; the public handle (moq_sub_fill_t) packs it under the
+ * subscriber's tag. Ordering uses only comparisons, so gaps from refusals are
+ * fine. */
 struct moq_sub_fill_req {
     sub_fill_state_t    state;
     moq_fill_t          handle;
@@ -205,6 +206,8 @@ struct moq_subscriber {
 
     moq_sub_fill_req_t   *fill_reqs;
     size_t                fill_cap;
+    uint64_t              fill_last_seq; /* sequences issued; tokens are tagged */
+    uint16_t              fill_tag;
 
     bool                  has_pending_fli;
     moq_sub_fill_item_t   pending_fli;
@@ -497,14 +500,13 @@ static moq_sub_fill_req_t *find_fill_awaiting_handle(moq_subscriber_t *s,
 }
 
 static moq_result_t alloc_fill_req(moq_subscriber_t *s, moq_sub_track_t *t,
-                                   sub_fill_identity_allocator_t *ids,
                                    moq_sub_fill_req_t **out)
 {
     for (size_t i = 0; i < s->fill_cap; i++) {
         moq_sub_fill_req_t *r = &s->fill_reqs[i];
         if (r->state == SUB_FILL_FREE) {
             uint64_t seq;
-            if (!sub_fill_identity_next(ids, &seq)) return MOQ_ERR_LIMIT;
+            if (!facade_fill_next(&s->fill_last_seq, &seq)) return MOQ_ERR_LIMIT;
             r->state = SUB_FILL_REQUESTED;
             r->track = t;
             r->seq = seq;
@@ -521,16 +523,17 @@ static moq_result_t alloc_fill_req(moq_subscriber_t *s, moq_sub_track_t *t,
 
 static moq_sub_fill_t fill_handle_of(const moq_sub_fill_req_t *r)
 {
-    moq_sub_fill_t h = { r->seq };
+    moq_sub_fill_t h = { facade_fill_pack(r->sub->fill_tag, r->seq) };
     return h;
 }
 
 /* The live request a handle names, or NULL once its terminal was polled. */
 static moq_sub_fill_req_t *fill_resolve(moq_subscriber_t *s, moq_sub_fill_t h)
 {
-    if (h._opaque == 0) return NULL;
+    if (h._opaque == 0 || facade_fill_tag_of(h._opaque) != s->fill_tag) return NULL;
+    uint64_t seq = facade_fill_seq_of(h._opaque);
     for (size_t i = 0; i < s->fill_cap; i++)
-        if (s->fill_reqs[i].state != SUB_FILL_FREE && s->fill_reqs[i].seq == h._opaque)
+        if (s->fill_reqs[i].state != SUB_FILL_FREE && s->fill_reqs[i].seq == seq)
             return &s->fill_reqs[i];
     return NULL;
 }
@@ -1116,6 +1119,8 @@ _Static_assert(offsetof(moq_sub_cfg_t, max_fills) ==
     memset(s->objects, 0, oc * sizeof(moq_sub_object_t));
 
     s->session = session;
+    s->fill_tag = facade_fill_tag(s, session->session_tag, ++session->facade_serial,
+                                  FACADE_FILL_KIND_SUBSCRIBER);
     s->alloc = *alloc;
     size_t sc = SUB_DEFAULT_MAX_STATUS;
     s->status_reqs = (moq_sub_status_req_t *)alloc->alloc(
@@ -1407,7 +1412,7 @@ moq_result_t moq_sub_subscribe(moq_subscriber_t *sub,
 
     moq_sub_fill_req_t *fr = NULL;
     if (fill) {
-        moq_result_t rc = alloc_fill_req(sub, t, &fill_identities, &fr);
+        moq_result_t rc = alloc_fill_req(sub, t, &fr);
         if (rc != MOQ_OK) return rc;
     }
 
@@ -1703,7 +1708,7 @@ moq_result_t moq_sub_update_subscription(moq_subscriber_t *sub,
         return MOQ_ERR_UNSUPPORTED;
     moq_sub_fill_req_t *fr = NULL;
     if (fill) {
-        moq_result_t reserve_rc = alloc_fill_req(sub, track, &fill_identities, &fr);
+        moq_result_t reserve_rc = alloc_fill_req(sub, track, &fr);
         if (reserve_rc != MOQ_OK) return reserve_rc;
         ucfg.fill = fill;
     }

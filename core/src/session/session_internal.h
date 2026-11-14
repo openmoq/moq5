@@ -2445,6 +2445,7 @@ struct moq_session {
     size_t state_location_retired_tail;
 
     uint16_t      session_tag;
+    uint16_t      facade_serial; /* facades created on this session, a tag input */
     bool          goaway_sent;
     bool          goaway_received;
     bool          streaming_objects;
