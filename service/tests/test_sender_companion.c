@@ -1285,15 +1285,27 @@ static void group_ids_configured_auto_legacy(moq_version_t version)
                               (moq_bytes_t){init, sizeof(init)});
     moq_media_sender_test_set_clock_hook(NULL, NULL);
     if (!started) { finish(&f); return; }
-    moq_media_metadata_t m; metadata(&m,false,7,0);
     old_send_object_t *o = object(0, NULL);
-    /* Written before the draft is known, so numbered from the base, then
-     * resolved to legacy: the base stays instead of dropping to 0. */
+    /* The first Group is written before the draft is known, so numbered from
+     * the base, then resolved to legacy: it keeps that number instead of
+     * dropping to 0, and the next Group follows it. */
     CHECK(write_object(&f, o) == MOQ_OK);
-    (void)m;
     if (observe_session(&f, version)) {
         CHECK(moq_media_sender_test_companion(f.sender) == MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01);
         CHECK(moq_media_sender_test_catalog_group(f.sender) == initial);
+        CHECK(write_object(&f, o) == MOQ_OK);
+        if (arm_peer(&f)) {
+            uint64_t seen = 0;
+            moq_event_t e;
+            while (moq_session_poll_events(f.peer, &e, 1)) {
+                if (e.kind == MOQ_EVENT_OBJECT_RECEIVED) {
+                    CHECK(e.u.object_received.group_id == initial + seen);
+                    ++seen;
+                }
+                moq_event_cleanup(&e);
+            }
+            CHECK(seen == 2);
+        }
     }
     free(o);
     finish(&f);
