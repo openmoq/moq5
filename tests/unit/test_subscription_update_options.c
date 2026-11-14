@@ -598,7 +598,8 @@ static void pressure(unsigned which)
     uint8_t wire[sizeof(original)]; memcpy(wire, original, sizeof(wire));
     moq_result_t rc = moq_session_on_bidi_stream_bytes(p.sv, p.se->rs.ref, wire,
                                                       sizeof(wire), false, 3);
-    REQUIRE(rc == (which == 3 ? MOQ_ERR_BUFFER : MOQ_ERR_WOULD_BLOCK));
+    /* Each waits for room that taking queued output releases. */
+    REQUIRE(rc == MOQ_ERR_WOULD_BLOCK);
     CHECK(moq_request_stream_peer_next_id(p.sv) == 2 && p.sv->fills.live == 0);
     CHECK(p.se->subscriber_priority == 128 && !p.se->dt_sub_has_object);
     CHECK(p.se->rs.recv_len == sizeof(original));

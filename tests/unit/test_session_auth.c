@@ -2965,7 +2965,7 @@ int main(void)
 
         size_t scratch_before = sv->event_scratch_len;
         moq_result_t rc = feed_client_setup_with_tokens(sv, &tok, 1, NULL, 0);
-        MOQ_TEST_CHECK(rc == MOQ_ERR_BUFFER);
+        MOQ_TEST_CHECK(rc == MOQ_ERR_LIMIT);
         MOQ_TEST_CHECK(sv->event_scratch_len == scratch_before);
         MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_IDLE);
         {

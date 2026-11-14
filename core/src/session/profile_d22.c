@@ -274,6 +274,7 @@ static moq_result_t d22_process_control_data(moq_session_t *s,
                                              const uint8_t *data, size_t len,
                                              size_t *out_consumed)
 {
+    moq_d22_profile_state_t *p = (moq_d22_profile_state_t *)s->profile_state;
     size_t total = 0;
     *out_consumed = 0;
     if (moq_binding_required_unbound(s)) return MOQ_ERR_WRONG_STATE;
@@ -288,9 +289,15 @@ static moq_result_t d22_process_control_data(moq_session_t *s,
             return close_with_error(s, 0x3, "malformed control envelope");
         }
         switch (env.msg_type) {
-        case MOQ_D22_SETUP:
+        case MOQ_D22_SETUP: {
+            const bool before = p->setup_received;
             rc = d22_handle_setup(s, &env);
+            /* As on draft 18: a committed SETUP stays consumed when the work
+             * after its commit fails. */
+            if (rc < 0 && !before && p->setup_received)
+                total += moq_buf_reader_offset(&r);
             break;
+        }
         case MOQ_D22_GOAWAY:
             rc = d22_handle_goaway(s, &env);
             break;

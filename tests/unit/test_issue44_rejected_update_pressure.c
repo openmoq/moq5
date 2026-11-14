@@ -234,7 +234,7 @@ static void preflight_case(unsigned mode)
         /* White-box total-capacity bound after handshake; allocation unchanged. */
         f.pub->send_cap = total - 1;
     }
-    moq_result_t expected = mode == 2 ? MOQ_ERR_BUFFER : MOQ_ERR_WOULD_BLOCK;
+    moq_result_t expected = mode == 2 ? MOQ_ERR_LIMIT : MOQ_ERR_WOULD_BLOCK;
     REQUIRE(moq_session_on_control_bytes(f.pub, f.update_wire.bytes,
                                         f.update_wire.len, 0) == expected);
     CHECK(!f.pub->publishes[f.slot].update_failed);
@@ -252,7 +252,7 @@ static void preflight_case(unsigned mode)
         CHECK(collect(f.pub, p) == 0);
     }
     if (mode == 2) {
-        REQUIRE(moq_session_process_pending(f.pub, 0) == MOQ_ERR_BUFFER);
+        REQUIRE(moq_session_process_pending(f.pub, 0) == MOQ_ERR_LIMIT);
         CHECK(!f.pub->publishes[f.slot].update_failed && alias_state(&f, false));
         CHECK(next_id(&f, 1) && f.pub->recv_len == f.update_wire.len);
         CHECK(collect(f.pub, p) == 0);

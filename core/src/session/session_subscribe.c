@@ -1048,6 +1048,7 @@ static moq_result_t handle_persistent_fetch_response_bytes(moq_session_t *s,
     if (len > 0) {
         memcpy(fe->rs.recv_buf + fe->rs.recv_len, buf, len);
         fe->rs.recv_len += len;
+        s->input_admitted = true;
     }
     if (fin) fe->rs.recv_fin = true;
 
@@ -1121,6 +1122,7 @@ static moq_result_t handle_fetch_response_bytes(moq_session_t *s, int fslot,
                     "fetch request stream message too large");
             memcpy(fe->rs.recv_buf + fe->rs.recv_len, buf, len);
             fe->rs.recv_len += len;
+            s->input_admitted = true;
         }
         for (;;) {
             fe = &s->fetches[fslot];
@@ -1177,6 +1179,7 @@ static moq_result_t handle_fetch_response_bytes(moq_session_t *s, int fslot,
             return close_with_error(s, 0x3, "fetch response too large");
         memcpy(fe->rs.recv_buf + fe->rs.recv_len, buf, len);
         fe->rs.recv_len += len;
+        s->input_admitted = true;
     }
     if (fin) fe->rs.recv_fin = true;
 
@@ -1293,6 +1296,7 @@ static moq_result_t handle_track_status_stream_bytes(moq_session_t *s, int tslot
             return close_with_error(s, 0x3, "track-status response too large");
         memcpy(te->rs.recv_buf + te->rs.recv_len, buf, len);
         te->rs.recv_len += len;
+        s->input_admitted = true;
     }
     if (fin_now) {
         te->rs.recv_fin = true;
@@ -1384,6 +1388,7 @@ static moq_result_t handle_subscribe_tracks_stream_bytes(moq_session_t *s,
                 "subscribe-tracks stream message too large");
         memcpy(e->rs.recv_buf + e->rs.recv_len, buf, len);
         e->rs.recv_len += len;
+        s->input_admitted = true;
     }
     if (fin) e->rs.recv_fin = true;
 
@@ -1663,6 +1668,7 @@ static moq_result_t handle_publish_stream_bytes(moq_session_t *s, int slot,
             return close_with_error(s, 0x3, "publish stream message too large");
         memcpy(e->rs.recv_buf + e->rs.recv_len, buf, len);
         e->rs.recv_len += len;
+        s->input_admitted = true;
     }
     if (fin) e->rs.recv_fin = true;
 
@@ -2147,6 +2153,7 @@ moq_result_t handle_request_stream_bytes(moq_session_t *s,
         }
         memcpy(e->rs.recv_buf + e->rs.recv_len, buf, len);
         e->rs.recv_len += len;
+        s->input_admitted = true;
     }
     if (fin) e->rs.recv_fin = true;
 
@@ -3741,25 +3748,38 @@ moq_result_t session_update_resolution_observe(const moq_session_t *s,
     return MOQ_OK;
 }
 
+/* Whether the update options and their token copies fit the event arena
+ * from `cursor`, with the alignment the copies below use. */
+static bool sub_update_options_fit(size_t cap, size_t cursor,
+                                   const moq_resolved_token_t *tokens,
+                                   size_t token_count)
+{
+    if (!sub_update_scratch_step(cap, &cursor, sizeof(moq_subscription_update_options_t),
+                                 _Alignof(moq_subscription_update_options_t)))
+        return false;
+    for (size_t i = 0; i < token_count; i++) {
+        if (!sub_update_scratch_step(cap, &cursor, tokens[i].token_value.len, 1))
+            return false;
+    }
+    return !token_count || (token_count <= SIZE_MAX / sizeof(*tokens) &&
+        sub_update_scratch_step(cap, &cursor, token_count * sizeof(*tokens),
+                                _Alignof(moq_resolved_token_t)));
+}
+
 moq_result_t session_update_stage_options(moq_session_t *s,
     const moq_sub_update_t *u, const moq_resolved_token_t *tokens,
     size_t token_count, moq_subscription_update_options_t **out)
 {
     *out = NULL;
     if (!s->profile->subscription_update_options) return MOQ_OK;
-    size_t cursor = s->event_scratch_len;
-    if (!sub_update_scratch_step(s->event_scratch_cap, &cursor,
-            sizeof(**out), _Alignof(moq_subscription_update_options_t)))
+    if (!sub_update_options_fit(s->event_scratch_cap, s->event_scratch_len,
+                                tokens, token_count)) {
+        /* Room queued events hold returns once they are taken. */
+        if (s->event_head != s->event_tail &&
+            sub_update_options_fit(s->event_scratch_cap, 0, tokens, token_count))
+            s->output_room_releases = true;
         return MOQ_ERR_BUFFER;
-    for (size_t i = 0; i < token_count; i++) {
-        if (!sub_update_scratch_step(s->event_scratch_cap, &cursor,
-                                    tokens[i].token_value.len, 1))
-            return MOQ_ERR_BUFFER;
     }
-    if (token_count && (token_count > SIZE_MAX / sizeof(*tokens) ||
-        !sub_update_scratch_step(s->event_scratch_cap, &cursor,
-            token_count * sizeof(*tokens), _Alignof(moq_resolved_token_t))))
-        return MOQ_ERR_BUFFER;
 
     moq_subscription_update_options_t *v = event_scratch_alloc_aligned(s,
         sizeof(*v), _Alignof(moq_subscription_update_options_t));

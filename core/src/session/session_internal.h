@@ -2344,6 +2344,18 @@ struct moq_session {
     uint8_t      *recv_buf;
     size_t        recv_cap;
     size_t        recv_len;
+    /* Set by an output producer that refused for room which taking the
+     * queued output releases: the send buffer behind queued actions, the
+     * event arena behind queued events. handle_control_bytes clears it before
+     * it handles copied input and reads it to tell a temporary refusal
+     * (WOULD_BLOCK) from a local limit (LIMIT); the request-stream dispatch
+     * and the bidi and data inputs read it the same way. */
+    bool          output_room_releases;
+    /* Set where a bidi-stream input copies the caller's bytes into a
+     * request's own buffer. moq_session_on_bidi_stream_bytes clears it
+     * first: MOQ_ERR_BUFFER stays the refused delivery (nothing copied) only
+     * while it is clear. */
+    bool          input_admitted;
 
     moq_sub_entry_t *subs;
     size_t           sub_cap;

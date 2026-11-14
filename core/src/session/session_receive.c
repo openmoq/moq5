@@ -2868,7 +2868,14 @@ static moq_result_t rx_drive_data(moq_session_t *s,
                             loop_rc = MOQ_ERR_WOULD_BLOCK;
                             goto compact;
                         }
+                        s->output_room_releases = false;
                         moq_result_t crc = fetch_cancel_on_receive(s, fslot);
+                        /* A draft-16 FETCH_CANCEL behind queued output waits
+                         * for that room with the bytes kept; one the send
+                         * buffer can never hold stays BUFFER, a local limit
+                         * at the input boundary. */
+                        if (crc == MOQ_ERR_BUFFER && s->output_room_releases)
+                            crc = MOQ_ERR_WOULD_BLOCK;
                         if (crc == MOQ_ERR_WOULD_BLOCK) {
                             loop_rc = crc;
                             goto compact;

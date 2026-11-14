@@ -585,26 +585,41 @@ MOQ_API moq_result_t moq_session_start(moq_session_t *s, uint64_t now_us);
  *   MOQ_OK              every byte was copied into the session's control
  *                       buffer and each complete message was handled. An
  *                       incomplete message stays buffered for later bytes.
- *   MOQ_ERR_WOULD_BLOCK every byte was copied, but a message could not be
- *                       handled until outputs are drained. That message
- *                       and everything after it stay buffered: drain
- *                       actions and events, then call
- *                       moq_session_process_pending(). Do not feed the
- *                       same bytes again. Any other negative result from
- *                       handling a message leaves the bytes buffered the
- *                       same way.
  *   MOQ_ERR_BUFFER      the bytes do not fit the control buffer now;
- *                       nothing was copied. Room returns only as buffered
- *                       messages are handled. The result does not prove
- *                       an oversized message: a refused delivery can hold
- *                       several valid messages, and buffered input may
- *                       still be handled and make room. A single
- *                       incomplete message that fills the buffer can
- *                       never complete, so a retry with no new bytes makes
- *                       no progress. A caller that cannot show that
- *                       handling buffered input will make room ends the
- *                       session for its own resource limit; that is not a
- *                       protocol violation by the peer.
+ *                       nothing was copied, and the caller keeps them.
+ *                       Room returns only as buffered messages are handled.
+ *                       This result says nothing about a message's size: a
+ *                       refused delivery can hold several valid messages,
+ *                       and buffered input may still be handled and make
+ *                       room. A single incomplete message that fills the
+ *                       buffer can never complete, so a retry with no new
+ *                       bytes makes no progress. A caller that cannot show
+ *                       that handling buffered input will make room ends
+ *                       the session for its own resource limit; that is not
+ *                       a protocol violation by the peer.
+ * Every result below means every byte was copied: the caller does not feed
+ * the same bytes again.
+ *   MOQ_ERR_WOULD_BLOCK a message could not be handled until outputs are
+ *                       drained: the action or event queue is full, or
+ *                       earlier output still occupies the room it needs in
+ *                       the send buffer or the event arena, which taking
+ *                       that output releases. That message and everything
+ *                       after it stay buffered: drain actions and events,
+ *                       then call moq_session_process_pending().
+ *   MOQ_ERR_LIMIT       a message cannot be handled because what handling it
+ *                       must produce can never fit this side's own capacity
+ *                       (moq_session_cfg_t.send_buffer_size or
+ *                       output_scratch_size), for example a draft-16 server
+ *                       whose own setup message is larger than its send
+ *                       buffer.
+ *                       The message and everything after it stay buffered;
+ *                       retrying cannot succeed. This is a local limit, not
+ *                       a protocol violation by the peer; what follows is the
+ *                       caller's resource policy (for example, ending the
+ *                       session for its own resource limit).
+ *   other negative      handling a message failed (for example
+ *                       MOQ_ERR_NOMEM); the bytes stay buffered the same
+ *                       way.
  *
  * Advancing call: invalidates borrows, takes now_us.
  */
@@ -616,9 +631,11 @@ MOQ_API moq_result_t moq_session_on_control_bytes(moq_session_t *s,
 /*
  * Process already-buffered control input without feeding new bytes.
  * Use after draining outputs to retry a previously blocked operation.
- * Results are those of moq_session_on_control_bytes() with no new bytes:
- * MOQ_OK when the buffered messages were handled, or none was buffered;
- * MOQ_ERR_WOULD_BLOCK when the blocked message still cannot be handled.
+ * Results, beside those every input shares, are those of
+ * moq_session_on_control_bytes() after its bytes were copied: MOQ_OK,
+ * MOQ_ERR_WOULD_BLOCK (still blocked; drain again), MOQ_ERR_LIMIT (the
+ * buffered message can never be handled; the same result again on every
+ * retry) or another failure. Never MOQ_ERR_BUFFER: no bytes are delivered.
  * Advancing call: invalidates borrows, takes now_us.
  */
 MOQ_API moq_result_t moq_session_process_pending(moq_session_t *s,
@@ -692,6 +709,11 @@ MOQ_API moq_result_t moq_session_tick(moq_session_t *s, uint64_t now_us);
  *                   cases. The caller therefore cannot choose between
  *                   delivering it again and an empty retry, and ends the
  *                   session.
+ *   MOQ_ERR_LIMIT   the session took the delivery, but what handling it
+ *                   must send can never fit this side's own capacity (a
+ *                   draft-16 fetch cancellation larger than the send
+ *                   buffer). The caller does not deliver it again.
+ * A delivery is never refused with MOQ_ERR_BUFFER.
  *
  * Advancing call: invalidates borrows, takes now_us.
  */
@@ -5496,8 +5518,9 @@ MOQ_API moq_result_t moq_session_subscribe_namespace(
  * and this call feeds requests, their responses and later messages alike.
  * Bytes that arrive before setup completes are buffered and handled once
  * it has.
- *   MOQ_ERR_WOULD_BLOCK: capacity is missing (an event, an action or a
- *     drain reference). The session owns the stream
+ *   MOQ_ERR_WOULD_BLOCK: capacity is missing (an event, an action, a
+ *     drain reference, or room earlier output holds in the send buffer
+ *     or the event arena). The session owns the stream
  *     (moq_session_has_transport_stream() is true) and keeps what it
  *     needs: drain actions and events, then retry with buf=NULL, len=0.
  *     Do not deliver the bytes again.
@@ -5512,6 +5535,12 @@ MOQ_API moq_result_t moq_session_subscribe_namespace(
  * On every draft, MOQ_OK means the bytes were consumed. For a stream the
  * session does not know, an empty call without FIN does nothing, and a FIN
  * with no bytes is a protocol violation.
+ *
+ * MOQ_ERR_BUFFER means none of this call's bytes were copied. Once they
+ * are, a message that waits for room queued output holds is
+ * MOQ_ERR_WOULD_BLOCK as above, and one whose handling can never fit this
+ * side's own capacity (send buffer or output scratch) is MOQ_ERR_LIMIT: the
+ * session took the bytes and the caller does not deliver them again.
  *
  * Advancing call: invalidates borrows, takes now_us.
  */

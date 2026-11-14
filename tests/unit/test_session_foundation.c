@@ -1109,9 +1109,10 @@ int main(void)
         moq_session_t *sv = NULL;
         moq_session_create(&scfg, 0, &sv);
 
+        /* The bytes were taken; the reply can never fit: a local limit. */
         moq_result_t rc = moq_session_on_control_bytes(sv,
             act.u.send_control.data, act.u.send_control.len, 0);
-        MOQ_TEST_CHECK(rc == MOQ_ERR_BUFFER);
+        MOQ_TEST_CHECK(rc == MOQ_ERR_LIMIT);
         MOQ_TEST_CHECK(moq_session_state(sv) == MOQ_SESS_IDLE);
         MOQ_TEST_CHECK(moq_session_peer_max_request_id(sv) == 0);
 
@@ -2266,10 +2267,10 @@ int main(void)
             }
 
         /* Feed to server: first SUBSCRIBE succeeds (scratch fits),
-         * second SUBSCRIBE returns retryable error (scratch consumed). */
+         * second SUBSCRIBE waits for the first event's scratch. */
         moq_result_t rc = moq_session_on_control_bytes(sv, buf,
             buf_len, 0);
-        MOQ_TEST_CHECK(rc == MOQ_ERR_BUFFER);
+        MOQ_TEST_CHECK(rc == MOQ_ERR_WOULD_BLOCK);
         MOQ_TEST_CHECK(moq_session_state(sv) != MOQ_SESS_CLOSED);
 
         /* First SUBSCRIBE_REQUEST event should be emitted. */

@@ -259,6 +259,7 @@ static moq_result_t d18_process_control_data(moq_session_t *s,
                                              const uint8_t *data, size_t len,
                                              size_t *out_consumed)
 {
+    moq_d18_profile_state_t *d18 = (moq_d18_profile_state_t *)s->profile_state;
     size_t total = 0;
 
     while (total < len && s->state != MOQ_SESS_CLOSED) {
@@ -274,9 +275,17 @@ static moq_result_t d18_process_control_data(moq_session_t *s,
         }
 
         switch (env.msg_type) {
-        case MOQ_D18_STREAM_SETUP:
+        case MOQ_D18_STREAM_SETUP: {
+            const bool before = d18->setup_received;
             rc = d18_handle_setup(s, &env);
+            /* A SETUP the session committed stays consumed when the work
+             * after its commit fails (dispatching request streams that
+             * arrived before it): handling it again would read as a
+             * duplicate SETUP. */
+            if (rc < 0 && !before && d18->setup_received)
+                total += moq_buf_reader_offset(&r);
             break;
+        }
         case MOQ_D18_GOAWAY:
             rc = d18_handle_goaway(s, &env);
             break;

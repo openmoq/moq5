@@ -1383,6 +1383,7 @@ moq_result_t ns_sub_on_new_bidi(moq_session_t *s,
     if (len > e->recv_cap) return MOQ_ERR_BUFFER;
     memcpy(e->recv_buf, buf, len);
     e->recv_len = len;
+    s->input_admitted = true;
 
     e->generation |= 1;
     e->state = MOQ_NS_SUB_RECVING_PUBLISHER;
@@ -1432,6 +1433,7 @@ static moq_result_t ns_sub_after_own_goaway(moq_session_t *s, int32_t ns_slot,
             return close_with_error(s, 0x3, "namespace-sub stream message too large");
         memcpy(e->recv_buf + e->recv_len, buf, len);
         e->recv_len += len;
+        s->input_admitted = true;
     }
     if (fin) e->pending_fin = true;
     for (;;) {
@@ -1577,6 +1579,7 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
                     return MOQ_ERR_BUFFER;
                 memcpy(e->recv_buf + e->recv_len, buf, len);
                 e->recv_len += len;
+                s->input_admitted = true;
             }
             if (fin) e->pending_fin = true;
             return handle_subscriber_response(s, ns_slot);
@@ -1605,6 +1608,7 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
                 if (len) {
                     memcpy(e->recv_buf + e->recv_len, buf, len);
                     e->recv_len += len;
+                    s->input_admitted = true;
                 }
                 if (fin) e->pending_fin = true;
                 if (e->recv_len) return ns_sub_reject_update(s, (size_t)ns_slot);
@@ -1668,6 +1672,7 @@ moq_result_t handle_bidi_stream_bytes(moq_session_t *s,
                     return MOQ_ERR_BUFFER;
                 memcpy(e->recv_buf + e->recv_len, buf, len);
                 e->recv_len += len;
+                s->input_admitted = true;
             }
         }
         if (updates && fin) e->pending_fin = true;

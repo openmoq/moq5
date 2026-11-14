@@ -642,6 +642,16 @@ add_executable(test_session_setup_tokens unit/test_session_setup_tokens.c)
 target_link_libraries(test_session_setup_tokens PRIVATE moq-core-test-internals)
 target_include_directories(test_session_setup_tokens PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME session_setup_tokens COMMAND test_session_setup_tokens)
+
+add_executable(test_control_input_custody unit/test_control_input_custody.c)
+target_link_libraries(test_control_input_custody PRIVATE moq-core-test-internals)
+target_include_directories(test_control_input_custody PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME control_input_custody COMMAND test_control_input_custody)
+
+add_executable(test_stream_input_custody unit/test_stream_input_custody.c)
+target_link_libraries(test_stream_input_custody PRIVATE moq-core-test-internals)
+target_include_directories(test_stream_input_custody PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME stream_input_custody COMMAND test_stream_input_custody)
 # Receive-capacity saturation through the real bridge over fake endpoints:
 # fill receive entries, retain later deliveries, and replay after capacity
 # returns. No request loses its response or receives a fabricated terminal.

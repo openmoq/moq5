@@ -2120,10 +2120,21 @@ static void event_location_retire(moq_session_t *s, const moq_location_filter_cf
  * once the event queue is empty. Exhaustion returns NULL, failing the
  * producing path exactly like transient scratch exhaustion would. */
 
+/* A refusal the empty arena would not repeat, while queued events hold it:
+ * the room returns once those events are taken. */
+static void event_scratch_refused(moq_session_t *s, size_t len)
+{
+    if (len <= s->event_scratch_cap && s->event_head != s->event_tail)
+        s->output_room_releases = true;
+}
+
 uint8_t *event_scratch_alloc(moq_session_t *s, size_t len)
 {
     if (len == 0) return s->event_scratch + s->event_scratch_len;
-    if (len > s->event_scratch_cap - s->event_scratch_len) return NULL;
+    if (len > s->event_scratch_cap - s->event_scratch_len) {
+        event_scratch_refused(s, len);
+        return NULL;
+    }
     uint8_t *p = s->event_scratch + s->event_scratch_len;
     s->event_scratch_len += len;
     return p;
@@ -2135,10 +2146,11 @@ void *event_scratch_alloc_aligned(moq_session_t *s, size_t len, size_t align)
     if ((align & (align - 1)) != 0) return NULL;
     size_t cur = s->event_scratch_len;
     size_t aligned = (cur + align - 1) & ~(align - 1);
-    if (aligned < cur) return NULL;
-    if (aligned > s->event_scratch_cap) return NULL;
-    size_t remaining = s->event_scratch_cap - aligned;
-    if (len > remaining) return NULL;
+    if (aligned < cur || aligned > s->event_scratch_cap ||
+        len > s->event_scratch_cap - aligned) {
+        event_scratch_refused(s, len);
+        return NULL;
+    }
     s->event_scratch_len = aligned + len;
     return s->event_scratch + aligned;
 }
@@ -2350,7 +2362,11 @@ moq_result_t queue_send_control(moq_session_t *s,
 {
     if (len == 0) return MOQ_OK;
     if (action_queue_full(s)) return MOQ_ERR_WOULD_BLOCK;
-    if (len > s->send_cap - s->send_len) return MOQ_ERR_BUFFER;
+    if (len > s->send_cap - s->send_len) {
+        /* Room the queued actions hold returns when they are taken. */
+        if (len <= s->send_cap) s->output_room_releases = true;
+        return MOQ_ERR_BUFFER;
+    }
     memcpy(s->send_buf + s->send_len, data, len);
     return commit_send_control_tail(s, len);
 }
@@ -2755,6 +2771,19 @@ moq_result_t close_with_error(moq_session_t *s,
 
 /* -- Input handlers ------------------------------------------------ */
 
+/* MOQ_ERR_BUFFER from an input call says no byte of the delivery was copied.
+ * Once the session took the bytes, a handler's refusal for output room is
+ * reported by what it means for them: room the queued output holds returns
+ * once that output is taken, so the input waits (WOULD_BLOCK); otherwise
+ * what handling it must produce can never fit this side's own capacity,
+ * which no retry changes -- a local limit (LIMIT), not a refused delivery and
+ * not the peer's fault. */
+static moq_result_t admitted_input_result(const moq_session_t *s, moq_result_t rc)
+{
+    if (rc != MOQ_ERR_BUFFER) return rc;
+    return s->output_room_releases ? MOQ_ERR_WOULD_BLOCK : MOQ_ERR_LIMIT;
+}
+
 static moq_result_t handle_control_bytes(moq_session_t *s,
                                           const uint8_t *buf, size_t len)
 {
@@ -2770,6 +2799,7 @@ static moq_result_t handle_control_bytes(moq_session_t *s,
     if (s->recv_len == 0) return MOQ_OK;
 
     size_t consumed = 0;
+    s->output_room_releases = false;
     moq_result_t rc = s->profile->process_control_data(
         s, s->recv_buf, s->recv_len, &consumed);
 
@@ -2778,7 +2808,8 @@ static moq_result_t handle_control_bytes(moq_session_t *s,
                 s->recv_len - consumed);
     s->recv_len -= consumed;
 
-    return rc;
+    /* The bytes are in recv_buf now. */
+    return admitted_input_result(s, rc);
 }
 
 static moq_result_t handle_tick(moq_session_t *s)
@@ -4624,7 +4655,10 @@ moq_result_t moq_session_on_data_bytes(moq_session_t *s,
     if (session_idle_expired(s))
         return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
     session_refresh_idle(s, now_us);
-    return handle_data_bytes(s, stream_ref, buf, len, fin);
+    /* No data delivery is refused with BUFFER before admission: a BUFFER
+     * here comes from handling bytes the session took. */
+    s->output_room_releases = false;
+    return admitted_input_result(s, handle_data_bytes(s, stream_ref, buf, len, fin));
 }
 
 moq_result_t moq_session_on_data_rcbuf(moq_session_t *s,
@@ -4639,7 +4673,8 @@ moq_result_t moq_session_on_data_rcbuf(moq_session_t *s,
     if (session_idle_expired(s))
         return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
     session_refresh_idle(s, now_us);
-    return handle_data_bytes_rcbuf(s, stream_ref, data, fin);
+    s->output_room_releases = false;
+    return admitted_input_result(s, handle_data_bytes_rcbuf(s, stream_ref, data, fin));
 }
 
 moq_result_t moq_session_on_data_reset(moq_session_t *s,
@@ -4676,7 +4711,11 @@ moq_result_t moq_session_on_bidi_stream_bytes(moq_session_t *s,
     if (session_idle_expired(s))
         return close_with_error(s, MOQ_CLOSE_IDLE_TIMEOUT, "idle timeout");
     session_refresh_idle(s, now_us);
-    return handle_bidi_stream_bytes(s, stream_ref, buf, len, fin);
+    s->input_admitted = false;
+    s->output_room_releases = false;
+    moq_result_t rc = handle_bidi_stream_bytes(s, stream_ref, buf, len, fin);
+    /* BUFFER before the bytes were copied is the refused delivery. */
+    return s->input_admitted ? admitted_input_result(s, rc) : rc;
 }
 
 moq_result_t moq_session_on_bidi_stream_reset(moq_session_t *s,

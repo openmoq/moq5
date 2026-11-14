@@ -597,7 +597,7 @@ moq_result_t moq_request_stream_prepare_pending_reject_after(moq_session_t *s,
     return rc;
 }
 
-moq_result_t moq_request_stream_process_request(
+static moq_result_t rs_process_request(
     moq_session_t *s, moq_stream_ref_t ref, int slot,
     const uint8_t *buf, size_t len, bool fin, size_t *out_consumed)
 {
@@ -1259,7 +1259,7 @@ moq_result_t moq_request_stream_process_request(
 
 /* -- Response-stream dispatch --------------------------------------- */
 
-moq_result_t moq_request_stream_process_response(
+static moq_result_t rs_process_response(
     moq_session_t *s, moq_stream_ref_t ref, int slot, uint32_t kind,
     const uint8_t *buf, size_t len, bool fin, size_t *out_consumed)
 {
@@ -1816,4 +1816,34 @@ moq_result_t moq_request_stream_process_response(
     /* First-response enforcement: only the response valid for this request
      * kind (or REQUEST_ERROR) may appear. */
     return close_with_error(s, 0x3, "unexpected first response message");
+}
+
+/* -- Dispatch results ------------------------------------------------ */
+
+/* A message the core handlers refused for output room which taking the
+ * queued output releases (output_room_releases) waits like any other
+ * capacity refusal: WOULD_BLOCK, so every family keeps its buffered bytes
+ * for the re-feed instead of treating the refusal as a hard failure. A
+ * refusal for room that never returns stays MOQ_ERR_BUFFER. */
+static moq_result_t rs_room_result(const moq_session_t *s, moq_result_t rc)
+{
+    return rc == MOQ_ERR_BUFFER && s->output_room_releases ? MOQ_ERR_WOULD_BLOCK : rc;
+}
+
+moq_result_t moq_request_stream_process_request(
+    moq_session_t *s, moq_stream_ref_t ref, int slot,
+    const uint8_t *buf, size_t len, bool fin, size_t *out_consumed)
+{
+    s->output_room_releases = false;
+    return rs_room_result(s, rs_process_request(s, ref, slot, buf, len, fin,
+                                                out_consumed));
+}
+
+moq_result_t moq_request_stream_process_response(
+    moq_session_t *s, moq_stream_ref_t ref, int slot, uint32_t kind,
+    const uint8_t *buf, size_t len, bool fin, size_t *out_consumed)
+{
+    s->output_room_releases = false;
+    return rs_room_result(s, rs_process_response(s, ref, slot, kind, buf, len,
+                                                 fin, out_consumed));
 }

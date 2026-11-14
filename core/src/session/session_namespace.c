@@ -239,6 +239,7 @@ static moq_result_t ann_handle_d22_bytes(moq_session_t *s, int slot,
     if (len > 0) {
         memcpy(e->rs.recv_buf + e->rs.recv_len, buf, len);
         e->rs.recv_len += len;
+        s->input_admitted = true;
     }
     if (fin || e->handoff_fin_pending) {
         if (e->response_validated && !e->response_fin) {
@@ -364,6 +365,7 @@ moq_result_t handle_announcement_stream_bytes(moq_session_t *s, int slot,
                 "announce request stream message too large");
         memcpy(e->rs.recv_buf + e->rs.recv_len, buf, len);
         e->rs.recv_len += len;
+        s->input_admitted = true;
     }
     if (fin) e->rs.recv_fin = true;
     /* A FIN that rode the creating PUBLISH_NAMESPACE was handed to this entry
