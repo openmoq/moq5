@@ -208,6 +208,17 @@ control_equal("paths multiarch: prefix" "${prefix}" "\${pcfiledir}/../../..")
 control_equal("paths multiarch: libdir" "${libdir}"
     "\${prefix}/lib/x86_64-linux-gnu")
 
+# The ascent is counted from the library directory's components, as a path
+# normalizes them, so it reads the same on every platform.
+foreach(case "lib/|../.." "./lib64|../.." "lib//x|../../.." "lib/../lib64|../.."
+             "../lib|../..")
+    string(REPLACE "|" ";" case "${case}")
+    list(GET case 0 dir)
+    list(GET case 1 ascent)
+    moq_tier_pc_paths("${dir}" "include" prefix libdir includedir needs)
+    control_equal("paths ascent for ${dir}" "${prefix}" "\${pcfiledir}/${ascent}")
+endforeach()
+
 # An absolute include directory is named as it is. Joined to the prefix it
 # would read ${prefix}//opt/moq/include, where no header is installed.
 moq_tier_pc_paths("lib" "/opt/moq/include" prefix libdir includedir needs)

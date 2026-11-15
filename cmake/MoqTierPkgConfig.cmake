@@ -38,8 +38,26 @@ function(moq_tier_pc_paths libdir includedir
     else()
         # From <prefix>/<libdir>/pkgconfig back to <prefix>: one level per
         # component of libdir (lib, lib64, lib/x86_64-linux-gnu) and one more.
-        file(RELATIVE_PATH up "/${libdir}/pkgconfig" "/")
-        string(REGEX REPLACE "/+$" "" up "${up}")
+        # The levels are counted from the components, the way a path
+        # normalizes them: an empty component or "." adds none, ".." takes
+        # one away, and the count never goes below the prefix. No path is
+        # formed: "/" is not a full path on Windows.
+        string(REPLACE "/" ";" parts "${libdir}")
+        set(depth 0)
+        foreach(part IN LISTS parts)
+            if(part STREQUAL "..")
+                if(depth GREATER 0)
+                    math(EXPR depth "${depth} - 1")
+                endif()
+            elseif(NOT part STREQUAL "" AND NOT part STREQUAL ".")
+                math(EXPR depth "${depth} + 1")
+            endif()
+        endforeach()
+        set(up "..")
+        while(depth GREATER 0)
+            string(APPEND up "/..")
+            math(EXPR depth "${depth} - 1")
+        endwhile()
         set(prefix "\${pcfiledir}/${up}")
         set(lib "\${prefix}/${libdir}")
         set(needs_prefix FALSE)
