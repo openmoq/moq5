@@ -261,7 +261,9 @@ function(loader_only_image_records text platform out)
                 elseif(_rest MATCHES "^calling preinit:[ \t]+(/.*)$")
                     set(_kind "preinit")
                     set(_preinit_${_pid} "${CMAKE_MATCH_1}")
-                elseif(_rest STREQUAL "")
+                elseif(_rest STREQUAL "" OR _rest STREQUAL "(no such file)")
+                    # The second is glibc's (2.43 and later) record after a
+                    # "trying file=" candidate that does not exist.
                     set(_kind "trace")
                 elseif(NOT _lookup STREQUAL "" AND _lookup STREQUAL "${_preinit_${_pid}}")
                     set(_kind "sanitizer-runtime-lookup")

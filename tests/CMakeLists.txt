@@ -2290,6 +2290,13 @@ if(UNIX)
             SKIP_REGULAR_EXPRESSION "tier_pkgconfig_consumers: UNSUPPORTED:")
         include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/RejectConsumerWarnings.cmake")
         moq_test_reject_consumer_warnings(tier_pkgconfig_consumers)
+        # The loader trace the consumers' check reads is judged by the same
+        # helper as the WebTransport consumers'; its decisions are pinned
+        # here too, against captured traces. No process is started.
+        add_test(NAME tier_loader_images_selftest
+            COMMAND ${CMAKE_COMMAND}
+                -P "${PROJECT_SOURCE_DIR}/adapters/wtquic/tests/loader_images_selftest.cmake")
+        set_tests_properties(tier_loader_images_selftest PROPERTIES TIMEOUT 60)
 
         add_test(NAME tier_pkgconfig_registration
             COMMAND ${CMAKE_COMMAND}

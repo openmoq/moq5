@@ -273,6 +273,22 @@ expect_empty("a linux image path containing 'error' is accepted" "${_why}")
 loader_only_image_records("      99:     something unknown here" Linux _why)
 expect_nonempty("an unknown linux record is refused" "${_why}")
 
+# glibc 2.43 states a candidate that does not exist in a record of its own,
+# after the "trying file=" line (captured on Ubuntu 26.04).
+set(_linux_missing_candidate
+"         9:\tfind library=libsystemd.so.0 [0]; searching
+         9:\t search path=/nonexistent\t\t(LD_LIBRARY_PATH)
+         9:\t  trying file=/nonexistent/libsystemd.so.0
+         9:\t    (no such file)
+         9:\t search path=/usr/lib/aarch64-linux-gnu\t\t(system search path)
+         9:\t  trying file=/usr/lib/aarch64-linux-gnu/libsystemd.so.0
+         9:\t
+         9:\tcalling init: /usr/lib/aarch64-linux-gnu/libsystemd.so.0")
+loader_only_image_records("${_linux_missing_candidate}" Linux _why)
+expect_empty("glibc's record of a missing candidate is accepted" "${_why}")
+loader_only_image_records("         9:\t    (no such thing)" Linux _why)
+expect_nonempty("another parenthesised linux record is refused" "${_why}")
+
 # The sanitizer lane's captured dyld info is not an image or a warning. It
 # requires both the exact record kind and a matching PID's actual ASan image.
 set(_asan_image "dyld[123]: <8B994207-FB33-3A22-8385-7FB6F5343956> /toolchain/lib/libclang_rt.asan_osx_dynamic.dylib")
