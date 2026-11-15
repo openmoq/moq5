@@ -129,7 +129,7 @@ if [ "$TIER" = core ]; then
                        if [ -f "$lib" ]; then defined "$lib"; fi
                    done | sort -u)
     above=$(for lib in "$libdir"/libmoq-*; do
-                case ${lib##*/} in libmoq-core.*) continue ;; esac
+                case ${lib##*/} in (libmoq-core.*) continue ;; esac
                 if [ -f "$lib" ]; then defined "$lib"; fi
             done | { grep '^moq' || true; } | sort -u | comm -23 - <(printf '%s\n' "$core_defined"))
     binary=$(awk '{ print $NF }' <<<"$symbols" | sed 's/^_//' | sort -u)
