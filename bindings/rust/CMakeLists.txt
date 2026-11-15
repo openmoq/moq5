@@ -4,7 +4,8 @@
 # (MOQ_RUST_RELAY_ROWS=OFF), the cross-build row (MOQ_RUST_CROSS_BUILD=OFF),
 # the player's rows (MOQ_RUST_PLAYER=OFF) and the simulator's tier graphs
 # (MOQ_RUST_SIM=OFF, whose refusal is then required instead) alone can be
-# left out explicitly.
+# left out explicitly. The quinn example's row (MOQ_RUST_QUINN_EXAMPLE=ON) is
+# asked for explicitly: it fetches the example's own dependencies.
 if(NOT MOQ_BUILD_TESTS)
     message(FATAL_ERROR
         "MOQ_BUILD_RUST_BINDING=ON requires MOQ_BUILD_TESTS=ON: the binding is qualified through ctest rows")
@@ -66,6 +67,23 @@ if(MOQ_RUST_RELAY_ROWS)
     if(NOT MOQ_RUST_SDK_PREFIX AND NOT MOQ_BUILD_PQ_THREADED)
         message(FATAL_ERROR
             "MOQ_RUST_RELAY_ROWS=ON needs MOQ_BUILD_PQ_THREADED=ON (the rows connect through the picoquic backend of the staged SDK) or MOQ_RUST_SDK_PREFIX naming an SDK with it")
+    endif()
+endif()
+
+# The quinn subscriber example, run against the relay with the relay rows'
+# publisher peer behind it. Off by default: its dependencies (quinn, tokio,
+# rustls) come from the crates.io registry, which no other row needs.
+option(MOQ_RUST_QUINN_EXAMPLE
+    "Run the quinn subscriber example against the relay (needs MOQ_RUST_RELAY_ROWS=ON, openssl, and the crates.io registry)" OFF)
+if(MOQ_RUST_QUINN_EXAMPLE)
+    if(NOT MOQ_RUST_RELAY_ROWS)
+        message(FATAL_ERROR
+            "MOQ_RUST_QUINN_EXAMPLE=ON needs MOQ_RUST_RELAY_ROWS=ON: the example runs against the same relay and publisher peer")
+    endif()
+    find_program(MOQ_RUST_OPENSSL openssl)
+    if(NOT MOQ_RUST_OPENSSL)
+        message(FATAL_ERROR
+            "MOQ_RUST_QUINN_EXAMPLE=ON needs openssl on the path: the row makes the relay a certificate with subject alternative names")
     endif()
 endif()
 
@@ -281,4 +299,8 @@ endif()
 if(MOQ_RUST_RELAY_ROWS)
     moq_rust_row(relay_rows 1200 "$<TARGET_FILE:moq5-relay>")
     set_tests_properties(rust_relay_rows PROPERTIES LABELS "rust;relay")
+endif()
+if(MOQ_RUST_QUINN_EXAMPLE)
+    moq_rust_row(quinn_example 900 "$<TARGET_FILE:moq5-relay>")
+    set_tests_properties(rust_quinn_example PROPERTIES LABELS "rust;relay")
 endif()

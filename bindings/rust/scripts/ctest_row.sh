@@ -7,7 +7,8 @@
 # Rows: fmt, clippy, doc, tests, tier_graphs, fake_tests, fake_asan, layout,
 # installed_consumer_static, installed_consumer_shared, package, msrv,
 # gate_controls, cross_refusal <target>, cross_build <target> <sysroot>
-# [cmake args...], relay_rows <moq5-relay binary>.
+# [cmake args...], relay_rows <moq5-relay binary>, quinn_example <moq5-relay
+# binary>.
 #
 # Environment: MOQ5_RUST_SDK (the installed SDK prefix the rows link;
 # required), MOQ5_RUST_WORK (the work directory; required), MOQ5_RUST_PLAYER,
@@ -27,6 +28,8 @@
 # the SDK's dependency prefixes, when its closure spans them), CC (default
 # cc) for the fake provider and the native peer, PKG_CONFIG (default
 # pkg-config), PYTHON (default python3), LIBCLANG_PATH as bindgen needs it.
+# The quinn_example row also needs openssl on the path and the crates.io
+# registry.
 # Every binary linked to an SDK runs with that SDK closure's loader path,
 # and every build states the SDK's installed link mode to the pkg-config
 # crate for each tier package (scripts/sdk_paths.sh). Any failing command,
@@ -62,6 +65,33 @@ sdk_pc() {    # pkg-config over one SDK: sdk_pc <prefix> <args...>
     local prefix=$1 path; shift
     path=$(moq5_sdk_pkgconfig "$prefix") || return 1
     PKG_CONFIG_PATH=$path "${PKG_CONFIG:-pkg-config}" "$@"
+}
+build_done_peer() {   # the relay rows' native publisher peer, as $W/done-peer: build_done_peer <sdk>
+    # It completes a subscription with a chosen status, and is built against
+    # the relay SDK's own closure. MOQ5_RELAY_PEER_CFLAGS adds what the
+    # installed picoquic_threaded.h needs beyond the closure's Cflags
+    # (picoquic's own headers, which that SDK does not install);
+    # MOQ5_RELAY_PEER_SANITIZE=thread builds it under ThreadSanitizer.
+    local sdk=$1 peer_cflags peer_libs
+    local -a peer_flags=()
+    case ${MOQ5_RELAY_PEER_SANITIZE:-} in
+        "") ;;
+        thread)
+            peer_flags=(-fsanitize=thread -fno-omit-frame-pointer)
+            # A report makes the peer exit 66, which the done-status row
+            # checks; stated, not left to the defaults (on macOS a report
+            # otherwise aborts the process).
+            export TSAN_OPTIONS="${TSAN_OPTIONS:+$TSAN_OPTIONS:}abort_on_error=0:exitcode=66" ;;
+        *) echo "ctest_row.sh: MOQ5_RELAY_PEER_SANITIZE must be empty or thread" >&2; exit 2 ;;
+    esac
+    # The closure's flags are read first, so a failing lookup fails the row.
+    peer_cflags=$(sdk_pc "$sdk" --cflags libmoq-service)
+    peer_libs=$(sdk_pc "$sdk" --libs libmoq-service)
+    # shellcheck disable=SC2086  # pkg-config output and the flags are word-split on purpose
+    "$CC" -std=c11 -Wall -Wextra -Werror -O1 -g ${peer_flags[@]+"${peer_flags[@]}"} \
+        $peer_cflags ${MOQ5_RELAY_PEER_CFLAGS:-} \
+        "$HERE/moq5/tests/support/done_peer.c" -o "$W/done-peer" \
+        $peer_libs ${peer_flags[@]+"${peer_flags[@]}"}
 }
 toolchain_tool() {   # the path of one tool of a rustup toolchain, empty when the component is absent
     "$RUSTUP" which --toolchain "$1" "$2" 2>/dev/null || true
@@ -558,30 +588,7 @@ relay_rows)
     moq5_sdk_export_link_mode "$SDK"
     # The live rows link this SDK: the statement holds for it too.
     check_statement "$SDK"
-    # The native peer that completes a subscription with a chosen status,
-    # built against the relay SDK's own closure. MOQ5_RELAY_PEER_CFLAGS adds
-    # what the installed picoquic_threaded.h needs beyond the closure's Cflags
-    # (picoquic's own headers, which that SDK does not install);
-    # MOQ5_RELAY_PEER_SANITIZE=thread builds it under ThreadSanitizer.
-    peer_flags=()
-    case ${MOQ5_RELAY_PEER_SANITIZE:-} in
-        "") ;;
-        thread)
-            peer_flags=(-fsanitize=thread -fno-omit-frame-pointer)
-            # A report makes the peer exit 66, which the done-status row
-            # checks; stated, not left to the defaults (on macOS a report
-            # otherwise aborts the process).
-            export TSAN_OPTIONS="${TSAN_OPTIONS:+$TSAN_OPTIONS:}abort_on_error=0:exitcode=66" ;;
-        *) echo "ctest_row.sh: MOQ5_RELAY_PEER_SANITIZE must be empty or thread" >&2; exit 2 ;;
-    esac
-    # The closure's flags are read first, so a failing lookup fails the row.
-    peer_cflags=$(sdk_pc "$SDK" --cflags libmoq-service)
-    peer_libs=$(sdk_pc "$SDK" --libs libmoq-service)
-    # shellcheck disable=SC2086  # pkg-config output and the flags are word-split on purpose
-    "$CC" -std=c11 -Wall -Wextra -Werror -O1 -g ${peer_flags[@]+"${peer_flags[@]}"} \
-        $peer_cflags ${MOQ5_RELAY_PEER_CFLAGS:-} \
-        "$HERE/moq5/tests/support/done_peer.c" -o "$W/done-peer" \
-        $peer_libs ${peer_flags[@]+"${peer_flags[@]}"}
+    build_done_peer "$SDK"
     # Every row on both drafts, built with the player where it is
     # qualified; the MPEG-TS rows require the outcome the SDK is stated to
     # give (the stream, or the refusal of the track).
@@ -612,6 +619,34 @@ relay_rows)
         grep -q 'the done peer exited with exit status: 3' "$W/peer-verdict-$draft.log" ||
             { echo "ctest_row.sh: the row failed for another reason:" >&2; tail -30 "$W/peer-verdict-$draft.log" >&2; exit 1; }
         echo "refused on the peer's exit status 3 (see $W/peer-verdict-$draft.log)"
+    done ;;
+quinn_example)
+    # The quinn subscriber example, a workspace of its own: formatted and
+    # lint-clean; its own tests of how a session ends (they need no relay);
+    # then run against the relay over real QUIC on both drafts, the relay
+    # rows' publisher peer behind the relay. It links the core library of
+    # the relay SDK alone.
+    RELAY=${1:?the moq5-relay binary}
+    SDK=${MOQ5_RELAY_SDK:-$MOQ_PREFIX}
+    moq5_sdk_export_loader "$SDK"
+    moq5_sdk_export_link_mode "$SDK"
+    check_statement "$SDK"
+    build_done_peer "$SDK"
+    example=$HERE/examples/quinn-subscriber/Cargo.toml
+    "$CARGO" fmt --manifest-path "$example" -- --check
+    MOQ_PREFIX=$SDK CARGO_TARGET_DIR=$W/quinn-target \
+        "$CARGO" clippy --manifest-path "$example" --locked --all-targets -- -D warnings
+    # Its declared minimum toolchain, with the versions its lock file names.
+    MOQ_PREFIX=$SDK CARGO_TARGET_DIR=$W/quinn-msrv-target toolchain_cargo "$MSRV" check \
+        --manifest-path "$example" --locked --all-targets
+    echo "== the quinn subscriber: how a session ends"
+    MOQ_PREFIX=$SDK MOQ5_RELAY_WORK=$W/quinn-work CARGO_TARGET_DIR=$W/quinn-target \
+        "$CARGO" test --manifest-path "$example" --locked
+    for draft in 22 18; do
+        echo "== the quinn subscriber against the relay (draft $draft)"
+        MOQ_PREFIX=$SDK MOQ5_RELAY=$RELAY MOQ5_DONE_PEER=$W/done-peer MOQ5_RELAY_DRAFT=$draft \
+            MOQ5_RELAY_WORK=$W/quinn-work CARGO_TARGET_DIR=$W/quinn-target \
+            "$CARGO" test --manifest-path "$example" --locked --test relay -- --ignored --nocapture
     done ;;
 *)
     echo "ctest_row.sh: unknown row $ROW" >&2; exit 2 ;;

@@ -20,6 +20,10 @@ Four crates, along libmoq's tiers:
 
 All are `publish = false`; nothing is uploaded or reserved.
 
+[`examples/quinn-subscriber`](examples/quinn-subscriber) is a small host for
+`moq5-core` over a real QUIC stack: a subscriber on
+[quinn](https://github.com/quinn-rs/quinn), in a workspace of its own.
+
 ## Initial sender catalogs
 
 `Sender::attach_with_tracks` queues attachment and the complete initial track
@@ -140,6 +144,8 @@ bindings/rust/
 ├── consumer/           its own workspace: out-of-tree consumers built in a
 │                       clean environment against a static or shared SDK,
 │                       of moq5 and (core/) of moq5-core alone
+├── examples/           quinn-subscriber: its own workspace, a moq5-core
+│                       host over quinn; its tests are a relay row
 ├── scripts/            ctest_row.sh (every row), package_check.sh,
 │                       stage_sdk.cmake, diagnostics.py (the diagnostic
 │                       classifier) + the dependency allowlist,
@@ -150,8 +156,9 @@ bindings/rust/
 └── CMakeLists.txt      the ctest rows (MOQ_BUILD_RUST_BINDING)
 ```
 
-The test workspaces are excluded from the product workspace, so nothing they
-depend on can unify into a consumer's build; the fake provider is reached
+The test workspaces and the example are excluded from the product workspace,
+so nothing they depend on (quinn, tokio and rustls, for the example) can
+unify into a consumer's build or reach its lock file; the fake provider is reached
 through the same pkg-config path a real SDK uses, never through a feature or
 a runtime table.
 
@@ -179,6 +186,7 @@ stage an SDK from the build and run `scripts/ctest_row.sh` for each:
 | `rust_cross_refusal` | a cross build with the host SDK alone, a host search path (plain, or the generic `TARGET_`/`HOST_` spellings) beside a sysroot, a sysroot alone, a target SDK without a sysroot, a `--sysroot` spelled inside an unrelated define or in a spelling bindgen does not read, mixed `-isysroot`/`--sysroot` operands naming two roots in either order, or two sysroots that disagree is refused before any probe, `PKG_CONFIG_ALLOW_CROSS` notwithstanding; a target search configuration holding no SDK is refused by the probe with the host SDK on every inherited spelling (no fallback) |
 | `rust_cross_build` | a target SDK configured from the tree (macOS: the other architecture) with the player, MPEG-TS and the simulator as stated, its cache and its own statement checked; the crates checked for that target against it (`cargo check --target`; nothing is linked or run) without the player and, where it is stated, with it, each pass naming the host SDK on every spelling and proving it unused: the link-search directories emitted are exactly the target SDK's libdir, and pkg-config, run through a recorder, was given exactly the target's directories as its library list and no search path on every probe; the same root named through `MOQ_SYSROOT` and both clang root options is accepted. The player pass must show the target's generated player bindings and both crates compiled with `feature="player"`, which the base pass's log must not (a control for a missing player pass); the simulator pass, where it is stated, the target's generated simulator bindings and `moq5-sys` compiled with `feature="sim"`, which the base pass's log must not; where it is stated absent, the target SDK's refusal of the simulator tier |
 | `rust_relay_rows` | `moq5/tests/live_*` against a `moq5-relay` subprocess on loopback with the test-only credentials, drafts 22 and 18, one row per process; the status-propagation row drives a native publisher peer (`moq5/tests/support/done_peer.c`) that completes its subscription with a chosen PUBLISH_DONE status (the peer injects it; no expiry timer runs) and must then exit 0 (its stop checks the status, also when it exited first); the same row with the peer exiting 3 after its done must fail, on that exit, on both drafts; `MOQ5_RELAY_PEER_SANITIZE=thread` builds the peer under ThreadSanitizer, whose report (exit 66) fails the row. MPEG-TS: 188- and 192-octet transport streams written in chunks that split packets across calls arrive byte for byte (the 192-octet prefix stripped by the receiver) in Location order, every Group opening with the PAT, the sender's counters exact; on an SDK stated without MPEG-TS, the track's refusal (the writer handles short writes, WOULD_BLOCK and held Objects without requiring them, and those results are the fake rows' coverage). Draft 22: explicit LOC-04 metadata and Track Properties arrive with each object (neither on drafts 16/18), and a Track Properties set that does not parse is refused when the track is added, on every draft, the sender still usable and the name free for the corrected set; a bounded poll leaves a head larger than its allowance queued and takes it at exactly its charge; the receiver information is the effective configuration; a late subscriber's fill delivers the retained objects under its request ID and ends with one COMPLETE terminal, after which it cannot be cancelled (drafts 16/18 refuse the fill). With the player feature, a raw video track plays through a player in decode order with its exact bytes, configuration (codec, dimensions, timescale), timeline and end, decoder-queue feedback pausing and resuming release; an opus track plays with the catalog's sample rate and channel count in its configuration |
+| `rust_quinn_example` | only with `MOQ_RUST_QUINN_EXAMPLE=ON`: `examples/quinn-subscriber` formatted, clippy-clean and checked with the 1.85 toolchain against its lock file; its own tests of how a session ends, which need no relay; then its three rows against a `moq5-relay` subprocess on loopback over real QUIC, on drafts 22 and 18, the relay rows' publisher peer behind the relay: the publisher completes the subscription; a session with an event queue of two keeps input and is resumed; an unsubscribe stops the streams being read, and each is settled before the session closes |
 
 `MOQ_RUST_PLAYER`, `MOQ_RUST_MPEG2TS` and `MOQ_RUST_SIM` state what the SDK
 carries beyond the service: the player (the rows build with the `player`
@@ -194,6 +202,9 @@ on its error stream there is a configure warning). A
 statement the staged tree contradicts is a configure error, and every row
 checks the statement against the SDK it links, so a stated feature the SDK
 lacks, or a refusal of MPEG-TS it carries, fails the row.
+`MOQ_RUST_QUINN_EXAMPLE=ON` adds the example's row; it is off by default
+because it alone needs the crates.io registry, for the example's
+dependencies, and `openssl`, for the relay's certificate.
 `MOQ_RUST_RELAY_ROWS=OFF` leaves the relay rows out explicitly,
 `MOQ_RUST_CROSS_BUILD=OFF` the cross-build row and `MOQ_RUST_PLAYER=OFF` the
 player's builds; a tree whose service has no
@@ -203,9 +214,9 @@ closure spans its dependency prefixes (the WTQuic managed SDK Requires the
 wtquic install's own `.pc` files) names their pkg-config directories
 through `MOQ_RUST_SDK_PKG_CONFIG_PATH`. Any other missing input is a
 configure error. `.github/workflows/rust.yml` runs the same rows on Ubuntu
-and macOS against static and shared SDKs, and the relay rows against a
-picoquic SDK on both, every SDK built with the player and MPEG-TS and both
-stated ON.
+and macOS against static and shared SDKs, and the relay rows and the
+example's row against a picoquic SDK on both, every SDK built with the
+player and MPEG-TS and both stated ON.
 
 ## Provenance
 

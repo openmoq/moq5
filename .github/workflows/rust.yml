@@ -221,6 +221,7 @@ jobs:
             -DMOQ_BUILD_WTQUIC_MSQUIC_MANAGED=ON \
             -Dmsquic_DIR="$msquic_DIR" -Dwtquic_DIR="$wtquic_DIR" \
             -DMOQ_BUILD_RUST_BINDING=ON -DMOQ_RUST_CROSS_BUILD=OFF \
+            -DMOQ_RUST_QUINN_EXAMPLE=ON \
             "-DMOQ_RUST_SDK_PREFIX=$RUNNER_TEMP/rust-pq-sdk" \
             -DMOQ_RUST_PLAYER=ON -DMOQ_RUST_MPEG2TS=ON \
             "${openssl_args[@]}"
@@ -240,6 +241,10 @@ jobs:
             build/rust-relay/Testing/Temporary/LastTest.log
             build/rust-relay/bindings/rust/work/live-work/**/relay.log
             build/rust-relay/bindings/rust/work/live-work/**/peer.log
+            build/rust-relay/bindings/rust/work/quinn-work/**/relay.log
+            build/rust-relay/bindings/rust/work/quinn-work/**/peer.log
+            build/rust-relay/bindings/rust/work/quinn-work/**/sub.out
+            build/rust-relay/bindings/rust/work/quinn-work/**/sub.err
             build/rust-relay/bindings/rust/work/peer-verdict-*.log
             build/rust-relay/bindings/rust/work/target/debug/build/moq5-sys*/**/out/*.rs
             build/rust-relay/bindings/rust/work/target/debug/build/moq5-sys*/**/out/*.txt

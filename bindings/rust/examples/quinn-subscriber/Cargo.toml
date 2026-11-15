@@ -1,0 +1,20 @@
+[package]
+name = "moq5-quinn-subscriber"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "A bare MoQ subscriber over quinn, driving the moq5-core session"
+publish = false
+
+# Its own workspace: quinn, tokio and rustls stay out of the binding crates'
+# dependency graph and lock file.
+[workspace]
+resolver = "3"
+
+[dependencies]
+bytes = "1"
+moq5-core = { path = "../../moq5-core" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
