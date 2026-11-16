@@ -404,6 +404,19 @@ if(MOQ_BUILD_TESTS)
             ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME endpoint_keepalive_default
                  COMMAND test_endpoint_keepalive_default)
+
+        add_executable(test_endpoint_socket_buffer_default
+            tests/test_endpoint_socket_buffer_default.c)
+        target_link_libraries(test_endpoint_socket_buffer_default PRIVATE
+            moq-service-ka-test-internals moq::core Threads::Threads
+            ${_MOQ_SERVICE_FACADE_LIBS})
+        target_compile_definitions(test_endpoint_socket_buffer_default PRIVATE
+            ${_MOQ_SERVICE_FACADE_DEFS})
+        target_include_directories(test_endpoint_socket_buffer_default PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${PROJECT_SOURCE_DIR}/tests/unit)
+        add_test(NAME endpoint_socket_buffer_default
+                 COMMAND test_endpoint_socket_buffer_default)
     endif()
 
     if(MOQ_BUILD_PICO_WT_MANAGED)
