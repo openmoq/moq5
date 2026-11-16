@@ -41,6 +41,19 @@ static bool put_cfg_field(void *raw, size_t alloc_size, size_t offset,
     put_cfg_field((raw), (alloc_size), offsetof(moq_endpoint_cfg_t, field), \
                   sizeof(((moq_endpoint_cfg_t *)0)->field), &(value), sizeof(value))
 
+/* The sizeof of the layout that ends with send_queue_cap_bytes, the one that
+ * precedes idle_timeout_ms: frozen per ABI as tests/unit/test_abi_layout_d22.c
+ * pins it (LP64, then ILP32 with a 4-aligned and with an 8-aligned uint64_t),
+ * never derived from the offset of the field that follows it. */
+typedef struct { char c; uint64_t v; } resolve_u64_probe_t;
+#define RESOLVE_ENDPOINT_ENUM_SHIFT \
+    (sizeof(moq_transport_protocol_t) < 4 ? 4 : 0)
+#define ENDPOINT_CFG_THROUGH_SEND_QUEUE_CAP_SIZE                           \
+    (sizeof(void *) == 8 ? (size_t)208                                    \
+     : offsetof(resolve_u64_probe_t, v) == 4                              \
+         ? (size_t)(124 - RESOLVE_ENDPOINT_ENUM_SHIFT)                    \
+         : (size_t)(128 - 2 * RESOLVE_ENDPOINT_ENUM_SHIFT))
+
 static moq_endpoint_cfg_t mkcfg(const char *url)
 {
     moq_endpoint_cfg_t c;
@@ -395,7 +408,8 @@ int main(void)
         c.idle_timeout_ms = MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS;
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
 
-        /* WebTransport has no idle timeout to set: refused, 0 still fine. */
+        /* The WebTransport backends do not support this endpoint option:
+         * refused, 0 still fine. */
         moq_endpoint_cfg_t w;
         moq_endpoint_cfg_init_sized(&w, sizeof(w));
         w.url = B("https://relay.example:4433/moq");
@@ -404,6 +418,97 @@ int main(void)
                               (int)MOQ_ERR_UNSUPPORTED);
         w.idle_timeout_ms = 0;
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r), (int)MOQ_OK);
+
+        /* idle.range_before_capability: on otherwise valid configurations, a
+         * value under the floor is INVAL on every transport, and only an
+         * in-range value reaches the capability answer. */
+        w.idle_timeout_ms = MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS - 1;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r), (int)MOQ_ERR_INVAL);
+        w.idle_timeout_ms = MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        c.idle_timeout_ms = 1;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_ERR_INVAL);
+    }
+
+    /* == idle_timeout_ms on older, partial and short layouts ========== *
+     * Real allocations of exactly the sizes in question, so ASan pins that
+     * nothing past the caller's object is read. The field is read only when
+     * struct_size covers all of it. */
+    {
+        const size_t pre_size = ENDPOINT_CFG_THROUGH_SEND_QUEUE_CAP_SIZE;
+        const size_t at = offsetof(moq_endpoint_cfg_t, idle_timeout_ms);
+        const size_t end = at + sizeof(uint32_t);
+        MOQ_TEST_CHECK(pre_size <= at);
+        MOQ_TEST_CHECK(end <= sizeof(moq_endpoint_cfg_t));
+        moq_endpoint_resolved_t r;
+
+        /* idle.preceding_layout.absent: the whole preceding layout, which
+         * has no such field: it resolves with 0 on raw QUIC, and on
+         * WebTransport, where a non-zero value would be refused. */
+        void *raw = malloc(pre_size);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw != NULL) {
+            moq_endpoint_cfg_init_sized(raw, pre_size);
+            uint32_t written_size;
+            memcpy(&written_size, raw, sizeof(written_size));
+            MOQ_TEST_CHECK_EQ_U64(written_size, (uint64_t)pre_size);
+            moq_bytes_t url = B("moqt://relay.example:4433");
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, pre_size, url, url));
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(raw, &r), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(r.idle_timeout_ms, 0);
+            url = B("https://relay.example:4433/moq");
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, pre_size, url, url));
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(raw, &r), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(r.idle_timeout_ms, 0);
+            free(raw);
+        }
+
+        /* idle.partial.poisoned: struct_size reaches into the field without
+         * covering it, and the field's bytes are poisoned. Read, they would
+         * be a value applied on raw QUIC and refused on WebTransport; half a
+         * field is not a field, so both resolve with 0. */
+        for (size_t covered = 1; covered < sizeof(uint32_t); covered++) {
+            moq_endpoint_cfg_t p;
+            moq_endpoint_cfg_init_sized(&p, sizeof(p));
+            memset((uint8_t *)&p + at, 0xA5, sizeof(uint32_t));
+            p.struct_size = (uint32_t)(at + covered);
+            p.url = B("moqt://relay.example:4433");
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&p, &r), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(r.idle_timeout_ms, 0);
+            p.url = B("https://relay.example:4433/moq");
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&p, &r), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(r.idle_timeout_ms, 0);
+        }
+
+        /* idle.whole_field.short_object: an allocation that ends where the
+         * field ends, short of the padded sizeof. The field is covered, so it
+         * is read: applied on raw QUIC, the floor still INVAL, and refused on
+         * WebTransport. */
+        raw = malloc(end);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw != NULL) {
+            moq_endpoint_cfg_init_sized(raw, end);
+            uint32_t written_size;
+            memcpy(&written_size, raw, sizeof(written_size));
+            MOQ_TEST_CHECK_EQ_U64(written_size, (uint64_t)end);
+            moq_bytes_t url = B("moqt://relay.example:4433");
+            uint32_t idle_ms = 3000;
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, end, url, url));
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, end, idle_timeout_ms, idle_ms));
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(raw, &r), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(r.idle_timeout_ms, 3000);
+            idle_ms = MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS - 1;
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, end, idle_timeout_ms, idle_ms));
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(raw, &r), (int)MOQ_ERR_INVAL);
+            idle_ms = 3000;
+            url = B("https://relay.example:4433/moq");
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, end, idle_timeout_ms, idle_ms));
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, end, url, url));
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(raw, &r),
+                                  (int)MOQ_ERR_UNSUPPORTED);
+            free(raw);
+        }
     }
 
     /* == handshake_timeout_us upper boundary ========================== *

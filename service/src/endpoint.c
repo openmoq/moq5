@@ -503,20 +503,26 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         out->handshake_timeout_us = cfg->handshake_timeout_us;
     }
 
-    /* QUIC idle timeout: the same complete-presence gate. Only the raw-QUIC
-     * picoquic adapter can apply it, so a non-zero value anywhere else is an
-     * UNSUPPORTED reject. */
-    out->idle_timeout_ms = 0;
-    if ((size_t)cfg->struct_size >=
-        offsetof(moq_endpoint_cfg_t, idle_timeout_ms) + sizeof(cfg->idle_timeout_ms)) {
+    /* QUIC idle timeout: the same complete-presence gate. The caller's object
+     * can be an older, smaller layout, so the size and the field are copied
+     * by bytes into a local that defaults to 0, never read through the
+     * current type. Only the raw-QUIC picoquic adapter can apply it, so a
+     * non-zero value anywhere else is an UNSUPPORTED reject. */
+    {
+        const size_t at = offsetof(moq_endpoint_cfg_t, idle_timeout_ms);
+        uint32_t size;
+        uint32_t idle_ms = 0;
+        memcpy(&size, cfg, sizeof(size));
+        if ((size_t)size >= at + sizeof(idle_ms))
+            memcpy(&idle_ms, (const uint8_t *)cfg + at, sizeof(idle_ms));
         /* Range first, as with the handshake bound: INVAL on every backend. */
-        if (cfg->idle_timeout_ms != 0 && cfg->idle_timeout_ms < MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS)
+        if (idle_ms != 0 && idle_ms < MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS)
             return MOQ_ERR_INVAL;
-        if (cfg->idle_timeout_ms != 0 &&
+        if (idle_ms != 0 &&
             (out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC ||
              out->protocol != MOQ_TRANSPORT_PROTOCOL_RAW_QUIC))
             return MOQ_ERR_UNSUPPORTED;
-        out->idle_timeout_ms = cfg->idle_timeout_ms;
+        out->idle_timeout_ms = idle_ms;
     }
 
     /* SETUP authorization tokens: the session's own limits, and that the

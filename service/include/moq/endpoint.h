@@ -283,8 +283,11 @@ typedef struct moq_endpoint_cfg {
      * TRANSPORT handshake -- how long a peer that never completes the QUIC/TLS
      * handshake holds the endpoint in CONNECTING before it goes terminal. It
      * does NOT bound a peer that completes the handshake and then stalls the
-     * WebTransport CONNECT or the MoQ SETUP. 0 leaves the backend's own value
-     * (30 s on picoquic). Honored by the picoquic backend on both protocols. No
+     * WebTransport CONNECT or the MoQ SETUP. 0 leaves the backend's own value:
+     * on picoquic, the offered idle timeout (idle_timeout_ms when that is
+     * non-zero, otherwise 30 s). A non-zero value here takes precedence over
+     * idle_timeout_ms for the handshake. Honored by the picoquic backend on
+     * both protocols. No
      * other service backend can apply THIS setting -- a transport-handshake-only
      * bound -- so a NON-ZERO value there is a connect-time MOQ_ERR_UNSUPPORTED,
      * not a silent no-op. That is a statement about this knob, not about
@@ -430,15 +433,21 @@ typedef struct moq_endpoint_cfg {
      * sizeof cfg). */
     uint64_t send_queue_cap_bytes;
     /* appended (enabled by struct_size): the QUIC idle timeout in milliseconds
-     * that the client offers. The connection closes after this long without a
-     * packet from the peer (the lower of the two peers' values applies), so a
-     * lower value notices a relay that vanished sooner. The keepalive then runs
-     * at half of it, and never slower than the default 15 s. 0 keeps the
-     * backend default (30 s on picoquic) and the 15 s keepalive. A value under
-     * MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS is MOQ_ERR_INVAL: picoquic also uses it
-     * as the handshake timeout. Honored by raw QUIC over picoquic only; a
-     * non-zero value on any other transport is MOQ_ERR_UNSUPPORTED, not a
-     * silent no-op. Set it via
+     * that the client offers (max_idle_timeout, RFC 9000 section 10.1). It is
+     * a nominal offer, not an exact closing time: the connection uses the
+     * lower of the two peers' non-zero offers, and the idle period is never
+     * shorter than three probe timeouts (PTO). A lower offer lets the client
+     * notice a relay that vanished sooner. The endpoint asks for a keepalive
+     * PING (section 10.1.2) every min(15 s, idle_timeout_ms / 2); picoquic may
+     * shorten that interval once the timeout is negotiated. 0 keeps the
+     * backend's default offer (30 s on picoquic) and the 15 s keepalive.
+     *
+     * Until the handshake completes, picoquic bounds it by handshake_timeout_us
+     * when that is non-zero, and otherwise by this offer. A value under
+     * MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS is therefore MOQ_ERR_INVAL, raised
+     * during resolution before the capability check, on every backend. Honored
+     * by raw QUIC over picoquic only; a non-zero value on any other transport
+     * is MOQ_ERR_UNSUPPORTED, not a silent no-op. Set it via
      * moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
     uint32_t idle_timeout_ms;
 } moq_endpoint_cfg_t;
