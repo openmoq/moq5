@@ -503,6 +503,22 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         out->handshake_timeout_us = cfg->handshake_timeout_us;
     }
 
+    /* QUIC idle timeout: the same complete-presence gate. Only the raw-QUIC
+     * picoquic adapter can apply it, so a non-zero value anywhere else is an
+     * UNSUPPORTED reject. */
+    out->idle_timeout_ms = 0;
+    if ((size_t)cfg->struct_size >=
+        offsetof(moq_endpoint_cfg_t, idle_timeout_ms) + sizeof(cfg->idle_timeout_ms)) {
+        /* Range first, as with the handshake bound: INVAL on every backend. */
+        if (cfg->idle_timeout_ms != 0 && cfg->idle_timeout_ms < MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS)
+            return MOQ_ERR_INVAL;
+        if (cfg->idle_timeout_ms != 0 &&
+            (out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC ||
+             out->protocol != MOQ_TRANSPORT_PROTOCOL_RAW_QUIC))
+            return MOQ_ERR_UNSUPPORTED;
+        out->idle_timeout_ms = cfg->idle_timeout_ms;
+    }
+
     /* SETUP authorization tokens: the session's own limits, and that the
      * SETUP carrying them fits the default session send arena the backends
      * use (and so a default peer's receive buffer), counting the URL as the
@@ -1590,8 +1606,12 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
     /* Send QUIC keepalive on the client connection so an idle publisher (one
      * with no subscriber yet) is not dropped by a relay's transport idle
      * timeout (moqx default ~30s). 15s stays comfortably under a 30s idle
-     * bound. Distinct from a MoQ/session deadline; see picoquic_threaded.h. */
+     * bound. A shorter idle timeout of our own needs a keepalive inside it:
+     * half of it. Distinct from a MoQ/session deadline; see picoquic_threaded.h. */
+    fc.idle_timeout_ms = r->idle_timeout_ms;
     fc.keep_alive_interval_ms = 15000;
+    if (r->idle_timeout_ms != 0 && r->idle_timeout_ms / 2 < fc.keep_alive_interval_ms)
+        fc.keep_alive_interval_ms = r->idle_timeout_ms / 2;
     fc.setup_auth_tokens = ep->setup_tokens.tokens;
     fc.setup_auth_token_count = ep->setup_tokens.count;
     if (cfg->struct_size >= offsetof(moq_endpoint_cfg_t, send_queue_cap_bytes) +
@@ -2038,6 +2058,10 @@ _Static_assert(offsetof(moq_endpoint_cfg_t, verify_certificate) >=
                    offsetof(moq_endpoint_cfg_t, setup_auth_token_count) +
                        sizeof(((moq_endpoint_cfg_t *)0)->setup_auth_token_count),
                "verify_certificate must be appended after setup_auth_token_count");
+_Static_assert(offsetof(moq_endpoint_cfg_t, idle_timeout_ms) >=
+                   offsetof(moq_endpoint_cfg_t, send_queue_cap_bytes) +
+                       sizeof(((moq_endpoint_cfg_t *)0)->send_queue_cap_bytes),
+               "idle_timeout_ms must be appended after send_queue_cap_bytes");
 _Static_assert(offsetof(moq_endpoint_cfg_t, verify_certificate_ctx) >=
                    offsetof(moq_endpoint_cfg_t, verify_certificate) +
                        sizeof(((moq_endpoint_cfg_t *)0)->verify_certificate),

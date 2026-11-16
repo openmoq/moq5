@@ -11,10 +11,11 @@
 
 #define MOQ5_SYSVAL(type, name) static const type MOQ5_SYSVAL_##name = name
 
-/* Modes spelled with UINT32_C(), and a bound spelled with a cast. */
+/* Modes and a floor spelled with UINT32_C(), and a bound spelled with a cast. */
 MOQ5_SYSVAL(uint32_t, MOQ_ENDPOINT_URI_LEGACY);
 MOQ5_SYSVAL(uint32_t, MOQ_ENDPOINT_URI_STANDARD);
 MOQ5_SYSVAL(uint64_t, MOQ_ENDPOINT_HANDSHAKE_TIMEOUT_MAX_US);
+MOQ5_SYSVAL(uint32_t, MOQ_ENDPOINT_IDLE_TIMEOUT_MIN_MS);
 
 /* Frozen v0 floors of the sized records the service tier reads and writes. */
 MOQ5_SYSVAL(size_t, MOQ_ENDPOINT_CFG_V0_SIZE);
