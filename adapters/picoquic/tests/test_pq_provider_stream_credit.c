@@ -149,7 +149,7 @@ static int setup(pair_t *p)
         REQUIRE(tls_api_one_sim_round(p->tls, &p->now, limit, &active) == 0);
     }
     REQUIRE(picoquic_get_cnx_state(s) == picoquic_state_ready);
-    REQUIRE(s->local_parameters.initial_max_stream_id_unidir == 1);
+    REQUIRE(s->local_parameters.initial_max_streams_uni == 1);
     REQUIRE(s->max_streams_unidir_local == 1);
     REQUIRE(s->max_streams_unidir_local_computed == 0);
     REQUIRE(s->is_reset_stream_at_enabled);

@@ -1,6 +1,6 @@
 Detect stateless resets behind another connection's ID; allow not sending them.
 
-Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
+Applies to picoquic 36f49b73d532369882d97474ac018655b6739a58, after 0001 to
 0008.
 
 - A packet associated with a connection by its leading bytes but not
@@ -24,10 +24,10 @@ through picoquic_incoming_packet. In LibMoQ:
 adapters/picoquic/tests/test_pq_stateless_reset_contract.c.
 
 diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
-index a6d214ef..68bf66cc 100644
+index 4d02d59b..918a5336 100644
 --- a/UnitTest1/unittest1.cpp
 +++ b/UnitTest1/unittest1.cpp
-@@ -1367,6 +1367,27 @@ namespace UnitTest1
+@@ -1455,6 +1455,27 @@ namespace UnitTest1
              Assert::AreEqual(ret, 0);
          }
  
@@ -56,7 +56,7 @@ index a6d214ef..68bf66cc 100644
          {
              int ret = stateless_reset_detect_test();
 diff --git a/picoquic/packet.c b/picoquic/packet.c
-index eb2a4f1b..1c5d5ecb 100644
+index 8dea0d8e..adb6ea94 100644
 --- a/picoquic/packet.c
 +++ b/picoquic/packet.c
 @@ -833,11 +833,32 @@ int picoquic_parse_header_and_decrypt(
@@ -104,10 +104,10 @@ index eb2a4f1b..1c5d5ecb 100644
          picoquic_stateless_packet_t* sp = picoquic_create_stateless_packet(quic);
          if (sp != NULL) {
 diff --git a/picoquic/picoquic.h b/picoquic/picoquic.h
-index 19215218..486c1e2d 100644
+index 7a2c29e8..06a4ff7e 100644
 --- a/picoquic/picoquic.h
 +++ b/picoquic/picoquic.h
-@@ -998,6 +998,14 @@ void picoquic_set_default_callback(picoquic_quic_t * quic, picoquic_stream_data_
+@@ -996,6 +996,14 @@ void picoquic_set_default_callback(picoquic_quic_t * quic, picoquic_stream_data_
   */
  void picoquic_set_default_stateless_reset_min_interval(picoquic_quic_t* quic, uint64_t min_interval_usec);
  
@@ -123,10 +123,10 @@ index 19215218..486c1e2d 100644
  * If that number is too high, the maximum number of open files will be hit 
  * at random places in the code. A small value means that some connections may
 diff --git a/picoquic/picoquic_internal.h b/picoquic/picoquic_internal.h
-index c5a81396..ea258b0b 100644
+index 9e2025c7..a161da61 100644
 --- a/picoquic/picoquic_internal.h
 +++ b/picoquic/picoquic_internal.h
-@@ -572,6 +572,7 @@ typedef struct st_picoquic_quic_t {
+@@ -571,6 +571,7 @@ typedef struct st_picoquic_quic_t {
      uint64_t cwin_max; /* max value of cwin per connection */
      /* Flags */
      unsigned int check_token : 1;
@@ -135,10 +135,10 @@ index c5a81396..ea258b0b 100644
      unsigned int provide_token : 1;
      unsigned int unconditional_cnx_id : 1;
 diff --git a/picoquic/quicctx.c b/picoquic/quicctx.c
-index 2c84a945..1e502969 100644
+index bfc6a1bc..801ef6c4 100644
 --- a/picoquic/quicctx.c
 +++ b/picoquic/quicctx.c
-@@ -4542,6 +4542,12 @@ void picoquic_set_default_stateless_reset_min_interval(picoquic_quic_t* quic, ui
+@@ -4697,6 +4697,12 @@ void picoquic_set_default_stateless_reset_min_interval(picoquic_quic_t* quic, ui
      quic->stateless_reset_min_interval = min_interval_usec;
  }
  
@@ -152,10 +152,10 @@ index 2c84a945..1e502969 100644
      picoquic_stream_data_cb_fn callback_fn, void* callback_ctx)
  {
 diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
-index 68cc9118..a43d12fa 100644
+index 001054ca..a248b70e 100644
 --- a/picoquic_t/picoquic_t.c
 +++ b/picoquic_t/picoquic_t.c
-@@ -314,6 +314,9 @@ static const picoquic_test_def_t test_table[] = {
+@@ -328,6 +328,9 @@ static const picoquic_test_def_t test_table[] = {
      { "stateless_reset_bad", stateless_reset_bad_test },
      { "stateless_reset_client", stateless_reset_client_test },
      { "stateless_reset_handshake", stateless_reset_handshake_test },
@@ -166,10 +166,10 @@ index 68cc9118..a43d12fa 100644
      { "stateless_reset_detect_callback", stateless_reset_detect_callback_test },
      { "stateless_reset_detect_vn", stateless_reset_detect_vn_test },
 diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
-index fc7791b5..59e05516 100644
+index 13ba9aa4..ccea89bb 100644
 --- a/picoquictest/picoquictest.h
 +++ b/picoquictest/picoquictest.h
-@@ -115,6 +115,9 @@ int stateless_reset_test(void);
+@@ -120,6 +120,9 @@ int stateless_reset_test(void);
  int stateless_reset_bad_test(void);
  int stateless_reset_client_test(void);
  int stateless_reset_handshake_test(void);
@@ -180,10 +180,10 @@ index fc7791b5..59e05516 100644
  int stateless_reset_detect_callback_test(void);
  int stateless_reset_detect_vn_test(void);
 diff --git a/picoquictest/tls_api_test.c b/picoquictest/tls_api_test.c
-index 90db7ef4..9c99827b 100644
+index e8b50f62..4f927cce 100644
 --- a/picoquictest/tls_api_test.c
 +++ b/picoquictest/tls_api_test.c
-@@ -3622,6 +3622,289 @@ int stateless_reset_client_test(void)
+@@ -3676,6 +3676,289 @@ int stateless_reset_client_test(void)
  }
  
  

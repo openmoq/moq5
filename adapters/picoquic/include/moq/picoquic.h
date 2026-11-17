@@ -55,10 +55,10 @@
  * follows from the caller's own configuration, per category: peer
  * unidirectional streams are bounded by the window this endpoint advertised
  * for them (initial_max_stream_data_uni) times the number of such streams
- * picoquic lets the peer keep open at once (initial_max_stream_id_unidir
+ * picoquic lets the peer keep open at once (initial_max_streams_uni
  * governs concurrency, not lifetime: picoquic re-credits a stream as each
  * one completes); peer-initiated bidirectional streams likewise by
- * initial_max_stream_data_bidi_remote and initial_max_stream_id_bidir;
+ * initial_max_stream_data_bidi_remote and initial_max_streams_bidi;
  * locally initiated bidirectional streams (request streams, whose receive
  * half this adapter also tracks) by initial_max_stream_data_bidi_local times
  * however many such streams the PEER's MAX_STREAMS allows this endpoint to
@@ -83,7 +83,7 @@
  * stream limits while the streams it already counted stay counted, under
  * this adapter's receive accounting. Create refuses a connection whose
  * local transport parameters cannot be read, before taking anything. The
- * adapter samples initial_max_stream_id_unidir at attach and fails the
+ * adapter samples initial_max_streams_uni at attach and fails the
  * connection closed (the transport-error path) when a service pass finds it
  * changed or unreadable. That check sees only a change of that one value;
  * it does not see other parameters or the stream-credit history before

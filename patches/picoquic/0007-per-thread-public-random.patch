@@ -1,6 +1,6 @@
 Keep the public random generator's state per thread
 
-Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
+Applies to picoquic 36f49b73d532369882d97474ac018655b6739a58, after 0001 to
 0006.
 
 picoquic_public_random_64() and the functions built on it draw from one
@@ -39,7 +39,7 @@ draw is provisional and a later provider upgrades it exactly once. A
 half-created worker pair settles through a barrier abort rather than hanging.
 
 diff --git a/UnitTest1/unittest1.cpp b/UnitTest1/unittest1.cpp
-index 22cdd2f8..a6d214ef 100644
+index cf018450..4d02d59b 100644
 --- a/UnitTest1/unittest1.cpp
 +++ b/UnitTest1/unittest1.cpp
 @@ -188,6 +188,13 @@ namespace UnitTest1
@@ -57,10 +57,10 @@ index 22cdd2f8..a6d214ef 100644
          {
              int ret = util_is_path_sane_test();
 diff --git a/picoquic/tls_api.c b/picoquic/tls_api.c
-index 217f8bd6..754a5c2d 100644
+index 52c2d40b..dfce63e6 100644
 --- a/picoquic/tls_api.c
 +++ b/picoquic/tls_api.c
-@@ -1022,49 +1022,112 @@ uint64_t picoquic_crypto_uniform_random(picoquic_quic_t* quic, uint64_t rnd_max)
+@@ -985,49 +985,112 @@ uint64_t picoquic_crypto_uniform_random(picoquic_quic_t* quic, uint64_t rnd_max)
   * generator. The 16 rounds of the xorshift process give a pretty good hash, but
   * that can probably be broken by linear analysis. Or at least we have no proof
   * that it cannot be broken.
@@ -191,7 +191,7 @@ index 217f8bd6..754a5c2d 100644
  }
  
  
-@@ -1074,7 +1137,7 @@ void picoquic_public_random_seed(picoquic_quic_t* quic)
+@@ -1037,7 +1100,7 @@ void picoquic_public_random_seed(picoquic_quic_t* quic)
      picoquic_crypto_random(quic, &seed, sizeof(seed));
  
      picoquic_public_random_seed_64(seed[0], 0);
@@ -201,7 +201,7 @@ index 217f8bd6..754a5c2d 100644
  
  void picoquic_public_random(void* buf, size_t len)
 diff --git a/picoquic_t/picoquic_t.c b/picoquic_t/picoquic_t.c
-index 21a7fba3..68cc9118 100644
+index a76c85d3..001054ca 100644
 --- a/picoquic_t/picoquic_t.c
 +++ b/picoquic_t/picoquic_t.c
 @@ -125,6 +125,7 @@ static const picoquic_test_def_t test_table[] = {
@@ -213,7 +213,7 @@ index 21a7fba3..68cc9118 100644
      { "set_addr_port", util_set_addr_port_test },
      { "picohash", picohash_test },
 diff --git a/picoquictest/picoquictest.h b/picoquictest/picoquictest.h
-index 192a2ae9..fc7791b5 100644
+index e8b4b4ce..13ba9aa4 100644
 --- a/picoquictest/picoquictest.h
 +++ b/picoquictest/picoquictest.h
 @@ -46,6 +46,7 @@ int util_uint8_to_str_test(void);

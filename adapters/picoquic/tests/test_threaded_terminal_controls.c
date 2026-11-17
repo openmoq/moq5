@@ -665,7 +665,7 @@ static int cli_fatal_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
     if (!cnx)
         return 0;
     picoquic_tp_t tp = *picoquic_get_transport_parameters(cnx, 1);
-    tp.initial_max_stream_id_unidir += 1;
+    tp.initial_max_streams_uni += 1;
     picoquic_set_transport_parameters(cnx, &tp);
     __atomic_store_n(&cf->tampered, 1, __ATOMIC_RELEASE);
     return 0;

@@ -332,7 +332,7 @@ static void test_quiet_held_deadline(void)
     const picoquic_tp_t *current_tp = picoquic_get_transport_parameters(cnx, 1);
     HOLD_REQUIRE(current_tp != NULL);
     picoquic_tp_t tp = *current_tp;
-    tp.initial_max_stream_id_unidir = BRIDGE_DEFAULT_MAX_STREAMS;
+    tp.initial_max_streams_uni = BRIDGE_DEFAULT_MAX_STREAMS;
     tp.initial_max_stream_data_uni = 1024;
     picoquic_set_transport_parameters(cnx, &tp);
 

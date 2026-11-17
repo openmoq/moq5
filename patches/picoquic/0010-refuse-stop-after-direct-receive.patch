@@ -1,6 +1,6 @@
 Refuse STOP_SENDING for a receive half completed through direct receive.
 
-Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2, after 0001 to
+Applies to picoquic 36f49b73d532369882d97474ac018655b6739a58, after 0001 to
 0009.
 
 Direct receive marks a completed receive half with fin_received and
@@ -16,10 +16,10 @@ bidirectional completed streams through both preparation APIs and an
 incomplete control.
 
 diff --git a/picoquic/streams.c b/picoquic/streams.c
-index 8e9a25f3..7eefc623 100644
+index 19e5254d..fbeb3744 100644
 --- a/picoquic/streams.c
 +++ b/picoquic/streams.c
-@@ -610,11 +610,12 @@ int picoquic_stop_sending(picoquic_cnx_t* cnx,
+@@ -615,11 +615,12 @@ int picoquic_stop_sending(picoquic_cnx_t* cnx,
              PICOQUIC_ERROR_STREAM_ALREADY_CLOSED : PICOQUIC_ERROR_INVALID_STREAM_ID;
      }
      else if (stream->reset_received ||
@@ -36,10 +36,10 @@ index 8e9a25f3..7eefc623 100644
      }
      else {
 diff --git a/picoquictest/tls_api_test.c b/picoquictest/tls_api_test.c
-index 9c99827b..bfbe4055 100644
+index 4f927cce..10711fa7 100644
 --- a/picoquictest/tls_api_test.c
 +++ b/picoquictest/tls_api_test.c
-@@ -13043,6 +13043,144 @@ static int close_check_test_teardown_pending(void)
+@@ -13867,6 +13867,144 @@ static int close_check_test_teardown_pending(void)
      return ret;
  }
  
@@ -184,7 +184,7 @@ index 9c99827b..bfbe4055 100644
  int direct_receive_close_check_test(void)
  {
      int ret = 0;
-@@ -13072,6 +13210,18 @@ int direct_receive_close_check_test(void)
+@@ -13896,6 +14034,18 @@ int direct_receive_close_check_test(void)
      if (close_check_test_teardown_pending() != 0) {
          ret = -1;
      }

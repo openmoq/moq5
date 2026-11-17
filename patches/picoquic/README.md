@@ -1,8 +1,8 @@
 # Temporary Picoquic Development Patches
 
 Owner: LibMoQ maintainers. Base:
-[`70b5fd5aafdd2d6c349ff783202ece9d778bcaf2`](https://github.com/private-octopus/picoquic/commit/70b5fd5aafdd2d6c349ff783202ece9d778bcaf2),
-released as `v2026.10.22.70b5fd5`. Apply the ordered `series` through
+[`36f49b73d532369882d97474ac018655b6739a58`](https://github.com/private-octopus/picoquic/commit/36f49b73d532369882d97474ac018655b6739a58),
+released as `v2026.11.12.36f49b7`. Apply the ordered `series` through
 `scripts/provider_patches.sh` or `scripts/setup_picoquic_deps.sh`. Picotls keeps
 its separate pin and series.
 
@@ -27,6 +27,14 @@ the feature it protects. Source applicability alone is not runtime qualification
 - Upstream's suppression of a reset callback after delivered FIN is retained.
   The reset-after-FIN wire regression already permits that behavior while
   checking the received reset's final size and error code.
+- [Upstream PR2369](https://github.com/private-octopus/picoquic/pull/2369)
+  (in the selected release) keeps an ACK_FREQUENCY request at or above the
+  peer's min_ack_delay. No downstream patch implements it; upstream's
+  `ackfrq_min_delay` test covers it.
+- Upstream 6152f9e6 replaces a NULL connection callback with one that refuses
+  every event, so in-order data is no longer queued for a connection without
+  a callback. The 0003/0010 direct-receive tests queue data behind a missing
+  first byte instead; their assertions are unchanged.
 
 ## Remaining Removal Conditions
 

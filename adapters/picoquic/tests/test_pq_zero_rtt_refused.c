@@ -60,6 +60,18 @@ static int noop_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
     return 0;
 }
 
+/* The raw client accepts every event. picoquic replaces a NULL callback with
+ * one that refuses every event, which would fail the handshake. */
+static int accept_all_cb(picoquic_cnx_t *cnx, uint64_t stream_id,
+                         uint8_t *bytes, size_t length,
+                         picoquic_call_back_event_t event, void *ctx,
+                         void *stream_ctx)
+{
+    (void)cnx; (void)stream_id; (void)bytes; (void)length; (void)event;
+    (void)ctx; (void)stream_ctx;
+    return 0;
+}
+
 /* Drive one client connection to readiness, then keep pumping a short while so a
  * post-handshake NEW_SESSION_TICKET is received. Returns 0 when ready. */
 static int drive(picoquic_quic_t *quic, picoquic_cnx_t *cnx, int fd,
@@ -138,7 +150,7 @@ int main(void)
     snprintf(ticket_file, sizeof(ticket_file), "moq_0rtt_tickets_%d.bin",
              (int)getpid());
     (void)unlink(ticket_file);
-    picoquic_quic_t *cq = picoquic_create(2, NULL, NULL, NULL, NULL, NULL, NULL,
+    picoquic_quic_t *cq = picoquic_create(2, NULL, NULL, NULL, NULL, accept_all_cb, NULL,
                                           NULL, NULL, NULL, now, NULL,
                                           ticket_file, NULL, 0);
     CHECK(cq != NULL);

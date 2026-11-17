@@ -267,7 +267,7 @@ and `Threads::Threads`.
 ## Provider source baseline
 
 The pinned development picoquic source is
-70b5fd5aafdd2d6c349ff783202ece9d778bcaf2 (release `v2026.10.22.70b5fd5`)
+36f49b73d532369882d97474ac018655b6739a58 (release `v2026.11.12.36f49b7`)
 with the patches `scripts/setup_picoquic_deps.sh` applies, built against
 picotls 7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1. Other source trees given
 through `MOQ_PICOQUIC_SOURCE_DIR` are used as they are: no version is

@@ -1,6 +1,6 @@
 Keep the declared project version in source archives and subproject builds.
 
-Applies to picoquic 70b5fd5aafdd2d6c349ff783202ece9d778bcaf2.
+Applies to picoquic 36f49b73d532369882d97474ac018655b6739a58.
 
 The parent may not be a Git checkout, and its revision is not picoquic's. The
 package configuration and version files use project()'s version, and
@@ -9,10 +9,10 @@ Tests: tests/cmake/PicoquicVersionMetadata.cmake (CTest
 picoquic_version_metadata), in archive and subproject modes.
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index a7d2c346..b92d95fe 100644
+index 23ef4492..8de91bfd 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -863,14 +863,9 @@ install(FILES
+@@ -876,14 +876,9 @@ install(FILES
  
  include(CMakePackageConfigHelpers)
  
@@ -30,7 +30,7 @@ index a7d2c346..b92d95fe 100644
  message(STATUS "Project version: ${PROJECT_VERSION}")
  
  if (NOT CMAKE_INSTALL_LIBDIR)
-@@ -881,7 +876,7 @@ set(INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Location of head
+@@ -894,7 +889,7 @@ set(INCLUDE_INSTALL_DIR ${CMAKE_INSTALL_INCLUDEDIR} CACHE PATH "Location of head
  
  set(INSTALL_CONFIG_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME})
  

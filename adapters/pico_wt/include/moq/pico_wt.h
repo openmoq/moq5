@@ -184,10 +184,10 @@ MOQ_API void moq_pico_wt_conn_notify_transport_closed(
  * most that window. A tighter maximum follows from the caller's own
  * configuration, per category: peer unidirectional WT streams are bounded by
  * initial_max_stream_data_uni times the number of such streams picoquic lets
- * the peer keep open at once (initial_max_stream_id_unidir governs
+ * the peer keep open at once (initial_max_streams_uni governs
  * concurrency, not lifetime: picoquic re-credits a stream as each completes);
  * peer-initiated bidirectional streams by initial_max_stream_data_bidi_remote
- * and initial_max_stream_id_bidir; locally initiated bidirectional streams
+ * and initial_max_streams_bidi; locally initiated bidirectional streams
  * (request streams, whose receive half this adapter also tracks) by
  * initial_max_stream_data_bidi_local times however many such streams the
  * PEER's MAX_STREAMS allows this endpoint to open, which is not under this
@@ -218,7 +218,7 @@ MOQ_API void moq_pico_wt_conn_notify_transport_closed(
  * stream limits while the streams it already counted stay counted, under
  * this adapter's receive accounting. Create refuses a connection whose
  * local transport parameters cannot be read, before taking anything. The
- * adapter samples initial_max_stream_id_unidir at attach and fails the
+ * adapter samples initial_max_streams_uni at attach and fails the
  * connection closed (the adapter's inbound failure) when a receive sweep
  * finds it changed or unreadable. That check sees only a change of that one
  * value; it does not see other parameters or the stream-credit history
