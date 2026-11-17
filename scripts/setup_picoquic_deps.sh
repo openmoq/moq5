@@ -74,7 +74,7 @@ set -euo pipefail
 PICOQUIC_REPO="${PICOQUIC_REPO:-https://github.com/private-octopus/picoquic}"
 PICOQUIC_REF="${PICOQUIC_REF:-36f49b73d532369882d97474ac018655b6739a58}"
 PICOTLS_REPO="${PICOTLS_REPO:-https://github.com/h2o/picotls.git}"
-PICOTLS_REF="${PICOTLS_REF:-7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1}"
+PICOTLS_REF="${PICOTLS_REF:-e446233b4100ebcdec60901c05bfb7f4cd369c5d}"
 
 script_dir=$(cd "$(dirname "$0")" && pwd)
 repo_root=$(cd "$script_dir/.." && pwd)

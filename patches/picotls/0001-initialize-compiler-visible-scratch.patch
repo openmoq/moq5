@@ -1,17 +1,17 @@
 Initialize compiler-visible scratch before conditional writes.
 
-Applies to picotls 7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1.
+Applies to picotls e446233b4100ebcdec60901c05bfb7f4cd369c5d.
 GCC Release builds cannot prove that every live curve word is initialized
 before use, or that the cipher-selection assertion succeeded before its
 output is inspected. Keep assertions and warnings enabled; initialize the
 scratch arrays and test output explicitly instead of suppressing diagnostics.
 The corresponding micro-ecc arrays remain unchanged in upstream as audited
-on 2026-10-13. No algorithm, curve geometry, or selection policy changes.
+on 2026-11-16. No algorithm, curve geometry, or selection policy changes.
 
 diff --git a/deps/micro-ecc/uECC.c b/deps/micro-ecc/uECC.c
 --- a/deps/micro-ecc/uECC.c
 +++ b/deps/micro-ecc/uECC.c
-@@ -799,7 +799,7 @@ static void XYcZ_add(uECC_word_t * X1,
+@@ -796,7 +796,7 @@ static void XYcZ_add(uECC_word_t * X1,
                       uECC_word_t * Y2,
                       uECC_Curve curve) {
      /* t1 = X1, t2 = Y1, t3 = X2, t4 = Y2 */
@@ -20,7 +20,7 @@ diff --git a/deps/micro-ecc/uECC.c b/deps/micro-ecc/uECC.c
      wordcount_t num_words = curve->num_words;
  
      uECC_vli_modSub(t5, X2, X1, curve->p, num_words); /* t5 = x2 - x1 */
-@@ -830,7 +830,7 @@ static void XYcZ_addC(uECC_word_t * X1,
+@@ -827,7 +827,7 @@ static void XYcZ_addC(uECC_word_t * X1,
                        uECC_word_t * Y2,
                        uECC_Curve curve) {
      /* t1 = X1, t2 = Y1, t3 = X2, t4 = Y2 */

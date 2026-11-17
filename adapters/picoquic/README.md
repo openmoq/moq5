@@ -269,7 +269,7 @@ and `Threads::Threads`.
 The pinned development picoquic source is
 36f49b73d532369882d97474ac018655b6739a58 (release `v2026.11.12.36f49b7`)
 with the patches `scripts/setup_picoquic_deps.sh` applies, built against
-picotls 7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1. Other source trees given
+picotls e446233b4100ebcdec60901c05bfb7f4cd369c5d. Other source trees given
 through `MOQ_PICOQUIC_SOURCE_DIR` are used as they are: no version is
 checked, and no Git metadata is required.
 

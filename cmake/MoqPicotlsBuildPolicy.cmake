@@ -4,6 +4,10 @@
 # Directory compile options follow CMAKE_C_FLAGS and configuration flags,
 # preserving caller flags while keeping picotls invariants active even when
 # Release defines NDEBUG.
+# Brotli certificate compression stays off. picotls enables it when pkg-config
+# finds libbrotli; picoquic does not use it, refuses a picotls it builds
+# itself with it, and a found library would add a dependency nobody asked for.
+set(WITH_BROTLI OFF CACHE BOOL "Build picotls with Brotli certificate compression" FORCE)
 if(MSVC)
     # picotls uses GCC-style warning flags that MSVC cannot build warning-free.
     add_compile_options(/UNDEBUG)

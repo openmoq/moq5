@@ -26,9 +26,9 @@ on:
         required: false
         default: '36f49b73d532369882d97474ac018655b6739a58'
       picotls_ref:
-        description: 'picotls branch/tag/full SHA override (default: 7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1)'
+        description: 'picotls branch/tag/full SHA override (default: e446233b4100ebcdec60901c05bfb7f4cd369c5d)'
         required: false
-        default: '7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1'
+        default: 'e446233b4100ebcdec60901c05bfb7f4cd369c5d'
 
 permissions:
   contents: read
@@ -58,7 +58,7 @@ jobs:
         shell: bash
         env:
           PICOQUIC_REF: ${{ github.event.inputs.picoquic_ref || '36f49b73d532369882d97474ac018655b6739a58' }}
-          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || '7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1' }}
+          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || 'e446233b4100ebcdec60901c05bfb7f4cd369c5d' }}
         run: |
           set -euo pipefail
           src/libmoq/scripts/validate_git_ref.sh "$PICOQUIC_REF" picoquic_ref
@@ -71,7 +71,7 @@ jobs:
         shell: bash
         env:
           PICOQUIC_REF: ${{ github.event.inputs.picoquic_ref || '36f49b73d532369882d97474ac018655b6739a58' }}
-          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || '7f0d38c1c54c920d56b4e13ceb1c2dfa2b1325e1' }}
+          PICOTLS_REF: ${{ github.event.inputs.picotls_ref || 'e446233b4100ebcdec60901c05bfb7f4cd369c5d' }}
         run: |
           set -euo pipefail
           fetch_ref() {  # <repo> <ref> <dir>: full SHA, branch or tag
