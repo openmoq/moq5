@@ -216,6 +216,15 @@ void moq_pq_conn_cfg_init_sized(moq_pq_conn_cfg_t *cfg, size_t cfg_size);
 int moq_pq_conn_create(const moq_pq_conn_cfg_t *cfg,
                          moq_pq_conn_t **out);
 
+/*
+ * Destroy an adapter connection. The cnx stays the caller's. If it is still
+ * live, the adapter first unbinds itself: it clears the cnx's callback, so
+ * picoquic never calls into the freed adapter. The cnx then has no
+ * application callback, and stream data the peer sends later closes it with
+ * INTERNAL_ERROR. A caller that keeps the connection installs its own
+ * callback (picoquic_set_callback) before picoquic processes another event;
+ * otherwise it closes or deletes the connection itself.
+ */
 void moq_pq_conn_destroy(moq_pq_conn_t *conn);
 
 /*

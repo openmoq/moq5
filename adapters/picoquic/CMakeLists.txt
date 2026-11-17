@@ -663,6 +663,27 @@ if(MOQ_BUILD_TESTS)
         add_test(NAME pq_stateless_reset_contract
             COMMAND test_pq_stateless_reset_contract)
         set_tests_properties(pq_stateless_reset_contract PROPERTIES TIMEOUT 120)
+
+        # What moq_pq_conn_destroy leaves on a caller-owned connection that is
+        # still live (picoquic.h): no callback, so later stream data closes it,
+        # and a callback the caller installs receives what follows.
+        add_executable(test_pq_attach_detach_contract
+            tests/test_pq_attach_detach_contract.c)
+        target_compile_definitions(test_pq_attach_detach_contract PRIVATE
+            MOQ_TEST_CERT_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+            MOQ_TEST_KEY_PATH="${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        target_include_directories(test_pq_attach_detach_contract PRIVATE
+            "${MOQ_PICOQUIC_SOURCE_DIR}/picoquic")
+        target_link_libraries(test_pq_attach_detach_contract PRIVATE
+            moq::adapter-picoquic moq::core ${_PQ} ${_adapter_tls_link})
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+            target_compile_options(test_pq_attach_detach_contract PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME pq_attach_detach_contract
+            COMMAND test_pq_attach_detach_contract)
+        set_tests_properties(pq_attach_detach_contract PROPERTIES TIMEOUT 120)
     endif()
 
     # Source-mode link-policy contract (see tests/source_mode_link_policy.cmake):
