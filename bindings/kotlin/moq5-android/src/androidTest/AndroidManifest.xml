@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The instrumentation APK's own manifest.
+
+  It exists for ONE declaration: a MoQ endpoint is a network client, so the
+  process that constructs one needs INTERNET. The library's own manifest cannot
+  supply it, because a library must not force a permission on every consumer;
+  the sample applications declare it for themselves, and this test application
+  declares it for itself.
+
+  Nothing else is declared here. AGP generates the <instrumentation> element
+  from the runner named in the module's defaultConfig, and a second copy in this
+  file could drift from it.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+</manifest>

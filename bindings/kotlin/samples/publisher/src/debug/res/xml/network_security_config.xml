@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug builds only. The platform applies debug-overrides only to a
+  debuggable app; the base configuration, and with it the system CAs, is
+  unchanged.
+
+  This BROADENS trust for this debug app: any CA in the device's user store
+  is also a trust anchor, and debug-override anchors override pin sets. It
+  does not disable verification: a relay's certificate must still chain to a
+  trusted anchor and match the URL's host or IP address.
+-->
+<network-security-config>
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="user" />
+        </trust-anchors>
+    </debug-overrides>
+</network-security-config>

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  A first-party MoQ5 sample application. It is an API acceptance app: it
+  consumes the published :moq5-android surface exactly as any application
+  would, and is never itself published.
+
+  INTERNET is the only permission it asks for, because a MoQ endpoint is a
+  network client. The platform launcher icon is used deliberately: a sample
+  that shipped its own artwork would carry resources that prove nothing about
+  the surface under test.
+
+  There is no android:allowBackup here. It is deprecated from Android 12, and
+  its replacement is a data-extraction-rules resource stating a backup policy
+  this sample has no opinion about; the platform default is the honest answer
+  for an acceptance app that stores nothing.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:label="MoQ Player Sample">
+        <!-- No android:label here: it would duplicate the application's. -->
+        <activity
+            android:name=".PlayerActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

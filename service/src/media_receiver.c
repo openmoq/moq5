@@ -865,6 +865,22 @@ static bool receiver_companion_d22(moq_media_companion_profile_t c)
            c == MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
 }
 
+/* Latch the session's draft (r->mu held): the transport version, and for
+ * AUTO the companion matching it. Draft 22 is not a match for SHARED_EPOCH,
+ * which the draft-22 companion refuses, so that pair stays unresolved and
+ * fails like a mismatch. */
+static void receiver_latch_version_locked(moq_media_receiver_t *r, moq_version_t v)
+{
+    r->transport_version = v;
+    if (r->companion_profile == MOQ_MEDIA_COMPANION_AUTO) {
+        if (v == MOQ_VERSION_DRAFT_22 &&
+            r->time_mode != MOQ_MEDIA_TIME_SHARED_EPOCH)
+            r->companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
+        else if (v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18)
+            r->companion_profile = MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
+    }
+}
+
 /* Shared by network reconciliation and app-thread poll nudge, under r->mu.
  * D22 includes any in-flight conversion charge; legacy remains depth-only. */
 static bool obj_resume_ready_locked(const moq_media_receiver_t *r)
@@ -6133,17 +6149,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
     {
         moq_version_t v = moq_session_version(session);
         pthread_mutex_lock(&r->mu);
-        r->transport_version = v;
-        /* AUTO takes the companion matching the draft. Draft 22 is not a
-         * match for SHARED_EPOCH, which the draft-22 companion refuses, so
-         * that pair stays unresolved and fails like a mismatch. */
-        if (r->companion_profile == MOQ_MEDIA_COMPANION_AUTO) {
-            if (v == MOQ_VERSION_DRAFT_22 &&
-                r->time_mode != MOQ_MEDIA_TIME_SHARED_EPOCH)
-                r->companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
-            else if (v == MOQ_VERSION_DRAFT_16 || v == MOQ_VERSION_DRAFT_18)
-                r->companion_profile = MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01;
-        }
+        receiver_latch_version_locked(r, v);
         bool usable =
             receiver_companion_d22(r->companion_profile)
                 ? v == MOQ_VERSION_DRAFT_22
@@ -8708,6 +8714,98 @@ void moq_media_receiver_test_track_attrib(moq_media_receiver_t *r,
     if (out_app_gen) *out_app_gen = t->app_gen;
     if (out_reconciled) *out_reconciled = t->reconciled_app_gen;
     pthread_mutex_unlock(&r->mu);
+}
+
+
+/* Preconditions and intake for a receiver with no session, each setting or
+ * driving exactly what production sets or drives elsewhere: the track at a
+ * catalog index, the desire a subscribe records, and one object through the
+ * real intake, routed by the track's kind as the pump routes it. The intake
+ * takes over the object's refs. */
+void moq_media_receiver_test_latch_session_version(moq_media_receiver_t *r, moq_version_t v);
+void moq_media_receiver_test_latch_session_version(moq_media_receiver_t *r, moq_version_t v)
+{
+    pthread_mutex_lock(&r->mu);
+    receiver_latch_version_locked(r, v);
+    pthread_mutex_unlock(&r->mu);
+}
+
+moq_media_track_t *moq_media_receiver_test_track_at(moq_media_receiver_t *r, size_t index);
+moq_media_track_t *moq_media_receiver_test_track_at(moq_media_receiver_t *r, size_t index)
+{
+    pthread_mutex_lock(&r->mu);
+    moq_media_track_t *t = index < r->track_count ? r->tracks[index] : NULL;
+    pthread_mutex_unlock(&r->mu);
+    return t;
+}
+
+void moq_media_receiver_test_mark_desired(moq_media_receiver_t *r, moq_media_track_t *track);
+void moq_media_receiver_test_mark_desired(moq_media_receiver_t *r, moq_media_track_t *track)
+{
+    pthread_mutex_lock(&r->mu);
+    track->desired_subscribed = true;
+    pthread_mutex_unlock(&r->mu);
+}
+
+void moq_media_receiver_test_push_object_ex(moq_media_receiver_t *r, moq_media_track_t *track,
+                                            uint64_t group, uint64_t subgroup, uint64_t object,
+                                            uint8_t publisher_priority, moq_object_status_t status,
+                                            bool end_of_group, bool datagram,
+                                            const uint8_t *payload, size_t len,
+                                            const uint8_t *properties, size_t plen);
+void moq_media_receiver_test_push_object_ex(moq_media_receiver_t *r, moq_media_track_t *track,
+                                            uint64_t group, uint64_t subgroup, uint64_t object,
+                                            uint8_t publisher_priority, moq_object_status_t status,
+                                            bool end_of_group, bool datagram,
+                                            const uint8_t *payload, size_t len,
+                                            const uint8_t *properties, size_t plen)
+{
+    moq_sub_object_t so;
+    if (!receiver_intake_begin(r)) return;     /* no room: the pump would wait */
+    memset(&so, 0, sizeof so);
+    so.track = track->sub_track;
+    so.group_id = group;
+    so.subgroup_id = subgroup;
+    so.object_id = object;
+    so.publisher_priority = publisher_priority;
+    so.status = status;
+    so.end_of_group = end_of_group;
+    so.datagram = datagram;
+    /* Only a NORMAL object carries a payload. */
+    if ((status == MOQ_OBJECT_NORMAL && payload &&
+         moq_rcbuf_create(&r->alloc, payload, len, &so.payload) != MOQ_OK) ||
+        (properties && plen &&
+         moq_rcbuf_create(&r->alloc, properties, plen, &so.properties) != MOQ_OK)) {
+        moq_sub_object_cleanup(&so);
+        receiver_intake_end(r);
+        return;
+    }
+    if (track->is_sap_timeline)
+        receiver_on_sap_object(r, track, &so, 0);
+    else if (track->is_media_timeline)
+        receiver_on_media_timeline_object(r, track, &so, 0);
+    else if (track->is_event_timeline)
+        moq_sub_object_cleanup(&so);
+    else if (track_is_ts(track))
+        receiver_on_ts_object(r, track, &so, 0);
+    else
+        receiver_on_media_object(r, track, &so, 0);
+    receiver_intake_end(r);
+}
+
+void moq_media_receiver_test_push_object(moq_media_receiver_t *r, moq_media_track_t *track,
+                                         uint64_t group, uint64_t object,
+                                         moq_object_status_t status, bool end_of_group,
+                                         bool datagram, const uint8_t *payload, size_t len,
+                                         const uint8_t *properties, size_t plen);
+void moq_media_receiver_test_push_object(moq_media_receiver_t *r, moq_media_track_t *track,
+                                         uint64_t group, uint64_t object,
+                                         moq_object_status_t status, bool end_of_group,
+                                         bool datagram, const uint8_t *payload, size_t len,
+                                         const uint8_t *properties, size_t plen)
+{
+    moq_media_receiver_test_push_object_ex(r, track, group, 0, object, 0, status, end_of_group,
+                                           datagram, payload, len, properties, plen);
 }
 
 #endif /* MOQ_MEDIA_RECEIVER_TESTING */

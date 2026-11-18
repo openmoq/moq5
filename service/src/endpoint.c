@@ -3200,4 +3200,114 @@ void moq_endpoint_test_set_offer(moq_endpoint_t *ep, const moq_version_t *v, siz
     ep->alpn_offer_count = n;
 }
 
+/* A scripted facade for a bare endpoint, for harnesses that drive the
+ * endpoint's public calls with no transport. The test owns the storage
+ * (moq_endpoint_test_probe_size() bytes) and sets the facade's INPUTS --
+ * negotiated version, fatal and its code, cleanly closed; the endpoint's own
+ * paths decide what each public call reports from them. wake() only records;
+ * wait() answers at most one recorded wake per call through the optional
+ * service function, and times out otherwise. Install refuses to replace an
+ * existing facade. */
+struct ep_test_probe {
+    int           report;          /* drain_state's answer */
+    unsigned      wakes;
+    unsigned      serviced;
+    void        (*service)(void *ctx);
+    void         *service_ctx;
+    moq_version_t negotiated;
+    bool          fatal;
+    uint64_t      fatal_code;
+    bool          clean;
+};
+
+static moq_result_t ep_probe_wait(void *f, uint64_t timeout_us)
+{
+    struct ep_test_probe *p = (struct ep_test_probe *)f;
+    (void)timeout_us;
+    if (p->service && p->serviced < p->wakes) {
+        p->serviced++;
+        p->service(p->service_ctx);
+        return MOQ_OK;
+    }
+    return MOQ_DONE;
+}
+static void ep_probe_wake(void *f) { ((struct ep_test_probe *)f)->wakes++; }
+static moq_version_t ep_probe_negotiated(void *f) { return ((struct ep_test_probe *)f)->negotiated; }
+static bool ep_probe_is_fatal(void *f) { return ((struct ep_test_probe *)f)->fatal; }
+static uint64_t ep_probe_fatal_code(void *f) { return ((struct ep_test_probe *)f)->fatal_code; }
+static bool ep_probe_clean_closed(void *f) { return ((struct ep_test_probe *)f)->clean; }
+static int ep_probe_drain_state(void *f) { return ((struct ep_test_probe *)f)->report; }
+static moq_result_t ep_probe_stop(void *f) { (void)f; return MOQ_OK; }
+static void ep_probe_destroy(void *f) { (void)f; }   /* caller-owned */
+static void ep_probe_terminal(void *f, moq_endpoint_terminal_reason_t *reason,
+                              uint64_t *detail)
+{
+    const struct ep_test_probe *p = (const struct ep_test_probe *)f;
+    if (p->fatal && p->fatal_code != 0) {
+        *reason = MOQ_ENDPOINT_TERMINAL_PROTOCOL; *detail = p->fatal_code;
+    } else if (p->fatal) {
+        *reason = MOQ_ENDPOINT_TERMINAL_TRANSPORT; *detail = 0;
+    } else if (p->clean) {
+        *reason = MOQ_ENDPOINT_TERMINAL_CLEAN; *detail = 0;
+    } else {
+        *reason = MOQ_ENDPOINT_TERMINAL_NONE; *detail = 0;
+    }
+}
+static const ep_backend_vtable_t ep_test_probe_vt = {
+    .wait = ep_probe_wait,
+    .wake = ep_probe_wake,
+    .negotiated_version = ep_probe_negotiated,
+    .is_fatal = ep_probe_is_fatal,
+    .fatal_code = ep_probe_fatal_code,
+    .clean_closed = ep_probe_clean_closed,
+    .drain_state = ep_probe_drain_state,
+    .stop = ep_probe_stop,
+    .destroy = ep_probe_destroy,
+    .terminal = ep_probe_terminal,
+};
+
+size_t moq_endpoint_test_probe_size(void);
+size_t moq_endpoint_test_probe_size(void) { return sizeof(struct ep_test_probe); }
+
+moq_result_t moq_endpoint_test_install_probe(moq_endpoint_t *ep, void *storage,
+                                             size_t size, int report);
+moq_result_t moq_endpoint_test_install_probe(moq_endpoint_t *ep, void *storage,
+                                             size_t size, int report)
+{
+    if (!ep || !storage || size < sizeof(struct ep_test_probe)) return MOQ_ERR_INVAL;
+    if (ep->vt || ep->facade) return MOQ_ERR_WRONG_STATE;
+    struct ep_test_probe *p = (struct ep_test_probe *)storage;
+    memset(p, 0, sizeof(*p));
+    p->report = report;
+    ep->vt = &ep_test_probe_vt;
+    ep->facade = p;
+    return MOQ_OK;
+}
+
+void moq_endpoint_test_probe_set_negotiated(void *probe, moq_version_t v);
+void moq_endpoint_test_probe_set_negotiated(void *probe, moq_version_t v)
+{
+    if (probe) ((struct ep_test_probe *)probe)->negotiated = v;
+}
+
+/* Fatal with `code` (0: a transport failure), never cleanly closed. */
+void moq_endpoint_test_probe_set_terminal(void *probe, bool fatal, uint64_t code);
+void moq_endpoint_test_probe_set_terminal(void *probe, bool fatal, uint64_t code)
+{
+    if (!probe) return;
+    struct ep_test_probe *p = (struct ep_test_probe *)probe;
+    p->fatal = fatal;
+    p->fatal_code = code;
+    p->clean = false;
+}
+
+void moq_endpoint_test_probe_set_service(void *probe, void (*fn)(void *), void *ctx);
+void moq_endpoint_test_probe_set_service(void *probe, void (*fn)(void *), void *ctx)
+{
+    if (!probe) return;
+    struct ep_test_probe *p = (struct ep_test_probe *)probe;
+    p->service = fn;
+    p->service_ctx = ctx;
+}
+
 #endif /* MOQ_MEDIA_SENDER_TESTING || MOQ_MEDIA_RECEIVER_TESTING */
