@@ -183,16 +183,20 @@ val expectedModuleVerificationTasks =
     setOf(
         ":moq5-android:check",
         ":bridge-r8-fixture:check",
+        ":samples:playback:check",
         ":samples:player:check",
         ":samples:publisher:check",
+        ":samples:showcase:check",
     )
 
 val requiredModuleVerificationTasks =
     listOf(
         ":moq5-android:check",
         ":bridge-r8-fixture:check",
+        ":samples:playback:check",
         ":samples:player:check",
         ":samples:publisher:check",
+        ":samples:showcase:check",
     )
 
 val requiredVerificationTasks =

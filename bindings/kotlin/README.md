@@ -28,9 +28,12 @@ working camera-to-player playback.
 | `moq5-android` | Public Kotlin API and the packaged native implementation |
 | `samples/publisher` | Publisher application and capture/publication contracts |
 | `samples/player` | Receiver application and encoded-media conversion contracts |
+| `samples/playback` | Playback engine shared by the two receiving samples (not published) |
+| `samples/showcase` | Full Android application over the same engine (Compose, Material 3) |
 | `bridge-r8-fixture` | Shrinking/obfuscation verification fixture, not application API |
 
-The library declares Android API 21 as its minimum; the samples declare API 23.
+The library declares Android API 21 as its minimum; the samples declare API 23,
+and the showcase API 26 (picture-in-picture and audio-focus requests).
 Individual sample capture features can require a later API and must refuse
 unsupported devices explicitly. The packaged ABIs are `arm64-v8a` and
 `x86_64`. These build declarations do not establish the final device support
@@ -89,7 +92,8 @@ repository. Keep its POM and Gradle module metadata with the AAR.
 
 The aggregate verification entry is `tools/gradlew-verified check`. Focused
 host tests include `:moq5-android:testDebugUnitTest`,
-`:samples:publisher:testDebugUnitTest`, and `:samples:player:testDebugUnitTest`.
+`:samples:publisher:testDebugUnitTest`, `:samples:player:testDebugUnitTest`,
+`:samples:playback:testDebugUnitTest` and `:samples:showcase:testDebugUnitTest`.
 The aggregate also checks native/package evidence and deliberately fails when
 required evidence is absent or stale. Device instrumentation, real media,
 trust-policy and external-consumer runtime checks remain separate acceptance
@@ -270,3 +274,25 @@ See the public contracts in [MoqEndpoint.kt](moq5-android/src/main/kotlin/org/op
 [Sender.kt](moq5-android/src/main/kotlin/org/openmoq/moq5/Sender.kt), and
 [TrustPolicy.kt](moq5-android/src/main/kotlin/org/openmoq/moq5/TrustPolicy.kt).
 Internal `engine`, `jni`, and `trust` packages are implementation details.
+
+## The Showcase Application
+
+`samples/showcase` ("MoQ5 Player") is a complete application built on the
+same receive surface and playback engine as `samples/player`, with Jetpack
+Compose and Material 3. Build and install it with
+`tools/gradlew-verified :samples:showcase:installDebug`. Enter a relay URL
+(`https://` for WebTransport, `moqt://` for raw QUIC) and a broadcast
+namespace, or open a link:
+
+```
+adb shell am start -a android.intent.action.VIEW \
+  -d 'moq5://watch?relay=https%3A%2F%2Frelay.example.com%3A4433%2Fmoq&namespace=live%2Fchannel-1'
+```
+
+A link may add `draft=16` or `draft=18` to offer one draft only (the default
+offers every draft the build speaks) and `start=next` to join at the next
+group boundary. Rotation keeps playing; going Home while playing enters
+picture-in-picture where the device supports it; leaving the app, closing
+picture-in-picture, losing audio focus or unplugging headphones stops
+playback, and Play rejoins the live broadcast. The app does not play in the
+background.

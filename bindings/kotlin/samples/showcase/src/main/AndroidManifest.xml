@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The MoQ5 showcase application. INTERNET is its only permission: a MoQ
+  endpoint is a network client, and the app does not play in the background
+  (leaving it stops playback unless it moved into picture-in-picture).
+
+  The activity handles rotation, resizing and dark-mode changes itself, so the
+  video surface and the running session survive them; picture-in-picture keeps
+  the same surface. `moq5://watch?relay=...&namespace=...` links open a
+  broadcast directly.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Showcase">
+        <activity
+            android:name=".ShowcaseActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:host="watch"
+                    android:scheme="moq5" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

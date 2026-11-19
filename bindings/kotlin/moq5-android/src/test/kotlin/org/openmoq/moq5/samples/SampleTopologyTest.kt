@@ -28,25 +28,33 @@ internal class SampleTopologyTest {
         /** `bindings/kotlin`, from the module directory the test runs in. */
         val root = File("..").canonicalFile
         val settings = File(root, "settings.gradle.kts")
-        val samples = listOf("player", "publisher")
+        val samples = listOf("player", "publisher", "showcase")
+
+        /** The shared playback engine: a library the player runs; its sources are judged as the player's. */
+        const val ENGINE = "playback"
 
         fun moduleDir(name: String) = File(root, "samples/$name")
+
+        /** A sample's source directories: its own, and for the player the engine it runs. */
+        fun sourceDirs(name: String): List<File> =
+            if (name == "player") listOf(File(moduleDir(name), "src"), File(moduleDir(ENGINE), "src"))
+            else listOf(File(moduleDir(name), "src"))
 
         fun buildScript(name: String) = File(moduleDir(name), "build.gradle.kts")
     }
 
     @Test
-    fun `both sample modules exist under bindings-kotlin samples`() {
+    fun `every sample module exists under bindings-kotlin samples`() {
         val missing = samples.filterNot { moduleDir(it).isDirectory && buildScript(it).isFile }
         assertTrue(
             missing.isEmpty(),
-            "the assessment names a player and a publisher sample; missing module(s): $missing " +
+            "the samples are the player, the publisher and the showcase; missing module(s): $missing " +
                 "(each is a directory under bindings/kotlin/samples with its own build.gradle.kts)",
         )
     }
 
     @Test
-    fun `settings registers both samples, so Gradle builds and gates them`() {
+    fun `settings registers every sample, so Gradle builds and gates them`() {
         val text = settings.readText()
         for (s in samples) {
             assertTrue(
@@ -85,7 +93,7 @@ internal class SampleTopologyTest {
 
     /** Root-relative source directories, as the shell gate names them. */
     private val PUBLISHER_SRC = "samples/publisher/src/main/kotlin/org/openmoq/moq5/samples/publisher"
-    private val PLAYER_SRC = "samples/player/src/main/kotlin/org/openmoq/moq5/samples/player"
+    private val PLAYER_SRC = "samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback"
 
     /** The files that alone may name a file-scoped class: full root-relative paths, never a basename. */
     private val CAMERA_DRIVER = "$PUBLISHER_SRC/Camera2Capture.kt"
@@ -103,6 +111,17 @@ internal class SampleTopologyTest {
     private val PUBLISHER_MEDIA = setOf("MediaCodec", "MediaFormat", "MediaCodecInfo", "AudioRecord", "AudioFormat", "AudioTimestamp", "MediaRecorder")
     private val PLAYER_MEDIA = setOf("MediaCodec", "MediaFormat", "AudioTrack", "AudioFormat", "AudioAttributes", "AudioTimestamp")
 
+    /** The showcase decodes nothing itself: it asks for audio focus and hears of noisy output. */
+    private val SHOWCASE_MEDIA = setOf("AudioAttributes", "AudioFocusRequest", "AudioManager")
+
+    /** A role's own `android.media` classes. */
+    private fun mediaOf(role: String): Set<String> =
+        when (role) {
+            "publisher" -> PUBLISHER_MEDIA
+            "showcase" -> SHOWCASE_MEDIA
+            else -> PLAYER_MEDIA
+        }
+
     /** A role's file-scoped `android.media` classes, and the only files that may name each. */
     private val MEDIA_FILE_SCOPES: Map<String, Map<String, Set<String>>> =
         mapOf(
@@ -114,7 +133,8 @@ internal class SampleTopologyTest {
     private data class Violation(val name: String, val reason: String)
 
     private fun roleOf(path: String): String =
-        samples.firstOrNull { path.startsWith("samples/$it/") } ?: error("not a sample source path: $path")
+        if (path.startsWith("samples/$ENGINE/")) "player"
+        else samples.firstOrNull { path.startsWith("samples/$it/") } ?: error("not a sample source path: $path")
 
     /**
      * The executable text of Kotlin source: line comments, nesting block
@@ -177,7 +197,7 @@ internal class SampleTopologyTest {
         if (wildcard(code, CAMERA2)) return listOf(Violation("$CAMERA2.*", "wildcard"))
         return named(code, CAMERA2).sorted().mapNotNull { cls ->
             when {
-                roleOf(path) == "player" -> Violation(cls, "role")
+                roleOf(path) != "publisher" -> Violation(cls, "role")
                 cls in CAMERA2_METADATA -> null
                 cls in CAMERA2_SESSION -> if (path == CAMERA_DRIVER) null else Violation(cls, "file")
                 else -> Violation(cls, "unlisted")
@@ -189,8 +209,8 @@ internal class SampleTopologyTest {
         val code = executable(path, text)
         if (wildcard(code, MEDIA)) return listOf(Violation("$MEDIA.*", "wildcard"))
         val role = roleOf(path)
-        val own = if (role == "publisher") PUBLISHER_MEDIA else PLAYER_MEDIA
-        val other = if (role == "publisher") PLAYER_MEDIA else PUBLISHER_MEDIA
+        val own = mediaOf(role)
+        val other = (PUBLISHER_MEDIA + PLAYER_MEDIA + SHOWCASE_MEDIA) - own
         return named(code, MEDIA).sorted().mapNotNull { cls ->
             val scope = MEDIA_FILE_SCOPES[role]?.get(cls)
             when {
@@ -205,17 +225,22 @@ internal class SampleTopologyTest {
     /** Libraries a sample may not take without a proposal. */
     private val LIBRARIES = listOf("androidx.compose", "androidx.lifecycle", "androidx.camera", "androidx.media3", "okhttp", "okhttp3", "retrofit")
 
+    /** The showcase's proposed UI libraries: its own, never another module's. */
+    private val SHOWCASE_LIBRARIES = setOf("androidx.compose", "androidx.lifecycle")
+
+    /** The libraries [role] may not name. */
+    private fun refusedLibraries(role: String): List<String> = if (role == "showcase") LIBRARIES - SHOWCASE_LIBRARIES else LIBRARIES
+
     /** A library is judged like a platform API: by what the executable text names, never by a comment or a literal. */
     private fun libraryViolations(path: String, text: String): List<Violation> {
-        roleOf(path) // a sample source path, or this fails
+        val role = roleOf(path) // a sample source path, or this fails
         val code = executable(path, text)
-        return LIBRARIES.filter { it in code }.map { Violation(it, "unproposed") }
+        return refusedLibraries(role).filter { it in code }.map { Violation(it, "unproposed") }
     }
 
     /** Every Kotlin and Java source of every sample, by its root-relative path. */
     private fun sampleSources(): List<Pair<String, String>> =
-        samples.flatMap { s ->
-            val dir = File(moduleDir(s), "src")
+        samples.flatMap { s -> sourceDirs(s) }.flatMap { dir ->
             if (!dir.isDirectory) emptyList() else
                 dir.walkTopDown().filter { it.isFile && (it.extension == "kt" || it.extension == "java") }
                     .map { it.relativeTo(root).path.replace(File.separatorChar, '/') to it.readText() }
@@ -233,7 +258,7 @@ internal class SampleTopologyTest {
             if (b.isFile) {
                 // A build script is judged as text: any mention there is a declaration.
                 val text = b.readText()
-                val found = (LIBRARIES + listOf("android.media.MediaCodec", "android.media.MediaMuxer")).filter { it in text }
+                val found = (refusedLibraries(s) + listOf("android.media.MediaCodec", "android.media.MediaMuxer")).filter { it in text }
                 assertTrue(found.isEmpty(), "the $s sample declares unproposed dependency(ies) $found")
                 assertTrue(CAMERA2 !in text, "the $s sample declares a camera2 dependency")
             }
@@ -337,6 +362,8 @@ internal class SampleTopologyTest {
         assertEquals(setOf("CameraDevice", "CameraCaptureSession", "CaptureRequest"), CAMERA2_SESSION)
         assertEquals(setOf("AudioFormat", "AudioRecord", "AudioTimestamp", "MediaCodec", "MediaCodecInfo", "MediaFormat", "MediaRecorder"), PUBLISHER_MEDIA)
         assertEquals(setOf("AudioAttributes", "AudioFormat", "AudioTimestamp", "AudioTrack", "MediaCodec", "MediaFormat"), PLAYER_MEDIA)
+        assertEquals(setOf("AudioAttributes", "AudioFocusRequest", "AudioManager"), SHOWCASE_MEDIA)
+        assertEquals(setOf("androidx.compose", "androidx.lifecycle"), SHOWCASE_LIBRARIES)
         assertEquals(
             mapOf(
                 "publisher" to mapOf(
@@ -346,8 +373,8 @@ internal class SampleTopologyTest {
                 ),
                 "player" to mapOf(
                     "MediaCodec" to setOf(
-                        "samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/AndroidPlaybackCodec.kt",
-                        "samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/AndroidPlaybackRender.kt",
+                        "samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/AndroidPlaybackCodec.kt",
+                        "samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/AndroidPlaybackRender.kt",
                     ),
                 ),
             ),
@@ -380,11 +407,12 @@ internal class SampleTopologyTest {
             "player" to setOf(
                 "AudioAttributes.Builder", "AudioFormat.Builder", "AudioTrack.Builder", "MediaCodec.BufferInfo",
             ),
+            "showcase" to setOf("AudioAttributes.Builder", "AudioFocusRequest.Builder"),
         )
 
     @Test
     fun `an allowance is by top-level class, and the nested members the samples use all belong to allowed owners`() {
-        val owners = CAMERA2_METADATA + CAMERA2_SESSION + PUBLISHER_MEDIA + PLAYER_MEDIA
+        val owners = CAMERA2_METADATA + CAMERA2_SESSION + PUBLISHER_MEDIA + PLAYER_MEDIA + SHOWCASE_MEDIA
         val member = Regex("(?<![A-Za-z0-9_.])(${owners.joinToString("|")})\\.([A-Z][a-z][A-Za-z0-9]*)\\b")
         val used = samples.associateWith { mutableSetOf<String>() }
         for ((path, text) in sampleSources()) {
@@ -392,7 +420,7 @@ internal class SampleTopologyTest {
         }
         assertEquals(NESTED_MEMBERS, used.mapValues { it.value.toSet() }, "the nested members in use, as reviewed")
         for ((role, members) in NESTED_MEMBERS) {
-            val allowed = if (role == "publisher") CAMERA2_METADATA + CAMERA2_SESSION + PUBLISHER_MEDIA else PLAYER_MEDIA
+            val allowed = if (role == "publisher") CAMERA2_METADATA + CAMERA2_SESSION + PUBLISHER_MEDIA else mediaOf(role)
             assertEquals(emptyList(), members.filterNot { it.substringBefore('.') in allowed }, "every $role nested member's owner is one of its allowed classes")
         }
     }
@@ -451,6 +479,26 @@ internal class SampleTopologyTest {
         }
         val smuggled = "import $CAMERA2.*\nval session: CameraExtensionSession? = null"
         assertEquals(listOf(Violation("$CAMERA2.*", "wildcard")), camera2Violations(CAMERA_DRIVER, smuggled))
+    }
+
+    @Test
+    fun `the shared playback engine is a registered library the player runs, held to the samples' dependency line`() {
+        val b = buildScript(ENGINE)
+        assertTrue(b.isFile, "the shared engine has no build script at samples/$ENGINE")
+        val text = b.readText()
+        assertTrue(
+            Regex("""^\s*include\("[:]samples:$ENGINE"\)""", RegexOption.MULTILINE).containsMatchIn(settings.readText()),
+            "settings.gradle.kts does not include \":samples:$ENGINE\"",
+        )
+        assertTrue("""id("com.android.library")""" in text && """id("com.android.application")""" !in text, "the engine is a library, never an installable app")
+        assertTrue(Regex("""api\(project\("[:]moq5-android"\)\)""").containsMatchIn(text), "the engine exports :moq5-android through api(project(...))")
+        val declared = (LIBRARIES + listOf("kotlinx-coroutines-core", "kotlinx-coroutines-android")).filter { it in text }
+        assertEquals(emptyList(), declared, "the engine declares no unproposed dependency and no coroutines artifact")
+        assertTrue(
+            Regex("""implementation\(project\("[:]samples:$ENGINE"\)\)""").containsMatchIn(buildScript("player").readText()),
+            "the player runs the engine its sources are judged with",
+        )
+        assertTrue(sampleSources().any { it.first.startsWith("samples/$ENGINE/") }, "the engine's sources are read as the player's")
     }
 
     @Test

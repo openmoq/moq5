@@ -13,9 +13,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.text.method.ScrollingMovementMethod
-import android.util.Log
 import android.view.Gravity
-import android.view.Surface
 import android.view.TextureView
 import android.view.ViewGroup
 import android.widget.Button
@@ -23,36 +21,26 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
+import org.openmoq.moq5.samples.playback.AndroidPlayback
+import org.openmoq.moq5.samples.playback.DiagnosticsListenerOwner
+import org.openmoq.moq5.samples.playback.PlaybackCapture
+import org.openmoq.moq5.samples.playback.PlaybackDiagnostics
+import org.openmoq.moq5.samples.playback.PlaybackRequest
+import org.openmoq.moq5.samples.playback.PlaybackTrace
+import org.openmoq.moq5.samples.playback.SessionUpdate
+import org.openmoq.moq5.samples.playback.UiDispatch
 
 /** A small service-tier player: public receiver, owned decoder thread, and TextureView output. */
 class PlayerActivity : Activity() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var diagnostics: DiagnosticsListenerOwner? = null
-    private val display = PlaybackDisplayRegistry<SurfaceTexture, Surface>(
-        createSurface = { Surface(it) },
-        releaseSurface = { it.release() },
-        releaseTransferredTexture = { it.release() },
-    )
-    /** Present only when the launch asked for the acceptance observer (the supervised run). */
-    private var presentation: PlaybackPresentationSeat<SurfaceTexture, Surface>? = null
 
     /**
-     * The Start/Stop lifecycle itself lives in [SessionController], so the
-     * path this Activity actually takes can be driven by a test rather than
-     * only by a finger on a button.
+     * The shared engine's screen-level owner: display, Start/Stop lifecycle and,
+     * when the launch asks for it, the acceptance observer. Created in
+     * [onCreate], once the launch flags are known.
      */
-    private val controller =
-        SessionController(
-            scope,
-            // The real dispatch boundary: produced on the session's thread,
-            // delivered on the UI thread.
-            UiDispatch { action -> runOnUiThread(action) },
-        ) { update -> render(update) }
+    private lateinit var playback: AndroidPlayback
 
     private lateinit var url: EditText
     private lateinit var namespace: EditText
@@ -71,7 +59,9 @@ class PlayerActivity : Activity() {
         } else if (flags.trace) {
             PlaybackTrace.mark { "diagnostics-listener unarmed: debuggable=$debuggable sdk=${Build.VERSION.SDK_INT}" }
         }
-        presentation = presentationSeatFor(flags.observe, display, System::nanoTime)
+        // The real dispatch boundary: produced on the session's thread,
+        // delivered on the UI thread.
+        playback = AndroidPlayback(UiDispatch { action -> runOnUiThread(action) }, flags.observe) { update -> render(update) }
 
         val inputs = playerInputs(intent::getStringExtra)
         url = field(inputs.url)
@@ -98,21 +88,20 @@ class PlayerActivity : Activity() {
             }.apply {
                 surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-                        this@PlayerActivity.display.available(surface)
+                        playback.surfaceAvailable(surface)
                         start.isEnabled = true
                     }
 
                     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
 
                     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
-                        controller.stop()
                         start.isEnabled = false
-                        return presentation?.onDestroyed(surface) ?: this@PlayerActivity.display.destroyed(surface)
+                        return playback.surfaceDestroyed(surface)
                     }
 
                     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
                         PlaybackTrace.mark { "texture updated ts=${surface.timestamp}" }
-                        presentation?.onFrame(surface, surface.timestamp) { capture() }
+                        playback.frameShown(surface) { capture() }
                     }
                 }
             }
@@ -153,7 +142,7 @@ class PlayerActivity : Activity() {
         val listener = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 PlaybackTrace.mark { "stats-callback thread=${Thread.currentThread().name} main=${Looper.myLooper() == Looper.getMainLooper()}" }
-                owner.delivered(intent.action) { PlaybackDiagnostics.request(scope) }
+                owner.delivered(intent.action) { playback.requestDiagnostics() }
             }
         }
         owner = DiagnosticsListenerOwner(
@@ -173,8 +162,7 @@ class PlayerActivity : Activity() {
     override fun onDestroy() {
         diagnostics?.retire()
         diagnostics = null
-        controller.destroy()
-        scope.cancel()
+        playback.destroy()
         super.onDestroy()
     }
 
@@ -193,6 +181,8 @@ class PlayerActivity : Activity() {
                 // Every public failure is typed; the sample shows the type,
                 // because that is what an application would branch on.
                 render(SessionUpdate.Reported(update.failure::class.simpleName + ": " + update.failure.message))
+            // The typed facts repeat what the report lines already say here.
+            is SessionUpdate.Event -> Unit
             is SessionUpdate.Stopped -> {
                 start.text = START
                 start.isEnabled = preview.isAvailable
@@ -207,15 +197,7 @@ class PlayerActivity : Activity() {
         val inputUrl = url.text.toString().trim()
         val inputNamespace = namespace.text.toString().trim()
         val inputBudget = budget.text.toString().trim().toIntOrNull() ?: DEFAULT_BUDGET.toInt()
-        val seat = presentation
-        controller.toggle { reporter ->
-            val playback = PlaybackSession { line -> reporter.report(line) }
-            val attempt = seat?.attempt(inputBudget, PresentationSinks({ line -> reporter.report(line) }, { tag, line -> Log.i(tag, line) }))
-            val notice = { line: String -> reporter.report(line) }
-            val host = if (attempt == null) AndroidPlaybackHost({ display.acquire() }, notice = notice)
-            else AndroidPlaybackHost({ display.acquire() }, attempt::onDisplayOwned, attempt::displayReleased, notice)
-            playback.watchRendered(inputUrl, inputNamespace, inputBudget, host, attempt)
-        }
+        playback.toggle(PlaybackRequest(inputUrl, inputNamespace, inputBudget))
     }
 
     /** The displayed frame, downscaled for the marker reader; null when the view has none. */

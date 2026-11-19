@@ -30,8 +30,15 @@ pluginManagement {
     // resolution: Gradle must find the com.android.library plugin marker at
     // exactly this version, so a nonexistent version fails in Gradle's own
     // plugin resolution rather than in a shell string comparison.
+    val kotlinVersion: String =
+        toolchain.getProperty("kotlin.version")
+            ?: error("gradle/toolchain.properties is missing the pin 'kotlin.version'")
+
     plugins {
         id("com.android.library") version agpVersion
+        // The Compose compiler is the Kotlin compiler plugin at the pinned
+        // Kotlin version; only the showcase sample applies it.
+        id("org.jetbrains.kotlin.plugin.compose") version kotlinVersion
     }
 }
 
@@ -48,8 +55,10 @@ include(":moq5-android")
 // dependency, and neither is ever published. `tools/check-sample-apps.sh` holds
 // them to that contract, and the root's module verification boundary names both
 // `check` tasks explicitly rather than relying on task-name expansion.
+include(":samples:playback")
 include(":samples:player")
 include(":samples:publisher")
+include(":samples:showcase")
 
 // A TEST-ONLY R8 fixture: a consuming application used to prove the bridge's
 // registration identity survives a minified release build under the library's

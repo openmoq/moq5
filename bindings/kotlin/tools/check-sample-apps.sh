@@ -64,8 +64,53 @@ fail() { fails=$((fails + 1)); printf 'FAIL[%s]: %s\n' "$1" "$2"; }
 settings="$root/settings.gradle.kts"
 [ -f "$settings" ] || { echo "$_self: no settings.gradle.kts under $root" >&2; exit 2; }
 
-# The two samples the assessment names, and the Gradle path each must occupy.
-SAMPLES='player publisher'
+# The two samples the assessment names, and the showcase application built on
+# the same surface; the Gradle path each must occupy.
+SAMPLES='player publisher showcase'
+
+# The showcase alone may use these UI libraries: proposed for it, with their
+# versions pinned in gradle/toolchain.properties. Every other module -- the
+# library, the engine, the player and the publisher -- keeps the full bar.
+SHOWCASE_UI_LIBRARIES='androidx.compose androidx.lifecycle'
+
+# The showcase's exact dependency set, by group:name, and nothing else. Versions
+# come only from the toolchain pins, never a literal in the build script.
+SHOWCASE_DEPENDENCIES='androidx.compose:compose-bom
+androidx.compose.ui:ui
+androidx.compose.foundation:foundation
+androidx.compose.material3:material3
+androidx.compose.material:material-icons-core
+androidx.compose.ui:ui-tooling-preview
+androidx.compose.ui:ui-tooling
+androidx.activity:activity-compose
+androidx.lifecycle:lifecycle-viewmodel-compose
+androidx.lifecycle:lifecycle-runtime-compose
+org.jetbrains.kotlin:kotlin-test-junit
+org.jetbrains.kotlinx:kotlinx-coroutines-test'
+
+# A UI library allowed for sample [1]: the showcase's own, and no one else's.
+ui_library_allowed() {
+    [ "$1" = showcase ] || return 1
+    for _lib in $SHOWCASE_UI_LIBRARIES; do
+        [ "$2" = "$_lib" ] && return 0
+    done
+    return 1
+}
+
+# The shared playback engine: a library module the player runs. Its sources
+# ARE the player's for every source row below -- the census, the platform-API
+# allowances, the dispatcher and cancellation rules read them as the player's
+# -- and its build script is held to a sample's line, except that it is a
+# library. It never gets an allowance the player does not have.
+ENGINE='playback'
+
+# A sample's source directories: its own, and for the player the engine it runs.
+sample_src_dirs() {
+    case $1 in
+        player) printf '%s\n' "$root/samples/player/src" "$root/samples/$ENGINE/src" ;;
+        *)      printf '%s\n' "$root/samples/$1/src" ;;
+    esac
+}
 
 # Packages a consumer must never reach into. `internal` is a Kotlin module
 # boundary, so a separate Gradle module already cannot compile against these --
@@ -123,14 +168,16 @@ PUBLISHER_CAMERA_FILE_ALLOWED="$PUBLISHER_CAMERA2_ALLOWED CameraDevice CameraCap
 PUBLISHER_ENCODER_FILE='samples/publisher/src/main/kotlin/org/openmoq/moq5/samples/publisher/MediaCodecEncoder.kt'
 PUBLISHER_ENCODER_ALLOWED='android.media.MediaCodec android.media.MediaCodecInfo'
 PUBLISHER_AUDIO_FILE='samples/publisher/src/main/kotlin/org/openmoq/moq5/samples/publisher/AudioRecordCapture.kt'
-PLAYER_CODEC_FILES='samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/AndroidPlaybackCodec.kt
-samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/AndroidPlaybackRender.kt'
+PLAYER_CODEC_FILES='samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/AndroidPlaybackCodec.kt
+samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/AndroidPlaybackRender.kt'
 
 # Class membership is role-specific. The separate codec census below also
 # restricts WHERE MediaCodec may be named; this list alone grants no new file
 # allowance. AudioRecord is reserved for the publisher's capture role.
 PUBLISHER_MEDIA_CLASSES='AudioFormat AudioRecord AudioTimestamp MediaCodec MediaCodecInfo MediaFormat MediaRecorder'
 PLAYER_MEDIA_CLASSES='AudioAttributes AudioFormat AudioTimestamp AudioTrack MediaCodec MediaFormat'
+# The showcase decodes nothing itself: it asks for audio focus and hears of noisy output.
+SHOWCASE_MEDIA_CLASSES='AudioAttributes AudioFocusRequest AudioManager'
 
 
 # The seam calls each SESSION file must make, in its own executable text.
@@ -139,7 +186,7 @@ PLAYER_MEDIA_CLASSES='AudioAttributes AudioFormat AudioTimestamp AudioTrack Medi
 # DEFINED in the contract files, so a module-wide text search still passes when
 # a session body stops calling them. These lists are path-aware for exactly
 # that reason -- they are checked against one file each.
-PLAYER_SESSION_FILE='samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/PlaybackSession.kt'
+PLAYER_SESSION_FILE='samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/PlaybackSession.kt'
 PLAYER_SESSION_CALLS='MediaFacts DecoderFormats PlaybackDecode accept'
 
 PUBLISHER_SESSION_FILE='samples/publisher/src/main/kotlin/org/openmoq/moq5/samples/publisher/BroadcastSession.kt'
@@ -174,6 +221,15 @@ subscribe
 objects
 statsSnapshot
 close'
+
+SHOWCASE_WORKFLOW='AndroidPlayback
+PlaybackRequest
+SessionUpdate
+PlaybackEvent
+PlaybackProblem
+VersionOffer
+StartMode
+MoqVersion'
 
 PUBLISHER_WORKFLOW='EndpointConfig
 MoqEndpoint
@@ -249,6 +305,7 @@ for s in $SAMPLES; do
     fi
     _dep=""
     for u in $UNJUSTIFIED; do
+        ui_library_allowed "$s" "$u" && continue
         grep -qF -- "$u" "$b" && _dep="$_dep $u"
     done
     if [ -n "$_dep" ]; then
@@ -262,6 +319,98 @@ for s in $SAMPLES; do
         pass "sample.$s.no-native" "builds no native code of its own"
     fi
 done
+
+# -- 2b. the shared playback engine's module ----------------------------------
+#
+# Its sources are judged as the player's in every row below. Its build script is
+# judged here: present and registered, a LIBRARY (an engine is never installed),
+# exporting the library's surface to the apps that use it, and held to the same
+# warning, dependency, native-build and coroutines line as a sample. The player
+# must actually run it.
+e="$root/samples/$ENGINE"
+eb="$e/build.gradle.kts"
+if [ -d "$e" ] && [ -f "$eb" ]; then
+    pass "engine.$ENGINE.module" "bindings/kotlin/samples/$ENGINE is a Gradle module"
+else
+    fail "engine.$ENGINE.module" "no module directory with a build.gradle.kts at bindings/kotlin/samples/$ENGINE"
+fi
+if grep -qE "^[[:space:]]*include\\(\":samples:$ENGINE\"\\)" "$settings"; then
+    pass "engine.$ENGINE.settings" "settings.gradle.kts includes \":samples:$ENGINE\""
+else
+    fail "engine.$ENGINE.settings" "settings.gradle.kts does not include \":samples:$ENGINE\"; an unregistered engine is never built or gated"
+fi
+if [ -f "$eb" ]; then
+    if grep -qE 'id\("com\.android\.library"\)' "$eb" && ! grep -qE 'id\("com\.android\.application"\)' "$eb"; then
+        pass "engine.$ENGINE.library" "is a library module"
+    else
+        fail "engine.$ENGINE.library" "samples/$ENGINE/build.gradle.kts must apply com.android.library and not com.android.application"
+    fi
+    if grep -qE 'api\(project\("[:]moq5-android"\)\)' "$eb"; then
+        pass "engine.$ENGINE.consumer" "exports :moq5-android through api(project(...))"
+    else
+        fail "engine.$ENGINE.consumer" "samples/$ENGINE/build.gradle.kts does not declare api(project(\":moq5-android\")); its public declarations name the library's types"
+    fi
+    if grep -qE 'sourceSets|srcDir' "$eb"; then
+        fail "engine.$ENGINE.sourcesets" "samples/$ENGINE/build.gradle.kts manipulates source sets"
+    else
+        pass "engine.$ENGINE.sourcesets" "declares no extra source set"
+    fi
+    if grep -q 'allWarningsAsErrors.set(true)' "$eb" && grep -q 'warningsAsErrors = true' "$eb" \
+        && grep -q 'abortOnError = true' "$eb" && grep -q '"-Werror"' "$eb"; then
+        pass "engine.$ENGINE.warnings" "Kotlin, lint and javac warnings are errors"
+    else
+        fail "engine.$ENGINE.warnings" "samples/$ENGINE/build.gradle.kts must make Kotlin (allWarningsAsErrors), lint (warningsAsErrors, abortOnError) and javac (-Werror) warnings errors"
+    fi
+    _dep=""
+    for u in $UNJUSTIFIED $COROUTINE_ARTIFACTS; do
+        grep -qF -- "$u" "$eb" && _dep="$_dep $u"
+    done
+    if [ -n "$_dep" ]; then
+        fail "engine.$ENGINE.unjustified-deps" "samples/$ENGINE/build.gradle.kts declares:$_dep -- the engine holds the bare sample's dependency line"
+    else
+        pass "engine.$ENGINE.unjustified-deps" "declares no unproposed dependency and no coroutines artifact of its own"
+    fi
+    if grep -qE 'externalNativeBuild|ndkVersion|CMakeLists' "$eb"; then
+        fail "engine.$ENGINE.no-native" "samples/$ENGINE/build.gradle.kts configures a native build"
+    else
+        pass "engine.$ENGINE.no-native" "builds no native code of its own"
+    fi
+    if grep -qE 'maven-publish|publishing \{' "$eb"; then
+        fail "engine.$ENGINE.unpublished" "samples/$ENGINE configures publishing; the engine is sample code, not an artifact"
+    else
+        pass "engine.$ENGINE.unpublished" "publishes nothing"
+    fi
+fi
+if grep -qE "implementation\\(project\\(\"[:]samples:$ENGINE\"\\)\\)" "$root/samples/player/build.gradle.kts" 2>/dev/null; then
+    pass "engine.$ENGINE.player-runs-it" "the player depends on :samples:$ENGINE"
+else
+    fail "engine.$ENGINE.player-runs-it" "samples/player/build.gradle.kts does not declare implementation(project(\":samples:$ENGINE\")); the player's census reads the engine as its own, so the player must run it"
+fi
+
+# -- 2c. the showcase's dependency set ---------------------------------------
+sb="$root/samples/showcase/build.gradle.kts"
+if [ -f "$sb" ]; then
+    _declared=$(grep -oE '(implementation|debugImplementation|testImplementation|api)\((platform\()?"[^"]+"' "$sb" \
+        | sed -E 's/.*"([^"]+)"/\1/' | sort -u)
+    _unknown=""
+    _literal=""
+    for _coord in $_declared; do
+        _ga=$(printf '%s' "$_coord" | cut -d: -f1-2)
+        _ok=no
+        for _allowed in $SHOWCASE_DEPENDENCIES; do
+            [ "$_ga" = "$_allowed" ] && _ok=yes
+        done
+        [ "$_ok" = no ] && _unknown="$_unknown $_ga"
+        printf '%s' "$_coord" | grep -qE ':[0-9]' && _literal="$_literal $_coord"
+    done
+    if [ -n "$_unknown" ]; then
+        fail "showcase.dependencies" "samples/showcase/build.gradle.kts declares dependency(ies) outside the proposed set:$_unknown"
+    elif [ -n "$_literal" ]; then
+        fail "showcase.dependencies" "samples/showcase/build.gradle.kts writes a literal version:$_literal -- versions come from gradle/toolchain.properties"
+    else
+        pass "showcase.dependencies" "declares only the proposed dependency set, every version from the toolchain pins"
+    fi
+fi
 
 # strip_kotlin <file...>  -- emit the sources with every line comment, block
 # comment (Kotlin block comments NEST; a .java file's do not, so there the first
@@ -321,12 +470,14 @@ strip_kotlin() {
 for s in $SAMPLES; do
     dir="$root/samples/$s"
     [ -d "$dir" ] || continue
-    srcs=$(find "$dir/src" -name '*.kt' -o -name '*.java' 2>/dev/null | sort)
-    if [ -z "$srcs" ]; then
+    # An app module with no source of its own is not an app, whatever engine it uses.
+    _own=$(find "$dir/src" -name '*.kt' -o -name '*.java' 2>/dev/null | sort)
+    if [ -z "$_own" ]; then
         fail "sample.$s.sources" "samples/$s has no Kotlin or Java source"
         continue
     fi
-    pass "sample.$s.sources" "samples/$s carries $(printf '%s\n' "$srcs" | grep -c .) source file(s)"
+    srcs=$(find $(sample_src_dirs "$s") -name '*.kt' -o -name '*.java' 2>/dev/null | sort)
+    pass "sample.$s.sources" "samples/$s carries $(printf '%s\n' "$_own" | grep -c .) source file(s) of its own, $(printf '%s\n' "$srcs" | grep -c .) with the sources it runs"
 
     _hit=""
     for p in $PRIVATE_PACKAGES; do
@@ -356,6 +507,7 @@ for s in $SAMPLES; do
     done
     _imp=""
     [ "$_stripped" = yes ] && for u in $UNJUSTIFIED; do
+        ui_library_allowed "$s" "$u" && continue
         _scope=$srcs
         # The encoder driver's own allowance is audited by class below.
         if [ "$s" = publisher ] && [ "$u" = android.media.MediaCodec ]; then
@@ -411,9 +563,13 @@ done
 # has no class to classify, so it is refused before the per-class comparison.
 media_census() {
     _s=$1
-    if [ "$_s" = publisher ]; then _allowed=$PUBLISHER_MEDIA_CLASSES; else _allowed=$PLAYER_MEDIA_CLASSES; fi
+    case $_s in
+        publisher) _allowed=$PUBLISHER_MEDIA_CLASSES ;;
+        showcase)  _allowed=$SHOWCASE_MEDIA_CLASSES ;;
+        *)         _allowed=$PLAYER_MEDIA_CLASSES ;;
+    esac
     dir="$root/samples/$_s"
-    srcs=$(find "$dir/src" \( -name '*.kt' -o -name '*.java' \) 2>/dev/null | sort)
+    srcs=$(find $(sample_src_dirs "$_s") \( -name '*.kt' -o -name '*.java' \) 2>/dev/null | sort)
     [ -n "$srcs" ] || { fail "sample.$_s.media" "no Kotlin source to audit"; return; }
     # shellcheck disable=SC2086
     strip_kotlin $srcs 2>/dev/null | sed -E 's/[[:space:]]*\.[[:space:]]*/./g' > "$scratch/$_s.media" || {
@@ -441,6 +597,7 @@ media_census() {
 }
 media_census player
 media_census publisher
+media_census showcase
 
 # Capturing PCM is a platform-adapter responsibility, not a permission for a
 # session or codec-independent contract file to own AudioRecord directly.
@@ -471,7 +628,7 @@ census() {
     _want=$2
     dir="$root/samples/$_s"
     [ -d "$dir" ] || { fail "sample.$_s.workflow" "no module to audit"; return; }
-    srcs=$(find "$dir/src" -name '*.kt' 2>/dev/null | sort)
+    srcs=$(find $(sample_src_dirs "$_s") -name '*.kt' 2>/dev/null | sort)
     if [ -z "$srcs" ]; then
         fail "sample.$_s.workflow" "no Kotlin source to audit"
         return
@@ -493,6 +650,7 @@ census() {
 }
 census player "$PLAYER_WORKFLOW"
 census publisher "$PUBLISHER_WORKFLOW"
+census showcase "$SHOWCASE_WORKFLOW"
 
 # -- 4b. the session-wiring census (one FILE each) ----------------------------
 #
@@ -533,7 +691,7 @@ session_census() {
 camera2_census() {
     _s=$1
     dir="$root/samples/$_s"
-    srcs=$(find "$dir/src" \( -name '*.kt' -o -name '*.java' \) 2>/dev/null | sort)
+    srcs=$(find $(sample_src_dirs "$_s") \( -name '*.kt' -o -name '*.java' \) 2>/dev/null | sort)
     if [ -z "$srcs" ]; then
         fail "sample.$_s.camera2" "no Kotlin source to audit"
         return
@@ -552,9 +710,9 @@ camera2_census() {
         fail "sample.$_s.camera2" "samples/$_s imports $CAMERA2_PACKAGE.* ; the allowance is exact, so a wildcard import is refused"
         return
     fi
-    if [ "$_s" = player ]; then
+    if [ "$_s" != publisher ]; then
         if grep -qF "$CAMERA2_PACKAGE" "$scratch/$_s.camera2"; then
-            fail "sample.$_s.camera2" "samples/$_s names $CAMERA2_PACKAGE; the player has no camera role"
+            fail "sample.$_s.camera2" "samples/$_s names $CAMERA2_PACKAGE; only the publisher has a camera role"
         else
             pass "sample.$_s.camera2" "names no camera2 API"
         fi
@@ -674,6 +832,7 @@ player_codec_census
 
 camera2_census player
 camera2_census publisher
+camera2_census showcase
 
 session_census player "$PLAYER_SESSION_FILE" "$PLAYER_SESSION_CALLS" ""
 session_census publisher "$PUBLISHER_SESSION_FILE" "$PUBLISHER_SESSION_CALLS" "$PUBLISHER_SESSION_FORBIDDEN"
@@ -693,7 +852,7 @@ for s in $SAMPLES; do
     fi
 
     dir="$root/samples/$s"
-    srcs=$(find "$dir/src" -name '*.kt' 2>/dev/null | sort)
+    srcs=$(find $(sample_src_dirs "$s") -name '*.kt' 2>/dev/null | sort)
     [ -n "$srcs" ] || continue
     # Read CODE, so a comment explaining why the Main dispatcher is avoided
     # does not trip the row that forbids using it.
@@ -832,8 +991,8 @@ catch_audit() {
                         # handle before its Nothing-returning helper rethrows
                         # the original. These are exact file/body exceptions,
                         # not permissions to report cancellation as failure.
-                        reader_carrier = sample == "player" && file == "samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/PlaybackReceiveLoop.kt" && generic == 1 && between == "{ throw PlaybackWorkFailure(" prev_name ") }"
-                        resource_cleanup = sample == "player" && file == "samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/PlaybackResourceOwner.kt" && generic == 1 && between == "{ failed(" prev_name ") }"
+                        reader_carrier = sample == "player" && file == "samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/PlaybackReceiveLoop.kt" && generic == 1 && between == "{ throw PlaybackWorkFailure(" prev_name ") }"
+                        resource_cleanup = sample == "player" && file == "samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/PlaybackResourceOwner.kt" && generic == 1 && between == "{ failed(" prev_name ") }"
                         if (paired == 0 && between != bare && between !~ recorded && !reader_carrier && !resource_cleanup) {
                             verdict = "the CancellationException catch before catch (" name ": " type ") has body \"" between "\", not \"{ throw " prev_name " }\" or \"{ <slot> = " prev_name " throw " prev_name " }\", and is not a paired collector inside a withContext(NonCancellable) cleanup block"
                         }
@@ -852,7 +1011,7 @@ catch_audit() {
 for s in $SAMPLES; do
     dir="$root/samples/$s"
     [ -d "$dir" ] || continue
-    srcs=$(find "$dir/src" -name '*.kt' 2>/dev/null | sort)
+    srcs=$(find $(sample_src_dirs "$s") -name '*.kt' 2>/dev/null | sort)
     [ -n "$srcs" ] || continue
     _thr=""
     _bad=""
@@ -1002,7 +1161,7 @@ list_members() {
 }
 
 rootbuild="$root/build.gradle.kts"
-for s in $SAMPLES; do
+for s in $SAMPLES $ENGINE; do
     _task=":samples:$s:check"
     _exp=$(list_members "$rootbuild" expectedModuleVerificationTasks setOf | grep -c -x -- "$_task")
     _req=$(list_members "$rootbuild" requiredModuleVerificationTasks listOf | grep -c -x -- "$_task")

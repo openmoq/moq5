@@ -153,6 +153,8 @@ dependencies {
     // APIs without declaring the artifact: declaring it here would teach the
     // wrong consumer contract and hide a regression in that export.
     implementation(project(":moq5-android"))
+    // The shared playback engine, itself written against the published surface only.
+    implementation(project(":samples:playback"))
 
     // Unit tests for the sample's OWN lifecycle code, in the same two artifacts
     // the library module already uses. They are test-only: the sample still

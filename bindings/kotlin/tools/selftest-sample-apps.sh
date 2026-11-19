@@ -47,8 +47,10 @@ build_fixture() {
     cat > "$W/root/settings.gradle.kts" <<'EOF'
 rootProject.name = "moq5-bindings"
 include(":moq5-android")
+include(":samples:playback")
 include(":samples:player")
 include(":samples:publisher")
+include(":samples:showcase")
 EOF
     # The root's module verification boundary, named twice as the real root
     # names it: once in the independent expected set, once in the configured
@@ -57,9 +59,9 @@ EOF
 // The module verification boundary: an independent expected set and the
 // configured list, each naming ":samples:player:check" exactly once.
 val expectedModuleVerificationTasks =
-    setOf(":moq5-android:check", ":bridge-r8-fixture:check", ":samples:player:check", ":samples:publisher:check")
+    setOf(":moq5-android:check", ":bridge-r8-fixture:check", ":samples:playback:check", ":samples:player:check", ":samples:publisher:check", ":samples:showcase:check")
 val requiredModuleVerificationTasks =
-    listOf(":moq5-android:check", ":bridge-r8-fixture:check", ":samples:player:check", ":samples:publisher:check")
+    listOf(":moq5-android:check", ":bridge-r8-fixture:check", ":samples:playback:check", ":samples:player:check", ":samples:publisher:check", ":samples:showcase:check")
 EOF
     for s in player publisher; do
         mkdir -p "$W/root/samples/$s/src/main/kotlin" || return 1
@@ -71,6 +73,45 @@ tasks.withType<JavaCompile>().configureEach { options.compilerArgs.addAll(listOf
 dependencies { implementation(project(":moq5-android")) }
 EOF
     done
+    # The player runs the shared engine, a library held to the samples' line.
+    printf 'dependencies { implementation(project(":samples:playback")) }\n' >> "$W/root/samples/player/build.gradle.kts"
+    mkdir -p "$W/root/samples/playback/src/main/kotlin" || return 1
+    cat > "$W/root/samples/playback/build.gradle.kts" <<'EOF'
+plugins { id("com.android.library") }
+android { lint { warningsAsErrors = true; abortOnError = true } }
+kotlin { compilerOptions { allWarningsAsErrors.set(true) } }
+tasks.withType<JavaCompile>().configureEach { options.compilerArgs.addAll(listOf("-Xlint:all", "-Werror")) }
+dependencies { api(project(":moq5-android")) }
+EOF
+    # The showcase: an application with its own proposed UI libraries, each
+    # version from a pin, and a source that uses them.
+    mkdir -p "$W/root/samples/showcase/src/main/kotlin" || return 1
+    cat > "$W/root/samples/showcase/build.gradle.kts" <<'EOF'
+plugins { id("com.android.application") }
+android { lint { warningsAsErrors = true; abortOnError = true } }
+kotlin { compilerOptions { allWarningsAsErrors.set(true) } }
+tasks.withType<JavaCompile>().configureEach { options.compilerArgs.addAll(listOf("-Xlint:all", "-Werror")) }
+dependencies {
+    implementation(project(":moq5-android"))
+    implementation(project(":samples:playback"))
+    implementation(platform("androidx.compose:compose-bom:${pin("androidx.composeBom.version")}"))
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:${pin("androidx.lifecycle.version")}")
+}
+EOF
+    cat > "$W/root/samples/showcase/src/main/kotlin/Fixture.kt" <<'EOF'
+package fixture
+
+import androidx.compose.runtime.Composable
+import androidx.lifecycle.ViewModel
+import android.media.AudioManager
+
+/* A stand-in for the showcase: the engine facade and the library's settings types. */
+class Model : ViewModel() {
+    val playback = AndroidPlayback(dispatch) { update: SessionUpdate -> show(update, (update as? PlaybackEvent), PlaybackProblem.of(error)) }
+    fun watch() = playback.toggle(PlaybackRequest(url, ns, versions = VersionOffer.Offer(listOf(MoqVersion.Draft16)), start = StartMode.Current))
+}
+EOF
     # Each fixture source exercises its whole workflow in EXECUTABLE-LOOKING
     # Kotlin. It is a stand-in, not a sample -- it never runs -- but it must be
     # code, because the census now reads code and would not see a comment.
@@ -104,9 +145,10 @@ private suspend fun session(url: String, ns: Namespace) {
 EOF
     # The session-wiring census reads ONE file per sample, at its real path, so
     # the fixture carries stand-ins there too. They are code for the same reason
-    # the workflow fixtures are: the census reads executable text.
-    mkdir -p "$W/root/samples/player/src/main/kotlin/org/openmoq/moq5/samples/player"
-    cat > "$W/root/samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/PlaybackSession.kt" <<'EOF'
+    # the workflow fixtures are: the census reads executable text. The player's
+    # session lives in the shared engine.
+    mkdir -p "$W/root/samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback"
+    cat > "$W/root/samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/PlaybackSession.kt" <<'EOF'
 package fixture
 
 /* A stand-in for the player session: the seam calls the census reads. */
@@ -581,7 +623,7 @@ raw_string_only()  { drop_subscribe && printf 'val doc = """receiver.subscribe(t
 # calling a seam -- or that leaves the call in a comment or a string -- is the
 # regression this row exists for, and a session that re-derives what a seam owns
 # is the other half of it.
-_player_session="$W/root/samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/PlaybackSession.kt"
+_player_session="$W/root/samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/PlaybackSession.kt"
 _publisher_session="$W/root/samples/publisher/src/main/kotlin/org/openmoq/moq5/samples/publisher/BroadcastSession.kt"
 drop_session_call()      { sed -i.bak '/decode.accept(/d' "$_player_session" && rm -f "$_player_session.bak"; }
 session_call_comment()   { drop_session_call && printf '// decode.accept(MediaFacts.ofObject(o))\n' >> "$_player_session"; }
@@ -751,8 +793,8 @@ case_is selftest.encoder-player        1 sample.player.unjustified-imports    en
 
 # The player's real decoder and renderer may each import MediaCodec, but that
 # exception is neither a new class family nor a third-file allowance.
-_player_codec="$W/root/samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/AndroidPlaybackCodec.kt"
-_player_render="$W/root/samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/AndroidPlaybackRender.kt"
+_player_codec="$W/root/samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/AndroidPlaybackCodec.kt"
+_player_render="$W/root/samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/AndroidPlaybackRender.kt"
 player_codec_files()   { printf 'import android.media.MediaCodec\n' > "$_player_codec" && printf 'import android.media.MediaCodec\n' > "$_player_render"; }
 player_codec_unlisted() { player_codec_files && printf 'import android.media.MediaCodecList\n' >> "$_player_codec"; }
 player_codec_wildcard() { player_codec_files && printf 'import android.media.*\n' >> "$_player_render"; }
@@ -822,8 +864,8 @@ case_is selftest.cancellation-recorded-then-returned 1 sample.player.cancellatio
 # partially acquired native resource before rethrow. Neither exception leaks
 # to a same-shaped catch in another player file. The Sync's old report-and-
 # rethrow behavior remains refused.
-_reader_file="$W/root/samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/PlaybackReceiveLoop.kt"
-_owner_file="$W/root/samples/player/src/main/kotlin/org/openmoq/moq5/samples/player/PlaybackResourceOwner.kt"
+_reader_file="$W/root/samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/PlaybackReceiveLoop.kt"
+_owner_file="$W/root/samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/PlaybackResourceOwner.kt"
 reader_carrier() { printf 'fun read() { try { work() } catch (cancelled: CancellationException) { throw PlaybackWorkFailure(cancelled) } catch (raised: Exception) { throw raised } }\n' > "$_reader_file"; }
 reader_elsewhere() { printf 'fun read() { try { work() } catch (cancelled: CancellationException) { throw PlaybackWorkFailure(cancelled) } catch (raised: Exception) { throw raised } }\n' > "$W/root/samples/player/src/main/kotlin/OtherRead.kt"; }
 reader_wrong_cause() { reader_carrier && sed -i.bak 's/PlaybackWorkFailure(cancelled)/PlaybackWorkFailure(other)/' "$_reader_file" && rm -f "$_reader_file.bak"; }
@@ -864,6 +906,74 @@ case_is selftest.workflow-comment      1 sample.player.workflow  comment_only
 case_is selftest.workflow-block        1 sample.player.workflow  block_comment_only
 case_is selftest.workflow-string       1 sample.player.workflow  string_only
 case_is selftest.workflow-rawstring    1 sample.player.workflow  raw_string_only
+
+# -- the shared engine: its own module rows, and its sources read as the player's
+_engine_build="$W/root/samples/playback/build.gradle.kts"
+_engine_src="$W/root/samples/playback/src/main/kotlin/org/openmoq/moq5/samples/playback/Engine.kt"
+engine_drop_module()     { rm -rf -- "$W/root/samples/playback"; }
+engine_unregistered()    { sed -i.bak '/samples:playback/d' "$W/root/settings.gradle.kts" && rm -f "$W/root/settings.gradle.kts.bak"; }
+engine_application()     { sed -i.bak 's/id("com.android.library")/id("com.android.application")/' "$_engine_build" && rm -f "$_engine_build.bak"; }
+engine_no_api()          { sed -i.bak 's/api(project(":moq5-android"))/implementation(project(":moq5-android"))/' "$_engine_build" && rm -f "$_engine_build.bak"; }
+engine_sourceset()       { printf 'android { sourceSets { getByName("main") { java.srcDir("../player/src/main/kotlin") } } }\n' >> "$_engine_build"; }
+engine_drop_werr()       { sed -i.bak '/allWarningsAsErrors/d' "$_engine_build" && rm -f "$_engine_build.bak"; }
+engine_compose()         { printf 'dependencies { implementation("androidx.compose.ui:ui:1.12.1") }\n' >> "$_engine_build"; }
+engine_lifecycle()       { printf 'dependencies { implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.11.0") }\n' >> "$_engine_build"; }
+engine_coroutines()      { printf 'dependencies { implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2") }\n' >> "$_engine_build"; }
+engine_native()          { printf 'android { externalNativeBuild { cmake { path = file("CMakeLists.txt") } } }\n' >> "$_engine_build"; }
+engine_published()       { printf 'plugins { id("maven-publish") }\n' >> "$_engine_build"; }
+player_drops_engine()    { sed -i.bak '/samples:playback/d' "$W/root/samples/player/build.gradle.kts" && rm -f "$W/root/samples/player/build.gradle.kts.bak"; }
+engine_off_root()        { sed -i.bak 's/":samples:playback:check", //' "$W/root/build.gradle.kts" && rm -f "$W/root/build.gradle.kts.bak"; }
+engine_imports_compose() { printf 'package fixture\nimport androidx.compose.runtime.Composable\n' > "$_engine_src"; }
+engine_main_dispatcher() { printf 'package fixture\nval scope = CoroutineScope(Dispatchers.Main)\n' > "$_engine_src"; }
+engine_uses_jni()        { printf 'package fixture\nimport org.openmoq.moq5.jni.NativeBridge\n' > "$_engine_src"; }
+engine_names_camera()    { printf 'package fixture\nimport android.hardware.camera2.CameraManager\n' > "$_engine_src"; }
+
+case_is selftest.engine-module          1 engine.playback.module            engine_drop_module
+case_is selftest.engine-settings        1 engine.playback.settings          engine_unregistered
+case_is selftest.engine-application     1 engine.playback.library           engine_application
+case_is selftest.engine-api             1 engine.playback.consumer          engine_no_api
+case_is selftest.engine-sourceset       1 engine.playback.sourcesets        engine_sourceset
+case_is selftest.engine-warnings        1 engine.playback.warnings          engine_drop_werr
+case_is selftest.engine-compose         1 engine.playback.unjustified-deps  engine_compose
+case_is selftest.engine-lifecycle       1 engine.playback.unjustified-deps  engine_lifecycle
+case_is selftest.engine-coroutines      1 engine.playback.unjustified-deps  engine_coroutines
+case_is selftest.engine-native          1 engine.playback.no-native         engine_native
+case_is selftest.engine-published       1 engine.playback.unpublished       engine_published
+case_is selftest.player-drops-engine    1 engine.playback.player-runs-it    player_drops_engine
+case_is selftest.engine-off-root        1 sample.playback.root-check        engine_off_root
+case_is selftest.engine-source-compose  1 sample.player.unjustified-imports engine_imports_compose
+case_is selftest.engine-source-main     1 sample.player.no-main-dispatcher  engine_main_dispatcher
+case_is selftest.engine-source-jni      1 sample.player.private-packages    engine_uses_jni
+case_is selftest.engine-source-camera   1 sample.player.camera2             engine_names_camera
+
+# -- the showcase: its own UI libraries, and only those, and only there ---------
+_showcase_build="$W/root/samples/showcase/build.gradle.kts"
+_showcase_src="$W/root/samples/showcase/src/main/kotlin/Fixture.kt"
+showcase_media3()       { printf 'dependencies { implementation("androidx.media3:media3-exoplayer:${pin("x")}") }\n' >> "$_showcase_build"; }
+showcase_unproposed()   { printf 'dependencies { implementation("androidx.navigation:navigation-compose:${pin("x")}") }\n' >> "$_showcase_build"; }
+showcase_literal()      { printf 'dependencies { implementation("androidx.activity:activity-compose:1.13.0") }\n' >> "$_showcase_build"; }
+showcase_off_root()     { sed -i.bak 's/, ":samples:showcase:check"//' "$W/root/build.gradle.kts" && rm -f "$W/root/build.gradle.kts.bak"; }
+showcase_import_media3() { printf 'import androidx.media3.exoplayer.ExoPlayer\n' >> "$_showcase_src"; }
+showcase_main()         { printf 'val scope = CoroutineScope(Dispatchers.Main)\n' >> "$_showcase_src"; }
+showcase_camera()       { printf 'import android.hardware.camera2.CameraManager\n' >> "$_showcase_src"; }
+showcase_audio_track()  { printf 'import android.media.AudioTrack\n' >> "$_showcase_src"; }
+showcase_no_workflow()  { sed -i.bak 's/AndroidPlayback(/Playback(/' "$_showcase_src" && rm -f "$_showcase_src.bak"; }
+player_compose_source() { printf 'import androidx.compose.runtime.Composable\n' >> "$W/root/samples/player/src/main/kotlin/Fixture.kt"; }
+publisher_lifecycle()   { printf 'import androidx.lifecycle.ViewModel\n' >> "$W/root/samples/publisher/src/main/kotlin/Fixture.kt"; }
+engine_compose_source() { printf 'package fixture\nimport androidx.lifecycle.ViewModel\n' > "$_engine_src"; }
+
+case_is selftest.showcase-media3          1 sample.showcase.unjustified-deps    showcase_media3
+case_is selftest.showcase-unproposed      1 showcase.dependencies               showcase_unproposed
+case_is selftest.showcase-literal-version 1 showcase.dependencies               showcase_literal
+case_is selftest.showcase-off-root        1 sample.showcase.root-check          showcase_off_root
+case_is selftest.showcase-import-media3   1 sample.showcase.unjustified-imports showcase_import_media3
+case_is selftest.showcase-main            1 sample.showcase.no-main-dispatcher  showcase_main
+case_is selftest.showcase-camera          1 sample.showcase.camera2             showcase_camera
+case_is selftest.showcase-audio-track     1 sample.showcase.media               showcase_audio_track
+case_is selftest.showcase-workflow        1 sample.showcase.workflow            showcase_no_workflow
+case_is selftest.player-compose-source    1 sample.player.unjustified-imports   player_compose_source
+case_is selftest.publisher-lifecycle      1 sample.publisher.unjustified-imports publisher_lifecycle
+case_is selftest.engine-lifecycle-source  1 sample.player.unjustified-imports   engine_compose_source
 
 printf '\n'
 if [ "$fails" -eq 0 ]; then

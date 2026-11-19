@@ -1,5 +1,7 @@
 package org.openmoq.moq5.samples.player
 
+import org.openmoq.moq5.samples.playback.OBSERVE_PRESENTATION_EXTRA
+
 /*
  * The launch can preset the three inputs, as `am start --es <extra> <value>` does, so a supervised
  * run never has to type into the fields. The launch intent is the Activity's own: a recreated

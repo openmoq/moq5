@@ -2,6 +2,7 @@ package org.openmoq.moq5.samples.player
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import org.openmoq.moq5.samples.playback.OBSERVE_PRESENTATION_EXTRA
 
 /** The acceptance observer and the diagnostic trace are two independent launch switches, both off by default. */
 class PlayerFlagsTest {
