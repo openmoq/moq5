@@ -13,7 +13,7 @@ set(MOQR_LIBRARY_TEST_DIR "${MOQR_LIBRARY_DIR}/tests")
 # CLI administration and coordinator tests own their thread dependency.  Do
 # not rely on the directory-scoped imported target created by relay/.
 find_package(Threads REQUIRED)
-include_directories("${MOQR_LIBRARY_DIR}/private")
+moq_directory_targets(INCLUDE_DIRECTORIES "${MOQR_LIBRARY_DIR}/private")
 
 # The sans-I/O admin tier: bounded parser, content negotiation, and the
 # deterministic response state machine. No sockets and no clock of its own.

@@ -136,10 +136,13 @@ if(MOQ_BUILD_ADAPTER_MVFST OR MOQ_BUILD_ADAPTER_PROXYGEN)
     enable_language(CXX)
 endif()
 
+include(cmake/MoqDirectoryTargets.cmake)
+
 # MSVC only exposes C11 <stdatomic.h> (used by the threaded service tier)
-# behind this switch (VS 2022 17.5+).
+# behind this switch (VS 2022 17.5+). Every C target of the build gets it.
 if(MSVC)
-    add_compile_options($<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
+    moq_directory_targets(
+        COMPILE_OPTIONS $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>)
 endif()
 
 # -- Core (always built) -------------------------------------------
@@ -492,6 +495,7 @@ if(MOQ_BUILD_ADAPTER_PICOQUIC OR MOQ_BUILD_ADAPTER_PICO_WT)
         cmake/MoqPicoquicProjectPolicy.cmake
         cmake/MoqPicotlsProjectPolicy.cmake
         cmake/MoqPicotlsBuildPolicy.cmake
+        cmake/MoqDirectoryTargets.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/libmoq)
 endif()
 

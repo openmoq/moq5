@@ -5,11 +5,12 @@
 #   (a relative ARCHIVE_OUTPUT_DIRECTORY) | shared (shared libraries,
 #   LIBRARY_OUTPUT_DIRECTORY) | split (one archive elsewhere).
 # Probe targets, built on request only, show the compile flags this directory
-# gets; the caller-hook scope variable and the options visible at the end of
-# project() are recorded as global properties.
+# gets; the caller-hook scope variable and the options LibMoQ's policy has
+# declared for this directory by the end of project() are recorded as global
+# properties.
 cmake_minimum_required(VERSION 3.20)
 project(picotls C)
-get_property(_moq_options DIRECTORY PROPERTY COMPILE_OPTIONS)
+get_property(_moq_options DIRECTORY PROPERTY MOQ_DIRECTORY_COMPILE_OPTIONS)
 set_property(GLOBAL PROPERTY MOQ_TEST_PTLS_OPTIONS "${_moq_options}")
 set_property(GLOBAL PROPERTY MOQ_TEST_PTLS_SCOPE "${MOQ_TEST_CALLER_SCOPE}")
 

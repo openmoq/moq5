@@ -1,5 +1,6 @@
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    add_compile_options(-Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    moq_directory_targets(
+        COMPILE_OPTIONS -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
 endif()
 
 add_test(NAME cmake_apple_abi_rules
@@ -36,6 +37,12 @@ add_test(NAME cmake_picoquic_component_selection
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PicoquicComponentSelectionTest.cmake")
 set_tests_properties(cmake_windows_owned_policy cmake_picoquic_component_selection
     PROPERTIES TIMEOUT 120)
+add_test(NAME cmake_directory_targets
+    COMMAND ${CMAKE_COMMAND} "-DMOQ_SOURCE=${PROJECT_SOURCE_DIR}"
+        "-DMOQ_WORK=${CMAKE_CURRENT_BINARY_DIR}/directory-targets"
+        "-DMOQ_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/DirectoryTargetsTest.cmake")
+set_tests_properties(cmake_directory_targets PROPERTIES TIMEOUT 120)
 
 # Installed package modules reach siblings through ${CMAKE_CURRENT_LIST_DIR}
 # only at a downstream configure, so check the installed set itself.

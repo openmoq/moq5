@@ -1,5 +1,5 @@
 # Tests owned by the transport-independent relay libraries.
-include_directories("${CMAKE_CURRENT_SOURCE_DIR}/../private")
+moq_directory_targets(INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/../private")
 
 set(MOQR_TEST_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../src/core")
 set(MOQR_TEST_BIND_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../src/bind")

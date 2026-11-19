@@ -272,17 +272,24 @@ C
             cat "$tmp/multi-warning-$config.log" >&2; die "self-test: wrong $config warning refusal"
         }
     done
-    # Exercise policy selection only: no host compiler pretends to be MSVC.
+    # Exercise policy selection only: nothing is compiled with MSVC's flags.
+    # A caller gave the directory a flag before the policy ran; at the end of
+    # the directory the probe target has that flag first, then the policy's.
     cat > "$tmp/msvc-source/CMakeLists.txt" <<'CMAKE'
 cmake_minimum_required(VERSION 3.20)
-project(policy_branch NONE)
+project(policy_branch C)
 set(MSVC TRUE)
 add_compile_options(/DMOQ_CALLER_FLAG=17)
 include("${MOQ_POLICY}")
-get_directory_property(actual COMPILE_OPTIONS)
-if(NOT "${actual}" STREQUAL "/DMOQ_CALLER_FLAG=17;/UNDEBUG")
-    message(FATAL_ERROR "MSVC policy options changed: ${actual}")
-endif()
+file(WRITE "${CMAKE_BINARY_DIR}/probe.c" "int moq_policy_probe(void) { return 0; }\n")
+add_library(probe STATIC "${CMAKE_BINARY_DIR}/probe.c")
+function(moq_check_policy)
+    get_target_property(actual probe COMPILE_OPTIONS)
+    if(NOT "${actual}" STREQUAL "/DMOQ_CALLER_FLAG=17;/UNDEBUG")
+        message(FATAL_ERROR "MSVC policy options changed: ${actual}")
+    endif()
+endfunction()
+cmake_language(DEFER CALL moq_check_policy)
 CMAKE
     cmake -S "$tmp/msvc-source" -B "$tmp/msvc-build" \
         "-DMOQ_POLICY=$repo_root/cmake/MoqPicotlsBuildPolicy.cmake" \

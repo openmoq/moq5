@@ -75,13 +75,13 @@ endif()
 # Tests (only when tests are enabled)
 if(MOQ_BUILD_TESTS)
     # Owned warning baseline for the in-tree C++ binding test executables
-    # below (directory scope -> applies to targets defined after this in
-    # this dir). It does NOT touch the header-only `moq_cpp` INTERFACE
-    # target (defined above, compiles nothing) nor the out-of-tree
-    # `cpp_consumer` cold-consumer build (a separate cmake invocation that
-    # must stay free of -Werror). -Werror gated by MOQ_WARNINGS_AS_ERRORS.
+    # below (every target this directory compiles from here on). It does NOT
+    # touch the header-only `moq_cpp` INTERFACE target (defined above,
+    # compiles nothing) nor the out-of-tree `cpp_consumer` cold-consumer
+    # build (a separate cmake invocation that must stay free of -Werror).
+    # -Werror gated by MOQ_WARNINGS_AS_ERRORS.
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-        add_compile_options(-Wall -Wextra -Wpedantic
+        moq_directory_targets(COMPILE_OPTIONS -Wall -Wextra -Wpedantic
             $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
 

@@ -476,6 +476,10 @@ _pt_configure(fetch_policy b-fetch-policy OK ${RELEASE}
 if(NOT pt_fetch_policy_HOOKORDER STREQUAL "A[];B[]")
     list(APPEND failures "fetch_policy: caller hooks ran as '${pt_fetch_policy_HOOKORDER}', expected A then B before LibMoQ's policy")
 endif()
+# What the hooks would have seen had the policy run first.
+if(NOT pt_fetch_policy_PTLSOPTIONS STREQUAL "-Werror;-UNDEBUG")
+    list(APPEND failures "fetch_policy: picotls's directory declared '${pt_fetch_policy_PTLSOPTIONS}' by the end of project(), expected LibMoQ's -Werror;-UNDEBUG")
+endif()
 if(NOT pt_fetch_policy_PTLSSCOPE STREQUAL "set-by-hook-a")
     list(APPEND failures "fetch_policy: a caller hook's variable did not reach picotls's scope ('${pt_fetch_policy_PTLSSCOPE}')")
 endif()
