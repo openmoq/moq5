@@ -152,6 +152,15 @@ typedef struct sub_group_end_entry {
     size_t              chunk_seq;
 } sub_group_end_entry_t;
 
+/* A refusal this subscriber owes a request the peer opened and nothing here
+ * serves (a relay's PUBLISH_NAMESPACE, for one), held while the session
+ * cannot take the answer. */
+typedef struct sub_owed_answer {
+    moq_event_kind_t    kind;
+    uint64_t            handle;
+    moq_request_error_t code;
+} sub_owed_answer_t;
+
 struct moq_subscriber {
     moq_session_t      *session;
     moq_alloc_t         alloc;
@@ -163,6 +172,11 @@ struct moq_subscriber {
                                       const moq_sub_update_result_t *result);
     bool                closed;
     bool                draining;
+
+    /* Refusals owed to unserved peer requests, in arrival order. */
+    sub_owed_answer_t  *owed;
+    size_t              owed_count;
+    size_t              owed_cap;
 
     /* Byte budget for payload+properties rcbufs retained in the object and
      * fetch-object ring queues. Counts bytes currently in the rings only; the
@@ -1290,6 +1304,26 @@ _Static_assert(offsetof(moq_sub_cfg_t, max_fills) ==
         s->surface_stream_terminals = true;
     }
 
+    /* One owed refusal per request the session can hold at once. */
+    size_t owed_cap = 0;
+    const size_t request_caps[] = {
+        session->sub_cap, session->pub_cap, session->ann_cap, session->ns_sub_cap,
+        session->track_sub_cap, session->ts_cap, session->fetch_cap
+    };
+    for (size_t i = 0; i < sizeof(request_caps) / sizeof(request_caps[0]); i++) {
+        if (request_caps[i] > SIZE_MAX - owed_cap) { moq_sub_destroy(s); return MOQ_ERR_LIMIT; }
+        owed_cap += request_caps[i];
+    }
+    if (owed_cap > SIZE_MAX / sizeof(sub_owed_answer_t)) { moq_sub_destroy(s); return MOQ_ERR_LIMIT; }
+    if (owed_cap) {
+        s->owed = (sub_owed_answer_t *)alloc->alloc(owed_cap * sizeof(sub_owed_answer_t), alloc->ctx);
+        if (!s->owed) {
+            moq_sub_destroy(s);
+            return MOQ_ERR_NOMEM;
+        }
+        s->owed_cap = owed_cap;
+    }
+
     *out = s;
     return MOQ_OK;
 }
@@ -1334,6 +1368,8 @@ void moq_sub_destroy(moq_subscriber_t *sub)
     }
 
     moq_alloc_t alloc = sub->alloc;
+    if (sub->owed)
+        alloc.free(sub->owed, sub->owed_cap * sizeof(sub_owed_answer_t), alloc.ctx);
     if (sub->stream_terminals)
         alloc.free(sub->stream_terminals,
             sub->st_cap * sizeof(sub_stream_terminal_entry_t), alloc.ctx);
@@ -1755,6 +1791,239 @@ static bool stream_finished_terminal(moq_subscriber_t *sub, moq_sub_track_t *t,
     return st_offer(sub, &st);
 }
 
+/* -- Refusals owed to unserved peer requests ------------------------
+ *
+ * The session raises a peer's request (a relay's PUBLISH_NAMESPACE, for one)
+ * and waits for an answer; nothing above a subscriber takes it, so each would
+ * stay unanswered until the session ends. The subscriber refuses them, as the
+ * publisher facade does for what it does not serve (pub_refuse_unserved), and
+ * holds a refusal the session cannot take yet. The checks mirror the
+ * publisher's pub_answer_pending, plus FETCH, which the publisher serves. */
+
+/* Whether the request still awaits its answer (pure: the session is not
+ * advanced). */
+static bool sub_answer_pending(moq_subscriber_t *sub, const sub_owed_answer_t *a)
+{
+    moq_session_t *s = sub->session;
+    switch (a->kind) {
+    case MOQ_EVENT_SUBSCRIBE_REQUEST: {
+        int slot = sub_resolve_handle(s, (moq_subscription_t){a->handle});
+        if (slot < 0) return false;
+        const moq_sub_entry_t *e = &s->subs[slot];
+        return e->handle._opaque == a->handle && e->role == MOQ_SUB_ROLE_PUBLISHER &&
+            e->state == MOQ_SUB_PENDING_PUBLISHER && !e->cancel_pending;
+    }
+    case MOQ_EVENT_PUBLISH_REQUEST: {
+        int slot = pub_resolve_handle(s, (moq_publication_t){a->handle});
+        if (slot < 0) return false;
+        const moq_pub_entry_t *e = &s->publishes[slot];
+        return e->handle._opaque == a->handle && e->role == MOQ_PUB_ROLE_SUBSCRIBER &&
+            e->state == MOQ_PUB_PENDING_SUBSCRIBER && !e->done_pending;
+    }
+    case MOQ_EVENT_NAMESPACE_PUBLISHED: {
+        size_t slot = moq_handle_slot(a->handle);
+        if (moq_handle_pool_tag(a->handle) != MOQ_HANDLE_POOL_ANNOUNCEMENT ||
+            moq_handle_session_tag(a->handle) != s->session_tag || slot >= s->ann_cap)
+            return false;
+        const moq_ann_entry_t *e = &s->announcements[slot];
+        if (e->generation != moq_handle_generation(a->handle) ||
+            e->handle._opaque != a->handle || e->role != MOQ_ANN_ROLE_RECEIVER ||
+            e->state != MOQ_ANN_PENDING_RECEIVER)
+            return false;
+        return !s->profile->premature_fin_fails_request ||
+            (!e->terminal_cause && !e->response_validated &&
+             moq_request_lifetime_check_initial_response(&e->rs.lifetime, true) == MOQ_OK);
+    }
+    case MOQ_EVENT_NS_SUB_REQUEST: {
+        size_t slot = moq_handle_slot(a->handle);
+        if (moq_handle_pool_tag(a->handle) != MOQ_HANDLE_POOL_NAMESPACE_SUB ||
+            moq_handle_session_tag(a->handle) != s->session_tag || slot >= s->ns_sub_cap)
+            return false;
+        const moq_ns_sub_entry_t *e = &s->ns_subs[slot];
+        return e->generation == moq_handle_generation(a->handle) &&
+            e->handle._opaque == a->handle && !e->local_subscriber &&
+            e->state == MOQ_NS_SUB_PENDING_PUBLISHER && !e->terminal.cause;
+    }
+    case MOQ_EVENT_SUBSCRIBE_TRACKS_REQUEST: {
+        int slot = track_sub_resolve_handle(s, (moq_track_sub_handle_t){a->handle});
+        if (slot < 0) return false;
+        const moq_track_sub_entry_t *e = &s->track_subs[slot];
+        return e->handle._opaque == a->handle && e->role == MOQ_TRACK_SUB_ROLE_PUBLISHER &&
+            e->state == MOQ_TRACK_SUB_PENDING_PUBLISHER;
+    }
+    case MOQ_EVENT_TRACK_STATUS_REQUEST: {
+        int slot = ts_resolve_handle(s, (moq_track_status_handle_t){a->handle});
+        if (slot < 0) return false;
+        const moq_ts_entry_t *e = &s->track_statuses[slot];
+        if (e->handle._opaque != a->handle || e->role != MOQ_TS_ROLE_PUBLISHER ||
+            e->state != MOQ_TS_PENDING_PUBLISHER || e->goaway_sent)
+            return false;
+        return !s->profile->premature_fin_fails_request ||
+            (!e->terminal_cause && !e->response_validated &&
+             moq_request_lifetime_check_initial_response(&e->rs.lifetime, true) == MOQ_OK);
+    }
+    case MOQ_EVENT_FETCH_REQUEST: {
+        int slot = fetch_resolve_handle(s, (moq_fetch_t){a->handle});
+        if (slot < 0) return false;
+        const moq_fetch_entry_t *e = &s->fetches[slot];
+        return e->handle._opaque == a->handle && e->role == MOQ_FETCH_ROLE_PUBLISHER &&
+            e->state == MOQ_FETCH_PENDING_PUBLISHER;
+    }
+    default:
+        return false;
+    }
+}
+
+/* Drop every owed refusal whose request no longer awaits one, keeping the
+ * order of the rest. */
+static void sub_owed_prune(moq_subscriber_t *sub)
+{
+    size_t keep = 0;
+    for (size_t i = 0; i < sub->owed_count; i++) {
+        if (!sub_answer_pending(sub, &sub->owed[i])) continue;
+        if (keep != i) sub->owed[keep] = sub->owed[i];
+        keep++;
+    }
+    sub->owed_count = keep;
+}
+
+/* Answered, or the request is gone (a stale handle, or no longer awaiting an
+ * answer). WOULD_BLOCK and CLOSED are told apart by the callers. */
+static bool sub_answer_settled(moq_result_t rc)
+{
+    return rc == MOQ_OK || rc == MOQ_ERR_STALE_HANDLE || rc == MOQ_ERR_WRONG_STATE;
+}
+
+static moq_result_t sub_answer_request(moq_subscriber_t *sub, const sub_owed_answer_t *a,
+                                       uint64_t now_us)
+{
+    moq_session_t *s = sub->session;
+    switch (a->kind) {
+    case MOQ_EVENT_SUBSCRIBE_REQUEST: {
+        moq_reject_subscribe_cfg_t rej;
+        moq_reject_subscribe_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_subscribe(s, (moq_subscription_t){ a->handle }, &rej, now_us);
+    }
+    case MOQ_EVENT_PUBLISH_REQUEST: {
+        moq_reject_publish_cfg_t rej;
+        moq_reject_publish_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_publish(s, (moq_publication_t){ a->handle }, &rej, now_us);
+    }
+    case MOQ_EVENT_NAMESPACE_PUBLISHED: {
+        moq_reject_namespace_cfg_t rej;
+        moq_reject_namespace_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_namespace(s, (moq_announcement_t){ a->handle }, &rej, now_us);
+    }
+    case MOQ_EVENT_NS_SUB_REQUEST: {
+        moq_reject_ns_sub_cfg_t rej;
+        moq_reject_ns_sub_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_ns_sub(s, (moq_ns_sub_handle_t){ a->handle }, &rej, now_us);
+    }
+    case MOQ_EVENT_SUBSCRIBE_TRACKS_REQUEST: {
+        moq_reject_subscribe_tracks_cfg_t rej;
+        moq_reject_subscribe_tracks_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_subscribe_tracks(s, (moq_track_sub_handle_t){ a->handle },
+                                                   &rej, now_us);
+    }
+    case MOQ_EVENT_TRACK_STATUS_REQUEST: {
+        moq_reject_track_status_cfg_t rej;
+        moq_reject_track_status_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_track_status(s, (moq_track_status_handle_t){ a->handle },
+                                               &rej, now_us);
+    }
+    case MOQ_EVENT_FETCH_REQUEST: {
+        moq_reject_fetch_cfg_t rej;
+        moq_reject_fetch_cfg_init(&rej);
+        rej.error_code = a->code;
+        return moq_session_reject_fetch(s, (moq_fetch_t){ a->handle }, &rej, now_us);
+    }
+    default:
+        return MOQ_OK;
+    }
+}
+
+/* Retry owed refusals in arrival order. Only WOULD_BLOCK keeps one; a refusal
+ * the session rejects outright is dropped and reported. */
+static moq_result_t sub_owed_drive(moq_subscriber_t *sub, uint64_t now_us)
+{
+    sub_owed_prune(sub);
+    size_t done = 0;
+    moq_result_t out = MOQ_OK;
+    while (done < sub->owed_count) {
+        /* Answering advances the session and may retire another request. */
+        if (!sub_answer_pending(sub, &sub->owed[done])) { done++; continue; }
+        moq_result_t rc = sub_answer_request(sub, &sub->owed[done], now_us);
+        if (rc == MOQ_ERR_WOULD_BLOCK) {
+            if (!sub_answer_pending(sub, &sub->owed[done])) { done++; continue; }
+            if (out == MOQ_OK) out = rc;
+            break;
+        }
+        if (rc == MOQ_ERR_CLOSED) { done = sub->owed_count; out = rc; break; }
+        if (!sub_answer_settled(rc) && out == MOQ_OK) out = rc;
+        done++;
+    }
+    if (done > 0) {
+        memmove(sub->owed, sub->owed + done, (sub->owed_count - done) * sizeof(sub->owed[0]));
+        sub->owed_count -= done;
+    }
+    sub_owed_prune(sub);
+    return out;
+}
+
+/* Refuse a request nothing here serves: now, or held behind earlier refusals
+ * (so they keep their order) or while the session cannot take it. */
+static moq_result_t sub_refuse_unserved(moq_subscriber_t *sub, const moq_event_t *ev,
+                                        uint64_t now_us)
+{
+    sub_owed_answer_t a = { .kind = ev->kind, .handle = 0,
+                            .code = MOQ_REQUEST_ERROR_NOT_SUPPORTED };
+    switch (ev->kind) {
+    case MOQ_EVENT_SUBSCRIBE_REQUEST:
+        a.handle = ev->u.subscribe_request.sub._opaque;
+        a.code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+        break;
+    case MOQ_EVENT_TRACK_STATUS_REQUEST:
+        a.handle = ev->u.track_status_request.handle._opaque;
+        a.code = MOQ_REQUEST_ERROR_DOES_NOT_EXIST;
+        break;
+    case MOQ_EVENT_PUBLISH_REQUEST:
+        a.handle = ev->u.publish_request.pub._opaque;
+        break;
+    case MOQ_EVENT_NAMESPACE_PUBLISHED:
+        a.handle = ev->u.namespace_published.ann._opaque;
+        break;
+    case MOQ_EVENT_NS_SUB_REQUEST:
+        a.handle = ev->u.ns_sub_request.handle._opaque;
+        break;
+    case MOQ_EVENT_SUBSCRIBE_TRACKS_REQUEST:
+        a.handle = ev->u.subscribe_tracks_request.handle._opaque;
+        break;
+    case MOQ_EVENT_FETCH_REQUEST:
+        a.handle = ev->u.fetch_request.fetch._opaque;
+        break;
+    default:
+        return MOQ_OK;
+    }
+    sub_owed_prune(sub);
+    if (!sub_answer_pending(sub, &a)) return MOQ_OK;
+    if (sub->owed_count == 0) {
+        moq_result_t rc = sub_answer_request(sub, &a, now_us);
+        if (rc != MOQ_ERR_WOULD_BLOCK)
+            return sub_answer_settled(rc) ? MOQ_OK : rc;
+        /* The failed attempt still advanced the session. */
+        if (!sub_answer_pending(sub, &a)) return MOQ_OK;
+    }
+    if (sub->owed_count >= sub->owed_cap) return MOQ_ERR_INTERNAL;
+    sub->owed[sub->owed_count++] = a;
+    return MOQ_OK;
+}
+
 moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
 {
     if (!sub) return MOQ_ERR_INVAL;
@@ -1822,6 +2091,12 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         memset(&sub->pending_fli, 0, sizeof(sub->pending_fli));
         sub->has_pending_fli = false;
     }
+
+    /* Refusals already owed go first, in the order the requests came. One
+     * the session rejects outright is reported once the rest has progressed. */
+    moq_result_t owed_rc = sub_owed_drive(sub, now_us);
+    if (owed_rc == MOQ_ERR_CLOSED) return owed_rc;
+    moq_result_t owed_err = owed_rc < 0 && owed_rc != MOQ_ERR_WOULD_BLOCK ? owed_rc : MOQ_OK;
 
     moq_event_t ev;
     for (;;) {
@@ -2630,6 +2905,22 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                     ev.u.closed.code);
             break;
 
+        /* Requests the peer opened: nothing above a subscriber serves them. */
+        case MOQ_EVENT_SUBSCRIBE_REQUEST:
+        case MOQ_EVENT_PUBLISH_REQUEST:
+        case MOQ_EVENT_NAMESPACE_PUBLISHED:
+        case MOQ_EVENT_NS_SUB_REQUEST:
+        case MOQ_EVENT_SUBSCRIBE_TRACKS_REQUEST:
+        case MOQ_EVENT_TRACK_STATUS_REQUEST:
+        case MOQ_EVENT_FETCH_REQUEST: {
+            moq_result_t urc = sub_refuse_unserved(sub, &ev, now_us);
+            if (urc < 0) {
+                moq_event_cleanup(&ev);
+                return urc;
+            }
+            break;
+        }
+
         default:
             break;
         }
@@ -2646,7 +2937,7 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             sub->tracks[i].initial_result_error != MOQ_OK)
             return sub->tracks[i].initial_result_error;
 
-    return MOQ_OK;
+    return owed_err;
 }
 
 moq_result_t moq_sub_poll_object(moq_subscriber_t *sub,
