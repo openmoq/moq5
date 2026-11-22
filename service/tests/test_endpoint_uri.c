@@ -63,7 +63,9 @@ _Static_assert(offsetof(moq_endpoint_cfg_t, accept_uri_ctx) == 192, "LP64 policy
 _Static_assert(offsetof(moq_endpoint_cfg_t, send_queue_cap_bytes) == 200,
                "LP64 URI-era full size");
 _Static_assert(offsetof(moq_endpoint_cfg_t, idle_timeout_ms) == 208, "LP64 idle timeout");
-_Static_assert(sizeof(moq_endpoint_cfg_t) == 216, "LP64 new full size");
+_Static_assert(offsetof(moq_endpoint_cfg_t, done_wait_timeout_us) == 216,
+               "LP64 done wait");
+_Static_assert(sizeof(moq_endpoint_cfg_t) == 224, "LP64 new full size");
 #endif
 
 static unsigned failures;

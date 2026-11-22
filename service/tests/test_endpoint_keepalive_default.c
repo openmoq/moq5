@@ -33,6 +33,7 @@ static int failures = 0;
 static unsigned g_calls;      /* how often create was reached */
 static uint32_t g_ka_ms;      /* keep_alive_interval_ms it carried */
 static uint32_t g_idle_ms;    /* idle_timeout_ms it carried */
+static uint64_t g_done_wait_us; /* done_wait_timeout_us it carried */
 
 /* The symbol the endpoint object set calls in place of moq_pq_threaded_create. */
 moq_result_t moq_test_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
@@ -43,6 +44,7 @@ moq_result_t moq_test_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
     g_calls++;
     g_ka_ms = cfg->keep_alive_interval_ms;
     g_idle_ms = cfg->idle_timeout_ms;
+    g_done_wait_us = cfg->done_wait_timeout_us;
     /* This TU is not renamed, so this reaches the real adapter create. */
     return moq_pq_threaded_create(cfg, out);
 }
@@ -82,8 +84,38 @@ static void check_connect(uint32_t idle_ms, uint32_t want_idle_ms, uint32_t want
     }
 }
 
+/* Connects with done_wait_timeout_us and checks the value the adapter create
+ * received. */
+static void check_done_wait(uint64_t done_wait_us, uint64_t want_us)
+{
+    g_calls = 0;
+    g_done_wait_us = UINT64_MAX;
+
+    moq_endpoint_cfg_t c;
+    moq_endpoint_cfg_init_sized(&c, sizeof(c));
+    c.url = B(DEAD_PEER_URL_QUIC);
+    c.protocol = MOQ_TRANSPORT_PROTOCOL_RAW_QUIC;
+    c.insecure_skip_verify = true;
+    c.done_wait_timeout_us = done_wait_us;
+
+    moq_endpoint_t *ep = NULL;
+    moq_result_t rc = moq_endpoint_connect(&c, &ep);
+    MOQ_TEST_CHECK_EQ_INT((int)rc, (int)MOQ_OK);
+    MOQ_TEST_CHECK(ep != NULL);
+    if (rc == MOQ_OK && ep != NULL) {
+        MOQ_TEST_CHECK_EQ_U64((uint64_t)g_calls, 1);
+        MOQ_TEST_CHECK_EQ_U64(g_done_wait_us, want_us);
+        moq_endpoint_stop(ep);
+        moq_endpoint_destroy(ep);
+    }
+}
+
 int main(void)
 {
+    /* The terminal wait reaches the adapter: 0 by default, as set otherwise. */
+    check_done_wait(0, 0);
+    check_done_wait(2000000ull, 2000000ull);
+
     /* No idle timeout: the backend default and the service keepalive, as before. */
     check_connect(0, 0, SERVICE_KA_MS);
     /* An idle timeout: the keepalive runs at half of it ... */

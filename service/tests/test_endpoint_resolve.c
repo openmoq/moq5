@@ -431,6 +431,50 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_ERR_INVAL);
     }
 
+    /* == done_wait_timeout_us resolve: gate + transport rejection ====== *
+     * The session terminal wait is forwarded by the raw-QUIC picoquic adapter
+     * only. 0 keeps the library default everywhere; a non-zero value on a
+     * transport that cannot forward it is refused rather than ignored. Any
+     * duration is accepted, the session saturates its deadline arithmetic. */
+    {
+        moq_endpoint_resolved_t r;
+
+        moq_endpoint_cfg_t v0 = mkcfg("moqt://relay.example:4433");
+        v0.struct_size = MOQ_ENDPOINT_CFG_V0_SIZE;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&v0, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.done_wait_timeout_us, 0);
+
+        moq_endpoint_cfg_t c;
+        moq_endpoint_cfg_init_sized(&c, sizeof(c));
+        c.url = B("moqt://relay.example:4433");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.done_wait_timeout_us, 0);
+        c.done_wait_timeout_us = 2000000ull;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.done_wait_timeout_us, 2000000ull);
+        c.done_wait_timeout_us = UINT64_MAX;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.done_wait_timeout_us, UINT64_MAX);
+
+        /* A caller built before the field never has it read, even when the
+         * bytes past its object would hold a value. */
+        moq_endpoint_cfg_t old = c;
+        old.struct_size = (uint32_t)offsetof(moq_endpoint_cfg_t,
+                                             done_wait_timeout_us);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&old, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.done_wait_timeout_us, 0);
+
+        /* WebTransport does not forward it: refused, 0 still fine. */
+        moq_endpoint_cfg_t w;
+        moq_endpoint_cfg_init_sized(&w, sizeof(w));
+        w.url = B("https://relay.example:4433/moq");
+        w.done_wait_timeout_us = 2000000ull;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        w.done_wait_timeout_us = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r), (int)MOQ_OK);
+    }
+
     /* == idle_timeout_ms on older, partial and short layouts ========== *
      * Real allocations of exactly the sizes in question, so ASan pins that
      * nothing past the caller's object is read. The field is read only when
