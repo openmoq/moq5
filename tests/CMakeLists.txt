@@ -1479,6 +1479,9 @@ if(TARGET moq::sim)
     add_executable(test_subscriber unit/test_subscriber.c)
     target_link_libraries(test_subscriber PRIVATE moq-core-test-internals moq::sim)
     add_test(NAME subscriber COMMAND test_subscriber)
+    add_executable(test_subscriber_unserved unit/test_subscriber_unserved.c)
+    target_link_libraries(test_subscriber_unserved PRIVATE moq-core-test-internals moq::sim)
+    add_test(NAME subscriber_unserved COMMAND test_subscriber_unserved)
 
     # One reader for a session a subscriber shares with a publisher
     # (moq_core_internal_sub_tick_routed, core_spi.h).
