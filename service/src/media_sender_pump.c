@@ -389,8 +389,9 @@ void sender_resync_track_demand(moq_media_sender_t *s,
 }
 
 
-/* Resync demand across all tracks. Called after moq_pub_tick() and after the
- * service teardown paths (end/remove/VOD finish) that can clear subscriptions.
+/* Resync demand across all tracks. Called after the publisher's progress
+ * (sender_pub_progress) and after the service teardown paths (end/remove/VOD
+ * finish) that can clear subscriptions.
  * The catalog track is private (not in s->tracks[]); resync it too so its
  * mirror is accurate, though it never fires an app callback. */
 static void sender_resync_demand(moq_media_sender_t *s)
@@ -438,9 +439,10 @@ static void sender_pub_on_namespace_terminal(void *ctx,
 
 /* A subscriber asked for a new group on a dynamic-groups track: latch it for
  * moq_media_sender_take_new_group_request. Fires on the network thread from
- * moq_pub_tick, which runs without s->mu. */
-/* Publisher callback on the network thread inside moq_pub_tick (sender_hook,
- * ep->mu held): the peer's session-wide GOAWAY. The endpoint keeps its New
+ * moq_pub_tick or sender_take_event, both without s->mu. */
+/* Publisher callback on the network thread inside moq_pub_tick or
+ * sender_take_event (ep->mu held): the peer's session-wide GOAWAY, which the
+ * receiver on a shared endpoint may record first. The endpoint keeps its New
  * Session URI for moq_endpoint_get_goaway_uri(). */
 static void sender_pub_on_goaway(void *ctx, moq_bytes_t new_session_uri)
 {
@@ -473,11 +475,11 @@ static void sender_pub_on_closed(void *ctx, uint64_t error_code)
 }
 
 
-/* A subscription was accepted (inside moq_pub_tick, which the hook runs
- * without s->mu). Only a catalog join matters here, while a terminal
- * generation's live write has begun -- written in part, or held by the facade
- * with its destinations already fixed -- and before its subscriptions are
- * finished: that subscription misses the generation
+/* A subscription was accepted (inside moq_pub_tick, moq_pub_flush or
+ * sender_take_event, all without s->mu). Only a catalog join matters here,
+ * while a terminal generation's live write has begun -- written in part, or
+ * held by the facade with its destinations already fixed -- and before its
+ * subscriptions are finished: that subscription misses the generation
  * (sender_republish_catalog). Repeated joins coalesce into one rewrite. */
 static void sender_pub_on_subscriber_joined(void *ctx, moq_pub_track_t *pt)
 {
@@ -601,10 +603,40 @@ size_t moq_media_sender_test_startup_first_tracks(void) { return atomic_load(&st
 #endif
 
 
+/* An event the receiver on this endpoint polled: the publisher keeps what is
+ * its own (endpoint_internal.h, take_event). Runs inside the receiver's tick,
+ * on the network thread under ep->mu, without s->mu, as the publisher's
+ * callbacks expect. */
+moq_core_internal_route_t sender_take_event(void *ctx, const moq_event_t *event,
+                                            uint64_t now_us)
+{
+    moq_media_sender_t *s = (moq_media_sender_t *)ctx;
+    if (!s->pub) return MOQ_CORE_INTERNAL_ROUTE_LEFT;
+    pthread_mutex_lock(&s->mu);
+    bool fatal = s->fatal;
+    pthread_mutex_unlock(&s->mu);
+    if (fatal) return MOQ_CORE_INTERNAL_ROUTE_LEFT;
+    moq_pub_event_result_t res = MOQ_PUB_EVENT_IGNORED;
+    (void)moq_pub_handle_event(s->pub, event, now_us, &res);
+    return res == MOQ_PUB_EVENT_CONSUMED ? MOQ_CORE_INTERNAL_ROUTE_TAKEN
+                                         : MOQ_CORE_INTERNAL_ROUTE_LEFT;
+}
+
+/* The publisher's progress for this pump: its own tick, or, while the
+ * receiver on this endpoint reads the session's events, only the flush of
+ * the work those events staged. */
+static void sender_pub_progress(moq_endpoint_t *ep, moq_media_sender_t *s,
+                                uint64_t now_us)
+{
+    if (ep && moq_endpoint_peer_reads_events_locked(ep, MOQ_ENDPOINT_HOOK_SENDER))
+        (void)moq_pub_flush(s->pub, now_us);
+    else
+        (void)moq_pub_tick(s->pub, now_us);
+}
+
 void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
                  uint64_t now_us, void *ctx)
 {
-    (void)ep;
     moq_media_sender_t *s = (moq_media_sender_t *)ctx;
 
     pthread_mutex_lock(&s->mu);
@@ -677,7 +709,7 @@ void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         s->observe_only = observe;
     }
     if (s->observe_only) {
-        (void)moq_pub_tick(s->pub, now_us);
+        sender_pub_progress(ep, s, now_us);
         return;
     }
     if (!s->tracks_frozen) {
@@ -694,7 +726,7 @@ void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
     if (!s->startup_complete) {
         /* Consume namespace/publication replies even while another startup
          * request is waiting for native admission. Selection stays retained. */
-        (void)moq_pub_tick(s->pub, now_us);
+        sender_pub_progress(ep, s, now_us);
         pthread_mutex_lock(&s->mu);
         fatal = s->fatal;
         pthread_mutex_unlock(&s->mu);
@@ -797,7 +829,7 @@ void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
         sender_arm_refresh(s, now_us);
     }
 
-    (void)moq_pub_tick(s->pub, now_us);
+    sender_pub_progress(ep, s, now_us);
 
     /* A dispatched event (namespace rejection/cancellation, or a rejected
      * PUBLISH) can have turned the sender fatal inside the tick above. That
@@ -932,7 +964,7 @@ void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
     if (s->ready && !s->fatal && conv_done)
         sender_republish_catalog(s, now_us);
 
-    (void)moq_pub_tick(s->pub, now_us);
+    sender_pub_progress(ep, s, now_us);
 
     /* Reconcile demand AFTER the tick + the teardown/finish work above, so the
      * mirror and app callbacks reflect subscriptions cleared without a left

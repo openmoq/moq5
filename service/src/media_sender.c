@@ -767,6 +767,7 @@ moq_result_t sender_new(moq_endpoint_t *ep, bool owns,
             .pump = sender_hook,
             .next_deadline_us = sender_next_deadline_us,
             .has_pending_output = sender_has_pending_output,
+            .take_event = sender_take_event,
         };
         moq_result_t arc = moq_endpoint_attach_hook(
             ep, MOQ_ENDPOINT_HOOK_SENDER, &ops, s);

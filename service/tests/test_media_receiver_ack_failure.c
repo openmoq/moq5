@@ -92,22 +92,25 @@ ACK_ASSERT(offsetof(moq_media_track_event_t, initiating_request_id) ==
 #include <string.h>
 
 /* Only configuration limits are fault-injected. Every ACK, callback, query,
- * unsubscribe and release below runs the real facade/session implementation. */
+ * unsubscribe and release below runs the real facade/session implementation.
+ * The receiver ticks its subscriber through the core's routed tick. */
+#include "../../core/src/spi/core_spi.h"
 static moq_result_t observed_create(moq_session_t *, const moq_alloc_t *,
     const moq_sub_cfg_t *, moq_subscriber_t **);
-static moq_result_t observed_tick(moq_subscriber_t *, uint64_t);
+static moq_result_t observed_tick(moq_subscriber_t *, uint64_t,
+    moq_core_internal_route_fn, void *);
 static moq_result_t observed_unsubscribe(moq_subscriber_t *, moq_sub_track_t *, uint64_t);
 static moq_result_t observed_release(moq_subscriber_t *, moq_sub_track_t *);
 static void observed_wake(moq_endpoint_t *);
 #define moq_sub_create observed_create
-#define moq_sub_tick observed_tick
+#define moq_core_internal_sub_tick_routed observed_tick
 #define moq_sub_unsubscribe observed_unsubscribe
 #define moq_sub_release_track observed_release
 #define moq_endpoint_wake observed_wake
 #define MOQ_MEDIA_RECEIVER_TESTING 1
 #include "../src/media_receiver.c"
 #undef moq_sub_create
-#undef moq_sub_tick
+#undef moq_core_internal_sub_tick_routed
 #undef moq_sub_unsubscribe
 #undef moq_sub_release_track
 #undef moq_endpoint_wake
@@ -175,9 +178,10 @@ static moq_result_t observed_create(moq_session_t *s, const moq_alloc_t *a,
     if (current->facade_objects) c.max_objects = current->facade_objects;
     return moq_sub_create(s, a, &c, out);
 }
-static moq_result_t observed_tick(moq_subscriber_t *s, uint64_t now)
+static moq_result_t observed_tick(moq_subscriber_t *s, uint64_t now,
+    moq_core_internal_route_fn route, void *ctx)
 {
-    moq_result_t rc = moq_sub_tick(s, now);
+    moq_result_t rc = moq_core_internal_sub_tick_routed(s, now, route, ctx);
     current->tick_result = rc;
     if (current->probe) {
         moq_sub_track_result_t result;

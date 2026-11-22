@@ -22,6 +22,9 @@ void sender_pub_on_publish_finished(void *ctx, moq_pub_track_t *pt);
 void sender_hook(moq_endpoint_t *ep, moq_session_t *session,
                  uint64_t now_us, void *ctx);
 
+moq_core_internal_route_t sender_take_event(void *ctx, const moq_event_t *event,
+                                            uint64_t now_us);
+
 moq_result_t sender_destroy_pub_task(moq_endpoint_t *ep,
                                      moq_session_t *session,
                                      uint64_t now_us, void *ctx);

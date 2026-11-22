@@ -6126,6 +6126,34 @@ static void receiver_st_mark_ready(moq_media_receiver_t *r)
     if (woke) moq_endpoint_wake(r->ep);
 }
 
+/* On an endpoint shared with a sender, the receiver's subscriber reads the
+ * session's events and offers each to the sender first (endpoint_internal.h). */
+static moq_core_internal_route_t receiver_offer_event(void *ctx, const moq_event_t *event,
+                                                      uint64_t now_us)
+{
+    moq_media_receiver_t *r = (moq_media_receiver_t *)ctx;
+    if (!r->ep) return MOQ_CORE_INTERNAL_ROUTE_LEFT;
+    return moq_endpoint_route_event_locked(r->ep, MOQ_ENDPOINT_HOOK_RECEIVER, event, now_us);
+}
+
+static moq_result_t receiver_tick(moq_media_receiver_t *r, uint64_t now_us)
+{
+    return moq_core_internal_sub_tick_routed(r->sub, now_us, receiver_offer_event, r);
+}
+
+/* The reader while its subscriber exists and the hook ticks it: whenever the
+ * receiver is not fatal (every pump that leaves it so has ticked), and while a
+ * failed catalog is retired, which ticks every pump although fatal. */
+static bool receiver_reads_events(void *ctx)
+{
+    moq_media_receiver_t *r = (moq_media_receiver_t *)ctx;
+    if (!r->sub) return false;
+    pthread_mutex_lock(&r->mu);
+    bool reads = !r->fatal || r->catalog_ack_failed;
+    pthread_mutex_unlock(&r->mu);
+    return reads;
+}
+
 /* The endpoint pump hook: runs on the network thread under the endpoint
  * mutex (endpoint_internal.h contract -- no public endpoint API calls). */
 static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
@@ -6140,7 +6168,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
     if (!session) return;
     if (r->catalog_ack_failed) {
         receiver_auth_clear_pending(r);
-        (void)moq_sub_tick(r->sub, now_us);
+        (void)receiver_tick(r, now_us);
         receiver_inspect_delivery_failures(r);
         receiver_retire_failed_catalog(r, now_us);
         return;
@@ -6208,7 +6236,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         r->observe_only = observe;
     }
     if (r->observe_only) {
-        (void)moq_sub_tick(r->sub, now_us);
+        (void)receiver_tick(r, now_us);
         return;
     }
     if (!r->catalog_sub) {
@@ -6256,7 +6284,10 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         tcfg.auth_tokens = r->catalog_auth.list.tokens;
         tcfg.auth_token_count = r->catalog_auth.list.count;
         rc = moq_sub_subscribe(r->sub, &tcfg, now_us, &r->catalog_sub);
-        if (receiver_admission_retry(rc)) return;
+        if (receiver_admission_retry(rc)) {
+            (void)receiver_tick(r, now_us);
+            return;
+        }
         if (receiver_auth_encoding_error(r, &r->catalog_auth, rc)) {
             receiver_auth_fail(r, &r->catalog_auth, &request,
                 MOQ_MEDIA_AUTH_SCOPE_SERVICE, NULL);
@@ -6269,7 +6300,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         }
     }
 
-    (void)moq_sub_tick(r->sub, now_us);
+    (void)receiver_tick(r, now_us);
     receiver_inspect_ack_results(r, now_us);
     receiver_inspect_delivery_failures(r);
     if (r->catalog_ack_failed) {
@@ -7074,6 +7105,7 @@ static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
         moq_endpoint_hook_ops_t ops = {
             .pump = receiver_hook,
             .next_deadline_us = receiver_next_deadline_us,
+            .reads_events = receiver_reads_events,
         };
         moq_result_t arc = moq_endpoint_attach_hook(
             ep, MOQ_ENDPOINT_HOOK_RECEIVER, &ops, r);

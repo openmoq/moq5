@@ -2390,6 +2390,36 @@ void moq_endpoint_detach_hook(moq_endpoint_t *ep,
     pthread_mutex_unlock(&ep->mu);
 }
 
+/* The reader pumps before the hooks that ask whether it read: hooks run in
+ * kind order (ep_pump_cycle). */
+_Static_assert(MOQ_ENDPOINT_HOOK_RECEIVER < MOQ_ENDPOINT_HOOK_SENDER,
+               "the receiver, which reads a shared session's events, pumps first");
+
+bool moq_endpoint_peer_reads_events_locked(moq_endpoint_t *ep,
+                                           moq_endpoint_hook_kind_t self)
+{
+    for (int k = 0; k < MOQ_ENDPOINT_HOOK_KIND_COUNT; k++) {
+        if (k == (int)self || !ep->hook_ops[k].pump || !ep->hook_ops[k].reads_events)
+            continue;
+        if (ep->hook_ops[k].reads_events(ep->hook_ctx[k])) return true;
+    }
+    return false;
+}
+
+moq_core_internal_route_t moq_endpoint_route_event_locked(
+    moq_endpoint_t *ep, moq_endpoint_hook_kind_t self, const moq_event_t *event,
+    uint64_t now_us)
+{
+    for (int k = 0; k < MOQ_ENDPOINT_HOOK_KIND_COUNT; k++) {
+        if (k == (int)self || !ep->hook_ops[k].pump || !ep->hook_ops[k].take_event)
+            continue;
+        if (ep->hook_ops[k].take_event(ep->hook_ctx[k], event, now_us) ==
+            MOQ_CORE_INTERNAL_ROUTE_TAKEN)
+            return MOQ_CORE_INTERNAL_ROUTE_TAKEN;
+    }
+    return MOQ_CORE_INTERNAL_ROUTE_LEFT;
+}
+
 moq_result_t moq_endpoint_stop(moq_endpoint_t *ep)
 {
     if (!ep) return MOQ_ERR_INVAL;

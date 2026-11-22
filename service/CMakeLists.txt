@@ -1551,6 +1551,22 @@ if(MOQ_BUILD_TESTS)
                     $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
             endif()
 
+            # A sender and a receiver on one endpoint: one reader for the
+            # shared session's events, through the real pump hooks.
+            add_executable(test_media_shared_endpoint
+                tests/test_media_shared_endpoint.c)
+            target_link_libraries(test_media_shared_endpoint PRIVATE
+                moq-service-refresh-test-internals moq::sim)
+            target_include_directories(test_media_shared_endpoint PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                target_compile_options(test_media_shared_endpoint PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_shared_endpoint COMMAND test_media_shared_endpoint)
+            set_tests_properties(media_shared_endpoint PROPERTIES TIMEOUT 30)
+
             add_executable(test_media_sender_refresh
                 tests/test_media_sender_refresh.c)
             target_link_libraries(test_media_sender_refresh PRIVATE

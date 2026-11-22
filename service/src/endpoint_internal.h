@@ -9,6 +9,7 @@
 #include <moq/endpoint.h>
 #include <moq/url.h>
 #include "endpoint_uri.h"
+#include "../../core/src/spi/core_spi.h"
 
 /* The largest version-offer set: every version this build supports. */
 #define MOQ_ENDPOINT_MAX_VERSIONS 8
@@ -149,11 +150,28 @@ typedef void (*moq_endpoint_hook_fn)(moq_endpoint_t *ep,
  *                      moq_endpoint_drain() succeeds only once every hook is
  *                      quiet as well as the transport. It may read the session
  *                      facade (it runs where pump does) but must not block or
- *                      re-enter the endpoint. NULL = the hook owes no output. */
+ *                      re-enter the endpoint. NULL = the hook owes no output.
+ *   reads_events     — optional; true while this hook's facade is the reader of
+ *                      the session's events, offering each to the other hooks
+ *                      through moq_endpoint_route_event_locked (a media receiver
+ *                      once its subscriber exists and while it is not fatal).
+ *                      Queried by the other hooks during their pump, under
+ *                      ep->mu; it takes only the hook's own lock.
+ *   take_event       — optional; offered an event another hook's facade polled.
+ *                      TAKEN when this hook's facade owns it (a media sender's
+ *                      publisher). Runs inside the reader's tick, on the
+ *                      network thread under ep->mu; the event's borrowed fields
+ *                      are valid for the call only.
+ * A sender and a receiver on one endpoint share one session and so one queue
+ * of events: one facade reads it, and the other takes its own events from the
+ * reader and only flushes its own work. */
 typedef struct moq_endpoint_hook_ops {
     moq_endpoint_hook_fn pump;
     uint64_t (*next_deadline_us)(void *ctx);
     bool (*has_pending_output)(void *ctx);
+    bool (*reads_events)(void *ctx);
+    moq_core_internal_route_t (*take_event)(void *ctx, const moq_event_t *event,
+                                            uint64_t now_us);
 } moq_endpoint_hook_ops_t;
 
 moq_result_t moq_endpoint_attach_hook(moq_endpoint_t *ep,
@@ -171,6 +189,17 @@ moq_result_t moq_endpoint_attach_hook(moq_endpoint_t *ep,
 uint64_t moq_endpoint_app_deadline_us(void *ctx);
 void moq_endpoint_detach_hook(moq_endpoint_t *ep,
                               moq_endpoint_hook_kind_t kind, void *ctx);
+
+/* From inside a hook's pump (ep->mu held, network thread). Whether another
+ * attached hook reads the session's events (its reads_events), so `self`
+ * must not poll them itself. */
+bool moq_endpoint_peer_reads_events_locked(moq_endpoint_t *ep,
+                                           moq_endpoint_hook_kind_t self);
+/* From inside the reading hook's tick (ep->mu held, network thread): offer an
+ * event to every other attached hook's take_event; TAKEN when one owns it. */
+moq_core_internal_route_t moq_endpoint_route_event_locked(
+    moq_endpoint_t *ep, moq_endpoint_hook_kind_t self, const moq_event_t *event,
+    uint64_t now_us);
 
 #ifdef MOQ_SERVICE_HAVE_WTQUIC_NETWORK_MANAGED
 #include <wtquic/types.h>

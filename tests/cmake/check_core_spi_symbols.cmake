@@ -60,6 +60,7 @@ set(BASE_SYMBOLS
     moq_core_internal_track_max_cache_duration
     moq_core_internal_track_properties_validate
     moq_core_internal_rcbuf_transferable
+    moq_core_internal_sub_tick_routed
 )
 set(FAMILY_PREFIX "moq_core_internal_")
 

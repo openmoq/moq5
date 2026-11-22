@@ -4,6 +4,7 @@
 #include "migration_internal.h"
 #include "../session/session_event_admission.h"
 #include "../session/session_internal.h"   /* session tag and facade serial */
+#include "../spi/core_spi.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -163,6 +164,11 @@ struct moq_subscriber {
                                       const moq_sub_update_result_t *result);
     bool                closed;
     bool                draining;
+
+    /* Set only for the length of a routed tick: the other owner of this
+     * session's events (moq_core_internal_sub_tick_routed). */
+    moq_core_internal_route_fn route;
+    void               *route_ctx;
 
     /* Byte budget for payload+properties rcbufs retained in the object and
      * fetch-object ring queues. Counts bytes currently in the rings only; the
@@ -1831,6 +1837,13 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         if (polled == MOQ_ERR_WOULD_BLOCK) return sub_would_block(sub);
         if (polled == MOQ_DONE) break;
         if (polled != MOQ_OK) return polled;
+        /* On a shared session the other owner sees each event first and
+         * keeps what is its own. */
+        if (sub->route &&
+            sub->route(sub->route_ctx, &ev, now_us) == MOQ_CORE_INTERNAL_ROUTE_TAKEN) {
+            moq_event_cleanup(&ev);
+            continue;
+        }
         switch (ev.kind) {
         case MOQ_EVENT_SUBSCRIBE_OK: {
             moq_sub_track_t *t = find_track_by_handle(sub,
@@ -2647,6 +2660,19 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
             return sub->tracks[i].initial_result_error;
 
     return MOQ_OK;
+}
+
+moq_result_t moq_core_internal_sub_tick_routed(moq_subscriber_t *sub, uint64_t now_us,
+                                               moq_core_internal_route_fn route,
+                                               void *ctx)
+{
+    if (!sub) return MOQ_ERR_INVAL;
+    sub->route = route;
+    sub->route_ctx = ctx;
+    moq_result_t rc = moq_sub_tick(sub, now_us);
+    sub->route = NULL;
+    sub->route_ctx = NULL;
+    return rc;
 }
 
 moq_result_t moq_sub_poll_object(moq_subscriber_t *sub,

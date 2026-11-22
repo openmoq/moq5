@@ -15,6 +15,7 @@
 #include <moq/export.h>
 #include <moq/publisher.h>
 #include <moq/session.h>
+#include <moq/subscriber.h>
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -117,6 +118,32 @@ MOQ_API bool moq_core_internal_virtual_resolve(
  * beforehand under the no-future-open requirement above. */
 MOQ_API moq_result_t moq_core_internal_virtual_finish(
     moq_session_t *s, const void *observer, bool abort_batch);
+
+/* One reader for a session that a subscriber facade shares with another
+ * event owner (a media receiver and a media sender on one endpoint): the
+ * subscriber's tick, with each event it polls offered to `route` first. An
+ * event `route` TAKES is that owner's; the tick cleans it up and moves on. A
+ * LEFT event goes through the subscriber's own handling exactly as in
+ * moq_sub_tick. An event every owner
+ * observes (the session's close or GOAWAY) is left by the other owner and so
+ * reaches the subscriber too. Polling keeps the subscriber's admission, so
+ * `route` sees events in session order, and an event the subscriber cannot
+ * admit yet holds back the ones behind it for every owner.
+ *
+ * `route` runs inside the tick, on the session's thread, while the event's
+ * borrowed fields are valid. It may advance the session for an event it takes
+ * and must not call into this subscriber. NULL `route` is moq_sub_tick. */
+typedef enum moq_core_internal_route {
+    MOQ_CORE_INTERNAL_ROUTE_LEFT  = 0,
+    MOQ_CORE_INTERNAL_ROUTE_TAKEN = 1
+} moq_core_internal_route_t;
+
+typedef moq_core_internal_route_t (*moq_core_internal_route_fn)(
+    void *ctx, const moq_event_t *event, uint64_t now_us);
+
+MOQ_API moq_result_t moq_core_internal_sub_tick_routed(
+    moq_subscriber_t *sub, uint64_t now_us,
+    moq_core_internal_route_fn route, void *ctx);
 
 #ifdef __cplusplus
 }
