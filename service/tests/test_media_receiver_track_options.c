@@ -31,7 +31,12 @@ typedef struct options_cfg {
     uint32_t mpeg2ts_program_number;
     const moq_location_filter_cfg_t *location;
     const moq_fill_cfg_t *fill;
+    const uint64_t *object_delivery_timeout_ms;
+    const uint64_t *subgroup_delivery_timeout_ms;
 } options_cfg_t;
+
+/* The extent a caller had before the delivery timeouts were appended. */
+#define OPTIONS_BEFORE_TIMEOUTS offsetof(options_cfg_t, object_delivery_timeout_ms)
 
 _Static_assert(MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_SIZE == sizeof(old_track_cfg_t),
                "validation uses the independent old extent");
@@ -46,6 +51,12 @@ _Static_assert(offsetof(options_cfg_t, location) == offsetof(moq_media_receiver_
                "independent location offset");
 _Static_assert(offsetof(options_cfg_t, fill) == offsetof(moq_media_receiver_track_subscribe_cfg_t, fill),
                "independent fill offset");
+_Static_assert(offsetof(options_cfg_t, object_delivery_timeout_ms) ==
+               offsetof(moq_media_receiver_track_subscribe_cfg_t, object_delivery_timeout_ms),
+               "independent object delivery timeout offset");
+_Static_assert(offsetof(options_cfg_t, subgroup_delivery_timeout_ms) ==
+               offsetof(moq_media_receiver_track_subscribe_cfg_t, subgroup_delivery_timeout_ms),
+               "independent subgroup delivery timeout offset");
 
 static int failures;
 static unsigned calls;
@@ -55,6 +66,9 @@ static moq_location_filter_cfg_t location_seen, fill_location_seen;
 static moq_fill_cfg_t fill_seen;
 static const moq_location_filter_cfg_t *caller_location, *caller_fill_location;
 static const moq_fill_cfg_t *caller_fill;
+static bool seen_object_dt, seen_subgroup_dt;
+static uint64_t object_dt_seen, subgroup_dt_seen;
+static const uint64_t *caller_object_dt, *caller_subgroup_dt;
 
 static moq_result_t observed_subscribe(moq_subscriber_t *sub,
     const moq_sub_track_cfg_t *cfg, uint64_t now_us, moq_sub_track_t **out)
@@ -75,6 +89,16 @@ static moq_result_t observed_subscribe(moq_subscriber_t *sub,
     if (seen_fill_location) {
         fill_location_seen = *cfg->fill->location;
         MOQ_TEST_CHECK(cfg->fill->location != caller_fill_location);
+    }
+    seen_object_dt = cfg->object_delivery_timeout_ms != NULL;
+    seen_subgroup_dt = cfg->subgroup_delivery_timeout_ms != NULL;
+    if (seen_object_dt) {
+        object_dt_seen = *cfg->object_delivery_timeout_ms;
+        MOQ_TEST_CHECK(cfg->object_delivery_timeout_ms != caller_object_dt);
+    }
+    if (seen_subgroup_dt) {
+        subgroup_dt_seen = *cfg->subgroup_delivery_timeout_ms;
+        MOQ_TEST_CHECK(cfg->subgroup_delivery_timeout_ms != caller_subgroup_dt);
     }
     return moq_sub_subscribe(sub, cfg, now_us, out);
 }
@@ -110,8 +134,10 @@ static bool start(fixture_t *f, moq_version_t version)
     memset(f, 0, sizeof(*f));
     calls = 0;
     seen_location = seen_fill = seen_fill_location = false;
+    seen_object_dt = seen_subgroup_dt = false;
     caller_location = caller_fill_location = NULL;
     caller_fill = NULL;
+    caller_object_dt = caller_subgroup_dt = NULL;
     moq_alloc_t alloc = test_allocator(&f->ledger);
     moq_simpair_cfg_t pair_cfg = MOQ_SIMPAIR_CFG_INIT;
     pair_cfg.alloc = &alloc;
@@ -277,7 +303,7 @@ static void test_old_and_partial(void)
 {
     const moq_version_t versions[] = {MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18, MOQ_VERSION_DRAFT_22};
     for (size_t v = 0; v < 3; v++) {
-        for (size_t n = sizeof(old_track_cfg_t); n < sizeof(options_cfg_t); n++) {
+        for (size_t n = sizeof(old_track_cfg_t); n < OPTIONS_BEFORE_TIMEOUTS; n++) {
             fixture_t f;
             bool ready = start(&f, versions[v]);
             MOQ_TEST_CHECK(ready);
@@ -458,6 +484,132 @@ static void test_legacy_locations(void)
     MOQ_TEST_PASS("track_options_legacy_locations_and_profile_widths");
 }
 
+/* The SUBSCRIBE the peer receives, or false if none arrived. */
+static bool peer_subscribe(fixture_t *f, moq_subscribe_request_event_t *out,
+                           moq_subscription_admission_options_t *options, bool *has_options)
+{
+    bool got = false;
+    moq_session_t *server = moq_simpair_server(f->pair);
+    MOQ_TEST_CHECK(moq_simpair_run_until_quiescent(f->pair, 32, NULL) == MOQ_OK);
+    moq_event_t event;
+    for (unsigned i = 0; i < 64 && moq_session_poll_events(server, &event, 1); i++) {
+        if (event.kind == MOQ_EVENT_SUBSCRIBE_REQUEST && !got) {
+            *out = event.u.subscribe_request;
+            *has_options = out->options != NULL;
+            if (*has_options) *options = *out->options;
+            got = true;
+        }
+        moq_event_cleanup(&event);
+    }
+    return got;
+}
+
+static void test_delivery_timeouts(void)
+{
+    /* Draft 16 carries one shared value, so the two must be equal there. */
+    const struct { moq_version_t version; uint64_t object_ms, subgroup_ms, wire_us; } cases[] = {
+        {MOQ_VERSION_DRAFT_16, 400, 400, 400000},
+        {MOQ_VERSION_DRAFT_18, 400, 900, 400000},
+        {MOQ_VERSION_DRAFT_22, 400, 900, 0},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        fixture_t f;
+        bool ready = start(&f, cases[c].version);
+        MOQ_TEST_CHECK(ready);
+        if (!ready) { finish(&f); continue; }
+        uint64_t object_ms = cases[c].object_ms, subgroup_ms = cases[c].subgroup_ms;
+        options_cfg_t cfg = {0};
+        cfg.struct_size = sizeof(cfg);
+        cfg.object_delivery_timeout_ms = &object_ms;
+        cfg.subgroup_delivery_timeout_ms = &subgroup_ms;
+        caller_object_dt = &object_ms; caller_subgroup_dt = &subgroup_ms;
+        MOQ_TEST_CHECK(subscribe(&f, &cfg) == MOQ_OK);
+        /* The values are copied: the caller's storage is free once it returns. */
+        object_ms = subgroup_ms = 0;
+        memset(&cfg, 0, sizeof(cfg));
+        reconcile(&f);
+        MOQ_TEST_CHECK(calls == 1 && seen_object_dt && seen_subgroup_dt);
+        MOQ_TEST_CHECK(object_dt_seen == cases[c].object_ms &&
+                       subgroup_dt_seen == cases[c].subgroup_ms);
+        /* Every later SUBSCRIBE the reconcile builds for the track (after a
+         * resubscribe, say) starts from the track's desired options. */
+        MOQ_TEST_CHECK(f.track->desired_options.has_object_delivery_timeout &&
+                       f.track->desired_options.object_delivery_timeout_ms == cases[c].object_ms);
+        MOQ_TEST_CHECK(f.track->desired_options.has_subgroup_delivery_timeout &&
+                       f.track->desired_options.subgroup_delivery_timeout_ms == cases[c].subgroup_ms);
+        moq_subscribe_request_event_t request = {0};
+        moq_subscription_admission_options_t options = {0};
+        bool has_options = false;
+        MOQ_TEST_CHECK(peer_subscribe(&f, &request, &options, &has_options));
+        if (cases[c].version == MOQ_VERSION_DRAFT_22) {
+            /* Draft 22 surfaces each timeout exactly. */
+            MOQ_TEST_CHECK(has_options);
+            if (has_options) {
+                MOQ_TEST_CHECK(options.flags & MOQ_SUBSCRIPTION_ADMISSION_OBJECT_DELIVERY_TIMEOUT);
+                MOQ_TEST_CHECK(options.flags & MOQ_SUBSCRIPTION_ADMISSION_SUBGROUP_DELIVERY_TIMEOUT);
+                MOQ_TEST_CHECK(options.object_delivery_timeout_ms == cases[c].object_ms);
+                MOQ_TEST_CHECK(options.subgroup_delivery_timeout_ms == cases[c].subgroup_ms);
+            }
+        } else {
+            /* Drafts 16 and 18 surface only the smaller nonzero value, so
+             * the peer event cannot show that both were sent; the observer
+             * above shows both reached moq_sub_subscribe. */
+            MOQ_TEST_CHECK(request.delivery_timeout_us == cases[c].wire_us);
+        }
+        finish(&f);
+    }
+    MOQ_TEST_PASS("track_options_delivery_timeouts_reach_the_subscribe");
+}
+
+static void test_delivery_timeout_refusals(void)
+{
+    /* Draft 16's single DELIVERY_TIMEOUT: a zero or two different values
+     * fail the call, before any state commits, and the receiver lives on. */
+    const struct { uint64_t object_ms, subgroup_ms; bool has_subgroup; } bad[] = {
+        {400, 900, true}, {0, 0, false},
+    };
+    for (size_t c = 0; c < sizeof(bad) / sizeof(bad[0]); c++) {
+        fixture_t f;
+        bool ready = start(&f, MOQ_VERSION_DRAFT_16);
+        MOQ_TEST_CHECK(ready);
+        if (!ready) { finish(&f); continue; }
+        uint64_t object_ms = bad[c].object_ms, subgroup_ms = bad[c].subgroup_ms;
+        options_cfg_t cfg = {0};
+        cfg.struct_size = sizeof(cfg);
+        cfg.object_delivery_timeout_ms = &object_ms;
+        if (bad[c].has_subgroup) cfg.subgroup_delivery_timeout_ms = &subgroup_ms;
+        MOQ_TEST_CHECK(subscribe(&f, &cfg) == MOQ_ERR_INVAL);
+        MOQ_TEST_CHECK(!f.track->desired_subscribed);
+        receiver_reconcile_subscriptions(f.receiver, moq_simpair_now_us(f.pair));
+        MOQ_TEST_CHECK(calls == 0 && !moq_media_receiver_is_fatal(f.receiver));
+        finish(&f);
+    }
+    MOQ_TEST_PASS("track_options_delivery_timeout_d16_refusals");
+}
+
+static void test_delivery_timeout_tails(void)
+{
+    for (size_t n = OPTIONS_BEFORE_TIMEOUTS; n < sizeof(options_cfg_t); n++) {
+        fixture_t f;
+        bool ready = start(&f, MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK(ready);
+        if (!ready) { finish(&f); continue; }
+        uint64_t object_ms = 400, subgroup_ms = 400;
+        options_cfg_t cfg = {0};
+        cfg.struct_size = (uint32_t)n;
+        cfg.object_delivery_timeout_ms = &object_ms;
+        cfg.subgroup_delivery_timeout_ms = &subgroup_ms;
+        MOQ_TEST_CHECK(subscribe(&f, &cfg) == MOQ_OK);
+        reconcile(&f);
+        /* A field is read only when struct_size covers all of it. */
+        bool object_covered = n >= offsetof(options_cfg_t, object_delivery_timeout_ms) +
+                                    sizeof(cfg.object_delivery_timeout_ms);
+        MOQ_TEST_CHECK(calls == 1 && seen_object_dt == object_covered && !seen_subgroup_dt);
+        finish(&f);
+    }
+    MOQ_TEST_PASS("track_options_delivery_timeout_partial_tails");
+}
+
 int main(void)
 {
     test_copy_and_selection();
@@ -466,6 +618,9 @@ int main(void)
     test_old_and_partial();
     test_semantic_values();
     test_legacy_locations();
+    test_delivery_timeouts();
+    test_delivery_timeout_refusals();
+    test_delivery_timeout_tails();
     printf("receiver_track_options: %d failures\n", failures);
     return failures ? 1 : 0;
 }

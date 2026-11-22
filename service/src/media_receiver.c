@@ -262,6 +262,10 @@ typedef struct receiver_track_options {
     moq_location_filter_cfg_t location;
     moq_location_filter_cfg_t fill_location;
     moq_fill_cfg_t fill;
+    bool has_object_delivery_timeout;
+    bool has_subgroup_delivery_timeout;
+    uint64_t object_delivery_timeout_ms;
+    uint64_t subgroup_delivery_timeout_ms;
 } receiver_track_options_t;
 
 struct moq_media_track {
@@ -5539,6 +5543,10 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
         tcfg.filter = filt ? filt : MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
         tcfg.has_subscriber_priority = has_prio;
         tcfg.subscriber_priority = prio;
+        if (options.has_object_delivery_timeout)
+            tcfg.object_delivery_timeout_ms = &options.object_delivery_timeout_ms;
+        if (options.has_subgroup_delivery_timeout)
+            tcfg.subgroup_delivery_timeout_ms = &options.subgroup_delivery_timeout_ms;
         /* The live join (LargestObject) on a draft with fills is the section
          * 3.5 join at the current group, so playback can start at that
          * group's start instead of waiting for the next one. A publisher
@@ -7596,6 +7604,18 @@ static moq_result_t receiver_copy_fill(const moq_fill_cfg_t *in,
 static moq_result_t receiver_check_track_options(
     const moq_media_receiver_t *r, const receiver_track_options_t *options)
 {
+    /* Draft 16 carries one shared delivery timeout, as
+     * session_check_dt_selection enforces: nonzero, a varint, and one value. */
+    if (r->transport_version == MOQ_VERSION_DRAFT_16) {
+        bool ho = options->has_object_delivery_timeout;
+        bool hs = options->has_subgroup_delivery_timeout;
+        uint64_t o = options->object_delivery_timeout_ms;
+        uint64_t sg = options->subgroup_delivery_timeout_ms;
+        if ((ho && (o == 0 || o > MOQ_QUIC_VARINT_MAX)) ||
+            (hs && (sg == 0 || sg > MOQ_QUIC_VARINT_MAX)) ||
+            (ho && hs && o != sg))
+            return MOQ_ERR_INVAL;
+    }
     if (!options->has_location && !options->has_fill) return MOQ_OK;
     if (r->transport_version == MOQ_VERSION_DRAFT_22)
         return receiver_companion_d22(r->companion_profile)
@@ -7675,6 +7695,20 @@ moq_result_t moq_media_receiver_subscribe_track(
                                 sizeof(cfg->fill) && cfg->fill) {
             moq_result_t rc = receiver_copy_fill(cfg->fill, &options);
             if (rc != MOQ_OK) return rc;
+        }
+        if (cfg->struct_size >= offsetof(moq_media_receiver_track_subscribe_cfg_t,
+                                         object_delivery_timeout_ms) +
+                                sizeof(cfg->object_delivery_timeout_ms) &&
+            cfg->object_delivery_timeout_ms) {
+            options.has_object_delivery_timeout = true;
+            options.object_delivery_timeout_ms = *cfg->object_delivery_timeout_ms;
+        }
+        if (cfg->struct_size >= offsetof(moq_media_receiver_track_subscribe_cfg_t,
+                                         subgroup_delivery_timeout_ms) +
+                                sizeof(cfg->subgroup_delivery_timeout_ms) &&
+            cfg->subgroup_delivery_timeout_ms) {
+            options.has_subgroup_delivery_timeout = true;
+            options.subgroup_delivery_timeout_ms = *cfg->subgroup_delivery_timeout_ms;
         }
         has_prio = cfg->has_priority;
         if (has_prio) prio = cfg->priority;

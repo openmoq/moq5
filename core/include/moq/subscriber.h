@@ -234,10 +234,11 @@ typedef struct moq_sub_track_cfg {
      * subscriber asks for, each exact milliseconds borrowed for the call.
      * Non-NULL selects one with its value, zero included; NULL leaves it
      * absent. Pointers keep the struct's alignment. Each is read only when
-     * struct_size covers that whole pointer. Draft-16 has no independent
-     * carriers; on draft-18, which defines both (§10.2.3, §10.2.4), this
-     * library does not send them yet. Either way a selection is
-     * MOQ_ERR_UNSUPPORTED before anything is sent. */
+     * struct_size covers that whole pointer. Drafts 18 and 22 send each
+     * as its own parameter (draft 18 §10.2.3, §10.2.4). Draft 16 carries
+     * one shared value: a selected value must be nonzero, and two selected
+     * values must be equal; otherwise the subscribe is MOQ_ERR_INVAL
+     * before anything is sent. */
     const uint64_t                  *object_delivery_timeout_ms;
     const uint64_t                  *subgroup_delivery_timeout_ms;
 } moq_sub_track_cfg_t;

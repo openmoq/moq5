@@ -781,6 +781,14 @@ typedef struct moq_media_receiver_track_subscribe_cfg {
      * companion (explicit, or AUTO resolved) with negotiated draft22. */
     const moq_location_filter_cfg_t *location;
     const moq_fill_cfg_t            *fill;
+    /* Appended after fill: the OBJECT_DELIVERY_TIMEOUT and
+     * SUBGROUP_DELIVERY_TIMEOUT that every SUBSCRIBE for the track carries,
+     * in milliseconds, as moq_sub_track_cfg_t takes them. NULL leaves one
+     * absent. The values are copied before returning. Draft 16 carries one
+     * shared value: a selected value must be nonzero, and two selected
+     * values must be equal; otherwise MOQ_ERR_INVAL. */
+    const uint64_t                  *object_delivery_timeout_ms;
+    const uint64_t                  *subgroup_delivery_timeout_ms;
 } moq_media_receiver_track_subscribe_cfg_t;
 
 /* Frozen v0 sizeof: through priority, rounded to the original uint32_t
