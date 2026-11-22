@@ -54,6 +54,10 @@ typedef struct moq_endpoint_resolved {
      * default) when the cfg predates the field. Consumed only by the raw-QUIC
      * picoquic adapter -- resolve rejects a non-zero value anywhere else. */
     uint32_t      idle_timeout_ms;
+    /* PUBLISH_DONE terminal wait in us, struct_size-gated at resolve; 0 (the
+     * library default) when the cfg predates the field. Consumed only by the
+     * picoquic backends -- resolve rejects a non-zero value anywhere else. */
+    uint64_t      publish_done_wait_us;
     /* SETUP authorization tokens, struct_size-gated and validated at resolve;
      * BORROWED from the cfg. Only the picoquic backend carries them. */
     const moq_auth_token_t *setup_auth_tokens;

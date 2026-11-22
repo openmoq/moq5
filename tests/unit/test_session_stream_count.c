@@ -3792,6 +3792,118 @@ static void test_ex_floor_and_adapter_loop(moq_version_t ver)
     MOQ_TEST_CHECK(as.balance == 0);
 }
 
+/* -- publish_done_wait_us: the cfg field, read only when covered ------ */
+static void test_ex_explicit_wait_cfg(void)
+{
+    sc_alloc_state_t as = {0};
+    moq_alloc_t alloc = sc_allocator(&as);
+    {
+        moq_session_cfg_t c = MOQ_SESSION_CFG_INIT;
+        c.alloc = &alloc; c.perspective = MOQ_PERSPECTIVE_CLIENT;
+        c.version = MOQ_VERSION_DRAFT_16;
+        c.publish_done_wait_us = 250000;
+        moq_session_t *s = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&c, 0, &s) == MOQ_OK);
+        if (s) MOQ_TEST_CHECK_EQ_U64(s->publish_done_wait_us, 250000);
+        if (s) MOQ_TEST_CHECK_EQ_U64(s->done_wait_timeout_us,
+                                     30ull * 1000ull * 1000ull);
+        moq_session_destroy(s);
+    }
+    /* A caller whose layout ends before the field, in an allocation of
+     * exactly that size: nothing past it is read, and the field is 0. */
+    {
+        size_t old_size = offsetof(moq_session_cfg_t, publish_done_wait_us);
+        uint8_t *raw = (uint8_t *)malloc(old_size);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw) {
+            moq_session_cfg_t full = MOQ_SESSION_CFG_INIT;
+            full.alloc = &alloc; full.perspective = MOQ_PERSPECTIVE_CLIENT;
+            full.version = MOQ_VERSION_DRAFT_16;
+            memcpy(raw, &full, old_size);
+            uint32_t ssz = (uint32_t)old_size;
+            memcpy(raw + offsetof(moq_session_cfg_t, struct_size), &ssz,
+                   sizeof(ssz));
+            moq_session_t *s = NULL;
+            MOQ_TEST_CHECK(moq_session_create(
+                (const moq_session_cfg_t *)(const void *)raw, 0, &s) == MOQ_OK);
+            if (s) MOQ_TEST_CHECK_EQ_U64(s->publish_done_wait_us, 0);
+            moq_session_destroy(s);
+            free(raw);
+        }
+    }
+    MOQ_TEST_CHECK(as.balance == 0);
+}
+
+/* -- an explicit wait replaces the negotiated floor (subscription) ----- *
+ * The publisher advertises a 60 s subgroup timeout, which floors the
+ * default wait (test_ex_floor_and_adapter_loop). With publish_done_wait_us
+ * set, the deadline is that wait, not the floor. */
+static void test_ex_explicit_wait_floor(moq_version_t ver)
+{
+    sc_alloc_state_t as = {0};
+    moq_alloc_t alloc = sc_allocator(&as);
+    moq_simpair_t *sp = ex_pair(&alloc, ver, 1000000 /* 1s cfg */, 0, 0);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_session_t *sv = moq_simpair_server(sp);
+    moq_session_t *cl = moq_simpair_client(sp);
+    cl->publish_done_wait_us = 200000;
+    moq_subscription_t cl_sub, sv_sub;
+    MOQ_TEST_CHECK(dt_subscribe_pending(sp, "t", &cl_sub, &sv_sub));
+    uint8_t props[64];
+    size_t plen = dt_blob_v(ver, props, sizeof(props), false, 0, true,
+                            60000, NULL, 0);
+    if (ver != MOQ_VERSION_DRAFT_18)
+        plen = dt_blob_v(ver, props, sizeof(props), true, 60000, false, 0,
+                         NULL, 0);
+    MOQ_TEST_CHECK(dt_accept_with_props(sp, sv_sub, props, plen) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+    drain_events(cl); drain_events(sv);
+    uint64_t now = moq_simpair_now_us(sp);
+    MOQ_TEST_CHECK(sub_feed_done(sp, ver, cl_sub, 0x2, 1, NULL, false)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(cl), now + 200000);
+    MOQ_TEST_CHECK(moq_session_tick(cl, now + 199999) == MOQ_OK);
+    MOQ_TEST_CHECK(cl_sub_done_pending(cl, cl_sub));        /* not yet */
+    MOQ_TEST_CHECK(moq_session_tick(cl, now + 200001) == MOQ_OK);
+    sub_evstats_t st = {0};
+    sub_poll_stats(cl, &st);
+    MOQ_TEST_CHECK_EQ_INT(st.done_n, 1);
+    MOQ_TEST_CHECK(moq_session_state(cl) == MOQ_SESS_ESTABLISHED);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+}
+
+/* -- an explicit wait replaces the default (publication) --------------- */
+static void test_ex_explicit_wait_pub(moq_version_t ver)
+{
+    cap_stream_t cs = {0};
+    MOQ_TEST_CHECK(capture_pub_stream(ver, 0x96, true, &cs));
+    sc_alloc_state_t as = {0};
+    moq_alloc_t alloc = sc_allocator(&as);
+    moq_simpair_t *sp = sc_pair(&alloc, ver, false, 0);   /* 30 s default */
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_session_t *cl = moq_simpair_client(sp);
+    cl->publish_done_wait_us = 200000;
+    uint64_t now = moq_simpair_now_us(sp);
+    moq_publication_t sv_pub, cl_pub;
+    MOQ_TEST_CHECK(sc_publish_pending(sp, 0x96, true, &sv_pub, &cl_pub));
+    MOQ_TEST_CHECK(pub_accept_fwd(sp, cl_pub, true));
+    feed_cap_header(cl, moq_stream_ref_from_u64(0xE96), &cs, now); /* live */
+    MOQ_TEST_CHECK(pub_feed_done(sp, ver, cl_pub, 0x2, 2, "pw", false)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(cl), now + 200000);
+    MOQ_TEST_CHECK(moq_session_tick(cl, now + 200001) == MOQ_OK);
+    sub_evstats_t st = {0};
+    pub_poll_stats(cl, &st);
+    MOQ_TEST_CHECK_EQ_INT(st.done_n, 1);
+    MOQ_TEST_CHECK_EQ_INT(ex_count_stops(cl), 1);
+    MOQ_TEST_CHECK(moq_session_state(cl) == MOQ_SESS_ESTABLISHED);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+}
+
 /* ==================================================================== */
 /* publication-path timeout matrix + malformed-PUBLISH cleanup */
 /* ==================================================================== */
@@ -4600,6 +4712,7 @@ int main(void)
     test_dt_saturation(MOQ_VERSION_DRAFT_22);
 
     test_ex_cfg();
+    test_ex_explicit_wait_cfg();
     for (int v = 0; v < 2; v++) {
         moq_version_t ver = v ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_16;
         test_ex_one_pass(ver);
@@ -4611,12 +4724,14 @@ int main(void)
         test_ex_close_matrix(ver, 2);
         test_ex_two_entry_wake(ver);
         test_ex_floor_and_adapter_loop(ver);
+        test_ex_explicit_wait_floor(ver);
 
         test_dt_pub_matrix(ver);
         test_dt_pub_inbound_and_update(ver, false);
         if (ver == MOQ_VERSION_DRAFT_16)
             test_dt_pub_inbound_and_update(ver, true);
         test_ex_pub_expiry(ver);
+        test_ex_explicit_wait_pub(ver);
         test_publish_malformed_props_cleanup(ver);
     }
     test_dt_d18_update_reject(false);

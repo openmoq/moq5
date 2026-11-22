@@ -459,6 +459,9 @@ PIN_AFTER(moq_endpoint_cfg_t, accept_uri_ctx, send_queue_cap_bytes);
 PIN_THROUGH(moq_endpoint_cfg_t, send_queue_cap_bytes, 208,
             124 - ABI_ENDPOINT_ENUM_SHIFT, 128 - 2 * ABI_ENDPOINT_ENUM_SHIFT, 8, 4, 8);
 PIN_AFTER(moq_endpoint_cfg_t, send_queue_cap_bytes, idle_timeout_ms);
+PIN_THROUGH(moq_endpoint_cfg_t, idle_timeout_ms, 216,
+            128 - ABI_ENDPOINT_ENUM_SHIFT, 136 - 2 * ABI_ENDPOINT_ENUM_SHIFT, 8, 4, 8);
+PIN_AFTER(moq_endpoint_cfg_t, idle_timeout_ms, publish_done_wait_us);
 #endif
 
 /* -- Simulator ------------------------------------------------------------- */
@@ -567,7 +570,9 @@ PIN_THROUGH(moq_session_cfg_t, defer_fetch_ranges,
 PIN_AFTER(moq_session_cfg_t, defer_fetch_ranges, cluster_hop_id);
 PIN_AFTER(moq_session_cfg_t, defer_fetch_ranges, cluster_enabled);
 PIN_AFTER(moq_session_cfg_t, defer_fetch_ranges, cluster_relay_cost);
-PIN_SIZE(moq_session_cfg_t, 208, 184 - ABI_SESSION_ENUM_SHIFT, 192);
+PIN_AFTER(moq_session_cfg_t, cluster_relay_cost, publish_done_wait_us);
+PIN_AT(moq_session_cfg_t, publish_done_wait_us, 208, 184 - ABI_SESSION_ENUM_SHIFT, 192);
+PIN_SIZE(moq_session_cfg_t, 216, 192 - ABI_SESSION_ENUM_SHIFT, 200);
 /* GOAWAY Timeout: at the previous sizeof (16/8/8). */
 PIN_AT(moq_goaway_event_t, has_timeout, 16, 8, 8);
 PIN_AT(moq_goaway_event_t, timeout_ms, 24, 16, 16);
@@ -892,8 +897,12 @@ PIN_AT(moq_endpoint_cfg_t, send_queue_cap_bytes, 200,
  * the final uint64_t alignment pads it on LP64 and 32-bit ARM. */
 PIN_AT(moq_endpoint_cfg_t, idle_timeout_ms, 208,
        124 - ABI_ENDPOINT_ENUM_SHIFT, 128 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
-PIN_SIZE(moq_endpoint_cfg_t, 216,
-         128 - ABI_ENDPOINT_ENUM_SHIFT, 136 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
+/* The PUBLISH_DONE wait starts at the sizeof through idle_timeout_ms, past
+ * its tail padding, so an older caller's struct_size never covers it. */
+PIN_AT(moq_endpoint_cfg_t, publish_done_wait_us, 216,
+       128 - ABI_ENDPOINT_ENUM_SHIFT, 136 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
+PIN_SIZE(moq_endpoint_cfg_t, 224,
+         136 - ABI_ENDPOINT_ENUM_SHIFT, 144 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
 #endif
 
 #ifdef ABI_HAVE_MEDIA_RECEIVER

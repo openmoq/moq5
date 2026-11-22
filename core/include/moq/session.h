@@ -364,6 +364,17 @@ typedef struct moq_session_cfg {
     bool cluster_enabled;
     bool cluster_has_relay_cost;
     uint64_t cluster_relay_cost;
+
+    /* Appended (ABI-additive): bound on how long a deferred terminal done
+     * (Stream Count gating) waits for its advertised data streams, used as
+     * given. Non-zero replaces both done_wait_timeout_us and the floor the
+     * negotiated delivery timeouts set on it, so the session may give up on
+     * late objects sooner than those timeouts (draft 22 Section 9.9 lets a
+     * subscriber discard subscription state earlier). A live receiver can
+     * set it to subscribe again sooner after its publisher restarts. 0 keeps
+     * done_wait_timeout_us and the floor. Read only when struct_size covers
+     * this field. */
+    uint64_t publish_done_wait_us;
 } moq_session_cfg_t;
 
 #ifdef __cplusplus

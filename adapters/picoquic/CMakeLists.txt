@@ -1081,7 +1081,8 @@ if(MOQ_BUILD_TESTS AND MOQ_BUILD_PQ_THREADED)
             -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     foreach(_row streaming_on streaming_off socket_buffer wake_pressure bind_v4
-                 bind_v6 socket_buffer_limit idle_wake idle_deadline)
+                 bind_v6 socket_buffer_limit idle_wake idle_deadline done_wait
+                 done_wait_old_layout)
         add_test(NAME threaded_server_options_${_row}
                  COMMAND test_threaded_server_options ${_row})
         set_tests_properties(threaded_server_options_${_row}

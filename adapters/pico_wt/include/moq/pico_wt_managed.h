@@ -257,6 +257,11 @@ typedef struct moq_pico_wt_managed_cfg {
      * malformed or refused target is MOQ_ERR_INVAL at _create, before any
      * transport effect. Set via moq_pico_wt_managed_cfg_init_sized. */
     const moq_connection_target_t *target;
+    /* Appended: every session's moq_session_cfg_t.publish_done_wait_us,
+     * the wait after a PUBLISH_DONE for the streams it counts, used as given
+     * (no delivery-timeout floor). 0 = the library default. Set via
+     * moq_pico_wt_managed_cfg_init_sized. */
+    uint64_t           publish_done_wait_us;
 } moq_pico_wt_managed_cfg_t;
 
 /* Pointer-only initializer: clears and stamps the original frozen prefix

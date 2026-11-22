@@ -5892,6 +5892,8 @@ moq_result_t session_core_on_subscribe_done(moq_session_t *s,
             uint64_t wait_us = s->done_wait_timeout_us;
             uint64_t floor_us = sub_dt_floor_us(e);
             if (floor_us > wait_us) wait_us = floor_us;
+            /* An application-set wait is used as given, replacing the floor. */
+            if (s->publish_done_wait_us) wait_us = s->publish_done_wait_us;
             e->done_deadline_us = deadline_add(s->last_now_us, wait_us);
             e->done_expired = false;
         }

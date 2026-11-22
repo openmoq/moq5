@@ -54,6 +54,14 @@ typedef struct { char c; uint64_t v; } resolve_u64_probe_t;
          ? (size_t)(124 - RESOLVE_ENDPOINT_ENUM_SHIFT)                    \
          : (size_t)(128 - 2 * RESOLVE_ENDPOINT_ENUM_SHIFT))
 
+/* The sizeof of the layout that ends with idle_timeout_ms, the one that
+ * precedes publish_done_wait_us, as tests/unit/test_abi_layout_d22.c pins it. */
+#define ENDPOINT_CFG_THROUGH_IDLE_TIMEOUT_SIZE                             \
+    (sizeof(void *) == 8 ? (size_t)216                                    \
+     : offsetof(resolve_u64_probe_t, v) == 4                              \
+         ? (size_t)(128 - RESOLVE_ENDPOINT_ENUM_SHIFT)                    \
+         : (size_t)(136 - 2 * RESOLVE_ENDPOINT_ENUM_SHIFT))
+
 static moq_endpoint_cfg_t mkcfg(const char *url)
 {
     moq_endpoint_cfg_t c;
@@ -509,6 +517,70 @@ int main(void)
                                   (int)MOQ_ERR_UNSUPPORTED);
             free(raw);
         }
+    }
+
+    /* == publish_done_wait_us resolve: gate + backend rejection ======= *
+     * Both picoquic facades forward the PUBLISH_DONE wait to the session; no
+     * other backend can. 0 keeps the library default everywhere. */
+    {
+        moq_endpoint_resolved_t r;
+
+        moq_endpoint_cfg_t v0 = mkcfg("moqt://relay.example:4433");
+        v0.struct_size = MOQ_ENDPOINT_CFG_V0_SIZE;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&v0, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.publish_done_wait_us, 0);
+
+        /* Raw QUIC and WebTransport on picoquic: carried through. */
+        moq_endpoint_cfg_t c;
+        moq_endpoint_cfg_init_sized(&c, sizeof(c));
+        c.url = B("moqt://relay.example:4433");
+        c.publish_done_wait_us = 500000;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.publish_done_wait_us, 500000);
+        c.url = B("https://relay.example:4433/moq");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.publish_done_wait_us, 500000);
+
+        /* Half a field is not a field: poisoned bytes past struct_size are
+         * never read. */
+        const size_t at = offsetof(moq_endpoint_cfg_t, publish_done_wait_us);
+        for (size_t covered = 1; covered < sizeof(uint64_t); covered++) {
+            moq_endpoint_cfg_t p;
+            moq_endpoint_cfg_init_sized(&p, sizeof(p));
+            memset((uint8_t *)&p + at, 0xA5, sizeof(uint64_t));
+            p.struct_size = (uint32_t)(at + covered);
+            p.url = B("moqt://relay.example:4433");
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&p, &r), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(r.publish_done_wait_us, 0);
+        }
+
+        /* The whole preceding layout, in an allocation of exactly its size
+         * (ASan pins that nothing past it is read): 0. */
+        const size_t pre_size = ENDPOINT_CFG_THROUGH_IDLE_TIMEOUT_SIZE;
+        MOQ_TEST_CHECK(pre_size <= at);
+        void *raw = malloc(pre_size);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw != NULL) {
+            moq_endpoint_cfg_init_sized(raw, pre_size);
+            moq_bytes_t url = B("moqt://relay.example:4433");
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, pre_size, url, url));
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(raw, &r), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(r.publish_done_wait_us, 0);
+            free(raw);
+        }
+
+#ifdef MOQ_SERVICE_HAVE_MSQUIC_MANAGED
+        /* Another backend refuses a non-zero value; 0 is still fine. */
+        moq_endpoint_cfg_t m;
+        moq_endpoint_cfg_init_sized(&m, sizeof(m));
+        m.url = B("moqt://relay.example:4433");
+        m.backend = MOQ_TRANSPORT_BACKEND_MSQUIC;
+        m.publish_done_wait_us = 500000;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&m, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        m.publish_done_wait_us = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&m, &r), (int)MOQ_OK);
+#endif
     }
 
     /* == handshake_timeout_us upper boundary ========================== *

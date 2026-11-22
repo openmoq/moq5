@@ -3535,6 +3535,11 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
                             + sizeof(cfg->done_wait_timeout_us))
         done_wait_us = cfg->done_wait_timeout_us;
     if (done_wait_us == 0) done_wait_us = MOQ_DONE_WAIT_DEFAULT_US;
+    /* publish_done_wait_us (appended; read only when covered). 0 = none. */
+    uint64_t publish_done_wait_us = 0;
+    if (cfg->struct_size >= offsetof(moq_session_cfg_t, publish_done_wait_us)
+                            + sizeof(cfg->publish_done_wait_us))
+        publish_done_wait_us = cfg->publish_done_wait_us;
     if (!th_cap)      th_cap = sub_cap + pub_cap + ts_cap;
     if (th_cap > SIZE_MAX / sizeof(moq_track_hist_t)) return MOQ_ERR_INVAL;
 
@@ -4022,6 +4027,7 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->subgroup_retry_deadline_us = UINT64_MAX;
     s->idle_deadline_us = UINT64_MAX;
     s->done_wait_timeout_us = done_wait_us;
+    s->publish_done_wait_us = publish_done_wait_us;
     s->expiry_retry_deadline_us = UINT64_MAX;
     if (cfg->struct_size >= offsetof(moq_session_cfg_t, goaway_timeout_us) +
         sizeof(cfg->goaway_timeout_us))

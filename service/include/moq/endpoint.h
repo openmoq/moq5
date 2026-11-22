@@ -450,6 +450,19 @@ typedef struct moq_endpoint_cfg {
      * is MOQ_ERR_UNSUPPORTED, not a silent no-op. Set it via
      * moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
     uint32_t idle_timeout_ms;
+    /* appended (enabled by struct_size): how long, in microseconds, a
+     * subscription that the peer ended with PUBLISH_DONE stays open for the
+     * data streams its Stream Count announces, used as given
+     * (moq_session_cfg_t.publish_done_wait_us): a non-zero value replaces
+     * the library default and the floor the negotiated delivery timeouts
+     * set, so late objects past it are not delivered. 0 keeps the library
+     * default (30 s, floored by the delivery timeouts). A live receiver can
+     * lower it to subscribe again sooner after a publisher restarts.
+     * Honored by the picoquic backend on both protocols; a non-zero value
+     * on any other backend is MOQ_ERR_UNSUPPORTED. A larger value than the
+     * clock can add saturates.
+     * Set it via moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
+    uint64_t publish_done_wait_us;
 } moq_endpoint_cfg_t;
 
 /* Smallest non-zero moq_endpoint_cfg_t.idle_timeout_ms (see its doc above). */
@@ -481,17 +494,19 @@ typedef struct moq_endpoint_cfg {
  * MOQ_WT_PROFILE_BACKEND_DEFAULT for wt_profile (no explicit selection), to 0
  * (the backend default) for handshake_timeout_us, to no setup tokens, to no
  * application certificate callback, LEGACY for uri_mode, the library default
- * for preferred_version, no URI policy, the adapter's default queue bound and
- * the backend's idle timeout. Because it never writes past the v0
- * floor, it can NEVER overflow the buffer of an old caller that predates a
- * later tail field. To SET any tail field, use moq_endpoint_cfg_init_sized(). */
+ * for preferred_version, no URI policy, the adapter's default queue bound,
+ * the backend's idle timeout and the library's PUBLISH_DONE wait. Because
+ * it never writes past the v0 floor, it can NEVER overflow the buffer of an
+ * old caller that predates a later tail field. To SET any tail field, use
+ * moq_endpoint_cfg_init_sized(). */
 MOQ_API void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg);
 
 /* Sized initializer: clears and stamps min(cfg_size, current sizeof) -- the
  * initializer to use whenever you set anything beyond the v0 floor (wt_profile,
  * handshake_timeout_us, setup_auth_tokens + setup_auth_token_count,
  * verify_certificate + verify_certificate_ctx, uri_mode, preferred_version,
- * accept_uri, send_queue_cap_bytes, idle_timeout_ms). Pass sizeof(moq_endpoint_cfg_t).
+ * accept_uri, send_queue_cap_bytes, idle_timeout_ms, publish_done_wait_us).
+ * Pass sizeof(moq_endpoint_cfg_t).
  * Never writes past cfg_size, so it is safe for a caller compiled against an older, smaller
  * header too. */
 MOQ_API void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg,

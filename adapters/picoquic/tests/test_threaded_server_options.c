@@ -15,6 +15,12 @@
  *   idle_wake       a server with no connection pumps when woken
  *   idle_deadline   a server with no connection pumps at its app deadline,
  *                   unwoken
+ *   done_wait       a client with publish_done_wait_us 300 ms sees a
+ *                   PUBLISH_DONE that announces more streams than arrive
+ *                   end within a few seconds, not the 30 s default
+ *   done_wait_old_layout  the same client, its struct_size ending before
+ *                   publish_done_wait_us while that field holds 300 ms: the
+ *                   field is not read, so no end comes within 3 s
  */
 
 #include <moq/picoquic_threaded.h>
@@ -24,6 +30,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <netinet/in.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,6 +106,12 @@ typedef struct {
     _Atomic int accept_rc;    /* first refused accept */
     _Atomic int write_rc;     /* first refused open/write */
     struct idle_dl *dl;       /* set before create: the app deadline */
+    /* done_wait row: after its object, end the subscription with
+     * TRACK_ENDED announcing 3 streams (1 sent). Network thread only. */
+    int done_mode;
+    moq_session_t *done_sess;
+    moq_subscription_t done_sub;
+    _Atomic int done_sent;
 } srv_ctx_t;
 
 /* The app deadline of the idle_deadline row, owned by the network thread:
@@ -176,10 +189,23 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                             (s->served += 1);
                         moq_rcbuf_decref(b);
                         moq_session_close_subgroup(sess, h, now);
+                        if (s->done_mode) {
+                            s->done_sess = sess;
+                            s->done_sub = sub;
+                        }
                     }
                 }
             }
             moq_event_cleanup(&ev[i]);
+        }
+        /* Retried on later pumps while the subgroup's FIN is still owed. */
+        if (s->done_sess == sess && !s->done_sent) {
+            moq_done_subscribe_cfg_t dc;
+            moq_done_subscribe_cfg_init(&dc);
+            dc.status_code = 0x2;      /* TRACK_ENDED: the receiver waits */
+            dc.stream_count = 3;       /* only 1 is ever sent */
+            if (moq_session_done_subscribe(sess, s->done_sub, &dc, now) >= 0)
+                (s->done_sent = 1);
         }
     }
     return 0;
@@ -232,7 +258,17 @@ typedef struct {
     _Atomic int chunk_end;       /* a chunk with end = true */
     _Atomic int whole;           /* OBJECT_RECEIVED events */
     _Atomic int whole_bytes;
+    _Atomic int sub_done;        /* SUBSCRIBE_DONE events */
+    _Atomic uint64_t object_ns;  /* CLOCK_MONOTONIC of the first object */
+    _Atomic uint64_t done_ns;    /* CLOCK_MONOTONIC of SUBSCRIBE_DONE */
 } cli_ctx_t;
+
+static uint64_t mono_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
 
 static int client_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                        uint64_t now, void *vctx)
@@ -273,7 +309,11 @@ static int client_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
         } else if (ev[i].kind == MOQ_EVENT_OBJECT_RECEIVED) {
             const moq_object_received_event_t *o = &ev[i].u.object_received;
             c->whole_bytes += o->payload ? (int)moq_rcbuf_len(o->payload) : 0;
+            if (!c->object_ns) (c->object_ns = mono_ns());
             (c->whole += 1);
+        } else if (ev[i].kind == MOQ_EVENT_SUBSCRIBE_DONE) {
+            if (!c->done_ns) (c->done_ns = mono_ns());
+            (c->sub_done += 1);
         }
         moq_event_cleanup(&ev[i]);
     }
@@ -281,6 +321,8 @@ static int client_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
 }
 
 static const char *g_client_host = "localhost";
+static uint64_t g_client_done_wait_us;   /* the next client's; 0 = default */
+static bool g_client_old_layout;         /* struct_size ends before it */
 
 static moq_pq_threaded_t *client_create(int port, bool streaming, cli_ctx_t *c)
 {
@@ -294,6 +336,10 @@ static moq_pq_threaded_t *client_create(int port, bool streaming, cli_ctx_t *c)
     cfg.on_lane_pump = client_pump;
     cfg.on_lane_pump_ctx = c;
     cfg.streaming_objects = streaming;
+    cfg.publish_done_wait_us = g_client_done_wait_us;
+    if (g_client_old_layout)   /* an older layout: the field is past it */
+        cfg.struct_size = (uint32_t)offsetof(moq_pq_threaded_cfg_t,
+                                             publish_done_wait_us);
     moq_pq_threaded_t *cli = NULL;
     return moq_pq_threaded_create(&cfg, &cli) == MOQ_OK ? cli : NULL;
 }
@@ -555,6 +601,84 @@ static void row_idle_deadline(void)
     stop(&srv);
 }
 
+/* The client's wait reaches its session: a PUBLISH_DONE whose count is never
+ * met ends after about 300 ms, where the library default would hold it 30 s
+ * (past this row's 20 s bound). */
+static void row_done_wait(void)
+{
+    srv_ctx_t s;
+    memset(&s, 0, sizeof(s));
+    s.done_mode = 1;
+    moq_pq_threaded_t *srv = NULL;
+    int port = 0;
+    for (int attempt = 0; attempt < 16 && !srv; attempt++) {
+        port = pick_free_udp_port();
+        if (port && server_create(port, 0, &s, &srv) != MOQ_OK) srv = NULL;
+    }
+    CHECK(srv != NULL);
+    if (!srv) return;
+    cli_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    g_client_done_wait_us = 300000;
+    moq_pq_threaded_t *cli = client_create(port, false, &c);
+    g_client_done_wait_us = 0;
+    CHECK(cli != NULL);
+    if (cli) DRIVE_UNTIL(cli, (c.sub_done));
+    uint64_t ms = (c.done_ns && c.object_ns && c.done_ns > c.object_ns)
+                      ? (c.done_ns - c.object_ns) / 1000000ull : 0;
+    printf("done_wait: whole=%d done_sent=%d sub_done=%d "
+           "object->done %llu ms\n", c.whole, s.done_sent, c.sub_done,
+           (unsigned long long)ms);
+    CHECK(c.whole == 1);
+    CHECK(s.done_sent == 1);
+    CHECK(c.sub_done == 1);
+    CHECK(ms < 5000);       /* the configured 300 ms, with loopback slack */
+    CHECK(ms >= 250);       /* TRACK_ENDED still waits: not ended early */
+    stop(&cli);
+    stop(&srv);
+}
+
+/* An older caller's layout ends before publish_done_wait_us: create() must
+ * not read the bytes there (300 ms here), so the default 30 s wait holds and
+ * no SUBSCRIBE_DONE arrives within 3 s of the object. */
+static void row_done_wait_old_layout(void)
+{
+    srv_ctx_t s;
+    memset(&s, 0, sizeof(s));
+    s.done_mode = 1;
+    moq_pq_threaded_t *srv = NULL;
+    int port = 0;
+    for (int attempt = 0; attempt < 16 && !srv; attempt++) {
+        port = pick_free_udp_port();
+        if (port && server_create(port, 0, &s, &srv) != MOQ_OK) srv = NULL;
+    }
+    CHECK(srv != NULL);
+    if (!srv) return;
+    cli_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    g_client_done_wait_us = 300000;
+    g_client_old_layout = true;
+    moq_pq_threaded_t *cli = client_create(port, false, &c);
+    g_client_done_wait_us = 0;
+    g_client_old_layout = false;
+    CHECK(cli != NULL);
+    if (cli) {
+        DRIVE_UNTIL(cli, (c.whole && s.done_sent));
+        struct timespec dl = deadline_in(3);
+        while (time_before(&dl) && !c.sub_done) {
+            moq_pq_threaded_wake(cli);
+            moq_pq_threaded_wait(cli, 10000);
+        }
+    }
+    printf("done_wait_old_layout: whole=%d done_sent=%d sub_done=%d\n",
+           c.whole, s.done_sent, c.sub_done);
+    CHECK(c.whole == 1);
+    CHECK(s.done_sent == 1);
+    CHECK(c.sub_done == 0);   /* still held by the 30 s default */
+    stop(&cli);
+    stop(&srv);
+}
+
 int main(int argc, char **argv)
 {
     const char *row = argc > 1 ? argv[1] : "streaming_on";
@@ -567,6 +691,9 @@ int main(int argc, char **argv)
     else if (strcmp(row, "socket_buffer_limit") == 0) row_socket_buffer_limit();
     else if (strcmp(row, "idle_wake") == 0) row_idle_wake();
     else if (strcmp(row, "idle_deadline") == 0) row_idle_deadline();
+    else if (strcmp(row, "done_wait") == 0) row_done_wait();
+    else if (strcmp(row, "done_wait_old_layout") == 0)
+        row_done_wait_old_layout();
     else {
         fprintf(stderr, "unknown row %s\n", row);
         return 2;

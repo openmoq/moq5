@@ -141,6 +141,7 @@ struct moq_pico_wt_managed {
     bool               send_request_capacity;
     uint64_t           initial_request_capacity;
     uint64_t           goaway_timeout_us;
+    uint64_t           publish_done_wait_us;
     uint32_t           keep_alive_interval_ms;
     bool               insecure_skip_verify;
     int              (*configure_quic)(picoquic_quic_t *, void *);
@@ -448,6 +449,7 @@ static void build_session_cfg(moq_pico_wt_managed_t *m,
     scfg->initial_request_capacity =
         m->initial_request_capacity ? m->initial_request_capacity : 64;
     scfg->goaway_timeout_us = m->goaway_timeout_us;
+    scfg->publish_done_wait_us = m->publish_done_wait_us;
     scfg->setup_auth_tokens = m->setup_tokens.tokens;
     scfg->setup_auth_token_count = m->setup_tokens.count;
 }
@@ -1609,6 +1611,8 @@ moq_result_t moq_pico_wt_managed_create(
         m->initial_request_capacity = cfg->initial_request_capacity;
     if (CFG_HAS(cfg, goaway_timeout_us))
         m->goaway_timeout_us = cfg->goaway_timeout_us;
+    if (CFG_HAS(cfg, publish_done_wait_us))
+        m->publish_done_wait_us = cfg->publish_done_wait_us;
     if (CFG_HAS(cfg, keep_alive_interval_ms))
         m->keep_alive_interval_ms = cfg->keep_alive_interval_ms;
     if (CFG_HAS(cfg, insecure_skip_verify))
