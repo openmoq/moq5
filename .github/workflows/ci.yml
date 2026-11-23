@@ -242,8 +242,11 @@ jobs:
           cmake --build build/service-surface-shared -j3
           lib="$(find build/service-surface-shared/service -name 'libmoq-service.so*' -type f -print -quit)"
           test -n "$lib"
+          # Read the table once: under pipefail, `nm | grep -q` fails when grep
+          # exits before nm has written its last block.
+          service_exports="$(nm -D --defined-only "$lib")"
           for sym in moq_media_auth_cfg_init_sized moq_media_sender_cfg_init_sized moq_media_sender_cfg_init_live_sized moq_media_sender_cfg_init_lossless_sized moq_media_sender_callbacks_init_sized moq_media_track_cfg_init moq_media_track_cfg_init_sized; do
-            nm -D --defined-only "$lib" | grep -q " $sym\$" ||
+            grep -q " $sym\$" <<< "$service_exports" ||
               { echo "missing export: $sym"; exit 1; }
           done
           core="$(find build/service-surface-shared/core -name 'libmoq-core.so*' -type f -print -quit)"
