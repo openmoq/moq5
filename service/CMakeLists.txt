@@ -22,6 +22,7 @@ add_library(moq-service
     src/endpoint_uri.c
     src/media_auth.c
     src/media_receiver.c
+    src/media_merge.c
     ${MOQ_MEDIA_SENDER_SOURCES}
 )
 
@@ -233,6 +234,21 @@ if(MOQ_BUILD_TESTS)
     endif()
     add_test(NAME media_auth COMMAND test_media_auth)
     set_tests_properties(media_auth PROPERTIES TIMEOUT 10)
+
+    # The two-path merge needs the MPEG-TS reorder window.
+    if(TARGET moq::mpeg2ts)
+        add_executable(test_media_merge tests/test_media_merge.c)
+        target_link_libraries(test_media_merge PRIVATE moq::service)
+        target_include_directories(test_media_merge PRIVATE
+            ${PROJECT_SOURCE_DIR}/tests/unit)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_media_merge PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME media_merge COMMAND test_media_merge)
+        set_tests_properties(media_merge PROPERTIES TIMEOUT 10)
+    endif()
 
     # White-box target: the resolution layer is internal (endpoint_internal.h,
     # not installed); tests compile the sources directly so the internal
