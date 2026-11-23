@@ -525,6 +525,25 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         out->idle_timeout_ms = idle_ms;
     }
 
+    /* Session terminal-wait bound: the same complete-presence gate and byte
+     * copy as the idle timeout. Any duration is valid (the session's deadline
+     * arithmetic saturates); only the raw-QUIC picoquic adapter forwards it,
+     * so a non-zero value anywhere else is an UNSUPPORTED reject. */
+    {
+        const size_t at = offsetof(moq_endpoint_cfg_t, done_wait_timeout_us);
+        uint32_t size;
+        uint64_t done_wait_us = 0;
+        memcpy(&size, cfg, sizeof(size));
+        if ((size_t)size >= at + sizeof(done_wait_us))
+            memcpy(&done_wait_us, (const uint8_t *)cfg + at,
+                   sizeof(done_wait_us));
+        if (done_wait_us != 0 &&
+            (out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC ||
+             out->protocol != MOQ_TRANSPORT_PROTOCOL_RAW_QUIC))
+            return MOQ_ERR_UNSUPPORTED;
+        out->done_wait_timeout_us = done_wait_us;
+    }
+
     /* SETUP authorization tokens: the session's own limits, and that the
      * SETUP carrying them fits the default session send arena the backends
      * use (and so a default peer's receive buffer), counting the URL as the
@@ -1615,6 +1634,7 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
      * bound. A shorter idle timeout of our own needs a keepalive inside it:
      * half of it. Distinct from a MoQ/session deadline; see picoquic_threaded.h. */
     fc.idle_timeout_ms = r->idle_timeout_ms;
+    fc.done_wait_timeout_us = r->done_wait_timeout_us;
     fc.keep_alive_interval_ms = 15000;
     if (r->idle_timeout_ms != 0 && r->idle_timeout_ms / 2 < fc.keep_alive_interval_ms)
         fc.keep_alive_interval_ms = r->idle_timeout_ms / 2;
@@ -2074,6 +2094,10 @@ _Static_assert(offsetof(moq_endpoint_cfg_t, idle_timeout_ms) >=
                    offsetof(moq_endpoint_cfg_t, send_queue_cap_bytes) +
                        sizeof(((moq_endpoint_cfg_t *)0)->send_queue_cap_bytes),
                "idle_timeout_ms must be appended after send_queue_cap_bytes");
+_Static_assert(offsetof(moq_endpoint_cfg_t, done_wait_timeout_us) >=
+                   offsetof(moq_endpoint_cfg_t, idle_timeout_ms) +
+                       sizeof(((moq_endpoint_cfg_t *)0)->idle_timeout_ms),
+               "done_wait_timeout_us must be appended after idle_timeout_ms");
 _Static_assert(offsetof(moq_endpoint_cfg_t, verify_certificate_ctx) >=
                    offsetof(moq_endpoint_cfg_t, verify_certificate) +
                        sizeof(((moq_endpoint_cfg_t *)0)->verify_certificate),

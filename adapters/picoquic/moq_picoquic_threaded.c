@@ -106,6 +106,8 @@ static void build_session_cfg(moq_pq_threaded_t *t,
     if (t->send_buffer_size) scfg->send_buffer_size = t->send_buffer_size;
     if (t->recv_buffer_size) scfg->recv_buffer_size = t->recv_buffer_size;
     if (t->goaway_timeout_us) scfg->goaway_timeout_us = t->goaway_timeout_us;
+    if (t->done_wait_timeout_us)
+        scfg->done_wait_timeout_us = t->done_wait_timeout_us;
     scfg->streaming_objects = t->streaming_objects;
     scfg->setup_auth_tokens = t->setup_tokens.tokens;
     scfg->setup_auth_token_count = t->setup_tokens.count;
@@ -1571,6 +1573,8 @@ static moq_result_t create_facade(const moq_pq_threaded_cfg_t *cfg,
         t->goaway_timeout_us = cfg->goaway_timeout_us;
     if (CFG_HAS(cfg, send_queue_cap_bytes))
         t->send_queue_cap_bytes = cfg->send_queue_cap_bytes;
+    if (CFG_HAS(cfg, done_wait_timeout_us))
+        t->done_wait_timeout_us = cfg->done_wait_timeout_us;
     if (CFG_HAS(cfg, keep_alive_interval_ms))
         t->keep_alive_interval_ms = cfg->keep_alive_interval_ms;
     t->max_connections =

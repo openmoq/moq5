@@ -459,6 +459,7 @@ PIN_AFTER(moq_endpoint_cfg_t, accept_uri_ctx, send_queue_cap_bytes);
 PIN_THROUGH(moq_endpoint_cfg_t, send_queue_cap_bytes, 208,
             124 - ABI_ENDPOINT_ENUM_SHIFT, 128 - 2 * ABI_ENDPOINT_ENUM_SHIFT, 8, 4, 8);
 PIN_AFTER(moq_endpoint_cfg_t, send_queue_cap_bytes, idle_timeout_ms);
+PIN_AFTER(moq_endpoint_cfg_t, idle_timeout_ms, done_wait_timeout_us);
 #endif
 
 /* -- Simulator ------------------------------------------------------------- */
@@ -892,8 +893,12 @@ PIN_AT(moq_endpoint_cfg_t, send_queue_cap_bytes, 200,
  * the final uint64_t alignment pads it on LP64 and 32-bit ARM. */
 PIN_AT(moq_endpoint_cfg_t, idle_timeout_ms, 208,
        124 - ABI_ENDPOINT_ENUM_SHIFT, 128 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
-PIN_SIZE(moq_endpoint_cfg_t, 216,
-         128 - ABI_ENDPOINT_ENUM_SHIFT, 136 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
+/* The session terminal wait follows idle_timeout_ms, padded to the uint64_t
+ * alignment of the target. */
+PIN_AT(moq_endpoint_cfg_t, done_wait_timeout_us, 216,
+       128 - ABI_ENDPOINT_ENUM_SHIFT, 136 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
+PIN_SIZE(moq_endpoint_cfg_t, 224,
+         136 - ABI_ENDPOINT_ENUM_SHIFT, 144 - 2 * ABI_ENDPOINT_ENUM_SHIFT);
 #endif
 
 #ifdef ABI_HAVE_MEDIA_RECEIVER

@@ -450,6 +450,24 @@ typedef struct moq_endpoint_cfg {
      * is MOQ_ERR_UNSUPPORTED, not a silent no-op. Set it via
      * moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
     uint32_t idle_timeout_ms;
+    /* appended (enabled by struct_size): the session's done_wait_timeout_us
+     * (moq_session_cfg_t.done_wait_timeout_us). When a publisher ends a
+     * subscription with a PUBLISH_DONE that advertises a finite, nonzero
+     * stream count, the receiver holds the done event until that many data
+     * streams are processed. This field bounds that hold, in microseconds;
+     * it is floored by the negotiated delivery timeouts, so a delivery
+     * timeout can raise the bound but never lower it. A receiver of a
+     * restarting publisher sees the done only after this long, so a
+     * shorter value shortens the gap. A value too short can discard the
+     * tail of data streams still in flight when the done arrives.
+     *
+     * 0 keeps the library default (30 s), as does a caller built before the
+     * field. Any other value is a duration; very large values saturate
+     * inside the session rather than wrap. Honored by raw QUIC over
+     * picoquic only; a non-zero value on any other transport is
+     * MOQ_ERR_UNSUPPORTED, not a silent no-op. Set it via
+     * moq_endpoint_cfg_init_sized(&cfg, sizeof cfg). */
+    uint64_t done_wait_timeout_us;
 } moq_endpoint_cfg_t;
 
 /* Smallest non-zero moq_endpoint_cfg_t.idle_timeout_ms (see its doc above). */
@@ -491,7 +509,7 @@ MOQ_API void moq_endpoint_cfg_init(moq_endpoint_cfg_t *cfg);
  * initializer to use whenever you set anything beyond the v0 floor (wt_profile,
  * handshake_timeout_us, setup_auth_tokens + setup_auth_token_count,
  * verify_certificate + verify_certificate_ctx, uri_mode, preferred_version,
- * accept_uri, send_queue_cap_bytes, idle_timeout_ms). Pass sizeof(moq_endpoint_cfg_t).
+ * accept_uri, send_queue_cap_bytes, idle_timeout_ms, done_wait_timeout_us). Pass sizeof(moq_endpoint_cfg_t).
  * Never writes past cfg_size, so it is safe for a caller compiled against an older, smaller
  * header too. */
 MOQ_API void moq_endpoint_cfg_init_sized(moq_endpoint_cfg_t *cfg,

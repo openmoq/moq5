@@ -398,6 +398,12 @@ typedef struct moq_pq_threaded_cfg {
      * (see <moq/picoquic.h>). 0 = default. Set via
      * moq_pq_threaded_cfg_init_sized. */
     uint64_t           send_queue_cap_bytes;
+    /* Appended: forwarded to every session this facade creates as
+     * moq_session_cfg_t.done_wait_timeout_us, the bound on how long a
+     * terminal PUBLISH_DONE waits for its data streams (floored by the
+     * negotiated delivery timeouts). 0 = the library default (30 s). Set via
+     * moq_pq_threaded_cfg_init_sized. */
+    uint64_t           done_wait_timeout_us;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that
