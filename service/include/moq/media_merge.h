@@ -50,10 +50,10 @@ typedef struct moq_media_merge_cfg {
     uint32_t path_count;
     /* MPEG-TS packet size of the track's Objects: 188, or 192 in Timestamp
      * Mode. Default 188. */
-    uint32_t packet_size;
+    uint32_t mpeg2ts_packet_size;
     /* Program whose PMT gives the PCR PID for gap durations; 0 is the first
      * program of the PAT. Default 0. */
-    uint16_t program_number;
+    uint16_t mpeg2ts_program_number;
     uint16_t _reserved;
     /* Objects held at once while a Location is missing. Default 128. */
     uint32_t slot_count;
@@ -62,6 +62,11 @@ typedef struct moq_media_merge_cfg {
      * paths. Default 600000 (600 ms). */
     uint64_t window_us;
 } moq_media_merge_cfg_t;
+
+/* The first release's layout, through window_us: the floor a caller's
+ * struct_size is measured against. */
+#define MOQ_MEDIA_MERGE_CFG_V0_SIZE \
+    (offsetof(moq_media_merge_cfg_t, window_us) + sizeof(uint64_t))
 
 /* Two paths, 188-octet packets, the first program, 128 slots, 600 ms. */
 MOQ_API void moq_media_merge_cfg_init_sized(moq_media_merge_cfg_t *cfg,
@@ -80,9 +85,14 @@ typedef struct moq_media_merge_path_stats {
     uint64_t last_offer_us; /* now_us of the last offer; 0 before the first */
 } moq_media_merge_path_stats_t;
 
+/* The first release's layout, through last_offer_us: the smallest record
+ * moq_media_merge_get_path_stats writes. */
+#define MOQ_MEDIA_MERGE_PATH_STATS_V0_SIZE \
+    (offsetof(moq_media_merge_path_stats_t, last_offer_us) + sizeof(uint64_t))
+
 /*
- * Returns MOQ_OK, MOQ_ERR_INVAL for a NULL out, a cfg struct_size too small
- * for window_us, or an invalid cfg, MOQ_ERR_NOMEM, and MOQ_ERR_UNSUPPORTED
+ * Returns MOQ_OK, MOQ_ERR_INVAL for a NULL out, a cfg struct_size below
+ * MOQ_MEDIA_MERGE_CFG_V0_SIZE, or an invalid cfg, MOQ_ERR_NOMEM, and MOQ_ERR_UNSUPPORTED
  * when the library was built without MPEG-TS support. alloc NULL uses
  * moq_alloc_default().
  */
@@ -97,14 +107,14 @@ MOQ_API void moq_media_merge_destroy(moq_media_merge_t *m);
  * Offer an Object that path `path` polled with moq_media_receiver_poll_object.
  * obj_size is sizeof(*obj) as the caller compiled it. The Object must carry
  * its identity (its stamped struct_size covers has_subgroup) and the MPEG2TS
- * packaging. An END_OF_GROUP status Object ends its Group, as
- * moq_media_merge_end_group_at would.
+ * packaging. An END_OF_GROUP status Object ends its Group at its Location.
  *
  * MOQ_OK: the merge took the Object and *obj is zeroed. It is held, or, when
- * it is a duplicate or late, counted and released. MOQ_ERR_BUFFER: every slot
- * is in use; poll first. MOQ_ERR_INVAL: NULL arguments, a bad path, an
- * Object without identity or of another packaging. On any error *obj is
- * left untouched and stays the caller's.
+ * it is a duplicate or late, counted and released. MOQ_ERR_WOULD_BLOCK: every
+ * slot is in use; poll, then offer it again. MOQ_ERR_INVAL: NULL arguments, a
+ * bad path, an Object without identity, one stamped larger than this
+ * library's moq_media_object_t (so not polled from it), or one of another
+ * packaging. On any error *obj is left untouched and stays the caller's.
  */
 MOQ_API moq_result_t moq_media_merge_offer(moq_media_merge_t *m, uint32_t path,
                                            uint64_t now_us,
@@ -145,8 +155,8 @@ MOQ_API uint64_t moq_media_merge_next_deadline_us(const moq_media_merge_t *m);
 MOQ_API void moq_media_merge_finish(moq_media_merge_t *m);
 
 /* MOQ_OK, or MOQ_ERR_INVAL for NULL arguments, a bad path, or a stats_size
- * below sizeof(uint32_t). Writes min(stats_size, sizeof) bytes and stamps
- * struct_size with them. */
+ * below MOQ_MEDIA_MERGE_PATH_STATS_V0_SIZE. Writes min(stats_size, sizeof)
+ * bytes and stamps struct_size with them. */
 MOQ_API moq_result_t moq_media_merge_get_path_stats(
     const moq_media_merge_t *m, uint32_t path,
     moq_media_merge_path_stats_t *stats, size_t stats_size);

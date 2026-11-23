@@ -9,9 +9,16 @@
 #include "test_support.h"
 #include "test_alloc_support.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
+
+/* No field has been appended yet: the v0 floors are the whole records. */
+_Static_assert(MOQ_MEDIA_MERGE_CFG_V0_SIZE == sizeof(moq_media_merge_cfg_t),
+               "the cfg floor is its first release");
+_Static_assert(MOQ_MEDIA_MERGE_PATH_STATS_V0_SIZE == sizeof(moq_media_merge_path_stats_t),
+               "the stats floor is its first release");
 
 /* One 188-octet TS packet on PID 0x100, payload only, its continuity counter
  * taken from the Location so every Object differs. */
@@ -183,7 +190,7 @@ static void test_invalid_full_and_arguments(void)
     offer(m, &alloc, 0, 20, 0, 2, true);
     offer(m, &alloc, 0, 21, 0, 3, true);    /* both slots held, waiting for (0,1) */
     moq_media_object_t o = make_object(&alloc, 0, 4, true);
-    MOQ_TEST_CHECK(moq_media_merge_offer(m, 0, 22, &o, sizeof(o)) == MOQ_ERR_BUFFER);
+    MOQ_TEST_CHECK(moq_media_merge_offer(m, 0, 22, &o, sizeof(o)) == MOQ_ERR_WOULD_BLOCK);
     MOQ_TEST_CHECK(o.payload_ref != NULL);  /* still the caller's */
     MOQ_TEST_CHECK(moq_media_merge_offer(m, 2, 22, &o, sizeof(o)) == MOQ_ERR_INVAL);
     o.packaging = 0;
@@ -197,7 +204,111 @@ static void test_invalid_full_and_arguments(void)
     cfg.path_count = 1;
     moq_media_merge_t *bad = NULL;
     MOQ_TEST_CHECK(moq_media_merge_create(&cfg, &alloc, &bad) == MOQ_ERR_INVAL && !bad);
+    moq_media_merge_cfg_init(&cfg);
+    MOQ_TEST_CHECK(cfg.mpeg2ts_packet_size == 188 && cfg.mpeg2ts_program_number == 0);
+    cfg.mpeg2ts_packet_size = 100;
+    MOQ_TEST_CHECK(moq_media_merge_create(&cfg, &alloc, &bad) == MOQ_ERR_INVAL && !bad);
+    moq_media_merge_cfg_init(&cfg);
+    cfg.struct_size = (uint32_t)MOQ_MEDIA_MERGE_CFG_V0_SIZE - 1;
+    MOQ_TEST_CHECK(moq_media_merge_create(&cfg, &alloc, &bad) == MOQ_ERR_INVAL && !bad);
+    moq_media_merge_cfg_init(&cfg);
+    cfg.mpeg2ts_packet_size = 192;
+    MOQ_TEST_CHECK(moq_media_merge_create(&cfg, &alloc, &bad) == MOQ_OK && bad);
+    moq_media_merge_destroy(bad);
+    MOQ_TEST_CHECK(as.balance == 0);
     MOQ_TEST_PASS("invalid_full_and_arguments");
+}
+
+/* An Object stamped larger than this library's moq_media_object_t did not come
+ * from this library's receiver: it is refused and stays the caller's, and
+ * nothing past the library's own layout is read or written. */
+static void test_larger_object_refused(void)
+{
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    moq_media_merge_t *m = make_merge(&alloc, 2);
+    struct { moq_media_object_t o; uint8_t tail[16]; } big;
+    memset(&big, 0, sizeof(big));
+    big.o = make_object(&alloc, 0, 0, true);
+    big.o.struct_size = (uint32_t)sizeof(big);
+    MOQ_TEST_CHECK(moq_media_merge_offer(m, 0, 10, &big.o, sizeof(big)) == MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK(big.o.payload_ref != NULL);  /* still the caller's */
+    MOQ_TEST_CHECK_EQ_U64(stats(m, 0).offered, 0);
+    moq_media_object_cleanup(&big.o);
+    moq_media_merge_destroy(m);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("larger_object_refused");
+}
+
+/* A stats record smaller than its first release's layout is refused, as the
+ * other stats getters refuse one. */
+static void test_stats_size_floor(void)
+{
+    test_alloc_state_t as = {0};
+    moq_alloc_t alloc = test_allocator(&as);
+    moq_media_merge_t *m = make_merge(&alloc, 2);
+    moq_media_merge_path_stats_t s;
+    memset(&s, 0xa5, sizeof(s));
+    MOQ_TEST_CHECK(moq_media_merge_get_path_stats(m, 0, &s, sizeof(uint32_t)) == MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK(moq_media_merge_get_path_stats(m, 0, &s, sizeof(s) - 1) == MOQ_ERR_INVAL);
+    MOQ_TEST_CHECK(moq_media_merge_get_path_stats(m, 0, &s, sizeof(s)) == MOQ_OK);
+    MOQ_TEST_CHECK(s.struct_size == sizeof(s) && s.offered == 0);
+    moq_media_merge_destroy(m);
+    MOQ_TEST_CHECK(as.balance == 0);
+    MOQ_TEST_PASS("stats_size_floor");
+}
+
+/* An allocator that refuses its Nth call and fills every block it hands out
+ * with a non-zero pattern, so nothing may rely on fresh memory being zero. */
+typedef struct {
+    unsigned calls, fail_at;
+    size_t live;
+} dirty_alloc_t;
+
+static void *dirty_alloc(size_t size, void *ctx)
+{
+    dirty_alloc_t *d = (dirty_alloc_t *)ctx;
+    if (++d->calls == d->fail_at) return NULL;
+    void *p = malloc(size);
+    if (p) {
+        memset(p, 0xa5, size);
+        d->live++;
+    }
+    return p;
+}
+
+static void dirty_free(void *ptr, size_t size, void *ctx)
+{
+    (void)size;
+    dirty_alloc_t *d = (dirty_alloc_t *)ctx;
+    if (ptr) {
+        d->live--;
+        free(ptr);
+    }
+}
+
+/* create fails cleanly at every allocation it makes: MOQ_ERR_NOMEM, no merge,
+ * nothing left allocated, and no partly built state read. */
+static void test_create_allocation_failures(void)
+{
+    moq_media_merge_cfg_t cfg;
+    moq_media_merge_cfg_init(&cfg);
+    cfg.slot_count = 2;
+    dirty_alloc_t probe = {0};
+    moq_alloc_t alloc = { .ctx = &probe, .alloc = dirty_alloc, .free = dirty_free };
+    moq_media_merge_t *m = NULL;
+    MOQ_TEST_CHECK(moq_media_merge_create(&cfg, &alloc, &m) == MOQ_OK && m);
+    moq_media_merge_destroy(m);
+    MOQ_TEST_CHECK(probe.live == 0 && probe.calls >= 2);
+    for (unsigned n = 1; n <= probe.calls; n++) {
+        dirty_alloc_t d = { .fail_at = n };
+        alloc.ctx = &d;
+        m = (moq_media_merge_t *)(uintptr_t)1;
+        MOQ_TEST_CHECK(moq_media_merge_create(&cfg, &alloc, &m) == MOQ_ERR_NOMEM);
+        MOQ_TEST_CHECK(m == NULL);
+        MOQ_TEST_CHECK(d.live == 0);
+    }
+    MOQ_TEST_PASS("create_allocation_failures");
 }
 
 int main(void)
@@ -206,6 +317,9 @@ int main(void)
     test_late_copy_after_the_window();
     test_end_group_releases_the_next_group();
     test_invalid_full_and_arguments();
+    test_larger_object_refused();
+    test_stats_size_floor();
+    test_create_allocation_failures();
     fprintf(stderr, "media_merge: %d failure(s)\n", failures);
     return failures ? 1 : 0;
 }

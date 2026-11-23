@@ -19,8 +19,6 @@
 /* The prefix that carries its loss report. */
 #define MERGE_OBJ_LOSS_SIZE \
     (offsetof(moq_media_object_t, discontinuous) + sizeof(bool))
-#define MERGE_CFG_MIN_SIZE \
-    (offsetof(moq_media_merge_cfg_t, window_us) + sizeof(uint64_t))
 #define MERGE_MAX_SLOTS 4096u
 
 void moq_media_merge_cfg_init_sized(moq_media_merge_cfg_t *cfg, size_t cfg_size)
@@ -31,7 +29,7 @@ void moq_media_merge_cfg_init_sized(moq_media_merge_cfg_t *cfg, size_t cfg_size)
     size_t n = cfg_size < sizeof(d) ? cfg_size : sizeof(d);
     d.struct_size = (uint32_t)n;
     d.path_count = 2;
-    d.packet_size = 188;
+    d.mpeg2ts_packet_size = 188;
     d.slot_count = 128;
     d.window_us = 600000;
     memcpy(cfg, &d, n);
@@ -120,9 +118,9 @@ moq_result_t moq_media_merge_create(const moq_media_merge_cfg_t *cfg,
 {
     if (!out) return MOQ_ERR_INVAL;
     *out = NULL;
-    if (!cfg || cfg->struct_size < MERGE_CFG_MIN_SIZE) return MOQ_ERR_INVAL;
+    if (!cfg || cfg->struct_size < MOQ_MEDIA_MERGE_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     if (cfg->path_count < 2 || cfg->path_count > MOQ_MEDIA_MERGE_MAX_PATHS ||
-        (cfg->packet_size != 188 && cfg->packet_size != 192) ||
+        (cfg->mpeg2ts_packet_size != 188 && cfg->mpeg2ts_packet_size != 192) ||
         cfg->slot_count == 0 || cfg->slot_count > MERGE_MAX_SLOTS || cfg->window_us == 0)
         return MOQ_ERR_INVAL;
     if (!alloc) alloc = moq_alloc_default();
@@ -140,17 +138,19 @@ moq_result_t moq_media_merge_create(const moq_media_merge_cfg_t *cfg,
     m->held = (merge_held_t *)alloc->alloc(m->slot_count * sizeof(*m->held), alloc->ctx);
     m->released = (merge_loc_t *)alloc->alloc(m->released_cap * sizeof(*m->released),
                                               alloc->ctx);
+    /* Zeroed before any failure frees them: merge_free walks the held
+     * slots. */
+    if (m->slots) memset(m->slots, 0, m->slot_count * sizeof(*m->slots));
+    if (m->held) memset(m->held, 0, m->slot_count * sizeof(*m->held));
     if (!m->slots || !m->held || !m->released) {
         merge_free(m);
         return MOQ_ERR_NOMEM;
     }
-    memset(m->slots, 0, m->slot_count * sizeof(*m->slots));
-    memset(m->held, 0, m->slot_count * sizeof(*m->held));
 
     moq_mpeg2ts_receiver_cfg_t rc;
     moq_mpeg2ts_receiver_cfg_init(&rc);
-    rc.packet_size = cfg->packet_size;
-    rc.program_number = cfg->program_number;
+    rc.packet_size = cfg->mpeg2ts_packet_size;
+    rc.program_number = cfg->mpeg2ts_program_number;
     rc.reorder_slots = m->slots;
     rc.reorder_slot_count = m->slot_count;
     rc.reorder_window_us = cfg->window_us;
@@ -175,7 +175,8 @@ moq_result_t moq_media_merge_offer(moq_media_merge_t *m, uint32_t path, uint64_t
 {
     if (!m || !obj || path >= m->path_count) return MOQ_ERR_INVAL;
     if (obj_size < MERGE_OBJ_IDENTITY_SIZE || obj->struct_size < MERGE_OBJ_IDENTITY_SIZE ||
-        obj->struct_size > obj_size || obj->packaging != MOQ_MEDIA_PACKAGING_MPEG2TS)
+        obj->struct_size > obj_size || obj->struct_size > sizeof(moq_media_object_t) ||
+        obj->packaging != MOQ_MEDIA_PACKAGING_MPEG2TS)
         return MOQ_ERR_INVAL;
     moq_media_merge_path_stats_t *st = &m->stats[path];
     const uint64_t g = obj->group_id, o = obj->object_id;
@@ -207,10 +208,10 @@ moq_result_t moq_media_merge_offer(moq_media_merge_t *m, uint32_t path, uint64_t
     merge_held_t *h = NULL;
     for (uint32_t i = 0; i < m->slot_count && !h; i++)
         if (!m->held[i].used) h = &m->held[i];
-    if (!h) return MOQ_ERR_BUFFER;
+    if (!h) return MOQ_ERR_WOULD_BLOCK;
     const uint32_t flags = obj->end_of_group ? MOQ_MPEG2TS_OBJ_SUBGROUP_ENDS_GROUP : 0u;
     moq_result_t rc = moq_mpeg2ts_receiver_offer(&m->rx, now_us, g, o, flags, obj->payload, h);
-    if (rc == MOQ_ERR_BUFFER) return MOQ_ERR_BUFFER;
+    if (rc == MOQ_ERR_BUFFER) return MOQ_ERR_WOULD_BLOCK;
     st->offered++;
     st->last_offer_us = now_us;
     if (rc != MOQ_OK) {
@@ -299,7 +300,8 @@ moq_result_t moq_media_merge_get_path_stats(const moq_media_merge_t *m, uint32_t
                                             moq_media_merge_path_stats_t *stats,
                                             size_t stats_size)
 {
-    if (!m || !stats || path >= m->path_count || stats_size < sizeof(uint32_t))
+    if (!m || !stats || path >= m->path_count ||
+        stats_size < MOQ_MEDIA_MERGE_PATH_STATS_V0_SIZE)
         return MOQ_ERR_INVAL;
     size_t n = stats_size < sizeof(m->stats[path]) ? stats_size : sizeof(m->stats[path]);
     memcpy(stats, &m->stats[path], n);
