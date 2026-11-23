@@ -35,6 +35,17 @@
  *       but the client leaves by returning nonzero from on_pump after object
  *       delivery. This prevents a stop-only fix from leaving callback-requested
  *       loop termination as an abrupt ghost-session path.
+ *   --mode done_wait: server + one client that asks a 5 s delivery timeout
+ *       and whose cfg sets done_wait_timeout_us to 300 ms with
+ *       done_wait_exact. After its object the server ends the subscription
+ *       with TRACK_ENDED announcing 3 streams (1 sent): the client's
+ *       SUBSCRIBE_DONE comes after about 300 ms, not at the 5 s floor, so the
+ *       wait and the flag reached the client's session.
+ *   --mode done_wait_floor: the same without done_wait_exact: the 5 s
+ *       delivery timeout floors the wait.
+ *   --mode done_wait_old_layout: done_wait_exact set, but the client's
+ *       struct_size ends before it: create() does not read it, so the floor
+ *       holds.
  *   --mode announce: server + one client; the client REGISTERS a
  *       namespace after setup (moq_session_publish_namespace), the
  *       server must observe NAMESPACE_PUBLISHED with the exact parts
@@ -57,6 +68,7 @@
 #include <picoquic.h>
 
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -107,6 +119,12 @@ typedef struct {
     int        subscribe_client;
     int        subscribe_sent;
     atomic_int got_datagram;
+    /* done_wait mode: after the object, end the subscription with
+     * TRACK_ENDED and a stream count that is never met. */
+    int        done_mode;
+    int        done_armed;
+    moq_subscription_t done_sub;
+    atomic_int done_sent;
 } server_app_t;
 
 #define DGRAM_PAYLOAD     "managed-client-datagram"
@@ -134,6 +152,10 @@ static void serve_subscribe(moq_session_t *s, moq_subscription_t sub,
         moq_rcbuf_decref(buf);
         if (wrc < 0) { moq_session_close_subgroup(s, sg, now); return; }
         if (moq_session_close_subgroup(s, sg, now) < 0) return;
+        if (a->done_mode) {
+            a->done_sub = sub;
+            a->done_armed = 1;
+        }
         atomic_store(&a->published, 1);
         return;
     }
@@ -220,6 +242,15 @@ static int server_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
         }
         moq_event_cleanup(&ev);
     }
+    /* Retried on later pumps while the subgroup's FIN is still owed. */
+    if (a->done_armed && !atomic_load(&a->done_sent)) {
+        moq_done_subscribe_cfg_t dc;
+        moq_done_subscribe_cfg_init(&dc);
+        dc.status_code = 0x2;     /* TRACK_ENDED: the receiver waits */
+        dc.stream_count = 3;      /* only 1 is ever sent */
+        if (moq_session_done_subscribe(s, a->done_sub, &dc, now) >= 0)
+            atomic_store(&a->done_sent, 1);
+    }
     return 0;
 }
 
@@ -269,7 +300,22 @@ typedef struct {
     int        keep_until_stopped;
     moq_subscription_t sub;
     atomic_int fin_ok;
+    /* done_wait mode: keep pumping until SUBSCRIBE_DONE, timing it from the
+     * object (CLOCK_MONOTONIC ns). */
+    int        wait_for_done;
+    atomic_int sub_done;
+    _Atomic uint64_t object_ns;
+    _Atomic uint64_t done_ns;
 } client_app_t;
+
+static uint64_t mono_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+static uint32_t g_client_delivery_timeout_ms;   /* the next SUBSCRIBE's; 0 = none */
 
 static void client_subscribe(moq_session_t *s, client_app_t *a)
 {
@@ -282,6 +328,10 @@ static void client_subscribe(moq_session_t *s, client_app_t *a)
     sc.track_namespace.count = 2;
     sc.track_name = (moq_bytes_t){(const uint8_t *)"video", 5};
     sc.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+    if (g_client_delivery_timeout_ms) {   /* floors the done wait */
+        sc.delivery_timeout_flags |= MOQ_SUBSCRIBE_OBJECT_DELIVERY_TIMEOUT;
+        sc.object_delivery_timeout_ms = g_client_delivery_timeout_ms;
+    }
     moq_subscription_t sub;
     if (moq_session_subscribe(s, &sc, 0, &sub) >= 0) {
         a->subscribed = 1;
@@ -343,6 +393,9 @@ static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
             }
         } else if (ev.kind == MOQ_EVENT_NAMESPACE_REJECTED && a->do_announce) {
             atomic_store(&a->ns_rejected, 1);
+        } else if (ev.kind == MOQ_EVENT_SUBSCRIBE_DONE && a->wait_for_done) {
+            if (!atomic_load(&a->done_ns)) atomic_store(&a->done_ns, mono_ns());
+            atomic_store(&a->sub_done, 1);
         } else if (ev.kind == MOQ_EVENT_SUBGROUP_FINISHED && a->keep_until_stopped) {
             const moq_subgroup_finished_event_t *f = &ev.u.subgroup_finished;
             if (moq_subscription_eq(f->sub, a->sub) && f->group_id == 0 && f->subgroup_id == 0 &&
@@ -375,6 +428,8 @@ static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
                 moq_event_cleanup(&ev);
                 continue;
             }
+            if (a->wait_for_done && !atomic_load(&a->object_ns))
+                atomic_store(&a->object_ns, mono_ns());
             atomic_store(&a->got_object, 1);
             if (a->initiate_goaway && !a->goaway_sent) {
                 /* Client GOAWAY (uri_len 0) → DRAINING → drain timer →
@@ -399,6 +454,8 @@ static int client_pump(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
         }
         return 0;
     }
+    if (a->wait_for_done)
+        return atomic_load(&a->sub_done) ? 1 : 0;   /* run until done */
     if (a->initiate_goaway || a->keep_until_stopped)
         return 0;  /* keep running: the closed state, or the drain's FIN/ACKs */
     return atomic_load(&a->got_object) ? 1 : 0;  /* else pump-exit */
@@ -707,6 +764,80 @@ static run_status_t run_loopback_proto(const char *cert, const char *key,
     fprintf(stderr, "[loopback] port %d: no setup reached "
             "(retryable; port may be busy)\n", port);
     return RUN_RETRY;
+}
+
+/* The client's done_wait_timeout_us and done_wait_exact reach its session: a
+ * PUBLISH_DONE whose count is never met ends after about 300 ms with the flag,
+ * and at the 5 s delivery-timeout floor without it (or past struct_size). */
+static bool sub_done_pred(void *ctx)
+{ return atomic_load(&((client_app_t *)ctx)->sub_done) != 0; }
+
+static run_status_t run_done_wait(const char *cert, const char *key, int port,
+                                  int timeout_sec, int mode)
+{
+    /* mode 0: done_wait_exact; 1: no flag (the floor); 2: the flag past the
+     * client's struct_size (the floor). */
+    server_app_t sapp; memset(&sapp, 0, sizeof(sapp));
+    sapp.done_mode = 1;
+    moq_pico_wt_managed_t *srv = make_server_ex(cert, key, port, &sapp, NULL);
+    if (!srv) return RUN_RETRY;
+    settle(srv, 300);
+
+    client_app_t capp; memset(&capp, 0, sizeof(capp));
+    capp.wait_for_done = 1;
+    moq_pico_wt_managed_cfg_t cfg;
+    moq_pico_wt_managed_cfg_init_sized(&cfg, sizeof(cfg));  /* tail fields */
+    cfg.alloc = moq_alloc_default();
+    cfg.perspective = MOQ_PERSPECTIVE_CLIENT;
+    cfg.host = "127.0.0.1";
+    cfg.port = moq_pico_wt_managed_local_port(srv);
+    cfg.insecure_skip_verify = true;
+    cfg.on_pump = client_pump;
+    cfg.on_pump_ctx = &capp;
+    cfg.done_wait_timeout_us = 300000;
+    cfg.done_wait_exact = mode != 1;
+    if (mode == 2)   /* an older caller's layout: the flag is past it */
+        cfg.struct_size = (uint32_t)offsetof(moq_pico_wt_managed_cfg_t,
+                                             done_wait_exact);
+    g_client_delivery_timeout_ms = 5000;
+    moq_pico_wt_managed_t *cli = NULL;
+    if (moq_pico_wt_managed_create(&cfg, &cli) != MOQ_OK) {
+        moq_pico_wt_managed_stop(srv);
+        moq_pico_wt_managed_destroy(srv);
+        return RUN_RETRY;
+    }
+    mono_deadline_t d = deadline_after_ms((uint64_t)timeout_sec * 1000);
+    (void)wait_until(cli, &d, 200000, sub_done_pred, &capp);
+    g_client_delivery_timeout_ms = 0;
+
+    moq_pico_wt_managed_stop(cli);
+    int reached_setup = capp.subscribed;
+    int got = atomic_load(&capp.got_object);
+    int done = atomic_load(&capp.sub_done);
+    uint64_t on = atomic_load(&capp.object_ns), dn = atomic_load(&capp.done_ns);
+    uint64_t ms = (on && dn > on) ? (dn - on) / 1000000ull : 0;
+    moq_pico_wt_managed_destroy(cli);
+    int sent = atomic_load(&sapp.done_sent);
+    moq_pico_wt_managed_stop(srv);
+    moq_pico_wt_managed_destroy(srv);
+
+    printf("[done_wait] object=%d done_sent=%d sub_done=%d "
+           "object->done %llu ms\n", got, sent, done, (unsigned long long)ms);
+    if (!reached_setup && !got) return RUN_RETRY;
+    CHECK(got);
+    CHECK(sent);
+    CHECK(done);
+    int timing_ok;
+    if (mode == 0) {
+        CHECK(ms >= 250);       /* TRACK_ENDED still waits: not ended early */
+        CHECK(ms < 3000);       /* the 300 ms as given, well before the floor */
+        timing_ok = ms >= 250 && ms < 3000;
+    } else {
+        CHECK(ms >= 4500);      /* the 5 s delivery-timeout floor */
+        timing_ok = ms >= 4500;
+    }
+    if (!(got && sent && done && timing_ok)) return RUN_HARD;
+    return RUN_OK;
 }
 
 /* A managed client publishes object datagrams. The managed client owns the
@@ -1843,12 +1974,16 @@ int main(int argc, char **argv)
     int loopback_22 = !strcmp(mode, "loopback_22");
     int nego_22_18 = !strcmp(mode, "nego_22_18");
     int nego_22_16 = !strcmp(mode, "nego_22_16");
+    int done_wait = !strcmp(mode, "done_wait");
+    int done_wait_floor = !strcmp(mode, "done_wait_floor");
+    int done_wait_old = !strcmp(mode, "done_wait_old_layout");
     if (!refuse && !close_mode && !stop_close && !pump_exit_close && !nego &&
         !nego_refuse && !nego_legacy && !nego_legacy_18 && !no_rsa &&
         !bigobj && !bigobj_smallwin && !bigobj_drain && !announce &&
         !announce_18 && !announce_done_18 && !announce_done_no_rsa &&
         !loopback_18 && !alpn_close_18 && !datagram && !datagram_18 &&
-        !loopback_22 && !nego_22_18 && !nego_22_16 &&
+        !loopback_22 && !nego_22_18 && !nego_22_16 && !done_wait &&
+        !done_wait_floor && !done_wait_old &&
         strcmp(mode, "loopback") != 0) {
         fprintf(stderr, "unknown --mode '%s' (expected loopback|refuse|close|"
                 "stop_close|pump_exit_close|nego|nego_refuse|nego_legacy|"
@@ -1856,7 +1991,8 @@ int main(int argc, char **argv)
                 "no_reset_stream_at|bigobj|bigobj_smallwin|bigobj_drain|"
                 "announce|announce_18|announce_done_18|announce_done_no_rsa|"
                 "loopback_18|alpn_close_18|datagram|datagram_18|loopback_22|"
-                "nego_22_18|nego_22_16)\n", mode);
+                "nego_22_18|nego_22_16|done_wait|"
+                "done_wait_floor|done_wait_old_layout)\n", mode);
         return 2;
     }
 
@@ -1896,6 +2032,9 @@ int main(int argc, char **argv)
            : alpn_close_18  ? run_alpn_close_18(cert, key, ports[i], 6)
            : datagram       ? run_datagram(cert, key, ports[i], 6, NULL)
            : datagram_18    ? run_datagram(cert, key, ports[i], 6, "moqt-18")
+           : done_wait      ? run_done_wait(cert, key, ports[i], 20, 0)
+           : done_wait_floor ? run_done_wait(cert, key, ports[i], 20, 1)
+           : done_wait_old  ? run_done_wait(cert, key, ports[i], 20, 2)
 #if defined(PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION) && \
     PICOQUIC_STREAM_TERMINAL_CONTRACT_VERSION >= 1
            : loopback_22    ? run_nego_ex(cert, key, ports[i], 6,

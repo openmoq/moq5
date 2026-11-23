@@ -364,6 +364,17 @@ typedef struct moq_session_cfg {
     bool cluster_enabled;
     bool cluster_has_relay_cost;
     uint64_t cluster_relay_cost;
+
+    /* Appended (ABI-additive): use done_wait_timeout_us as given. By default
+     * the effective wait of a deferred terminal done is never below the
+     * subscription's negotiated delivery timeouts. When true and
+     * done_wait_timeout_us is non-zero, it is exactly done_wait_timeout_us,
+     * so the session may give up on late objects sooner than those timeouts
+     * (draft 22 Section 9.9 lets a subscriber discard subscription state
+     * earlier). Ignored when done_wait_timeout_us is 0, which keeps the
+     * library default with its floor. Read only when struct_size covers this
+     * field; older callers keep the floor. */
+    bool done_wait_exact;
 } moq_session_cfg_t;
 
 #ifdef __cplusplus

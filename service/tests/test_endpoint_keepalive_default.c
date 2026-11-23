@@ -34,6 +34,7 @@ static unsigned g_calls;      /* how often create was reached */
 static uint32_t g_ka_ms;      /* keep_alive_interval_ms it carried */
 static uint32_t g_idle_ms;    /* idle_timeout_ms it carried */
 static uint64_t g_done_wait_us; /* done_wait_timeout_us it carried */
+static int g_done_exact;        /* done_wait_exact it carried (-1 = not called) */
 
 /* The symbol the endpoint object set calls in place of moq_pq_threaded_create. */
 moq_result_t moq_test_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
@@ -45,6 +46,7 @@ moq_result_t moq_test_pq_threaded_create(const moq_pq_threaded_cfg_t *cfg,
     g_ka_ms = cfg->keep_alive_interval_ms;
     g_idle_ms = cfg->idle_timeout_ms;
     g_done_wait_us = cfg->done_wait_timeout_us;
+    g_done_exact = cfg->done_wait_exact ? 1 : 0;
     /* This TU is not renamed, so this reaches the real adapter create. */
     return moq_pq_threaded_create(cfg, out);
 }
@@ -86,10 +88,12 @@ static void check_connect(uint32_t idle_ms, uint32_t want_idle_ms, uint32_t want
 
 /* Connects with done_wait_timeout_us and checks the value the adapter create
  * received. */
-static void check_done_wait(uint64_t done_wait_us, uint64_t want_us)
+static void check_done_wait_exact(uint64_t done_wait_us, bool exact,
+                                  uint64_t want_us, int want_exact)
 {
     g_calls = 0;
     g_done_wait_us = UINT64_MAX;
+    g_done_exact = -1;
 
     moq_endpoint_cfg_t c;
     moq_endpoint_cfg_init_sized(&c, sizeof(c));
@@ -97,6 +101,7 @@ static void check_done_wait(uint64_t done_wait_us, uint64_t want_us)
     c.protocol = MOQ_TRANSPORT_PROTOCOL_RAW_QUIC;
     c.insecure_skip_verify = true;
     c.done_wait_timeout_us = done_wait_us;
+    c.done_wait_exact = exact;
 
     moq_endpoint_t *ep = NULL;
     moq_result_t rc = moq_endpoint_connect(&c, &ep);
@@ -105,6 +110,7 @@ static void check_done_wait(uint64_t done_wait_us, uint64_t want_us)
     if (rc == MOQ_OK && ep != NULL) {
         MOQ_TEST_CHECK_EQ_U64((uint64_t)g_calls, 1);
         MOQ_TEST_CHECK_EQ_U64(g_done_wait_us, want_us);
+        MOQ_TEST_CHECK_EQ_INT(g_done_exact, want_exact);
         moq_endpoint_stop(ep);
         moq_endpoint_destroy(ep);
     }
@@ -113,8 +119,12 @@ static void check_done_wait(uint64_t done_wait_us, uint64_t want_us)
 int main(void)
 {
     /* The terminal wait reaches the adapter: 0 by default, as set otherwise. */
-    check_done_wait(0, 0);
-    check_done_wait(2000000ull, 2000000ull);
+    check_done_wait_exact(0, false, 0, 0);
+    check_done_wait_exact(2000000ull, false, 2000000ull, 0);
+    /* done_wait_exact reaches the adapter with a wait; without one it is
+     * cleared, so the default keeps its floor. */
+    check_done_wait_exact(2000000ull, true, 2000000ull, 1);
+    check_done_wait_exact(0, true, 0, 0);
 
     /* No idle timeout: the backend default and the service keepalive, as before. */
     check_connect(0, 0, SERVICE_KA_MS);

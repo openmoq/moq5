@@ -92,6 +92,7 @@ struct moq_pq_threaded {
     uint32_t            recv_buffer_size;
     uint64_t            goaway_timeout_us;
     uint64_t            done_wait_timeout_us;   /* 0 = library default */
+    bool                done_wait_exact;        /* with a non-zero wait: no floor */
     uint32_t            keep_alive_interval_ms;  /* 0 = keepalive disabled */
     uint64_t            send_queue_cap_bytes;    /* 0 = adapter default */
     bool                insecure_skip_verify;

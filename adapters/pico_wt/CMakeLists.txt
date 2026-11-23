@@ -1141,6 +1141,29 @@ if(MOQ_BUILD_PICO_WT_MANAGED)
             TIMEOUT 30
             LABELS "network;pico_wt;managed")
 
+        # The client's PUBLISH_DONE wait reaches its session.
+        add_test(NAME pico_wt_managed_done_wait
+            COMMAND test_pico_wt_managed_loopback --mode done_wait
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_done_wait PROPERTIES
+            TIMEOUT 60
+            LABELS "network;pico_wt;managed")
+        add_test(NAME pico_wt_managed_done_wait_floor
+            COMMAND test_pico_wt_managed_loopback --mode done_wait_floor
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_done_wait_floor PROPERTIES
+            TIMEOUT 60
+            LABELS "network;pico_wt;managed")
+        add_test(NAME pico_wt_managed_done_wait_old_layout
+            COMMAND test_pico_wt_managed_loopback --mode done_wait_old_layout
+                --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                --key  "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+        set_tests_properties(pico_wt_managed_done_wait_old_layout PROPERTIES
+            TIMEOUT 60
+            LABELS "network;pico_wt;managed")
+
         # Large-object delivery: a 256 KiB object over a WT subgroup stream
         # must arrive in full (exact length + byte pattern). Guards both the
         # large-stream send/receive path and the harness's real-elapsed-time

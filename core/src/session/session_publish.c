@@ -2219,6 +2219,8 @@ moq_result_t session_core_on_publish_done(moq_session_t *s,
             uint64_t wait_us = s->done_wait_timeout_us;
             uint64_t floor_us = pub_dt_floor_us(pe);
             if (floor_us > wait_us) wait_us = floor_us;
+            /* An application that asked for the wait as given has no floor. */
+            if (s->done_wait_exact) wait_us = s->done_wait_timeout_us;
             pe->done_deadline_us = deadline_add(s->last_now_us, wait_us);
             pe->done_expired = false;
         }

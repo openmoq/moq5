@@ -3792,6 +3792,151 @@ static void test_ex_floor_and_adapter_loop(moq_version_t ver)
     MOQ_TEST_CHECK(as.balance == 0);
 }
 
+/* -- done_wait_exact: read when covered, and only with a configured wait --- */
+static void test_ex_exact_cfg(void)
+{
+    sc_alloc_state_t as = {0};
+    moq_alloc_t alloc = sc_allocator(&as);
+    struct { uint64_t wait; bool exact; bool want; } rows[] = {
+        { 250000, true,  true  },   /* a configured wait, as given */
+        { 250000, false, false },   /* the default: floored */
+        { 0,      true,  false },   /* no configured wait: the flag is ignored */
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        moq_session_cfg_t c = MOQ_SESSION_CFG_INIT;
+        c.alloc = &alloc; c.perspective = MOQ_PERSPECTIVE_CLIENT;
+        c.version = MOQ_VERSION_DRAFT_16;
+        c.done_wait_timeout_us = rows[i].wait;
+        c.done_wait_exact = rows[i].exact;
+        moq_session_t *s = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&c, 0, &s) == MOQ_OK);
+        if (s) {
+            MOQ_TEST_CHECK(s->done_wait_exact == rows[i].want);
+            MOQ_TEST_CHECK_EQ_U64(s->done_wait_timeout_us,
+                                  rows[i].wait ? rows[i].wait : 30ull * 1000ull * 1000ull);
+        }
+        moq_session_destroy(s);
+    }
+    /* A caller whose layout ends before the flag, in an allocation of exactly
+     * that size, with a configured wait: the flag is never read. */
+    {
+        size_t old_size = offsetof(moq_session_cfg_t, done_wait_exact);
+        uint8_t *raw = (uint8_t *)malloc(old_size);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw) {
+            moq_session_cfg_t full = MOQ_SESSION_CFG_INIT;
+            full.alloc = &alloc; full.perspective = MOQ_PERSPECTIVE_CLIENT;
+            full.version = MOQ_VERSION_DRAFT_16;
+            full.done_wait_timeout_us = 250000;
+            memcpy(raw, &full, old_size);
+            uint32_t ssz = (uint32_t)old_size;
+            memcpy(raw + offsetof(moq_session_cfg_t, struct_size), &ssz, sizeof(ssz));
+            moq_session_t *s = NULL;
+            MOQ_TEST_CHECK(moq_session_create(
+                (const moq_session_cfg_t *)(const void *)raw, 0, &s) == MOQ_OK);
+            if (s) MOQ_TEST_CHECK(!s->done_wait_exact);
+            moq_session_destroy(s);
+            free(raw);
+        }
+    }
+    /* A byte other than 0 or 1 in the flag reads as true, never as undefined:
+     * the session copies it as a byte. */
+    {
+        moq_session_cfg_t c = MOQ_SESSION_CFG_INIT;
+        c.alloc = &alloc; c.perspective = MOQ_PERSPECTIVE_CLIENT;
+        c.version = MOQ_VERSION_DRAFT_16;
+        c.done_wait_timeout_us = 250000;
+        memset((uint8_t *)&c + offsetof(moq_session_cfg_t, done_wait_exact), 0x5A, 1);
+        moq_session_t *s = NULL;
+        MOQ_TEST_CHECK(moq_session_create(&c, 0, &s) == MOQ_OK);
+        if (s) MOQ_TEST_CHECK(s->done_wait_exact);
+        moq_session_destroy(s);
+    }
+    MOQ_TEST_CHECK(as.balance == 0);
+}
+
+/* -- done_wait_exact replaces the negotiated floor (subscription) ------- *
+ * The publisher advertises a 60 s subgroup timeout, which floors the 1 s
+ * configured wait (test_ex_floor_and_adapter_loop). With done_wait_exact the
+ * deadline is the 1 s wait. */
+static void test_ex_exact_floor(moq_version_t ver)
+{
+    sc_alloc_state_t as = {0};
+    moq_alloc_t alloc = sc_allocator(&as);
+    moq_simpair_t *sp = ex_pair(&alloc, ver, 1000000 /* 1s cfg */, 0, 0);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_session_t *sv = moq_simpair_server(sp);
+    moq_session_t *cl = moq_simpair_client(sp);
+    cl->done_wait_exact = true;   /* the cfg read is test_ex_exact_cfg's */
+    moq_subscription_t cl_sub, sv_sub;
+    MOQ_TEST_CHECK(dt_subscribe_pending(sp, "t", &cl_sub, &sv_sub));
+    uint8_t props[64];
+    size_t plen = dt_blob_v(ver, props, sizeof(props), false, 0, true,
+                            60000, NULL, 0);
+    if (ver != MOQ_VERSION_DRAFT_18)
+        plen = dt_blob_v(ver, props, sizeof(props), true, 60000, false, 0,
+                         NULL, 0);
+    MOQ_TEST_CHECK(dt_accept_with_props(sp, sv_sub, props, plen) == MOQ_OK);
+    moq_simpair_run_until_quiescent(sp, 16, NULL);
+    drain_events(cl); drain_events(sv);
+    uint64_t now = moq_simpair_now_us(sp);
+    MOQ_TEST_CHECK(sub_feed_done(sp, ver, cl_sub, 0x2, 1, NULL, false)
+                   == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(cl), now + 1000000);
+    MOQ_TEST_CHECK(moq_session_tick(cl, now + 999999) == MOQ_OK);
+    MOQ_TEST_CHECK(cl_sub_done_pending(cl, cl_sub));        /* not yet */
+    MOQ_TEST_CHECK(moq_session_tick(cl, now + 1000001) == MOQ_OK);
+    sub_evstats_t st = {0};
+    sub_poll_stats(cl, &st);
+    MOQ_TEST_CHECK_EQ_INT(st.done_n, 1);
+    MOQ_TEST_CHECK(moq_session_state(cl) == MOQ_SESS_ESTABLISHED);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+}
+
+/* -- done_wait_exact replaces the floor (publication) -------------------- *
+ * The publication carries a 60 s object delivery timeout (set on the entry),
+ * which floors the 200 ms wait; with done_wait_exact (mode 1) the deadline is
+ * the 200 ms, without it (mode 0) the floor. */
+static void test_ex_exact_pub(moq_version_t ver, bool exact)
+{
+    cap_stream_t cs = {0};
+    MOQ_TEST_CHECK(capture_pub_stream(ver, 0x96, true, &cs));
+    sc_alloc_state_t as = {0};
+    moq_alloc_t alloc = sc_allocator(&as);
+    moq_simpair_t *sp = ex_pair(&alloc, ver, 200000, 0, 0);
+    MOQ_TEST_CHECK(sp != NULL);
+    if (!sp) return;
+    moq_session_t *cl = moq_simpair_client(sp);
+    cl->done_wait_exact = exact;
+    uint64_t now = moq_simpair_now_us(sp);
+    moq_publication_t sv_pub, cl_pub;
+    MOQ_TEST_CHECK(sc_publish_pending(sp, 0x96, true, &sv_pub, &cl_pub));
+    MOQ_TEST_CHECK(pub_accept_fwd(sp, cl_pub, true));
+    {
+        int slot = pub_resolve_handle(cl, cl_pub);
+        MOQ_TEST_CHECK(slot >= 0);
+        if (slot >= 0) {
+            cl->publishes[slot].dt_sub_has_object = true;
+            cl->publishes[slot].dt_sub_object_ms = 60000;
+        }
+    }
+    feed_cap_header(cl, moq_stream_ref_from_u64(0xE96), &cs, now); /* live */
+    MOQ_TEST_CHECK(pub_feed_done(sp, ver, cl_pub, 0x2, 2, "pw", false)
+                   == MOQ_OK);
+    uint64_t wait = exact ? 200000 : 60000ull * 1000ull;
+    MOQ_TEST_CHECK_EQ_U64(moq_session_next_deadline_us(cl), now + wait);
+    MOQ_TEST_CHECK(moq_session_tick(cl, now + wait + 1) == MOQ_OK);
+    sub_evstats_t st = {0};
+    pub_poll_stats(cl, &st);
+    MOQ_TEST_CHECK_EQ_INT(st.done_n, 1);
+    MOQ_TEST_CHECK_EQ_INT(ex_count_stops(cl), 1);
+    MOQ_TEST_CHECK(moq_session_state(cl) == MOQ_SESS_ESTABLISHED);
+    moq_simpair_destroy(sp);
+    MOQ_TEST_CHECK(as.balance == 0);
+}
+
 /* ==================================================================== */
 /* publication-path timeout matrix + malformed-PUBLISH cleanup */
 /* ==================================================================== */
@@ -4600,6 +4745,7 @@ int main(void)
     test_dt_saturation(MOQ_VERSION_DRAFT_22);
 
     test_ex_cfg();
+    test_ex_exact_cfg();
     for (int v = 0; v < 2; v++) {
         moq_version_t ver = v ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_16;
         test_ex_one_pass(ver);
@@ -4611,12 +4757,15 @@ int main(void)
         test_ex_close_matrix(ver, 2);
         test_ex_two_entry_wake(ver);
         test_ex_floor_and_adapter_loop(ver);
+        test_ex_exact_floor(ver);
 
         test_dt_pub_matrix(ver);
         test_dt_pub_inbound_and_update(ver, false);
         if (ver == MOQ_VERSION_DRAFT_16)
             test_dt_pub_inbound_and_update(ver, true);
         test_ex_pub_expiry(ver);
+        test_ex_exact_pub(ver, false);
+        test_ex_exact_pub(ver, true);
         test_publish_malformed_props_cleanup(ver);
     }
     test_dt_d18_update_reject(false);
