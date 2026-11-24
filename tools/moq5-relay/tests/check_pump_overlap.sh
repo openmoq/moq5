@@ -112,9 +112,10 @@ expect_ident pthread_join 1
 expect_ident spawn_cohort 2
 expect_ident join_cohort 2
 
+# awk reads to the end of its input instead of exiting at the closing brace:
+# under pipefail, a reader that leaves early can kill the writer with SIGPIPE.
 body_of() {
-    printf '%s\n' "$code" |
-        awk -v f="^$1\\\\(" 'BEGIN{on=0} $0 ~ f {on=1} on {print} on && /^}/ {exit}'
+    awk -v f="^$1\\\\(" 'on == 0 && $0 ~ f {on = 1} on == 1 {print} on == 1 && /^}/ {on = 2}' <<< "$code"
 }
 norm() { tr '\n' ' ' | tr -s ' ' | sed -e 's/^ //' -e 's/ $//'; }
 
@@ -123,7 +124,7 @@ spawn=$(body_of spawn_cohort)
 join=$(body_of join_cohort)
 [ -n "$spawn" ] || fail "spawn_cohort not found"
 [ -n "$join" ] || fail "join_cohort not found"
-printf '%s\n' "$join" | grep -q 'pthread_join' ||
+grep -q 'pthread_join' <<< "$join" ||
     fail "join_cohort does not join the readers"
 
 # -- canonical regions, by digest -------------------------------------------
