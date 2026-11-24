@@ -290,7 +290,7 @@ if(MOQ_BUILD_TESTS AND TARGET picoquic-test AND MOQ_PICOQUIC_SOURCE_DIR)
             target_compile_options(test_outbound_stream_credit PRIVATE
                 -Wall -Wextra -Wpedantic $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
         endif()
-        foreach(cell raw-uni raw-bidi wt-uni wt-bidi raw-reset wt-reset)
+        foreach(cell raw-uni raw-bidi wt-uni wt-bidi raw-reset wt-reset raw-bidi-cancel)
             string(REPLACE "-" "_" suffix "${cell}")
             add_test(NAME outbound_credit_${suffix}
                 COMMAND test_outbound_stream_credit ${cell})
