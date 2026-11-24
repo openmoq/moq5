@@ -233,6 +233,7 @@ struct PlayerOutputCopyTests {
             (UInt32(MOQ_MEDIA_PLAYER_END_LOCAL_FAILURE), .localFailure),
             (UInt32(MOQ_MEDIA_PLAYER_END_CLOSED), .closed),
             (UInt32(MOQ_MEDIA_PLAYER_END_FATAL), .fatal),
+            (UInt32(MOQ_MEDIA_PLAYER_END_REPLACED), .replaced),
             (40, .unknown(40)),
         ]
         let dispositions: [(UInt32, PlayerEndDisposition)] = [
@@ -241,6 +242,7 @@ struct PlayerOutputCopyTests {
             (UInt32(MOQ_MEDIA_PLAYER_END_IMMEDIATE), .immediate),
             (41, .unknown(41)),
         ]
+        #expect(causes.count <= 2 * dispositions.count)
         for ((rawCause, cause), (rawDisposition, disposition)) in zip(causes, dispositions + dispositions) {
             var e = output(kind: UInt32(MOQ_MEDIA_PLAYER_OUTPUT_END))
             e.u.end.cause = rawCause
@@ -324,6 +326,38 @@ struct PlayerEventCopyTests {
             Issue.record("forgotten: \(forgotten)")
             return
         }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("TRACK_REPLACED names the replacing track; without it the record is unknown")
+    func trackReplaced() {
+        let successor = PlayerTrack(
+            id: 0x2000,
+            description: TrackDescription(name: "video", mediaType: .video, packaging: .raw))
+        let record = event(UInt32(MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED)) {
+            $0.track = OpaquePointer(bitPattern: 0x1000)
+            $0.u.replaced.replacement = OpaquePointer(bitPattern: 0x2000)
+        }
+        #expect(replacementHandle(of: record) == OpaquePointer(bitPattern: 0x2000))
+        let replaced = copyPlayerEvent(record, track: videoTrack, replacement: successor)
+        guard case .trackReplaced(let old, let new) = replaced else {
+            Issue.record("replaced: \(replaced)")
+            return
+        }
+        #expect(old == videoTrack && new == successor)
+
+        let lone = copyPlayerEvent(record, track: videoTrack)
+        guard case .unknown(let kind, let track) = lone else {
+            Issue.record("lone: \(lone)")
+            return
+        }
+        #expect(kind == UInt32(MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED) && track == videoTrack)
+
+        /* The handle is read only from a TRACK_REPLACED record. */
+        let other = event(UInt32(MOQ_MEDIA_PLAYER_EVENT_GAP)) {
+            $0.u.replaced.replacement = OpaquePointer(bitPattern: 0x2000)
+        }
+        #expect(replacementHandle(of: other) == nil)
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)

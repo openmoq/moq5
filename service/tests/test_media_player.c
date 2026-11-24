@@ -30,7 +30,15 @@
  *   - wait never advances: OK for outputs and due deadlines, INTERRUPTED
  *     with the latch set;
  *   - attach refuses a receiver the player cannot own; outputs are never
- *     truncated; cleanup works after destroy.
+ *     truncated; cleanup works after destroy;
+ *   - an MSF-02 replacement of a selected track is TRACK_REPLACED and
+ *     END{REPLACED, IMMEDIATE} on the old handle, from its REMOVED alone,
+ *     and the new handle plays with the old selection's choices, also along
+ *     a chain of replacements; the old handle's slot is kept for it, a
+ *     terminal receiver discards it, and a new handle the player cannot
+ *     play is offered instead and not subscribed; a plain removal and an
+ *     advisory change are unchanged; a track with an encryptionScheme is
+ *     refused, and AUTO passes over it.
  */
 #include <moq/media_player.h>
 #include <moq/publisher.h>
@@ -65,6 +73,9 @@ bool moq_media_receiver_test_inject_object(moq_media_receiver_t *r, moq_media_tr
                                            uint64_t time_us, moq_rcbuf_t *payload);
 
 moq_playback_t *moq_media_player_test_engine(const moq_media_player_t *p);
+void moq_media_player_test_split_replacement(moq_media_player_t *p);
+size_t moq_media_receiver_test_track_count(const moq_media_receiver_t *r);
+moq_media_track_t *moq_media_receiver_test_track_at(moq_media_receiver_t *r, size_t index);
 void moq_playback_test_local_issuer(moq_playback_t *pb, uint64_t remaining);
 size_t moq_playback_test_buffered_count(const moq_playback_t *pb);
 
@@ -123,6 +134,7 @@ typedef struct {
     uint32_t engine_max_events;
     uint32_t engine_max_known_ranges;
     uint32_t max_stream_terminals;
+    uint32_t engine_max_tracks;
 } pf_opts_t;
 
 static moq_media_track_t *pf_track(pf_t *f, const char *name)
@@ -267,6 +279,7 @@ static bool pf_setup(pf_t *f, moq_version_t ver, const char *catalog,
     if (o && o->max_buffered_bytes) pb.max_buffered_bytes = o->max_buffered_bytes;
     if (o && o->engine_max_events) pb.max_events = o->engine_max_events;
     if (o && o->engine_max_known_ranges) pb.max_known_ranges = o->engine_max_known_ranges;
+    if (o && o->engine_max_tracks) pb.max_tracks = o->engine_max_tracks;
     moq_media_player_cfg_t c;
     moq_media_player_cfg_init(&c);
     c.selection = o && o->selection ? o->selection : MOQ_MEDIA_SELECTION_MANUAL;
@@ -362,12 +375,22 @@ typedef struct {
     size_t n;
 } out_log_t;
 
-/* Poll every output into the log, returning their refs. */
-static void outputs(pf_t *f, out_log_t *log)
+/* Poll every output into the log, returning their refs. With `track`, the
+ * codec string of its last CONFIGURE goes to `codec` (cap bytes, always
+ * NUL-terminated). */
+static void outputs_codec(pf_t *f, out_log_t *log, moq_media_track_t *track,
+                          char *codec, size_t cap)
 {
     moq_media_player_output_t o;
     while (moq_media_player_poll_output(f->p, &o, sizeof(o)) == MOQ_OK) {
         if (o.track) pf_learn(f, o.track);
+        if (track && o.track == track && o.kind == MOQ_MEDIA_PLAYER_OUTPUT_CONFIGURE &&
+            o.u.configure.codec && cap > 0) {
+            size_t n = moq_rcbuf_len(o.u.configure.codec);
+            if (n >= cap) n = cap - 1;
+            memcpy(codec, moq_rcbuf_data(o.u.configure.codec), n);
+            codec[n] = '\0';
+        }
         if (log && log->n < 96) {
             log->o[log->n] = o;
             log->o[log->n].u.unit.payload = NULL;
@@ -381,6 +404,11 @@ static void outputs(pf_t *f, out_log_t *log)
         }
         moq_media_player_output_cleanup(&o);
     }
+}
+
+static void outputs(pf_t *f, out_log_t *log)
+{
+    outputs_codec(f, log, NULL, NULL, 0);
 }
 
 static size_t count_out(const out_log_t *log, uint32_t kind, moq_media_track_t *t)
@@ -4388,6 +4416,727 @@ out:
     if (failures == before) printf("PASS: %s\n", row);
 }
 
+/* -- MSF-02 track replacement and encrypted tracks ------------------------ */
+
+#define CATALOG02(tracks) \
+    "{\"version\":\"draft-02\",\"generatedAt\":1,\"tracks\":[" tracks "]}"
+#define DELTA02(ops) "{\"generatedAt\":2,\"deltaUpdate\":[" ops "]}"
+
+/* A codec change is decode-critical: the receiver replaces the handle. */
+static const char k_delta_codec[] = DELTA02(
+    "{\"op\":\"update\",\"tracks\":[{\"parentName\":\"video\","
+    "\"codec\":\"avc1.64001f\"}]}");
+
+/* Catalog group `g`: the independent catalog `base`, then `delta` as the
+ * group's next Object (MSF 5.3: a delta applies to its group's independent
+ * catalog), on one subgroup that ends the group. */
+static void write_catalog_delta(pf_t *f, uint64_t g, const char *base, const char *delta)
+{
+    const char *const json[] = { base, delta };
+    for (uint64_t i = 0; i < 2; i++) {
+        moq_rcbuf_t *pay = NULL;
+        moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)json[i], strlen(json[i]),
+                         &pay);
+        moq_pub_object_cfg_t oc;
+        moq_pub_object_cfg_init_sized(&oc, sizeof(oc));
+        oc.group_id = g;
+        oc.object_id = i;
+        oc.payload = pay;
+        oc.end_of_group = true;
+        CHECK(moq_pub_write_object_ex(f->pub, f->catalog, &oc, f->now) == MOQ_OK);
+        moq_rcbuf_decref(pay);
+    }
+    CHECK(moq_pub_end_group(f->pub, f->catalog, f->now) == MOQ_OK);
+}
+
+/* Learn every handle the receiver has, announced by the player or not
+ * (AUTO announces only what it did not select). */
+static void learn_all(pf_t *f)
+{
+    size_t n = moq_media_receiver_test_track_count(f->r);
+    for (size_t i = 0; i < n; i++) pf_learn(f, moq_media_receiver_test_track_at(f->r, i));
+}
+
+/* Whether the receiver has removed `t` (replaced or withdrawn). */
+static bool receiver_removed(pf_t *f, moq_media_track_t *t)
+{
+    moq_media_track_state_t s;
+    return moq_media_receiver_track_state(f->r, t, &s) == MOQ_ERR_WRONG_STATE;
+}
+
+/* One cycle, then everything the player has into the logs (either may be
+ * NULL). */
+static void cycle_poll(pf_t *f, ev_log_t *evl, out_log_t *log)
+{
+    (void)cycle(f);
+    events(f, evl);
+    outputs(f, log);
+}
+
+/* Cycles, polling, until the receiver's subscription of `t` is active
+ * (bounded). */
+static bool until_active(pf_t *f, moq_media_track_t *t, ev_log_t *evl, out_log_t *log)
+{
+    for (unsigned i = 0; i < 64; i++) {
+        moq_media_track_state_t s;
+        if (moq_media_receiver_track_state(f->r, t, &s) == MOQ_OK &&
+            s == MOQ_MEDIA_TRACK_STATE_ACTIVE)
+            return true;
+        cycle_poll(f, evl, log);
+    }
+    return false;
+}
+
+static const moq_media_player_event_t *find_ev(const ev_log_t *log, uint32_t kind,
+                                               const moq_media_track_t *t)
+{
+    for (size_t i = 0; i < log->n; i++)
+        if (log->ev[i].kind == kind && (!t || log->ev[i].track == t)) return &log->ev[i];
+    return NULL;
+}
+
+static size_t count_ev_track(const ev_log_t *log, uint32_t kind, const moq_media_track_t *t)
+{
+    size_t n = 0;
+    for (size_t i = 0; i < log->n; i++)
+        n += log->ev[i].kind == kind && log->ev[i].track == t;
+    return n;
+}
+
+/* The timeline of the first output of `t` in the log; 0 when none. */
+static uint32_t timeline_of(const out_log_t *log, const moq_media_track_t *t)
+{
+    for (size_t i = 0; i < log->n; i++)
+        if (log->o[i].track == t) return log->o[i].timeline_id;
+    return 0;
+}
+
+/* A selected video track replaced by an MSF-02 critical change (a delta
+ * changing its codec on a draft-02 base): TRACK_REPLACED names the new
+ * handle, the old track ends END{REPLACED, IMMEDIATE} and leaves its slot,
+ * and the new handle is selected with the old one's selection (here its own
+ * timeline, apart from the audio of its render group). Playback continues
+ * on the new handle behind its own CONFIGURE, with only the Objects of its
+ * own subscription; audio plays on; ENDED never fires. */
+static void test_player_replacement(moq_version_t ver)
+{
+    static char label[64];
+    snprintf(label, sizeof(label), "player_replacement_%s", vname(ver));
+    row = label;
+    unsigned before = failures;
+    static const char base[] = CATALOG02(
+        LOC_VIDEO("video", ",\"renderGroup\":1") ","
+        LOC_AUDIO("audio", "opus", ",\"renderGroup\":1"));
+    static const char *const names[] = { "video", "audio" };
+    pf_t f;
+    REQUIRE(pf_setup(&f, ver, base, names, 2, NULL));
+    moq_media_track_t *a = pf_track(&f, "video"), *au = pf_track(&f, "audio");
+    REQUIRE(a && au);
+    moq_media_player_select_cfg_t sc;
+    moq_media_player_select_cfg_init(&sc);
+    sc.independent_timing = true;
+    REQUIRE(moq_media_player_select_track(f.p, a, &sc) == MOQ_OK);
+    REQUIRE(select_plain(&f, "audio") == MOQ_OK);
+    cycles(&f, 16);
+    write_loc(&f, "video", 0, 0, true, 0, 0);
+    write_loc(&f, "video", 0, 1, false, 0, 0);
+    write_loc(&f, "audio", 0, 0, true, 0, 0);
+    ev_log_t evl = {0};
+    out_log_t log = {0};
+    for (unsigned i = 0; i < 16; i++) cycle_poll(&f, &evl, &log);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, a) == 2);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, au) == 1);
+    uint32_t tl_audio = timeline_of(&log, au), tl_a = timeline_of(&log, a);
+    CHECK(tl_audio != 0 && tl_a != 0 && tl_a != tl_audio);
+
+    write_catalog_delta(&f, 1, base, k_delta_codec);
+    /* An Object on the old subscription around the change: whenever it
+     * lands, it is never the new handle's. */
+    write_loc(&f, "video", 0, 2, false, 0, 0);
+    for (unsigned i = 0; i < 64 && !receiver_removed(&f, a); i++) cycle_poll(&f, &evl, &log);
+    REQUIRE(receiver_removed(&f, a));
+    cycle_poll(&f, &evl, &log);
+    const moq_media_player_event_t *rp = find_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED, a);
+    REQUIRE(rp != NULL);
+    moq_media_track_t *b = rp->u.replaced.replacement;
+    REQUIRE(b != NULL && b != a);
+    CHECK(rp->detail_size == sizeof(rp->u.replaced));
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED) == 1);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REMOVED) == 0);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, a) == 1);
+    const moq_media_player_output_t *e = last_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END);
+    REQUIRE(e != NULL);
+    CHECK(e->track == a);
+    CHECK(e->u.end.cause == MOQ_MEDIA_PLAYER_END_REPLACED);
+    CHECK(e->u.end.disposition == MOQ_MEDIA_PLAYER_END_IMMEDIATE);
+    /* The old handle left its slot; the new one is selected in its place. */
+    CHECK(pstats(&f).tracks_selected == 2);
+    CHECK(moq_media_player_deselect_track(f.p, a) == MOQ_ERR_INVAL);
+    CHECK(moq_media_player_select_track(f.p, b, NULL) == MOQ_ERR_WRONG_STATE);
+    CHECK(count_ev_track(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_AVAILABLE, b) == 0);
+
+    /* The new handle's subscription goes out once the old one is retired;
+     * only what it delivers is played. */
+    REQUIRE(until_active(&f, b, &evl, &log));
+    size_t before_b = log.n;
+    write_loc(&f, "video", 1, 0, true, 0, 0);
+    write_loc(&f, "video", 1, 1, false, 0, 0);
+    write_loc(&f, "audio", 0, 1, false, 0, 0);
+    char codec[32] = "";
+    for (unsigned i = 0; i < 16; i++) {
+        (void)cycle(&f);
+        events(&f, &evl);
+        outputs_codec(&f, &log, b, codec, sizeof(codec));
+    }
+    CHECK(strcmp(codec, "avc1.64001f") == 0);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_CONFIGURE, b) == 1);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, b) == 2);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, au) == 2);
+    size_t cfg_at = SIZE_MAX, first_unit = SIZE_MAX;
+    for (size_t i = before_b; i < log.n; i++) {
+        const moq_media_player_output_t *x = &log.o[i];
+        if (x->track != b) continue;
+        if (x->kind == MOQ_MEDIA_PLAYER_OUTPUT_CONFIGURE && cfg_at == SIZE_MAX) cfg_at = i;
+        if (x->kind == MOQ_MEDIA_PLAYER_OUTPUT_UNIT) {
+            if (first_unit == SIZE_MAX) first_unit = i;
+            CHECK(x->u.unit.group_id == 1);
+        }
+    }
+    CHECK(cfg_at < first_unit && first_unit != SIZE_MAX);
+    /* Its own timeline, as the old handle's selection asked. */
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_TIMELINE, b) == 1);
+    uint32_t tl_b = timeline_of(&log, b);
+    CHECK(tl_b != 0 && tl_b != tl_audio);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, b) == 0);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_ENDED) == 0);
+out:
+    pf_teardown(&f);
+    if (failures == before) printf("PASS: %s\n", row);
+}
+
+/* Replace the selected `a` with the MSF-02 codec delta and run the network
+ * and the receiver, without a player tick, until the receiver has committed
+ * the replacement; then one tick that takes the REMOVED and stops before the
+ * successor's ADDED. Returns the successor from TRACK_REPLACED, or NULL. */
+static moq_media_track_t *replace_split(pf_t *f, const char *base, moq_media_track_t *a,
+                                        ev_log_t *evl, out_log_t *log)
+{
+    write_catalog_delta(f, 1, base, k_delta_codec);
+    for (unsigned i = 0; i < 64 && !receiver_removed(f, a); i++) net_step(f);
+    if (!CHECK(receiver_removed(f, a))) return NULL;
+    moq_media_player_test_split_replacement(f->p);
+    CHECK(moq_media_player_tick(f->p, f->now) == MOQ_OK);
+    events(f, evl);
+    outputs(f, log);
+    const moq_media_player_event_t *rp = find_ev(evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED, a);
+    if (!CHECK(rp != NULL)) return NULL;
+    CHECK(rp->u.replaced.replacement != a);
+    return rp->u.replaced.replacement;
+}
+
+/* The REMOVED alone: the tick takes the replacement's REMOVED and nothing
+ * after it. TRACK_REPLACED and END{REPLACED} come out at once, with no wait
+ * for the successor; the old track's slot is kept for the moving selection
+ * (an engine of one track: another selection meanwhile is LIMIT), and the
+ * successor's ADDED on a later tick takes it. */
+static void test_player_lone_removed(moq_version_t ver)
+{
+    static char label[80];
+    snprintf(label, sizeof(label), "player_lone_removed_empty_queue_%s", vname(ver));
+    row = label;
+    unsigned before = failures;
+    static const char base[] = CATALOG02(LOC_VIDEO("video", "") "," LOC_VIDEO("other", ""));
+    static const char *const names[] = { "video", "other" };
+    pf_opts_t o = { .engine_max_tracks = 1 };
+    pf_t f;
+    REQUIRE(pf_setup(&f, ver, base, names, 2, &o));
+    moq_media_track_t *a = pf_track(&f, "video"), *other = pf_track(&f, "other");
+    REQUIRE(a && other);
+    REQUIRE(moq_media_player_select_track(f.p, a, NULL) == MOQ_OK);
+    CHECK(moq_media_player_select_track(f.p, other, NULL) == MOQ_ERR_LIMIT);
+    cycles(&f, 16);
+    write_loc(&f, "video", 0, 0, true, 0, 0);
+    ev_log_t evl = {0};
+    out_log_t log = {0};
+    for (unsigned i = 0; i < 8; i++) cycle_poll(&f, &evl, &log);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, a) == 1);
+
+    ev_log_t ev1 = {0};
+    out_log_t out1 = {0};
+    moq_media_track_t *b = replace_split(&f, base, a, &ev1, &out1);
+    REQUIRE(b != NULL);
+    CHECK(count_ev(&ev1, MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED) == 1);
+    CHECK(count_ev(&ev1, MOQ_MEDIA_PLAYER_EVENT_TRACK_REMOVED) == 0);
+    CHECK(count_out(&out1, MOQ_MEDIA_PLAYER_OUTPUT_END, a) == 1);
+    const moq_media_player_output_t *e = last_out(&out1, MOQ_MEDIA_PLAYER_OUTPUT_END);
+    REQUIRE(e != NULL);
+    CHECK(e->u.end.cause == MOQ_MEDIA_PLAYER_END_REPLACED);
+    CHECK(e->u.end.disposition == MOQ_MEDIA_PLAYER_END_IMMEDIATE);
+    CHECK(pstats(&f).tracks_selected == 0);
+    CHECK(moq_media_player_deselect_track(f.p, a) == MOQ_ERR_INVAL);
+    CHECK(moq_media_player_select_track(f.p, other, NULL) == MOQ_ERR_LIMIT);
+    /* The successor's ADDED is input for the next tick. */
+    CHECK(moq_media_player_wait(f.p, f.now, 0) == MOQ_OK);
+
+    CHECK(moq_media_player_tick(f.p, f.now) == MOQ_OK);
+    events(&f, &evl);
+    outputs(&f, &log);
+    CHECK(pstats(&f).tracks_selected == 1);
+    CHECK(moq_media_player_select_track(f.p, b, NULL) == MOQ_ERR_WRONG_STATE);
+    CHECK(moq_media_player_select_track(f.p, other, NULL) == MOQ_ERR_LIMIT);
+    CHECK(count_ev_track(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_AVAILABLE, b) == 0);
+    REQUIRE(until_active(&f, b, &evl, &log));
+    write_loc(&f, "video", 1, 0, true, 0, 0);
+    char codec[32] = "";
+    for (unsigned i = 0; i < 16; i++) {
+        (void)cycle(&f);
+        events(&f, &evl);
+        outputs_codec(&f, &log, b, codec, sizeof(codec));
+    }
+    CHECK(strcmp(codec, "avc1.64001f") == 0);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, b) == 1);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, NULL) == 0);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_ENDED) == 0);
+out:
+    pf_teardown(&f);
+    if (failures == before) printf("PASS: %s\n", row);
+}
+
+/* The audio has ended; then the video is replaced, and every selected track
+ * has ended once its END{REPLACED} is out, but ENDED waits: the video's
+ * selection is moving. The receiver goes terminal before the player takes
+ * the successor's ADDED: the moving selection is discarded with the rest of
+ * the player's track state. The successor is never selected nor offered,
+ * ENDED and CLOSED follow, and nothing is left behind. */
+static void test_player_terminal_before_added(moq_version_t ver)
+{
+    static char label[80];
+    snprintf(label, sizeof(label), "player_terminal_before_added_%s", vname(ver));
+    row = label;
+    unsigned before = failures;
+    static const char base[] = CATALOG02(LOC_VIDEO("video", "") ","
+                                         LOC_AUDIO("audio", "opus", ""));
+    static const char *const names[] = { "video", "audio" };
+    pf_t f;
+    REQUIRE(pf_setup(&f, ver, base, names, 2, NULL));
+    moq_media_track_t *a = pf_track(&f, "video"), *au = pf_track(&f, "audio");
+    REQUIRE(a && au);
+    REQUIRE(moq_media_player_select_track(f.p, a, NULL) == MOQ_OK);
+    REQUIRE(moq_media_player_select_track(f.p, au, NULL) == MOQ_OK);
+    cycles(&f, 16);
+    write_loc(&f, "video", 0, 0, true, 0, 0);
+    write_loc(&f, "audio", 0, 0, true, 0, 0);
+    ev_log_t evl = {0};
+    out_log_t log = {0};
+    for (unsigned i = 0; i < 8; i++) cycle_poll(&f, &evl, &log);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, a) == 1);
+    CHECK(moq_pub_end_track(f.pub, pf_pub(&f, "audio"), f.now) == MOQ_OK);
+    for (unsigned i = 0; i < 4 * (TAIL_US / 1000); i++) cycle_poll(&f, &evl, &log);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, au) == 1);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_ENDED) == 0);
+
+    moq_media_track_t *b = replace_split(&f, base, a, &evl, &log);
+    REQUIRE(b != NULL);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, a) == 1);
+    CHECK(pstats(&f).tracks_selected == 1);    /* the audio, ended */
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_ENDED) == 0);
+    moq_endpoint_test_set_stopped(f.ep);
+    for (unsigned i = 0; i < 8; i++) cycle_poll(&f, &evl, &log);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, NULL) == 2);
+    CHECK(count_ev_track(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_AVAILABLE, b) == 0);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, b) == 0);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_ENDED) == 1);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_CLOSED) == 1);
+    CHECK(moq_media_player_is_closed(f.p));
+    CHECK(pstats(&f).tracks_selected == 1);
+    CHECK(moq_media_player_select_track(f.p, b, NULL) == MOQ_ERR_WRONG_STATE);
+    CHECK(moq_media_player_tick(f.p, f.now) == MOQ_ERR_CLOSED);
+out:
+    pf_teardown(&f);
+    if (failures == before) printf("PASS: %s\n", row);
+}
+
+/* A plain removal on an MSF-02 catalog (a delta "remove") is unchanged: no
+ * TRACK_REPLACED; TRACK_REMOVED, then after the tail wait END{REMOVED,
+ * TAIL_CUTOFF}, and the track stays selected until deselected. */
+static void test_player_removed_plain(moq_version_t ver)
+{
+    static char label[64];
+    snprintf(label, sizeof(label), "player_removed_plain_%s", vname(ver));
+    row = label;
+    unsigned before = failures;
+    static const char base[] = CATALOG02(LOC_VIDEO("video", "") "," LOC_VIDEO("other", ""));
+    static const char remove[] = DELTA02(
+        "{\"op\":\"remove\",\"tracks\":[{\"name\":\"video\"}]}");
+    static const char *const names[] = { "video", "other" };
+    pf_t f;
+    REQUIRE(pf_setup(&f, ver, base, names, 2, NULL));
+    moq_media_track_t *a = pf_track(&f, "video");
+    REQUIRE(a != NULL);
+    REQUIRE(select_plain(&f, "video") == MOQ_OK);
+    cycles(&f, 16);
+    write_loc(&f, "video", 0, 0, true, 0, 0);
+    cycles(&f, 8);
+    write_catalog_delta(&f, 1, base, remove);
+    ev_log_t evl = {0};
+    out_log_t log = {0};
+    for (unsigned i = 0; i < 120; i++) cycle_poll(&f, &evl, &log);
+    CHECK(receiver_removed(&f, a));
+    CHECK(count_ev_track(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REMOVED, a) == 1);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED) == 0);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, a) == 1);
+    const moq_media_player_output_t *e = last_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END);
+    REQUIRE(e != NULL);
+    CHECK(e->u.end.cause == MOQ_MEDIA_PLAYER_END_REMOVED);
+    CHECK(e->u.end.disposition == MOQ_MEDIA_PLAYER_END_TAIL_CUTOFF);
+    CHECK(pstats(&f).tracks_selected == 1);
+    CHECK(moq_media_player_deselect_track(f.p, a) == MOQ_OK);
+out:
+    pf_teardown(&f);
+    if (failures == before) printf("PASS: %s\n", row);
+}
+
+/* An advisory MSF-02 change (a delta adding a bitrate) publishes a new
+ * description generation for the same handle and nothing else: playback
+ * continues on it, with no decoder reset, no TRACK_REPLACED, TRACK_REMOVED
+ * or END. */
+static void test_player_advisory_update(moq_version_t ver)
+{
+    static char label[64];
+    snprintf(label, sizeof(label), "player_advisory_update_%s", vname(ver));
+    row = label;
+    unsigned before = failures;
+    static const char base[] = CATALOG02(LOC_VIDEO("video", ""));
+    static const char advisory[] = DELTA02(
+        "{\"op\":\"update\",\"tracks\":[{\"parentName\":\"video\",\"bitrate\":2000}]}");
+    pf_t f;
+    REQUIRE(pf_setup(&f, ver, base, k_v, 1, NULL));
+    moq_media_track_t *a = pf_track(&f, "video");
+    REQUIRE(a != NULL);
+    REQUIRE(select_plain(&f, "video") == MOQ_OK);
+    cycles(&f, 16);
+    /* Group 0 on a subgroup that ends it, so its FIN closes the group. */
+    write_loc_eog(&f, "video", 0, 0, true, 0, 0, true);
+    write_loc_eog(&f, "video", 0, 1, false, 0, 0, true);
+    ev_log_t evl = {0};
+    out_log_t log = {0};
+    for (unsigned i = 0; i < 8; i++) cycle_poll(&f, &evl, &log);
+    write_catalog_delta(&f, 1, base, advisory);
+    const moq_media_track_desc_t *d = NULL;
+    for (unsigned i = 0; i < 64; i++) {
+        d = moq_media_track_desc_get(a);
+        if (d && d->config_generation == 1) break;
+        cycle_poll(&f, &evl, &log);
+    }
+    /* Non-vacuity: the receiver adopted the change on the same handle. */
+    REQUIRE(d != NULL && d->config_generation == 1);
+    CHECK(d->has_bitrate && d->bitrate == 2000);
+    CHECK(!receiver_removed(&f, a));
+    write_loc_eog(&f, "video", 0, 2, false, 0, 0, true);
+    end_group(&f, "video");
+    write_loc_eog(&f, "video", 1, 0, true, 0, 0, true);
+    for (unsigned i = 0; i < 16; i++) cycle_poll(&f, &evl, &log);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, a) == 4);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_CONFIGURE, a) == 1);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_DISCONTINUITY, a) == 0);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, NULL) == 0);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED) == 0);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REMOVED) == 0);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_ENDED) == 0);
+    CHECK(pstats(&f).tracks_selected == 1);
+out:
+    pf_teardown(&f);
+    if (failures == before) printf("PASS: %s\n", row);
+}
+
+/* A track whose catalog entry declares an encryptionScheme is not played
+ * (the player plays clear media only), on either catalog revision:
+ * selecting it is MOQ_ERR_UNSUPPORTED, and AUTO passes over it to the clear
+ * track listed after it. The receiver still describes it, with the scheme
+ * on its supplement record. */
+static void test_player_refuses_encrypted(moq_version_t ver, bool r02)
+{
+    static char label[80];
+    snprintf(label, sizeof(label), "player_refuses_encrypted_%s_%s",
+             r02 ? "msf02" : "msf01", vname(ver));
+    row = label;
+    unsigned before = failures;
+#define ENC_TRACKS \
+    LOC_VIDEO("secret", ",\"encryptionScheme\":\"moq-secure-objects\"") "," \
+    LOC_VIDEO("clear", "")
+    static const char cat01[] = CATALOG(ENC_TRACKS);
+    static const char cat02[] = CATALOG02(ENC_TRACKS);
+#undef ENC_TRACKS
+    static const char *const names[] = { "secret", "clear" };
+    const char *cat = r02 ? cat02 : cat01;
+    pf_t f;
+    REQUIRE(pf_setup(&f, ver, cat, names, 2, NULL));
+    moq_media_track_t *secret = pf_track(&f, "secret"), *clear = pf_track(&f, "clear");
+    REQUIRE(secret && clear);
+    const moq_media_track_desc_t *d = moq_media_track_desc_get(secret);
+    REQUIRE(d != NULL);
+    const moq_msf_track_supplement_t *sup =
+        moq_msf_ext_supplement(d->extensions, d->extension_count);
+    CHECK(sup && sup->has_encryption_scheme);
+    CHECK(moq_media_player_select_track(f.p, secret, NULL) == MOQ_ERR_UNSUPPORTED);
+    CHECK(pstats(&f).tracks_selected == 0);
+    CHECK(moq_media_player_select_track(f.p, clear, NULL) == MOQ_OK);
+    pf_teardown(&f);
+    memset(&f, 0, sizeof(f));
+
+    /* AUTO: no render groups, so one video track, the first it can play. */
+    pf_opts_t o = { .selection = MOQ_MEDIA_SELECTION_AUTO };
+    REQUIRE(pf_setup(&f, ver, cat, names, 2, &o));
+    learn_all(&f);
+    secret = pf_track(&f, "secret");
+    clear = pf_track(&f, "clear");
+    REQUIRE(secret && clear);
+    CHECK(pstats(&f).tracks_selected == 1);
+    CHECK(moq_media_player_select_track(f.p, clear, NULL) == MOQ_ERR_WRONG_STATE);
+    CHECK(moq_media_player_deselect_track(f.p, secret) == MOQ_ERR_INVAL);
+    CHECK(pstats(&f).selections_failed == 0);
+out:
+    pf_teardown(&f);
+    if (failures == before) printf("PASS: %s\n", row);
+}
+
+/* Two replacements before the player looks (A by B, then B by C, in one
+ * catalog group): the selection moves along the chain to the newest handle,
+ * C, which plays; B is reported replaced too and is never selected. */
+static void test_player_replacement_chain(moq_version_t ver)
+{
+    static char label[80];
+    snprintf(label, sizeof(label), "player_replacement_chain_%s", vname(ver));
+    row = label;
+    unsigned before = failures;
+    static const char base[] = CATALOG02(LOC_VIDEO("video", ""));
+    static const char second[] = "{\"generatedAt\":3,\"deltaUpdate\":["
+        "{\"op\":\"update\",\"tracks\":[{\"parentName\":\"video\","
+        "\"codec\":\"avc1.640028\"}]}]}";
+    pf_t f;
+    REQUIRE(pf_setup(&f, ver, base, k_v, 1, NULL));
+    moq_media_track_t *a = pf_track(&f, "video");
+    REQUIRE(a != NULL);
+    REQUIRE(select_plain(&f, "video") == MOQ_OK);
+    cycles(&f, 16);
+    write_loc(&f, "video", 0, 0, true, 0, 0);
+    ev_log_t evl = {0};
+    out_log_t log = {0};
+    for (unsigned i = 0; i < 8; i++) cycle_poll(&f, &evl, &log);
+    /* Group 1: the base, the first change, then the second, all taken in
+     * by the receiver before the player's next tick. */
+    const char *const json[] = { base, k_delta_codec, second };
+    for (uint64_t i = 0; i < 3; i++) {
+        moq_rcbuf_t *pay = NULL;
+        moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)json[i], strlen(json[i]),
+                         &pay);
+        moq_pub_object_cfg_t oc;
+        moq_pub_object_cfg_init_sized(&oc, sizeof(oc));
+        oc.group_id = 1;
+        oc.object_id = i;
+        oc.payload = pay;
+        oc.end_of_group = true;
+        CHECK(moq_pub_write_object_ex(f.pub, f.catalog, &oc, f.now) == MOQ_OK);
+        moq_rcbuf_decref(pay);
+    }
+    CHECK(moq_pub_end_group(f.pub, f.catalog, f.now) == MOQ_OK);
+    /* Both committed: three handles, the first removed. */
+    bool both = false;
+    for (unsigned i = 0; i < 64 && !both; i++) {
+        net_step(&f);
+        both = receiver_removed(&f, a) && moq_media_receiver_test_track_count(f.r) == 3;
+    }
+    REQUIRE(both);
+    CHECK(moq_media_player_tick(f.p, f.now) == MOQ_OK);
+    events(&f, &evl);
+    outputs(&f, &log);
+    const moq_media_player_event_t *r1 = find_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED, a);
+    REQUIRE(r1 != NULL);
+    moq_media_track_t *b = r1->u.replaced.replacement;
+    REQUIRE(b != NULL);
+    const moq_media_player_event_t *r2 = find_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED, b);
+    REQUIRE(r2 != NULL);
+    moq_media_track_t *c = r2->u.replaced.replacement;
+    REQUIRE(c != NULL && c != a && c != b);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED) == 2);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, a) == 1);
+    CHECK(pstats(&f).tracks_selected == 1);
+    CHECK(moq_media_player_select_track(f.p, c, NULL) == MOQ_ERR_WRONG_STATE);
+    CHECK(moq_media_player_deselect_track(f.p, b) == MOQ_ERR_INVAL);
+    CHECK(count_ev_track(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_AVAILABLE, b) == 0);
+    CHECK(count_ev_track(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_AVAILABLE, c) == 0);
+    REQUIRE(until_active(&f, c, &evl, &log));
+    write_loc(&f, "video", 1, 0, true, 0, 0);
+    char codec[32] = "";
+    for (unsigned i = 0; i < 16; i++) {
+        (void)cycle(&f);
+        events(&f, &evl);
+        outputs_codec(&f, &log, c, codec, sizeof(codec));
+    }
+    CHECK(strcmp(codec, "avc1.640028") == 0);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, c) == 1);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_ENDED) == 0);
+out:
+    pf_teardown(&f);
+    if (failures == before) printf("PASS: %s\n", row);
+}
+
+/* A successor the player does not play (the change adds an encryptionScheme):
+ * the old track still ends REPLACED, the new handle is offered as
+ * TRACK_AVAILABLE instead of selected, and the selection the receiver moved
+ * to it is withdrawn, so it is not subscribed. */
+static void test_player_replacement_refused(moq_version_t ver)
+{
+    static char label[80];
+    snprintf(label, sizeof(label), "player_replacement_refused_%s", vname(ver));
+    row = label;
+    unsigned before = failures;
+    static const char base[] = CATALOG02(LOC_VIDEO("video", ""));
+    static const char encrypt[] = DELTA02(
+        "{\"op\":\"update\",\"tracks\":[{\"parentName\":\"video\","
+        "\"encryptionScheme\":\"moq-secure-objects\"}]}");
+    pf_t f;
+    REQUIRE(pf_setup(&f, ver, base, k_v, 1, NULL));
+    moq_media_track_t *a = pf_track(&f, "video");
+    REQUIRE(a != NULL);
+    REQUIRE(select_plain(&f, "video") == MOQ_OK);
+    cycles(&f, 16);
+    write_loc(&f, "video", 0, 0, true, 0, 0);
+    ev_log_t evl = {0};
+    out_log_t log = {0};
+    for (unsigned i = 0; i < 8; i++) cycle_poll(&f, &evl, &log);
+    write_catalog_delta(&f, 1, base, encrypt);
+    for (unsigned i = 0; i < 64 && !receiver_removed(&f, a); i++) cycle_poll(&f, &evl, &log);
+    REQUIRE(receiver_removed(&f, a));
+    for (unsigned i = 0; i < 16; i++) cycle_poll(&f, &evl, &log);
+    const moq_media_player_event_t *rp = find_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED, a);
+    REQUIRE(rp != NULL);
+    moq_media_track_t *b = rp->u.replaced.replacement;
+    REQUIRE(b != NULL);
+    const moq_media_player_output_t *e = last_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END);
+    REQUIRE(e != NULL);
+    CHECK(e->track == a && e->u.end.cause == MOQ_MEDIA_PLAYER_END_REPLACED);
+    CHECK(count_ev_track(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_AVAILABLE, b) == 1);
+    CHECK(pstats(&f).tracks_selected == 0);
+    /* Not wanted at the receiver: never subscribed, or paused. */
+    moq_media_track_state_t s;
+    CHECK(moq_media_receiver_track_state(f.r, b, &s) == MOQ_OK &&
+          (s == MOQ_MEDIA_TRACK_STATE_DISCOVERED || s == MOQ_MEDIA_TRACK_STATE_PAUSED_APP));
+    CHECK(moq_media_player_select_track(f.p, b, NULL) == MOQ_ERR_UNSUPPORTED);
+out:
+    pf_teardown(&f);
+    if (failures == before) printf("PASS: %s\n", row);
+}
+
+/* A track whose END is already out when it is replaced has no selection
+ * left to move: TRACK_REPLACED, no second END, the old handle released, and
+ * the new handle offered as TRACK_AVAILABLE, with the selection the
+ * receiver moved to it withdrawn. */
+static void test_player_replacement_after_end(moq_version_t ver)
+{
+    static char label[80];
+    snprintf(label, sizeof(label), "player_replacement_after_end_%s", vname(ver));
+    row = label;
+    unsigned before = failures;
+    static const char base[] = CATALOG02(LOC_VIDEO("video", ""));
+    pf_t f;
+    REQUIRE(pf_setup(&f, ver, base, k_v, 1, NULL));
+    moq_media_track_t *a = pf_track(&f, "video");
+    REQUIRE(a != NULL);
+    REQUIRE(select_plain(&f, "video") == MOQ_OK);
+    cycles(&f, 16);
+    write_loc_eog(&f, "video", 0, 0, true, 0, 0, true);
+    end_group(&f, "video");
+    cycles(&f, 8);
+    /* Its END_OF_TRACK, with its subscription still live at the receiver
+     * and the publisher's track still open: only the player can make the
+     * new handle unwanted. */
+    CHECK(moq_media_receiver_test_end_of_track(f.r, a, 1, 0));
+    ev_log_t evl = {0};
+    out_log_t log = {0};
+    for (unsigned i = 0; i < 4 * (TAIL_US / 1000); i++) cycle_poll(&f, &evl, &log);
+    REQUIRE(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, a) == 1);
+    CHECK(pstats(&f).tracks_selected == 1);
+    write_catalog_delta(&f, 1, base, k_delta_codec);
+    for (unsigned i = 0; i < 64 && !receiver_removed(&f, a); i++) cycle_poll(&f, &evl, &log);
+    REQUIRE(receiver_removed(&f, a));
+    for (unsigned i = 0; i < 16; i++) cycle_poll(&f, &evl, &log);
+    const moq_media_player_event_t *rp = find_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED, a);
+    REQUIRE(rp != NULL);
+    moq_media_track_t *b = rp->u.replaced.replacement;
+    REQUIRE(b != NULL);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, a) == 1);
+    CHECK(pstats(&f).tracks_selected == 0);
+    CHECK(moq_media_player_deselect_track(f.p, a) == MOQ_ERR_INVAL);
+    CHECK(count_ev_track(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_AVAILABLE, b) == 1);
+    moq_media_track_state_t s = (moq_media_track_state_t)0;
+    moq_result_t src = moq_media_receiver_track_state(f.r, b, &s);
+    CHECK(src == MOQ_OK &&
+          (s == MOQ_MEDIA_TRACK_STATE_DISCOVERED || s == MOQ_MEDIA_TRACK_STATE_PAUSED_APP));
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_ENDED) == 1);
+    if (failures != before)
+        fprintf(stderr, "  %s: new handle state rc=%d state=%d\n", row, (int)src, (int)s);
+out:
+    pf_teardown(&f);
+    if (failures == before) printf("PASS: %s\n", row);
+}
+
+/* The old handle deselected after TRACK_REPLACED, while its END is still
+ * held back (no output room): the deselection ends nothing of the new
+ * handle, which the receiver would otherwise be told to unsubscribe (it
+ * acts on the successor for a replaced handle). No END follows for the old
+ * handle, and the new one plays. */
+static void test_player_replacement_deselect_old(moq_version_t ver)
+{
+    static char label[80];
+    snprintf(label, sizeof(label), "player_replacement_deselect_old_%s", vname(ver));
+    row = label;
+    unsigned before = failures;
+    static const char base[] = CATALOG02(LOC_VIDEO("video", ""));
+    pf_opts_t o = { .max_outputs = 2 };
+    pf_t f;
+    REQUIRE(pf_setup(&f, ver, base, k_v, 1, &o));
+    moq_media_track_t *a = pf_track(&f, "video");
+    REQUIRE(a != NULL);
+    REQUIRE(select_plain(&f, "video") == MOQ_OK);
+    cycles(&f, 16);
+    /* TIMELINE, CONFIGURE and a unit: more than the two output slots. */
+    write_loc(&f, "video", 0, 0, true, 0, 0);
+    ev_log_t evl = {0};
+    for (unsigned i = 0; i < 8; i++) {
+        (void)cycle(&f);
+        events(&f, &evl);
+    }
+    write_catalog_delta(&f, 1, base, k_delta_codec);
+    for (unsigned i = 0; i < 64 && !receiver_removed(&f, a); i++) {
+        (void)cycle(&f);
+        events(&f, &evl);
+    }
+    REQUIRE(receiver_removed(&f, a));
+    (void)cycle(&f);
+    events(&f, &evl);
+    const moq_media_player_event_t *rp = find_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED, a);
+    REQUIRE(rp != NULL);
+    moq_media_track_t *b = rp->u.replaced.replacement;
+    REQUIRE(b != NULL);
+    /* Still selected: its END has had no room. */
+    CHECK(pstats(&f).tracks_selected == 2);
+    CHECK(moq_media_player_deselect_track(f.p, a) == MOQ_OK);
+    CHECK(moq_media_player_deselect_track(f.p, a) == MOQ_ERR_INVAL);
+    CHECK(pstats(&f).tracks_selected == 1);
+    out_log_t log = {0};
+    outputs(&f, &log);
+    REQUIRE(until_active(&f, b, &evl, &log));
+    write_loc(&f, "video", 1, 0, true, 0, 0);
+    for (unsigned i = 0; i < 16; i++) cycle_poll(&f, &evl, &log);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_END, a) == 0);
+    CHECK(count_out(&log, MOQ_MEDIA_PLAYER_OUTPUT_UNIT, b) == 1);
+    CHECK(count_ev(&evl, MOQ_MEDIA_PLAYER_EVENT_ENDED) == 0);
+out:
+    pf_teardown(&f);
+    if (failures == before) printf("PASS: %s\n", row);
+}
+
 int main(void)
 {
     const moq_version_t vers[] = { MOQ_VERSION_DRAFT_16, MOQ_VERSION_DRAFT_18,
@@ -4471,6 +5220,17 @@ int main(void)
         test_fill_failure_keeps_parent(vers[i], true);
         test_fill_failure_keeps_parent(vers[i], false);
         test_paused_keeps_other_timer(vers[i]);
+        test_player_replacement(vers[i]);
+        test_player_replacement_chain(vers[i]);
+        test_player_replacement_refused(vers[i]);
+        test_player_replacement_after_end(vers[i]);
+        test_player_replacement_deselect_old(vers[i]);
+        test_player_lone_removed(vers[i]);
+        test_player_terminal_before_added(vers[i]);
+        test_player_removed_plain(vers[i]);
+        test_player_advisory_update(vers[i]);
+        test_player_refuses_encrypted(vers[i], false);
+        test_player_refuses_encrypted(vers[i], true);
     }
     test_refusal_recorded();
     test_queue_bounds();

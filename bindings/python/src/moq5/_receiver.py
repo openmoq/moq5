@@ -26,6 +26,7 @@ from ._values import (
     FillErrorDomain,
     FillReason,
     FillTerminal,
+    InitSource,
     LocationFilter,
     LocMetadata,
     MediaMetadata,
@@ -33,6 +34,7 @@ from ._values import (
     MediaTemplate,
     MediaTimeDomain,
     MediaType,
+    MsfRevision,
     ObjectStatus,
     Packaging,
     ParseDrop,
@@ -120,6 +122,13 @@ def _description(d: dict) -> TrackDescription:
         depends=d["depends"],
         template=template,
         vod=VodState(d["is_live"], d["track_duration_ms"]),
+        config_generation=d["config_generation"],
+        init_source=None if d["init_source"] is None else _known_or_int(InitSource, d["init_source"]),
+        init_property_type=d["init_property_type"],
+        encryption_scheme=d["encryption_scheme"],
+        cipher_suite=d["cipher_suite"],
+        key_id=d["key_id"],
+        track_base_key=d["track_base_key"],
     )
 
 
@@ -195,7 +204,17 @@ class Receiver:
 
     def stats(self) -> ReceiverStats:
         """Copy the stats snapshot; appended fields are None when not stamped."""
-        return ReceiverStats(*_call(_native.receiver_stats, self.__handle))
+        *legacy, block = _call(_native.receiver_stats, self.__handle)
+        if block is None:
+            return ReceiverStats(*legacy)
+        (revision, decompressed, failures, limited, refused, conflicts, ignored, headers, gaps,
+         forced) = block
+        return ReceiverStats(
+            *legacy, catalog_revision=_known_or_int(MsfRevision, revision),
+            objects_decompressed=decompressed, decompress_failures=failures,
+            decompress_limited=limited, compression_refused=refused,
+            compression_conflicts=conflicts, compression_ignored=ignored,
+            event_timeline_headers_ignored=headers, loc_order_gaps=gaps, loc_order_forced=forced)
 
     def wait(self, timeout_us: int) -> WaitResult:
         """Wait for pollable work, a wake, terminal, or the timeout, sliced
@@ -299,7 +318,7 @@ class Receiver:
                 self.__closed[0] = True
             return outcome
         (kind, capsule, desc, largest, expires_ms, drop, local_result, fill, origin, delivery_id,
-         created_id) = result
+         created_id, config_generation, replaces_capsule, replaced_by_capsule) = result
         # Convert everything BEFORE publishing anything: no half-updated
         # Track or cache survives a failure below.
         description = None if desc is None else _description(desc)
@@ -314,22 +333,33 @@ class Receiver:
                 None if fill["reason"] is None else _known_or_int(FillReason, fill["reason"]),
                 None if fill["error_domain"] is None else _known_or_int(FillErrorDomain, fill["error_domain"]),
                 fill["error_code"])
-        track = None
-        publish = None
-        if capsule is not None:
-            key = _call(_native.track_key, capsule)
-            track = self.__tracks.get(key)
-            if track is None:
-                track = Track(self, capsule, key)
-                publish = key
+        # Every handle the event names (its track and an MSF-02 replacement's
+        # other track) resolves to the cached Track; new ones are published
+        # together after the event converted.
+        publish: dict[int, Track] = {}
+
+        def resolve(handle: object) -> Track | None:
+            if handle is None:
+                return None
+            key = _call(_native.track_key, handle)
+            known = self.__tracks.get(key) or publish.get(key)
+            if known is None:
+                known = Track(self, handle, key)
+                publish[key] = known
+            return known
+
+        track = resolve(capsule)
+        replaces = resolve(replaces_capsule)
+        replaced_by = resolve(replaced_by_capsule)
         event = TrackEvent(_known_or_int(TrackEventKind, kind), track, description,
                            None if largest is None else (largest[0], largest[1]), expires_ms, parse_drop,
                            local_result=local_result, fill_terminal=fill_terminal,
                            delivery_origin=None if origin is None else _known_or_int(DeliveryOrigin, origin),
                            delivery_initiating_request_id=delivery_id,
-                           fill_created_id=created_id)
-        if publish is not None:
-            self.__tracks[publish] = track
+                           fill_created_id=created_id, config_generation=config_generation,
+                           replaces=replaces, replaced_by=replaced_by)
+        for key, new in publish.items():
+            self.__tracks[key] = new
         if track is not None:
             track._description = description
         return event

@@ -3,7 +3,8 @@
 //! attaches, selection and its ownership check, progress and waiting as the
 //! library reports them, outputs that own their references until dropped and
 //! are refused (and released) outside the frozen layout, events with every
-//! detail, feedback, the stamped statistics, and the order of teardown.
+//! detail, a replacement's event and end, feedback, the stamped statistics,
+//! and the order of teardown.
 
 #![cfg(feature = "player")]
 
@@ -778,6 +779,62 @@ fn events_are_plain_values_with_every_detail() {
     s.set("poll_event_stamp", 0);
     s.set("poll_event_result", i64::from(sys::MOQ_ERR_CLOSED));
     assert_eq!(player.poll_event().err(), Some(Error::CLOSED));
+}
+
+/// A replaced track: the event names the replacement, a handle of the
+/// player's receiver that selection then takes, and the old track's end
+/// carries its own cause.
+#[test]
+fn a_replacement_names_its_successor_and_ends_the_old_track() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let player = player(&s, &endpoint);
+    let old = track(&player, 1);
+    let mut replaced = sys::moq_media_player_event_t {
+        kind: sys::MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED,
+        track: raw_track(&player, 1),
+        ..Default::default()
+    };
+    replaced.u.replaced.replacement = raw_track(&player, 2);
+    // SAFETY: only the size of the union's member is taken.
+    replaced.detail_size = unsafe { std::mem::size_of_val(&replaced.u.replaced) } as u32;
+    push_event(replaced);
+    let mut end = output(&player, sys::MOQ_MEDIA_PLAYER_OUTPUT_END);
+    end.u.end.cause = sys::MOQ_MEDIA_PLAYER_END_REPLACED;
+    end.u.end.disposition = sys::MOQ_MEDIA_PLAYER_END_IMMEDIATE;
+    push_output(end);
+
+    let event = player
+        .poll_event()
+        .expect("poll_event on a live player")
+        .expect("the pushed event is pollable");
+    assert_eq!(event.track, Some(old));
+    let PlayerEventKind::TrackReplaced { replacement } = event.kind else {
+        panic!("a TrackReplaced event: {:?}", event.kind);
+    };
+    assert_eq!(replacement.as_ptr(), raw_track(&player, 2));
+    s.take_log();
+    assert_eq!(player.select_track(replacement, None), Ok(()));
+    assert_eq!(s.take_log(), ["select track=2 config=none"]);
+    let out = player
+        .poll_output()
+        .expect("poll_output on a live player")
+        .expect("the pushed output is pollable");
+    assert_eq!(out.track(), Some(old));
+    match out.detail() {
+        OutputDetail::End(detail) => {
+            assert_eq!(detail.cause, EndCause::Replaced);
+            assert_eq!(detail.disposition, EndDisposition::Immediate);
+        }
+        other => panic!("an end: {other:?}"),
+    }
+    drop(out);
+
+    // A replacement whose detail is short of the handle is refused.
+    let mut short = replaced;
+    short.detail_size -= 1;
+    push_event(short);
+    assert_eq!(player.poll_event().err(), Some(Error::ABI_MISMATCH));
 }
 
 #[test]

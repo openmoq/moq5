@@ -99,6 +99,23 @@ typedef struct {
     /* The receiver reported a normal end of the track (its END_OF_TRACK,
      * or a normal or statusless done). */
     bool                  peer_ended;
+    /* The selection's choices, which a replacement moves to the new
+     * handle. */
+    uint32_t              sel_start;     /* moq_media_start_mode_t */
+    bool                  sel_independent;
+    bool                  sel_shared_epoch;
+    /* The receiver replaced the handle (TRACK_REMOVED with replaced_by).
+     * It acts on the successor for every command on a replaced handle, so
+     * this one is never unsubscribed; its slot is released once its END is
+     * out. */
+    bool                  replaced;
+    /* A selection moving to a new handle: transfer_to takes the choices
+     * above once the receiver has announced it (transfer_announced). The
+     * replaced track's slot keeps it, and keeps it alone once that track is
+     * released: the slot is then reserved (not used) until the transfer
+     * ends, so there are never more transfers than slots. */
+    moq_media_track_t    *transfer_to;
+    bool                  transfer_announced;
 } player_track_t;
 
 /* The object held for the engine. */
@@ -171,6 +188,11 @@ struct moq_media_player {
     bool     ended_reported, closed_reported;
 
     moq_media_player_stats_t stats;
+#ifdef MOQ_MEDIA_PLAYER_TESTING
+    /* Take no track event after the next replacement's TRACK_REMOVED this
+     * tick, so its successor's TRACK_ADDED waits for a later one. */
+    bool test_split_replacement;
+#endif
 };
 
 static void *player_calloc(const moq_alloc_t *a, size_t count, size_t size);
@@ -357,6 +379,12 @@ moq_playback_t *moq_media_player_test_engine(const moq_media_player_t *p)
 {
     return p ? p->pb : NULL;
 }
+
+void moq_media_player_test_split_replacement(moq_media_player_t *p);
+void moq_media_player_test_split_replacement(moq_media_player_t *p)
+{
+    if (p) p->test_split_replacement = true;
+}
 #endif
 
 void moq_media_player_output_cleanup(moq_media_player_output_t *out)
@@ -408,12 +436,27 @@ static bool span_is(moq_bytes_t b, const char *lit)
     return b.len == n && (n == 0 || memcmp(b.data, lit, n) == 0);
 }
 
+/* Whether the catalog entry declares an encryptionScheme (MSF 4.4.1): its
+ * payload is encrypted, and the player plays clear media only. Read from the
+ * description's supplement record, where the description carries one. */
+static bool track_encrypted(const moq_media_track_desc_t *d)
+{
+    if (d->struct_size < offsetof(moq_media_track_desc_t, extension_count) +
+                         sizeof(d->extension_count))
+        return false;
+    const moq_msf_track_supplement_t *sup =
+        moq_msf_ext_supplement(d->extensions, d->extension_count);
+    return sup && sup->struct_size >= MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE &&
+           sup->has_encryption_scheme;
+}
+
 /* What this release plays, judged from the catalog alone. */
 static moq_result_t track_supported(const moq_media_player_t *p,
                                     const moq_media_track_desc_t *d,
                                     bool *requires_config)
 {
     *requires_config = false;
+    if (track_encrypted(d)) return MOQ_ERR_UNSUPPORTED;
     if (d->info.packaging != MOQ_MEDIA_PACKAGING_RAW ||
         !(span_is(d->packaging, "loc") || span_is(d->packaging, "")))
         return MOQ_ERR_UNSUPPORTED;
@@ -531,9 +574,12 @@ static moq_result_t player_select(moq_media_player_t *p, moq_media_track_t *trac
     rc = track_supported(p, &d, &requires_config);
     if (rc != MOQ_OK) return rc;
 
+    /* A slot kept for a selection moving to this very handle is its own. */
     uint32_t slot = UINT32_MAX;
     for (uint32_t i = 0; i < p->max_tracks && slot == UINT32_MAX; i++)
-        if (!p->tracks[i].used) slot = i;
+        if (!p->tracks[i].used &&
+            (!p->tracks[i].transfer_to || p->tracks[i].transfer_to == track))
+            slot = i;
     if (slot == UINT32_MAX) return MOQ_ERR_LIMIT;
 
     uint32_t domain = track_domain(p, &d);
@@ -575,6 +621,17 @@ static moq_result_t player_select(moq_media_player_t *p, moq_media_track_t *trac
         return rc;
     }
 
+    /* Selected: a selection that was moving to it has arrived. */
+    for (uint32_t i = 0; i < p->max_tracks; i++) {
+        player_track_t *x = &p->tracks[i];
+        if (x->transfer_to != track) continue;
+        if (!x->used) {
+            memset(x, 0, sizeof(*x));
+        } else {
+            x->transfer_to = NULL;
+            x->transfer_announced = false;
+        }
+    }
     player_track_t *t = &p->tracks[slot];
     memset(t, 0, sizeof(*t));
     t->used = true;
@@ -587,6 +644,9 @@ static moq_result_t player_select(moq_media_player_t *p, moq_media_track_t *trac
     t->timescale = d.info.timescale;
     t->requires_config = requires_config;
     t->config_seen = !requires_config;
+    t->sel_start = sc->start;
+    t->sel_independent = sc->independent_timing;
+    t->sel_shared_epoch = sc->shared_epoch;
     p->timelines[tl].members++;
     p->stats.tracks_selected++;
     return MOQ_OK;
@@ -621,6 +681,10 @@ static void held_drop(moq_media_player_t *p)
     p->has_held = false;
 }
 
+/* Release a selected track's slot. `unsubscribe`: the track's subscription
+ * ends too. A replaced handle is never unsubscribed, since the receiver
+ * would act on its successor; a selection still moving there is withdrawn
+ * from it instead. */
 static void track_release(moq_media_player_t *p, uint32_t index, bool unsubscribe)
 {
     player_track_t *t = &p->tracks[index];
@@ -628,7 +692,10 @@ static void track_release(moq_media_player_t *p, uint32_t index, bool unsubscrib
     if (p->has_held_refusal && p->held_refusal.track == index) p->has_held_refusal = false;
     staged_drop(p, t);
     if (t->eng_live) (void)moq_playback_remove_track(p->pb, t->eng);
-    if (unsubscribe) (void)moq_media_receiver_unsubscribe_track(p->r, t->track);
+    if (unsubscribe && !t->replaced)
+        (void)moq_media_receiver_unsubscribe_track(p->r, t->track);
+    if (unsubscribe && t->transfer_to)
+        (void)moq_media_receiver_unsubscribe_track(p->r, t->transfer_to);
     timeline_leave(p, t->timeline);
     memset(t, 0, sizeof(*t));
     if (p->stats.tracks_selected > 0) p->stats.tracks_selected--;
@@ -642,6 +709,111 @@ moq_result_t moq_media_player_deselect_track(moq_media_player_t *p,
     if (!track_of(p, track, &index)) return MOQ_ERR_INVAL;
     track_release(p, index, true);
     return MOQ_OK;
+}
+
+/* -- Replacement ------------------------------------------------------------ */
+
+/* The slot whose selection is moving to `track`, or NULL. */
+static player_track_t *transfer_of(moq_media_player_t *p, const moq_media_track_t *track)
+{
+    for (uint32_t i = 0; i < p->max_tracks; i++)
+        if (p->tracks[i].transfer_to == track) return &p->tracks[i];
+    return NULL;
+}
+
+static bool transfers_pending(const moq_media_player_t *p)
+{
+    for (uint32_t i = 0; i < p->max_tracks; i++)
+        if (p->tracks[i].transfer_to) return true;
+    return false;
+}
+
+/* End a transfer short of its handle; a reserved slot is free again.
+ * `withdraw`: the receiver moved the old selection to that handle, which
+ * the player does not play, so that selection is unsubscribed (the
+ * receiver acts on the newest handle of a replacement chain). A transfer
+ * holds no references, so there is nothing else to release. */
+static void transfer_end(moq_media_player_t *p, player_track_t *x, bool withdraw)
+{
+    if (withdraw) (void)moq_media_receiver_unsubscribe_track(p->r, x->transfer_to);
+    if (!x->used) {
+        memset(x, 0, sizeof(*x));
+        return;
+    }
+    x->transfer_to = NULL;
+    x->transfer_announced = false;
+}
+
+static void announce_available(moq_media_player_t *p, moq_media_track_t *track);
+
+/* Select an announced successor with the old selection's choices. Selection
+ * ends the transfer. No free slot (MOQ_ERR_LIMIT) keeps it: the replaced
+ * track's slot is released, and reserved for it, once that track's END is
+ * out. A successor the receiver has itself removed since keeps it too, not
+ * announced: that removal follows in the receiver's queue and either names
+ * the next successor or ends the transfer. Any other refusal ends it: the
+ * successor is offered like any new track, and the selection the receiver
+ * moved to it is withdrawn. */
+static void transfer_try(moq_media_player_t *p, player_track_t *x)
+{
+    moq_media_track_t *to = x->transfer_to;
+    moq_media_player_select_cfg_t sc;
+    moq_media_player_select_cfg_init(&sc);
+    sc.start = x->sel_start;
+    sc.independent_timing = x->sel_independent;
+    sc.shared_epoch = x->sel_shared_epoch;
+    moq_result_t rc = player_select(p, to, &sc);
+    if (rc == MOQ_OK || rc == MOQ_ERR_LIMIT) return;
+    moq_media_track_state_t state;
+    if (moq_media_receiver_track_state(p->r, to, &state) == MOQ_ERR_WRONG_STATE) {
+        x->transfer_announced = false;
+        return;
+    }
+    transfer_end(p, x, true);
+    if (p->catalog_ready && !p->auto_pending) announce_available(p, to);
+}
+
+/* Once a tick's track events are taken: a terminal receiver discards every
+ * transfer, with the rest of the player's track state; otherwise each
+ * announced one is tried. */
+static void transfers_run(moq_media_player_t *p)
+{
+    for (uint32_t i = 0; i < p->max_tracks; i++) {
+        player_track_t *x = &p->tracks[i];
+        if (!x->transfer_to) continue;
+        if (p->receiver_terminal) transfer_end(p, x, false);
+        else if (x->transfer_announced) transfer_try(p, x);
+    }
+}
+
+/* A transfer tick can make now: an announced one with a slot to take (its
+ * own reserved slot, or a free one). */
+static bool transfer_due(const moq_media_player_t *p)
+{
+    bool free_slot = false;
+    for (uint32_t i = 0; i < p->max_tracks; i++)
+        if (!p->tracks[i].used && !p->tracks[i].transfer_to) free_slot = true;
+    for (uint32_t i = 0; i < p->max_tracks; i++) {
+        const player_track_t *x = &p->tracks[i];
+        if (x->transfer_to && x->transfer_announced && (!x->used || free_slot))
+            return true;
+    }
+    return false;
+}
+
+/* A replaced track whose END is out can never play again: its slot is
+ * released, and stays reserved while its selection is still moving. */
+static void track_retire(moq_media_player_t *p, uint32_t index)
+{
+    player_track_t *t = &p->tracks[index];
+    player_track_t keep = *t;
+    track_release(p, index, false);
+    if (!keep.transfer_to) return;
+    t->transfer_to = keep.transfer_to;
+    t->transfer_announced = keep.transfer_announced;
+    t->sel_start = keep.sel_start;
+    t->sel_independent = keep.sel_independent;
+    t->sel_shared_epoch = keep.sel_shared_epoch;
 }
 
 /* -- AUTO selection ------------------------------------------------------- */
@@ -799,11 +971,15 @@ static moq_result_t auto_select(moq_media_player_t *p)
 
 /* -- Terminal processing -------------------------------------------------- */
 
+/* No wait is possible. A replaced handle's queue was purged at the
+ * replacement and its late Objects are dropped, so nothing more can come
+ * for it. */
 static bool cause_immediate(uint32_t cause)
 {
     return cause == MOQ_MEDIA_PLAYER_END_LOCAL_FAILURE ||
            cause == MOQ_MEDIA_PLAYER_END_CLOSED ||
-           cause == MOQ_MEDIA_PLAYER_END_FATAL;
+           cause == MOQ_MEDIA_PLAYER_END_FATAL ||
+           cause == MOQ_MEDIA_PLAYER_END_REPLACED;
 }
 
 static void settle_reports(moq_media_player_t *p);
@@ -1264,6 +1440,37 @@ static void catalog_settle(moq_media_player_t *p)
     ev_push(p, &ready);
 }
 
+/* The receiver replaced `track` by `succ` (an MSF-02 critical change), which
+ * TRACK_REPLACED reports in place of TRACK_REMOVED; the REMOVED alone names
+ * the successor, so nothing waits for its ADDED. A selection moving to
+ * `track` (x) moves on to `succ`. A selected track still playing (t) ends
+ * REPLACED at once and its selection moves to `succ`. One whose END is
+ * already out has no selection left to move: it is released, and the
+ * selection the receiver moved with the handle is withdrawn. */
+static void track_replaced(moq_media_player_t *p, moq_media_track_t *track,
+                           player_track_t *t, player_track_t *x,
+                           moq_media_track_t *succ, uint64_t now_us)
+{
+    moq_media_player_event_t ev = ev_make(MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED, track,
+                                          DETAIL(replaced));
+    ev.u.replaced.replacement = succ;
+    ev_push(p, &ev);
+    if (x) {
+        x->transfer_to = succ;
+        x->transfer_announced = false;
+    }
+    if (!t) return;
+    t->replaced = true;
+    if (t->end_emitted) {
+        (void)moq_media_receiver_unsubscribe_track(p->r, succ);
+        track_release(p, (uint32_t)(t - p->tracks), false);
+        return;
+    }
+    t->transfer_to = succ;
+    t->transfer_announced = false;
+    track_trigger(p, t, MOQ_MEDIA_PLAYER_END_REPLACED, now_us);
+}
+
 static void take_track_events(moq_media_player_t *p, uint64_t now_us)
 {
     moq_media_track_event_t ev;
@@ -1271,10 +1478,18 @@ static void take_track_events(moq_media_player_t *p, uint64_t now_us)
            moq_media_receiver_poll_track(p->r, &ev, sizeof(ev)) == MOQ_OK) {
         player_track_t *t = ev.track ? track_of(p, ev.track, NULL) : NULL;
         switch (ev.kind) {
-        case MOQ_MEDIA_TRACK_ADDED:
+        case MOQ_MEDIA_TRACK_ADDED: {
             known_add(p, ev.track);
+            /* The successor a selection is moving to: transfers_run selects
+             * it once this tick's events are taken; it is not offered. */
+            player_track_t *x = transfer_of(p, ev.track);
+            if (x) {
+                x->transfer_announced = true;
+                break;
+            }
             if (p->catalog_ready && !p->auto_pending) announce_available(p, ev.track);
             break;
+        }
         case MOQ_MEDIA_CATALOG_READY:
             if (p->catalog_ready) break;
             p->catalog_ready = true;
@@ -1283,6 +1498,24 @@ static void take_track_events(moq_media_player_t *p, uint64_t now_us)
             catalog_settle(p);
             break;
         case MOQ_MEDIA_TRACK_REMOVED: {
+            moq_media_track_t *succ =
+                ev.struct_size >= offsetof(moq_media_track_event_t, replaced_by) +
+                                      sizeof(ev.replaced_by) ? ev.replaced_by : NULL;
+#ifdef MOQ_MEDIA_PLAYER_TESTING
+            bool split = succ && p->test_split_replacement;
+            if (split) p->test_split_replacement = false;
+#endif
+            player_track_t *x = transfer_of(p, ev.track);
+            if (succ) {
+                track_replaced(p, ev.track, t, x, succ, now_us);
+#ifdef MOQ_MEDIA_PLAYER_TESTING
+                if (split) return;
+#endif
+                break;
+            }
+            /* A selection moving to a handle that is gone has nowhere to
+             * go. */
+            if (x) transfer_end(p, x, false);
             moq_media_player_event_t rm =
                 ev_make(MOQ_MEDIA_PLAYER_EVENT_TRACK_REMOVED, ev.track, 0);
             ev_push(p, &rm);
@@ -1587,6 +1820,7 @@ static bool emit_ends(moq_media_player_t *p)
             (void)moq_playback_remove_track(p->pb, t->eng);
             t->eng_live = false;
         }
+        if (t->replaced) track_retire(p, i);
     }
     return true;
 }
@@ -1744,7 +1978,8 @@ static void report_terminal(moq_media_player_t *p)
         any = true;
         if (!p->tracks[i].end_emitted) all = false;
     }
-    if (any && all && !p->ended_reported) {
+    /* A selection moving to a new handle is not over. */
+    if (any && all && !transfers_pending(p) && !p->ended_reported) {
         p->ended_reported = true;
         moq_media_player_event_t ev = ev_make(MOQ_MEDIA_PLAYER_EVENT_ENDED, NULL, 0);
         ev_push(p, &ev);
@@ -1771,6 +2006,7 @@ moq_result_t moq_media_player_tick(moq_media_player_t *p, uint64_t now_us)
         p->fatal = moq_media_receiver_is_fatal(p->r);
         p->fatal_code = moq_media_receiver_fatal_code(p->r);
     }
+    transfers_run(p);
     take_input(p, now_us);
     track_drains(p, now_us);
     bool room = true;
@@ -1787,6 +2023,8 @@ moq_result_t moq_media_player_tick(moq_media_player_t *p, uint64_t now_us)
         (void)moq_playback_tick(p->pb, now_us);
         room = drain_engine(p, now_us);
     }
+    /* A replaced track's END releases its slot to the selection moving on. */
+    transfers_run(p);
     report_terminal(p);
     waits_mark(p, now_us);
     return room ? MOQ_OK : MOQ_ERR_WOULD_BLOCK;
@@ -1851,6 +2089,7 @@ moq_result_t moq_media_player_wait(moq_media_player_t *p, uint64_t now_us,
     uint64_t d = moq_media_player_next_deadline_us(p);
     if (d <= now_us) return MOQ_OK;
     if (drain_due(p)) return MOQ_OK;
+    if (transfer_due(p)) return MOQ_OK;
     bool receiver_terminal = p->receiver_terminal ||
         moq_media_receiver_is_closed(p->r) || moq_media_receiver_is_fatal(p->r);
     if (receiver_terminal && !p->receiver_terminal) return MOQ_OK;
@@ -2233,8 +2472,11 @@ moq_result_t moq_media_player_attach(moq_media_receiver_t *r,
 void moq_media_player_destroy(moq_media_player_t *p)
 {
     if (!p) return;
-    for (uint32_t i = 0; i < p->max_tracks; i++)
+    for (uint32_t i = 0; i < p->max_tracks; i++) {
         if (p->tracks[i].used) track_release(p, i, !p->owns_receiver);
+        else if (p->tracks[i].transfer_to)
+            transfer_end(p, &p->tracks[i], !p->owns_receiver);
+    }
     moq_media_receiver_t *r = p->owns_receiver ? p->r : NULL;
     player_free(p);
     if (r) moq_media_receiver_destroy(r);

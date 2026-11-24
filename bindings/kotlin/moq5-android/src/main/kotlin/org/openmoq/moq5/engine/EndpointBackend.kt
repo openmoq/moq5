@@ -134,7 +134,10 @@ internal enum class BackendTrackEventKind(val native: Int) {
 /**
  * One drained `moq_media_track_event_t`: the kind, the track's BORROWED
  * child token (zero for CATALOG_READY), the description snapshot taken at
- * the poll for ADDED and UPDATED, and the coalesced parse-drop counters.
+ * the poll for ADDED and UPDATED, the description generation the event
+ * announces, and the coalesced parse-drop counters. [replaces] (on ADDED) and
+ * [replacedBy] (on REMOVED) are the other track of an MSF-02 replacement, by
+ * its borrowed token; [replacedBy] names a successor whose own ADDED follows.
  */
 internal data class BackendTrackEvent(
     val kind: BackendTrackEventKind,
@@ -151,6 +154,9 @@ internal data class BackendTrackEvent(
     val deliveryOrigin: BackendDeliveryOrigin? = null,
     val deliveryInitiatingRequestId: RequestId? = null,
     val fillLoss: FillLoss? = null,
+    val configGeneration: UInt = 0u,
+    val replaces: Long? = null,
+    val replacedBy: Long? = null,
 )
 
 /** `MOQ_MEDIA_DELIVERY_*`: whose delivery a local admission refused. */

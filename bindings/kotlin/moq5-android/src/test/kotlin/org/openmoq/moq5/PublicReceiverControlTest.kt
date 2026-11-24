@@ -63,6 +63,11 @@ import kotlin.time.Duration.Companion.seconds
  *    child -- while a Removed track keeps its
  *    [TrackUnavailableException] and a closed (detached) receiver its
  *    [ReceiverClosedException].
+ *  * A track an MSF-02 replacement removed is the exception to "Removed
+ *    refuses every command": the C acts on the newest track of its
+ *    replacement chain, so the binding forwards the command on the old
+ *    track, and keeps the desired state on that newest track (the
+ *    replacement moved it there). A state read on it stays refused.
  */
 internal class PublicReceiverControlTest : EngineFixture() {
     private companion object {
@@ -78,6 +83,10 @@ internal class PublicReceiverControlTest : EngineFixture() {
         fun ended(t: Long) = BackendTrackEvent(BackendTrackEventKind.Ended, t, null)
         fun removed(t: Long) = BackendTrackEvent(BackendTrackEventKind.Removed, t, null)
         val ready = BackendTrackEvent(BackendTrackEventKind.CatalogReady, 0L, null)
+        val T3 = -0x7fff_ffff_ffff_fcfdL
+        val T4 = -0x7fff_ffff_ffff_fbfdL
+        fun replaced(old: Long, new: Long, d: TrackDescription) =
+            arrayOf(BackendTrackEvent(BackendTrackEventKind.Removed, old, null, replacedBy = new), BackendTrackEvent(BackendTrackEventKind.Added, new, d, replaces = old))
     }
 
     private fun runTest(body: suspend CoroutineScope.() -> Unit) = runBlocking { body() }
@@ -500,4 +509,67 @@ internal class PublicReceiverControlTest : EngineFixture() {
             endOfGroup = false, viaDatagram = false, keyframe = true, captureTime = null,
             decodeTime = MediaMicros(0uL), compositionOffset = MediaOffsetMicros(0L), presentationTime = MediaMicros(0uL),
         )
+
+    @Test
+    fun `subscribe and unsubscribe on a replaced track reach its successor -- the selection moved with the replacement`() =
+        runTest {
+            val backend = newBackend()
+            val endpoint = MoqEndpoint.open(EndpointConfig(URL)) { backend }
+            val receiver = endpoint.attachReceiver(MANUAL)
+            val video = discovered(backend, receiver).tracks[0]
+            receiver.subscribe(video)
+            assertEquals(1, backend.observed().subscribeCalls.size)
+            backend.scriptTrackEvents(*replaced(T1, T3, VIDEO.copy(codec = MediaBytes("avc1.64001f".toByteArray()))))
+            backend.markActivity()
+            val successor = withTimeout(BOUND) { receiver.inventory.first { it.tracks.size == 3 } }.tracks[2]
+            assertTrue(video.replacedBy === successor && video.presence == TrackPresence.Removed)
+            assertEquals(TrackState.Pending, withTimeout(BOUND) { receiver.trackState(successor) }, "the C moved the selection to the successor")
+            receiver.subscribe(video)
+            assertEquals(1, backend.observed().subscribeCalls.size, "the successor is already wanted: no command for a repeat, through either track")
+            receiver.subscribe(successor)
+            assertEquals(1, backend.observed().subscribeCalls.size)
+            receiver.unsubscribe(video)
+            assertEquals(listOf(T1), backend.observed().unsubscribeCalls.map { it.track }, "forwarded on the replaced track, as issued")
+            assertEquals(TrackState.Discovered, withTimeout(BOUND) { receiver.trackState(successor) }, "and it reached the successor")
+            receiver.unsubscribe(successor)
+            assertEquals(1, backend.observed().unsubscribeCalls.size, "the successor is no longer wanted: no second command")
+            receiver.subscribe(video, start = StartMode.NextGroup, priority = 3u)
+            val again = backend.observed().subscribeCalls.last()
+            assertEquals(Triple(T1, StartMode.NextGroup, 3u.toUByte()), Triple(again.track, again.start, again.priority), "a new command, on the replaced track, with this call's arguments")
+            assertEquals(TrackState.Pending, withTimeout(BOUND) { receiver.trackState(successor) })
+            assertEquals(TrackPresence.Removed, assertFailsWith<TrackUnavailableException> { receiver.trackState(video) }.presence, "a replaced track has no state of its own")
+            endpoint.closeAndJoin()
+        }
+
+    @Test
+    fun `a command on the first track of a replacement chain reaches the newest, and a chain whose newest track is gone refuses by that presence`() =
+        runTest {
+            val backend = newBackend()
+            val endpoint = MoqEndpoint.open(EndpointConfig(URL)) { backend }
+            val receiver = endpoint.attachReceiver(MANUAL)
+            val video = discovered(backend, receiver).tracks[0]
+            backend.scriptTrackEvents(*replaced(T1, T3, VIDEO.copy(codec = MediaBytes("avc1.64001f".toByteArray()))), *replaced(T3, T4, VIDEO.copy(codec = MediaBytes("hvc1.1.6.L93.B0".toByteArray()))))
+            backend.markActivity()
+            val inv = withTimeout(BOUND) { receiver.inventory.first { it.tracks.size == 4 } }
+            val (middle, newest) = inv.tracks[2] to inv.tracks[3]
+            assertTrue(video.replacedBy === middle && middle.replacedBy === newest && newest.replaces === middle)
+            receiver.subscribe(video)
+            assertEquals(T1, backend.observed().subscribeCalls.single().track)
+            assertEquals(TrackState.Pending, withTimeout(BOUND) { receiver.trackState(newest) }, "the newest track of the chain took it")
+            receiver.subscribe(middle)
+            assertEquals(1, backend.observed().subscribeCalls.size, "one desired state for the whole chain")
+            backend.scriptTrackEvents(ended(T4))
+            backend.markActivity()
+            withTimeout(BOUND) { receiver.inventory.first { it.tracks[3].presence == TrackPresence.Ended } }
+            receiver.unsubscribe(video)
+            assertEquals(TrackPresence.Ended, assertFailsWith<TrackUnavailableException> { receiver.subscribe(video) }.presence, "refused by the presence of the track it would act on")
+            backend.scriptTrackEvents(removed(T4))
+            backend.markActivity()
+            withTimeout(BOUND) { receiver.inventory.first { it.tracks[3].presence == TrackPresence.Removed } }
+            val calls = backend.observed().subscribeCalls.size + backend.observed().unsubscribeCalls.size
+            assertEquals(TrackPresence.Removed, assertFailsWith<TrackUnavailableException> { receiver.subscribe(middle) }.presence)
+            assertEquals(TrackPresence.Removed, assertFailsWith<TrackUnavailableException> { receiver.unsubscribe(video) }.presence)
+            assertEquals(calls, backend.observed().subscribeCalls.size + backend.observed().unsubscribeCalls.size, "refused locally: the chain ends in a removed track")
+            endpoint.closeAndJoin()
+        }
 }

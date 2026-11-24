@@ -32,7 +32,10 @@ internal object ReceiverEventScalars {
     const val FILL_LOSS_CAUSES = 20 // MOQ_MEDIA_FILL_LOSS_* bits; 0 when none
     const val FILL_LOSS_GROUP = 21
     const val FILL_LOSS_OBJECT = 22
-    const val COUNT = 23
+    const val CONFIG_GENERATION = 23 // the description generation the event announces (v0 prefix: always written)
+    const val REPLACES = 24       // ADDED of a replacement: the predecessor's BORROWED token; 0 = NULL
+    const val REPLACED_BY = 25    // REMOVED of a replacement: the successor's BORROWED token (minted on first sight); 0 = NULL
+    const val COUNT = 26
 
     const val HAS_LOCAL_RESULT = 0x01L
     const val HAS_INITIATING_ID = 0x02L
@@ -42,6 +45,7 @@ internal object ReceiverEventScalars {
     const val HAS_DELIVERY_ORIGIN = 0x20L
     const val HAS_DELIVERY_ID = 0x40L
     const val HAS_FILL_LOSS = 0x80L
+    const val HAS_REPLACEMENT = 0x100L // the replaces / replaced_by block, one bit for both
 }
 
 /**
@@ -86,7 +90,20 @@ internal object TrackDescribeScalars {
     const val HAS_TRACK_DURATION = 32
     const val TRACK_DURATION_MS = 33
     const val IS_LIVE = 34
-    const val COUNT = 35
+    const val DESC_GENERATION = 35    // config_generation; zero unless HAS_GENERATION
+    const val INIT_SOURCE = 36        // MOQ_MEDIA_INIT_SOURCE_*, an open set; zero unless HAS_GENERATION
+    const val INIT_PROPERTY_TYPE = 37 // init_property_type, all 64 bits; zero unless HAS_GENERATION
+    const val HAS = 38                // which appended fields the copy's stamp and the supplement carried: the HAS_* bits
+    const val COUNT = 39
+
+    /** The copy's stamp covered the block through config_generation (generation, init source, init property type). */
+    const val HAS_GENERATION = 0x01L
+
+    /* The supplement record's encryption fields (MSF 5.2.38-5.2.41), one bit per has_*. */
+    const val HAS_ENCRYPTION_SCHEME = 0x02L
+    const val HAS_CIPHER_SUITE = 0x04L
+    const val HAS_KEY_ID = 0x08L
+    const val HAS_TRACK_BASE_KEY = 0x10L
 }
 
 /** The byte-field order of the array `nativeTrackDescribe` returns: the fixed fields, then `depends`, then the content-protection ref ids. */
@@ -104,7 +121,13 @@ internal object TrackDescribeBytes {
     const val CODEC_CONFIG = 10
     const val CENC_SCHEME = 11
     const val CENC_DEFAULT_KID = 12
-    const val FIXED = 13
+    // The supplement's encryption fields, verbatim; empty unless their TrackDescribeScalars.HAS_* bit is set.
+    // TRACK_BASE_KEY is key material.
+    const val ENCRYPTION_SCHEME = 13
+    const val CIPHER_SUITE = 14
+    const val KEY_ID = 15
+    const val TRACK_BASE_KEY = 16
+    const val FIXED = 17
 }
 
 /**
@@ -180,7 +203,13 @@ internal object ReceiverTimelineScalars {
     const val COUNT = 7
 }
 
-/** The scalar block `nativeReceiverStats` fills: one slot per `moq_media_receiver_stats_t` field, in the struct's order; the two booleans as 0/1. */
+/**
+ * The scalar block `nativeReceiverStats` fills: one slot per
+ * `moq_media_receiver_stats_t` field, in the struct's order; the two booleans
+ * as 0/1. The block after [TRACKS_MALFORMED] is written only when the
+ * library's stamp covered all of it, through `loc_order_forced`
+ * ([HAS_REVISION_BLOCK] 1); otherwise its slots are zero and unobserved.
+ */
 internal object ReceiverStatsScalars {
     const val OBJECTS_RECEIVED = 0
     const val OBJECTS_QUEUED = 1
@@ -198,5 +227,16 @@ internal object ReceiverStatsScalars {
     const val GAP_TAILS_UNKNOWN = 13
     const val REORDER_REFUSED = 14
     const val TRACKS_MALFORMED = 15
-    const val COUNT = 16
+    const val HAS_REVISION_BLOCK = 16 // 1 when the stamp covered catalog_revision through loc_order_forced
+    const val CATALOG_REVISION = 17   // moq_msf_revision_t, an open set
+    const val OBJECTS_DECOMPRESSED = 18
+    const val DECOMPRESS_FAILURES = 19
+    const val DECOMPRESS_LIMITED = 20
+    const val COMPRESSION_REFUSED = 21
+    const val COMPRESSION_CONFLICTS = 22
+    const val COMPRESSION_IGNORED = 23
+    const val EVENT_TIMELINE_HEADERS_IGNORED = 24
+    const val LOC_ORDER_GAPS = 25
+    const val LOC_ORDER_FORCED = 26
+    const val COUNT = 27
 }

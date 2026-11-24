@@ -25,6 +25,14 @@ import kotlin.concurrent.withLock
  * handles are never recycled, so a token seen twice as ADDED, or a change
  * for a token never announced, is a contract anomaly: it is counted and
  * dropped rather than folded into an invented or duplicated track.
+ *
+ * An MSF-02 replacement arrives as REMOVED naming the successor's token,
+ * then the successor's ADDED naming the replaced token. The REMOVED alone
+ * moves the replaced track's desired state to the successor (as the C moves
+ * its selection) and records the successor as pending; the ADDED links the
+ * two tracks, in this drain or a later one. An ADDED whose named predecessor
+ * does not match a pending replacement is counted as an anomaly; the new
+ * track is still integrated.
  */
 internal class ReceiverModel(policy: EventHistoryPolicy) {
     private val lock = ReentrantLock()
@@ -91,12 +99,34 @@ internal class ReceiverModel(policy: EventHistoryPolicy) {
     fun resolve(token: Long): MediaTrack? = lock.withLock { byToken[token] }
 
     /* The binding's own record of which tracks the application wants: one
-     * backend command per transition, none for a repeat. */
+     * backend command per transition, none for a repeat. A replacement moves
+     * an entry to the successor's token. */
     private val desired = HashSet<Long>()
+
+    /* lock-guarded: each replaced token's successor, and each successor whose
+     * ADDED has not been integrated yet, with the track it replaces. */
+    private val successor = HashMap<Long, Long>()
+    private val pendingReplacement = HashMap<Long, MediaTrack>()
 
     fun isDesired(token: Long): Boolean = lock.withLock { token in desired }
 
     fun setDesired(token: Long, wanted: Boolean) = lock.withLock { if (wanted) desired += token else desired -= token }
+
+    /** True when a replacement removed [token]: a command on it reaches its successor. */
+    fun isReplaced(token: Long): Boolean = lock.withLock { token in successor }
+
+    /**
+     * The newest token of [token]'s replacement chain, which a command on it
+     * reaches natively; [token] itself when it was not replaced. Every
+     * successor is a newer handle, so the walk ends within the chain's length.
+     */
+    fun chainHead(token: Long): Long =
+        lock.withLock {
+            var t = token
+            var steps = successor.size
+            while (steps-- > 0) t = successor[t] ?: break
+            t
+        }
 
     fun claimObjectConsumer(): Boolean = lock.withLock { if (objectConsumer) false else { objectConsumer = true; true } }
 
@@ -129,7 +159,14 @@ internal class ReceiverModel(policy: EventHistoryPolicy) {
                                 val t = MediaTrack(event.track, d)
                                 byToken[event.track] = t
                                 order += t
-                                TrackEvent.Added(t)
+                                val pending = pendingReplacement.remove(event.track)
+                                val predecessor = event.replaces?.let { byToken[it] }
+                                if (pending !== predecessor) anomalies++
+                                if (predecessor != null) {
+                                    t.replaces = predecessor
+                                    predecessor.replacedBy = t
+                                }
+                                TrackEvent.Added(t, predecessor)
                             }
                         }
                         BackendTrackEventKind.Updated -> {
@@ -139,7 +176,7 @@ internal class ReceiverModel(policy: EventHistoryPolicy) {
                                 null
                             } else {
                                 known.description = d
-                                TrackEvent.Updated(known)
+                                TrackEvent.Updated(known, event.configGeneration)
                             }
                         }
                         BackendTrackEventKind.Removed ->
@@ -148,7 +185,15 @@ internal class ReceiverModel(policy: EventHistoryPolicy) {
                                 null
                             } else {
                                 known.presence = TrackPresence.Removed
-                                TrackEvent.Removed(known)
+                                val next = event.replacedBy
+                                if (next == null) {
+                                    TrackEvent.Removed(known)
+                                } else {
+                                    successor[event.track] = next
+                                    pendingReplacement[next] = known
+                                    if (desired.remove(event.track)) desired += next
+                                    TrackEvent.Removed(known, replaced = true)
+                                }
                             }
                         BackendTrackEventKind.Ended ->
                             if (known == null) {
@@ -269,6 +314,8 @@ internal class ReceiverModel(policy: EventHistoryPolicy) {
                 retired = true
                 trackExhausted = true
                 exhausted += NativeQueue.entries
+                // A successor never announced stays unannounced: its predecessor keeps a null replacedBy.
+                pendingReplacement.clear()
                 for (t in order) t.isRetired = true
                 if (terminal == null) {
                     terminal = ReceiverTerminal.Closed

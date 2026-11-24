@@ -1506,6 +1506,9 @@ if(TARGET moq::sim)
     add_executable(test_subscriber_track_result unit/test_subscriber_track_result.c)
     target_link_libraries(test_subscriber_track_result PRIVATE moq::core moq::sim)
     add_test(NAME subscriber_track_result COMMAND test_subscriber_track_result)
+    add_executable(test_subscriber_fetch_result unit/test_subscriber_fetch_result.c)
+    target_link_libraries(test_subscriber_fetch_result PRIVATE moq::core moq::sim)
+    add_test(NAME subscriber_fetch_result COMMAND test_subscriber_fetch_result)
 
     add_executable(test_facade_fill unit/test_facade_fill.c)
     target_link_libraries(test_facade_fill PRIVATE moq::core moq::sim)
@@ -2174,6 +2177,16 @@ if(TARGET moq::sim AND TARGET moq-service-receiver-test-internals)
     add_test(NAME media_receiver_stream_terminals
         COMMAND test_media_receiver_stream_terminals)
     set_tests_properties(media_receiver_stream_terminals PROPERTIES TIMEOUT 120)
+endif()
+
+# The receiver's MSF-02 subscriptions over a real publisher and SimPair.
+if(TARGET moq::sim AND TARGET moq-service-receiver-test-internals)
+    add_executable(test_media_receiver_msf02_net
+        ${PROJECT_SOURCE_DIR}/service/tests/test_media_receiver_msf02_net.c)
+    target_link_libraries(test_media_receiver_msf02_net PRIVATE
+        moq-service-receiver-test-internals moq::sim)
+    add_test(NAME media_receiver_msf02_net COMMAND test_media_receiver_msf02_net)
+    set_tests_properties(media_receiver_msf02_net PROPERTIES TIMEOUT 120)
 endif()
 
 # A completed broadcast on the receiver over a real publisher and SimPair.

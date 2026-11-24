@@ -90,6 +90,11 @@ struct moq_media_track {
            channel_config, init_data, codec_config, record_config, scheme, kid;
     text_t depends_text[FIXTURE_ARRAY], cp_text[FIXTURE_ARRAY];
     moq_bytes_t depends[FIXTURE_ARRAY], cp[FIXTURE_ARRAY];
+    /* The handle-owned supplement record desc.extensions lists, and the
+     * backing of its encryption fields. */
+    moq_msf_track_supplement_t supplement;
+    moq_msf_track_ext_t ext;
+    text_t encryption_scheme, cipher_suite, key_id, track_base_key;
     bool current_is_live, current_has_duration;
     uint64_t current_duration;
     uint32_t desc_stamp, info_stamp, cmaf_stamp;
@@ -111,6 +116,8 @@ typedef struct {
     uint32_t delivery_origin;
     uint64_t delivery_initiating_request_id;
     bool orphan_desc;    /* no handle, but a non-NULL descriptor pointer (malformed shape) */
+    uint32_t config_generation;
+    struct moq_media_track *replaces, *replaced_by;
 } fixture_event_t;
 
 struct moq_media_receiver {
@@ -1309,6 +1316,30 @@ PyObject *test_stats(PyObject *module, PyObject *args)
     Py_RETURN_NONE;
 }
 
+/* _test_stats_msf02(catalog_revision, objects_decompressed, ..., loc_order_forced):
+ * script the block after tracks_malformed. */
+PyObject *test_stats_msf02(PyObject *module, PyObject *args)
+{
+    (void)module;
+    unsigned int revision;
+    unsigned long long v[9];
+    if (!PyArg_ParseTuple(args, "IKKKKKKKKK", &revision, &v[0], &v[1], &v[2], &v[3], &v[4],
+                          &v[5], &v[6], &v[7], &v[8])) return NULL;
+    pthread_mutex_lock(&mutex);
+    scripted_stats.catalog_revision = revision;
+    scripted_stats.objects_decompressed = v[0];
+    scripted_stats.decompress_failures = v[1];
+    scripted_stats.decompress_limited = v[2];
+    scripted_stats.compression_refused = v[3];
+    scripted_stats.compression_conflicts = v[4];
+    scripted_stats.compression_ignored = v[5];
+    scripted_stats.event_timeline_headers_ignored = v[6];
+    scripted_stats.loc_order_gaps = v[7];
+    scripted_stats.loc_order_forced = v[8];
+    pthread_mutex_unlock(&mutex);
+    Py_RETURN_NONE;
+}
+
 PyObject *test_stats_size(PyObject *module, PyObject *value)
 {
     (void)module;
@@ -1542,6 +1573,9 @@ moq_result_t moq_media_receiver_poll_track(moq_media_receiver_t *r, moq_media_tr
     full.fill_error_code = e.fill_error_code;
     full.delivery_origin = e.delivery_origin;
     full.delivery_initiating_request_id = e.delivery_initiating_request_id;
+    full.config_generation = e.config_generation;
+    full.replaces = e.replaces;
+    full.replaced_by = e.replaced_by;
     /* Write exactly the stamped prefix (clamped to sizeof), like a sized
      * native poll; the caller's bytes beyond it stay whatever they were. */
     size_t n = e.stamp < sizeof(full) ? e.stamp : sizeof(full);
@@ -1772,6 +1806,36 @@ PyObject *test_track_desc(PyObject *module, PyObject *args)
         t->current_has_duration = d->has_track_duration;
         t->current_duration = d->track_duration_ms;
     }
+    if (take_u64(dict, "config_generation", &has, &v) < 0) goto fail;
+    d->config_generation = (uint32_t)v;
+    if (take_u64(dict, "init_source", &has, &v) < 0) goto fail;
+    d->init_source = (uint32_t)v;
+    if (take_u64(dict, "init_property_type", &has, &d->init_property_type) < 0) goto fail;
+    {
+        /* The supplement record is listed when an encryption key is present
+         * or its stamp is scripted. */
+        moq_msf_track_supplement_t *sp = &t->supplement;
+        memset(sp, 0, sizeof(*sp));
+        memset(&t->ext, 0, sizeof(t->ext));
+        if (take_text(dict, "encryption_scheme", &t->encryption_scheme, &sp->encryption_scheme) < 0 ||
+            take_text(dict, "cipher_suite", &t->cipher_suite, &sp->cipher_suite) < 0 ||
+            take_text(dict, "key_id", &t->key_id, &sp->key_id) < 0 ||
+            take_text(dict, "track_base_key", &t->track_base_key, &sp->track_base_key) < 0)
+            goto fail;
+        sp->has_encryption_scheme = field(dict, "encryption_scheme") != NULL;
+        sp->has_cipher_suite = field(dict, "cipher_suite") != NULL;
+        sp->has_key_id = field(dict, "key_id") != NULL;
+        sp->has_track_base_key = field(dict, "track_base_key") != NULL;
+        if (take_u64(dict, "supplement_stamp", &has, &v) < 0) goto fail;
+        sp->struct_size = has ? (uint32_t)v : (uint32_t)sizeof(*sp);
+        if (has || sp->has_encryption_scheme || sp->has_cipher_suite || sp->has_key_id ||
+            sp->has_track_base_key) {
+            t->ext.kind = MOQ_MSF_EXT_SUPPLEMENT;
+            t->ext.u.supplement = sp;
+            d->extensions = &t->ext;
+            d->extension_count = 1;
+        }
+    }
     if (take_u64(dict, "desc_stamp", &has, &v) < 0) goto fail;
     t->desc_stamp = has ? (uint32_t)v : (uint32_t)sizeof(*d);
     if (take_u64(dict, "info_stamp", &has, &v) < 0) goto fail;
@@ -1858,13 +1922,24 @@ PyObject *test_push_event(PyObject *module, PyObject *args)
     (void)module;
     int kind;
     PyObject *capsule, *stamp, *largest, *expires, *drop, *local = Py_None, *fill = Py_None;
-    PyObject *delivery = Py_None;
-    if (!PyArg_ParseTuple(args, "iOOOOO|OOO", &kind, &capsule, &stamp, &largest, &expires,
-                         &drop, &local, &fill, &delivery)) return NULL;
+    PyObject *delivery = Py_None, *replaces = Py_None, *replaced_by = Py_None;
+    unsigned int generation = 0;
+    if (!PyArg_ParseTuple(args, "iOOOOO|OOOOOI", &kind, &capsule, &stamp, &largest, &expires,
+                         &drop, &local, &fill, &delivery, &replaces, &replaced_by, &generation))
+        return NULL;
     fixture_event_t e;
     memset(&e, 0, sizeof(e));
     e.kind = kind;
     e.stamp = sizeof(moq_media_track_event_t);
+    e.config_generation = generation;
+    if (replaces != Py_None) {
+        e.replaces = moq5_test_track(replaces);
+        if (!e.replaces) return NULL;
+    }
+    if (replaced_by != Py_None) {
+        e.replaced_by = moq5_test_track(replaced_by);
+        if (!e.replaced_by) return NULL;
+    }
     if (local != Py_None) {
         long n = PyLong_AsLong(local);
         if (PyErr_Occurred()) return NULL;
@@ -2037,6 +2112,11 @@ PyObject *test_layout(PyObject *module, PyObject *args)
     LAYOUT("metadata_sizeof", sizeof(moq_media_metadata_t));
     LAYOUT("loc_v0", MOQ_LOC_METADATA_V0_SIZE);
     LAYOUT("loc_sizeof", sizeof(moq_loc_metadata_t));
+    LAYOUT("event_replaced_by_end", END(moq_media_track_event_t, replaced_by));
+    LAYOUT("desc_config_generation_end", END(moq_media_track_desc_t, config_generation));
+    LAYOUT("desc_extension_count_end", END(moq_media_track_desc_t, extension_count));
+    LAYOUT("supplement_v0", MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE);
+    LAYOUT("stats_loc_order_forced_end", END(moq_media_receiver_stats_t, loc_order_forced));
 #undef LAYOUT
     return d;
 }

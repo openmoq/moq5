@@ -45,6 +45,11 @@ import kotlin.time.Duration.Companion.seconds
  *    already dequeued into a stream's handoff slot is no longer counted.
  *  * A closed (detached) receiver refuses with [ReceiverClosedException];
  *    a receiver at its terminal still answers (the C answers).
+ *  * The block appended after `tracks_malformed` (the catalog revision, the
+ *    compression counters, the ignored event-timeline headers, the LOC
+ *    ordering counters) is all or nothing: each field reaches the public
+ *    value as its own, and a library that did not report the block leaves
+ *    every one of them null, never zero.
  */
 internal class PublicReceiverStatsTest : EngineFixture() {
     private companion object {
@@ -182,5 +187,34 @@ internal class PublicReceiverStatsTest : EngineFixture() {
             assertEquals(null, receiver.inventory.value.terminal)
             backend.expireWait()
             runCatching { endpoint.closeAndJoin() }
+        }
+
+    @Test
+    fun `the appended block reaches the public value field by field, and an unreported block is null throughout`() =
+        runTest {
+            val backend = newBackend()
+            val endpoint = MoqEndpoint.open(EndpointConfig(URL)) { backend }
+            val receiver = endpoint.attachReceiver(CONFIG)
+            discovered(backend, receiver)
+            val unreported = withTimeout(BOUND) { receiver.statsSnapshot() }
+            assertEquals(
+                listOf<Any?>(null, null, null, null, null, null, null, null, null, null),
+                listOf(unreported.catalogRevision, unreported.objectsDecompressed, unreported.decompressFailures, unreported.decompressLimited, unreported.compressionRefused, unreported.compressionConflicts, unreported.compressionIgnored, unreported.eventTimelineHeadersIgnored, unreported.locOrderGaps, unreported.locOrderForced),
+            )
+            backend.scriptedStats = ZERO.copy(
+                catalogRevision = CatalogRevision.Msf02, objectsDecompressed = 0x8000_0000_0000_0000uL, decompressFailures = 2uL, decompressLimited = 3uL,
+                compressionRefused = 4uL, compressionConflicts = 5uL, compressionIgnored = 6uL, eventTimelineHeadersIgnored = 7uL,
+                locOrderGaps = 8uL, locOrderForced = ULong.MAX_VALUE,
+            )
+            val s = withTimeout(BOUND) { receiver.statsSnapshot() }
+            assertEquals(CatalogRevision.Msf02, s.catalogRevision)
+            assertEquals(
+                listOf(0x8000_0000_0000_0000uL, 2uL, 3uL, 4uL, 5uL, 6uL, 7uL, 8uL, ULong.MAX_VALUE),
+                listOf(s.objectsDecompressed, s.decompressFailures, s.decompressLimited, s.compressionRefused, s.compressionConflicts, s.compressionIgnored, s.eventTimelineHeadersIgnored, s.locOrderGaps, s.locOrderForced),
+                "distinct values: nothing conflated or swapped",
+            )
+            backend.scriptedStats = ZERO.copy(catalogRevision = CatalogRevision.Unknown(9u))
+            assertEquals(CatalogRevision.Unknown(9u), withTimeout(BOUND) { receiver.statsSnapshot() }.catalogRevision, "an unknown revision is carried, not refused")
+            endpoint.closeAndJoin()
         }
 }

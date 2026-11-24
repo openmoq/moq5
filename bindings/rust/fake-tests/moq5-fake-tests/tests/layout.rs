@@ -121,7 +121,7 @@ fn rust_side() -> BTreeMap<String, Entry> {
             content_protection_ref_id_count, packaging, event_type, mime_type, depends,
             depends_count, has_template, template_, has_track_duration, track_duration_ms,
             is_live, extensions, extension_count, has_alt_group, alt_group, has_render_group,
-            render_group, has_label,
+            render_group, has_label, init_property_type, init_source, config_generation,
         }
         moq_media_track_event_t {
             struct_size, kind, track, desc, config_generation, has_largest, largest_group,
@@ -130,7 +130,7 @@ fn rust_side() -> BTreeMap<String, Entry> {
             fill_error_domain, fill_error_code, delivery_origin,
             delivery_initiating_request_id, fill_unreported_loss_causes,
             fill_unreported_loss_group, fill_unreported_loss_object, has_done_status,
-            done_status,
+            done_status, replaces, replaced_by,
         }
         moq_media_object_t {
             struct_size, track, config_generation, packaging, status, end_of_group, datagram,
@@ -155,7 +155,10 @@ fn rust_side() -> BTreeMap<String, Entry> {
             struct_size, objects_received, objects_queued, bytes_queued, objects_dropped,
             groups_dropped, keyframes_dropped, parse_drops, overflow_events, pause_transitions,
             paused, catalog_drops, catalog_complete, gaps_reported, gap_tails_unknown,
-            reorder_refused, tracks_malformed,
+            reorder_refused, tracks_malformed, catalog_revision, _reserved_catalog_revision,
+            objects_decompressed, decompress_failures, decompress_limited, compression_refused,
+            compression_conflicts, compression_ignored, event_timeline_headers_ignored,
+            loc_order_gaps, loc_order_forced,
         }
         moq_location_filter_cfg_t {
             struct_size, kind, relative_group_offset, start_group, start_object, end_group,
@@ -188,6 +191,13 @@ fn rust_side() -> BTreeMap<String, Entry> {
             scte35_pid, malformed,
         }
         moq_msf_track_ext_t { kind, u }
+        moq_msf_track_supplement_t {
+            struct_size, has_packaging_metadata, packaging_metadata, has_keyframe_spacing,
+            keyframe_spacing, has_accessible_window_ms, accessible_window_ms,
+            has_encryption_scheme, encryption_scheme, has_cipher_suite, cipher_suite,
+            has_key_id, key_id, has_track_base_key, track_base_key, has_depends,
+            depends_render_groups, depends_render_group_count, malformed,
+        }
         moq_loc_metadata_t {
             struct_size, present, timestamp, timescale, marking_len, marking, audio_level,
             reserved, video_config, audio_config,
@@ -281,6 +291,28 @@ fn rust_side() -> BTreeMap<String, Entry> {
         (
             "MOQ_ENDPOINT_URI_STANDARD",
             sys::MOQ_ENDPOINT_URI_STANDARD as usize,
+        ),
+        (
+            "MOQ_MEDIA_INIT_SOURCE_NONE",
+            sys::MOQ_MEDIA_INIT_SOURCE_NONE as usize,
+        ),
+        (
+            "MOQ_MEDIA_INIT_SOURCE_INLINE",
+            sys::MOQ_MEDIA_INIT_SOURCE_INLINE as usize,
+        ),
+        (
+            "MOQ_MEDIA_INIT_SOURCE_TRACK_PROPERTY",
+            sys::MOQ_MEDIA_INIT_SOURCE_TRACK_PROPERTY as usize,
+        ),
+        (
+            "MOQ_MEDIA_INIT_SOURCE_OBJECT_PROPERTY",
+            sys::MOQ_MEDIA_INIT_SOURCE_OBJECT_PROPERTY as usize,
+        ),
+        ("MOQ_MSF_REVISION_01", sys::MOQ_MSF_REVISION_01 as usize),
+        ("MOQ_MSF_REVISION_02", sys::MOQ_MSF_REVISION_02 as usize),
+        (
+            "MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE",
+            sys::MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE,
         ),
         ("MOQ_LOC_METADATA_V0_SIZE", sys::MOQ_LOC_METADATA_V0_SIZE),
         ("MOQ_LOC_EXT_V0_SIZE", sys::MOQ_LOC_EXT_V0_SIZE),
@@ -417,6 +449,7 @@ fn player_side(v: &mut BTreeMap<String, Entry>) {
             has_render_group, render_group, reason,
         }
         started: moq_media_player_event__bindgen_ty_1__bindgen_ty_8 { timeline_id }
+        replaced: moq_media_player_event__bindgen_ty_1__bindgen_ty_9 { replacement }
     });
     members!(moq_media_player_feedback_t.u {
         decoder_queue: moq_media_player_feedback__bindgen_ty_1__bindgen_ty_1 {
@@ -570,6 +603,10 @@ fn the_floors_lie_within_the_records() {
         size_of::<sys::moq_location_filter_cfg_t>()
     );
     assert!(sys::MOQ_FILL_CFG_V0_SIZE as usize <= size_of::<sys::moq_fill_cfg_t>());
+    assert_eq!(
+        sys::MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE,
+        offset_of!(sys::moq_msf_track_supplement_t, malformed) + size_of::<u32>()
+    );
 }
 
 #[cfg(feature = "player")]

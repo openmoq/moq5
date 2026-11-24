@@ -316,6 +316,25 @@ such as `b"avc1"` or `b"avc3"`, the `frma` original format for an encrypted
 entry); it is `None` for LOC and MPEG-TS tracks and for a CMAF track whose
 header did not parse.
 
+MSF-02 catalogs may change a declared track. An advisory change keeps the
+`Track` and publishes a new description generation: the `UPDATED` event's
+`config_generation` is its number (0 for the description a track was
+discovered with), and `description.config_generation` is the CURRENT one,
+which may be newer. A decode- or delivery-critical change replaces the
+handle: the `REMOVED` event carries the successor as `replaced_by` (a `Track`
+before its `ADDED` is polled), and the `ADDED` right after it carries the
+predecessor as `replaces`; the successor's `ADDED` yields that same `Track`
+while a reference to it is held. `description.init_source` (`InitSource`, or
+an unknown integer) and `init_property_type` say where the decoder
+configuration comes from. `encryption_scheme`, `cipher_suite`, `key_id` and
+`track_base_key` are the catalog's values, verbatim: the library does not
+decrypt, so an encrypted LOC track's payloads are ciphertext.
+`track_base_key` is key material and is left out of the description's repr.
+`ReceiverStats` adds the effective catalog's `catalog_revision`
+(`MsfRevision`, or an unknown integer) and the compression and LOC ordering
+counters as one block, all `None` when the native stamp does not cover it.
+These fields are keyword-only observations outside equality.
+
 `TrackEvent.kind_extended` adds `ExtendedTrackEventKind.LOCAL_FAILURE`,
 `UPDATE_LOCAL_FAILURE`, `DELIVERY_LOCAL_FAILURE`, `FILL_TERMINAL` and
 `FILL_CREATED`.

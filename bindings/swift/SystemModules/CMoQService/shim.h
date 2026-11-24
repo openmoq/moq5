@@ -83,4 +83,24 @@ static inline moq_media_time_domain_t moq_swift_media_time_domain_application_me
     return MOQ_MEDIA_TIME_DOMAIN_APPLICATION_MEDIA;
 }
 
+static inline uint32_t moq_swift_media_init_source_none(void)
+{
+    return MOQ_MEDIA_INIT_SOURCE_NONE;
+}
+
+static inline uint32_t moq_swift_media_init_source_inline(void)
+{
+    return MOQ_MEDIA_INIT_SOURCE_INLINE;
+}
+
+static inline uint32_t moq_swift_media_init_source_track_property(void)
+{
+    return MOQ_MEDIA_INIT_SOURCE_TRACK_PROPERTY;
+}
+
+static inline uint32_t moq_swift_media_init_source_object_property(void)
+{
+    return MOQ_MEDIA_INIT_SOURCE_OBJECT_PROPERTY;
+}
+
 #endif

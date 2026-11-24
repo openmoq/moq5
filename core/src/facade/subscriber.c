@@ -78,6 +78,11 @@ struct moq_sub_fetch_req {
     moq_fetch_t         handle;
     moq_subscriber_t   *sub;
     sub_delivery_failure_t delivery_failure;
+    /* FETCH_OK values (moq_sub_get_fetch_result). The properties are held
+     * in result_properties until the slot is released. */
+    moq_sub_fetch_result_t result;
+    moq_rcbuf_t          *result_properties;
+    moq_result_t          result_error;
 };
 
 #define SUB_DEFAULT_MAX_FILLS      16
@@ -286,11 +291,17 @@ static moq_sub_track_t *alloc_track(moq_subscriber_t *s)
     return NULL;
 }
 
+/* Drop retained initial ACK properties and their byte-budget debit. */
+static void ack_properties_release(moq_subscriber_t *s, moq_rcbuf_t **held)
+{
+    s->retained_ack_bytes -= moq_rcbuf_len(*held);
+    moq_rcbuf_decref(*held);
+    *held = NULL;
+}
+
 static void track_result_release(moq_subscriber_t *s, moq_sub_track_t *t)
 {
-    s->retained_ack_bytes -= moq_rcbuf_len(t->initial_properties);
-    moq_rcbuf_decref(t->initial_properties);
-    t->initial_properties = NULL;
+    ack_properties_release(s, &t->initial_properties);
     memset(&t->initial_result, 0, sizeof(t->initial_result));
     t->initial_result_error = MOQ_OK;
     facade_migration_clear(&t->migration, &s->alloc);
@@ -717,6 +728,27 @@ static bool ack_bytes_fit(const moq_subscriber_t *s, size_t bytes)
     return ack_charge(&remaining, bytes) && retained_refs_fit(s, remaining);
 }
 
+/* Copy an initial ACK's Track Properties into facade storage, debiting the
+ * byte budget every retained ACK snapshot shares. BUFFER when they do not
+ * fit, the allocator's failure otherwise; nothing is held or debited on
+ * failure. Empty properties hold nothing. */
+static moq_result_t ack_properties_retain(moq_subscriber_t *s, moq_bytes_t props,
+                                          moq_rcbuf_t **held, moq_bytes_t *span)
+{
+    size_t len = props.len;
+    if (!len) return MOQ_OK;
+    size_t allocation_size;
+    if (!ack_bytes_fit(s, len) ||
+        moq_rcbuf_allocation_size(len, &allocation_size) != MOQ_OK)
+        return MOQ_ERR_BUFFER;
+    moq_result_t rc = moq_rcbuf_create(&s->alloc, props.data, len, held);
+    if (rc != MOQ_OK) return rc;
+    s->retained_ack_bytes += len; /* Checked by ack_bytes_fit. */
+    span->data = moq_rcbuf_data(*held);
+    span->len = len;
+    return MOQ_OK;
+}
+
 static moq_result_t track_result_capture(moq_subscriber_t *s,
     moq_sub_track_t *t, const moq_subscribe_ok_event_t *ack)
 {
@@ -731,20 +763,26 @@ static moq_result_t track_result_capture(moq_subscriber_t *s,
         r->flags |= MOQ_SUB_TRACK_RESULT_HAS_EXPIRES;
         r->expires_ms = ack->expires_ms;
     }
-    size_t len = ack->track_properties.len;
-    if (len) {
-        size_t allocation_size;
-        if (!ack_bytes_fit(s, len) ||
-            moq_rcbuf_allocation_size(len, &allocation_size) != MOQ_OK)
-            return MOQ_ERR_BUFFER;
-        moq_result_t rc = moq_rcbuf_create(&s->alloc, ack->track_properties.data,
-                                          len, &t->initial_properties);
-        if (rc != MOQ_OK) return rc;
-        s->retained_ack_bytes += len; /* Checked by ack_bytes_fit. */
-        r->track_properties.data = moq_rcbuf_data(t->initial_properties);
-        r->track_properties.len = len;
-    }
-    return MOQ_OK;
+    return ack_properties_retain(s, ack->track_properties,
+                                 &t->initial_properties, &r->track_properties);
+}
+
+static moq_result_t fetch_result_capture(moq_subscriber_t *s,
+    moq_sub_fetch_req_t *r, const moq_fetch_ok_event_t *ok)
+{
+    r->result.flags = MOQ_SUB_FETCH_RESULT_RESPONSE_SEEN;
+    return ack_properties_retain(s, ok->track_properties,
+                                 &r->result_properties, &r->result.track_properties);
+}
+
+/* Release a fetch slot together with its FETCH_OK result, so a later request
+ * that takes the slot starts with none. */
+static void fetch_req_free(moq_subscriber_t *s, moq_sub_fetch_req_t *r)
+{
+    ack_properties_release(s, &r->result_properties);
+    memset(&r->result, 0, sizeof(r->result));
+    r->result_error = MOQ_OK;
+    r->state = SUB_FETCH_FREE;
 }
 
 static uint64_t sub_retained_bytes(const moq_subscriber_t *s)
@@ -812,7 +850,7 @@ static void reap_failed_history(moq_subscriber_t *s)
         moq_sub_fetch_req_t *r = &s->fetch_reqs[i];
         if (r->state != SUB_FETCH_FREE &&
             delivery_failure_settled(&r->delivery_failure) &&
-            !history_has_fetch(s, r)) r->state = SUB_FETCH_FREE;
+            !history_has_fetch(s, r)) fetch_req_free(s, r);
     }
     for (size_t i = 0; i < s->fill_cap; i++) {
         moq_sub_fill_req_t *r = &s->fill_reqs[i];
@@ -1340,6 +1378,8 @@ void moq_sub_destroy(moq_subscriber_t *sub)
 
     for (size_t i = 0; i < sub->track_cap; i++)
         track_result_release(sub, &sub->tracks[i]);
+    for (size_t i = 0; i < sub->fetch_cap; i++)
+        ack_properties_release(sub, &sub->fetch_reqs[i].result_properties);
 
     /* Release pending and queued object refs. */
     if (sub->has_pending) {
@@ -2318,6 +2358,16 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                 ev.u.fetch_ok.fetch);
             if (r && r->state == SUB_FETCH_PENDING) {
                 sub->stats.fetch_ok++;
+                /* The event's properties are borrowed: copy them while the
+                 * event is held, whether or not its item can queue now. */
+                r->result_error = fetch_result_capture(sub, r, &ev.u.fetch_ok);
+                /* The core has already accepted this fetch. Preserve that
+                 * lifetime even when the local snapshot cannot be kept. */
+                r->state = SUB_FETCH_ACTIVE;
+                if (r->result_error != MOQ_OK) {
+                    moq_event_cleanup(&ev);
+                    return r->result_error;
+                }
                 if (fi_queue_full(sub)) {
                     sub->pending_fi.kind = MOQ_SUB_FETCH_OK;
                     sub->pending_fi.request = r;
@@ -2325,7 +2375,6 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                     sub->pending_fi.u.ok.end_group = ev.u.fetch_ok.end_group;
                     sub->pending_fi.u.ok.end_object = ev.u.fetch_ok.end_object;
                     sub->has_pending_fi = true;
-                    r->state = SUB_FETCH_ACTIVE;
                     moq_event_cleanup(&ev);
                     return sub_would_block(sub);
                 }
@@ -2335,7 +2384,6 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
                 f->u.ok.end_of_track = ev.u.fetch_ok.end_of_track;
                 f->u.ok.end_group = ev.u.fetch_ok.end_group;
                 f->u.ok.end_object = ev.u.fetch_ok.end_object;
-                r->state = SUB_FETCH_ACTIVE;
             }
             break;
         }
@@ -2949,6 +2997,10 @@ moq_result_t moq_sub_tick(moq_subscriber_t *sub, uint64_t now_us)
         if (sub->tracks[i].state == SUB_TRACK_ACTIVE &&
             sub->tracks[i].initial_result_error != MOQ_OK)
             return sub->tracks[i].initial_result_error;
+    for (size_t i = 0; i < sub->fetch_cap; i++)
+        if (sub->fetch_reqs[i].state == SUB_FETCH_ACTIVE &&
+            sub->fetch_reqs[i].result_error != MOQ_OK)
+            return sub->fetch_reqs[i].result_error;
 
     return owed_err;
 }
@@ -3324,7 +3376,7 @@ moq_result_t moq_sub_cancel_fetch(moq_subscriber_t *sub,
      * reusable, so a later fetch reusing the slot pointer cannot inherit them. */
     purge_fetch_items_for(sub, req);
 
-    req->state = SUB_FETCH_FREE;
+    fetch_req_free(sub, req);
     return MOQ_OK;
 }
 
@@ -3350,7 +3402,7 @@ moq_result_t moq_sub_poll_fetch(moq_subscriber_t *sub,
             out->request->delivery_failure.terminal_polled = true;
             out->request->delivery_failure.cancel_pending = false;
         } else {
-            out->request->state = SUB_FETCH_FREE;
+            fetch_req_free(sub, out->request);
         }
     }
     reap_failed_history(sub);
@@ -3362,6 +3414,26 @@ void moq_sub_fetch_item_cleanup(moq_sub_fetch_item_t *item)
 {
     if (!item) return;
     fetch_item_release_refs(item);
+}
+
+moq_result_t moq_sub_get_fetch_result(const moq_subscriber_t *sub,
+    const moq_sub_fetch_req_t *req, moq_sub_fetch_result_t *out, size_t out_size)
+{
+    if (!sub || !req || !out || out_size < MOQ_SUB_FETCH_RESULT_V0_SIZE)
+        return MOQ_ERR_INVAL;
+    /* Compare identities before dereferencing a possibly foreign pointer. */
+    for (size_t i = 0; i < sub->fetch_cap; i++) {
+        const moq_sub_fetch_req_t *r = &sub->fetch_reqs[i];
+        if (r != req) continue;
+        if (r->state == SUB_FETCH_FREE) return MOQ_ERR_INVAL;
+        if (r->result_error != MOQ_OK) return r->result_error;
+        moq_sub_fetch_result_t result = r->result;
+        size_t n = out_size < sizeof(result) ? out_size : sizeof(result);
+        result.struct_size = (uint32_t)n;
+        memcpy(out, &result, n);
+        return MOQ_OK;
+    }
+    return MOQ_ERR_INVAL;
 }
 
 /* -- Fills ---------------------------------------------------------- */

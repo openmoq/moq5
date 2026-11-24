@@ -46,7 +46,10 @@ if(MOQ_PYTHON_BUILD_TESTS)
     target_compile_definitions(_native_fixture PRIVATE MOQ_PYTHON_TESTING=1)
     target_include_directories(_native_fixture PRIVATE tests
         $<TARGET_PROPERTY:moq::service,INTERFACE_INCLUDE_DIRECTORIES>)
-    target_link_libraries(_native_fixture PRIVATE moq::loc Threads::Threads)
+    # moq::msf for the bridge's extension-list lookup; its link closure
+    # (moq::media-object) carries the moq::loc the fixture uses. Naming
+    # moq::loc beside it would repeat that archive on a static link line.
+    target_link_libraries(_native_fixture PRIVATE moq::msf Threads::Threads)
     set_target_properties(_native_fixture PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-package/$<CONFIG>/moq5")
     file(GLOB python_sources CONFIGURE_DEPENDS "src/moq5/*.py")

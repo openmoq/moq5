@@ -202,3 +202,166 @@ struct ObjectCopyOutTests {
         #expect(storage.withMediaBytes { Data($0) } == Data([1, 2]))
     }
 }
+
+@Suite("MSF-02 description and track-event copies")
+struct MSF02ReceiverCopyTests {
+
+    /// A description stamped at the full size, naming a video track whose
+    /// extension list holds `supplement` (when given).
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    private func description(
+        _ arena: CBytesArena,
+        extensions: UnsafePointer<moq_msf_track_ext_t>? = nil, count: Int = 0
+    ) -> moq_media_track_desc_t {
+        var desc = moq_media_track_desc_t()
+        desc.struct_size = UInt32(MemoryLayout<moq_media_track_desc_t>.size)
+        desc.name = arena.bytes("video")
+        desc.info.media_type = MOQ_MEDIA_TYPE_VIDEO
+        desc.info.packaging = MOQ_MEDIA_PACKAGING_RAW
+        desc.extensions = extensions
+        desc.extension_count = count
+        return desc
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A description copies its generation, init source and encryption fields")
+    func generationInitSourceAndEncryption() throws {
+        let arena = CBytesArena()
+        let supplement = UnsafeMutablePointer<moq_msf_track_supplement_t>.allocate(capacity: 1)
+        defer { supplement.deallocate() }
+        supplement.initialize(to: moq_msf_track_supplement_t())
+        moq_msf_track_supplement_init_sized(
+            supplement, MemoryLayout<moq_msf_track_supplement_t>.size)
+        supplement.pointee.has_encryption_scheme = true
+        supplement.pointee.encryption_scheme = arena.bytes("moq-secure-objects")
+        supplement.pointee.has_cipher_suite = true
+        supplement.pointee.cipher_suite = arena.bytes("aes-128-gcm-sha256")
+        supplement.pointee.has_key_id = true
+        supplement.pointee.key_id = arena.bytes("key-1")
+        supplement.pointee.has_track_base_key = true
+        supplement.pointee.track_base_key = arena.bytes("MTIzNDU2Nzg5MDEyMzQ1Ng==")
+        let ext = UnsafeMutablePointer<moq_msf_track_ext_t>.allocate(capacity: 1)
+        defer { ext.deallocate() }
+        ext.initialize(to: moq_msf_track_ext_t())
+        ext.pointee.kind = UInt32(MOQ_MSF_EXT_SUPPLEMENT)
+        ext.pointee.u.supplement = UnsafePointer(supplement)
+
+        var desc = description(arena, extensions: UnsafePointer(ext), count: 1)
+        desc.config_generation = 2
+        desc.init_source = moq_swift_media_init_source_track_property()
+        desc.init_property_type = 0x0D
+        let copy = try #require(withExtendedLifetime(arena) { copyTrackDescription(desc) })
+        #expect(copy.configGeneration == 2)
+        #expect(copy.initSource == .trackProperty)
+        #expect(copy.initPropertyType == 0x0D)
+        #expect(copy.encryptionScheme == "moq-secure-objects")
+        #expect(copy.cipherSuite == "aes-128-gcm-sha256")
+        #expect(copy.keyID == "key-1")
+        #expect(copy.trackBaseKey?.value == "MTIzNDU2Nzg5MDEyMzQ1Ng==")
+        #expect(!String(describing: copy).contains("MTIzNDU2Nzg5MDEyMzQ1Ng=="))
+
+        /* Each field is gated by its own has_ flag; a present empty value
+         * is empty, not absent. */
+        supplement.pointee.has_cipher_suite = false
+        supplement.pointee.key_id = moq_bytes_t(data: nil, len: 0)
+        let partial = try #require(withExtendedLifetime(arena) { copyTrackDescription(desc) })
+        #expect(partial.cipherSuite == nil)
+        #expect(partial.keyID == "")
+        #expect(partial.encryptionScheme == "moq-secure-objects")
+
+        /* A record below its first published size is not read. */
+        let v0 = MemoryLayout<moq_msf_track_supplement_t>.offset(
+            of: \moq_msf_track_supplement_t.malformed)! + MemoryLayout<UInt32>.size
+        supplement.pointee.struct_size = UInt32(v0) - 1
+        let short = try #require(withExtendedLifetime(arena) { copyTrackDescription(desc) })
+        #expect(short.encryptionScheme == nil && short.keyID == nil && short.trackBaseKey == nil)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Each init source maps; an unknown one is kept")
+    func initSources() throws {
+        let arena = CBytesArena()
+        let cases: [(UInt32, InitSource)] = [
+            (moq_swift_media_init_source_none(), .none),
+            (moq_swift_media_init_source_inline(), .inline),
+            (moq_swift_media_init_source_track_property(), .trackProperty),
+            (moq_swift_media_init_source_object_property(), .objectProperty),
+            (9, .unknown(9)),
+        ]
+        for (raw, expected) in cases {
+            var desc = description(arena)
+            desc.init_source = raw
+            let copy = try #require(withExtendedLifetime(arena) { copyTrackDescription(desc) })
+            #expect(copy.initSource == expected)
+        }
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("Fields the description's stamp does not cover stay nil")
+    func stampGating() throws {
+        let arena = CBytesArena()
+        var desc = description(arena)
+        desc.config_generation = 5
+        desc.init_source = moq_swift_media_init_source_inline()
+        desc.init_property_type = 7
+        desc.struct_size = UInt32(MemoryLayout<moq_media_track_desc_t>.offset(
+            of: \moq_media_track_desc_t.init_property_type)!)
+        let short = try #require(withExtendedLifetime(arena) { copyTrackDescription(desc) })
+        #expect(short.configGeneration == nil)
+        #expect(short.initSource == nil)
+        #expect(short.initPropertyType == nil)
+        desc.struct_size = UInt32(MemoryLayout<moq_media_track_desc_t>.size)
+        let full = try #require(withExtendedLifetime(arena) { copyTrackDescription(desc) })
+        #expect(full.configGeneration == 5 && full.initSource == .inline)
+        #expect(full.initPropertyType == 7)
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A replacement's REMOVED names its successor; the ADDED names its predecessor")
+    func replacementEvents() throws {
+        let arena = CBytesArena()
+        var desc = description(arena)
+        desc.config_generation = 3
+        let old = try #require(OpaquePointer(bitPattern: 0x1000))
+        let new = try #require(OpaquePointer(bitPattern: 0x2000))
+        let fullSize = UInt32(MemoryLayout<moq_media_track_event_t>.size)
+        try withUnsafePointer(to: &desc) { descPointer in
+            var removed = moq_media_track_event_t()
+            removed.struct_size = fullSize
+            removed.kind = MOQ_MEDIA_TRACK_REMOVED
+            removed.track = old
+            removed.replaced_by = new
+            let r = try #require(copyReceiverTrackEvent(removed))
+            #expect(r.handleID == 0x1000)
+            #expect(r.replacedByHandleID == 0x2000)
+            #expect(r.replacesHandleID == nil)
+
+            var added = moq_media_track_event_t()
+            added.struct_size = fullSize
+            added.kind = MOQ_MEDIA_TRACK_ADDED
+            added.track = new
+            added.desc = descPointer
+            added.replaces = old
+            let a = try #require(copyReceiverTrackEvent(added))
+            #expect(a.handleID == 0x2000)
+            #expect(a.replacesHandleID == 0x1000)
+            #expect(a.replacedByHandleID == nil)
+
+            var updated = moq_media_track_event_t()
+            updated.struct_size = fullSize
+            updated.kind = MOQ_MEDIA_TRACK_UPDATED
+            updated.track = new
+            updated.desc = descPointer
+            updated.config_generation = 3
+            let u = try #require(copyReceiverTrackEvent(updated))
+            #expect(u.configGeneration == 3)
+            #expect(u.trackDescription?.configGeneration == 3)
+
+            /* A stamp short of replaced_by carries neither link. */
+            removed.struct_size = UInt32(MemoryLayout<moq_media_track_event_t>.offset(
+                of: \moq_media_track_event_t.replaced_by)!)
+            let short = try #require(copyReceiverTrackEvent(removed))
+            #expect(short.replacedByHandleID == nil && short.replacesHandleID == nil)
+        }
+    }
+}

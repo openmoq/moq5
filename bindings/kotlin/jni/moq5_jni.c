@@ -1789,13 +1789,14 @@ static jint JNICALL moq5_impl_nativeReceiverClose(JNIEnv *env, jobject self, jlo
  * (see moq5_receiver_child.h; the token is minted on the bridge's first sight
  * of the handle, event or object). The slot orders below are the ones the
  * Kotlin carrier tables name. */
-#define MOQ5_RX_EV_SCALARS 23
+#define MOQ5_RX_EV_SCALARS 26
 
 /* The appended track-event fields a poll's stamp covered, one bit each (slot
  * 12). A field is published only when its whole extent lies inside the
  * struct_size the library stamped; an absent bit means "not observed", which
  * the carrier keeps distinct from a present zero. The fill-loss summary is
- * one block, covered only through fill_unreported_loss_object. */
+ * one block, covered only through fill_unreported_loss_object; the
+ * replacement links are one block, covered only through replaced_by. */
 #define MOQ5_EV_HAS_LOCAL_RESULT      0x01
 #define MOQ5_EV_HAS_INITIATING_ID     0x02
 #define MOQ5_EV_HAS_FILL_REASON       0x04
@@ -1804,10 +1805,25 @@ static jint JNICALL moq5_impl_nativeReceiverClose(JNIEnv *env, jobject self, jlo
 #define MOQ5_EV_HAS_DELIVERY_ORIGIN   0x20
 #define MOQ5_EV_HAS_DELIVERY_ID       0x40
 #define MOQ5_EV_HAS_FILL_LOSS         0x80
+#define MOQ5_EV_HAS_REPLACEMENT       0x100
 #define MOQ5_EV_COVERS(ev, field) \
     ((size_t)(ev).struct_size >= offsetof(moq_media_track_event_t, field) + sizeof((ev).field))
-#define MOQ5_TD_SCALARS 35
-#define MOQ5_TD_FIXED_BYTES 13
+
+/* The describe row: 39 scalars, 17 fixed byte fields. Slot 38 is a mask of
+ * the appended fields the copy carried: the generation block (slots 35-37)
+ * when the copy's stamp covered it, through config_generation, and each
+ * encryption field of the track's supplement record (byte fields 13-16) when
+ * the catalog carried it. An absent field's slots are zero and its byte
+ * field empty. */
+#define MOQ5_TD_SCALARS 39
+#define MOQ5_TD_FIXED_BYTES 17
+#define MOQ5_TD_HAS_GENERATION        0x01
+#define MOQ5_TD_HAS_ENCRYPTION_SCHEME 0x02
+#define MOQ5_TD_HAS_CIPHER_SUITE      0x04
+#define MOQ5_TD_HAS_KEY_ID            0x08
+#define MOQ5_TD_HAS_TRACK_BASE_KEY    0x10
+#define MOQ5_TD_COVERS(d, field) \
+    ((size_t)(d)->struct_size >= offsetof(moq_media_track_desc_t, field) + sizeof((d)->field))
 
 /* The borrowed token for `track` under the receiver child `rx`, minting one on
  * the bridge's FIRST SIGHT of the handle -- from a track event or from an
@@ -1868,14 +1884,23 @@ static jint JNICALL moq5_impl_nativeReceiverPollTrack(JNIEnv *env, jobject self,
     memset(out, 0, sizeof out);
     if (rc == MOQ_OK) {
         moq5_handle_t tok = MOQ5_HANDLE_INVALID;
-        if (ev.track != NULL) {
-            rr = moq5_track_token(child, (moq5_handle_t)rx, ev.track, &tok);
-            if (rr != MOQ5_REG_OK) {
-                /* The event is consumed and cannot be delivered without its
-                 * token: the registry's refusal, and nothing published. */
-                (void)moq5_reg_release((moq5_handle_t)rx);
-                return (jint)(MOQ5_ERR_REGISTRY_BASE + (int)rr);
-            }
+        moq5_handle_t replaces_tok = MOQ5_HANDLE_INVALID;
+        moq5_handle_t replaced_by_tok = MOQ5_HANDLE_INVALID;
+        const bool replacement = MOQ5_EV_COVERS(ev, replaced_by);
+        rr = MOQ5_REG_OK;
+        if (ev.track != NULL) rr = moq5_track_token(child, (moq5_handle_t)rx, ev.track, &tok);
+        /* A replacement names the other handle of the pair: the successor on
+         * the REMOVED, before its own ADDED is polled (minted here on first
+         * sight, as an object's track is), and the predecessor on the ADDED. */
+        if (rr == MOQ5_REG_OK && replacement && ev.replaces != NULL)
+            rr = moq5_track_token(child, (moq5_handle_t)rx, ev.replaces, &replaces_tok);
+        if (rr == MOQ5_REG_OK && replacement && ev.replaced_by != NULL)
+            rr = moq5_track_token(child, (moq5_handle_t)rx, ev.replaced_by, &replaced_by_tok);
+        if (rr != MOQ5_REG_OK) {
+            /* The event is consumed and cannot be delivered without its
+             * tokens: the registry's refusal, and nothing published. */
+            (void)moq5_reg_release((moq5_handle_t)rx);
+            return (jint)(MOQ5_ERR_REGISTRY_BASE + (int)rr);
         }
         out[0] = (jlong)ev.kind;
         out[1] = (jlong)tok;
@@ -1923,8 +1948,15 @@ static jint JNICALL moq5_impl_nativeReceiverPollTrack(JNIEnv *env, jobject self,
                 out[21] = (jlong)ev.fill_unreported_loss_group;
                 out[22] = (jlong)ev.fill_unreported_loss_object;
             }
+            if (replacement) {
+                has |= MOQ5_EV_HAS_REPLACEMENT;
+                out[24] = (jlong)replaces_tok;
+                out[25] = (jlong)replaced_by_tok;
+            }
             out[12] = has;
         }
+        /* In the event's v0 prefix: always written. */
+        out[23] = (jlong)ev.config_generation;
         (*env)->SetLongArrayRegion(env, scalars, 0, (jsize)MOQ5_RX_EV_SCALARS, out);
     } else if (rc == MOQ_ERR_CLOSED) {
         out[10] = moq_media_receiver_is_fatal(child->r) ? 1 : 0;
@@ -2061,6 +2093,19 @@ static jobjectArray JNICALL moq5_impl_nativeTrackDescribe(JNIEnv *env, jobject s
             (d->cmaf != NULL && d->cmaf->struct_size >= MOQ_CMAF_INIT_INFO_V0_SIZE) ? d->cmaf : NULL;
         const bool init = d->init_data.len > 0;
         const bool cenc = ci != NULL && ci->has_cenc;
+        /* The supplement record is handle-owned, like the other spans of the
+         * copy, and read only when the copy covers the extension list and the
+         * record covers its first published size (all four fields lie in it).
+         * trackBaseKey is key material: it is copied into its byte field and
+         * nowhere else. */
+        const moq_msf_track_supplement_t *sup =
+            MOQ5_TD_COVERS(d, extension_count) ? moq_msf_ext_supplement(d->extensions, d->extension_count) : NULL;
+        const bool has_sup = sup != NULL && sup->struct_size >= MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE;
+        const bool scheme = has_sup && sup->has_encryption_scheme;
+        const bool suite = has_sup && sup->has_cipher_suite;
+        const bool key_id = has_sup && sup->has_key_id;
+        const bool base_key = has_sup && sup->has_track_base_key;
+        const bool generation = MOQ5_TD_COVERS(d, config_generation);
         const moq_bytes_t fields[MOQ5_TD_FIXED_BYTES] = {
             d->name, d->role, d->codec, d->lang, d->label, d->packaging, d->mime_type,
             d->event_type, d->channel_config,
@@ -2068,6 +2113,10 @@ static jobjectArray JNICALL moq5_impl_nativeTrackDescribe(JNIEnv *env, jobject s
             init ? d->codec_config : empty,
             cenc ? ci->scheme : empty,
             cenc ? ci->default_kid : empty,
+            scheme ? sup->encryption_scheme : empty,
+            suite ? sup->cipher_suite : empty,
+            key_id ? sup->key_id : empty,
+            base_key ? sup->track_base_key : empty,
         };
         for (i = 0; i < (jsize)MOQ5_TD_FIXED_BYTES; i++) {
             if (!moq5_put_bytes(env, arr, i, fields[i])) goto nomem;
@@ -2116,6 +2165,16 @@ static jobjectArray JNICALL moq5_impl_nativeTrackDescribe(JNIEnv *env, jobject s
         out[32] = d->has_track_duration ? 1 : 0;
         out[33] = (jlong)d->track_duration_ms;
         out[34] = d->is_live ? 1 : 0;
+        if (generation) {
+            out[35] = (jlong)d->config_generation;
+            out[36] = (jlong)d->init_source;
+            out[37] = (jlong)d->init_property_type; /* all 64 bits */
+        }
+        out[38] = (generation ? MOQ5_TD_HAS_GENERATION : 0) |
+                  (scheme ? MOQ5_TD_HAS_ENCRYPTION_SCHEME : 0) |
+                  (suite ? MOQ5_TD_HAS_CIPHER_SUITE : 0) |
+                  (key_id ? MOQ5_TD_HAS_KEY_ID : 0) |
+                  (base_key ? MOQ5_TD_HAS_TRACK_BASE_KEY : 0);
         (*env)->SetLongArrayRegion(env, scalars, 0, (jsize)MOQ5_TD_SCALARS, out);
     }
     (void)moq5_reg_release((moq5_handle_t)track);
@@ -2496,8 +2555,13 @@ static jint JNICALL moq5_impl_nativeReceiverPollMediaTimeline(JNIEnv *env, jobje
  *
  * ONE moq_media_receiver_get_stats read under the receiver pin, every field
  * of moq_media_receiver_stats_t published exactly once into the block, in
- * the struct's order; the two booleans as 0/1. */
-#define MOQ5_RX_STATS_SCALARS 16
+ * the struct's order; the two booleans as 0/1. The block appended after
+ * tracks_malformed is published only when the library's stamp covered all of
+ * it, through loc_order_forced: slot 16 says so (1), and its slots are zero
+ * otherwise. The reserved field after catalog_revision has no slot. */
+#define MOQ5_RX_STATS_SCALARS 27
+#define MOQ5_RX_STATS_COVERS(st, field) \
+    ((size_t)(st).struct_size >= offsetof(moq_media_receiver_stats_t, field) + sizeof((st).field))
 
 static jint JNICALL moq5_impl_nativeReceiverStats(JNIEnv *env, jobject self, jlong root, jlong rx,
                                                   jlongArray scalars)
@@ -2535,6 +2599,20 @@ static jint JNICALL moq5_impl_nativeReceiverStats(JNIEnv *env, jobject self, jlo
         out[13] = (jlong)st.gap_tails_unknown;
         out[14] = (jlong)st.reorder_refused;
         out[15] = (jlong)st.tracks_malformed;
+        memset(&out[16], 0, (MOQ5_RX_STATS_SCALARS - 16) * sizeof out[0]);
+        if (MOQ5_RX_STATS_COVERS(st, loc_order_forced)) {
+            out[16] = 1;
+            out[17] = (jlong)st.catalog_revision;
+            out[18] = (jlong)st.objects_decompressed;
+            out[19] = (jlong)st.decompress_failures;
+            out[20] = (jlong)st.decompress_limited;
+            out[21] = (jlong)st.compression_refused;
+            out[22] = (jlong)st.compression_conflicts;
+            out[23] = (jlong)st.compression_ignored;
+            out[24] = (jlong)st.event_timeline_headers_ignored;
+            out[25] = (jlong)st.loc_order_gaps;
+            out[26] = (jlong)st.loc_order_forced;
+        }
         (*env)->SetLongArrayRegion(env, scalars, 0, (jsize)MOQ5_RX_STATS_SCALARS, out);
     }
     rr = moq5_reg_release((moq5_handle_t)rx);

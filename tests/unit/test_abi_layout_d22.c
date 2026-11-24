@@ -933,7 +933,13 @@ PIN_THROUGH(moq_media_track_event_t, fill_unreported_loss_object,
 PIN_AFTER(moq_media_track_event_t, fill_unreported_loss_object, has_done_status);
 PIN_AT(moq_media_track_event_t, has_done_status, 168, 148, 160);
 PIN_AT(moq_media_track_event_t, done_status, 176, 156, 168);
-PIN_SIZE(moq_media_track_event_t, 184, 164, 176);
+/* The replacement block starts at the complete sizeof through done_status,
+ * which ends with no tail padding. */
+PIN_THROUGH(moq_media_track_event_t, done_status, 184, 164, 176, 8, 4, 8);
+PIN_AFTER(moq_media_track_event_t, done_status, replaces);
+PIN_AT(moq_media_track_event_t, replaces, 184, 164, 176);
+PIN_AT(moq_media_track_event_t, replaced_by, 192, 168, 180);
+PIN_SIZE(moq_media_track_event_t, 200, 172, 184);
 #endif
 #ifdef ABI_HAVE_SIM
 PIN_AT(moq_simpair_cfg_t, server_defer_subscription_updates, 168, 136, 152);
@@ -1074,6 +1080,14 @@ _Static_assert(sizeof(((moq_sub_local_failure_t *)0)->owner_kind) == 4,
                "local failure kind is enum-mode independent");
 _Static_assert(sizeof(((moq_sub_local_failure_t *)0)->local_result) == 4,
                "local result has signed 32-bit storage");
+/* A fetch request's FETCH_OK result: v0 is the whole record. */
+PIN_AT(moq_sub_fetch_result_t, struct_size, 0, 0, 0);
+PIN_AT(moq_sub_fetch_result_t, flags, 4, 4, 4);
+PIN_AT(moq_sub_fetch_result_t, track_properties, 8, 8, 8);
+PIN_SIZE(moq_sub_fetch_result_t, 24, 16, 16);
+PIN_V0(MOQ_SUB_FETCH_RESULT_V0_SIZE, 24, 16, 16);
+_Static_assert(_Alignof(moq_sub_fetch_result_t) == sizeof(void *),
+               "fetch result alignment");
 
 /* -- INCLUDE_PROPERTIES and TRACK_STATUS_OK Track Properties ------------ *
  * Each request config gains the INCLUDE_PROPERTIES pair after its previous
@@ -1121,6 +1135,18 @@ PIN_SIZE(moq_pub_new_group_request_info_t, 24, 24, 24);
 
 #ifdef ABI_HAVE_MEDIA_RECEIVER
 PIN_AFTER(moq_media_receiver_stats_t, catalog_complete, tracks_malformed);
+/* The catalog-revision block starts at the complete sizeof through
+ * tracks_malformed, which ends with no tail padding. */
+PIN_AFTER(moq_media_receiver_stats_t, tracks_malformed, catalog_revision);
+_Static_assert(offsetof(moq_media_receiver_stats_t, catalog_revision) ==
+               ABI_SIZEOF_THROUGH(moq_media_receiver_stats_t, tracks_malformed),
+               "moq_media_receiver_stats_t: catalog_revision at the old sizeof");
+_Static_assert(offsetof(moq_media_receiver_stats_t, objects_decompressed) ==
+               offsetof(moq_media_receiver_stats_t, catalog_revision) + 8,
+               "moq_media_receiver_stats_t: reserved slot after catalog_revision");
+_Static_assert(sizeof(moq_media_receiver_stats_t) ==
+               offsetof(moq_media_receiver_stats_t, loc_order_forced) + 8,
+               "moq_media_receiver_stats_t: ends at loc_order_forced");
 /* The receiver companion starts at the complete sizeof through the MPEG2TS
  * block (104 LP64, 72 i386, 80 ARM; i386 short enums shift it by 4), never
  * in that layout's tail padding. */
@@ -1162,7 +1188,13 @@ PIN_AFTER(moq_media_track_desc_t, alt_group, has_render_group);
 PIN_AT(moq_media_track_desc_t, has_render_group, 440, 300, 312);
 PIN_AT(moq_media_track_desc_t, render_group, 444, 304, 316);
 PIN_AT(moq_media_track_desc_t, has_label, 448, 308, 320);
-PIN_SIZE(moq_media_track_desc_t, 456, 312, 328);
+/* The init-source block starts at the complete sizeof through has_label. */
+PIN_THROUGH(moq_media_track_desc_t, has_label, 456, 312, 328, 8, 4, 8);
+PIN_AFTER(moq_media_track_desc_t, has_label, init_property_type);
+PIN_AT(moq_media_track_desc_t, init_property_type, 456, 312, 328);
+PIN_AT(moq_media_track_desc_t, init_source, 464, 320, 336);
+PIN_AT(moq_media_track_desc_t, config_generation, 468, 324, 340);
+PIN_SIZE(moq_media_track_desc_t, 472, 328, 344);
 /* The parsed CMAF record grows on its own: sample_entry starts at the v0
  * floor through default_kid, which leaves no tail padding behind. */
 PIN_THROUGH(moq_cmaf_init_info_t, default_kid, 96, 64, 64, 8, 4, 4);
@@ -1211,7 +1243,14 @@ PIN_AT(moq_media_sender_cfg_t, resource_auth, 184, 112, 120);
 PIN_AFTER(moq_media_sender_cfg_t, resource_auth, has_initial_group_id);
 PIN_AT(moq_media_sender_cfg_t, has_initial_group_id, 196, 120, 128);
 PIN_AT(moq_media_sender_cfg_t, initial_group_id, 200, 124, 136);
-PIN_SIZE(moq_media_sender_cfg_t, 208, 132, 144);
+/* The layout through initial_group_id ends without tail padding on every
+ * target, so catalog_revision starts exactly at its sizeof; the reserved
+ * bytes after it fill the new layout out to the struct's alignment. */
+PIN_THROUGH(moq_media_sender_cfg_t, initial_group_id, 208, 132, 144, 8, 4, 8);
+PIN_AFTER(moq_media_sender_cfg_t, initial_group_id, catalog_revision);
+PIN_AT(moq_media_sender_cfg_t, catalog_revision, 208, 132, 144);
+PIN_AT(moq_media_sender_cfg_t, _reserved_catalog_revision, 212, 136, 148);
+PIN_SIZE(moq_media_sender_cfg_t, 216, 140, 152);
 /* The media track's Track Properties start exactly at the sizeof of the
  * layout that ends at the MPEG2TS block (its enum members change that sizeof
  * under short enums, so the pin is relational), never in its tail padding.

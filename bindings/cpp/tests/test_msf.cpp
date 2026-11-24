@@ -2,6 +2,9 @@
 #include "test_support.hpp"
 
 #include <cstring>
+#include <span>
+#include <string>
+#include <string_view>
 
 int main()
 {
@@ -664,6 +667,321 @@ int main()
         auto old = moq::msf::parse(moq::bytes_view(
             R"({"version":"1","tracks":[]})"));
         MOQ_CHECK(old.ok() && old->revision() == MOQ_MSF_REVISION_01);
+    }
+
+    // MSF-02 authoring: the supplement fields, Number "depends" entries, the
+    // revision and the publish tracks survive encode and parse.
+    {
+        moq::msf::track t[2];
+        t[0].name = "video"; t[0].packaging = "loc"; t[0].is_live = true;
+        t[0].has_render_group = true; t[0].render_group = 1;
+        t[0].has_alt_group = true; t[0].alt_group = 4;
+        t[0].has_packaging_metadata = true;
+        t[0].packaging_metadata = "streamMapping=object";
+        t[0].keyframe_spacing = 30;
+        t[0].accessible_window_ms = 60000;
+        t[0].has_encryption_scheme = true; t[0].encryption_scheme = "moq-secure-objects";
+        t[0].has_cipher_suite = true; t[0].cipher_suite = "aes-128-gcm-sha256";
+        t[0].has_key_id = true; t[0].key_id = "kid-1";
+        t[0].has_track_base_key = true; t[0].track_base_key = "MTIzNDU2Nzg5MDEyMzQ1Ng==";
+        const moq::bytes_view deps[] = {"video"};
+        t[1].name = "captions"; t[1].packaging = "loc"; t[1].is_live = true;
+        t[1].depends = deps; t[1].depends_count = 1;
+        t[1].depends_render_groups = {1};
+        moq::msf::track pub;
+        pub.name = "qoe"; pub.packaging = "moqlog"; pub.is_live = true;
+
+        moq::msf::catalog cat;
+        cat.revision = MOQ_MSF_REVISION_02;
+        cat.tracks = t; cat.track_count = 2;
+        cat.publish_tracks = &pub; cat.publish_track_count = 1;
+        auto enc = moq::msf::encode(cat);
+        MOQ_CHECK(enc.ok());
+        if (enc.ok()) {
+            std::string_view json(reinterpret_cast<const char *>(enc->data()), enc->size());
+            MOQ_CHECK(json.find(R"("version":"draft-02")") != std::string_view::npos);
+            MOQ_CHECK(json.find(R"("depends":["video",1])") != std::string_view::npos);
+            auto dec = moq::msf::parse(moq::bytes_view(enc->data(), enc->size()));
+            MOQ_CHECK(dec.ok());
+            if (dec.ok()) {
+                MOQ_CHECK(dec->revision() == MOQ_MSF_REVISION_02);
+                MOQ_CHECK(dec->publish_track_count() == 1);
+                MOQ_CHECK(dec->publish_track(0).name == "qoe");
+                MOQ_CHECK(dec->publish_track(0).supplement == nullptr);
+                const moq_msf_track_supplement_t *s = dec->track(0).supplement;
+                MOQ_CHECK(s != nullptr);
+                if (s) {
+                    namespace d = moq::msf::detail;
+                    MOQ_CHECK(s->has_packaging_metadata &&
+                              d::sv(s->packaging_metadata) == "streamMapping=object");
+                    MOQ_CHECK(s->has_keyframe_spacing && s->keyframe_spacing == 30);
+                    MOQ_CHECK(s->has_accessible_window_ms && s->accessible_window_ms == 60000);
+                    MOQ_CHECK(s->has_encryption_scheme &&
+                              d::sv(s->encryption_scheme) == "moq-secure-objects");
+                    MOQ_CHECK(s->has_cipher_suite && d::sv(s->cipher_suite) == "aes-128-gcm-sha256");
+                    MOQ_CHECK(s->has_key_id && d::sv(s->key_id) == "kid-1");
+                    MOQ_CHECK(s->has_track_base_key &&
+                              d::sv(s->track_base_key) == "MTIzNDU2Nzg5MDEyMzQ1Ng==");
+                    MOQ_CHECK(s->depends_render_group_count == 0);
+                }
+                auto cv = dec->track(1);
+                MOQ_CHECK(cv.depends.size() == 1 && cv.depends[0] == "video");
+                MOQ_CHECK(cv.supplement != nullptr);
+                if (cv.supplement) {
+                    MOQ_CHECK(cv.supplement->depends_render_group_count == 1);
+                    MOQ_CHECK(cv.supplement->depends_render_groups &&
+                              cv.supplement->depends_render_groups[0] == 1);
+                    MOQ_CHECK(!cv.supplement->has_keyframe_spacing &&
+                              !cv.supplement->has_encryption_scheme);
+                }
+            }
+        }
+    }
+
+    // MSF-01 encode: the four encryption fields are MSF-01 fields too and are
+    // carried; the MSF-02-only fields are refused, and so are publish tracks
+    // on a delta.
+    {
+        moq::msf::track t;
+        t.name = "v"; t.packaging = "loc"; t.is_live = true;
+        t.has_encryption_scheme = true; t.encryption_scheme = "moq-secure-objects";
+        t.has_key_id = true; t.key_id = "k";
+        moq::msf::catalog cat;
+        cat.tracks = &t; cat.track_count = 1;
+        MOQ_CHECK(cat.revision == MOQ_MSF_REVISION_01);
+        auto enc = moq::msf::encode(cat);
+        MOQ_CHECK(enc.ok());
+        if (enc.ok()) {
+            auto dec = moq::msf::parse(moq::bytes_view(enc->data(), enc->size()));
+            MOQ_CHECK(dec.ok() && dec->revision() == MOQ_MSF_REVISION_01);
+            if (dec.ok()) {
+                const moq_msf_track_supplement_t *s = dec->track(0).supplement;
+                MOQ_CHECK(s && s->has_encryption_scheme && s->has_key_id &&
+                          moq::msf::detail::sv(s->key_id) == "k");
+            }
+        }
+
+        moq::msf::track k = t;
+        k.keyframe_spacing = 15;
+        cat.tracks = &k;
+        auto ks = moq::msf::encode(cat);
+        MOQ_CHECK(!ks.ok() && ks.error().code() == moq::errc::invalid);
+
+        moq::msf::track g;
+        g.name = "v"; g.packaging = "loc"; g.is_live = true;
+        g.has_render_group = true; g.render_group = 1;
+        g.depends_render_groups = {1};
+        cat.tracks = &g;
+        auto gs = moq::msf::encode(cat);
+        MOQ_CHECK(!gs.ok() && gs.error().code() == moq::errc::invalid);
+
+        moq::msf::track pm;
+        pm.name = "v"; pm.packaging = "loc"; pm.is_live = true;
+        pm.has_packaging_metadata = true; pm.packaging_metadata = "streamMapping=group";
+        cat.tracks = &pm;
+        auto ps = moq::msf::encode(cat);
+        MOQ_CHECK(!ps.ok() && ps.error().code() == moq::errc::invalid);
+
+        moq::msf::track rm;
+        rm.name = "v";
+        moq::msf::delta_op op;
+        op.kind = moq::msf::delta_op_kind::remove;
+        op.tracks = &rm; op.track_count = 1;
+        moq::msf::catalog delta;
+        delta.revision = MOQ_MSF_REVISION_02;
+        delta.has_generated_at = true; delta.generated_at = 2;
+        delta.delta_update = &op; delta.delta_update_count = 1;
+        MOQ_CHECK(moq::msf::encode(delta).ok());
+        delta.publish_tracks = &t; delta.publish_track_count = 1;
+        auto pd = moq::msf::encode(delta);
+        MOQ_CHECK(!pd.ok() && pd.error().code() == moq::errc::invalid);
+    }
+
+    // An MSF-02 "update" op authored, parsed and applied: the target is found
+    // by its Full Track Name, a track without "namespace" inheriting the
+    // catalog namespace in cfg.
+    {
+        auto base = moq::msf::parse(moq::bytes_view(
+            R"({"version":"draft-02","tracks":[{"name":"video","packaging":"loc",)"
+            R"("isLive":true,"bitrate":1000,"keyframeSpacing":30}]})"));
+        MOQ_CHECK(base.ok());
+
+        moq::msf::track up;
+        up.has_parent_name = true; up.parent_name = "video";
+        up.has_parent_namespace = true; up.parent_namespace = "live/cam1";
+        up.has_bitrate = true; up.bitrate = 2000;
+        up.keyframe_spacing = 60;
+        up.has_key_id = true; up.key_id = "k2";
+        moq::msf::delta_op op;
+        op.kind = moq::msf::delta_op_kind::update;
+        op.tracks = &up; op.track_count = 1;
+        moq::msf::catalog dcat;
+        dcat.revision = MOQ_MSF_REVISION_02;
+        dcat.has_generated_at = true; dcat.generated_at = 7;
+        dcat.delta_update = &op; dcat.delta_update_count = 1;
+        auto denc = moq::msf::encode(dcat);
+        MOQ_CHECK(denc.ok());
+        if (base.ok() && denc.ok()) {
+            auto delta = moq::msf::parse(moq::bytes_view(denc->data(), denc->size()));
+            MOQ_CHECK(delta.ok());
+            if (delta.ok()) {
+                MOQ_CHECK(delta->revision() == MOQ_MSF_REVISION_02);
+                MOQ_CHECK(delta->delta_op(0).kind() == moq::msf::delta_op_kind::update);
+                auto ut = delta->delta_op(0).track(0);
+                MOQ_CHECK(ut.parent_namespace.value_or("") == "live/cam1");
+                MOQ_CHECK(ut.supplement && ut.supplement->keyframe_spacing == 60);
+
+                // Without the catalog namespace the target is unknown.
+                auto none = moq::msf::apply_delta(*base, *delta);
+                MOQ_CHECK(!none.ok() && none.error().code() == moq::errc::protocol);
+
+                moq::msf::validate_cfg cfg;
+                cfg.catalog_namespace = moq::namespace_name{"live", "cam1"};
+                auto eff = moq::msf::apply_delta(*base, *delta, cfg);
+                MOQ_CHECK(eff.ok());
+                if (eff.ok()) {
+                    MOQ_CHECK(!eff->is_delta());
+                    MOQ_CHECK(eff->revision() == MOQ_MSF_REVISION_02);
+                    MOQ_CHECK(eff->track_count() == 1);
+                    auto v = eff->track(0);
+                    MOQ_CHECK(v.name == "video" && v.bitrate.value_or(0) == 2000);
+                    MOQ_CHECK(v.supplement && v.supplement->keyframe_spacing == 60 &&
+                              moq::msf::detail::sv(v.supplement->key_id) == "k2");
+                }
+
+                // A delta within its limit applies.
+                moq::msf::validate_cfg tight = cfg;
+                tight.max_delta_ops = 1;
+                MOQ_CHECK(moq::msf::apply_delta(*base, *delta, tight).ok());
+
+                // A delta is no base, and a base is no delta.
+                auto swapped = moq::msf::apply_delta(*delta, *base, cfg);
+                MOQ_CHECK(!swapped.ok() && swapped.error().code() == moq::errc::invalid);
+            }
+        }
+    }
+
+    // apply_delta judges a delta by the BASE's revision: an "update" op onto
+    // an MSF-01 base is a protocol error; an MSF-01 delta still applies.
+    {
+        auto base = moq::msf::parse(moq::bytes_view(
+            R"({"version":"draft-01","tracks":[{"name":"video","packaging":"loc",)"
+            R"("isLive":true}]})"));
+        auto update = moq::msf::parse(moq::bytes_view(
+            R"({"generatedAt":1,"deltaUpdate":[{"op":"update","tracks":[)"
+            R"({"parentName":"video","bitrate":5}]}]})"));
+        auto add = moq::msf::parse(moq::bytes_view(
+            R"({"deltaUpdate":[{"op":"add","tracks":[{"name":"audio",)"
+            R"("packaging":"loc","isLive":true}]}]})"));
+        MOQ_CHECK(base.ok() && update.ok() && add.ok());
+        if (base.ok() && update.ok() && add.ok()) {
+            auto u = moq::msf::apply_delta(*base, *update);
+            MOQ_CHECK(!u.ok() && u.error().code() == moq::errc::protocol);
+            auto a = moq::msf::apply_delta(*base, *add);
+            MOQ_CHECK(a.ok());
+            if (a.ok()) {
+                MOQ_CHECK(a->revision() == MOQ_MSF_REVISION_01);
+                MOQ_CHECK(a->track_count() == 2 && a->track(1).name == "audio");
+            }
+            moq::msf::validate_cfg limited;
+            limited.max_effective_tracks = 1;
+            auto over = moq::msf::apply_delta(*base, *add, limited);
+            MOQ_CHECK(!over.ok() && over.error().code() == moq::errc::protocol);
+        }
+    }
+
+    // check(): the first violation's reason as the value; the catalog
+    // namespace decides which tracks share a Full Track Name.
+    {
+        auto ok = moq::msf::parse(moq::bytes_view(
+            R"({"version":"draft-02","tracks":[)"
+            R"({"name":"v","packaging":"loc","isLive":true,"renderGroup":1},)"
+            R"({"name":"c","packaging":"loc","isLive":true,"depends":["v",1]}]})"));
+        MOQ_CHECK(ok.ok());
+        if (ok.ok()) {
+            auto r = moq::msf::check(*ok);
+            MOQ_CHECK(r.ok() && *r == MOQ_MSF_CATALOG_OK);
+        }
+
+        auto unresolved = moq::msf::parse(moq::bytes_view(
+            R"({"version":"draft-02","tracks":[)"
+            R"({"name":"c","packaging":"loc","isLive":true,"depends":["v"]}]})"));
+        MOQ_CHECK(unresolved.ok());
+        if (unresolved.ok()) {
+            auto r = moq::msf::check(*unresolved);
+            MOQ_CHECK(r.ok() && *r == MOQ_MSF_CATALOG_ERR_DEPENDS_UNRESOLVED);
+        }
+
+        auto twins = moq::msf::parse(moq::bytes_view(
+            R"({"version":"draft-02","tracks":[)"
+            R"({"name":"v","packaging":"loc","isLive":true},)"
+            R"({"name":"v","namespace":"live/cam1","packaging":"loc","isLive":true}]})"));
+        MOQ_CHECK(twins.ok());
+        if (twins.ok()) {
+            auto apart = moq::msf::check(*twins);
+            MOQ_CHECK(apart.ok() && *apart == MOQ_MSF_CATALOG_OK);
+            moq::msf::validate_cfg cfg;
+            cfg.catalog_namespace = moq::namespace_name{"live", "cam1"};
+            auto same = moq::msf::check(*twins, cfg);
+            MOQ_CHECK(same.ok() && *same == MOQ_MSF_CATALOG_ERR_DUPLICATE_TRACK);
+        }
+
+        auto dup_pub = moq::msf::parse(moq::bytes_view(
+            R"({"version":"draft-02","tracks":[],"publishTracks":[)"
+            R"({"name":"log","packaging":"moqlog","isLive":true},)"
+            R"({"name":"log","packaging":"moqlog","isLive":true}]})"));
+        MOQ_CHECK(dup_pub.ok());
+        if (dup_pub.ok()) {
+            auto r = moq::msf::check(*dup_pub);
+            MOQ_CHECK(r.ok() && *r == MOQ_MSF_CATALOG_ERR_DUPLICATE_PUBLISH_TRACK);
+        }
+
+        auto delta = moq::msf::parse(moq::bytes_view(
+            R"({"deltaUpdate":[{"op":"remove","tracks":[{"name":"v"}]}]})"));
+        MOQ_CHECK(delta.ok());
+        if (delta.ok()) {
+            auto r = moq::msf::check(*delta);
+            MOQ_CHECK(!r.ok() && r.error().code() == moq::errc::invalid);
+        }
+
+        // A namespace longer than 32 parts is refused, not truncated.
+        std::string_view parts[33];
+        for (auto &p : parts) p = "x";
+        moq::msf::validate_cfg overflow;
+        overflow.catalog_namespace = moq::namespace_name(std::span<const std::string_view>(parts));
+        MOQ_CHECK(overflow.catalog_namespace.overflowed());
+        if (ok.ok()) {
+            auto r = moq::msf::check(*ok, overflow);
+            MOQ_CHECK(!r.ok() && r.error().code() == moq::errc::invalid);
+        }
+    }
+
+    // namespace_split(): the MSF-02 5.2.2 fields, borrowed from the input.
+    {
+        const char text[] = "example.com/live/cam1";
+        auto ns = moq::msf::namespace_split(moq::bytes_view(text));
+        MOQ_CHECK(ns.ok());
+        if (ns.ok()) {
+            MOQ_CHECK(ns->count() == 3);
+            MOQ_CHECK((*ns)[0] == "example.com" && (*ns)[1] == "live" && (*ns)[2] == "cam1");
+            MOQ_CHECK((*ns)[2].data() == text + 17);
+        }
+        auto one = moq::msf::namespace_split(moq::bytes_view("solo"));
+        MOQ_CHECK(one.ok() && one->count() == 1 && (*one)[0] == "solo");
+        for (const char *bad : {"", "/a", "a/", "a//b"}) {
+            auto r = moq::msf::namespace_split(moq::bytes_view(std::string_view(bad)));
+            MOQ_CHECK(!r.ok() && r.error().code() == moq::errc::protocol);
+        }
+        std::string many;
+        for (int i = 0; i < 32; i++) many += i ? "/f" : "f";
+        auto max = moq::msf::namespace_split(moq::bytes_view(std::string_view(many)));
+        MOQ_CHECK(max.ok() && max->count() == 32 && !max->overflowed());
+        many += "/f";
+        auto over = moq::msf::namespace_split(moq::bytes_view(std::string_view(many)));
+        MOQ_CHECK(!over.ok() && over.error().code() == moq::errc::protocol);
+        auto null_span = moq::msf::namespace_split(
+            moq::bytes_view(static_cast<const uint8_t *>(nullptr), 1));
+        MOQ_CHECK(!null_span.ok() && null_span.error().code() == moq::errc::invalid);
     }
 
     std::printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

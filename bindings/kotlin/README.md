@@ -149,6 +149,17 @@ receiver; do not reconstruct them from names or share them across receivers.
 `unsubscribe` pauses delivery and purges queued objects for that track; it does
 not destroy the catalog handle. Subscription acceptance is asynchronous.
 
+Under an MSF-02 catalog a track's description can change. An advisory change
+(bitrate, label, dimensions, ...) keeps the `MediaTrack` and publishes a new
+description generation (`TrackEvent.Updated` with its `configGeneration`). A
+change that decides how objects are parsed or delivered (codec, packaging,
+init, `encryptionScheme`, ...) replaces the track: `TrackEvent.Removed` with
+`replaced = true`, then the new track's `TrackEvent.Added` with `replaces`,
+linked through `MediaTrack.replacedBy` and `replaces`. The selection moves to
+the new track, and `subscribe`/`unsubscribe` on the old one act on the newest
+track of its chain. A track's `TrackDescription.encryption` carries the
+catalog's key fields; its `trackBaseKey` is a secret and is never printed.
+
 `inventory` and endpoint `snapshots` are current state, not lossless event
 histories. To request discovery history, choose
 `EventHistoryPolicy.Exact(capacity)` at receiver creation and consume

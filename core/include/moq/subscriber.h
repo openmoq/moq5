@@ -103,8 +103,9 @@ typedef struct moq_sub_cfg {
      * could park unbounded bytes in the facade's count-only queues. 0 selects
      * the default (16 MiB, matching the session's default receive budget).
      * Values larger than SIZE_MAX are clamped to SIZE_MAX. Initial ACK property
-     * snapshots also debit this cap, separately from bytes_queued, until the
-     * corresponding track is released. */
+     * snapshots (a track's SUBSCRIBE_OK, a fetch request's positive response)
+     * also debit this cap, separately from bytes_queued, until the
+     * corresponding track or request is released. */
     uint64_t max_queued_object_bytes;
     /* Appended: fired when the peer ACCEPTS an outbound
      * moq_sub_update_subscription for this track -- success only; a
@@ -497,10 +498,13 @@ MOQ_API bool moq_sub_track_has_queued_input(const moq_subscriber_t *sub,
 /* -- Group ends --------------------------------------------------- */
 
 /* The end of a Group on a subscription: a subgroup whose header carried the
- * END_OF_GROUP bit ended with a FIN, so the last Object the subgroup carried
- * is the Group's largest (drafts 16 and 18). A subgroup that is reset, or
- * that ends with a FIN but without the bit, says nothing about where its
- * Group ends and produces no record. Plain values; nothing to clean up. */
+ * END_OF_GROUP bit (0x08 on drafts 16, 18 and 22) ended with a FIN, so the
+ * last Object the subgroup carried is the Group's largest. On every draft it
+ * comes from the same subgroup end as the MOQ_SUB_STREAM_FIN_END_OF_GROUP
+ * stream terminal, which also names that Object (last_object_id); this
+ * record does not. A subgroup that is reset, or that ends with a FIN but
+ * without the bit, says nothing about where its Group ends and produces no
+ * record. Plain values; nothing to clean up. */
 typedef struct moq_sub_group_end {
     moq_sub_track_t *track;
     uint64_t         group_id;
@@ -951,7 +955,8 @@ typedef struct moq_sub_fetch_item {
  *
  * For terminal items (ERROR, COMPLETE, RESET), request is an opaque
  * correlation token. Normally polling the terminal releases its slot for a
- * later moq_sub_fetch call. After a D22 local delivery failure, reuse also
+ * later moq_sub_fetch call, together with the request's response result
+ * (moq_sub_get_fetch_result). After a D22 local delivery failure, reuse also
  * waits for moq_sub_poll_local_failure, accepted queued items and native
  * retirement to settle. A successful local cancellation or session close can
  * settle retirement without producing a peer terminal item. Continue ticking
@@ -962,6 +967,73 @@ MOQ_API moq_result_t moq_sub_poll_fetch(
     moq_sub_fetch_item_t *out);
 
 MOQ_API void moq_sub_fetch_item_cleanup(moq_sub_fetch_item_t *item);
+
+/* -- Fetch result ------------------------------------------------- */
+
+/* Immutable values of a fetch request's positive response, the one its
+ * MOQ_SUB_FETCH_OK item reports: the Track Properties that response carried,
+ * in the session draft's encoding. A Joining FETCH's response may carry
+ * properties other than its subscription's SUBSCRIBE_OK
+ * (moq_sub_get_track_result). Flags describe presence, so a response without
+ * properties stays distinct from no response yet. No ownership is
+ * transferred. */
+#define MOQ_SUB_FETCH_RESULT_RESPONSE_SEEN 0x1u
+
+typedef struct moq_sub_fetch_result {
+    uint32_t    struct_size;
+    uint32_t    flags;
+    moq_bytes_t track_properties;
+} moq_sub_fetch_result_t;
+
+/* Frozen full v0 extent: 24 bytes on LP64, 16 on ILP32. Future tails must
+ * not change this floor. */
+#define MOQ_SUB_FETCH_RESULT_V0_SIZE \
+    (offsetof(moq_sub_fetch_result_t, track_properties) + sizeof(moq_bytes_t))
+
+/*
+ * The positive-response result of a request made by moq_sub_fetch() or
+ * moq_sub_joining_fetch(). Observational and nonallocating; not an advancing
+ * call. No caller stamp is required. Copies/stamps min(out_size, library
+ * size); NULL arguments, a foreign or released request, or a size below the
+ * v0 floor return MOQ_ERR_INVAL. Every refusal leaves the output untouched.
+ *
+ * Before the positive response, flags and values are zero. The values are
+ * recorded when moq_sub_tick() consumes that response, which can be before
+ * its MOQ_SUB_FETCH_OK item is polled. OBJECT and GAP items that arrived
+ * ahead of the response are queued ahead of that item, and read zero flags
+ * here until a tick consumes it. A response that arrives after the request
+ * has ended locally is not recorded. Later items never alter the values.
+ *
+ * track_properties BORROWS facade storage until the request is released.
+ * Normally that is the moq_sub_poll_fetch() call that returns the request's
+ * terminal item (ERROR, COMPLETE or RESET): once that call returns, the span
+ * is invalid and this call returns MOQ_ERR_INVAL for the request, until a
+ * later request reuses its slot (the pointer then names that request, as
+ * moq_sub_poll_fetch() warns). Every OBJECT and GAP item of a request is
+ * queued ahead of its terminal, so a caller that finishes with each item
+ * before polling the next can read the span throughout; copy the bytes to
+ * keep them past the terminal. A successful moq_sub_cancel_fetch() and
+ * moq_sub_destroy() release the request too; after a local delivery failure,
+ * release waits as moq_sub_poll_fetch() describes. All access remains on the
+ * session executor. Copy bytes for another executor.
+ *
+ * If the properties cannot be retained, the tick that consumed the response
+ * and this query report MOQ_ERR_NOMEM (allocation) or MOQ_ERR_BUFFER (byte
+ * capacity: they debit max_queued_object_bytes as initial ACK snapshots do).
+ * The request still becomes active, with no MOQ_SUB_FETCH_OK item and no
+ * fabricated error item. The failing tick stops after that response. Query
+ * failure stays latched until release; later ticks process events normally
+ * (the request's own OBJECT, GAP and terminal items included, and unrelated
+ * work) and, absent queue backpressure, report the retained error until a
+ * tick consumes the request's terminal or the session closes. Poll the
+ * terminal, or cancel the request, to release it. No protocol session is
+ * closed by this failure.
+ */
+MOQ_API moq_result_t moq_sub_get_fetch_result(
+    const moq_subscriber_t *sub,
+    const moq_sub_fetch_req_t *req,
+    moq_sub_fetch_result_t *out,
+    size_t out_size);
 
 /* -- Fills (draft-22 section 3.4) --------------------------------- */
 

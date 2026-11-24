@@ -15,8 +15,16 @@
 //!
 //! This release plays RAW/LOC video and the RAW/LOC audio codecs `opus` and
 //! `mp4a.40.2`, on drafts 16, 18 and 22. CMAF, MPEG-TS, dependent spatial
-//! layers and timeline tracks are refused at selection with
-//! [`Error::UNSUPPORTED`]: the receiver serves those directly.
+//! layers, timeline tracks and tracks whose catalog entry declares an
+//! encryption scheme (the player plays clear media only) are refused at
+//! selection with [`Error::UNSUPPORTED`]: the receiver serves those
+//! directly.
+//!
+//! **Replacement.** When an MSF-02 catalog changes a track in a way that
+//! decides how its objects are parsed or delivered, the receiver replaces
+//! its handle. The player reports [`PlayerEventKind::TrackReplaced`], ends a
+//! selected old track with [`EndCause::Replaced`], and selects the
+//! replacement with the old track's configuration once it is announced.
 //!
 //! **Threading and the clock.** The player owns no thread. Every call on it,
 //! [`wait`](Player::wait) and the observers included, is the application's,
@@ -1249,6 +1257,9 @@ pub enum EndCause {
     Closed,
     /// The receiver failed.
     Fatal,
+    /// A new handle replaced the track ([`PlayerEventKind::TrackReplaced`]);
+    /// applied when the old handle is removed, so no later cause applies.
+    Replaced,
     /// A cause this crate does not know.
     Other(u32),
 }
@@ -1262,6 +1273,7 @@ impl EndCause {
             sys::MOQ_MEDIA_PLAYER_END_LOCAL_FAILURE => EndCause::LocalFailure,
             sys::MOQ_MEDIA_PLAYER_END_CLOSED => EndCause::Closed,
             sys::MOQ_MEDIA_PLAYER_END_FATAL => EndCause::Fatal,
+            sys::MOQ_MEDIA_PLAYER_END_REPLACED => EndCause::Replaced,
             code => EndCause::Other(code),
         }
     }
@@ -1515,6 +1527,15 @@ pub enum PlayerEventKind {
         /// Its last group.
         last_group_id: u64,
     },
+    /// An MSF-02 catalog change replaced the track with a new handle. A
+    /// selected track ends with [`EndCause::Replaced`], and the player
+    /// selects the replacement with the track's configuration once the
+    /// replacement is announced, so playback continues behind the decoder
+    /// reset its configuration output implies.
+    TrackReplaced {
+        /// The handle that replaces the event's track.
+        replacement: Track,
+    },
     /// A kind this crate does not know.
     Other(u32),
 }
@@ -1639,6 +1660,14 @@ impl PlayerEvent {
                         last_group_id: detail.last_group_id,
                     }
                 }
+                sys::MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED => {
+                    let detail = &raw.u.replaced;
+                    covered(mem::size_of_val(detail))?;
+                    let replacement = NonNull::new(detail.replacement).ok_or(Error::INTERNAL)?;
+                    PlayerEventKind::TrackReplaced {
+                        replacement: Track::new(replacement, owner),
+                    }
+                }
                 kind => PlayerEventKind::Other(kind),
             }
         };
@@ -1747,6 +1776,14 @@ mod tests {
         );
         assert_eq!(EndCause::from_raw(99), EndCause::Other(99));
         assert_eq!(
+            EndCause::from_raw(sys::MOQ_MEDIA_PLAYER_END_REPLACED),
+            EndCause::Replaced
+        );
+        assert_eq!(
+            EndCause::from_raw(sys::MOQ_MEDIA_PLAYER_END_FATAL),
+            EndCause::Fatal
+        );
+        assert_eq!(
             EndDisposition::from_raw(sys::MOQ_MEDIA_PLAYER_END_TAIL_CUTOFF),
             EndDisposition::TailCutoff
         );
@@ -1765,6 +1802,39 @@ mod tests {
             DiscontinuityReason::from_raw(sys::MOQ_MEDIA_PLAYER_DISCONTINUITY_DECODE_ERROR),
             DiscontinuityReason::DecodeError
         );
+    }
+
+    #[test]
+    fn a_replaced_track_names_its_replacement() {
+        let mut old = 1u8;
+        let mut new = 2u8;
+        let old = ptr::addr_of_mut!(old).cast::<sys::moq_media_track_t>();
+        let new = ptr::addr_of_mut!(new).cast::<sys::moq_media_track_t>();
+        let mut raw = sys::moq_media_player_event_t {
+            struct_size: mem::size_of::<sys::moq_media_player_event_t>() as u32,
+            kind: sys::MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED,
+            track: old,
+            ..Default::default()
+        };
+        raw.u.replaced.replacement = new;
+        // SAFETY: only the size of the union's member is taken.
+        let detail = unsafe { mem::size_of_val(&raw.u.replaced) };
+        raw.detail_size = detail as u32;
+        let event = PlayerEvent::from_raw(&raw, 4).expect("a covered detail");
+        let PlayerEventKind::TrackReplaced { replacement } = event.kind else {
+            panic!("a TrackReplaced event: {:?}", event.kind);
+        };
+        let handle = |pointer| Track::new(NonNull::new(pointer).expect("a test handle"), 4);
+        assert_eq!(replacement, handle(new), "tagged as the receiver's own");
+        assert_eq!(event.track, Some(handle(old)));
+
+        // A detail short of the replacement, or no replacement at all, is
+        // not a replacement event.
+        raw.detail_size = (detail - 1) as u32;
+        assert_eq!(PlayerEvent::from_raw(&raw, 4), Err(Error::ABI_MISMATCH));
+        raw.detail_size = detail as u32;
+        raw.u.replaced.replacement = ptr::null_mut();
+        assert_eq!(PlayerEvent::from_raw(&raw, 4), Err(Error::INTERNAL));
     }
 
     #[test]

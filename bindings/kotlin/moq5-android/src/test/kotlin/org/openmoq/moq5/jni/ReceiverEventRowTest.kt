@@ -36,6 +36,22 @@ internal class ReceiverEventRowTest {
         ok("receivertrackinsertfault", "with the next child insertion refused: poll -> REG_CAPACITY, no token published; the next poll mints a token; close, stop, destroy succeed")
 
     @Test
+    fun `a critical change replaces the track -- REMOVED names the successor's token, the ADDED that follows names the predecessor's, and commands on the old track reach the new one`() =
+        ok("receiverreplacement", "MSF-02 base {video, other}; a codec update of video -> REMOVED(a) with HAS_REPLACEMENT and REPLACED_BY a fresh kind-3 token b, REPLACES 0; ADDED(b) with REPLACES a, generation 0, the new codec; a's description untouched; a bitrate update of other -> UPDATED with CONFIG_GENERATION 1 and describe generation 1; subscribe(a) -> b PENDING, a's state WRONG_STATE, unsubscribe(a) -> b DISCOVERED")
+
+    @Test
+    fun `a refused token mint for the successor after the REMOVED was consumed is the registry's code, and a bridge failure through the backend`() =
+        ok("receiverreplacementmintfault", "next child insertion refused at the REMOVED -> REG_CAPACITY, nothing published; the ADDED(b) that follows mints and names a; through JniEndpointBackend the same refusal is Bridge(receiver-poll-track, REG_CAPACITY)")
+
+    @Test
+    fun `the backend decodes the replacement pair as tokens on the kinds that carry them, and the generations of events and descriptions`() =
+        ok("backendreplacement", "ADDED(a) replaces nothing, generation 0, init source None, no encryption; REMOVED(a).replacedBy = b; ADDED(b).replaces = a with the new codec at generation 0; UPDATED(other) at generation 1 with a generation-1 snapshot; then Empty")
+
+    @Test
+    fun `the describe row carries the generation, the init source and its property type, and the four encryption fields, and nothing outside the copy's stamp`() =
+        ok("receiverdescribemsf02", "track-property 0x0D -> INIT_SOURCE 2, type 13; inline initData -> INLINE; the four encryption fields verbatim with their bits; the shipped decoder yields InitSource and TrackEncryption and never renders the key; a copy restamped at the v0 size publishes HAS 0, zero slots and empty fields")
+
+    @Test
     fun `the backend maps empty, event, closed and refused answers without folding`() =
         ok("backendreceiverevents", "Empty for DONE; Event with the same token for ADDED; a stale receiver token -> Bridge(REG_STALE); never a MoqResultCode")
 }

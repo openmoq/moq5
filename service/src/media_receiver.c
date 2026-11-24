@@ -20,8 +20,10 @@
 #include <moq/msf_media.h>
 #include <moq/media_object.h>
 #include <moq/wire.h>   /* MOQ_QUIC_VARINT_MAX */
+#include <moq/vi64.h>
 
 #include "media_receiver_internal.h"
+#include "media_receiver_order.h"
 #include "endpoint_internal.h"
 #include "../../core/src/spi/core_spi.h"
 
@@ -138,6 +140,21 @@ _Static_assert(offsetof(moq_media_track_event_t, has_done_status) ==
                "the done status must follow the complete fill loss allocation");
 #define MEDIA_TRACK_EVENT_DONE_END \
     (offsetof(moq_media_track_event_t, done_status) + sizeof(uint64_t))
+_Static_assert(offsetof(moq_media_track_event_t, replaces) ==
+               MEDIA_TRACK_EVENT_DONE_END,
+               "the replacement block must follow the complete done-status allocation");
+#define MEDIA_TRACK_EVENT_REPLACED_END \
+    (offsetof(moq_media_track_event_t, replaced_by) + sizeof(moq_media_track_t *))
+_Static_assert(offsetof(moq_media_track_desc_t, init_property_type) ==
+               ((offsetof(moq_media_track_desc_t, has_label) + sizeof(bool) +
+                 _Alignof(moq_media_track_desc_t) - 1) &
+                ~(size_t)(_Alignof(moq_media_track_desc_t) - 1)),
+               "the init-source block must follow the complete has_label allocation");
+#define MEDIA_RECEIVER_STATS_TRACKS_MALFORMED_END \
+    (offsetof(moq_media_receiver_stats_t, tracks_malformed) + sizeof(uint64_t))
+_Static_assert(offsetof(moq_media_receiver_stats_t, catalog_revision) ==
+               MEDIA_RECEIVER_STATS_TRACKS_MALFORMED_END,
+               "the catalog-revision block must follow the complete tracks_malformed allocation");
 _Static_assert(offsetof(moq_media_track_desc_t, has_render_group) ==
                ((offsetof(moq_media_track_desc_t, alt_group) + sizeof(int) +
                  _Alignof(moq_media_track_desc_t) - 1) &
@@ -489,7 +506,70 @@ struct moq_media_track {
     bool             mt_has_last;
     uint64_t         mt_last_group;
     uint64_t         mt_last_object;
+
+    /* -- MSF-02 description generations ------------------------------- *
+     * desc is generation 0. An advisory change of the declared track
+     * publishes a complete new description (receiver_desc_gen_t, newest
+     * first on gens) and never rewrites a published one; every generation
+     * stays valid until the receiver is destroyed. desc_cur is the current
+     * generation, written only by the network thread under r->mu; desc_pub
+     * mirrors it for the lock-free moq_media_track_desc_get (release store,
+     * acquire load). The live-to-VOD triple is written in place on desc_cur,
+     * under r->mu. config_gen is desc_cur's generation number. */
+    moq_media_track_desc_t *desc_cur;
+    const moq_media_track_desc_t *_Atomic desc_pub;
+    struct receiver_desc_gen *gens;
+    uint32_t         config_gen;
+
+    /* The in-group ordering stage of an MSF-02 "object"-mapped LOC track's
+     * live subscription (network thread), or NULL; `ordered` (set at build,
+     * immutable): the track takes one when its subscription is issued. */
+    struct receiver_ordering *order;
+    bool             ordered;
+    /* An MSF-02 CMAF track with a parsed init record: every fragment's
+     * tfhd.track_ID must be the init's (moq_cmaf_validate_object), the
+     * configuration identity CMAF carries (set at build, immutable). */
+    bool             cmaf_track_id_check;
+
+    /* The MSF-02 Full Track Name namespace (11.2): the catalog's namespace
+     * for a track without "namespace" (MSF-02 5.2.2), else that string split
+     * into fields; the fields live in ns_block. has_ns_fields false when the
+     * track's namespace string does not split (an MSF-01 track), so it never
+     * matches an MSF-02 identity. ns_override: an MSF-02 track whose
+     * namespace differs, field by field, from the receiver's; it subscribes
+     * under its own namespace. */
+    bool             has_ns_fields;
+    bool             ns_override;
+    moq_namespace_t  ns_fields;
+    void            *ns_block;
+    size_t           ns_block_size;
+
+    /* -- Replacement (MSF-02 critical change) ------------------------- *
+     * replaced: this handle was removed by replacement; successor names the
+     * handle that took its place (a chain, newest last), so a command issued
+     * on it acts on the chain's head. gate: the predecessor whose facade
+     * slot must be released before this handle may subscribe (drafts 16/18
+     * allow one subscription per track; draft 22 discourages overlapping
+     * filters); NULL once open. All under r->mu; handles are never recycled
+     * before destroy, so the pointers stay valid. */
+    bool             replaced;
+    moq_media_track_t *successor;
+    moq_media_track_t *gate;
 };
+
+/* One later description of a track (see moq_media_track.gens): the complete
+ * description and the storage it alone owns. */
+typedef struct receiver_desc_gen {
+    struct receiver_desc_gen *next;
+    moq_media_track_desc_t desc;
+    moq_rcbuf_t           *init_buf;
+    uint8_t               *desc_strings;
+    size_t                 desc_strings_size;
+    moq_bytes_t           *desc_depends_arr;
+    moq_bytes_t           *desc_cp_refs_arr;
+    uint8_t               *desc_ext;
+    size_t                 desc_ext_size;
+} receiver_desc_gen_t;
 
 typedef struct receiver_event {
     moq_media_track_event_kind_t kind;
@@ -511,6 +591,13 @@ typedef struct receiver_event {
     bool     has_done_status;              /* TRACK_ENDED from a done */
     uint64_t done_status;
     uint64_t fill_cmd_seq;                 /* FILL_CREATED: its command */
+    /* The description and generation the event announces, taken when it
+     * is queued, so a later generation never changes what an earlier event
+     * says. */
+    const moq_media_track_desc_t *desc;
+    uint32_t config_generation;
+    moq_media_track_t *replaces;           /* TRACK_ADDED of a replacement */
+    moq_media_track_t *replaced_by;        /* TRACK_REMOVED of a replacement */
 } receiver_event_t;
 
 /* Identity/intent only, not a second item queue. The facade keeps each child
@@ -959,7 +1046,7 @@ static void st_push_locked(moq_media_receiver_t *r,
     e->rec.struct_size = (uint32_t)sizeof(e->rec);
     e->barrier = r->st_collect ? r->intake_seq : r->ingress_seq;
     e->dom = dom;
-    e->ready = !track_is_ts(rec->track);
+    e->ready = !track_is_ts(rec->track) && !rec->track->order;
     if (dom) r->fill_doms[dom - 1].st_owed++;
     r->st_tail++;
 }
@@ -1055,25 +1142,46 @@ static void st_end_of_track(moq_media_receiver_t *r, moq_media_track_t *t,
 
 /* -- Event queue (r->mu) ----------------------------------------------- */
 
-static bool rq_push(moq_media_receiver_t *r, moq_media_track_event_kind_t kind,
-                    moq_media_track_t *track)
+/* Queue a track event with r->mu held; returns the queued entry, or NULL
+ * after terminalizing on overflow. The entry carries the track's current
+ * description and generation. */
+static receiver_event_t *rq_push_locked(moq_media_receiver_t *r,
+                                        moq_media_track_event_kind_t kind,
+                                        moq_media_track_t *track)
 {
-    pthread_mutex_lock(&r->mu);
     if (r->ev_tail - r->ev_head >= r->ev_cap) {
         /* Losing a discovery event is unrecoverable miswiring (§6.3):
          * terminalize, never drop silently. */
         r->fatal = true;
         r->fatal_code = MOQ_MEDIA_RECEIVER_FATAL_EVENT_OVERFLOW;
-        pthread_mutex_unlock(&r->mu);
-        return false;
+        return NULL;
     }
     receiver_event_t *e = &r->events[r->ev_tail % r->ev_cap];
     memset(e, 0, sizeof(*e));
     e->kind = kind;
     e->track = track;
+    if (track) {
+        e->desc = track->desc_cur;
+        e->config_generation = track->config_gen;
+    }
     r->ev_tail++;
+    return e;
+}
+
+/* Free event-queue slots now (r->mu held). */
+static uint32_t rq_room_locked(const moq_media_receiver_t *r)
+{
+    uint32_t used = r->ev_tail - r->ev_head;
+    return used >= r->ev_cap ? 0 : r->ev_cap - used;
+}
+
+static bool rq_push(moq_media_receiver_t *r, moq_media_track_event_kind_t kind,
+                    moq_media_track_t *track)
+{
+    pthread_mutex_lock(&r->mu);
+    bool ok = rq_push_locked(r, kind, track) != NULL;
     pthread_mutex_unlock(&r->mu);
-    return true;
+    return ok;
 }
 
 /* Coalesced, NON-FATAL parse-drop bookkeeping with r->mu ALREADY held. Bumps the
@@ -1672,12 +1780,39 @@ static void receiver_cmd_auth_release(moq_media_receiver_t *r,
     t->cmd_auth_seq = 0;
 }
 
+/* Free a description generation and the storage it owns. NULL-safe. */
+static void receiver_gen_free(moq_media_receiver_t *r, receiver_desc_gen_t *g)
+{
+    if (!g) return;
+    if (g->desc_ext) r->alloc.free(g->desc_ext, g->desc_ext_size, r->alloc.ctx);
+    if (g->init_buf) moq_rcbuf_decref(g->init_buf);
+    if (g->desc_depends_arr)
+        r->alloc.free(g->desc_depends_arr,
+                      g->desc.depends_count * sizeof(moq_bytes_t), r->alloc.ctx);
+    if (g->desc_cp_refs_arr)
+        r->alloc.free(g->desc_cp_refs_arr,
+                      g->desc.content_protection_ref_id_count * sizeof(moq_bytes_t),
+                      r->alloc.ctx);
+    if (g->desc_strings)
+        r->alloc.free(g->desc_strings, g->desc_strings_size, r->alloc.ctx);
+    r->alloc.free(g, sizeof(*g), r->alloc.ctx);
+}
+
+static void receiver_order_free(moq_media_receiver_t *r, moq_media_track_t *t);
+
 static void receiver_track_free(moq_media_receiver_t *r, moq_media_track_t *t)
 {
     if (!t) return;
     moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
     receiver_cmd_auth_release(r, t);
     receiver_ts_free(r, t);
+    receiver_order_free(r, t);
+    while (t->gens) {
+        receiver_desc_gen_t *g = t->gens;
+        t->gens = g->next;
+        receiver_gen_free(r, g);
+    }
+    if (t->ns_block) r->alloc.free(t->ns_block, t->ns_block_size, r->alloc.ctx);
     if (t->desc_ext)
         r->alloc.free(t->desc_ext, t->desc_ext_size, r->alloc.ctx);
     if (t->init_buf) moq_rcbuf_decref(t->init_buf);
@@ -1695,6 +1830,34 @@ static void receiver_track_free(moq_media_receiver_t *r, moq_media_track_t *t)
 
 static size_t ext_align8(size_t n) { return (n + 7u) & ~(size_t)7u; }
 
+/* The handle-owned bytes of one supplement record: the record, then its
+ * spans and its renderGroup array. SIZE_MAX when not representable. */
+static size_t supplement_copy_size(const moq_msf_track_supplement_t *s)
+{
+    size_t n = ext_align8(sizeof(moq_msf_track_supplement_t));
+    if (s->struct_size < MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE) return n;
+    const moq_bytes_t spans[5] = { s->packaging_metadata, s->encryption_scheme,
+                                   s->cipher_suite, s->key_id, s->track_base_key };
+    for (size_t i = 0; i < 5; i++) {
+        if (spans[i].len > SIZE_MAX / 4) return SIZE_MAX;
+        size_t add = ext_align8(spans[i].len);
+        if (add > SIZE_MAX / 2 - n) return SIZE_MAX;
+        n += add;
+    }
+    if (s->depends_render_group_count > (SIZE_MAX / 4) / sizeof(int)) return SIZE_MAX;
+    size_t add = ext_align8(s->depends_render_group_count * sizeof(int));
+    if (add > SIZE_MAX / 2 - n) return SIZE_MAX;
+    return n + add;
+}
+
+/* Whether the receiver copies the extension record `e` onto a handle: the
+ * kinds it knows, with a record. */
+static bool ext_copied(const moq_msf_track_ext_t *e)
+{
+    return (e->kind == MOQ_MSF_EXT_MPEG2TS && e->u.mpeg2ts) ||
+           (e->kind == MOQ_MSF_EXT_SUPPLEMENT && e->u.supplement);
+}
+
 /* The handle-owned size of a track's extension list (see
  * receiver_copy_extensions); 0 when it carries no record this receiver
  * knows. Saturates at SIZE_MAX. */
@@ -1703,14 +1866,20 @@ static size_t ext_copy_size(const moq_msf_track_t *mt)
     size_t n = 0, entries = 0;
     for (size_t i = 0; i < mt->extension_count; i++) {
         const moq_msf_track_ext_t *e = &mt->extensions[i];
-        if (e->kind != MOQ_MSF_EXT_MPEG2TS || !e->u.mpeg2ts) continue;
-        const moq_msf_mpeg2ts_t *ts = e->u.mpeg2ts;
+        if (!ext_copied(e)) continue;
         entries++;
-        size_t add = ext_align8(sizeof(moq_msf_mpeg2ts_t));
-        if (ts->si_pid_count > (SIZE_MAX / 2) / sizeof(uint32_t)) return SIZE_MAX;
-        add += ext_align8(ts->si_pid_count * sizeof(uint32_t));
-        add += ext_align8(ts->mode_name.len) +
-               ext_align8(ts->timestamp_mode_name.len);
+        size_t add;
+        if (e->kind == MOQ_MSF_EXT_SUPPLEMENT) {
+            add = supplement_copy_size(e->u.supplement);
+            if (add == SIZE_MAX) return SIZE_MAX;
+        } else {
+            const moq_msf_mpeg2ts_t *ts = e->u.mpeg2ts;
+            add = ext_align8(sizeof(moq_msf_mpeg2ts_t));
+            if (ts->si_pid_count > (SIZE_MAX / 2) / sizeof(uint32_t)) return SIZE_MAX;
+            add += ext_align8(ts->si_pid_count * sizeof(uint32_t));
+            add += ext_align8(ts->mode_name.len) +
+                   ext_align8(ts->timestamp_mode_name.len);
+        }
         if (add > SIZE_MAX / 2 - n) return SIZE_MAX;
         n += add;
     }
@@ -1718,24 +1887,65 @@ static size_t ext_copy_size(const moq_msf_track_t *mt)
     return n + ext_align8(entries * sizeof(moq_msf_track_ext_t));
 }
 
-/* Deep-copy the records this receiver knows (today MOQ_MSF_EXT_MPEG2TS) into
- * one handle-owned block: the parsed record borrows the catalog DOM, which
- * a later catalog replaces. */
-static void receiver_copy_extensions(moq_media_track_t *t,
-                                     const moq_msf_track_t *mt)
+/* Copy `len` bytes to blk + *off and return the handle-owned span. */
+static moq_bytes_t ext_copy_span(uint8_t *blk, size_t *off, moq_bytes_t src)
 {
-    uint8_t *blk = t->desc_ext;
+    if (src.len == 0) return (moq_bytes_t){ NULL, 0 };
+    memcpy(blk + *off, src.data, src.len);
+    moq_bytes_t out = { blk + *off, src.len };
+    *off += ext_align8(src.len);
+    return out;
+}
+
+/* Deep-copy the records this receiver knows (MOQ_MSF_EXT_MPEG2TS and
+ * MOQ_MSF_EXT_SUPPLEMENT) into one handle-owned block: the parsed record
+ * borrows the catalog DOM, which a later catalog replaces. The block is
+ * ext_copy_size(mt) bytes, zeroed. */
+static void receiver_copy_extensions_to(uint8_t *blk, const moq_msf_track_t *mt,
+                                        const moq_msf_track_ext_t **out_list,
+                                        size_t *out_count)
+{
     size_t entries = 0;
     for (size_t i = 0; i < mt->extension_count; i++)
-        if (mt->extensions[i].kind == MOQ_MSF_EXT_MPEG2TS &&
-            mt->extensions[i].u.mpeg2ts)
-            entries++;
+        if (ext_copied(&mt->extensions[i])) entries++;
     moq_msf_track_ext_t *list = (moq_msf_track_ext_t *)(void *)blk;
     size_t off = ext_align8(entries * sizeof(moq_msf_track_ext_t));
     size_t k = 0;
     for (size_t i = 0; i < mt->extension_count; i++) {
         const moq_msf_track_ext_t *e = &mt->extensions[i];
-        if (e->kind != MOQ_MSF_EXT_MPEG2TS || !e->u.mpeg2ts) continue;
+        if (!ext_copied(e)) continue;
+        if (e->kind == MOQ_MSF_EXT_SUPPLEMENT) {
+            const moq_msf_track_supplement_t *src = e->u.supplement;
+            moq_msf_track_supplement_t *rec =
+                (moq_msf_track_supplement_t *)(void *)(blk + off);
+            off += ext_align8(sizeof(*rec));
+            moq_msf_track_supplement_init(rec);
+            if (src->struct_size >= MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE) {
+                size_t n = src->struct_size < sizeof(*rec) ? src->struct_size
+                                                           : sizeof(*rec);
+                memcpy(rec, src, n);
+                rec->struct_size = (uint32_t)sizeof(*rec);
+                rec->packaging_metadata = ext_copy_span(blk, &off, src->packaging_metadata);
+                rec->encryption_scheme = ext_copy_span(blk, &off, src->encryption_scheme);
+                rec->cipher_suite = ext_copy_span(blk, &off, src->cipher_suite);
+                rec->key_id = ext_copy_span(blk, &off, src->key_id);
+                rec->track_base_key = ext_copy_span(blk, &off, src->track_base_key);
+                rec->depends_render_groups = NULL;
+                if (src->depends_render_group_count > 0 && src->depends_render_groups) {
+                    int *groups = (int *)(void *)(blk + off);
+                    memcpy(groups, src->depends_render_groups,
+                           src->depends_render_group_count * sizeof(int));
+                    rec->depends_render_groups = groups;
+                    off += ext_align8(src->depends_render_group_count * sizeof(int));
+                } else {
+                    rec->depends_render_group_count = 0;
+                }
+            }
+            list[k].kind = MOQ_MSF_EXT_SUPPLEMENT;
+            list[k].u.supplement = rec;
+            k++;
+            continue;
+        }
         const moq_msf_mpeg2ts_t *src = e->u.mpeg2ts;
         moq_msf_mpeg2ts_t *rec = (moq_msf_mpeg2ts_t *)(void *)(blk + off);
         off += ext_align8(sizeof(*rec));
@@ -1755,24 +1965,21 @@ static void receiver_copy_extensions(moq_media_track_t *t,
         } else {
             rec->si_pid_count = 0;
         }
-        if (src->mode_name.len > 0) {
-            memcpy(blk + off, src->mode_name.data, src->mode_name.len);
-            rec->mode_name = (moq_bytes_t){ blk + off, src->mode_name.len };
-            off += ext_align8(src->mode_name.len);
-        }
-        if (src->timestamp_mode_name.len > 0) {
-            memcpy(blk + off, src->timestamp_mode_name.data,
-                   src->timestamp_mode_name.len);
-            rec->timestamp_mode_name =
-                (moq_bytes_t){ blk + off, src->timestamp_mode_name.len };
-            off += ext_align8(src->timestamp_mode_name.len);
-        }
+        rec->mode_name = ext_copy_span(blk, &off, src->mode_name);
+        rec->timestamp_mode_name = ext_copy_span(blk, &off, src->timestamp_mode_name);
         list[k].kind = MOQ_MSF_EXT_MPEG2TS;
         list[k].u.mpeg2ts = rec;
         k++;
     }
-    t->desc.extensions = list;
-    t->desc.extension_count = k;
+    *out_list = list;
+    *out_count = k;
+}
+
+static void receiver_copy_extensions(moq_media_track_t *t,
+                                     const moq_msf_track_t *mt)
+{
+    receiver_copy_extensions_to(t->desc_ext, mt, &t->desc.extensions,
+                                &t->desc.extension_count);
 }
 
 /* Whether this build can turn an Object of a track with `info` into a
@@ -1785,28 +1992,84 @@ static uint32_t receiver_ts_packet_size(const moq_media_track_desc_t *desc)
     return ts ? ts->packet_size : 0;
 }
 
-/* A catalog track's init data as a handle build resolves it: inline initData
- * wins, else its initRef in src's initDataList. Empty when it has neither. */
-static moq_bytes_t receiver_resolved_init(const moq_msf_track_t *mt,
+/* Where a catalog track's decoder configuration comes from (see
+ * moq_media_track_desc_t.init_source), as a handle build resolves it.
+ * `data` is the inline init (empty for the in-band kinds and NONE); `usable`
+ * false means the track has no delivery path: an MSF-02 initDataList entry
+ * of a type this receiver does not know, or an in-band configuration this
+ * receiver cannot take (see receiver_track_init). */
+typedef struct receiver_init {
+    moq_bytes_t data;
+    uint32_t    source;
+    uint64_t    property_type;
+    bool        usable;
+} receiver_init_t;
+
+/* Resolve a catalog track's init against `src` (its own catalog).
+ * MSF-01: inline initData wins, else the initRef entry's data, whatever its
+ * type, as before. MSF-02 (5.1.7): inline initData wins; an initRef entry of
+ * type "inline" gives its data; "track-property" and "object-property" carry
+ * the configuration in band, in the property their data names (12.2), which
+ * this receiver takes only for a "loc" track on a draft-22 companion, as
+ * VIDEO_CONFIG (0x0D) on role "video" or AUDIO_CONFIG (0x0F) on role
+ * "audio": LOC is the packaging those properties configure, and the legacy
+ * companion carries no per-Object configuration. Any other type, or another
+ * pairing, is not usable. An initRef naming no entry resolves to none, with
+ * the path unchanged, in both revisions. */
+static receiver_init_t receiver_track_init(const moq_media_receiver_t *r,
+                                           const moq_msf_track_t *mt,
+                                           const moq_msf_catalog_t *src)
+{
+    receiver_init_t in = { { NULL, 0 }, MOQ_MEDIA_INIT_SOURCE_NONE, 0, true };
+    if (mt->has_init_data && mt->init_data.len > 0) {
+        in.data = mt->init_data;
+        in.source = MOQ_MEDIA_INIT_SOURCE_INLINE;
+        return in;
+    }
+    if (!mt->has_init_ref || !src) return in;
+    const moq_msf_init_data_entry_t *e =
+        moq_msf_catalog_find_init_data(src, mt->init_ref);
+    if (!e) return in;
+    if (src->revision != MOQ_MSF_REVISION_02 || span_eq_lit(e->type, "inline", 6)) {
+        in.data = e->data;
+        in.source = in.data.len > 0 ? MOQ_MEDIA_INIT_SOURCE_INLINE
+                                    : MOQ_MEDIA_INIT_SOURCE_NONE;
+        return in;
+    }
+    bool track_prop = span_eq_lit(e->type, "track-property", 14);
+    bool object_prop = span_eq_lit(e->type, "object-property", 15);
+    if (!track_prop && !object_prop) { in.usable = false; return in; }
+    in.source = track_prop ? MOQ_MEDIA_INIT_SOURCE_TRACK_PROPERTY
+                           : MOQ_MEDIA_INIT_SOURCE_OBJECT_PROPERTY;
+    uint64_t type = 0;
+    bool typed = moq_msf_init_data_property_type(e, &type) == MOQ_OK;
+    if (typed) in.property_type = type;
+    bool video = mt->has_role && span_eq_lit(mt->role, "video", 5);
+    bool audio = mt->has_role && span_eq_lit(mt->role, "audio", 5);
+    in.usable = typed && span_eq_lit(mt->packaging, "loc", 3) &&
+                ((video && type == 0x0Du) || (audio && type == 0x0Fu)) &&
+                receiver_companion_d22(r->companion_profile);
+    return in;
+}
+
+/* A catalog track's inline init data as a handle build resolves it; empty
+ * when it has none. */
+static moq_bytes_t receiver_resolved_init(const moq_media_receiver_t *r,
+                                          const moq_msf_track_t *mt,
                                           const moq_msf_catalog_t *src)
 {
-    if (mt->has_init_data && mt->init_data.len > 0) return mt->init_data;
-    if (mt->has_init_ref && src) {
-        const moq_msf_init_data_entry_t *e =
-            moq_msf_catalog_find_init_data(src, mt->init_ref);
-        if (e) return e->data;
-    }
-    return (moq_bytes_t){ NULL, 0 };
+    return receiver_track_init(r, mt, src).data;
 }
 
 /* Whether a handle built from `mt` holds a parsed CMAF header record: a
  * "cmaf" track with init data to parse. Every other packaging keeps a NULL
  * desc.cmaf and pays nothing for it. */
-static bool receiver_track_holds_cmaf(const moq_msf_track_t *mt,
+static bool receiver_track_holds_cmaf(const moq_media_receiver_t *r,
+                                      const moq_msf_track_t *mt,
                                       const moq_msf_catalog_t *src)
 {
     return span_eq_lit(mt->packaging, "cmaf", 4) &&
-           receiver_resolved_init(mt, src).len > 0;
+           receiver_resolved_init(r, mt, src).len > 0;
 }
 
 static bool receiver_parse_probe(const moq_media_receiver_t *r,
@@ -1824,10 +2087,47 @@ static bool receiver_parse_probe(const moq_media_receiver_t *r,
                                         &out, sizeof(out), NULL) == MOQ_OK;
 }
 
+/* Whether a namespace's fields equal another's, field by field, by exact
+ * bytes. */
+static bool ns_equal(moq_namespace_t a, moq_namespace_t b)
+{
+    if (a.count != b.count) return false;
+    for (size_t i = 0; i < a.count; i++)
+        if (!span_eq(a.parts[i], b.parts[i])) return false;
+    return true;
+}
+
+/* MSF-02 delivery rules a handle build applies on top of the info and
+ * parse probe (the receiver's policy for publisher MUSTs, and the
+ * encryption boundary). True when the track keeps its delivery path. */
+static bool receiver_track_policy_ok(const moq_msf_track_t *mt,
+                                     const moq_msf_catalog_t *src,
+                                     const receiver_init_t *init)
+{
+    /* MSF 4.4.1: an encrypted payload must be decrypted before processing.
+     * The receiver interprets CMAF and MPEG-2 TS payloads and the timelines'
+     * JSON, which MoQ Secure Objects would encrypt (MSF defines its scheme
+     * for LOC, CMSF-01 4), so those have no path; a "loc" payload is handed
+     * over as received and the application decrypts it. Both revisions. */
+    const moq_msf_track_supplement_t *sup = moq_msf_track_supplement(mt);
+    if (sup && sup->has_encryption_scheme &&
+        !span_eq_lit(mt->packaging, "loc", 3))
+        return false;
+    if (!init->usable) return false;
+    if (!src || src->revision != MOQ_MSF_REVISION_02) return true;
+    /* MSF-02 5.2.4.1 / 5.2.19: a loc audio or video track names its codec;
+     * without it no decoder can be chosen. */
+    bool av = mt->has_role && (span_eq_lit(mt->role, "audio", 5) ||
+                               span_eq_lit(mt->role, "video", 5));
+    if (span_eq_lit(mt->packaging, "loc", 3) && av && !mt->has_codec)
+        return false;
+    return true;
+}
+
 /* Build a handle from a catalog track, copying every desc span into
  * handle-owned storage so the handle outlives the effective catalog. `src` is
- * the source catalog used to resolve an initRef. Returns NULL on allocation
- * failure. */
+ * the track's own catalog: it resolves an initRef and gives the revision the
+ * track follows. Returns NULL on allocation failure. */
 static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
                                                const moq_msf_track_t *mt,
                                                const moq_msf_catalog_t *src)
@@ -1838,6 +2138,10 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
     memset(t, 0, sizeof(*t));
     moq_media_track_desc_t *d = &t->desc;
     d->struct_size = (uint32_t)sizeof(*d);
+    t->desc_cur = d;
+    atomic_store_explicit(&t->desc_pub, d, memory_order_relaxed);
+    bool r02 = src && src->revision == MOQ_MSF_REVISION_02;
+    receiver_init_t init = receiver_track_init(r, mt, src);
 
     /* One owned buffer for the parsed CMAF header record (first, when the
      * track has one) then all string spans + the depends/cp-ref bytes + the
@@ -1845,7 +2149,7 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
      * the allocator's alignment for any object -- which every typed block in
      * this file relies on -- is the record's alignment; the strings after it
      * are bytes. */
-    bool holds_cmaf = receiver_track_holds_cmaf(mt, src);
+    bool holds_cmaf = receiver_track_holds_cmaf(r, mt, src);
     size_t strings_at = holds_cmaf ? sizeof(moq_cmaf_init_info_t) : 0;
     size_t need = mt->name.len + mt->packaging.len;
     if (mt->has_namespace) need += mt->namespace_.len;
@@ -1887,6 +2191,19 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
             receiver_copy_extensions(t, mt);
         }
     }
+    /* The MSF-02 Full Track Name namespace of a track with "namespace":
+     * its fields, split from the handle-owned copy below. */
+    size_t ns_count = 0;
+    if (r02 && mt->has_namespace) {
+        if (moq_msf_namespace_split(mt->namespace_, NULL, 0, &ns_count) !=
+                MOQ_ERR_BUFFER || ns_count == 0) {
+            ns_count = 0;   /* does not split: no MSF-02 identity */
+        } else {
+            t->ns_block_size = ns_count * sizeof(moq_bytes_t);
+            t->ns_block = r->alloc.alloc(t->ns_block_size, r->alloc.ctx);
+            if (!t->ns_block) { receiver_track_free(r, t); return NULL; }
+        }
+    }
 
     size_t off = strings_at;
 #define COPY_DESC_SPAN(dst, src_span) do { \
@@ -1914,6 +2231,24 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
         COPY_DESC_SPAN(t->desc_cp_refs_arr[i], mt->cp_ref_ids[i]);
 #undef COPY_DESC_SPAN
 
+    /* The namespace a subscription of this track names: the receiver's for a
+     * track without one (both revisions); under MSF-02 a track's own fields
+     * (5.2.2), which may override it; an MSF-01 namespace string has no
+     * defined MoQT mapping, so such a track has no namespace to subscribe. */
+    if (!mt->has_namespace) {
+        t->has_ns_fields = true;
+        t->ns_fields = r->namespace_;
+    } else if (ns_count > 0) {
+        moq_bytes_t *fields = (moq_bytes_t *)t->ns_block;
+        size_t got = 0;
+        if (moq_msf_namespace_split(t->key_ns, fields, ns_count, &got) == MOQ_OK &&
+            got == ns_count) {
+            t->has_ns_fields = true;
+            t->ns_fields = (moq_namespace_t){ .parts = fields, .count = got };
+            t->ns_override = !ns_equal(t->ns_fields, r->namespace_);
+        }
+    }
+
     d->depends = t->desc_depends_arr;
     d->depends_count = mt->depends_count;
     d->content_protection_ref_ids = t->desc_cp_refs_arr;
@@ -1937,6 +2272,9 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
     d->has_render_group = mt->has_render_group;
     d->render_group = mt->render_group;
     d->has_label = mt->has_label;
+    d->init_source = init.source;
+    d->init_property_type = init.property_type;
+    d->config_generation = 0;
 
     t->is_event_timeline = span_eq_lit(d->packaging, "eventtimeline", 13);
     t->is_media_timeline = span_eq_lit(d->packaging, "mediatimeline", 13);
@@ -1946,12 +2284,11 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
 
     moq_media_track_info_init(&d->info);
 
-    /* Resolve init: inline initData wins, else follow initRef into src's
-     * initDataList. The decoded bytes are owned via init_buf, so the spans
-     * that borrow them stay valid after src is freed. */
+    /* Resolve init: the inline init (initData, or an initRef entry that
+     * carries it) decodes into init_buf, so the spans that borrow it stay
+     * valid after src is freed. An in-band configuration has none here. */
     moq_msf_track_t rt = *mt;
-    moq_bytes_t resolved = receiver_resolved_init(mt, src);
-    if (resolved.len > 0) { rt.has_init_data = true; rt.init_data = resolved; }
+    if (init.data.len > 0) { rt.has_init_data = true; rt.init_data = init.data; }
     /* The SIZED companion, not the legacy entry plus a hand-widened
      * struct_size: this descriptor is a current-size struct we own, and the
      * negotiated draft is the authority for the object-property codec. The
@@ -1989,54 +2326,66 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
         d->cmaf = NULL;
     }
 
-    /* The delivery path. A namespace-override track has none (see
-     * subscribe_track); the decoded timelines have theirs; a media track has
-     * poll_object when its info derived and this build parses it. */
+    /* The delivery path. A track without a namespace to subscribe (an MSF-01
+     * namespace override) has none (see subscribe_track); the decoded
+     * timelines have theirs; a media track has poll_object when its info
+     * derived and this build parses it; the policy above can take either
+     * away. */
+    bool policy = receiver_track_policy_ok(mt, src, &init);
     if (t->is_sap_timeline || t->is_media_timeline)
-        t->has_path = true;
+        t->has_path = policy;
     else if (!t->is_event_timeline)
         t->has_media_path = t->has_path =
-            irc == MOQ_OK && receiver_parse_probe(r, d);
-    if (t->key_has_ns)
+            policy && irc == MOQ_OK && receiver_parse_probe(r, d);
+    if (!t->has_ns_fields)
         t->has_media_path = t->has_path = false;
+    t->cmaf_track_id_check = r02 && d->cmaf && d->cmaf->track_id != 0;
+    /* MSF-02 4.1.1: an "object" layout (or one not recognized) may deliver a
+     * Group's Objects on separate streams, out of order; LOC playback takes
+     * Object order as decode order, so such a track restores it. */
+    moq_msf_stream_mapping_t mapping = moq_msf_track_stream_mapping(mt);
+    t->ordered = r02 && t->has_media_path && span_eq_lit(d->packaging, "loc", 3) &&
+                 mapping != MOQ_MSF_STREAM_MAPPING_GROUP;
     return t;
 }
 
-/* Append a handle to the growable handle pointer array. */
-static bool receiver_tracks_push(moq_media_receiver_t *r, moq_media_track_t *t)
+/* Whether handle `t` is the declared track `mt` of a catalog of revision
+ * `rev`. MSF-01: the name and the namespace string as written (the same
+ * local name may appear in several namespaces, so both must match). MSF-02:
+ * the Full Track Name (11.2.2), a track without "namespace" inheriting the
+ * receiver's namespace. */
+static bool track_is(const moq_media_receiver_t *r, const moq_media_track_t *t,
+                     const moq_msf_track_t *mt, moq_msf_revision_t rev)
 {
-    if (r->track_count == r->track_cap) {
-        size_t nc = r->track_cap ? r->track_cap * 2 : 8;
-        moq_media_track_t **na = (moq_media_track_t **)r->alloc.alloc(
-            nc * sizeof(moq_media_track_t *), r->alloc.ctx);
-        if (!na) return false;
-        if (r->tracks) {
-            memcpy(na, r->tracks, r->track_count * sizeof(moq_media_track_t *));
-            r->alloc.free(r->tracks, r->track_cap * sizeof(moq_media_track_t *),
-                          r->alloc.ctx);
-        }
-        r->tracks = na;
-        r->track_cap = nc;
-    }
-    r->tracks[r->track_count++] = t;
-    return true;
+    if (rev == MOQ_MSF_REVISION_02)
+        return t->has_ns_fields &&
+               moq_msf_track_matches(mt, r->namespace_, t->ns_fields, t->desc.name);
+    if (!span_eq(t->desc.name, mt->name)) return false;
+    if (t->key_has_ns != mt->has_namespace) return false;
+    return !mt->has_namespace || span_eq(t->key_ns, mt->namespace_);
 }
 
-/* Find a live (non-removed) handle by the full MSF tuple (namespace, name),
- * compared against each handle's own stored key. MSF allows the same local name
- * in different namespaces, so the namespace presence and bytes must both match. */
-static moq_media_track_t *receiver_find_live(moq_media_receiver_t *r,
-                                             moq_bytes_t name,
-                                             bool has_ns, moq_bytes_t ns)
+/* The live (non-removed) handle of a catalog track, judged by `rev`. */
+static moq_media_track_t *receiver_find_live(const moq_media_receiver_t *r,
+                                             const moq_msf_track_t *mt,
+                                             moq_msf_revision_t rev)
 {
     for (size_t i = 0; i < r->track_count; i++) {
         moq_media_track_t *t = r->tracks[i];
-        if (t->removed) continue;
-        if (!span_eq(t->desc.name, name)) continue;
-        if (t->key_has_ns != has_ns) continue;
-        if (has_ns && !span_eq(t->key_ns, ns)) continue;
-        return t;
+        if (!t->removed && track_is(r, t, mt, rev)) return t;
     }
+    return NULL;
+}
+
+/* The track of `cat` that handle `t` was built from, judged by `cat`'s own
+ * revision; NULL when it has none. */
+static const moq_msf_track_t *catalog_track_of(const moq_media_receiver_t *r,
+                                               const moq_msf_catalog_t *cat,
+                                               const moq_media_track_t *t)
+{
+    for (size_t i = 0; i < cat->track_count; i++)
+        if (track_is(r, t, &cat->tracks[i], cat->revision))
+            return &cat->tracks[i];
     return NULL;
 }
 
@@ -2162,20 +2511,201 @@ static track_meta_class_t classify_track_change(const moq_msf_track_t *old,
     return TM_VOD;
 }
 
-/* §5.3: a declared Namespace|Name tuple's attributes are immutable, except the
- * §11.3 live->VOD conversion. Returns true if any tuple present in both `cand`
- * and the current effective catalog changed in a forbidden way. */
-static bool receiver_immutable_violation(const moq_msf_catalog_t *eff,
-                                         const moq_msf_catalog_t *cand)
+/* How a declared track changed between catalogs. MSF-01 knows SAME, VOD
+ * and FORBIDDEN (every other change breaks the immutable tuple, 5.3). MSF-02
+ * (5.1.6, 5.3) changes a declared track in place: ADVISORY changes keep the
+ * handle and publish a new description generation; CRITICAL changes, which
+ * drive how Objects are parsed or delivered, replace the handle; FORBIDDEN
+ * changes drop the catalog. */
+typedef enum { TC_SAME, TC_VOD, TC_ADVISORY, TC_CRITICAL, TC_FORBIDDEN } track_change_t;
+
+static bool opt_span_differs(bool ha, moq_bytes_t a, bool hb, moq_bytes_t b)
+{
+    return ha != hb || (ha && !span_eq(a, b));
+}
+
+static bool template_equal(const moq_msf_media_template_t *a,
+                           const moq_msf_media_template_t *b)
+{
+    return a->start_media_ms == b->start_media_ms &&
+           a->delta_media_ms == b->delta_media_ms &&
+           a->start_group == b->start_group && a->start_object == b->start_object &&
+           a->delta_group == b->delta_group && a->delta_object == b->delta_object &&
+           a->start_wallclock_ms == b->start_wallclock_ms &&
+           a->delta_wallclock_ms == b->delta_wallclock_ms;
+}
+
+static bool cmsf_url_equal(const moq_cmsf_url_t *a, const moq_cmsf_url_t *b)
+{
+    return a->present == b->present && (!a->present || span_eq(a->url, b->url)) &&
+           !opt_span_differs(a->has_type, a->type, b->has_type, b->type);
+}
+
+/* Two resolved content-protection entries describe the same protection. */
+static bool cp_entry_equal(const moq_cmsf_content_protection_t *a,
+                           const moq_cmsf_content_protection_t *b)
+{
+    if (!a || !b) return a == b;
+    if (!span_eq(a->scheme, b->scheme) || a->default_kid_count != b->default_kid_count)
+        return false;
+    for (size_t i = 0; i < a->default_kid_count; i++)
+        if (!span_eq(a->default_kids[i], b->default_kids[i])) return false;
+    const moq_cmsf_drm_system_t *x = &a->drm_system, *y = &b->drm_system;
+    return span_eq(x->system_id, y->system_id) &&
+           cmsf_url_equal(&x->la_url, &y->la_url) &&
+           cmsf_url_equal(&x->cert_url, &y->cert_url) &&
+           cmsf_url_equal(&x->auth_url, &y->auth_url) &&
+           !opt_span_differs(x->has_pssh, x->pssh, y->has_pssh, y->pssh) &&
+           !opt_span_differs(x->has_robustness, x->robustness,
+                             y->has_robustness, y->robustness);
+}
+
+/* An optional supplement span compared across two (possibly absent)
+ * records. */
+#define SUP_HAS(s, f) ((s) != NULL && (s)->has_##f)
+#define SUP_SPAN(s, f) (SUP_HAS(s, f) ? (s)->f : (moq_bytes_t){ NULL, 0 })
+#define SUP_SPAN_DIFFERS(a, b, f) \
+    opt_span_differs(SUP_HAS(a, f), SUP_SPAN(a, f), SUP_HAS(b, f), SUP_SPAN(b, f))
+
+/* Classify how an MSF-02 catalog changes declared track `a` (of catalog
+ * `ac`) into `b` (of `bc`). */
+static track_change_t classify_r02(const moq_media_receiver_t *r,
+                                   const moq_msf_track_t *a,
+                                   const moq_msf_catalog_t *ac,
+                                   const moq_msf_track_t *b,
+                                   const moq_msf_catalog_t *bc)
+{
+    /* Forbidden: isLive never turns true again (5.2.8); a present template
+     * never changes (7.4.2). */
+    if (!a->is_live && b->is_live) return TC_FORBIDDEN;
+    if (a->has_template &&
+        (!b->has_template || !template_equal(&a->template_, &b->template_)))
+        return TC_FORBIDDEN;
+
+    /* Critical: what parses or delivers the Objects. */
+    const moq_msf_track_supplement_t *sa = moq_msf_track_supplement(a);
+    const moq_msf_track_supplement_t *sb = moq_msf_track_supplement(b);
+    if (!span_eq(a->packaging, b->packaging) ||
+        opt_span_differs(a->has_role, a->role, b->has_role, b->role) ||
+        opt_span_differs(a->has_codec, a->codec, b->has_codec, b->codec) ||
+        opt_span_differs(a->has_event_type, a->event_type,
+                         b->has_event_type, b->event_type) ||
+        opt_span_differs(a->has_channel_config, a->channel_config,
+                         b->has_channel_config, b->channel_config) ||
+        opt_span_differs(a->has_init_track, a->init_track,
+                         b->has_init_track, b->init_track) ||
+        a->has_timescale != b->has_timescale || a->timescale != b->timescale ||
+        a->has_samplerate != b->has_samplerate || a->samplerate != b->samplerate ||
+        !ts_record_equal(moq_msf_track_mpeg2ts(a), moq_msf_track_mpeg2ts(b)) ||
+        moq_msf_track_stream_mapping(a) != moq_msf_track_stream_mapping(b) ||
+        SUP_SPAN_DIFFERS(sa, sb, encryption_scheme))
+        return TC_CRITICAL;
+    receiver_init_t ia = receiver_track_init(r, a, ac);
+    receiver_init_t ib = receiver_track_init(r, b, bc);
+    if (ia.source != ib.source || ia.property_type != ib.property_type ||
+        ia.usable != ib.usable || !span_eq(ia.data, ib.data))
+        return TC_CRITICAL;
+    if (a->cp_ref_id_count != b->cp_ref_id_count) return TC_CRITICAL;
+    for (size_t i = 0; i < a->cp_ref_id_count; i++) {
+        if (!span_eq(a->cp_ref_ids[i], b->cp_ref_ids[i])) return TC_CRITICAL;
+        if (!cp_entry_equal(
+                moq_msf_catalog_find_content_protection(ac, a->cp_ref_ids[i]),
+                moq_msf_catalog_find_content_protection(bc, b->cp_ref_ids[i])))
+            return TC_CRITICAL;
+    }
+
+    /* The live-to-VOD conversion: isLive true to false, or a trackDuration
+     * appearing on a track that is not live. */
+    bool vod = (a->is_live && !b->is_live) ||
+               (!a->has_track_duration && b->has_track_duration);
+
+    /* Advisory: descriptive fields no Object depends on. */
+    bool adv =
+        (a->has_track_duration && (!b->has_track_duration ||
+                                   a->track_duration_ms != b->track_duration_ms)) ||
+        a->has_bitrate != b->has_bitrate || a->bitrate != b->bitrate ||
+        a->has_framerate != b->has_framerate ||
+        a->framerate_millis != b->framerate_millis ||
+        a->has_width != b->has_width || a->width != b->width ||
+        a->has_height != b->has_height || a->height != b->height ||
+        opt_span_differs(a->has_label, a->label, b->has_label, b->label) ||
+        opt_span_differs(a->has_lang, a->lang, b->has_lang, b->lang) ||
+        opt_span_differs(a->has_mime_type, a->mime_type, b->has_mime_type, b->mime_type) ||
+        a->has_target_latency != b->has_target_latency ||
+        a->target_latency != b->target_latency ||
+        a->has_render_group != b->has_render_group || a->render_group != b->render_group ||
+        a->has_alt_group != b->has_alt_group || a->alt_group != b->alt_group ||
+        a->has_max_grp_sap != b->has_max_grp_sap || a->max_grp_sap != b->max_grp_sap ||
+        a->has_max_obj_sap != b->has_max_obj_sap || a->max_obj_sap != b->max_obj_sap ||
+        a->depends_count != b->depends_count ||
+        (!a->has_template && b->has_template) ||
+        SUP_SPAN_DIFFERS(sa, sb, packaging_metadata) ||
+        SUP_SPAN_DIFFERS(sa, sb, cipher_suite) ||
+        SUP_SPAN_DIFFERS(sa, sb, key_id) ||
+        SUP_SPAN_DIFFERS(sa, sb, track_base_key);
+    for (size_t i = 0; !adv && i < a->depends_count; i++)
+        adv = !span_eq(a->depends[i], b->depends[i]);
+    if (!adv) {
+        bool hka = sa && sa->has_keyframe_spacing, hkb = sb && sb->has_keyframe_spacing;
+        bool hwa = sa && sa->has_accessible_window_ms, hwb = sb && sb->has_accessible_window_ms;
+        size_t na = sa ? sa->depends_render_group_count : 0;
+        size_t nb = sb ? sb->depends_render_group_count : 0;
+        adv = hka != hkb || (hka && sa->keyframe_spacing != sb->keyframe_spacing) ||
+              hwa != hwb || (hwa && sa->accessible_window_ms != sb->accessible_window_ms) ||
+              na != nb;
+        for (size_t i = 0; !adv && i < na; i++)
+            adv = sa->depends_render_groups[i] != sb->depends_render_groups[i];
+    }
+    if (adv) return TC_ADVISORY;
+    return vod ? TC_VOD : TC_SAME;
+}
+
+/* Classify the change of declared track `a` into `b` by the revision of the
+ * candidate catalog `bc`. */
+static track_change_t classify_change(const moq_media_receiver_t *r,
+                                      const moq_msf_track_t *a,
+                                      const moq_msf_catalog_t *ac,
+                                      const moq_msf_track_t *b,
+                                      const moq_msf_catalog_t *bc)
+{
+    if (bc->revision == MOQ_MSF_REVISION_02) return classify_r02(r, a, ac, b, bc);
+    switch (classify_track_change(a, b)) {
+    case TM_SAME: return TC_SAME;
+    case TM_VOD:  return TC_VOD;
+    default:      return TC_FORBIDDEN;
+    }
+}
+
+/* Whether a candidate changes any declared track of `eff` in a way its
+ * revision forbids (MSF-01: anything but live-to-VOD, 5.3). */
+static bool receiver_change_forbidden(const moq_media_receiver_t *r,
+                                      const moq_msf_catalog_t *eff,
+                                      const moq_msf_catalog_t *cand)
 {
     for (size_t i = 0; i < cand->track_count; i++) {
         const moq_msf_track_t *c = &cand->tracks[i];
         for (size_t j = 0; j < eff->track_count; j++) {
             const moq_msf_track_t *e = &eff->tracks[j];
-            if (!span_eq(c->name, e->name)) continue;
-            if (c->has_namespace != e->has_namespace) continue;
-            if (c->has_namespace && !span_eq(c->namespace_, e->namespace_)) continue;
-            if (classify_track_change(e, c) == TM_VIOLATION) return true;
+            bool same;
+            if (cand->revision == MOQ_MSF_REVISION_02) {
+                moq_bytes_t fields[MOQ_MSF_NAMESPACE_MAX_FIELDS];
+                moq_namespace_t ns = r->namespace_;
+                size_t n = 0;
+                if (c->has_namespace) {
+                    if (moq_msf_namespace_split(c->namespace_, fields,
+                                                MOQ_MSF_NAMESPACE_MAX_FIELDS,
+                                                &n) != MOQ_OK)
+                        continue;
+                    ns = (moq_namespace_t){ .parts = fields, .count = n };
+                }
+                same = moq_msf_track_matches(e, r->namespace_, ns, c->name);
+            } else {
+                same = span_eq(c->name, e->name) &&
+                       c->has_namespace == e->has_namespace &&
+                       (!c->has_namespace || span_eq(c->namespace_, e->namespace_));
+            }
+            if (!same) continue;
+            if (classify_change(r, e, eff, c, cand) == TC_FORBIDDEN) return true;
             break;
         }
     }
@@ -2198,7 +2728,8 @@ static uint64_t sat_add(uint64_t a, uint64_t b)
  * initDataList -- otherwise an initRef-bearing track retains a large init_buf
  * while charging near-zero. The encoded init length is >= the decoded init_buf
  * length, so charging it is conservative. Reads only parsed MSF fields. */
-static uint64_t est_track_retained_bytes(const moq_msf_track_t *mt,
+static uint64_t est_track_retained_bytes(const moq_media_receiver_t *r,
+                                         const moq_msf_track_t *mt,
                                          const moq_msf_catalog_t *src)
 {
     uint64_t b = sizeof(moq_media_track_t);
@@ -2220,10 +2751,32 @@ static uint64_t est_track_retained_bytes(const moq_msf_track_t *mt,
     /* The handle-owned extension block (records, SI PIDs, names). */
     b = sat_add(b, (uint64_t)ext_copy_size(mt));
     /* Init: inline wins; else resolve initRef against src (mirrors build). */
-    b = sat_add(b, receiver_resolved_init(mt, src).len);
+    b = sat_add(b, receiver_resolved_init(r, mt, src).len);
     /* The parsed header record, which shares desc_strings. */
-    if (receiver_track_holds_cmaf(mt, src))
+    if (receiver_track_holds_cmaf(r, mt, src))
         b = sat_add(b, sizeof(moq_cmaf_init_info_t));
+    /* An MSF-02 namespace's fields (at most MOQ_MSF_NAMESPACE_MAX_FIELDS). */
+    if (mt->has_namespace)
+        b = sat_add(b, (uint64_t)MOQ_MSF_NAMESPACE_MAX_FIELDS * sizeof(moq_bytes_t));
+    return b;
+}
+
+/* The parser-owned arrays of one parsed track that cleanup frees: the
+ * track itself, its depends / cp-ref arrays and its extension block, which
+ * holds at most one entry and record per kind and the records' arrays
+ * (counted at the largest such block, so the estimate never falls short). */
+static uint64_t est_parsed_track_bytes(const moq_msf_track_t *t)
+{
+    uint64_t b = sizeof(moq_msf_track_t);
+    b = sat_add(b, (uint64_t)t->depends_count   * sizeof(moq_bytes_t));
+    b = sat_add(b, (uint64_t)t->cp_ref_id_count * sizeof(moq_bytes_t));
+    if (t->extension_count == 0) return b;
+    b = sat_add(b, 2u * sizeof(moq_msf_track_ext_t) + sizeof(moq_msf_mpeg2ts_t) +
+                   sizeof(moq_msf_track_supplement_t) + sizeof(uint64_t));
+    const moq_msf_mpeg2ts_t *ts = moq_msf_track_mpeg2ts(t);
+    if (ts) b = sat_add(b, (uint64_t)ts->si_pid_count * sizeof(uint32_t));
+    const moq_msf_track_supplement_t *sup = moq_msf_track_supplement(t);
+    if (sup) b = sat_add(b, (uint64_t)sup->depends_render_group_count * sizeof(int));
     return b;
 }
 
@@ -2231,28 +2784,17 @@ static uint64_t est_track_retained_bytes(const moq_msf_track_t *mt,
  * effective catalog moved into cp_snaps) holds. Strings borrow from the parse
  * arena, so the dominant term is `_dom_size` (the whole DOM, freed by
  * moq_msf_catalog_cleanup); the remaining terms are the parser-owned arrays
- * that cleanup also frees (tracks, init-data list, content protections + their
- * defaultKIDs, per-track depends / cp-ref arrays, per-track extension lists
- * with their records and SI PID arrays, delta ops).
- * This mirrors the exact allocations msf.c releases, so the cap reflects real
- * retained memory. */
+ * that cleanup also frees: tracks and publishTracks with their per-track
+ * arrays and extension blocks, the init-data list, content protections and
+ * their defaultKIDs, delta ops. */
 static uint64_t est_catalog_retained_bytes(const moq_msf_catalog_t *c)
 {
     uint64_t b = sizeof(moq_msf_catalog_t);
     b = sat_add(b, c->_dom_size);                       /* all borrowed strings */
-    b = sat_add(b, (uint64_t)c->track_count * sizeof(moq_msf_track_t));
-    for (size_t i = 0; i < c->track_count; i++) {
-        const moq_msf_track_t *t = &c->tracks[i];
-        b = sat_add(b, (uint64_t)t->depends_count   * sizeof(moq_bytes_t));
-        b = sat_add(b, (uint64_t)t->cp_ref_id_count * sizeof(moq_bytes_t));
-        b = sat_add(b, (uint64_t)t->extension_count *
-                       sizeof(moq_msf_track_ext_t));
-        const moq_msf_mpeg2ts_t *ts = moq_msf_track_mpeg2ts(t);
-        if (ts) {
-            b = sat_add(b, ts->struct_size);
-            b = sat_add(b, (uint64_t)ts->si_pid_count * sizeof(uint32_t));
-        }
-    }
+    for (size_t i = 0; i < c->track_count; i++)
+        b = sat_add(b, est_parsed_track_bytes(&c->tracks[i]));
+    for (size_t i = 0; i < c->publish_track_count; i++)
+        b = sat_add(b, est_parsed_track_bytes(&c->publish_tracks[i]));
     b = sat_add(b, (uint64_t)c->init_data_count *
                    sizeof(moq_msf_init_data_entry_t));
     b = sat_add(b, (uint64_t)c->content_protection_count *
@@ -2268,119 +2810,6 @@ static bool receiver_facade_drained(moq_media_receiver_t *r);
 static void receiver_retire_subscription(moq_media_receiver_t *r,
                                          moq_sub_track_t **slot,
                                          uint64_t now_us, bool drained);
-
-/* Diff a candidate catalog against the live handles: add new tuples, remove
- * gone ones, leave survivors untouched. Returns MOQ_ERR_NOMEM on a build/grow
- * failure (caller terminalizes). */
-static moq_result_t receiver_reconcile(moq_media_receiver_t *r,
-                                       const moq_msf_catalog_t *cand,
-                                       uint64_t now_us)
-{
-    for (size_t i = 0; i < r->track_count; i++) r->tracks[i]->recon_seen = false;
-
-    for (size_t i = 0; i < cand->track_count; i++) {
-        const moq_msf_track_t *mt = &cand->tracks[i];
-        moq_media_track_t *live = receiver_find_live(
-            r, mt->name, mt->has_namespace, mt->namespace_);
-        if (live) {
-            live->recon_seen = true;
-            /* live->VOD conversion (§11.3): the immutable check already proved
-             * any change is the sanctioned is_live true->false / trackDuration
-             * absent->present. If is_live or duration actually changed, update
-             * the handle's desc IN PLACE (scalars; no allocation) and emit
-             * TRACK_UPDATED so the app learns the new VOD metadata. The desc
-             * writes precede the rq_push, so an app that polls the event sees
-             * them. */
-            if (mt->is_live != live->desc.is_live ||
-                mt->has_track_duration != live->desc.has_track_duration ||
-                mt->track_duration_ms != live->desc.track_duration_ms) {
-                /* The three writes are the only in-place mutation of a
-                 * published description; they are serialized against
-                 * moq_media_receiver_track_desc_copy() by r->mu so a copy
-                 * never observes a torn triple. rq_push takes r->mu itself,
-                 * so the event is queued after the unlock. */
-                pthread_mutex_lock(&r->mu);
-                PUB_PHASE_HOOK(r, MOQ_MR_VOD_WRITER_PRE);
-                live->desc.is_live = mt->is_live;
-                live->desc.has_track_duration = mt->has_track_duration;
-                live->desc.track_duration_ms = mt->track_duration_ms;
-                PUB_PHASE_HOOK(r, MOQ_MR_VOD_WRITER_POST);
-                pthread_mutex_unlock(&r->mu);
-                if (!rq_push(r, MOQ_MEDIA_TRACK_UPDATED, live))
-                    return MOQ_OK;   /* overflow already terminalized */
-            }
-            continue;   /* survivor */
-        }
-
-        moq_media_track_t *t = receiver_track_build(r, mt, cand);
-        if (!t) return MOQ_ERR_NOMEM;
-        t->recon_seen = true;
-        pthread_mutex_lock(&r->mu);
-        bool pushed = receiver_tracks_push(r, t);
-        /* Auto-subscribe takes every media track with a delivery path:
-         * timelines are subscribed explicitly, and a track without a path
-         * (info not derived, packaging not parseable in this build, or an MSF
-         * §5.2.2 namespace override) would only cost bitrate. See
-         * subscribe_track, which refuses those. */
-        if (pushed && r->auto_subscribe && t->has_media_path) {
-            t->desired_subscribed = true;
-            t->desired_filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
-        }
-        pthread_mutex_unlock(&r->mu);
-        if (!pushed) { receiver_track_free(r, t); return MOQ_ERR_NOMEM; }
-        /* Account the new stable handle's retained bytes (room was preflighted
-         * in receiver_adopt). initRef is resolved against `cand` exactly as the
-         * build above did. Never decreases: the handle outlives every catalog
-         * per the lifetime contract. */
-        r->retained_bytes = sat_add(r->retained_bytes,
-                                    est_track_retained_bytes(mt, cand));
-        if (!rq_push(r, MOQ_MEDIA_TRACK_ADDED, t))
-            return MOQ_OK;   /* overflow already terminalized */
-    }
-
-    /* Removed tuples: live, non-removed, not seen this pass. A terminal
-     * catalog (isComplete, MSF 5.1.3 / 11.3) completes the broadcast rather
-     * than withdrawing the track: what the track already delivered stays
-     * queued for the application, and a track whose subscription has not
-     * ended keeps it until its subscription's done is processed, with every
-     * stream the done counts taken in. Every such track settles in
-     * receiver_settle_completions, one already over at once: its
-     * TRACK_REMOVED then follows the commit that latches
-     * stats.catalog_complete, so a consumer reading it at that event sees
-     * the broadcast complete. */
-    bool completing = cand->is_complete;
-    for (size_t i = 0; i < r->track_count; i++) {
-        moq_media_track_t *t = r->tracks[i];
-        if (t->removed || t->recon_seen) continue;
-        moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
-        pthread_mutex_lock(&r->mu);
-        t->removed = true;
-        t->removed_by_completion = completing;
-        /* Keep wanted media in flight after completion; do not revive a
-         * subscription the application already cancelled. */
-        if (!completing) t->desired_subscribed = false;
-        if (completing && t->local_result == MOQ_OK && !t->auth_failed) {
-            t->completion_pending = true;
-            t->completion_cancelled = !t->desired_subscribed;
-            pthread_mutex_unlock(&r->mu);
-            continue;
-        }
-        if (!completing)
-            obj_compact_locked(r, keep_not_track, t);   /* purge its queued objects */
-        pthread_mutex_unlock(&r->mu);
-        /* The facade slot stays mapped until it is released: stream
-         * terminals still queued for it reach the lane under the removed
-         * handle. receiver_retire_tracks retries a refused unsubscribe or
-         * release on every pass. */
-        if (t->sub_track && t->local_result == MOQ_OK && !t->auth_failed)
-            receiver_retire_subscription(r, &t->sub_track, now_us,
-                                         receiver_facade_drained(r));
-        receiver_ts_free(r, t);
-        if (!rq_push(r, MOQ_MEDIA_TRACK_REMOVED, t))
-            return MOQ_OK;   /* overflow already terminalized */
-    }
-    return MOQ_OK;
-}
 
 /* Reserve room for one more CP snapshot when the current effective carries
  * contentProtections, so the commit below cannot fail (no visible state is
@@ -2404,18 +2833,17 @@ static moq_result_t receiver_reserve_cp_snap(moq_media_receiver_t *r)
     return MOQ_OK;
 }
 
-/* Commit a candidate as the new effective catalog. NO-FAIL: cp_snaps capacity
- * was reserved before reconcile, so this only moves pointers. The previous
- * effective is retained in cp_snaps if it carried contentProtections (so any
- * pointer find_content_protection returned stays valid), else freed. Takes
- * ownership of *cand (caller must not clean it up afterward). */
-static void receiver_commit_effective(moq_media_receiver_t *r,
-                                      moq_msf_catalog_t *cand)
+/* Commit a candidate as the new effective catalog, with r->mu held. NO-FAIL:
+ * cp_snaps capacity was reserved before, so this only moves pointers. The
+ * previous effective is retained in cp_snaps if it carried
+ * contentProtections (so any pointer find_content_protection returned stays
+ * valid), else freed. Takes ownership of *cand (caller must not clean it up
+ * afterward). The caller holds r->mu across the whole publication, so the
+ * public find_content_protection() reader (which takes the same mutex) never
+ * observes a torn effective/has_effective transition. */
+static void receiver_commit_effective_locked(moq_media_receiver_t *r,
+                                             moq_msf_catalog_t *cand)
 {
-    /* One lock/unlock pair holds r->mu across the whole publication critical
-     * section, so the public find_content_protection() reader (which takes the
-     * same mutex) never observes a torn effective/has_effective transition. */
-    pthread_mutex_lock(&r->mu);
     /* Writer PRE: before any access to r->has_effective / r->effective. */
     PUB_PHASE_HOOK(r, MOQ_MR_WRITER_PRE);
     if (r->has_effective) {
@@ -2431,14 +2859,13 @@ static void receiver_commit_effective(moq_media_receiver_t *r,
     }
     r->effective = *cand;     /* move ownership */
     r->has_effective = true;
-    /* MSF §5.1.3: latch terminal completion for app observation (get_stats).
-     * Folded into the enclosing lock -- no nested lock. */
+    r->stats.catalog_revision = r->effective.revision;
+    /* MSF §5.1.3: latch terminal completion for app observation (get_stats). */
     if (r->effective.is_complete)
         r->stats.catalog_complete = true;
     /* Writer POST: after retention/detach, publication of effective and
      * has_effective, and the catalog_complete mutation, before the unlock. */
     PUB_PHASE_HOOK(r, MOQ_MR_WRITER_POST);
-    pthread_mutex_unlock(&r->mu);
 }
 
 static void receiver_count_drop(moq_media_receiver_t *r)
@@ -2460,69 +2887,377 @@ static void receiver_desync(moq_media_receiver_t *r)
 
 typedef enum {
     ADOPT_OK = 0,       /* committed; cand ownership moved into r->effective */
-    ADOPT_VIOLATION,    /* §5.3 immutable-tuple violation; cand still owned */
+    ADOPT_VIOLATION,    /* a change the candidate's revision forbids (MSF-01
+                           5.3 immutable tuple; MSF-02 5.2.8, 7.4.2); cand
+                           still owned */
     ADOPT_NOMEM,        /* allocation failure; cand still owned (caller fatals) */
-    ADOPT_LIMIT,        /* a receiver-lifetime retained-state cap would be
-                           exceeded; cand still owned. After an effective exists
-                           this is a bounded drop; on the first catalog it is
-                           fatal (CATALOG_UNUSABLE). */
+    ADOPT_LIMIT,        /* a receiver-lifetime retained-state cap, or the
+                           event queue's room for the adoption's events, would
+                           be exceeded; cand still owned. After an effective
+                           exists this is a bounded drop; on the first catalog
+                           it is fatal. */
 } adopt_result_t;
 
-/* Preflight the retained-state growth this candidate would cause, BEFORE any
- * mutation (no-partial-mutation rule). Counts the NEW stable handles it adds
- * (candidate tuples with no live handle) and their estimated bytes, plus the CP
- * snapshot the commit would retain (the current effective, if it carries
- * contentProtections) and its bytes. Returns false if adding them would exceed
- * the handle-count, CP-snapshot-count, or retained-byte cap. Read-only:
- * mirrors receiver_reconcile's add set and receiver_commit_effective's snapshot
- * rule so the accounting added after commit matches what is checked here. */
-static bool receiver_update_within_limits(const moq_media_receiver_t *r,
-                                          const moq_msf_catalog_t *cand)
+#ifdef MOQ_MEDIA_RECEIVER_TESTING
+/* Test-only hook, called with no lock held just before an adoption's commit
+ * takes r->mu (phase 0) and just after it releases it (phase 1), so a test
+ * can issue application commands at exactly those instants. Never compiled
+ * into the shipping library. */
+static void (*g_adopt_hook)(void *ctx, int phase);
+static void *g_adopt_hook_ctx;
+void moq_media_receiver_test_set_adopt_hook(void (*fn)(void *, int), void *ctx);
+void moq_media_receiver_test_set_adopt_hook(void (*fn)(void *, int), void *ctx)
 {
-    size_t   add_handles = 0;
-    uint64_t add_bytes   = 0;
-    for (size_t i = 0; i < cand->track_count; i++) {
-        const moq_msf_track_t *mt = &cand->tracks[i];
-        if (receiver_find_live((moq_media_receiver_t *)r, mt->name,
-                               mt->has_namespace, mt->namespace_))
-            continue;   /* survivor: reuses its existing handle */
-        add_handles++;
-        add_bytes = sat_add(add_bytes, est_track_retained_bytes(mt, cand));
+    g_adopt_hook = fn;
+    g_adopt_hook_ctx = ctx;
+}
+#define ADOPT_HOOK(phase) \
+    do { if (g_adopt_hook) g_adopt_hook(g_adopt_hook_ctx, (phase)); } while (0)
+#else
+#define ADOPT_HOOK(phase) ((void)0)
+#endif
+
+/* One candidate track's plan in an adoption. */
+typedef struct adopt_item {
+    const moq_msf_track_t *mt;     /* the candidate's track */
+    moq_media_track_t     *live;   /* its declared handle, or NULL (NEW) */
+    track_change_t         change; /* how it changed (live only) */
+    moq_media_track_t     *built;  /* NEW or CRITICAL: the handle to add */
+    receiver_desc_gen_t   *gen;    /* ADVISORY: the generation to publish */
+    uint64_t               bytes;  /* retained bytes built/gen add */
+} adopt_item_t;
+
+/* Move the description storage of a freshly built handle into a new
+ * generation of `live`, and free the handle shell. NULL on allocation
+ * failure (`t` is then freed whole). */
+static receiver_desc_gen_t *receiver_gen_from(moq_media_receiver_t *r,
+                                              moq_media_track_t *t)
+{
+    receiver_desc_gen_t *g =
+        (receiver_desc_gen_t *)r->alloc.alloc(sizeof(*g), r->alloc.ctx);
+    if (!g) { receiver_track_free(r, t); return NULL; }
+    memset(g, 0, sizeof(*g));
+    g->desc = t->desc;
+    g->init_buf = t->init_buf;           t->init_buf = NULL;
+    g->desc_strings = t->desc_strings;   t->desc_strings = NULL;
+    g->desc_strings_size = t->desc_strings_size;
+    g->desc_depends_arr = t->desc_depends_arr; t->desc_depends_arr = NULL;
+    g->desc_cp_refs_arr = t->desc_cp_refs_arr; t->desc_cp_refs_arr = NULL;
+    g->desc_ext = t->desc_ext;           t->desc_ext = NULL;
+    g->desc_ext_size = t->desc_ext_size;
+    receiver_track_free(r, t);
+    return g;
+}
+
+/* Whether a rebuilt handle `b` delivers exactly as `a`: the decisions a
+ * build derives (delivery path, decoder, timeline kind, init source,
+ * subscription namespace). An "advisory" field that changes any of them is
+ * delivery-critical for this receiver. */
+static bool receiver_same_delivery(const moq_media_track_t *a,
+                                   const moq_media_track_t *b)
+{
+    return a->has_path == b->has_path && a->has_media_path == b->has_media_path &&
+           a->is_event_timeline == b->is_event_timeline &&
+           a->is_media_timeline == b->is_media_timeline &&
+           a->is_sap_timeline == b->is_sap_timeline &&
+           a->has_ns_fields == b->has_ns_fields &&
+           a->ns_override == b->ns_override &&
+           a->desc.info.media_type == b->desc.info.media_type &&
+           a->desc.info.packaging == b->desc.info.packaging &&
+           a->desc.init_source == b->desc.init_source &&
+           a->desc.init_property_type == b->desc.init_property_type;
+}
+
+static void adopt_items_free(moq_media_receiver_t *r, adopt_item_t *items,
+                             size_t n)
+{
+    if (!items) return;
+    for (size_t i = 0; i < n; i++) {
+        receiver_track_free(r, items[i].built);
+        receiver_gen_free(r, items[i].gen);
     }
+    r->alloc.free(items, n * sizeof(*items), r->alloc.ctx);
+}
 
-    bool     will_snap  = r->has_effective &&
-                          r->effective.content_protection_count > 0;
-    uint64_t snap_bytes = will_snap
-                          ? est_catalog_retained_bytes(&r->effective) : 0;
-
-    if (r->track_count + add_handles > r->max_stable_handles)         return false;
-    if (r->cp_snap_count + (will_snap ? 1u : 0u) > r->max_cp_snaps)   return false;
-    /* Overflow-safe projected total vs the byte cap. */
-    if (sat_add(sat_add(r->retained_bytes, add_bytes), snap_bytes) >
-        r->max_retained_bytes)
-        return false;
+/* Grow the handle array so `extra` more handles fit without allocating
+ * (under r->mu: the app thread reads it there). */
+static bool receiver_tracks_reserve(moq_media_receiver_t *r, size_t extra)
+{
+    if (extra <= r->track_cap - r->track_count) return true;
+    if (extra > SIZE_MAX / 2 - r->track_count) return false;
+    size_t need = r->track_count + extra;
+    size_t nc = r->track_cap ? r->track_cap : 8;
+    while (nc < need) nc *= 2;
+    if (nc > SIZE_MAX / sizeof(moq_media_track_t *)) return false;
+    moq_media_track_t **na = (moq_media_track_t **)r->alloc.alloc(
+        nc * sizeof(moq_media_track_t *), r->alloc.ctx);
+    if (!na) return false;
+    pthread_mutex_lock(&r->mu);
+    if (r->tracks) {
+        memcpy(na, r->tracks, r->track_count * sizeof(moq_media_track_t *));
+        r->alloc.free(r->tracks, r->track_cap * sizeof(moq_media_track_t *),
+                      r->alloc.ctx);
+    }
+    r->tracks = na;
+    r->track_cap = nc;
+    pthread_mutex_unlock(&r->mu);
     return true;
 }
 
-/* Shared independent/delta adoption: immutable check, then the no-fail commit
- * (CP slot reserved before reconcile, so nothing is mutated before the last
- * fallible step). On ADOPT_OK the caller must NOT clean up cand. */
+/* Retire a removed handle's subscription and its held state (network
+ * thread, no lock): its facade slot stays mapped until released, so stream
+ * terminals still queued for it reach the lane under the removed handle;
+ * receiver_retire_tracks retries a refused unsubscribe or release on every
+ * pass. */
+static void receiver_retire_removed(moq_media_receiver_t *r, moq_media_track_t *t,
+                                    uint64_t now_us)
+{
+    moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
+    if (t->sub_track && t->local_result == MOQ_OK && !t->auth_failed)
+        receiver_retire_subscription(r, &t->sub_track, now_us,
+                                     receiver_facade_drained(r));
+    receiver_ts_free(r, t);
+    receiver_order_free(r, t);
+}
+
+/* Adopt a candidate catalog in two phases (network thread).
+ *
+ * Phase 1 plans and preflights with no visible mutation: each candidate
+ * track is matched to its declared handle by the candidate's identity rule
+ * and classified (track_change_t); a forbidden change refuses the whole
+ * candidate; every new handle, every replacement handle and every advisory
+ * generation is built, unpublished; then the handle cap, the retained-byte
+ * cap, the CP snapshot slot and the event queue's room for every event the
+ * adoption queues are checked. Any failure frees what was built and leaves
+ * the effective catalog, every handle and every selection exactly as they
+ * were.
+ *
+ * Phase 2 commits under one r->mu hold and cannot fail, since every
+ * allocation and event slot is already held: in candidate order a VOD
+ * change rewrites the current generation's live-to-VOD triple, an advisory
+ * change publishes its generation, a replacement moves the old handle's
+ * selection to its successor and retires the old handle (REMOVED with
+ * replaced_by, then ADDED with replaces), and a new track is added; then
+ * tracks the candidate no longer declares are removed, and the candidate
+ * becomes the effective catalog. Every application command takes r->mu, so
+ * a command either precedes the commit, and its effect is in the moved
+ * selection, or follows it, and is forwarded to the successor
+ * (receiver_chain_head_locked). Old subscriptions are retired after the
+ * unlock. On ADOPT_OK the caller must NOT clean up cand. */
 static void receiver_settle_completions(moq_media_receiver_t *r, uint64_t now_us);
 
 static adopt_result_t receiver_adopt(moq_media_receiver_t *r,
                                      moq_msf_catalog_t *cand, uint64_t now_us)
 {
-    if (r->has_effective && receiver_immutable_violation(&r->effective, cand))
-        return ADOPT_VIOLATION;
-    /* Bound cumulative retained state before mutating anything. */
-    if (!receiver_update_within_limits(r, cand)) return ADOPT_LIMIT;
-    if (receiver_reserve_cp_snap(r) != MOQ_OK) return ADOPT_NOMEM;
-    if (receiver_reconcile(r, cand, now_us) != MOQ_OK) return ADOPT_NOMEM;
-    receiver_commit_effective(r, cand);   /* no-fail (slot reserved) */
+    const moq_msf_catalog_t *eff = r->has_effective ? &r->effective : NULL;
+    size_t n = cand->track_count;
+    adopt_item_t *items = NULL;
+    if (n > 0) {
+        if (n > SIZE_MAX / sizeof(*items)) return ADOPT_NOMEM;
+        items = (adopt_item_t *)r->alloc.alloc(n * sizeof(*items), r->alloc.ctx);
+        if (!items) return ADOPT_NOMEM;
+        memset(items, 0, n * sizeof(*items));
+    }
+
+    /* Match and classify. */
+    for (size_t i = 0; i < r->track_count; i++) r->tracks[i]->recon_seen = false;
+    for (size_t i = 0; i < n; i++) {
+        adopt_item_t *it = &items[i];
+        it->mt = &cand->tracks[i];
+        it->live = receiver_find_live(r, it->mt, cand->revision);
+        if (!it->live) continue;
+        it->live->recon_seen = true;
+        const moq_msf_track_t *old = eff ? catalog_track_of(r, eff, it->live) : NULL;
+        it->change = old ? classify_change(r, old, eff, it->mt, cand) : TC_CRITICAL;
+        if (it->change == TC_FORBIDDEN) {
+            adopt_items_free(r, items, n);
+            return ADOPT_VIOLATION;
+        }
+        if (it->change == TC_CRITICAL && cand->revision != MOQ_MSF_REVISION_02) {
+            adopt_items_free(r, items, n);
+            return ADOPT_VIOLATION;
+        }
+    }
+
+    /* Build, unpublished. */
+    size_t add_handles = 0;
+    uint64_t add_bytes = 0;
+    uint32_t events = r->has_effective ? 0u : 1u;   /* CATALOG_READY */
+    for (size_t i = 0; i < n; i++) {
+        adopt_item_t *it = &items[i];
+        if (it->live && (it->change == TC_SAME || it->change == TC_VOD)) {
+            if (it->change == TC_VOD) events++;
+            continue;
+        }
+        moq_media_track_t *t = receiver_track_build(r, it->mt, cand);
+        if (!t) { adopt_items_free(r, items, n); return ADOPT_NOMEM; }
+        it->bytes = est_track_retained_bytes(r, it->mt, cand);
+        if (it->live && it->change == TC_ADVISORY &&
+            !receiver_same_delivery(it->live, t))
+            it->change = TC_CRITICAL;
+        if (it->live && it->change == TC_ADVISORY) {
+            if (it->live->config_gen == UINT32_MAX) {
+                receiver_track_free(r, t);
+                adopt_items_free(r, items, n);
+                return ADOPT_LIMIT;
+            }
+            it->gen = receiver_gen_from(r, t);
+            if (!it->gen) { adopt_items_free(r, items, n); return ADOPT_NOMEM; }
+            it->gen->desc.config_generation = it->live->config_gen + 1u;
+            events++;
+        } else {
+            it->built = t;
+            add_handles++;
+            events += it->live ? 2u : 1u;
+        }
+        add_bytes = sat_add(add_bytes, it->bytes);
+    }
+    for (size_t i = 0; i < r->track_count; i++)
+        if (!r->tracks[i]->removed && !r->tracks[i]->recon_seen) events++;
+
+    /* Caps and room. An update whose events would not all fit is dropped
+     * whole; the first catalog keeps the overflow rule (the event that does
+     * not fit terminalizes the receiver), as nothing is visible yet. */
+    bool will_snap = r->has_effective && r->effective.content_protection_count > 0;
+    uint64_t snap_bytes = will_snap ? est_catalog_retained_bytes(&r->effective) : 0;
+    pthread_mutex_lock(&r->mu);
+    uint32_t room = rq_room_locked(r);
+    pthread_mutex_unlock(&r->mu);
+    if (add_handles > r->max_stable_handles ||
+        r->track_count > r->max_stable_handles - add_handles ||
+        r->cp_snap_count + (will_snap ? 1u : 0u) > r->max_cp_snaps ||
+        sat_add(sat_add(r->retained_bytes, add_bytes), snap_bytes) >
+            r->max_retained_bytes ||
+        (r->has_effective && events > room)) {
+        adopt_items_free(r, items, n);
+        return ADOPT_LIMIT;
+    }
+    if ((will_snap && receiver_reserve_cp_snap(r) != MOQ_OK) ||
+        !receiver_tracks_reserve(r, add_handles)) {
+        adopt_items_free(r, items, n);
+        return ADOPT_NOMEM;
+    }
+
+    /* Commit. */
+    ADOPT_HOOK(0);
+    bool completing = cand->is_complete;
+    pthread_mutex_lock(&r->mu);
+    for (size_t i = 0; i < n; i++) {
+        adopt_item_t *it = &items[i];
+        moq_media_track_t *live = it->live;
+        if (live && it->change == TC_VOD) {
+            /* MSF 11.3/11.4: the one in-place write of a published
+             * description, on its current generation, serialized against
+             * moq_media_receiver_track_desc_copy() by r->mu. */
+            PUB_PHASE_HOOK(r, MOQ_MR_VOD_WRITER_PRE);
+            live->desc_cur->is_live = it->mt->is_live;
+            live->desc_cur->has_track_duration = it->mt->has_track_duration;
+            live->desc_cur->track_duration_ms = it->mt->track_duration_ms;
+            PUB_PHASE_HOOK(r, MOQ_MR_VOD_WRITER_POST);
+            (void)rq_push_locked(r, MOQ_MEDIA_TRACK_UPDATED, live);
+        } else if (live && it->change == TC_ADVISORY) {
+            receiver_desc_gen_t *g = it->gen;
+            it->gen = NULL;
+            g->next = live->gens;
+            live->gens = g;
+            live->config_gen = g->desc.config_generation;
+            live->desc_cur = &g->desc;
+            atomic_store_explicit(&live->desc_pub, &g->desc, memory_order_release);
+            r->retained_bytes = sat_add(r->retained_bytes, it->bytes);
+            (void)rq_push_locked(r, MOQ_MEDIA_TRACK_UPDATED, live);
+        } else if (live && it->change == TC_CRITICAL) {
+            moq_media_track_t *nt = it->built;
+            it->built = NULL;
+            /* The latest selection, moved whole: every command took r->mu. A
+             * successor without a delivery path cannot take a subscription. */
+            nt->desired_subscribed = live->desired_subscribed && nt->has_path;
+            nt->desired_filter = live->desired_filter;
+            nt->desired_has_priority = live->desired_has_priority;
+            nt->desired_priority = live->desired_priority;
+            nt->desired_ts_program = live->desired_ts_program;
+            nt->desired_options = live->desired_options;
+            /* A successor's first wire action is a SUBSCRIBE, not an
+             * UPDATE: no acknowledgment attribution carries over. */
+            nt->app_gen = nt->reconciled_app_gen = 0;
+            nt->gate = live->gate ? live->gate : (live->sub_track ? live : NULL);
+            live->successor = nt;
+            live->replaced = true;
+            live->removed = true;
+            live->desired_subscribed = false;
+            /* Fill commands belong to the old subscription generation. */
+            if (live->cmd_state == FILL_CMD_QUEUED) live->cmd_state = FILL_CMD_NONE;
+            else if (live->cmd_state == FILL_CMD_CLAIMED) live->cmd_withdrawn = true;
+            obj_compact_locked(r, keep_not_track, live);
+            live->has_drop_filter = false;
+            r->tracks[r->track_count++] = nt;       /* room reserved */
+            nt->recon_seen = true;
+            r->retained_bytes = sat_add(r->retained_bytes, it->bytes);
+            receiver_event_t *e = rq_push_locked(r, MOQ_MEDIA_TRACK_REMOVED, live);
+            if (e) e->replaced_by = nt;
+            e = rq_push_locked(r, MOQ_MEDIA_TRACK_ADDED, nt);
+            if (e) e->replaces = live;
+        } else if (!live) {
+            moq_media_track_t *t = it->built;
+            it->built = NULL;
+            t->recon_seen = true;
+            r->tracks[r->track_count++] = t;        /* room reserved */
+            /* Auto-subscribe takes every media track with a delivery path:
+             * timelines are subscribed explicitly, and a track without a
+             * path (info not derived, packaging not parseable in this build,
+             * no namespace to subscribe, or a receiver policy) would only
+             * cost bitrate. See subscribe_track, which refuses those. */
+            if (r->auto_subscribe && t->has_media_path) {
+                t->desired_subscribed = true;
+                t->desired_filter = MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
+            }
+            r->retained_bytes = sat_add(r->retained_bytes, it->bytes);
+            (void)rq_push_locked(r, MOQ_MEDIA_TRACK_ADDED, t);
+        }
+    }
+    /* Tracks the candidate no longer declares. A terminal catalog (isComplete,
+     * MSF 5.1.3 / 11.3) completes the broadcast rather than withdrawing the
+     * track: what the track already delivered stays queued for the
+     * application, and a track whose subscription has not ended keeps it
+     * until its subscription's done is processed, with every stream the
+     * done counts taken in. Every such track settles in
+     * receiver_settle_completions, one already over at once: its
+     * TRACK_REMOVED then follows the commit that latches
+     * stats.catalog_complete, so a consumer reading it at that event sees
+     * the broadcast complete. */
+    size_t scan = r->track_count;
+    for (size_t i = 0; i < scan; i++) {
+        moq_media_track_t *t = r->tracks[i];
+        if (t->removed || t->recon_seen) continue;
+        t->removed = true;
+        t->removed_by_completion = completing;
+        /* Keep wanted media in flight after completion; do not revive a
+         * subscription the application already cancelled. */
+        if (!completing) t->desired_subscribed = false;
+        if (completing && t->local_result == MOQ_OK && !t->auth_failed) {
+            t->completion_pending = true;
+            t->completion_cancelled = !t->desired_subscribed;
+            continue;
+        }
+        if (!completing)
+            obj_compact_locked(r, keep_not_track, t);   /* purge its queued objects */
+        (void)rq_push_locked(r, MOQ_MEDIA_TRACK_REMOVED, t);
+    }
+    receiver_commit_effective_locked(r, cand);
+    pthread_mutex_unlock(&r->mu);
+    ADOPT_HOOK(1);
+
+    /* Retire what the commit removed (no lock held). */
+    for (size_t i = 0; i < r->track_count; i++) {
+        moq_media_track_t *t = r->tracks[i];
+        if (t->removed && !t->completion_pending && (t->sub_track || t->ts ||
+                                                     t->order))
+            receiver_retire_removed(r, t, now_us);
+    }
+    adopt_items_free(r, items, n);
     /* A terminal catalog's removals settle after its commit, so a track
      * that is already over (never subscribed, or its subscription done) is
      * removed in this same adoption, with stats.catalog_complete set. */
-    if (cand->is_complete) receiver_settle_completions(r, now_us);
+    if (completing) receiver_settle_completions(r, now_us);
     return ADOPT_OK;
 }
 
@@ -2534,7 +3269,7 @@ static adopt_result_t receiver_adopt(moq_media_receiver_t *r,
  * receiver enforces this inbound semantic invariant before adoption -- on both
  * the independent and the delta-applied candidate -- so the parser stays lenient
  * for raw/fuzz users while the receiver contract holds. (Survivor tracks that
- * change live/duration are already caught by receiver_immutable_violation; this
+ * change live/duration are already caught by the adoption's classification; this
  * additionally catches NEW live+duration tracks, e.g. a first/later independent
  * catalog or a delta `add`.) */
 static bool catalog_has_live_track_with_duration(const moq_msf_catalog_t *c)
@@ -2616,18 +3351,224 @@ static void receiver_join_current_group(moq_location_filter_cfg_t *loc,
     fill->location = fill_loc;
 }
 
-/* Parse a catalog object through the MSF-01 extent of the catalog API: the
- * MSF-01 vocabulary only, with no publishTracks and no track supplements,
- * which this receiver's adoption and retained-state accounting do not
- * cover. The storage past that extent is zeroed, so the whole struct is
- * defined wherever it is copied. */
+/* -- MSF properties (MSF-02 12) ----------------------------------------- *
+ * MSF_COMPRESSION (12.1, an integer) and MSF_EVENT_TIMELINE_HEADER (12.3.1,
+ * bytes) in a Track or Object Properties block encoded for the session's
+ * draft, searched as LOC reads its properties: the outer list and one
+ * Immutable Properties (0x0B) inner list. Draft 16 encodes the KVP fields as
+ * QUIC varints, drafts 18 and 22 as vi64 (draft-16 1.4.2, draft-18 1.4.3,
+ * draft-22 8.3); any other draft has no registered codec. Bounded: every
+ * field is checked against the bytes left before it is read, and each step
+ * consumes at least one byte. */
+#define RECEIVER_MSF_COMPRESSION           UINT64_C(0x78)
+#define RECEIVER_MSF_EVENT_TIMELINE_HEADER UINT64_C(0x7B)
+#define RECEIVER_MSF_IMMUTABLE_PROPERTIES  UINT64_C(0x0B)
+
+typedef struct receiver_prop_walk {
+    bool           d16;
+    const uint8_t *p;
+    size_t         n;
+    uint64_t       prev;
+    bool           first;
+} receiver_prop_walk_t;
+
+typedef struct receiver_prop {
+    uint64_t       type;
+    uint64_t       value;      /* even type */
+    moq_bytes_t    bytes;      /* odd type, borrowed from the block */
+} receiver_prop_t;
+
+static size_t receiver_prop_int(bool d16, const uint8_t *p, size_t n, uint64_t *v)
+{
+    return d16 ? moq_quic_varint_decode(p, n, v) : moq_vi64_decode(p, n, v);
+}
+
+/* MOQ_OK with *out, MOQ_DONE at the end, MOQ_ERR_PROTO when malformed. */
+static moq_result_t receiver_prop_next(receiver_prop_walk_t *w, receiver_prop_t *out)
+{
+    if (w->n == 0) return MOQ_DONE;
+    uint64_t delta = 0;
+    size_t k = receiver_prop_int(w->d16, w->p, w->n, &delta);
+    if (k == 0) return MOQ_ERR_PROTO;
+    w->p += k;
+    w->n -= k;
+    if (!w->first && delta > UINT64_MAX - w->prev) return MOQ_ERR_PROTO;
+    out->type = w->first ? delta : w->prev + delta;
+    w->prev = out->type;
+    w->first = false;
+    out->value = 0;
+    out->bytes = (moq_bytes_t){ NULL, 0 };
+    uint64_t v = 0;
+    k = receiver_prop_int(w->d16, w->p, w->n, &v);
+    if (k == 0) return MOQ_ERR_PROTO;
+    w->p += k;
+    w->n -= k;
+    if ((out->type & 1u) == 0) { out->value = v; return MOQ_OK; }
+    if (v > 0xFFFFu || v > w->n) return MOQ_ERR_PROTO;   /* odd Length cap */
+    out->bytes = (moq_bytes_t){ w->p, (size_t)v };
+    w->p += (size_t)v;
+    w->n -= (size_t)v;
+    return MOQ_OK;
+}
+
+/* Find property `type` in `props` for draft `v`. MOQ_OK with *present (and
+ * *out when present); MOQ_ERR_UNSUPPORTED for a draft without a registered
+ * codec or the property repeated; MOQ_ERR_PROTO for a malformed block. */
+static moq_result_t receiver_prop_find(moq_version_t v, moq_bytes_t props,
+                                       uint64_t type, bool *present,
+                                       receiver_prop_t *out)
+{
+    *present = false;
+    if (props.len == 0) return MOQ_OK;
+    if (v != MOQ_VERSION_DRAFT_16 && v != MOQ_VERSION_DRAFT_18 &&
+        v != MOQ_VERSION_DRAFT_22)
+        return MOQ_ERR_UNSUPPORTED;
+    bool d16 = v == MOQ_VERSION_DRAFT_16;
+    receiver_prop_walk_t outer = { d16, props.data, props.len, 0, true };
+    receiver_prop_t it;
+    moq_result_t rc;
+    while ((rc = receiver_prop_next(&outer, &it)) == MOQ_OK) {
+        if (it.type == RECEIVER_MSF_IMMUTABLE_PROPERTIES) {
+            receiver_prop_walk_t inner = { d16, it.bytes.data, it.bytes.len, 0, true };
+            receiver_prop_t in;
+            while ((rc = receiver_prop_next(&inner, &in)) == MOQ_OK) {
+                if (in.type == RECEIVER_MSF_IMMUTABLE_PROPERTIES) return MOQ_ERR_PROTO;
+                if (in.type != type) continue;
+                if (*present) return MOQ_ERR_UNSUPPORTED;
+                *present = true;
+                *out = in;
+            }
+            if (rc != MOQ_DONE) return rc;
+            continue;
+        }
+        if (it.type != type) continue;
+        if (*present) return MOQ_ERR_UNSUPPORTED;
+        *present = true;
+        *out = it;
+    }
+    return rc == MOQ_DONE ? MOQ_OK : rc;
+}
+
+/* What MSF_COMPRESSION (MSF-02 12.1) makes of one catalog or timeline
+ * Object, from its origin's Track Properties and its own Object Properties.
+ * This is the one place the receiver decides it. Value 0 (or no property)
+ * is uncompressed. A publisher must not use both properties on a track
+ * (12.1), so an Object carrying the Object property where the Track
+ * property is set is dropped, whatever the values. MSF defines GZIP (1),
+ * but this build does not decompress, so a compressed payload is refused
+ * as an algorithm it does not support (12.1.1: "MUST NOT attempt to
+ * process the payload"; 12.1.2: "MUST NOT attempt to process that
+ * object"), like any value it does not know, a repeated property and a
+ * malformed block: it is never processed as if uncompressed. */
+typedef enum {
+    RECEIVER_PAYLOAD_PLAIN = 0,       /* process as received */
+    RECEIVER_PAYLOAD_CONFLICT,        /* drop the Object */
+    RECEIVER_PAYLOAD_OBJECT_REFUSED,  /* drop the Object */
+    RECEIVER_PAYLOAD_ORIGIN_REFUSED,  /* refuse every Object of the origin */
+} receiver_payload_t;
+
+static receiver_payload_t receiver_payload_compression(moq_version_t v,
+                                                       moq_bytes_t track_props,
+                                                       moq_bytes_t object_props)
+{
+    bool tp = false, op = false;
+    receiver_prop_t t, o;
+    if (receiver_prop_find(v, track_props, RECEIVER_MSF_COMPRESSION, &tp, &t) != MOQ_OK ||
+        (tp && t.value != 0))
+        return RECEIVER_PAYLOAD_ORIGIN_REFUSED;
+    moq_result_t rc = receiver_prop_find(v, object_props, RECEIVER_MSF_COMPRESSION, &op, &o);
+    if (tp && (op || rc == MOQ_ERR_UNSUPPORTED)) return RECEIVER_PAYLOAD_CONFLICT;
+    if (rc != MOQ_OK || (op && o.value != 0)) return RECEIVER_PAYLOAD_OBJECT_REFUSED;
+    return RECEIVER_PAYLOAD_PLAIN;
+}
+
+/* Whether a Properties block carries MSF_COMPRESSION at all (any value,
+ * repeated or not, inside a well-formed block or not). */
+static bool receiver_props_mention_compression(moq_version_t v, moq_bytes_t props)
+{
+    bool present = false;
+    receiver_prop_t p;
+    moq_result_t rc = receiver_prop_find(v, props, RECEIVER_MSF_COMPRESSION, &present, &p);
+    return present || rc == MOQ_ERR_UNSUPPORTED;
+}
+
+static moq_bytes_t rcbuf_bytes(const moq_rcbuf_t *b)
+{
+    return b ? (moq_bytes_t){ moq_rcbuf_data(b), moq_rcbuf_len(b) }
+             : (moq_bytes_t){ NULL, 0 };
+}
+
+/* The Track Properties of a subscription generation (its SUBSCRIBE_OK, or
+ * PUBLISH on draft 22); empty when unknown. A fill inherits its parent's. */
+static moq_bytes_t receiver_sub_track_props(const moq_media_receiver_t *r,
+                                            const moq_sub_track_t *generation)
+{
+    moq_sub_track_result_t res;
+    if (!r->sub || !generation ||
+        moq_sub_get_track_result(r->sub, generation, &res, sizeof(res)) != MOQ_OK)
+        return (moq_bytes_t){ NULL, 0 };
+    return res.track_properties;
+}
+
+/* The Track Properties of a fetch's own response (FETCH_OK), its origin's:
+ * a fetch never inherits its subscription's. Empty before the response is
+ * seen (on drafts 16 and 18 a fetch's Objects may arrive ahead of it); such
+ * an Object is then judged by its own properties. */
+static moq_bytes_t receiver_fetch_track_props(const moq_media_receiver_t *r,
+                                              const moq_sub_fetch_req_t *req)
+{
+    moq_sub_fetch_result_t res;
+    if (!r->sub || !req ||
+        moq_sub_get_fetch_result(r->sub, req, &res, sizeof(res)) != MOQ_OK ||
+        !(res.flags & MOQ_SUB_FETCH_RESULT_RESPONSE_SEEN))
+        return (moq_bytes_t){ NULL, 0 };
+    return res.track_properties;
+}
+
+/* Parse a catalog object, both revisions (the full extent of the catalog
+ * API: MSF-02 vocabulary, publishTracks and track supplements included). */
 static moq_result_t receiver_parse_catalog(moq_media_receiver_t *r,
                                            moq_bytes_t json,
                                            moq_msf_catalog_t *out)
 {
     memset(out, 0, sizeof(*out));
-    return moq_msf_catalog_parse_sized(&r->alloc, json, out,
-                                       MOQ_MSF_CATALOG_SIZE_THROUGH_VERSION_FORM);
+    return moq_msf_catalog_parse_sized(&r->alloc, json, out, sizeof(*out));
+}
+
+/* What a catalog of this receiver is judged against: its namespace, which
+ * a track without "namespace" inherits (MSF-02 5.2.2), and its handle cap,
+ * which bounds a delta's effective catalog before any O(n) work. */
+static moq_msf_validate_cfg_t receiver_catalog_vcfg(const moq_media_receiver_t *r)
+{
+    moq_msf_validate_cfg_t vc;
+    moq_msf_validate_cfg_init(&vc);
+    vc.catalog_namespace = r->namespace_;
+    vc.max_effective_tracks = r->max_stable_handles;
+    return vc;
+}
+
+/* The inbound semantic check of an independent catalog (moq_msf_catalog_check):
+ * the raw parser is lenient, but a peer catalog with duplicate Full Track
+ * Names, initDataList ids or contentProtection refIDs, or MSF-02 "depends"
+ * entries that do not resolve, is rejected rather than coalesced. */
+static bool receiver_catalog_ok(const moq_media_receiver_t *r,
+                                const moq_msf_catalog_t *cat)
+{
+    moq_msf_validate_cfg_t vc = receiver_catalog_vcfg(r);
+    return moq_msf_catalog_check(&r->alloc, cat, &vc, NULL) == MOQ_OK;
+}
+
+/* Apply a delta onto `base`, judged by the base's revision. Identity lookups
+ * inside apply are indexed, so a large valid delta is O(base + delta). */
+static moq_result_t receiver_apply_delta(const moq_media_receiver_t *r,
+                                         const moq_msf_catalog_t *base,
+                                         const moq_msf_catalog_t *delta,
+                                         moq_msf_catalog_t *out)
+{
+    moq_msf_validate_cfg_t vc = receiver_catalog_vcfg(r);
+    moq_alloc_t alloc = r->alloc;
+    return moq_msf_catalog_apply_delta_sized(&alloc, base, delta, &vc, out,
+                                             sizeof(*out));
 }
 
 /* Ingest one catalog object (network thread). object 0 = an independent catalog
@@ -2636,9 +3577,30 @@ static moq_result_t receiver_parse_catalog(moq_media_receiver_t *r,
  * (moq_msf_catalog_apply_delta → adopt). Any failure keeps the current
  * effective, counts a drop, and desyncs the group until the next independent
  * (object 0 of a newer group) re-syncs. */
+/* Count a catalog Object MSF_COMPRESSION keeps from being processed;
+ * false when the payload is plain. */
+static bool receiver_catalog_compressed(moq_media_receiver_t *r,
+                                        moq_bytes_t track_props,
+                                        moq_bytes_t object_props)
+{
+    receiver_payload_t pc = receiver_payload_compression(r->transport_version,
+                                                         track_props, object_props);
+    if (pc == RECEIVER_PAYLOAD_PLAIN) return false;
+    pthread_mutex_lock(&r->mu);
+    if (pc == RECEIVER_PAYLOAD_CONFLICT) r->stats.compression_conflicts++;
+    else r->stats.compression_refused++;
+    pthread_mutex_unlock(&r->mu);
+    return true;
+}
+
+/* `object_props` are the Object's properties and `track_props` its origin's
+ * Track Properties (the catalog subscription's, or the Joining FETCH's own):
+ * an Object MSF_COMPRESSION keeps from being processed fails as a malformed
+ * catalog Object does. */
 static void receiver_ingest_catalog(moq_media_receiver_t *r,
                                     uint64_t group_id, uint64_t object_id,
-                                    moq_rcbuf_t *payload, uint64_t now_us)
+                                    moq_rcbuf_t *payload, moq_bytes_t object_props,
+                                    moq_bytes_t track_props, uint64_t now_us)
 {
     if (!payload) return;
 
@@ -2664,6 +3626,11 @@ static void receiver_ingest_catalog(moq_media_receiver_t *r,
         }
 
         moq_msf_catalog_t cand;
+        if (receiver_catalog_compressed(r, track_props, object_props)) {
+            if (first) { receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_CATALOG_UNUSABLE); return; }
+            receiver_count_drop(r);
+            return;
+        }
         moq_result_t rc = receiver_parse_catalog(r, json, &cand);
         if (rc != MOQ_OK || cand.delta_update) {        /* delta on object 0 */
             if (rc == MOQ_OK) moq_msf_catalog_cleanup(&r->alloc, &cand);
@@ -2685,7 +3652,7 @@ static void receiver_ingest_catalog(moq_media_receiver_t *r,
          * duplicate track tuples / initDataList ids / contentProtection refIDs
          * rather than silently coalescing them. Treated like a malformed
          * independent catalog: fatal on the first, a counted drop afterwards. */
-        if (moq_msf_catalog_validate_identities(&r->alloc, &cand) != MOQ_OK) {
+        if (!receiver_catalog_ok(r, &cand)) {
             moq_msf_catalog_cleanup(&r->alloc, &cand);
             if (first) { receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_CATALOG_UNUSABLE); return; }
             receiver_count_drop(r);
@@ -2734,6 +3701,10 @@ static void receiver_ingest_catalog(moq_media_receiver_t *r,
     }
 
     moq_msf_catalog_t delta;
+    if (receiver_catalog_compressed(r, track_props, object_props)) {
+        receiver_desync(r);
+        return;
+    }
     moq_result_t rc = receiver_parse_catalog(r, json, &delta);
     if (rc != MOQ_OK || !delta.delta_update) {   /* not a delta object */
         if (rc == MOQ_OK) moq_msf_catalog_cleanup(&r->alloc, &delta);
@@ -2741,18 +3712,9 @@ static void receiver_ingest_catalog(moq_media_receiver_t *r,
         return;
     }
     moq_msf_catalog_t cand;
-    memset(&cand, 0, sizeof(cand));   /* the apply writes the MSF-01 extent */
-    /* Bound the delta before it builds the effective catalog: the receiver
-     * never retains more than max_stable_handles tracks, so a delta that would
-     * exceed that is refused (MOQ_ERR_PROTO -> desync) before any O(n) work.
-     * Identity lookups inside apply are indexed, so a large valid delta is
-     * O(base + delta), not O(n^2). */
-    moq_msf_apply_limits_t alim;
-    memset(&alim, 0, sizeof(alim));
-    alim.struct_size = sizeof(alim);
-    alim.max_effective_tracks = r->max_stable_handles;
-    rc = moq_msf_catalog_apply_delta_ex(&r->alloc, &r->effective, &delta,
-                                        &alim, &cand);
+    /* The receiver never retains more than max_stable_handles tracks, so a
+     * delta that would exceed that is refused (MOQ_ERR_PROTO -> desync). */
+    rc = receiver_apply_delta(r, &r->effective, &delta, &cand);
     moq_msf_catalog_cleanup(&r->alloc, &delta);
     if (rc != MOQ_OK) { receiver_desync(r); return; }   /* apply failure */
 
@@ -2872,16 +3834,14 @@ static moq_result_t receiver_isolate(moq_media_receiver_t *r, moq_rcbuf_t **slot
     return MOQ_OK;
 }
 
-#ifdef MOQ_SERVICE_HAVE_MPEG2TS
 /* Keep *slot as is when transferable, else isolate it. False when the copy
- * cannot be allocated (*slot unchanged). The TS window's retention points
- * use it; queued objects and staged catalog JSON isolate inside their own
- * reservations. */
+ * cannot be allocated (*slot unchanged). The reorder windows' and the
+ * ordering stage's retention points use it; queued objects and staged
+ * catalog JSON isolate inside their own reservations. */
 static bool receiver_own_for_handoff(moq_media_receiver_t *r, moq_rcbuf_t **slot)
 {
     return receiver_transferable(r, *slot) || receiver_isolate(r, slot) == MOQ_OK;
 }
-#endif
 
 /* Retain only the JSON payload in the existing object ring. These entries
  * share its physical count/byte ceiling, but are not app-pollable media. */
@@ -2892,6 +3852,10 @@ static void receiver_bootstrap_stage_live(moq_media_receiver_t *r,
     if (object->status != MOQ_OBJECT_NORMAL) return;
 
     size_t bytes = object->payload ? moq_rcbuf_len(object->payload) : 0;
+    /* The properties travel with the JSON: MSF_COMPRESSION is judged when
+     * the staged Object is replayed. */
+    size_t prop_bytes = object->properties ? moq_rcbuf_len(object->properties) : 0;
+    if (prop_bytes > SIZE_MAX - bytes) { receiver_bootstrap_fail(r); return; }
     pthread_mutex_lock(&r->mu);
     for (uint32_t i = r->obj_head; i != r->obj_tail; i++) {
         const receiver_obj_entry_t *e = &r->objs[i % r->ring_cap];
@@ -2905,7 +3869,15 @@ static void receiver_bootstrap_stage_live(moq_media_receiver_t *r,
     if (r->overflow.policy == MOQ_MEDIA_OVERFLOW_FLOW_CONTROL)
         ceiling += ceiling / 2; /* construction checked this sum */
     bool fits = r->obj_tail - r->obj_head < r->ring_cap &&
-        obj_bytes_fit(r, bytes, ceiling);
+        obj_bytes_fit(r, bytes + prop_bytes, ceiling);
+    if (fits && object->properties && !receiver_transferable(r, object->properties)) {
+        r->obj_budget_total += bytes + prop_bytes;
+        pthread_mutex_unlock(&r->mu);
+        moq_result_t crc = receiver_isolate(r, &object->properties);
+        pthread_mutex_lock(&r->mu);
+        r->obj_budget_total -= bytes + prop_bytes;
+        fits = crc == MOQ_OK && r->obj_tail - r->obj_head < r->ring_cap;
+    }
     if (fits && object->payload && !receiver_transferable(r, object->payload)) {
         /* The staged JSON stays in the ring, which a destroying thread may
          * release, so a shared payload is replaced by a copy first. Its bytes
@@ -2925,12 +3897,14 @@ static void receiver_bootstrap_stage_live(moq_media_receiver_t *r,
         receiver_obj_entry_t *e = &r->objs[r->obj_tail++ % r->ring_cap];
         memset(e, 0, sizeof(*e));
         e->catalog = true;
-        e->budget = bytes;
+        e->budget = bytes + prop_bytes;
         e->obj.group_id = object->group_id;
         e->obj.object_id = object->object_id;
         e->obj.payload_ref = object->payload;
         object->payload = NULL;
-        r->obj_budget_total += bytes;
+        e->obj.properties_ref = object->properties;
+        object->properties = NULL;
+        r->obj_budget_total += bytes + prop_bytes;
         r->catalog_objects_queued++;
     }
     pthread_mutex_unlock(&r->mu);
@@ -2957,14 +3931,17 @@ static void receiver_bootstrap_replay_live(moq_media_receiver_t *r, uint64_t now
         receiver_obj_entry_t *head = &r->objs[r->obj_head % r->ring_cap];
         assert(selected->catalog && head->catalog);
         moq_rcbuf_t *payload = selected->obj.payload_ref;
+        moq_rcbuf_t *props = selected->obj.properties_ref;
         uint64_t group = selected->obj.group_id, object = selected->obj.object_id;
         obj_unqueue_locked(r, selected);
         if (selected != head) *selected = *head;
         memset(head, 0, sizeof(*head));
         r->obj_head++;
         pthread_mutex_unlock(&r->mu);
-        receiver_ingest_catalog(r, group, object, payload, now_us);
+        receiver_ingest_catalog(r, group, object, payload, rcbuf_bytes(props),
+                                receiver_sub_track_props(r, r->catalog_sub), now_us);
         moq_rcbuf_decref(payload);
+        if (props) moq_rcbuf_decref(props);
         pthread_mutex_lock(&r->mu);
         bool fatal = r->fatal;
         pthread_mutex_unlock(&r->mu);
@@ -3025,9 +4002,16 @@ static void receiver_bootstrap_object(moq_media_receiver_t *r,
         receiver_bootstrap_fail(r);
         return;
     }
+    /* The fill inherits the catalog subscription's Track Properties; an
+     * Object it cannot process breaks the base-and-deltas sequence. */
+    if (receiver_catalog_compressed(r, receiver_sub_track_props(r, r->catalog_sub),
+                                    rcbuf_bytes(item->u.object.properties))) {
+        receiver_bootstrap_fail(r);
+        return;
+    }
     moq_bytes_t json = { moq_rcbuf_data(item->u.object.payload), moq_rcbuf_len(item->u.object.payload) };
     moq_msf_catalog_t parsed, candidate;
-    memset(&candidate, 0, sizeof(candidate));   /* the apply writes the MSF-01 extent */
+    memset(&candidate, 0, sizeof(candidate));
     moq_result_t rc = receiver_parse_catalog(r, json, &parsed);
     if (rc != MOQ_OK) { receiver_bootstrap_fail(r); return; }
     if (!b->have_base) {
@@ -3038,19 +4022,17 @@ static void receiver_bootstrap_object(moq_media_receiver_t *r,
         }
         candidate = parsed;
     } else {
-        moq_msf_apply_limits_t limits = {0};
-        limits.struct_size = sizeof(limits);
-        limits.max_effective_tracks = r->max_stable_handles;
-        rc = parsed.delta_update ? moq_msf_catalog_apply_delta_ex(
-            &r->alloc, &r->effective, &parsed, &limits, &candidate) : MOQ_ERR_PROTO;
+        rc = parsed.delta_update
+            ? receiver_apply_delta(r, &r->effective, &parsed, &candidate)
+            : MOQ_ERR_PROTO;
         moq_msf_catalog_cleanup(&r->alloc, &parsed);
         if (rc != MOQ_OK) { receiver_bootstrap_fail(r); return; }
     }
     uint64_t cost = est_catalog_retained_bytes(&candidate);
     uint64_t other = r->retained_bytes - b->retained_bytes;
     if (catalog_has_live_track_with_duration(&candidate) ||
-        moq_msf_catalog_validate_identities(&r->alloc, &candidate) != MOQ_OK ||
-        (b->have_base && receiver_immutable_violation(&r->effective, &candidate)) ||
+        !receiver_catalog_ok(r, &candidate) ||
+        (b->have_base && receiver_change_forbidden(r, &r->effective, &candidate)) ||
         candidate.track_count > r->max_stable_handles || cost > r->max_retained_bytes ||
         other > r->max_retained_bytes - cost) {
         moq_msf_catalog_cleanup(&r->alloc, &candidate);
@@ -3317,7 +4299,10 @@ static void receiver_take_fill_item(moq_media_receiver_t *r,
         if (fi->kind == MOQ_SUB_FILL_OBJECT)
             receiver_ingest_catalog(r, fi->u.object.group_id,
                                     fi->u.object.object_id,
-                                    fi->u.object.payload, now_us);
+                                    fi->u.object.payload,
+                                    rcbuf_bytes(fi->u.object.properties),
+                                    receiver_sub_track_props(r, r->catalog_sub),
+                                    now_us);
         moq_sub_fill_item_cleanup(fi);
         return;
     }
@@ -3379,7 +4364,7 @@ static moq_media_auth_request_t receiver_auth_request(moq_media_receiver_t *r,
     moq_media_auth_request_t request = {0};
     request.struct_size = sizeof(request);
     request.action = action;
-    request.track_namespace = r->namespace_;
+    request.track_namespace = track ? track->ns_fields : r->namespace_;
     request.track_name = track ? track->desc.name :
         (moq_bytes_t){r->catalog_name, r->catalog_name_len};
     return request;
@@ -3448,7 +4433,10 @@ static void receiver_auth_fail(moq_media_receiver_t *r,
         r->mt_tail = out;
     }
     pthread_mutex_unlock(&r->mu);
-    if (t) receiver_ts_free(r, t);
+    if (t) {
+        receiver_ts_free(r, t);
+        receiver_order_free(r, t);
+    }
     moq_media_auth_operation_notify(op, &r->auth_source, request, scope, t);
     moq_media_auth_operation_clear(op, &r->alloc);
     moq_endpoint_wake(r->ep);
@@ -3512,7 +4500,10 @@ static void receiver_pump_catalog_fetch(moq_media_receiver_t *r,
             if (item.kind == MOQ_SUB_FETCH_OBJECT)
                 receiver_ingest_catalog(r, item.u.object.group_id,
                                         item.u.object.object_id,
-                                        item.u.object.payload, now_us);
+                                        item.u.object.payload,
+                                        rcbuf_bytes(item.u.object.properties),
+                                        receiver_fetch_track_props(r, item.request),
+                                        now_us);
             /* moq_sub_poll_fetch already released the request slot for terminal
              * items; drop our handle (only on our own fetch) so a recycled slot
              * can't later match. */
@@ -3978,6 +4969,31 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
         return;
     }
 
+    /* The fragment must belong to the track the handle's init describes. A
+     * stale Group of another configuration is caught here when its track_ID
+     * differs; one with the same track_ID is not (see media_receiver.h). */
+    if (rc == MOQ_OK && track->cmaf_track_id_check &&
+        parsed.status == MOQ_OBJECT_NORMAL && parsed.fragment.len > 0) {
+        moq_cmaf_object_report_t report;
+        moq_cmaf_object_report_init(&report);
+        (void)moq_cmaf_validate_object(track->desc.cmaf, parsed.fragment, &report);
+        if (report.track_id != 0 && report.track_id != track->desc.cmaf->track_id)
+            rc = MOQ_ERR_PROTO;
+    }
+    if (rc != MOQ_OK) {
+        receiver_note_parse_drop(r, track, MOQ_MEDIA_PARSE_DROP_MEDIA);
+        pthread_mutex_lock(&r->mu);
+        receiver_loss_dropped_locked(r, track, so, loss, dom);
+        pthread_mutex_unlock(&r->mu);
+        if (heap_samples)
+            r->alloc.free(heap_samples,
+                          sample_cap * sizeof(moq_cmaf_sample_t),
+                          r->alloc.ctx);
+        if (deliver) moq_rcbuf_decref(deliver);
+        moq_sub_object_cleanup(so);
+        return;
+    }
+
     /* A terminal-status object is track-event data, never an object. */
     if (parsed.status == MOQ_OBJECT_END_OF_TRACK) {
         st_end_of_track(r, track, so->group_id, so->object_id);
@@ -4347,75 +5363,10 @@ static void receiver_on_fill_ts_object(moq_media_receiver_t *r,
                             initiating_request_id, &ref, join ? &jr : NULL);
 }
 
-/* -- MPEG2TS intake (network thread) -------------------------------------- *
- * Each subscribed TS track runs a <moq/mpeg2ts.h> receiver: Objects are
- * offered to its reorder window as they arrive and released in Location
- * order, each with the loss report the window computed, into the common
- * queue. The window holds the facade's payload reference (in a held record)
- * until release. Group ends come from the facade's FIN surface and from
- * END_OF_GROUP status Objects; END_OF_TRACK and the subscription's end
- * finish the window, so no held Object is lost behind TRACK_ENDED. */
-
-/* Whether the track has a join PSI to give (mpeg2ts_join_psi and PSI init
- * data of whole packets). */
-static bool ts_join_psi_usable(const moq_media_receiver_t *r,
-                               const moq_media_track_t *t)
-{
-    uint32_t ps = receiver_ts_packet_size(&t->desc);
-    return r->ts_join_psi && t->desc.init_data.len > 0 &&
-           t->desc.init_data.len % ps == 0;
-}
-
-/* Whether an Object of subscription generation `gen` is prepared as a
- * candidate for the join PSI: the generation is current and its PSI has not
- * gone out yet. Caller holds r->mu. */
-static bool ts_join_wanted_locked(const moq_media_receiver_t *r,
-                                  const moq_media_track_t *t, uint32_t gen)
-{
-    return ts_join_psi_usable(r, t) && gen == t->ts_gen && !t->ts_join_delivered;
-}
-
-#ifdef MOQ_SERVICE_HAVE_MPEG2TS
-typedef struct receiver_ts {
-    moq_mpeg2ts_receiver_t      rx;
-    moq_mpeg2ts_reorder_slot_t *slots;
-    size_t                      slot_count;
-    /* A delivery the window released that waits for lane room; a status
-     * Object that goes out once what was due at its arrival has; an end
-     * that waits for the finished window to empty. Each keeps the slot its
-     * intake reserved. */
-    bool                        has_parked;
-    bool                        stalled;
-    moq_mpeg2ts_delivery_t      parked;
-    bool                        has_status;
-    moq_sub_object_t            status;
-    uint64_t                    status_seq, status_us;
-    bool                        end_pending;
-    uint64_t                    end_group, end_object;
-} receiver_ts_t;
-
-/* The window ctx of a track's END_OF_TRACK (an address no holder has). */
-static const char receiver_ts_end_mark;
-#define RECEIVER_TS_END_MARK ((void *)(uintptr_t)&receiver_ts_end_mark)
-
-/* What a held Object needs besides its Location and payload. */
-typedef struct receiver_ts_held {
-    moq_rcbuf_t *payload;
-    moq_rcbuf_t *properties;
-    uint64_t     seq;          /* its ingress sequence */
-    uint64_t     subgroup_id;
-    uint8_t      priority;
-    bool         datagram;
-    bool         end_of_group;
-} receiver_ts_held_t;
-
-static void ts_held_free(moq_media_receiver_t *r, receiver_ts_held_t *h)
-{
-    if (!h || (void *)h == RECEIVER_TS_END_MARK) return;
-    if (h->payload) moq_rcbuf_decref(h->payload);
-    if (h->properties) moq_rcbuf_decref(h->properties);
-    r->alloc.free(h, sizeof(*h), r->alloc.ctx);
-}
+/* -- Held items and their lane slots (network thread) ---------------------- *
+ * What a reorder window or the in-group ordering stage holds keeps the lane
+ * slot its intake reserved, and is admitted later under its own ingress
+ * sequence. */
 
 /* The intake's reserved slot passes to what the window now holds. */
 static void ts_keep_slot(moq_media_receiver_t *r)
@@ -4494,6 +5445,76 @@ static bool receiver_release_room(moq_media_receiver_t *r, uint64_t need)
     bool ok = fits || st_unreserved_locked(r) >= r->domains_queued;
     pthread_mutex_unlock(&r->mu);
     return ok;
+}
+
+/* -- MPEG2TS intake (network thread) -------------------------------------- *
+ * Each subscribed TS track runs a <moq/mpeg2ts.h> receiver: Objects are
+ * offered to its reorder window as they arrive and released in Location
+ * order, each with the loss report the window computed, into the common
+ * queue. The window holds the facade's payload reference (in a held record)
+ * until release. Group ends come from the facade's FIN surface and from
+ * END_OF_GROUP status Objects; END_OF_TRACK and the subscription's end
+ * finish the window, so no held Object is lost behind TRACK_ENDED. */
+
+/* Whether the track has a join PSI to give (mpeg2ts_join_psi and PSI init
+ * data of whole packets). */
+static bool ts_join_psi_usable(const moq_media_receiver_t *r,
+                               const moq_media_track_t *t)
+{
+    uint32_t ps = receiver_ts_packet_size(&t->desc);
+    return r->ts_join_psi && t->desc.init_data.len > 0 &&
+           t->desc.init_data.len % ps == 0;
+}
+
+/* Whether an Object of subscription generation `gen` is prepared as a
+ * candidate for the join PSI: the generation is current and its PSI has not
+ * gone out yet. Caller holds r->mu. */
+static bool ts_join_wanted_locked(const moq_media_receiver_t *r,
+                                  const moq_media_track_t *t, uint32_t gen)
+{
+    return ts_join_psi_usable(r, t) && gen == t->ts_gen && !t->ts_join_delivered;
+}
+
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+typedef struct receiver_ts {
+    moq_mpeg2ts_receiver_t      rx;
+    moq_mpeg2ts_reorder_slot_t *slots;
+    size_t                      slot_count;
+    /* A delivery the window released that waits for lane room; a status
+     * Object that goes out once what was due at its arrival has; an end
+     * that waits for the finished window to empty. Each keeps the slot its
+     * intake reserved. */
+    bool                        has_parked;
+    bool                        stalled;
+    moq_mpeg2ts_delivery_t      parked;
+    bool                        has_status;
+    moq_sub_object_t            status;
+    uint64_t                    status_seq, status_us;
+    bool                        end_pending;
+    uint64_t                    end_group, end_object;
+} receiver_ts_t;
+
+/* The window ctx of a track's END_OF_TRACK (an address no holder has). */
+static const char receiver_ts_end_mark;
+#define RECEIVER_TS_END_MARK ((void *)(uintptr_t)&receiver_ts_end_mark)
+
+/* What a held Object needs besides its Location and payload. */
+typedef struct receiver_ts_held {
+    moq_rcbuf_t *payload;
+    moq_rcbuf_t *properties;
+    uint64_t     seq;          /* its ingress sequence */
+    uint64_t     subgroup_id;
+    uint8_t      priority;
+    bool         datagram;
+    bool         end_of_group;
+} receiver_ts_held_t;
+
+static void ts_held_free(moq_media_receiver_t *r, receiver_ts_held_t *h)
+{
+    if (!h || (void *)h == RECEIVER_TS_END_MARK) return;
+    if (h->payload) moq_rcbuf_decref(h->payload);
+    if (h->properties) moq_rcbuf_decref(h->properties);
+    r->alloc.free(h, sizeof(*h), r->alloc.ctx);
 }
 
 /* The payload the app receives for an Object of a TS track, LIVE or fill:
@@ -5081,6 +6102,372 @@ static bool track_is_ts(const moq_media_track_t *t)
     return t->desc.info.packaging == MOQ_MEDIA_PACKAGING_MPEG2TS;
 }
 
+/* -- In-group ordering stage (network thread) ------------------------------ *
+ * An MSF-02 "loc" track whose streamMapping is "object", or a value this
+ * receiver does not recognize, restores (Group, Object) order on its live
+ * subscription (media_receiver_order.h); fills and Joining FETCHes are one
+ * ordered stream each and bypass it. What the stage holds keeps the lane slot
+ * its intake reserved, as an MPEG2TS window's Objects do; what it releases
+ * goes to the common queue with its loss report (has_loss_report). Facts come
+ * from the stream terminals the receiver always surfaces internally and from
+ * END_OF_GROUP status Objects. The bounds are the MPEG2TS window's defaults:
+ * the stage is a policy, so what it gives up is not proof the network lost
+ * it. */
+#define RECEIVER_LOC_ORDER_GROUPS    4u
+#define RECEIVER_LOC_ORDER_SLOTS     64u
+#define RECEIVER_LOC_ORDER_WINDOW_US 300000u
+
+/* One Object the stage holds: the facade's record, its refs owned. */
+typedef struct receiver_order_held {
+    moq_sub_object_t so;
+    uint64_t         seq;      /* its ingress sequence */
+} receiver_order_held_t;
+
+typedef struct receiver_ordering {
+    receiver_order_t         *stage;
+    /* A release that waits for lane room, and an END_OF_TRACK that waits for
+     * the finished stage to empty, each keeping the slot its intake
+     * reserved. */
+    bool                      has_parked;
+    receiver_order_delivery_t parked;
+    bool                      stalled;
+    bool                      end_pending;
+    uint64_t                  end_group, end_object;
+    /* The stage's totals already added to the receiver's stats. */
+    uint64_t                  gaps_counted, forced_counted;
+} receiver_ordering_t;
+
+static void order_held_free(moq_media_receiver_t *r, receiver_order_held_t *h)
+{
+    if (!h) return;
+    moq_sub_object_cleanup(&h->so);
+    r->alloc.free(h, sizeof(*h), r->alloc.ctx);
+}
+
+/* The stage gives a held item up without releasing it: its slot returns. */
+static void order_item_release(void *ctx, void *item)
+{
+    moq_media_receiver_t *r = (moq_media_receiver_t *)ctx;
+    order_held_free(r, (receiver_order_held_t *)item);
+    ts_drop_slot(r);
+}
+
+static void order_set_stalled(moq_media_receiver_t *r, receiver_ordering_t *o,
+                              bool stalled)
+{
+    pthread_mutex_lock(&r->mu);
+    if (stalled != o->stalled) {
+        o->stalled = stalled;
+        if (stalled) r->ts_stalled++;
+        else r->ts_stalled--;
+    }
+    if (stalled) {
+        r->ts_wake = true;
+        r->st_blocked = true;
+    }
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* Fold the stage's new gap and forced counts into the stats. */
+static void order_count(moq_media_receiver_t *r, receiver_ordering_t *o)
+{
+    uint64_t g = receiver_order_gaps_total(o->stage);
+    uint64_t f = receiver_order_forced_total(o->stage);
+    if (g == o->gaps_counted && f == o->forced_counted) return;
+    pthread_mutex_lock(&r->mu);
+    r->stats.loc_order_gaps = sat_add(r->stats.loc_order_gaps, g - o->gaps_counted);
+    r->stats.loc_order_forced = sat_add(r->stats.loc_order_forced, f - o->forced_counted);
+    pthread_mutex_unlock(&r->mu);
+    o->gaps_counted = g;
+    o->forced_counted = f;
+}
+
+/* Release a track's ordering stage and what it holds, with the lane slots
+ * they reserved, without delivering anything. */
+static void receiver_order_free(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    receiver_ordering_t *o = t->order;
+    if (!o) return;
+    if (o->has_parked) order_item_release(r, o->parked.ctx);
+    if (o->end_pending) ts_drop_slot(r);
+    order_set_stalled(r, o, false);
+    order_count(r, o);
+    receiver_order_destroy(o->stage, order_item_release, r);
+    r->alloc.free(o, sizeof(*o), r->alloc.ctx);
+    t->order = NULL;
+}
+
+/* The track's subscription is being issued: a fresh stage for it, and a new
+ * loss generation. False on allocation failure (the subscribe is retried). */
+static bool receiver_order_start(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    receiver_order_free(r, t);
+    receiver_ordering_t *o = (receiver_ordering_t *)r->alloc.alloc(sizeof(*o),
+                                                                  r->alloc.ctx);
+    if (!o) return false;
+    memset(o, 0, sizeof(*o));
+    receiver_order_cfg_t cfg = { RECEIVER_LOC_ORDER_GROUPS, RECEIVER_LOC_ORDER_SLOTS,
+                                 RECEIVER_LOC_ORDER_WINDOW_US };
+    if (receiver_order_create(&r->alloc, &cfg, &o->stage) != MOQ_OK) {
+        r->alloc.free(o, sizeof(*o), r->alloc.ctx);
+        return false;
+    }
+    t->order = o;
+    pthread_mutex_lock(&r->mu);
+    t->ts_gen++;
+    pthread_mutex_unlock(&r->mu);
+    return true;
+}
+
+/* Hand one released item to the common queue, with its loss report. False
+ * when it needs lane room that is not there yet: nothing changed. */
+static bool receiver_order_release(moq_media_receiver_t *r, moq_media_track_t *t,
+                                   const receiver_order_delivery_t *d)
+{
+    receiver_order_held_t *h = (receiver_order_held_t *)d->ctx;
+    size_t len = h->so.payload ? moq_rcbuf_len(h->so.payload) : 0;
+    if (!receiver_release_room(r, receiver_charge(r, t, len))) return false;
+    receiver_loss_t loss;
+    memset(&loss, 0, sizeof(loss));
+    loss.gap = d->gap;
+    loss.gap_group = d->gap_group;
+    loss.gap_object = d->gap_object;
+    loss.gap_tail_unknown = d->gap_tail_unknown;
+    moq_sub_object_t so = h->so;
+    uint64_t seq = h->seq;
+    r->alloc.free(h, sizeof(*h), r->alloc.ctx);
+    receiver_ts_adm_t saved = receiver_ts_adm_begin(r, seq);
+    receiver_deliver_object(r, t, &so, &loss, NULL, MOQ_MEDIA_DELIVERY_LIVE, 0,
+                            NULL, NULL);
+    receiver_ts_adm_end(r, saved);
+    return true;
+}
+
+/* Release every item the stage has due at now_us, in order, each with the
+ * room its admission needs; then a pending END_OF_TRACK once the finished
+ * stage is empty. True when it stopped for room: what it stopped at stays
+ * parked, and the application's next poll wakes the network thread to
+ * resume. */
+static bool receiver_order_drain(moq_media_receiver_t *r, moq_media_track_t *t,
+                                 uint64_t now_us)
+{
+    receiver_ordering_t *o = t->order;
+    if (!o) return false;
+    for (;;) {
+        if (!o->has_parked) {
+            if (receiver_order_poll(o->stage, now_us, &o->parked) != MOQ_OK) break;
+            o->has_parked = true;
+        }
+        if (!receiver_order_release(r, t, &o->parked)) {
+            order_count(r, o);
+            order_set_stalled(r, o, true);
+            return true;
+        }
+        o->has_parked = false;
+    }
+    order_count(r, o);
+    order_set_stalled(r, o, false);
+    if (o->end_pending && !receiver_order_holds(o->stage)) {
+        o->end_pending = false;
+        receiver_ts_adm_t saved = receiver_ts_adm_begin(r, r->ingress_seq);
+        st_end_of_track(r, t, o->end_group, o->end_object);
+        receiver_ts_adm_end(r, saved);
+        receiver_mark_track_ended(r, t);
+    }
+    return false;
+}
+
+/* Hold `item` (one Object's facts) in the stage: `offer` is the intake
+ * call. A full stage makes room by its capacity policy, one forced step at
+ * a time, draining what each step releases; a step that cannot make room
+ * refuses the fact. Bounded: each step frees a slot or retires a record. */
+typedef moq_result_t (*order_intake_fn)(receiver_order_t *o, uint64_t now_us,
+                                        uint64_t group, uint64_t object, void *item);
+
+static moq_result_t receiver_order_intake(moq_media_receiver_t *r, moq_media_track_t *t,
+                                          order_intake_fn offer, uint64_t now_us,
+                                          uint64_t group, uint64_t object, void *item)
+{
+    receiver_ordering_t *o = t->order;
+    moq_result_t rc = offer(o->stage, now_us, group, object, item);
+    for (uint32_t i = 0;
+         rc == MOQ_ERR_BUFFER && i <= RECEIVER_LOC_ORDER_GROUPS + RECEIVER_LOC_ORDER_SLOTS;
+         i++) {
+        /* What is already due leaves by a poll; only then does a forced
+         * step make room. */
+        if (receiver_order_drain(r, t, now_us)) break;   /* waits for lane room */
+        rc = offer(o->stage, now_us, group, object, item);
+        if (rc != MOQ_ERR_BUFFER) break;
+        if (receiver_order_force(o->stage, now_us) != MOQ_OK) break;
+        if (receiver_order_drain(r, t, now_us)) break;
+        rc = offer(o->stage, now_us, group, object, item);
+    }
+    order_count(r, o);
+    return rc;
+}
+
+static moq_result_t order_offer_fact_fin(receiver_order_t *o, uint64_t now_us,
+                                         uint64_t group, uint64_t object, void *item)
+{
+    (void)item;
+    return receiver_order_fin(o, now_us, group, object);
+}
+
+static moq_result_t order_offer_fact_loss(receiver_order_t *o, uint64_t now_us,
+                                          uint64_t group, uint64_t object, void *item)
+{
+    (void)item;
+    return receiver_order_loss(o, now_us, group, object);
+}
+
+/* One arriving Object of an ordered track. Objects are taken in even while
+ * the application has the track disabled, so the stage's Location accounting
+ * stays exact across a pause; what it releases then is dropped at queue
+ * admission and reported as a gap on the next Object the app gets. */
+static void receiver_on_ordered_object(moq_media_receiver_t *r, moq_media_track_t *t,
+                                       moq_sub_object_t *so, uint64_t now_us)
+{
+    receiver_ordering_t *o = t->order;
+    if (!o) { moq_sub_object_cleanup(so); return; }
+    if (so->status == MOQ_OBJECT_END_OF_TRACK) {
+        /* Subscription end: everything held is released, Group by Group,
+         * then the track ends at its END_OF_TRACK. */
+        uint64_t g = so->group_id, ob = so->object_id;
+        moq_sub_object_cleanup(so);
+        if (t->ended || o->end_pending) return;
+        receiver_order_finish(o->stage);
+        if (receiver_order_drain(r, t, now_us) || receiver_order_holds(o->stage)) {
+            o->end_pending = true;
+            o->end_group = g;
+            o->end_object = ob;
+            ts_keep_slot(r);
+            return;
+        }
+        st_end_of_track(r, t, g, ob);
+        receiver_mark_track_ended(r, t);
+        return;
+    }
+    bool status = so->status == MOQ_OBJECT_END_OF_GROUP;
+    if (!status && so->status != MOQ_OBJECT_NORMAL) {
+        /* Another status says nothing the stage orders: it goes through as
+         * for any track. */
+        receiver_on_media_object(r, t, so, now_us);
+        return;
+    }
+    receiver_order_held_t *h = (receiver_order_held_t *)r->alloc.alloc(sizeof(*h),
+                                                                      r->alloc.ctx);
+    /* The stage keeps the holder until it is released or the receiver is
+     * destroyed, possibly on another thread: its buffers are made
+     * transferable first. One that cannot be is lost exactly as when the
+     * holder is refused: at its own Location, which the next released Object
+     * of the track reports as a gap. */
+    if (h && (!receiver_own_for_handoff(r, &so->payload) ||
+              !receiver_own_for_handoff(r, &so->properties))) {
+        r->alloc.free(h, sizeof(*h), r->alloc.ctx);
+        h = NULL;
+    }
+    moq_result_t rc;
+    if (!h) {
+        pthread_mutex_lock(&r->mu);
+        r->stats.objects_received++;
+        r->stats.objects_dropped++;
+        pthread_mutex_unlock(&r->mu);
+        uint64_t g = so->group_id, ob = so->object_id;
+        moq_sub_object_cleanup(so);
+        if (!status) {
+            rc = receiver_order_intake(r, t, order_offer_fact_loss, now_us, g, ob, NULL);
+            if (rc != MOQ_OK && rc != MOQ_DONE) {
+                pthread_mutex_lock(&r->mu);
+                ts_note_loss_locked(r, t, t->ts_gen, g, ob, r->obj_tail);
+                pthread_mutex_unlock(&r->mu);
+            }
+        }
+        (void)receiver_order_drain(r, t, now_us);
+        return;
+    }
+    h->so = *so;
+    memset(so, 0, sizeof(*so));
+    pthread_mutex_lock(&r->mu);
+    h->seq = r->intake_seq;
+    pthread_mutex_unlock(&r->mu);
+    rc = receiver_order_intake(r, t, status ? receiver_order_offer_status
+                                            : receiver_order_offer,
+                               now_us, h->so.group_id, h->so.object_id, h);
+    if (rc == MOQ_OK) {
+        ts_keep_slot(r);
+    } else {
+        /* Late, duplicated, past its Group's known end, or above an exhausted
+         * Group (MOQ_ERR_PROTO); or no room the capacity policy could make
+         * (MOQ_ERR_BUFFER), which is a local loss of this Object. */
+        uint64_t g = h->so.group_id, ob = h->so.object_id;
+        pthread_mutex_lock(&r->mu);
+        if (rc == MOQ_ERR_PROTO) {
+            r->stats.reorder_refused++;
+        } else {
+            r->stats.objects_received++;
+            r->stats.objects_dropped++;
+            if (!status) ts_note_loss_locked(r, t, t->ts_gen, g, ob, r->obj_tail);
+        }
+        pthread_mutex_unlock(&r->mu);
+        order_held_free(r, h);
+    }
+    (void)receiver_order_drain(r, t, now_us);
+}
+
+/* A stream terminal's facts for the track's ordering stage, when it has
+ * one: a FIN on the END_OF_GROUP subgroup ends the Group after its last
+ * Object (MOQ_SUB_STREAM_FIN_END_OF_GROUP); a RESET that cut an Object short
+ * lost that Object. A plain FIN, or a RESET without a cut Object, says
+ * nothing about the Group (with one Object per subgroup, nothing was lost;
+ * of an unknown layout nothing more can be inferred). */
+static void receiver_order_terminal(moq_media_receiver_t *r, moq_media_track_t *t,
+                                    const moq_sub_stream_terminal_t *st,
+                                    uint64_t now_us)
+{
+    if (!t->order || t->sub_track != st->track) return;
+    if (st->kind == MOQ_SUB_STREAM_FIN_END_OF_GROUP && st->has_last_object)
+        (void)receiver_order_intake(r, t, order_offer_fact_fin, now_us,
+                                    st->group_id, st->last_object_id, NULL);
+    else if (st->kind == MOQ_SUB_STREAM_RESET && st->has_cut_object)
+        (void)receiver_order_intake(r, t, order_offer_fact_loss, now_us,
+                                    st->group_id, st->cut_object_id, NULL);
+    else
+        return;
+    (void)receiver_order_drain(r, t, now_us);
+}
+
+/* The subscription ended: every held item is released, in order. True
+ * when that stopped for lane room; it resumes with the next drain. */
+static bool receiver_order_finish_now(moq_media_receiver_t *r, moq_media_track_t *t,
+                                      uint64_t now_us)
+{
+    if (!t->order) return false;
+    receiver_order_finish(t->order->stage);
+    return receiver_order_drain(r, t, now_us) || receiver_order_holds(t->order->stage);
+}
+
+typedef struct { uint64_t barrier; bool found; } order_barrier_t;
+
+static void order_barrier_probe(void *ctx, void *item)
+{
+    order_barrier_t *b = (order_barrier_t *)ctx;
+    if (((const receiver_order_held_t *)item)->seq < b->barrier) b->found = true;
+}
+
+/* Whether `t`'s stage holds, or has parked, an Object taken in before
+ * `barrier` (network thread). */
+static bool order_holds_before(const moq_media_track_t *t, uint64_t barrier)
+{
+    const receiver_ordering_t *o = t->order;
+    if (!o) return false;
+    if (o->has_parked &&
+        ((const receiver_order_held_t *)o->parked.ctx)->seq < barrier)
+        return true;
+    order_barrier_t b = { barrier, false };
+    receiver_order_for_each(o->stage, order_barrier_probe, &b);
+    return b.found;
+}
+
 /* -- SAP event-timeline intake (network thread) ------------------------- *
  * A self-contained, tolerant scanner for the fixed CMSF §3.6.1 payload: a JSON
  * array of {"l":[group,object],"data":[sapType,ept_ms]} records. It rejects
@@ -5177,7 +6564,7 @@ static bool sap_record(sap_cur_t *c, uint64_t *g, uint64_t *o,
     if (!sap_ch(c, '{')) return false;
     sap_ws(c);
     if (c->p < c->end && *c->p == '}') return false;  /* empty: missing keys */
-    bool has_l = false, has_d = false;
+    bool has_l = false, has_upper_l = false, has_d = false;
     for (;;) {
         sap_ws(c);
         if (c->p >= c->end || *c->p != '"') return false;
@@ -5185,9 +6572,15 @@ static bool sap_record(sap_cur_t *c, uint64_t *g, uint64_t *o,
         if (!sap_skip_string(c)) return false;
         size_t klen = (size_t)((c->p - 1) - kstart);   /* between the quotes */
         if (!sap_ch(c, ':')) return false;
-        if (klen == 1 && kstart[0] == 'l') {
+        if (klen == 1 && (kstart[0] == 'l' || kstart[0] == 'L')) {
+            /* The Location index is "l" in CMSF-01 3.6.1 and "L" in MSF-02
+             * 8.2; either is read, but "only one of these index values may
+             * be used within each record" (MSF-02 8.2). */
+            bool upper = kstart[0] == 'L';
+            if (upper ? (has_l && !has_upper_l) : has_upper_l) return false;
             if (!sap_pair(c, g, o)) return false;
             has_l = true;
+            has_upper_l = upper;
         } else if (klen == 4 && memcmp(kstart, "data", 4) == 0) {
             if (!sap_pair(c, st, ept)) return false;
             has_d = true;
@@ -5225,6 +6618,47 @@ static void sap_queue_push(moq_media_receiver_t *r, moq_media_track_t *track,
 
 /* Parse a SAP timeline object and enqueue its NEW records. Takes over / releases
  * the facade object's refs (the caller must NOT also cleanup). */
+/* MSF_COMPRESSION of a timeline Object (MSF-02 12.1), judged once the
+ * effective catalog is MSF-02; under MSF-01 the property is not interpreted
+ * (an unknown property is ignored, draft-18 11.1) and the Object is counted
+ * in compression_ignored. True when the Object is to be processed; otherwise
+ * it was dropped (with a parse drop when the Object itself is refused), or
+ * its origin was refused: a property the receiver cannot honor on the
+ * Track ends the subscription as a local failure (MOQ_ERR_UNSUPPORTED), the
+ * 12.1.1 SHOULD to unsubscribe. Takes no ownership. */
+static bool receiver_timeline_payload_ok(moq_media_receiver_t *r,
+                                         moq_media_track_t *track,
+                                         const moq_sub_object_t *so,
+                                         moq_media_parse_drop_class_t cls)
+{
+    moq_bytes_t tp = receiver_sub_track_props(r, so->track ? so->track : track->sub_track);
+    moq_bytes_t op = rcbuf_bytes(so->properties);
+    pthread_mutex_lock(&r->mu);
+    bool r02 = r->has_effective && r->effective.revision == MOQ_MSF_REVISION_02;
+    pthread_mutex_unlock(&r->mu);
+    if (!r02) {
+        if (receiver_props_mention_compression(r->transport_version, tp) ||
+            receiver_props_mention_compression(r->transport_version, op)) {
+            pthread_mutex_lock(&r->mu);
+            r->stats.compression_ignored++;
+            pthread_mutex_unlock(&r->mu);
+        }
+        return true;
+    }
+    receiver_payload_t pc = receiver_payload_compression(r->transport_version, tp, op);
+    if (pc == RECEIVER_PAYLOAD_PLAIN) return true;
+    pthread_mutex_lock(&r->mu);
+    if (pc == RECEIVER_PAYLOAD_CONFLICT) r->stats.compression_conflicts++;
+    else r->stats.compression_refused++;
+    pthread_mutex_unlock(&r->mu);
+    if (pc == RECEIVER_PAYLOAD_OBJECT_REFUSED)
+        receiver_note_parse_drop(r, track, cls);
+    else if (pc == RECEIVER_PAYLOAD_ORIGIN_REFUSED)
+        receiver_mark_track_local_failure(r, track, MOQ_ERR_UNSUPPORTED,
+                                          MOQ_MEDIA_TRACK_LOCAL_FAILURE);
+    return false;
+}
+
 static void receiver_on_sap_object(moq_media_receiver_t *r,
                                    moq_media_track_t *track,
                                    moq_sub_object_t *so, uint64_t now_us)
@@ -5242,10 +6676,34 @@ static void receiver_on_sap_object(moq_media_receiver_t *r,
     bool wanted = track->desired_subscribed;
     pthread_mutex_unlock(&r->mu);
     if (!wanted) { moq_sub_object_cleanup(so); return; }
+    if (!receiver_timeline_payload_ok(r, track, so, MOQ_MEDIA_PARSE_DROP_SAP)) {
+        moq_sub_object_cleanup(so);
+        return;
+    }
     if (!so->payload) {
         receiver_note_parse_drop(r, track, MOQ_MEDIA_PARSE_DROP_SAP);
         moq_sub_object_cleanup(so);
         return;
+    }
+    /* MSF-02 8.1 asks a subscriber to check for MSF_EVENT_TIMELINE_HEADER
+     * before parsing, and 12.3.1 lets the eventType define its serialization;
+     * CMSF-01 3.6.1 defines the SAP payload and no header, so a header here
+     * has no defined meaning: it is noted, not interpreted, and the records
+     * parse as without it. */
+    {
+        bool hdr = false;
+        receiver_prop_t hp;
+        moq_bytes_t tp = receiver_sub_track_props(r, so->track ? so->track : track->sub_track);
+        pthread_mutex_lock(&r->mu);
+        bool r02 = r->has_effective && r->effective.revision == MOQ_MSF_REVISION_02;
+        pthread_mutex_unlock(&r->mu);
+        if (r02 && receiver_prop_find(r->transport_version, tp,
+                                      RECEIVER_MSF_EVENT_TIMELINE_HEADER, &hdr,
+                                      &hp) == MOQ_OK && hdr) {
+            pthread_mutex_lock(&r->mu);
+            r->stats.event_timeline_headers_ignored++;
+            pthread_mutex_unlock(&r->mu);
+        }
     }
 
     /* Parse the WHOLE array into a temporary list first; enqueue and advance the
@@ -5368,6 +6826,10 @@ static void receiver_on_media_timeline_object(moq_media_receiver_t *r,
     bool wanted = track->desired_subscribed;
     pthread_mutex_unlock(&r->mu);
     if (!wanted) { moq_sub_object_cleanup(so); return; }
+    if (!receiver_timeline_payload_ok(r, track, so, MOQ_MEDIA_PARSE_DROP_MEDIA_TIMELINE)) {
+        moq_sub_object_cleanup(so);
+        return;
+    }
     if (!so->payload) {
         receiver_note_parse_drop(r, track, MOQ_MEDIA_PARSE_DROP_MEDIA_TIMELINE);
         moq_sub_object_cleanup(so);
@@ -5468,6 +6930,7 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
          * A re-armed subscription starts a fresh window, so the finished
          * one is freed once the facade slot is released. */
         if (receiver_ts_finish(r, t, now_us)) continue;
+        if (receiver_order_finish_now(r, t, now_us)) continue;
 
         /* The subscription is already complete: free its facade slot (no
          * UNSUBSCRIBE is sent) and drop our handle so reconcile may re-subscribe. */
@@ -5479,6 +6942,7 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
             t->sub_track = NULL;
         }
         receiver_ts_free(r, t);
+        receiver_order_free(r, t);
         t->done_pending = false;
         moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
         /* the live subscription is gone; a pending app attribution
@@ -5526,9 +6990,20 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
     for (size_t i = 0; i < r->track_count; i++) {
         moq_media_track_t *t = r->tracks[i];
         if (t->removed || t->auth_failed) continue;
-        /* Never subscribe a namespace-override track under the receiver
-         * namespace (it is also refused at subscribe_track). */
-        if (t->key_has_ns) continue;
+        /* A track without a namespace to subscribe (an MSF-01 namespace
+         * override) is never subscribed (it is also refused at
+         * subscribe_track). */
+        if (!t->has_ns_fields) continue;
+        /* A replacement subscribes only once its predecessor's facade slot is
+         * released: drafts 16 and 18 allow one subscription per track, and
+         * on draft 22 two overlapping subscriptions would duplicate delivery
+         * and blur which handle an Object belongs to. */
+        if (t->gate) {
+            if (t->gate->sub_track) continue;
+            pthread_mutex_lock(&r->mu);
+            t->gate = NULL;
+            pthread_mutex_unlock(&r->mu);
+        }
 
         pthread_mutex_lock(&r->mu);
         bool want = t->desired_subscribed;
@@ -5547,14 +7022,17 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
         /* The original done may precede either conversion or a terminal empty
          * catalog (MSF 11.3). Wait for the validated conversion before owning
          * a replacement's streams, fill or TS window. */
-        if (t->was_live && t->vod_rearmed && t->desc.is_live) continue;
+        if (t->was_live && t->vod_rearmed && t->desc_cur->is_live) continue;
         /* A TS track's reorder window exists before its first Object can. */
         if (track_is_ts(t) && !receiver_ts_start(r, t, ts_program))
+            continue;   /* allocation failed: retried next cycle */
+        /* So does an ordered track's stage. */
+        if (t->ordered && !receiver_order_start(r, t))
             continue;   /* allocation failed: retried next cycle */
 
         moq_sub_track_cfg_t tcfg;
         moq_sub_track_cfg_init(&tcfg);
-        tcfg.track_namespace = r->namespace_;
+        tcfg.track_namespace = t->ns_fields;
         tcfg.track_name = t->desc.name;
         tcfg.filter = filt ? filt : MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT;
         tcfg.has_subscriber_priority = has_prio;
@@ -5601,6 +7079,7 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
         if (!current) {
             moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
             receiver_ts_free(r, t);
+            receiver_order_free(r, t);
             continue;
         }
         if (rc != MOQ_OK) {
@@ -5627,6 +7106,7 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
         } else if (receiver_admission_retry(rc)) {
             t->sub_track = NULL;        /* transient: retry next cycle */
             receiver_ts_free(r, t);
+            receiver_order_free(r, t);
         } else if (receiver_auth_encoding_error(r, &t->auth_operation, rc)) {
             receiver_auth_fail(r, &t->auth_operation, &request,
                 MOQ_MEDIA_AUTH_SCOPE_TRACK, t);
@@ -5911,20 +7391,27 @@ static void receiver_poll_group_ends(moq_media_receiver_t *r, uint64_t now_us)
     }
 }
 
-/* Move the facade's pollable stream terminals of media tracks onto the
- * lane, in order. Each is pollable from the facade only once its stream's
- * Objects were taken in, so its barrier follows them. One that cannot go
- * on the lane yet is held, and intake stops until it does. */
-static void receiver_poll_stream_terminals(moq_media_receiver_t *r)
+/* Take the facade's pollable stream terminals, in order: the receiver always
+ * surfaces them internally, since a track's in-group ordering stage needs
+ * the FIN of its END_OF_GROUP subgroup and the Object a RESET cut. Each goes
+ * to the stage of its track, when it has one, and onto the application's
+ * lane only when the application enabled it; with the lane off it is then
+ * dropped, so the facade queue never holds the session. Each is pollable
+ * from the facade only once its stream's Objects were taken in, so its lane
+ * barrier follows them. One that cannot go on the lane yet is held, and
+ * intake stops until it does. */
+static void receiver_poll_stream_terminals(moq_media_receiver_t *r, uint64_t now_us)
 {
-    if (!r->st_enabled) return;
+    if (!r->sub) return;
     for (;;) {
-        pthread_mutex_lock(&r->mu);
-        st_place_held_locked(r);
-        bool held = r->st_has_held;
-        if (held) r->st_blocked = true;
-        pthread_mutex_unlock(&r->mu);
-        if (held) return;
+        if (r->st_enabled) {
+            pthread_mutex_lock(&r->mu);
+            st_place_held_locked(r);
+            bool held = r->st_has_held;
+            if (held) r->st_blocked = true;
+            pthread_mutex_unlock(&r->mu);
+            if (held) return;
+        }
         moq_sub_stream_terminal_t st;
         if (moq_sub_poll_stream_terminal(r->sub, &st, sizeof(st)) != MOQ_OK)
             return;
@@ -5932,6 +7419,8 @@ static void receiver_poll_stream_terminals(moq_media_receiver_t *r)
         if (!t || t->is_sap_timeline || t->is_media_timeline ||
             t->is_event_timeline)
             continue;
+        receiver_order_terminal(r, t, &st, now_us);
+        if (!r->st_enabled) continue;
         moq_media_stream_terminal_t rec;
         memset(&rec, 0, sizeof(rec));
         rec.kind = st.kind == MOQ_SUB_STREAM_FIN_END_OF_GROUP
@@ -6024,6 +7513,7 @@ static void receiver_settle_completions(moq_media_receiver_t *r, uint64_t now_us
             receiver_retire_subscription(r, &t->sub_track, now_us,
                                          receiver_facade_drained(r));
         receiver_ts_free(r, t);
+        receiver_order_free(r, t);
         if (!rq_push(r, MOQ_MEDIA_TRACK_REMOVED, t)) return;   /* overflow terminalized */
     }
 }
@@ -6080,7 +7570,10 @@ static void receiver_retire_failed_catalog(moq_media_receiver_t *r, uint64_t now
     /* So do what the reorder windows hold or have parked, with the lane
      * slots they reserved; records already on the lane that waited for
      * them become pollable. */
-    for (size_t i = 0; i < r->track_count; i++) receiver_ts_free(r, r->tracks[i]);
+    for (size_t i = 0; i < r->track_count; i++) {
+        receiver_ts_free(r, r->tracks[i]);
+        receiver_order_free(r, r->tracks[i]);
+    }
     receiver_st_mark_ready(r);
     bool drained = receiver_facade_drained(r);
     receiver_retire_subscription(r, &r->catalog_sub, now_us, drained);
@@ -6097,6 +7590,10 @@ static void receiver_ts_timers(moq_media_receiver_t *r, uint64_t now_us)
     uint64_t deadline = UINT64_MAX;
     for (size_t i = 0; i < r->track_count; i++) {
         moq_media_track_t *t = r->tracks[i];
+        if (t->order && !receiver_order_drain(r, t, now_us)) {
+            uint64_t d = receiver_order_next_deadline_us(t->order->stage);
+            if (d < deadline) deadline = d;
+        }
         if (!t->ts) continue;
         if (receiver_ts_drain(r, t, now_us)) continue;
         uint64_t d = receiver_ts_deadline(t);
@@ -6116,8 +7613,10 @@ static void receiver_ts_resume(moq_media_receiver_t *r, uint64_t now_us)
     uint32_t stalled = r->ts_stalled;
     pthread_mutex_unlock(&r->mu);
     if (stalled == 0) return;
-    for (size_t i = 0; i < r->track_count; i++)
+    for (size_t i = 0; i < r->track_count; i++) {
         if (r->tracks[i]->ts) (void)receiver_ts_drain(r, r->tracks[i], now_us);
+        if (r->tracks[i]->order) (void)receiver_order_drain(r, r->tracks[i], now_us);
+    }
 }
 
 /* Mark ready the records of MPEG2TS tracks whose reorder window holds no
@@ -6135,6 +7634,7 @@ static void receiver_st_mark_ready(moq_media_receiver_t *r)
 #ifdef MOQ_SERVICE_HAVE_MPEG2TS
         if (ts_holds_before(e->rec.track, e->barrier)) continue;
 #endif
+        if (order_holds_before(e->rec.track, e->barrier)) continue;
         e->ready = true;
         woke = true;
     }
@@ -6243,7 +7743,10 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         /* Group ends let a TS track's reorder window release the next Group
          * at once instead of after the window. */
         scfg.surface_group_ends = true;
-        scfg.surface_stream_terminals = r->st_enabled;
+        /* Always on: the in-group ordering stage takes its terminal facts
+         * from them; the application's lane stays gated by its own option
+         * (receiver_poll_stream_terminals). */
+        scfg.surface_stream_terminals = true;
         scfg.on_goaway = receiver_on_goaway;
         if (moq_sub_create(session, &r->alloc, &scfg, &r->sub) != MOQ_OK) {
             receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_SETUP_FAILED);
@@ -6272,11 +7775,19 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
                                          r->catalog_name_len };
         r->joins_by_fill = moq_session_supports_fill(session);
         r->catalog_bootstrap.active = r->joins_by_fill;
+        /* MSF 5: the catalog subscription SHOULD have a higher subscriber
+         * priority than any other concurrent one; 0 is the highest, and the
+         * revision is not known before subscribing, so every revision gets
+         * it. */
+        tcfg.has_subscriber_priority = true;
+        tcfg.subscriber_priority = 0;
         moq_location_filter_cfg_t loc;
         moq_location_filter_cfg_t fill_loc;
         moq_fill_cfg_t fill;
         if (r->joins_by_fill) {
             receiver_join_current_group(&loc, &fill_loc, &fill);
+            fill.has_subscriber_priority = true;
+            fill.subscriber_priority = 0;
             tcfg.location = &loc;
             tcfg.fill = &fill;
         }
@@ -6333,13 +7844,16 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
                 receiver_bootstrap_stage_live(r, &obj);
             else if (!r->catalog_ack_failed)
                 receiver_ingest_catalog(r, obj.group_id, obj.object_id,
-                                        obj.payload, now_us);
+                                        obj.payload, rcbuf_bytes(obj.properties),
+                                        receiver_sub_track_props(r,
+                                            obj.track ? obj.track : r->catalog_sub),
+                                        now_us);
             moq_sub_object_cleanup(&obj);
             /* Every polled Object can make a Group end ready, whichever
              * track it belongs to. */
             receiver_intake_end(r);
             receiver_poll_group_ends(r, now_us);
-            receiver_poll_stream_terminals(r);
+            receiver_poll_stream_terminals(r, now_us);
             continue;
         }
         moq_media_track_t *t = track_for_sub(r, obj.track);
@@ -6348,7 +7862,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
             moq_sub_object_cleanup(&obj);
             receiver_intake_end(r);
             receiver_poll_group_ends(r, now_us);
-            receiver_poll_stream_terminals(r);
+            receiver_poll_stream_terminals(r, now_us);
             continue;
         }
         /* Ownership of obj's refs passes to the intake. A CMSF SAP timeline is
@@ -6364,15 +7878,17 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
             moq_sub_object_cleanup(&obj);
         else if (track_is_ts(t))
             receiver_on_ts_object(r, t, &obj, now_us);
+        else if (t->order)
+            receiver_on_ordered_object(r, t, &obj, now_us);
         else
             receiver_on_media_object(r, t, &obj, now_us);
         receiver_intake_end(r);
         receiver_poll_group_ends(r, now_us);
-        receiver_poll_stream_terminals(r);
+        receiver_poll_stream_terminals(r, now_us);
     }
     receiver_intake_end(r);
     receiver_poll_group_ends(r, now_us);
-    receiver_poll_stream_terminals(r);
+    receiver_poll_stream_terminals(r, now_us);
 
     /* Process subscription completions after draining this tick's objects.
      * The first "Track Ended" of a track created live may re-arm it for VOD;
@@ -7366,7 +8882,8 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
         full.struct_size = (uint32_t)n;
         full.kind = MOQ_MEDIA_TRACK_FILL_TERMINAL;
         full.track = ready->track;
-        full.desc = &ready->track->desc;
+        full.desc = ready->track->desc_cur;
+        full.config_generation = ready->track->config_gen;
         full.initiating_request_id = ready->initiating_request_id;
         full.fill_reason = ready->reason;
         full.fill_error_domain = ready->error_domain;
@@ -7387,6 +8904,12 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
     if (r->ev_tail != r->ev_head) {
         receiver_event_t e = r->events[r->ev_head % r->ev_cap];
         r->ev_head++;
+        /* Events queued without a description (fill and delivery records)
+         * name the track's current one. */
+        if (!e.desc && e.track) {
+            e.desc = e.track->desc_cur;
+            e.config_generation = e.track->config_gen;
+        }
         /* Polled at any output size: the command's receipt is consumed. */
         if (e.kind == MOQ_MEDIA_TRACK_FILL_CREATED && e.track &&
             e.track->cmd_state == FILL_CMD_RECEIPT &&
@@ -7401,8 +8924,8 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
         full.struct_size = (uint32_t)n;
         full.kind = e.kind;
         full.track = e.track;
-        full.desc = e.track ? &e.track->desc : NULL;
-        full.config_generation = 0;
+        full.desc = e.desc;
+        full.config_generation = e.config_generation;
         /* the UPDATE_OK scalars come from the QUEUE ENTRY's per-event
          * copies, never from current track state. Zero for other kinds. */
         full.has_largest = e.has_largest;
@@ -7421,6 +8944,10 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
             full.has_done_status = e.has_done_status;
             full.done_status = e.done_status;
         }
+        if (n >= MEDIA_TRACK_EVENT_REPLACED_END) {
+            full.replaces = e.replaces;
+            full.replaced_by = e.replaced_by;
+        }
         memcpy(ev, &full, n);
         return MOQ_OK;
     }
@@ -7435,6 +8962,8 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
             moq_result_t result = t->local_result;
             moq_media_track_event_kind_t kind = t->local_failure_kind;
             bool delivery = t->delivery_failed;
+            const moq_media_track_desc_t *desc = t->desc_cur;
+            uint32_t generation = t->config_gen;
             pthread_mutex_unlock(&r->mu);
 
             moq_media_track_event_t full;
@@ -7442,7 +8971,8 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
             full.struct_size = (uint32_t)n;
             full.kind = kind;
             full.track = t;
-            full.desc = &t->desc;
+            full.desc = desc;
+            full.config_generation = generation;
             full.local_result = (int32_t)result;
             if (delivery) full.delivery_origin = MOQ_MEDIA_DELIVERY_LIVE;
             memcpy(ev, &full, n);
@@ -7470,6 +9000,8 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
             t->parse_drops_reported = t->parse_drops;
             t->parse_drop_pending = false;
             r->parse_drop_pending_count--;
+            const moq_media_track_desc_t *desc = t->desc_cur;
+            uint32_t generation = t->config_gen;
             pthread_mutex_unlock(&r->mu);
 
             moq_media_track_event_t full;
@@ -7477,8 +9009,8 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
             full.struct_size = (uint32_t)n;
             full.kind = MOQ_MEDIA_TRACK_PARSE_DROP;
             full.track = t;
-            full.desc = &t->desc;
-            full.config_generation = 0;
+            full.desc = desc;
+            full.config_generation = generation;
             full.parse_drop_class = cls;
             full.parse_drops_total = total;
             full.parse_drops_delta = delta;
@@ -7497,7 +9029,12 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
 const moq_media_track_desc_t *moq_media_track_desc_get(
     const moq_media_track_t *track)
 {
-    return track ? &track->desc : NULL;
+    if (!track) return NULL;
+    /* The release store that published a generation orders every write of
+     * its description before this load. */
+    return atomic_load_explicit(
+        (const moq_media_track_desc_t *_Atomic *)(uintptr_t)&track->desc_pub,
+        memory_order_acquire);
 }
 
 moq_result_t moq_media_receiver_track_desc_copy(
@@ -7520,7 +9057,7 @@ moq_result_t moq_media_receiver_track_desc_copy(
         if (r->tracks[i] == track) { owned = true; break; }
     }
     if (owned) {
-        memcpy(out, &track->desc, n);
+        memcpy(out, track->desc_cur, n);
         out->struct_size = (uint32_t)n;
     }
     PUB_PHASE_HOOK(r, MOQ_MR_DESC_READER_POST);
@@ -7534,7 +9071,7 @@ moq_media_receiver_find_content_protection(
 {
     if (!r) return NULL;                  /* null receiver: no probe, no lock */
     /* Hold r->mu across the whole effective-generation selection and traversal,
-     * the same mutex receiver_commit_effective() holds while publishing. The
+     * the same mutex receiver_adopt holds while publishing. The
      * returned pointer stays valid past the unlock only because a later commit
      * retains any previous effective catalog that carried contentProtections
      * (cp_snaps) -- the retained-snapshot lifetime contract is unchanged. */
@@ -7703,6 +9240,19 @@ static bool receiver_owns_track(moq_media_receiver_t *r,
     return false;
 }
 
+/* The live end of a handle's replacement chain (r->mu): a command on a
+ * handle an MSF-02 replacement removed acts on its newest successor, so the
+ * latest intent reaches the live handle even when it was issued before the
+ * application saw the replacement. Every successor is a newer handle, so
+ * the walk ends within the handle count. Other handles are their own head. */
+static moq_media_track_t *receiver_chain_head_locked(const moq_media_receiver_t *r,
+                                                     moq_media_track_t *t)
+{
+    for (size_t i = 0; i < r->track_count && t->replaced && t->successor; i++)
+        t = t->successor;
+    return t;
+}
+
 moq_result_t moq_media_receiver_subscribe_track(
     moq_media_receiver_t *r, moq_media_track_t *track,
     const moq_media_receiver_track_subscribe_cfg_t *cfg)
@@ -7775,6 +9325,7 @@ moq_result_t moq_media_receiver_subscribe_track(
         pthread_mutex_unlock(&r->mu);
         return MOQ_ERR_INVAL;
     }
+    track = receiver_chain_head_locked(r, track);
     /* A track that has ended (peer-rejected, or end-of-track) or been removed
      * from the catalog can never be re-established: the reconcile permanently
      * skips such tracks, so refuse here rather than recording desired state
@@ -7785,12 +9336,14 @@ moq_result_t moq_media_receiver_subscribe_track(
         return MOQ_ERR_WRONG_STATE;
     }
     /* No delivery path: refuse rather than subscribe something that can only
-     * be dropped. An MSF §5.2.2 namespace override is one -- the MSF namespace
+     * be dropped. An MSF-01 namespace override is one -- the MSF-01 namespace
      * string has no defined mapping to a MoQT namespace tuple, and
      * subscribing under the receiver namespace would target the wrong
-     * namespace. The others are info that did not derive, a packaging this
-     * build does not parse, and a timeline the receiver does not decode. */
-    if (track->key_has_ns || !track->has_path) {
+     * namespace (an MSF-02 one names its own fields, 5.2.2, and is
+     * subscribed under them). The others are info that did not derive, a
+     * packaging this build does not parse, a timeline the receiver does not
+     * decode, and the receiver's own delivery policy. */
+    if (!track->has_ns_fields || !track->has_path) {
         pthread_mutex_unlock(&r->mu);
         return MOQ_ERR_UNSUPPORTED;
     }
@@ -7834,6 +9387,7 @@ moq_result_t moq_media_receiver_unsubscribe_track(
         pthread_mutex_unlock(&r->mu);
         return MOQ_ERR_INVAL;
     }
+    track = receiver_chain_head_locked(r, track);
     if (track->auth_failed) {
         pthread_mutex_unlock(&r->mu);
         return MOQ_OK;
@@ -7878,6 +9432,8 @@ moq_result_t moq_media_receiver_fill_track(
     if (rc != MOQ_OK) return rc;
 
     pthread_mutex_lock(&r->mu);
+    if (!r->fatal && receiver_owns_track(r, track))
+        track = receiver_chain_head_locked(r, track);
     if (r->fatal) rc = MOQ_ERR_CLOSED;
     else if (!receiver_owns_track(r, track)) rc = MOQ_ERR_INVAL;
     else if (r->transport_version != MOQ_VERSION_DRAFT_22 ||
@@ -8419,6 +9975,146 @@ void moq_media_receiver_test_free(moq_media_receiver_t *r)
     if (r) receiver_free(r);
 }
 
+/* Replace a test receiver's allocator (the caller's delegates to the one it
+ * replaces, so earlier allocations free through it). */
+void moq_media_receiver_test_set_receiver_alloc(moq_media_receiver_t *r,
+                                                const moq_alloc_t *alloc);
+void moq_media_receiver_test_set_receiver_alloc(moq_media_receiver_t *r,
+                                                const moq_alloc_t *alloc)
+{
+    r->alloc = *alloc;
+}
+
+/* Resize a test receiver's empty track-event queue. */
+bool moq_media_receiver_test_set_event_cap(moq_media_receiver_t *r, uint32_t cap);
+bool moq_media_receiver_test_set_event_cap(moq_media_receiver_t *r, uint32_t cap)
+{
+    if (cap == 0 || r->ev_tail != r->ev_head) return false;
+    receiver_event_t *ev = (receiver_event_t *)r->alloc.alloc(
+        cap * sizeof(receiver_event_t), r->alloc.ctx);
+    if (!ev) return false;
+    r->alloc.free(r->events, r->ev_cap * sizeof(receiver_event_t), r->alloc.ctx);
+    r->events = ev;
+    r->ev_cap = cap;
+    r->ev_head = r->ev_tail = 0;
+    return true;
+}
+
+/* A track's recorded selection, as the network thread would read it. */
+void moq_media_receiver_test_track_intent(moq_media_receiver_t *r,
+    const moq_media_track_t *t, bool *subscribed, uint32_t *filter,
+    bool *has_priority, uint8_t *priority, uint32_t *ts_program,
+    uint64_t *app_gen);
+void moq_media_receiver_test_track_intent(moq_media_receiver_t *r,
+    const moq_media_track_t *t, bool *subscribed, uint32_t *filter,
+    bool *has_priority, uint8_t *priority, uint32_t *ts_program,
+    uint64_t *app_gen)
+{
+    pthread_mutex_lock(&r->mu);
+    *subscribed = t->desired_subscribed;
+    *filter = (uint32_t)t->desired_filter;
+    *has_priority = t->desired_has_priority;
+    *priority = t->desired_priority;
+    *ts_program = t->desired_ts_program;
+    *app_gen = t->app_gen;
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* A replacement handle's subscription gate and its fill command state. */
+const moq_media_track_t *moq_media_receiver_test_track_gate(moq_media_receiver_t *r,
+                                                            const moq_media_track_t *t);
+const moq_media_track_t *moq_media_receiver_test_track_gate(moq_media_receiver_t *r,
+                                                            const moq_media_track_t *t)
+{
+    pthread_mutex_lock(&r->mu);
+    const moq_media_track_t *g = t->gate;
+    pthread_mutex_unlock(&r->mu);
+    return g;
+}
+int moq_media_receiver_test_track_cmd_state(moq_media_receiver_t *r,
+                                            const moq_media_track_t *t);
+int moq_media_receiver_test_track_cmd_state(moq_media_receiver_t *r,
+                                            const moq_media_track_t *t)
+{
+    pthread_mutex_lock(&r->mu);
+    int st = t->cmd_state;
+    pthread_mutex_unlock(&r->mu);
+    return st;
+}
+
+/* The ordering stage of an ordered track, as its subscription would start
+ * it; false for a track without one. */
+bool moq_media_receiver_test_order_start(moq_media_receiver_t *r, moq_media_track_t *t);
+bool moq_media_receiver_test_order_start(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    return t->ordered && receiver_order_start(r, t);
+}
+
+/* One live Object of `t` taken in at now_us, as the pump would. */
+void moq_media_receiver_test_order_push(moq_media_receiver_t *r, moq_media_track_t *t,
+    uint64_t now_us, uint64_t group, uint64_t subgroup, uint64_t object,
+    moq_object_status_t status, const uint8_t *payload, size_t len);
+void moq_media_receiver_test_order_push(moq_media_receiver_t *r, moq_media_track_t *t,
+    uint64_t now_us, uint64_t group, uint64_t subgroup, uint64_t object,
+    moq_object_status_t status, const uint8_t *payload, size_t len)
+{
+    moq_sub_object_t so;
+    if (!receiver_intake_begin(r)) return;
+    memset(&so, 0, sizeof so);
+    so.track = t->sub_track;
+    so.group_id = group;
+    so.subgroup_id = subgroup;
+    so.object_id = object;
+    so.publisher_priority = 0x80;
+    so.status = status;
+    if (status == MOQ_OBJECT_NORMAL && payload &&
+        moq_rcbuf_create(&r->alloc, payload, len, &so.payload) != MOQ_OK) {
+        receiver_intake_end(r);
+        return;
+    }
+    if (t->order) receiver_on_ordered_object(r, t, &so, now_us);
+    else receiver_on_media_object(r, t, &so, now_us);
+    receiver_intake_end(r);
+}
+
+/* One stream terminal of `t`'s subscription taken at now_us. */
+void moq_media_receiver_test_order_terminal(moq_media_receiver_t *r, moq_media_track_t *t,
+    uint64_t now_us, uint32_t kind, uint64_t group, bool has_last, uint64_t last,
+    bool has_cut, uint64_t cut);
+void moq_media_receiver_test_order_terminal(moq_media_receiver_t *r, moq_media_track_t *t,
+    uint64_t now_us, uint32_t kind, uint64_t group, bool has_last, uint64_t last,
+    bool has_cut, uint64_t cut)
+{
+    moq_sub_stream_terminal_t st;
+    memset(&st, 0, sizeof(st));
+    st.struct_size = (uint32_t)sizeof(st);
+    st.kind = kind;
+    st.track = t->sub_track;
+    st.group_id = group;
+    st.has_last_object = has_last;
+    st.last_object_id = last;
+    st.has_cut_object = has_cut;
+    st.cut_object_id = cut;
+    receiver_order_terminal(r, t, &st, now_us);
+}
+
+/* The pump's timer step at now_us (reorder windows and ordering stages). */
+void moq_media_receiver_test_timers(moq_media_receiver_t *r, uint64_t now_us);
+void moq_media_receiver_test_timers(moq_media_receiver_t *r, uint64_t now_us)
+{
+    receiver_ts_timers(r, now_us);
+}
+
+/* Give a sessionless test receiver the namespace its catalog track was
+ * received under (borrowed: the caller keeps it alive until free). */
+void moq_media_receiver_test_set_namespace(moq_media_receiver_t *r,
+                                           moq_namespace_t ns);
+void moq_media_receiver_test_set_namespace(moq_media_receiver_t *r,
+                                           moq_namespace_t ns)
+{
+    r->namespace_ = ns;
+}
+
 /* Stage one live catalog Object exactly as the bootstrap's live intake does
  * (receiver_bootstrap_stage_live), on the calling thread acting as the
  * network side. `payload` is borrowed; the Object takes its own reference.
@@ -8446,10 +10142,30 @@ void moq_media_receiver_test_ingest(moq_media_receiver_t *r, uint64_t group,
                                     uint64_t object, const char *json,
                                     size_t len)
 {
+    /* The payload stands for the facade's Object: it is not the receiver's
+     * allocation, so a test failing the receiver's allocator fails only what
+     * the receiver allocates. */
     moq_rcbuf_t *buf = NULL;
-    if (moq_rcbuf_create(&r->alloc, (const uint8_t *)json, len, &buf) != MOQ_OK)
+    if (moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)json, len, &buf) != MOQ_OK)
         return;
-    receiver_ingest_catalog(r, group, object, buf, 0);
+    receiver_ingest_catalog(r, group, object, buf, (moq_bytes_t){ NULL, 0 },
+                            (moq_bytes_t){ NULL, 0 }, 0);
+    moq_rcbuf_decref(buf);
+}
+
+/* The same with the Object's properties and its origin's Track Properties
+ * (borrowed for the call), encoded for the receiver's latched draft. */
+void moq_media_receiver_test_ingest_props(moq_media_receiver_t *r, uint64_t group,
+    uint64_t object, const char *json, size_t len, moq_bytes_t track_props,
+    moq_bytes_t object_props);
+void moq_media_receiver_test_ingest_props(moq_media_receiver_t *r, uint64_t group,
+    uint64_t object, const char *json, size_t len, moq_bytes_t track_props,
+    moq_bytes_t object_props)
+{
+    moq_rcbuf_t *buf = NULL;
+    if (moq_rcbuf_create(moq_alloc_default(), (const uint8_t *)json, len, &buf) != MOQ_OK)
+        return;
+    receiver_ingest_catalog(r, group, object, buf, object_props, track_props, 0);
     moq_rcbuf_decref(buf);
 }
 
@@ -8870,6 +10586,8 @@ void moq_media_receiver_test_push_object_ex(moq_media_receiver_t *r, moq_media_t
         moq_sub_object_cleanup(&so);
     else if (track_is_ts(track))
         receiver_on_ts_object(r, track, &so, 0);
+    else if (track->order)
+        receiver_on_ordered_object(r, track, &so, 0);
     else
         receiver_on_media_object(r, track, &so, 0);
     receiver_intake_end(r);

@@ -8,11 +8,14 @@
 #endif
 
 moq_result_t sender_check_extensions(const moq_media_track_cfg_t *cfg,
-                                     const moq_msf_mpeg2ts_t **rec);
+                                     moq_msf_revision_t rev,
+                                     const moq_msf_mpeg2ts_t **rec,
+                                     const moq_msf_track_supplement_t **supp);
 
 moq_result_t sender_copy_extensions(moq_media_sender_t *s,
                                     moq_media_track_t *t,
-                                    const moq_msf_mpeg2ts_t *src);
+                                    const moq_msf_mpeg2ts_t *src,
+                                    const moq_msf_track_supplement_t *supp);
 
 moq_msf_mpeg2ts_t *sender_ts_record(moq_media_track_t *t);
 

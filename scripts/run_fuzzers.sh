@@ -87,6 +87,7 @@ TARGETS=(
     fuzz_session_data
     fuzz_session_d18
     fuzz_pq_cid_route
+    fuzz_receiver_order
     fuzz_loc
     fuzz_cmaf
     fuzz_msf

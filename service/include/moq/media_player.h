@@ -28,8 +28,28 @@
  *
  * This release supports RAW/LOC video and the RAW/LOC audio codecs `opus`
  * and `mp4a.40.2`, on drafts 16, 18 and 22. CMAF, MPEG-2 TS, dependent
- * spatial layers and timeline tracks are refused at selection with
- * MOQ_ERR_UNSUPPORTED; the receiver serves them directly.
+ * spatial layers, timeline tracks and tracks whose catalog entry declares
+ * an encryptionScheme (MSF 4.4.1: the player plays clear media only) are
+ * refused at selection with MOQ_ERR_UNSUPPORTED; the receiver serves them
+ * directly.
+ *
+ * Replacement: when an MSF-02 catalog changes a declared track in a
+ * decode- or delivery-critical way, the receiver replaces its handle
+ * (moq_media_track_event_t.replaced_by). The player reports TRACK_REPLACED
+ * for the old handle in place of TRACK_REMOVED. A selected track still
+ * playing ends at once, END{REPLACED, IMMEDIATE}, and its selection moves
+ * to the new handle: once the receiver announces that handle, the player
+ * selects it with the old selection's start, independent_timing and
+ * shared_epoch, so playback continues behind the decoder reset its own
+ * CONFIGURE implies. While the selection is moving, the old track's slot
+ * is kept for it (another selection may find no room, MOQ_ERR_LIMIT) and
+ * ENDED does not fire. A new handle the player cannot select (other than
+ * for want of a slot) is offered as TRACK_AVAILABLE instead, and the
+ * selection the receiver moved to it is withdrawn. So it is for a track
+ * whose END was already out: it moves no selection, and is released. An
+ * advisory change (TRACK_UPDATED at the receiver) does not affect
+ * playback. As the receiver documents, a replacement does not guarantee
+ * that the new handle's first Objects use the new configuration.
  *
  * Threading: the player owns no thread. Every call on a player, wait and
  * the observers included, is made by the application on one thread at a
@@ -176,10 +196,11 @@ MOQ_API moq_result_t moq_media_player_attach(moq_media_receiver_t *r,
                                              const moq_media_player_cfg_t *cfg,
                                              moq_media_player_t **out);
 
-/* Destroy the player: unsubscribe every track it selected and release all
- * it holds. A created player destroys its receiver too; an attached one
- * returns the receiver's queues to the application. Polled outputs stay
- * valid (they own their refs). NULL-safe. */
+/* Destroy the player: unsubscribe every track it selected (a selection
+ * moving to a new handle included) and release all it holds. A created
+ * player destroys its receiver too; an attached one returns the receiver's
+ * queues to the application. Polled outputs stay valid (they own their
+ * refs). NULL-safe. */
 MOQ_API void moq_media_player_destroy(moq_media_player_t *p);
 
 /* The receiver, for observing calls (track_desc_get, get_stats, ...). Never
@@ -229,7 +250,9 @@ MOQ_API void moq_media_player_select_cfg_init_sized(
  * for an mp4a.40.2 track that can carry no decoder configuration (no
  * catalog configuration on drafts 16/18); MOQ_ERR_WRONG_STATE for a track
  * already selected, ended, removed, or once the receiver is terminal;
- * MOQ_ERR_LIMIT when the engine's max_tracks are in use; MOQ_ERR_NOMEM; and
+ * MOQ_ERR_LIMIT when the engine's max_tracks are in use (a slot kept for a
+ * selection moving to a new handle counts, except for that handle);
+ * MOQ_ERR_NOMEM; and
  * the receiver's subscribe results. A refusal selects nothing.
  */
 MOQ_API moq_result_t moq_media_player_select_track(
@@ -302,7 +325,10 @@ typedef uint32_t moq_media_player_discontinuity_t;
  * or a track its receiver ended for good (a normal done that ends the
  * subscription, or a refused VOD re-subscription) whose END_OF_TRACK did
  * not arrive within the tail wait. A normal done is no cause of its own: an
- * END_OF_TRACK arriving within that wait still ends the track COMPLETE. */
+ * END_OF_TRACK arriving within that wait still ends the track COMPLETE.
+ * REPLACED: once that END is queued the old handle is released. It is no
+ * longer selected (deselect_track and handle_feedback refuse it with
+ * MOQ_ERR_INVAL), and its slot goes to the new handle. */
 typedef uint32_t moq_media_player_end_cause_t;
 #define MOQ_MEDIA_PLAYER_END_PEER_END_OF_TRACK 1u /* its END_OF_TRACK */
 #define MOQ_MEDIA_PLAYER_END_PEER_DONE         2u /* delivery ended, no END_OF_TRACK */
@@ -313,12 +339,19 @@ typedef uint32_t moq_media_player_end_cause_t;
 #define MOQ_MEDIA_PLAYER_END_LOCAL_FAILURE     4u /* receiver-local failure */
 #define MOQ_MEDIA_PLAYER_END_CLOSED            5u /* the receiver closed */
 #define MOQ_MEDIA_PLAYER_END_FATAL             6u /* the receiver failed */
+#define MOQ_MEDIA_PLAYER_END_REPLACED          7u /* replaced by a new handle
+                                                  * (TRACK_REPLACED); applied
+                                                  * when the old handle is
+                                                  * removed, so no later cause
+                                                  * applies to it */
 
 /* How its input was settled (END.disposition). COMPLETE: every location up
  * to its END_OF_TRACK was played or known not to exist (only with cause
  * PEER_END_OF_TRACK). TAIL_CUTOFF: a bounded wait gave up on missing input
  * (the tail wait, or a gap the engine stopped waiting for). IMMEDIATE: no
- * wait was possible (LOCAL_FAILURE, CLOSED, FATAL). */
+ * wait was possible (LOCAL_FAILURE, CLOSED, FATAL; and REPLACED, as the
+ * receiver purged the old handle's queue and drops its late Objects, so
+ * nothing more can come for it). */
 typedef uint32_t moq_media_player_end_disposition_t;
 #define MOQ_MEDIA_PLAYER_END_COMPLETE    1u
 #define MOQ_MEDIA_PLAYER_END_TAIL_CUTOFF 2u
@@ -427,6 +460,7 @@ typedef uint32_t moq_media_player_event_kind_t;
 #define MOQ_MEDIA_PLAYER_EVENT_TIMING_INDEPENDENT  16u /* AUTO, ALLOW_INDEPENDENT */
 #define MOQ_MEDIA_PLAYER_EVENT_SYNC_UNAVAILABLE    17u /* AUTO left a group out */
 #define MOQ_MEDIA_PLAYER_EVENT_KNOWLEDGE_FORGOTTEN 18u /* absence demoted */
+#define MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED      19u /* a new handle replaces it */
 
 /* Player drop reasons (DROP.reason) beyond the engine's
  * moq_playback_drop_reason_t, which DROP also carries as is. */
@@ -470,6 +504,9 @@ typedef struct moq_media_player_event {
             uint32_t reason;                       /* MOQ_MEDIA_PLAYER_SYNC_* */
         } sync;
         struct { uint32_t timeline_id; } started;
+        /* TRACK_REPLACED, reported in place of TRACK_REMOVED: the handle
+         * that replaces `track` (valid until the receiver is destroyed). */
+        struct { moq_media_track_t *replacement; } replaced;
         uint8_t _reserved[MOQ_MEDIA_PLAYER_EVENT_DETAIL_MAX];
     } u;
 } moq_media_player_event_t;

@@ -103,8 +103,8 @@ pub use moq5_core::{
 };
 pub use moq5_media::{
     cmaf, CompanionProfile, LocMetadata, Marking, MediaType, Mpeg2tsKeys, Mpeg2tsMode,
-    Mpeg2tsRecord, Mpeg2tsRecordRef, Mpeg2tsTimestampMode, ObjectMetadata, Packaging, SapType,
-    TimeDomain, TrackExtension,
+    Mpeg2tsRecord, Mpeg2tsRecordRef, Mpeg2tsTimestampMode, MsfRevision, ObjectMetadata, Packaging,
+    SapType, TimeDomain, TrackExtension,
 };
 
 mod endpoint;
@@ -123,11 +123,11 @@ pub use endpoint::{
 };
 pub use mpeg2ts::{Mpeg2tsInput, Mpeg2tsTrackStats, Mpeg2tsWriteError};
 pub use receiver::{
-    ContentProtectionRef, FillError, FillLoss, FillOptions, FillReason, FillTerminal, LossReport,
-    MediaObject, MediaTemplate, ObjectIdentity, OverflowPolicy, ParseDrop, ParseDropClass,
-    PollWithin, Receiver, ReceiverConfig, ReceiverInfo, ReceiverStats, SapRecord, StartMode,
-    StreamTerminal, StreamTerminalKind, SubscribeOptions, TimeMode, TimelineRecord, Track,
-    TrackDescription, TrackEvent, TrackEventKind, TrackState,
+    ContentProtectionRef, FillError, FillLoss, FillOptions, FillReason, FillTerminal, InitSource,
+    LossReport, MediaObject, MediaTemplate, ObjectIdentity, OverflowPolicy, ParseDrop,
+    ParseDropClass, PollWithin, Receiver, ReceiverConfig, ReceiverInfo, ReceiverStats, SapRecord,
+    StartMode, StreamTerminal, StreamTerminalKind, SubscribeOptions, TimeMode, TimelineRecord,
+    Track, TrackDescription, TrackEvent, TrackEventKind, TrackState,
 };
 pub use sender::{
     Backpressure, CmsfUrl, ContentProtection, DrmSystem, SendObject, SendTrack, SendTrackConfig,

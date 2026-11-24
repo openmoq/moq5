@@ -515,11 +515,33 @@ class ReceiverConfig:
         return cls(namespace=namespace, overflow=OverflowPolicy.FLOW_CONTROL, **fields)  # type: ignore[arg-type]
 
 
+class MsfRevision(IntEnum):
+    """The MSF revision a catalog follows; unknown future values stay integers."""
+
+    MSF01 = _constants["MSF_REVISION_01"]
+    MSF02 = _constants["MSF_REVISION_02"]
+
+
 @dataclass(frozen=True, slots=True)
 class ReceiverStats:
     """A copied stats snapshot. The v0 fields (through `paused`) are always
     present; the appended fields are None when the native stamped prefix does
-    not cover them, never zero."""
+    not cover them, never zero.
+
+    The keyword-only block (`catalog_revision` through `loc_order_forced`) is
+    one native block: all present or all None. `catalog_revision` is the
+    effective catalog's revision, valid once CATALOG_READY was queued. The
+    compression counters count catalog and media-timeline Objects carrying
+    MSF_COMPRESSION (MSF-02 12.1): this build decompresses nothing, so
+    `objects_decompressed`, `decompress_failures` and `decompress_limited`
+    stay zero and such Objects are counted in `compression_refused`;
+    `compression_conflicts` counts an Object property beside a Track property,
+    `compression_ignored` timeline Objects under an MSF-01 catalog.
+    `event_timeline_headers_ignored` counts SAP-timeline Objects whose origin
+    carried MSF_EVENT_TIMELINE_HEADER. `loc_order_gaps` counts Objects the
+    in-group ordering stage of an "object"-mapped LOC track gave up on, and
+    `loc_order_forced` the advances its capacity forced. These observations
+    do not change legacy equality/hash."""
 
     objects_received: int
     objects_queued: int
@@ -534,6 +556,16 @@ class ReceiverStats:
     catalog_drops: int | None
     catalog_complete: bool | None
     tracks_malformed: int | None
+    catalog_revision: MsfRevision | int | None = field(default=None, compare=False, kw_only=True)
+    objects_decompressed: int | None = field(default=None, compare=False, kw_only=True)
+    decompress_failures: int | None = field(default=None, compare=False, kw_only=True)
+    decompress_limited: int | None = field(default=None, compare=False, kw_only=True)
+    compression_refused: int | None = field(default=None, compare=False, kw_only=True)
+    compression_conflicts: int | None = field(default=None, compare=False, kw_only=True)
+    compression_ignored: int | None = field(default=None, compare=False, kw_only=True)
+    event_timeline_headers_ignored: int | None = field(default=None, compare=False, kw_only=True)
+    loc_order_gaps: int | None = field(default=None, compare=False, kw_only=True)
+    loc_order_forced: int | None = field(default=None, compare=False, kw_only=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -584,6 +616,18 @@ class CodecKind(IntEnum):
     AV1 = _constants["CMAF_CODEC_AV1"]
     AAC = _constants["CMAF_CODEC_AAC"]
     OPUS = _constants["CMAF_CODEC_OPUS"]
+
+
+class InitSource(IntEnum):
+    """Where a track's decoder configuration comes from: NONE (the catalog
+    names none), INLINE (the catalog itself), or in band as a Track or an
+    Object property (MSF-02 5.1.7, 12.2) of type `init_property_type`.
+    Unknown future values stay integers."""
+
+    NONE = _constants["MEDIA_INIT_SOURCE_NONE"]
+    INLINE = _constants["MEDIA_INIT_SOURCE_INLINE"]
+    TRACK_PROPERTY = _constants["MEDIA_INIT_SOURCE_TRACK_PROPERTY"]
+    OBJECT_PROPERTY = _constants["MEDIA_INIT_SOURCE_OBJECT_PROPERTY"]
 
 
 class ParseDropClass(IntEnum):
@@ -659,7 +703,18 @@ class TrackDescription:
     (outer, info, cmaf record) did not cover, are None -- never fabricated
     zeros. `codec_config` is the decoder extradata whatever the packaging;
     `cmaf` is the record parsed from a CMAF header, None for every other
-    track (LOC, MPEG-TS, a CMAF track whose header did not parse)."""
+    track (LOC, MPEG-TS, a CMAF track whose header did not parse).
+
+    The keyword-only fields are additive observations that do not change
+    legacy equality/hash. `config_generation` is this description's
+    generation (0 at discovery, n after the n-th MSF-02 advisory change);
+    `init_source` and `init_property_type` say where the decoder
+    configuration comes from. `encryption_scheme`, `cipher_suite`, `key_id`
+    and `track_base_key` are the catalog's MSF 5.2.38-5.2.41 values,
+    verbatim: an encryption scheme means the payload is encrypted and this
+    library does not decrypt it, so a LOC track's objects arrive as
+    ciphertext. `track_base_key` is key material (MSF-02 13.2) and is left
+    out of the repr."""
 
     name: bytes
     role: bytes | None
@@ -688,6 +743,13 @@ class TrackDescription:
     depends: tuple[bytes, ...]
     template: MediaTemplate | None
     vod: VodState
+    config_generation: int | None = field(default=None, compare=False, kw_only=True)
+    init_source: InitSource | int | None = field(default=None, compare=False, kw_only=True)
+    init_property_type: int | None = field(default=None, compare=False, kw_only=True)
+    encryption_scheme: bytes | None = field(default=None, compare=False, kw_only=True)
+    cipher_suite: bytes | None = field(default=None, compare=False, kw_only=True)
+    key_id: bytes | None = field(default=None, compare=False, kw_only=True)
+    track_base_key: bytes | None = field(default=None, compare=False, kw_only=True, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -861,8 +923,14 @@ class TrackEvent:
     delivery_origin; only FILL has a delivery_initiating_request_id (zero is
     valid). FILL_CREATED carries fill_created_id, the initiating request ID of
     the fill Receiver.fill_track requested (zero is valid); it is None for
-    every other kind. Absent complete fields remain None. The keyword-only
-    views preserve legacy equality/hash and positional construction/patterns."""
+    every other kind. `config_generation` is the generation of the
+    description the event announces (an UPDATED's is the MSF-02 advisory
+    change's number), which may be older than `description`, the CURRENT
+    copy. An MSF-02 replacement links two Tracks: its REMOVED carries the
+    successor as `replaced_by`, and the ADDED right after it carries the
+    predecessor as `replaces`; both are None on every other event. Absent
+    complete fields remain None. The keyword-only views preserve legacy
+    equality/hash and positional construction/patterns."""
 
     kind: TrackEventKind | int
     track: Track | None
@@ -875,6 +943,9 @@ class TrackEvent:
     delivery_origin: DeliveryOrigin | int | None = field(default=None, compare=False, kw_only=True)
     delivery_initiating_request_id: int | None = field(default=None, compare=False, kw_only=True)
     fill_created_id: int | None = field(default=None, compare=False, kw_only=True)
+    config_generation: int | None = field(default=None, compare=False, kw_only=True)
+    replaces: Track | None = field(default=None, compare=False, kw_only=True)
+    replaced_by: Track | None = field(default=None, compare=False, kw_only=True)
 
     @property
     def kind_extended(self) -> ExtendedTrackEventKind | int:

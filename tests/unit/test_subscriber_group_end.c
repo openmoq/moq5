@@ -1,10 +1,13 @@
 /*
  * Subscriber facade Group ends (moq_sub_cfg_t.surface_group_ends,
- * moq_sub_poll_group_end), under both wire profiles.
+ * moq_sub_poll_group_end), on drafts 16, 18 and 22.
  *
  * Invariants pinned here:
  *   - a subgroup whose header carried END_OF_GROUP and that ends with a FIN
  *     yields exactly one Group end, naming its track, group and subgroup;
+ *   - on draft 22 the same subgroup also yields a FIN_END_OF_GROUP stream
+ *     terminal naming the Group's largest Object, and a FIN without the bit
+ *     yields a plain FIN terminal and no Group end;
  *   - that Group end is pollable only after every object queued before it
  *     has been polled;
  *   - a FIN without END_OF_GROUP and a reset subgroup yield none;
@@ -35,8 +38,9 @@ typedef struct {
     moq_sub_track_t   *track;
 } fx_t;
 
-static void fx_setup(fx_t *f, moq_version_t ver, bool group_ends,
-                     int cfg_generation, uint32_t max_objects)
+static void fx_setup_lanes(fx_t *f, moq_version_t ver, bool group_ends,
+                           bool stream_terminals, int cfg_generation,
+                           uint32_t max_objects)
 {
     memset(f, 0, sizeof(*f));
     f->alloc = test_allocator(&f->as);
@@ -72,6 +76,7 @@ static void fx_setup(fx_t *f, moq_version_t ver, bool group_ends,
     } else {
         moq_sub_cfg_init_sized(&scfg, sizeof(scfg));
         scfg.surface_group_ends = group_ends;
+        scfg.surface_stream_terminals = stream_terminals;
     }
     if (cfg_generation == 2) {
         /* Main's full pre-TS sizeof, with poisoned old tail padding and an
@@ -98,6 +103,12 @@ static void fx_setup(fx_t *f, moq_version_t ver, bool group_ends,
     moq_simpair_run_until_quiescent(f->sp, 8, NULL);
     moq_sub_tick(f->sub, moq_simpair_now_us(f->sp));
     MOQ_TEST_CHECK(moq_sub_track_is_active(f->track));
+}
+
+static void fx_setup(fx_t *f, moq_version_t ver, bool group_ends,
+                     int cfg_generation, uint32_t max_objects)
+{
+    fx_setup_lanes(f, ver, group_ends, false, cfg_generation, max_objects);
 }
 
 static void fx_teardown(fx_t *f)
@@ -341,8 +352,74 @@ static void test_release_with_queued_group_end(moq_version_t ver)
         printf("PASS: group_end_release_%s\n", pname(ver));
 }
 
+/* Draft 22 decodes the subgroup header with draft 18's decoder, END_OF_GROUP
+ * being bit 0x08 in both, and finishes the subgroup through the shared
+ * receive path. A subgroup that carried the bit and ends with a FIN yields,
+ * behind its objects, a FIN_END_OF_GROUP stream terminal naming the Group's
+ * largest Object and a Group end; one without the bit yields a plain FIN
+ * terminal and no Group end. */
+static void test_group_end_d22(void)
+{
+    int before = failures;
+    fx_t f;
+    fx_setup_lanes(&f, MOQ_VERSION_DRAFT_22, true, true, 0, 0);
+
+    write_obj(&f, 0, 0, true);
+    write_obj(&f, 0, 3, true);
+    MOQ_TEST_CHECK(moq_pub_end_group(f.pub, f.ptrack,
+                                     moq_simpair_now_us(f.sp)) == MOQ_OK);
+    write_obj(&f, 1, 0, false);
+    write_obj(&f, 1, 1, false);
+    MOQ_TEST_CHECK(moq_pub_end_group(f.pub, f.ptrack,
+                                     moq_simpair_now_us(f.sp)) == MOQ_OK);
+    deliver(&f);
+    MOQ_TEST_CHECK(moq_sub_tick(f.sub, moq_simpair_now_us(f.sp)) == MOQ_OK);
+
+    moq_sub_stream_terminal_t st;
+    moq_sub_group_end_t ge;
+    MOQ_TEST_CHECK(moq_sub_poll_stream_terminal(f.sub, &st, sizeof(st)) == MOQ_DONE);
+    MOQ_TEST_CHECK(moq_sub_poll_group_end(f.sub, &ge) == MOQ_DONE);
+    MOQ_TEST_CHECK(poll_obj(&f, 0, 0));
+    MOQ_TEST_CHECK(poll_obj(&f, 0, 3));
+    memset(&st, 0xEE, sizeof(st));
+    MOQ_TEST_CHECK(moq_sub_poll_stream_terminal(f.sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK(st.struct_size == sizeof(st));
+    MOQ_TEST_CHECK(st.kind == MOQ_SUB_STREAM_FIN_END_OF_GROUP);
+    MOQ_TEST_CHECK(st.track == f.track);
+    MOQ_TEST_CHECK_EQ_U64(st.group_id, 0);
+    MOQ_TEST_CHECK_EQ_U64(st.subgroup_id, 0);
+    MOQ_TEST_CHECK(st.has_last_object && !st.has_cut_object);
+    MOQ_TEST_CHECK_EQ_U64(st.last_object_id, 3);
+    memset(&ge, 0xEE, sizeof(ge));
+    MOQ_TEST_CHECK(moq_sub_poll_group_end(f.sub, &ge) == MOQ_OK);
+    MOQ_TEST_CHECK(ge.track == f.track);
+    MOQ_TEST_CHECK_EQ_U64(ge.group_id, 0);
+    MOQ_TEST_CHECK_EQ_U64(ge.subgroup_id, 0);
+    MOQ_TEST_CHECK(moq_sub_poll_group_end(f.sub, &ge) == MOQ_DONE);
+
+    MOQ_TEST_CHECK(poll_obj(&f, 1, 0));
+    MOQ_TEST_CHECK(poll_obj(&f, 1, 1));
+    memset(&st, 0xEE, sizeof(st));
+    MOQ_TEST_CHECK(moq_sub_poll_stream_terminal(f.sub, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK(st.kind == MOQ_SUB_STREAM_FIN);
+    MOQ_TEST_CHECK_EQ_U64(st.group_id, 1);
+    MOQ_TEST_CHECK(st.has_last_object);
+    MOQ_TEST_CHECK_EQ_U64(st.last_object_id, 1);
+    MOQ_TEST_CHECK(moq_sub_poll_stream_terminal(f.sub, &st, sizeof(st)) == MOQ_DONE);
+    MOQ_TEST_CHECK(moq_sub_poll_group_end(f.sub, &ge) == MOQ_DONE);
+
+    moq_sub_stats_t stats;
+    MOQ_TEST_CHECK(moq_sub_get_stats(f.sub, &stats, sizeof(stats)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(stats.subgroup_finished, 2);
+
+    fx_teardown(&f);
+    if (failures == before)
+        printf("PASS: sub_group_end_d22\n");
+}
+
 int main(void)
 {
+    test_group_end_d22();
     for (int vi = 0; vi < 2; vi++) {
         moq_version_t ver = vi ? MOQ_VERSION_DRAFT_18 : MOQ_VERSION_DRAFT_16;
         test_fin_with_end_of_group(ver);

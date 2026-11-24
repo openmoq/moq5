@@ -240,6 +240,29 @@ int main()
         CHECK(dec.ok(), 55);
         CHECK(dec->size() == 2, 56);
     }
+
+    // -- 5c. MSF-02 authoring, check, apply and naming smoke ------------
+    {
+        moq::msf::track t;
+        t.name = "v"; t.packaging = "loc"; t.is_live = true;
+        t.keyframe_spacing = 30;
+        moq::msf::catalog cat;
+        cat.revision = MOQ_MSF_REVISION_02;
+        cat.tracks = &t; cat.track_count = 1;
+        auto enc = moq::msf::encode(cat);
+        CHECK(enc.ok(), 57);
+        auto dec = moq::msf::parse(moq::bytes_view(enc->data(), enc->size()));
+        CHECK(dec.ok() && dec->revision() == MOQ_MSF_REVISION_02, 58);
+        auto reason = moq::msf::check(*dec);
+        CHECK(reason.ok() && *reason == MOQ_MSF_CATALOG_OK, 59);
+        auto delta = moq::msf::parse(moq::bytes_view(
+            R"({"generatedAt":1,"deltaUpdate":[{"op":"remove","tracks":[{"name":"v"}]}]})"));
+        CHECK(delta.ok(), 61);
+        auto eff = moq::msf::apply_delta(*dec, *delta);
+        CHECK(eff.ok() && eff->track_count() == 0, 62);
+        auto ns = moq::msf::namespace_split(moq::bytes_view("live/cam1"));
+        CHECK(ns.ok() && ns->count() == 2, 63);
+    }
 #endif
 
 #ifdef MOQ_HAS_CMAF

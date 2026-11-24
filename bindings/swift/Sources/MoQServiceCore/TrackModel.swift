@@ -33,6 +33,42 @@ public enum SAPType: Sendable, Hashable {
     case type1, type2, type3
 }
 
+/// Where a track's decoder configuration comes from (the C description's
+/// `init_source`). The set may grow: a value this binding does not name is
+/// kept as `.unknown`.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+public enum InitSource: Sendable, Hashable {
+    /// The catalog names none.
+    case none
+    /// The catalog itself (`initData` / `codecConfig`).
+    case inline
+    /// In band (MSF-02 5.1.7, 12.2), as a Track property of type
+    /// `initPropertyType`, observable on each object's metadata.
+    case trackProperty
+    /// In band (MSF-02 5.1.7, 12.2), as an Object property of type
+    /// `initPropertyType` on each object.
+    case objectProperty
+    case unknown(UInt32)
+}
+
+/// An encrypted track's trackBaseKey (MSF 5.2.41), verbatim from the catalog.
+/// It is key material (MSF-02 13.2): `value` reads it, and no description,
+/// debug description or reflection of it, or of a value holding it, shows
+/// it.
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+public struct TrackBaseKey: Sendable, Hashable, CustomStringConvertible,
+                            CustomDebugStringConvertible, CustomReflectable {
+    public let value: String
+
+    public init(_ value: String) {
+        self.value = value
+    }
+
+    public var description: String { "TrackBaseKey(redacted)" }
+    public var debugDescription: String { description }
+    public var customMirror: Mirror { Mirror(self, children: [], displayStyle: .struct) }
+}
+
 /// An immutable, Sendable snapshot of a track's catalog description. Copied
 /// eagerly from the C tier's handle-owned spans at event time; never borrows.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
@@ -58,6 +94,25 @@ public struct TrackDescription: Sendable, Hashable {
     public var initData: Data?
     /// Decoder extradata (SPS/PPS, AudioSpecificConfig) — what a decoder wants.
     public var codecConfig: Data?
+    /// This description's generation: 0 for the one the track was discovered
+    /// with, n for the one the n-th MSF-02 advisory change published (an
+    /// `.updated` event). nil when the native description does not carry it.
+    public var configGeneration: UInt32?
+    /// Where the decoder configuration comes from; nil when the native
+    /// description does not carry it.
+    public var initSource: InitSource?
+    /// The property type of an in-band configuration (0x0D VIDEO_CONFIG,
+    /// 0x0F AUDIO_CONFIG), 0 otherwise; nil when the native description does
+    /// not carry it.
+    public var initPropertyType: UInt64?
+    /// MSF 5.2.38-5.2.41, verbatim from the catalog; nil when absent. An
+    /// encryptionScheme means the object payload is encrypted: this library
+    /// does not decrypt, so a LOC track's objects arrive as ciphertext and the
+    /// application decrypts them with these.
+    public var encryptionScheme: String?
+    public var cipherSuite: String?
+    public var keyID: String?
+    public var trackBaseKey: TrackBaseKey?
 
     public init(name: String, mediaType: MediaType, packaging: MediaPackaging) {
         self.name = name

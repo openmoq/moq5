@@ -123,8 +123,21 @@ target_include_directories(fuzz_pq_cid_route PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../adapters/picoquic)
 target_compile_options(fuzz_pq_cid_route PRIVATE ${FUZZ_FLAGS})
 target_link_options(fuzz_pq_cid_route PRIVATE ${FUZZ_FLAGS})
-set(_fuzz_target_count 9)
-set(_fuzz_test_count 15)
+
+# The media receiver's in-group ordering stage: allocation-bounded state with
+# no I/O, compiled here from its source so the fuzz tree needs no service
+# tier.
+add_executable(fuzz_receiver_order fuzz_receiver_order.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../service/src/media_receiver_order.c)
+target_include_directories(fuzz_receiver_order PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../service/src)
+target_link_libraries(fuzz_receiver_order PRIVATE moq::core)
+target_compile_options(fuzz_receiver_order PRIVATE ${FUZZ_FLAGS})
+target_link_options(fuzz_receiver_order PRIVATE ${FUZZ_FLAGS})
+add_test(NAME fuzz_receiver_order_smoke
+         COMMAND fuzz_receiver_order -runs=1 -max_len=0)
+set(_fuzz_target_count 10)
+set(_fuzz_test_count 16)
 
 # The relay admin parser, built only when the relay tier is in this tree.
 if(TARGET moqr-admin)

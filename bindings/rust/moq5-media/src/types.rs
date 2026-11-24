@@ -181,6 +181,42 @@ impl CompanionProfile {
     }
 }
 
+/// The MSF revision a catalog follows (`moq_msf_revision_t`, an open set).
+/// An independent catalog's revision is its root `version` (MSF-01 and
+/// MSF-02 5.1.1); a delta update follows the catalog it is applied to.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MsfRevision {
+    /// draft-ietf-moq-msf-01. Zero, so an absent or zeroed field selects it.
+    Msf01,
+    /// draft-ietf-moq-msf-02.
+    Msf02,
+    /// A revision this crate does not know.
+    Other(u32),
+}
+
+impl MsfRevision {
+    /// A revision from its `MOQ_MSF_REVISION_*` value, known or not.
+    #[must_use]
+    pub fn from_code(code: sys::moq_msf_revision_t) -> MsfRevision {
+        match code {
+            sys::MOQ_MSF_REVISION_01 => MsfRevision::Msf01,
+            sys::MOQ_MSF_REVISION_02 => MsfRevision::Msf02,
+            code => MsfRevision::Other(code),
+        }
+    }
+
+    /// The `MOQ_MSF_REVISION_*` value.
+    #[must_use]
+    pub fn code(self) -> sys::moq_msf_revision_t {
+        match self {
+            MsfRevision::Msf01 => sys::MOQ_MSF_REVISION_01,
+            MsfRevision::Msf02 => sys::MOQ_MSF_REVISION_02,
+            MsfRevision::Other(code) => code,
+        }
+    }
+}
+
 /// The clock a timestamp is in (`moq_media_time_domain_t`).
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -244,6 +280,18 @@ mod tests {
             TimeDomain::from_code(TimeDomain::UnixMicros.code()),
             TimeDomain::UnixMicros
         );
+        assert_eq!(
+            MsfRevision::from_code(sys::MOQ_MSF_REVISION_01),
+            MsfRevision::Msf01
+        );
+        assert_eq!(
+            MsfRevision::from_code(sys::MOQ_MSF_REVISION_02),
+            MsfRevision::Msf02
+        );
+        assert_eq!(MsfRevision::Msf01.code(), 0, "zero selects MSF-01");
+        assert_eq!(MsfRevision::Msf02.code(), sys::MOQ_MSF_REVISION_02);
+        assert_eq!(MsfRevision::from_code(7), MsfRevision::Other(7));
+        assert_eq!(MsfRevision::Other(7).code(), 7);
         assert_eq!(SapType::from_code(200), SapType::Unknown);
         for sap in [
             SapType::None,

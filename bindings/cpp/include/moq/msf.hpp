@@ -9,6 +9,7 @@
 #include <cstring>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 namespace moq::msf {
 
@@ -262,10 +263,41 @@ public:
     track_view track(size_t i) const { return detail::view_from(op_->tracks[i]); }
 };
 
+/// What a catalog is judged against by check() and apply_delta()
+/// (moq_msf_validate_cfg_t). catalog_namespace is the Track Namespace the
+/// catalog track was received under: an MSF-02 track without "namespace"
+/// inherits it (MSF-02 5.2.2), and so does a "clone" or "update" op track
+/// without "parentNamespace" (5.2.35). Empty means unknown; a namespace that
+/// overflowed namespace_name is refused, never truncated. Its parts are
+/// borrowed for the call. The two limits bound apply_delta() only; 0 is no
+/// limit.
+struct validate_cfg {
+    namespace_name catalog_namespace;
+    size_t         max_delta_ops = 0;
+    size_t         max_effective_tracks = 0;
+};
+
+class parsed_catalog;
+inline result<parsed_catalog> apply_delta(const parsed_catalog &base,
+                                          const parsed_catalog &delta,
+                                          const validate_cfg &cfg,
+                                          const moq_alloc_t *alloc);
+inline result<moq_msf_catalog_error_t> check(const parsed_catalog &cat,
+                                             const validate_cfg &cfg,
+                                             const moq_alloc_t *alloc);
+
 class parsed_catalog {
     moq_msf_catalog_t cat_{};
     moq_alloc_t alloc_{};
     bool valid_ = false;
+
+    friend result<parsed_catalog> apply_delta(const parsed_catalog &,
+                                              const parsed_catalog &,
+                                              const validate_cfg &,
+                                              const moq_alloc_t *);
+    friend result<moq_msf_catalog_error_t> check(const parsed_catalog &,
+                                                 const validate_cfg &,
+                                                 const moq_alloc_t *);
 
 public:
     parsed_catalog() = default;
@@ -370,8 +402,9 @@ public:
         return detail::cp_view_from(*c);
     }
 
-    // MSF-01 5.1.6 delta update. is_delta() is true for a partial catalog
-    // (version 0, no root tracks) carrying add/remove/clone operations.
+    // MSF 5.1.6 delta update. is_delta() is true for a partial catalog
+    // (version 0, no root tracks) carrying add/remove/clone (and, MSF-02,
+    // update) operations.
     bool is_delta() const { return cat_.delta_update != nullptr; }
     size_t delta_op_count() const { return cat_.delta_update_count; }
     delta_op_view delta_op(size_t i) const {
@@ -496,11 +529,13 @@ struct track {
     const bytes_view *content_protection_ref_ids = nullptr;
     size_t            content_protection_ref_id_count = 0;
 
-    // Delta-op authoring (MSF-01 5.1.6). Ignored for an independent catalog
+    // Delta-op authoring (MSF 5.1.6). Ignored for an independent catalog
     // track -- there name/packaging/isLive are always emitted. On a delta
-    // add/clone op track, packaging/isLive are emitted only when has_packaging /
-    // has_is_live are set, so a partial track round-trips. On a clone op track
-    // parent_name is REQUIRED and parent_namespace optional; on a remove op
+    // add/clone/update op track, packaging/isLive are emitted only when
+    // has_packaging / has_is_live are set, so a partial track round-trips. On
+    // a clone or (MSF-02) update op track parent_name is REQUIRED and
+    // parent_namespace optional; an update op track emits name only when it is
+    // non-empty (it names no other track than its target). On a remove op
     // track set name (+ optional namespace) only.
     bool       has_packaging      = false;
     bool       has_is_live        = false;
@@ -512,6 +547,24 @@ struct track {
     // there). si_pids is borrowed and must outlive encode(); mode_name and
     // timestamp_mode_name are ignored on encode for recognized values.
     std::optional<moq_msf_mpeg2ts_t> mpeg2ts;
+
+    // MSF track fields moq_msf_track_t cannot hold, handed to the C track as
+    // its MOQ_MSF_EXT_SUPPLEMENT record (moq_msf_track_supplement_t), which
+    // encode() builds in its arena when any of them is set. The views are
+    // borrowed and must outlive encode(). The encoder refuses every one of
+    // them but the four encryption fields in an MSF-01 catalog.
+    bool       has_packaging_metadata = false;  bytes_view packaging_metadata; // MSF-02 5.2.5
+    std::optional<uint64_t> keyframe_spacing;       // MSF-02 5.2.46: Objects per keyframe interval
+    std::optional<uint64_t> accessible_window_ms;   // MSF-02 5.2.45 accessibleWindowTime
+    // MSF 5.2.38-5.2.41, verbatim. trackBaseKey is key material (MSF-02
+    // 13.2): handle it as a secret.
+    bool       has_encryption_scheme  = false;  bytes_view encryption_scheme;
+    bool       has_cipher_suite       = false;  bytes_view cipher_suite;
+    bool       has_key_id             = false;  bytes_view key_id;
+    bool       has_track_base_key     = false;  bytes_view track_base_key;
+    // MSF-02 5.2.15: the Number entries of "depends" (renderGroup ids),
+    // emitted after the String entries in `depends`. Owned by the track.
+    std::vector<int> depends_render_groups;
 };
 
 // MSF-01 5.1.7 root Initialization Data List entry (authoring; borrowed views).
@@ -557,6 +610,11 @@ struct delta_op {
 
 struct catalog {
     int                  version = MOQ_MSF_VERSION;
+    // The MSF revision the catalog follows, which selects its spelling and
+    // rules (moq_msf_revision_t): MOQ_MSF_REVISION_01 (the default) or
+    // MOQ_MSF_REVISION_02. A delta carries no version (MSF-02 5.3); its
+    // revision still decides which vocabulary the encoder admits.
+    moq_msf_revision_t   revision = MOQ_MSF_REVISION_01;
     const track         *tracks  = nullptr;
     size_t               track_count = 0;
     bool                 has_generated_at = false;
@@ -570,6 +628,11 @@ struct catalog {
     const content_protection *content_protections = nullptr;
     size_t                    content_protection_count = 0;
     const delta_op           *delta_update = nullptr;  size_t delta_update_count = 0;
+
+    // MSF 5.1.5 publish tracks: tracks the subscriber may publish to, laid out
+    // as `tracks`. Borrowed; must outlive encode(). An independent catalog
+    // only (a delta never carries them).
+    const track              *publish_tracks = nullptr;  size_t publish_track_count = 0;
 };
 
 namespace detail {
@@ -581,6 +644,57 @@ inline bool track_arrays_coherent(const track &t) {
     if (t.content_protection_ref_id_count > 0 && !t.content_protection_ref_ids)
         return false;
     return true;
+}
+
+// Whether a track sets any field that lives in the C supplement record.
+inline bool track_has_supplement(const track &t) {
+    return t.has_packaging_metadata || t.keyframe_spacing ||
+           t.accessible_window_ms || t.has_encryption_scheme ||
+           t.has_cipher_suite || t.has_key_id || t.has_track_base_key ||
+           !t.depends_render_groups.empty();
+}
+
+// The arena-owned supplement record for a track, or nullptr after latching
+// arena.failed() on an allocation failure.
+inline moq_msf_track_supplement_t *build_supplement(encode_arena &arena,
+                                                    const track &s) {
+    auto *rec = arena.calloc_n<moq_msf_track_supplement_t>(1);
+    const size_t ngroups = s.depends_render_groups.size();
+    int *groups = arena.calloc_n<int>(ngroups);
+    if (!rec || (ngroups > 0 && !groups)) return nullptr;
+    moq_msf_track_supplement_init(rec);
+    if (s.has_packaging_metadata) {
+        rec->has_packaging_metadata = true;
+        rec->packaging_metadata = s.packaging_metadata.raw();
+    }
+    if (s.keyframe_spacing) {
+        rec->has_keyframe_spacing = true;
+        rec->keyframe_spacing = *s.keyframe_spacing;
+    }
+    if (s.accessible_window_ms) {
+        rec->has_accessible_window_ms = true;
+        rec->accessible_window_ms = *s.accessible_window_ms;
+    }
+    if (s.has_encryption_scheme) {
+        rec->has_encryption_scheme = true;
+        rec->encryption_scheme = s.encryption_scheme.raw();
+    }
+    if (s.has_cipher_suite) {
+        rec->has_cipher_suite = true;
+        rec->cipher_suite = s.cipher_suite.raw();
+    }
+    if (s.has_key_id) {
+        rec->has_key_id = true;
+        rec->key_id = s.key_id.raw();
+    }
+    if (s.has_track_base_key) {
+        rec->has_track_base_key = true;
+        rec->track_base_key = s.track_base_key.raw();
+    }
+    for (size_t i = 0; i < ngroups; i++) groups[i] = s.depends_render_groups[i];
+    rec->depends_render_groups = groups;
+    rec->depends_render_group_count = ngroups;
+    return rec;
 }
 } // namespace detail
 
@@ -631,20 +745,34 @@ inline void fill_c_track_(detail::encode_arena &arena, moq_msf_track_t &d,
     if (s.has_is_live)   d.has_is_live   = true;
     if (s.has_parent_name)      { d.has_parent_name = true;      d.parent_name = s.parent_name.raw(); }
     if (s.has_parent_namespace) { d.has_parent_namespace = true; d.parent_namespace = s.parent_namespace.raw(); }
-    if (s.mpeg2ts) {
-        // One extension entry and its record, owned by the encode arena. On
-        // allocation failure the arena latches failed(), which encode()
-        // checks before calling moq_msf_catalog_encode.
+    // The extension list (MPEG-2 TS record, then the supplement, in kind
+    // order) and its records, owned by the encode arena. On allocation
+    // failure the arena latches failed(), which encode() checks before
+    // calling moq_msf_catalog_encode.
+    const bool supplement = detail::track_has_supplement(s);
+    const size_t ext_count = (s.mpeg2ts ? 1u : 0u) + (supplement ? 1u : 0u);
+    auto *ext = arena.calloc_n<moq_msf_track_ext_t>(ext_count);
+    size_t k = 0;
+    if (ext && s.mpeg2ts) {
         auto *rec = arena.calloc_n<moq_msf_mpeg2ts_t>(1);
-        auto *ext = arena.calloc_n<moq_msf_track_ext_t>(1);
-        if (rec && ext) {
+        if (rec) {
             *rec = *s.mpeg2ts;
             rec->struct_size = sizeof(moq_msf_mpeg2ts_t);
-            ext->kind = MOQ_MSF_EXT_MPEG2TS;
-            ext->u.mpeg2ts = rec;
-            d.extensions = ext;
-            d.extension_count = 1;
+            ext[k].kind = MOQ_MSF_EXT_MPEG2TS;
+            ext[k].u.mpeg2ts = rec;
+            k++;
         }
+    }
+    if (ext && supplement) {
+        if (const moq_msf_track_supplement_t *rec = detail::build_supplement(arena, s)) {
+            ext[k].kind = MOQ_MSF_EXT_SUPPLEMENT;
+            ext[k].u.supplement = rec;
+            k++;
+        }
+    }
+    if (ext && k == ext_count) {
+        d.extensions = ext;
+        d.extension_count = ext_count;
     }
     // Borrowed arrays -> arena-owned moq_bytes_t arrays. On allocation failure
     // dup_bytes_array leaves the field NULL/0 and latches arena.failed(), which
@@ -664,6 +792,7 @@ inline result<buffer> encode(const catalog &cat,
     if (cat.content_protection_count > 0 && !cat.content_protections)
         return errc::invalid;
     if (cat.delta_update_count > 0 && !cat.delta_update) return errc::invalid;
+    if (cat.publish_track_count > 0 && !cat.publish_tracks) return errc::invalid;
 
     // Owns every transient C array; frees them all when this scope exits (after
     // the encode call), so each early return below is leak-safe.
@@ -676,6 +805,7 @@ inline result<buffer> encode(const catalog &cat,
     cc.has_generated_at = cat.has_generated_at;
     cc.generated_at = cat.generated_at;
     cc.is_complete = cat.is_complete;
+    cc.revision = cat.revision;
 
     // Tracks: stack fast-path for <= 8, arena otherwise. stack_ct lives for the
     // whole call (incl. the encode below), so no manual free is needed.
@@ -694,6 +824,19 @@ inline result<buffer> encode(const catalog &cat,
         }
         cc.tracks = ct;
         cc.track_count = cat.track_count;
+    }
+
+    // MSF 5.1.5 publishTracks.
+    if (cat.publish_track_count > 0) {
+        auto *pt = arena.calloc_n<moq_msf_track_t>(cat.publish_track_count);
+        if (!pt) return errc::nomem;
+        for (size_t i = 0; i < cat.publish_track_count; i++) {
+            if (!detail::track_arrays_coherent(cat.publish_tracks[i]))
+                return errc::invalid;
+            fill_c_track_(arena, pt[i], cat.publish_tracks[i]);
+        }
+        cc.publish_tracks = pt;
+        cc.publish_track_count = cat.publish_track_count;
     }
 
     // MSF-01 5.1.7 initDataList.
@@ -797,6 +940,82 @@ inline result<buffer> encode_init_data(bytes_view data,
     moq_result_t rc = moq_msf_encode_init_data(alloc, data.raw(), &raw);
     if (rc < 0) return errc_from_result(rc);
     return buffer::adopt(raw);
+}
+
+namespace detail {
+// The C validate cfg for cfg, borrowing its namespace parts; false for a
+// namespace that overflowed namespace_name.
+inline bool c_validate_cfg(const validate_cfg &cfg, moq_msf_validate_cfg_t &out) {
+    if (cfg.catalog_namespace.overflowed()) return false;
+    moq_msf_validate_cfg_init(&out);
+    out.catalog_namespace = cfg.catalog_namespace.c_namespace();
+    out.max_delta_ops = cfg.max_delta_ops;
+    out.max_effective_tracks = cfg.max_effective_tracks;
+    return true;
+}
+} // namespace detail
+
+/// Apply a delta (MSF 5.1.6) to an independent base
+/// (moq_msf_catalog_apply_delta_sized), yielding the effective catalog as a
+/// new owner. The delta is judged by the BASE's revision: MSF-01 rules, or
+/// MSF-02 5.3 with tracks matched by Full Track Name under
+/// cfg.catalog_namespace. The result keeps the base's revision, version form,
+/// initDataList, contentProtections and publishTracks; base and delta are
+/// unchanged.
+/// errc::invalid: base is a delta, delta is not one, or cfg's namespace
+///   overflowed.
+/// errc::protocol: a complete base, an exceeded limit, an illogical op or an
+///   invalid effective catalog.
+/// errc::nomem on allocation failure.
+inline result<parsed_catalog> apply_delta(const parsed_catalog &base,
+                                          const parsed_catalog &delta,
+                                          const validate_cfg &cfg = {},
+                                          const moq_alloc_t *alloc = moq_alloc_default())
+{
+    moq_msf_validate_cfg_t c;
+    if (!detail::c_validate_cfg(cfg, c)) return errc::invalid;
+    moq_msf_catalog_t out;
+    moq_result_t rc = moq_msf_catalog_apply_delta_sized(alloc, &base.cat_, &delta.cat_,
+                                                        &c, &out, sizeof(out));
+    if (rc < 0) return errc_from_result(rc);
+    return parsed_catalog(out, *alloc);
+}
+
+/// The inbound semantic check of an independent catalog
+/// (moq_msf_catalog_check): unique Full Track Names within tracks and within
+/// publish tracks, unique initDataList ids and contentProtection refIDs, and
+/// (MSF-02 5.2.15) resolving "depends" entries. A violation is the VALUE, not
+/// an error: MOQ_MSF_CATALOG_OK, or the first MOQ_MSF_CATALOG_ERR_* found (a
+/// reader must tolerate reasons it does not know).
+/// errc::invalid: cat is a delta, or cfg's namespace overflowed.
+/// errc::nomem on allocation failure.
+inline result<moq_msf_catalog_error_t> check(const parsed_catalog &cat,
+                                             const validate_cfg &cfg = {},
+                                             const moq_alloc_t *alloc = moq_alloc_default())
+{
+    moq_msf_validate_cfg_t c;
+    if (!detail::c_validate_cfg(cfg, c)) return errc::invalid;
+    moq_msf_catalog_error_t reason = MOQ_MSF_CATALOG_OK;
+    moq_result_t rc = moq_msf_catalog_check(alloc, &cat.cat_, &c, &reason);
+    if (rc < 0 && rc != MOQ_ERR_PROTO) return errc_from_result(rc);
+    return reason;
+}
+
+/// Split a "namespace" (or "parentNamespace") string into its Track
+/// Namespace fields at every '/' (MSF-02 5.2.2, moq_msf_namespace_split): 1
+/// to 32 non-empty fields, each borrowing ns.
+/// errc::protocol: an empty string, an empty field (a leading, trailing or
+///   doubled '/'), or more than 32 fields.
+/// errc::invalid: a view with no buffer and a nonzero size.
+inline result<namespace_name> namespace_split(bytes_view ns)
+{
+    static_assert(MOQ_MSF_NAMESPACE_MAX_FIELDS <= namespace_name::max_parts);
+    moq_bytes_t fields[MOQ_MSF_NAMESPACE_MAX_FIELDS] = {};
+    size_t n = 0;
+    moq_result_t rc = moq_msf_namespace_split(ns.raw(), fields,
+                                              MOQ_MSF_NAMESPACE_MAX_FIELDS, &n);
+    if (rc < 0) return errc_from_result(rc);
+    return namespace_name(moq_namespace_t{fields, n});
 }
 
 } // namespace moq::msf

@@ -73,7 +73,8 @@ final class ServicePlayerBackend: PlayerBackend, @unchecked Sendable {
         guard moq_media_player_poll_event(
             player, &ev, MemoryLayout<moq_media_player_event_t>.size) == moq_result_t(MOQ_OK)
         else { return nil }
-        return copyPlayerEvent(ev, track: track(ev.track))
+        return copyPlayerEvent(ev, track: track(ev.track),
+                               replacement: track(replacementHandle(of: ev)))
     }
 
     var nextDeadlineMicroseconds: UInt64? {
@@ -298,6 +299,7 @@ func copyPlayerOutput(_ out: moq_media_player_output_t, track: PlayerTrack?) -> 
         case UInt32(MOQ_MEDIA_PLAYER_END_LOCAL_FAILURE): cause = .localFailure
         case UInt32(MOQ_MEDIA_PLAYER_END_CLOSED): cause = .closed
         case UInt32(MOQ_MEDIA_PLAYER_END_FATAL): cause = .fatal
+        case UInt32(MOQ_MEDIA_PLAYER_END_REPLACED): cause = .replaced
         default: cause = .unknown(e.cause)
         }
         let disposition: PlayerEndDisposition
@@ -314,8 +316,18 @@ func copyPlayerOutput(_ out: moq_media_player_output_t, track: PlayerTrack?) -> 
     }
     }
 
+/// The handle a TRACK_REPLACED record names as the replacement; nil for
+/// every other kind.
+func replacementHandle(of ev: moq_media_player_event_t) -> OpaquePointer? {
+    ev.kind == UInt32(MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED) ? ev.u.replaced.replacement : nil
+}
+
+/// Deep-copy one polled event; `track` is its handle's model and
+/// `replacement` the model of ``replacementHandle(of:)``'s handle. A
+/// TRACK_REPLACED without both surfaces as `.unknown`.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
-func copyPlayerEvent(_ ev: moq_media_player_event_t, track: PlayerTrack?) -> PlayerEvent {
+func copyPlayerEvent(_ ev: moq_media_player_event_t, track: PlayerTrack?,
+                     replacement: PlayerTrack? = nil) -> PlayerEvent {
     switch (ev.kind, track) {
     case (UInt32(MOQ_MEDIA_PLAYER_EVENT_TRACK_AVAILABLE), let t?):
         return .trackAvailable(t)
@@ -356,6 +368,9 @@ func copyPlayerEvent(_ ev: moq_media_player_event_t, track: PlayerTrack?) -> Pla
         let k = ev.u.knowledge_forgotten
         return .knowledgeForgotten(t, firstGroupID: k.first_group_id,
                                    lastGroupID: k.last_group_id)
+    case (UInt32(MOQ_MEDIA_PLAYER_EVENT_TRACK_REPLACED), let t?):
+        guard let replacement else { return .unknown(kind: ev.kind, track: t) }
+        return .trackReplaced(t, replacement: replacement)
     default:
         return .unknown(kind: ev.kind, track: track)
     }

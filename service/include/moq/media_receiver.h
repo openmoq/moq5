@@ -21,6 +21,45 @@
  * Largest followed by NO_STREAM instead waits for the first live independent
  * catalog. Draft-16/18 retain the Joining FETCH bootstrap.
  *
+ * Catalog revisions. Both MSF-01 and MSF-02 (draft-ietf-moq-msf-02)
+ * catalogs are read; the revision is the independent catalog's "version",
+ * and a delta follows the catalog it applies to (stats.catalog_revision).
+ * Under MSF-01 a declared track's attributes are immutable except the
+ * live-to-VOD conversion. Under MSF-02 (5.1.6, 5.3) a catalog may change a
+ * declared track in place: an advisory change (bitrate, framerate,
+ * dimensions, label, lang, targetLatency, renderGroup, altGroup, depends,
+ * the SAP maxima, keyframeSpacing, accessibleWindowTime, mimeType,
+ * cipherSuite, keyId, trackBaseKey, packagingMetadata keys other than
+ * streamMapping, a template added) keeps the handle and publishes a new
+ * description generation (MOQ_MEDIA_TRACK_UPDATED); a change that decides
+ * how Objects are parsed or delivered (packaging, role, codec, timescale,
+ * samplerate, channelConfig, eventType, the resolved init, the content
+ * protection, the MPEG-2 TS record, the stream mapping, encryptionScheme,
+ * or anything that changes the receiver's delivery decision) REPLACES the
+ * handle: TRACK_REMOVED names the successor (replaced_by), and the
+ * successor's TRACK_ADDED, immediately after it, names its predecessor
+ * (replaces). The predecessor's selection moves to the successor whole, and
+ * a command later issued on the predecessor acts on the successor. A change
+ * MSF-02 forbids (isLive false to true, a present template changing) drops
+ * the catalog (stats.catalog_drops). Every catalog is adopted whole or not
+ * at all: one that cannot be (an allocation failure, a retained-state cap,
+ * too little room in the track-event queue for its events once a catalog
+ * is ready) changes nothing and is dropped.
+ *
+ * What a replacement guarantees: a new handle and decoder lifecycle, and
+ * that no Object the predecessor's subscription received is delivered on
+ * the successor (its queue is purged, its late Objects are dropped, and the
+ * successor subscribes only once the predecessor's subscription is
+ * released). It does not guarantee that the successor's Objects use the new
+ * configuration: MSF gives a catalog change no synchronization point with
+ * the media, and a relay may serve the new subscription a Group produced
+ * before the change. Where the packaging carries the configuration it is
+ * checked: a LOC-05 Codec String or in-band VIDEO/AUDIO_CONFIG on an Object
+ * governs that Object, and an MSF-02 CMAF fragment whose tfhd track_ID
+ * differs from the init's is dropped (MOQ_MEDIA_PARSE_DROP_MEDIA). A LOC
+ * Object without such properties, or a CMAF fragment with the init's
+ * track_ID, reaches the new decoder unflagged.
+ *
  * Subscription modes. One rule decides what can be subscribed: the receiver
  * has a DELIVERY PATH for a track when it is a media track whose structured
  * info derived from the catalog and whose packaging this build parses
@@ -28,8 +67,37 @@
  * (poll_media_timeline). subscribe_track refuses any other track with
  * MOQ_ERR_UNSUPPORTED: a track whose info did not derive (e.g. an unknown
  * packaging), an MPEG2TS track in a build without moq::mpeg2ts, an
- * eventtimeline of another kind, and an MSF §5.2.2 namespace-override track
- * (the MSF namespace has no defined MoQT mapping).
+ * eventtimeline of another kind, an MSF-01 namespace-override track (the
+ * MSF-01 namespace has no defined MoQT mapping; an MSF-02 track's
+ * "namespace" names its Track Namespace fields, MSF-02 5.2.2, and is
+ * subscribed under them), and these MSF policies:
+ *  - an encrypted track (encryptionScheme, MSF 4.4.1) of any packaging but
+ *    "loc": the receiver interprets CMAF, MPEG-2 TS and timeline payloads,
+ *    which it cannot decrypt. An encrypted "loc" track IS delivered, with
+ *    its payload as received (ciphertext) and its LOC properties, which stay
+ *    in plaintext (MSF-02 4.4.4); the key fields are on the description's
+ *    supplement record (moq_msf_ext_supplement(desc->extensions, ...)), and
+ *    the application decrypts;
+ *  - an MSF-02 track whose decoder configuration the catalog places in band
+ *    (an initDataList "track-property" or "object-property" entry) unless it
+ *    is a "loc" track with VIDEO_CONFIG (0x0D) on role "video" or
+ *    AUDIO_CONFIG (0x0F) on role "audio" on a draft-22 companion: the legacy
+ *    companion carries no per-Object configuration, so a decoder would get
+ *    media without it (desc.init_source says where it comes from);
+ *  - an MSF-02 "loc" audio or video track without a codec.
+ *
+ * Compression (MSF-02 12.1). A catalog or timeline Object whose origin's
+ * Track Properties or own Object Properties carry MSF_COMPRESSION (0x78)
+ * with a value other than 0 (uncompressed) is never processed as if it were
+ * uncompressed. This build does not decompress yet, GZIP (1) included, so
+ * such an Object is refused as an algorithm it does not support: a catalog
+ * Object fails as a malformed one does (the first catalog's failure is
+ * CATALOG_UNUSABLE), a timeline whose Track Properties say so fails locally
+ * (MOQ_MEDIA_TRACK_LOCAL_FAILURE, MOQ_ERR_UNSUPPORTED) and one Object that
+ * says so is a parse drop. An Object carrying the Object property where the
+ * Track property is set is dropped (a publisher may not use both). Under an
+ * MSF-01 catalog the property is not interpreted on timelines. See the
+ * stats for the counters.
  *  - auto_subscribe = true: every media track with a delivery path is
  *    subscribed after discovery (simple-player default); timeline tracks are
  *    not -- subscribe them explicitly.
@@ -255,12 +323,16 @@ MOQ_API void moq_media_receiver_cfg_init_flow_control_sized(
  * metadata) is OWNED by the track handle and stays valid until the receiver is
  * destroyed -- it does NOT borrow from the current effective catalog, so a
  * catalog update that replaces the catalog does not invalidate a handle's desc.
- * A handle's metadata is immutable for its lifetime with ONE exception: a §11.3
- * live->VOD conversion updates the surviving handle's is_live/track_duration in
- * place and fires MOQ_MEDIA_TRACK_UPDATED (per MSF-01 §5.3 every OTHER attribute
- * of a declared Namespace|Name tuple stays fixed). A handle removed from the
- * catalog stays allocated (and its desc readable) until the receiver is
- * destroyed; it just transitions to a terminal state.
+ * A published description is immutable with ONE exception: a live->VOD
+ * conversion (MSF-01 11.3, MSF-02 11.4) updates the current description's
+ * is_live/track_duration in place and fires MOQ_MEDIA_TRACK_UPDATED (per
+ * MSF-01 §5.3 every OTHER attribute of a declared Namespace|Name tuple stays
+ * fixed). An MSF-02 advisory change publishes a new description generation
+ * for the same handle instead (see the top of this header); the earlier
+ * ones stay valid and unchanged. A handle removed from the catalog stays
+ * allocated (and its desc readable) until the receiver is destroyed; it just
+ * transitions to a terminal state. Generations count against the caps below
+ * like handles do.
  *
  * Because handles (and the content-protection snapshots that keep previously
  * returned find_content_protection() pointers valid) live until the receiver is
@@ -416,21 +488,60 @@ typedef struct moq_media_track_desc {
     bool                     has_render_group;
     int                      render_group;
     bool                     has_label;
+    /* Appended after has_label, at the complete sizeof of the layout that
+     * ends with it; one block, read only when struct_size covers
+     * config_generation.
+     *
+     * init_source: where the track's decoder configuration comes from
+     * (MOQ_MEDIA_INIT_SOURCE_*). INLINE: from the catalog (init_data,
+     * codec_config above). TRACK_PROPERTY / OBJECT_PROPERTY: in band, as the
+     * catalog's initDataList entry names it (MSF-02 5.1.7, 12.2), observable
+     * on each Object's metadata (video_config / audio_config) from the first
+     * Object on, not at TRACK_ADDED; only the draft-22 companions deliver
+     * such tracks (see the top of this header). NONE: the catalog names none.
+     * init_property_type: the property type for the two in-band kinds (0x0D
+     * VIDEO_CONFIG, 0x0F AUDIO_CONFIG), zero otherwise.
+     *
+     * config_generation: this description's generation. 0 for the
+     * description the track was discovered with; n for the one the n-th
+     * MSF-02 advisory change of the track published (MOQ_MEDIA_TRACK_UPDATED
+     * carries the same number). A description never changes once published,
+     * apart from the live-to-VOD triple; a later generation is a new
+     * description. */
+    uint64_t                 init_property_type;
+    uint32_t                 init_source;
+    uint32_t                 config_generation;
 } moq_media_track_desc_t;
+
+/* moq_media_track_desc_t.init_source. Fixed-width for ABI stability; values
+ * are never renumbered. Unknown values must be ignored. */
+#define MOQ_MEDIA_INIT_SOURCE_NONE            UINT32_C(0)
+#define MOQ_MEDIA_INIT_SOURCE_INLINE          UINT32_C(1)
+#define MOQ_MEDIA_INIT_SOURCE_TRACK_PROPERTY  UINT32_C(2)
+#define MOQ_MEDIA_INIT_SOURCE_OBJECT_PROPERTY UINT32_C(3)
 
 /* -- Track discovery events (§6.2) ------------------------------------ */
 
 typedef enum moq_media_track_event_kind {
     MOQ_MEDIA_TRACK_ADDED = 1,   /* new tuple discovered (any catalog generation) */
-    MOQ_MEDIA_TRACK_UPDATED,     /* a surviving tuple converted live->VOD (§11.3):
-                                    is_live flipped true->false and/or
-                                    track_duration appeared on the SAME handle.
-                                    This is the ONLY sanctioned mutation of a
-                                    declared tuple (§5.2.7); all other metadata
-                                    changes remain immutable-tuple violations
-                                    (§5.3) and are dropped. The handle's desc is
-                                    updated in place before this fires. */
-    MOQ_MEDIA_TRACK_REMOVED,     /* tuple dropped by a later catalog generation */
+    MOQ_MEDIA_TRACK_UPDATED,     /* the description of the SAME handle
+                                    changed. Either a live->VOD conversion
+                                    (MSF-01 11.3, MSF-02 11.4): is_live
+                                    flipped true->false and/or track_duration
+                                    appeared, written in place on the
+                                    current description before this fires
+                                    (the one in-place change; read it with
+                                    moq_media_receiver_track_desc_copy); or an
+                                    MSF-02 advisory change (see the top of
+                                    this header): a new description
+                                    generation, desc, with config_generation
+                                    its number; earlier generations stay
+                                    valid and unchanged. Under MSF-01 every
+                                    other change is an immutable-tuple
+                                    violation (5.3) and is dropped. */
+    MOQ_MEDIA_TRACK_REMOVED,     /* tuple dropped by a later catalog
+                                    generation, or replaced by a new handle
+                                    (replaced_by, an MSF-02 critical change) */
     MOQ_MEDIA_TRACK_ENDED,       /* peer end-of-track / rejection */
     MOQ_MEDIA_CATALOG_READY,     /* first (independent) catalog enumerated; fires
                                     exactly once per connection (later generations
@@ -456,12 +567,19 @@ typedef enum moq_media_track_event_kind {
                                     parse_drops_delta (below); `track` is always
                                     non-NULL (every parse drop is track-scoped)
                                     and `desc` is the handle's description. */
-    MOQ_MEDIA_TRACK_LOCAL_FAILURE = 8, /* initial ACK metadata could not be
-                                    retained locally. Exactly once per failed
-                                    track generation, even without media objects.
-                                    Read local_result only when wholly covered by
-                                    struct_size. This is not a peer rejection or
-                                    END_OF_TRACK; unrelated tracks continue. */
+    MOQ_MEDIA_TRACK_LOCAL_FAILURE = 8, /* the track's subscription cannot be
+                                    served locally: its initial ACK metadata
+                                    could not be retained (MOQ_ERR_NOMEM or
+                                    MOQ_ERR_BUFFER), or a timeline's Track
+                                    Properties name a compression this build
+                                    does not decompress (MOQ_ERR_UNSUPPORTED,
+                                    MSF-02 12.1.1; the subscription ends).
+                                    Exactly once per failed track generation,
+                                    even without media objects. Read
+                                    local_result only when wholly covered by
+                                    struct_size. This is not a peer rejection
+                                    or END_OF_TRACK; unrelated tracks
+                                    continue. */
     MOQ_MEDIA_TRACK_FILL_TERMINAL = 9, /* one child ended; parent track state
                                     is unchanged. Read the stamped plain fill
                                     tail below. Catalog children are private.
@@ -527,9 +645,13 @@ typedef struct moq_media_track_event {
                                             three refuse it with
                                             MOQ_ERR_WRONG_STATE. */
     const moq_media_track_desc_t *desc;  /* handle-owned (see lifetime note
-                                            above); NULL for CATALOG_READY */
-    uint32_t config_generation;          /* reserved for dynamic config;
-                                            always 0 today */
+                                            above); NULL for CATALOG_READY. The
+                                            description generation the event
+                                            announces: a later generation never
+                                            changes what an earlier event says */
+    uint32_t config_generation;          /* desc's generation: 0 for the one
+                                            the track was discovered with, n for
+                                            the n-th MSF-02 advisory change */
     /* Permanently reserved, never read. On LP64 the v0 struct ended in
      * four bytes of trailing padding after config_generation, which this
      * spacer occupies, so the appended fields below start at the old
@@ -654,6 +776,17 @@ typedef struct moq_media_track_event {
     bool     has_done_status;
     uint8_t  _reserved_done[7];           /* zero; never read */
     uint64_t done_status;
+    /* Appended after done_status; one block, written and readable only when
+     * struct_size covers replaced_by. The replacement of a declared track by
+     * an MSF-02 catalog that changed it in a decode- or delivery-critical way
+     * (see MOQ_MEDIA_TRACK_UPDATED): on that TRACK_REMOVED, replaced_by is
+     * the new handle and replaces is NULL; on the TRACK_ADDED that
+     * immediately follows it, replaces is the old handle and replaced_by is
+     * NULL. NULL on every other event. The REMOVED alone names the successor,
+     * so a consumer can act on it without waiting for the ADDED. Both handles
+     * stay valid until the receiver is destroyed. */
+    moq_media_track_t *replaces;
+    moq_media_track_t *replaced_by;
 } moq_media_track_event_t;
 
 /* Causes in fill_unreported_loss_causes. */
@@ -661,14 +794,18 @@ typedef struct moq_media_track_event {
 #define MOQ_MEDIA_FILL_LOSS_UNKNOWN    0x2u /* an End of Unknown Range */
 #define MOQ_MEDIA_FILL_LOSS_TIMED_OUT  0x4u /* an End of Timed-Out Range */
 
-/* The description for a track handle (handle-owned; same lifetime as the
- * TRACK_ADDED event's desc). NULL for a NULL track.
+/* The CURRENT description generation of a track handle (handle-owned; it
+ * and every earlier generation stay valid until the receiver is
+ * destroyed). NULL for a NULL track.
  *
- * Borrowed access is lock-free. Immutable fields (spans, arrays, structured
- * info, catalog passthroughs) may be read through this pointer for the
- * handle's lifetime. The mutable fields -- is_live, has_track_duration,
- * track_duration_ms -- are rewritten in place by the service thread on a
- * live-to-VOD conversion (MSF §11.3) and MUST NOT be read through this
+ * Borrowed access is lock-free: the network thread publishes each new
+ * generation complete before this can return it. A generation's immutable
+ * fields (spans, arrays, structured info, catalog passthroughs) may be read
+ * through the pointer for the receiver's lifetime; a later MSF-02 advisory
+ * change publishes a NEW generation and never rewrites one. The mutable
+ * fields -- is_live, has_track_duration, track_duration_ms -- are rewritten
+ * in place on the current generation by the service thread on a live-to-VOD
+ * conversion (MSF-01 11.3, MSF-02 11.4) and MUST NOT be read through this
  * pointer concurrently with service: that is a data race. Read them with
  * moq_media_receiver_track_desc_copy() instead. */
 MOQ_API const moq_media_track_desc_t *moq_media_track_desc_get(
@@ -680,10 +817,12 @@ MOQ_API const moq_media_track_desc_t *moq_media_track_desc_get(
 #define MOQ_MEDIA_TRACK_DESC_V0_SIZE \
     (offsetof(moq_media_track_desc_t, is_live) + sizeof(bool))
 
-/* Copy a track's CURRENT description into `out` under the receiver mutex --
- * the same mutex the live-to-VOD writer holds -- so the mutable triple is
- * read coherently. This is a snapshot of the present state, not the image
- * the TRACK_ADDED/UPDATED event carried.
+/* Copy a track's CURRENT description generation into `out` under the
+ * receiver mutex -- the same mutex the live-to-VOD writer and the
+ * generation publisher hold -- so the mutable triple is read coherently.
+ * This is a snapshot of the present state, not the image the
+ * TRACK_ADDED/UPDATED event carried; its config_generation says which
+ * generation it is.
  *
  * `track` must be a handle of `r`: membership is checked against the
  * receiver's own handle table without dereferencing an unowned pointer.
@@ -821,6 +960,15 @@ MOQ_API void moq_media_receiver_track_subscribe_cfg_init_sized(
 /* Schedule a subscription for `track` (a handle from a polled TRACK_ADDED).
  * cfg NULL == defaults (CURRENT start, no priority).
  *
+ * Replaced handles: subscribe_track, unsubscribe_track and fill_track on a
+ * handle an MSF-02 replacement removed (TRACK_REMOVED with replaced_by) act
+ * on the newest handle of its replacement chain and return that call's
+ * result, so the latest intent reaches the live handle even when it was
+ * issued before the application saw the replacement events. A selection
+ * made before the replacement moved with it; a fill command recorded before
+ * it belonged to the old subscription and was dropped. Other removed handles
+ * keep refusing (MOQ_ERR_WRONG_STATE).
+ *
  * The call is atomic: it records desired state and schedules reconciliation
  * with a non-allocating wake, so MOQ_OK means the change is committed (it never
  * partially succeeds).
@@ -837,8 +985,9 @@ MOQ_API void moq_media_receiver_track_subscribe_cfg_init_sized(
  *                     rejected/finished/failed track cannot be (re)subscribed
  *   MOQ_ERR_UNSUPPORTED  the receiver has no delivery path for this track
  *                     (info not derived, packaging not parseable in this
- *                     build, a timeline of a kind it does not decode, or a
- *                     namespace override), or a location/fill is not
+ *                     build, a timeline of a kind it does not decode, an
+ *                     MSF-01 namespace override, or a receiver policy: see
+ *                     the top of this header), or a location/fill is not
  *                     representable by the negotiated draft and selected
  *                     companion; nothing is recorded
  *   MOQ_ERR_CLOSED    the receiver is terminal
@@ -1095,9 +1244,21 @@ typedef struct moq_media_object {
 
     /* Loss report, appended after has_subgroup; available when the stamped
      * struct_size reaches the end of discontinuous. has_loss_report is true
-     * when the receiver tracks Location continuity for this track's
-     * packaging (MPEG2TS today) and the fields below are meaningful; false
-     * means not tracked, and says nothing about loss.
+     * when the receiver tracks Location continuity for the Object's track
+     * (MPEG2TS, and a "loc" track whose MSF-02 streamMapping is "object" or
+     * a value not recognized, on its live subscription) and the fields below
+     * are meaningful; false means not tracked, and says nothing about loss.
+     * For such a LOC track the receiver restores (Group, Object) order, which
+     * separate subgroup streams do not keep, through a bounded stage: up to
+     * four open Groups and 64 held Objects, each stall waiting at most
+     * 300 ms. A position given up by that window or by its capacity is
+     * reported as a gap (a policy, not proof the network lost it), and a
+     * Group the window retires without a known end reports the next Group's
+     * first Object with gap_tail_unknown. A publisher that signals no Group
+     * end (no END_OF_GROUP subgroup, no END_OF_GROUP status Object) delays
+     * each Group boundary by up to the window; an END_OF_GROUP status Object
+     * when the next Group starts removes the wait. A fill is one ordered
+     * stream and bypasses the stage.
      *
      *   gap                  a run of missing, rejected or locally dropped
      *                        Objects precedes this one; gap_group /
@@ -1445,6 +1606,43 @@ typedef struct moq_media_receiver_stats {
     /* Appended: media tracks whose subscription ended because the Track was
      * malformed (draft-22 §12.1); each also ends (TRACK_ENDED). */
     uint64_t tracks_malformed;
+    /* Appended after tracks_malformed; one block, read only when struct_size
+     * covers loc_order_forced.
+     *
+     * catalog_revision: the MOQ_MSF_REVISION_* of the effective catalog,
+     * valid once CATALOG_READY was queued.
+     *
+     * MSF_COMPRESSION (MSF-02 12.1), per catalog or media-timeline Object:
+     * objects_decompressed and decompress_failures (malformed compressed
+     * data) and decompress_limited (over the decompressed-size cap) count
+     * decompression; compression_refused counts Objects and subscriptions
+     * refused for an algorithm this build does not decompress (GZIP
+     * included: decompression is not implemented yet, so no Object is
+     * decompressed and the first three stay zero), a repeated or malformed
+     * property, or a compressed MSF-01 catalog; compression_conflicts counts
+     * Objects carrying the Object property where the Track property is set;
+     * compression_ignored counts timeline Objects whose property was not
+     * interpreted because the effective catalog is MSF-01.
+     *
+     * event_timeline_headers_ignored: SAP-timeline Objects whose origin
+     * carried MSF_EVENT_TIMELINE_HEADER, which CMSF-01 defines no meaning for;
+     * the records are parsed as without it.
+     *
+     * loc_order_gaps: Objects the in-group ordering stage of an "object"-
+     * mapped LOC track gave up on (the window expired or its capacity forced
+     * it; a policy, not proof the network lost them); loc_order_forced: the
+     * advances its capacity policy forced. */
+    uint32_t catalog_revision;
+    uint32_t _reserved_catalog_revision;   /* zero; never read */
+    uint64_t objects_decompressed;
+    uint64_t decompress_failures;
+    uint64_t decompress_limited;
+    uint64_t compression_refused;
+    uint64_t compression_conflicts;
+    uint64_t compression_ignored;
+    uint64_t event_timeline_headers_ignored;
+    uint64_t loc_order_gaps;
+    uint64_t loc_order_forced;
 } moq_media_receiver_stats_t;
 
 /* Snapshot stats into *out. Pass `out_size = sizeof(*out)`; same size contract as

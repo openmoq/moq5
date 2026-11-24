@@ -11,6 +11,10 @@ void track_fill_msf(const moq_media_track_t *t, moq_msf_track_t *m);
 
 bool track_in_catalog(const moq_media_track_t *t, bool only_registered);
 
+moq_result_t sender_catalog_probe_r02(moq_media_sender_t *s,
+                                      moq_media_track_t *const *tracks,
+                                      size_t n);
+
 bool sender_tracks_snapshot(moq_media_sender_t *s,
                             moq_media_track_t ***out_snap,
                             size_t *out_count);

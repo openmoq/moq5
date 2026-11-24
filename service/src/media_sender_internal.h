@@ -167,6 +167,12 @@ _Static_assert(offsetof(moq_media_sender_cfg_t, resource_auth) >=
      ~((size_t)_Alignof(moq_media_sender_cfg_t) - 1u)),
     "resource_auth must follow the complete companion sender allocation");
 
+_Static_assert(offsetof(moq_media_sender_cfg_t, catalog_revision) >=
+    ((offsetof(moq_media_sender_cfg_t, initial_group_id) + sizeof(uint64_t) +
+      _Alignof(moq_media_sender_cfg_t) - 1u) &
+     ~((size_t)_Alignof(moq_media_sender_cfg_t) - 1u)),
+    "catalog_revision must follow the complete initial Group ID allocation");
+
 
 #define SENDER_DEFAULT_SAP_HISTORY_GROUPS 8u
 
@@ -378,6 +384,11 @@ struct moq_media_track {
     moq_media_track_t    *sap_timeline;      /* media track -> its timeline (NULL otherwise) */
     moq_bytes_t          *depends;           /* timeline: [media track name]; freed by track_free */
     size_t                depends_count;
+    /* A generated timeline of an MSF-02 sender: the media track its "depends"
+     * names. MSF-02 5.2.15 makes a catalog whose dependency does not resolve
+     * invalid, so the timeline is in a catalog only together with this track
+     * (track_in_catalog). NULL otherwise. */
+    const moq_media_track_t *catalog_needs;
 
     /* Timeline history + emission (network thread, mu held). Records are
      * appended at media emit time (so they match the real wire Location and a
@@ -483,6 +494,9 @@ struct moq_media_sender {
      * with the matching companion (sender_resolve_companion_locked). */
     moq_media_companion_profile_t companion_profile;
     bool             companion_auto;
+    /* The MSF revision of every catalog and delta this sender writes
+     * (cfg->catalog_revision). Fixed at creation, so read without mu. */
+    moq_msf_revision_t catalog_revision;
 
     /* Namespace + catalog track name, deep-copied (same idiom as the
      * receiver): [ns part bytes...][catalog name bytes]. */

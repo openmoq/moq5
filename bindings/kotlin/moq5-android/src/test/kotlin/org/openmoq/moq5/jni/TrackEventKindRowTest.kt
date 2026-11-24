@@ -26,6 +26,14 @@ internal class TrackEventKindRowTest {
         ok("receiverkindstamps", "a stamp inside local_result publishes no HAS bit; the fill fields drop out one by one as the stamp shortens; the loss block is all or nothing; a FILL origin without its child ID, then no origin")
 
     @Test
+    fun `the replacement links are one block, published only when the stamp covers replaced_by, and decoded on the kinds that carry them`() =
+        ok("receiverreplacementstamps", "a whole stamp publishes HAS_REPLACEMENT with the successor's token; a stamp inside replaced_by, or ending before it, publishes neither slot; REMOVED decodes replacedBy, ADDED decodes replaces, a NULL link is null; the real CATALOG_READY follows")
+
+    @Test
+    fun `through the public API a replacement is Removed(replaced) then Added(replaces), the tracks are linked, and a command on the old track reaches the new one natively`() =
+        ok("publicreplacement", "public API over the real JNI backend: Added(a), Added(other), CatalogReady, Removed(a, replaced), Added(b, replaces = a); a.replacedBy === b; subscribe(a) -> b Pending natively; trackState(a) -> Removed; unsubscribe(a) -> b Discovered")
+
+    @Test
     fun `the FAILED track state crosses as 6 and reads as Failed`() =
         ok("receiverfailedstate", "one scripted FAILED read, then the real DISCOVERED")
 

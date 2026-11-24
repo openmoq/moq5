@@ -104,7 +104,35 @@ func copyTrackDescription(_ desc: moq_media_track_desc_t) -> TrackDescription? {
         ? .milliseconds(desc.track_duration_ms) : nil
     copy.initData = optionalData(desc.init_data)
     copy.codecConfig = optionalData(desc.codec_config)
+    /* Appended blocks, each read only when the stamp covers it. */
+    if receivedFieldIsPresent(desc.struct_size, \moq_media_track_desc_t.config_generation) {
+        copy.configGeneration = desc.config_generation
+        copy.initSource = copyInitSource(desc.init_source)
+        copy.initPropertyType = desc.init_property_type
+    }
+    if receivedFieldIsPresent(desc.struct_size, \moq_media_track_desc_t.extension_count),
+       let supplement = moq_msf_ext_supplement(desc.extensions, desc.extension_count),
+       receivedFieldIsPresent(supplement.pointee.struct_size,
+                              \moq_msf_track_supplement_t.malformed) {
+        let s = supplement.pointee
+        copy.encryptionScheme = s.has_encryption_scheme ? swiftString(s.encryption_scheme) : nil
+        copy.cipherSuite = s.has_cipher_suite ? swiftString(s.cipher_suite) : nil
+        copy.keyID = s.has_key_id ? swiftString(s.key_id) : nil
+        copy.trackBaseKey = s.has_track_base_key
+            ? TrackBaseKey(swiftString(s.track_base_key)) : nil
+    }
     return copy
+}
+
+@available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+private func copyInitSource(_ raw: UInt32) -> InitSource {
+    switch raw {
+    case moq_swift_media_init_source_none(): .none
+    case moq_swift_media_init_source_inline(): .inline
+    case moq_swift_media_init_source_track_property(): .trackProperty
+    case moq_swift_media_init_source_object_property(): .objectProperty
+    default: .unknown(raw)
+    }
 }
 
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
@@ -374,6 +402,11 @@ final class ServiceReceiverBackend: ReceiverBackend, @unchecked Sendable {
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 func copyReceiverTrackEvent(_ event: moq_media_track_event_t) -> ReceiverPolledEvent? {
     let handleID = UInt64(UInt(bitPattern: event.track))
+    /* The replacement links are one block, read only when the stamp covers
+     * it; the generation is in the event's frozen prefix. */
+    let linked = receivedFieldIsPresent(event.struct_size, \moq_media_track_event_t.replaced_by)
+    let replaces = linked ? event.replaces.map { UInt64(UInt(bitPattern: $0)) } : nil
+    let replacedBy = linked ? event.replaced_by.map { UInt64(UInt(bitPattern: $0)) } : nil
     switch event.kind {
     case MOQ_MEDIA_CATALOG_READY:
         return ReceiverPolledEvent(kind: .catalogReady, handleID: 0, trackDescription: nil)
@@ -382,12 +415,16 @@ func copyReceiverTrackEvent(_ event: moq_media_track_event_t) -> ReceiverPolledE
         guard let description = event.desc.flatMap({ copyTrackDescription($0.pointee) }) else {
             return nil
         }
-        return ReceiverPolledEvent(kind: .added, handleID: handleID, trackDescription: description)
+        return ReceiverPolledEvent(kind: .added, handleID: handleID, trackDescription: description,
+                                   configGeneration: event.config_generation,
+                                   replacesHandleID: replaces)
     case MOQ_MEDIA_TRACK_UPDATED:
         return ReceiverPolledEvent(kind: .updated, handleID: handleID,
-                                   trackDescription: event.desc.flatMap { copyTrackDescription($0.pointee) })
+                                   trackDescription: event.desc.flatMap { copyTrackDescription($0.pointee) },
+                                   configGeneration: event.config_generation)
     case MOQ_MEDIA_TRACK_REMOVED:
-        return ReceiverPolledEvent(kind: .removed, handleID: handleID, trackDescription: nil)
+        return ReceiverPolledEvent(kind: .removed, handleID: handleID, trackDescription: nil,
+                                   replacedByHandleID: replacedBy)
     case MOQ_MEDIA_TRACK_ENDED:
         return ReceiverPolledEvent(kind: .ended, handleID: handleID, trackDescription: nil)
     case MOQ_MEDIA_TRACK_PARSE_DROP:

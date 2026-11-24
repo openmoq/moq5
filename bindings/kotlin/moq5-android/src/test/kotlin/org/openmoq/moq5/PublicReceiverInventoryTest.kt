@@ -58,6 +58,12 @@ import kotlin.time.Duration.Companion.seconds
  *    enter the stream nor consume its capacity.
  *  * A bridge answer on the poll quarantines; a C terminal (CLOSED, fatal or
  *    clean) is a durable value on the inventory and the end of the stream.
+ *  * An MSF-02 replacement is two public events: `Removed(old, replaced =
+ *    true)`, then `Added(new, replaces = old)`; the tracks are linked both
+ *    ways (`replacedBy` / `replaces`) once the successor is announced, and the
+ *    REMOVED alone is published without waiting for it, across drains. An
+ *    advisory change is `Updated(track, configGeneration)`, while the
+ *    track's own snapshot carries the generation it was taken at.
  */
 internal class PublicReceiverInventoryTest : EngineFixture() {
     private companion object {
@@ -74,6 +80,8 @@ internal class PublicReceiverInventoryTest : EngineFixture() {
         fun removed(t: Long) = BackendTrackEvent(BackendTrackEventKind.Removed, t, null)
         fun ended(t: Long) = BackendTrackEvent(BackendTrackEventKind.Ended, t, null)
         val ready = BackendTrackEvent(BackendTrackEventKind.CatalogReady, 0L, null)
+        val T3 = -0x7fff_ffff_ffff_fcfdL
+        val VIDEO_AVC = VIDEO.copy(codec = MediaBytes("avc1.64001f".toByteArray()), configGeneration = 0u)
     }
 
     private fun runTest(body: suspend CoroutineScope.() -> Unit) = runBlocking { body() }
@@ -352,5 +360,71 @@ internal class PublicReceiverInventoryTest : EngineFixture() {
             endpoint.closeAndJoin()
             backend2.expireWait()
             runCatching { endpoint2.closeAndJoin() }
+        }
+
+    @Test
+    fun `a replacement is Removed(replaced) then Added(replaces), linking both tracks, and an advisory update carries its generation`() =
+        runTest {
+            val backend = newBackend()
+            val endpoint = MoqEndpoint.open(EndpointConfig(URL)) { backend }
+            val receiver = endpoint.attachReceiver(CONFIG.copy(eventHistory = EventHistoryPolicy.Exact(capacity = 16)))
+            val stream = receiver.trackEvents!!
+            backend.scriptTrackEvents(added(T1, VIDEO), added(T2, AUDIO), ready)
+            backend.markActivity()
+            val first = withTimeout(BOUND) { receiver.inventory.first { it.catalogReady } }
+            val video = first.tracks[0]
+            val audio = first.tracks[1]
+            backend.scriptTrackEvents(
+                BackendTrackEvent(BackendTrackEventKind.Removed, T1, null, replacedBy = T3),
+                BackendTrackEvent(BackendTrackEventKind.Added, T3, VIDEO_AVC, replaces = T1),
+                BackendTrackEvent(BackendTrackEventKind.Updated, T2, AUDIO.copy(bitrate = 64_000uL, configGeneration = 2u), configGeneration = 1u),
+            )
+            backend.markActivity()
+            val inv = withTimeout(BOUND) { receiver.inventory.first { it.tracks.size == 3 && it.tracks[1].description.bitrate != null } }
+            val avc = inv.tracks[2]
+            assertEquals(listOf(video, audio, avc), inv.tracks, "the replaced track is retained; its successor is a new identity, appended")
+            assertEquals(TrackPresence.Removed, video.presence)
+            assertEquals(TrackPresence.Present, avc.presence)
+            assertTrue(video.replacedBy === avc && avc.replaces === video, "linked both ways")
+            assertEquals(null, video.replaces)
+            assertEquals(null, avc.replacedBy)
+            assertEquals(VIDEO_AVC, avc.description)
+            assertEquals(VIDEO, video.description, "the old track's description is untouched")
+            assertEquals(0, inv.anomalies)
+            val events = withTimeout(BOUND) { List(6) { stream.next()!! } }
+            assertEquals(
+                listOf(
+                    TrackEvent.Added(video), TrackEvent.Added(audio), TrackEvent.CatalogReady,
+                    TrackEvent.Removed(video, replaced = true), TrackEvent.Added(avc, replaces = video), TrackEvent.Updated(audio, configGeneration = 1u),
+                ),
+                events,
+            )
+            assertEquals(2u, audio.description.configGeneration, "the snapshot is the generation current at the drain, which may be newer than the event's")
+            endpoint.closeAndJoin()
+        }
+
+    @Test
+    fun `a replacement split across two drains publishes the REMOVED at once and links the tracks when the successor's ADDED arrives`() =
+        runTest {
+            val backend = newBackend()
+            val endpoint = MoqEndpoint.open(EndpointConfig(URL)) { backend }
+            val receiver = endpoint.attachReceiver(CONFIG.copy(eventHistory = EventHistoryPolicy.Exact(capacity = 16)))
+            val stream = receiver.trackEvents!!
+            backend.scriptTrackEvents(added(T1, VIDEO), ready)
+            backend.markActivity()
+            val video = withTimeout(BOUND) { receiver.inventory.first { it.catalogReady } }.tracks[0]
+            backend.scriptTrackEvents(BackendTrackEvent(BackendTrackEventKind.Removed, T1, null, replacedBy = T3))
+            backend.markActivity()
+            val between = withTimeout(BOUND) { receiver.inventory.first { it.tracks[0].presence == TrackPresence.Removed } }
+            assertEquals(1, between.tracks.size, "no successor until its ADDED")
+            assertEquals(null, video.replacedBy)
+            assertEquals(listOf(TrackEvent.Added(video), TrackEvent.CatalogReady, TrackEvent.Removed(video, replaced = true)), withTimeout(BOUND) { List(3) { stream.next()!! } })
+            backend.scriptTrackEvents(BackendTrackEvent(BackendTrackEventKind.Added, T3, VIDEO_AVC, replaces = T1))
+            backend.markActivity()
+            val avc = withTimeout(BOUND) { receiver.inventory.first { it.tracks.size == 2 } }.tracks[1]
+            assertTrue(video.replacedBy === avc && avc.replaces === video)
+            assertEquals(TrackEvent.Added(avc, replaces = video), withTimeout(BOUND) { stream.next() })
+            assertEquals(0, receiver.inventory.value.anomalies)
+            endpoint.closeAndJoin()
         }
 }

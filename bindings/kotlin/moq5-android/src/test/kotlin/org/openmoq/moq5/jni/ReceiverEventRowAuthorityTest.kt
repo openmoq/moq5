@@ -20,6 +20,7 @@ internal class ReceiverEventRowAuthorityTest {
         const val DESCRIBE_DESCRIPTOR = "(JJJ[J)[[B"
         const val EPOCH_WITH_ROWS = 10
         const val EPOCH_WITH_APPENDED_FIELDS = 18
+        const val EPOCH_WITH_REPLACEMENT = 19
         val abiHeader = File("../jni/moq5_abi.h")
         val keepRules = File("consumer-rules.pro")
     }
@@ -54,10 +55,39 @@ internal class ReceiverEventRowAuthorityTest {
 
     @Test
     fun `the track-event carrier's appended-field scalars moved the epoch past the last 12-scalar epoch`() {
-        assertEquals(23, ReceiverEventScalars.COUNT)
+        assertTrue(ReceiverEventScalars.COUNT >= 23, "the appended-field slots are still carried")
         val declared = Regex("""^#define MOQ5_ABI_EPOCH (\d+)$""", RegexOption.MULTILINE).find(abiHeader.readText())?.groupValues?.get(1)?.toInt()
         assertTrue(declared != null && declared >= EPOCH_WITH_APPENDED_FIELDS, "the authority's epoch is $declared, needs $EPOCH_WITH_APPENDED_FIELDS or later")
         assertEquals(declared, NativeBridge.ABI_EPOCH, "the Kotlin side's epoch")
+    }
+
+    @Test
+    fun `the replacement and generation slots moved the epoch past the 23-scalar track event and the 35-scalar describe`() {
+        assertEquals(26, ReceiverEventScalars.COUNT)
+        assertEquals(39, TrackDescribeScalars.COUNT)
+        assertEquals(17, TrackDescribeBytes.FIXED)
+        assertEquals(27, ReceiverStatsScalars.COUNT)
+        val declared = Regex("""^#define MOQ5_ABI_EPOCH (\d+)$""", RegexOption.MULTILINE).find(abiHeader.readText())?.groupValues?.get(1)?.toInt()
+        assertTrue(declared != null && declared >= EPOCH_WITH_REPLACEMENT, "the authority's epoch is $declared, needs $EPOCH_WITH_REPLACEMENT or later")
+        assertEquals(declared, NativeBridge.ABI_EPOCH, "the Kotlin side's epoch")
+    }
+
+    @Test
+    fun `the native carriers declare the counts the Kotlin carriers name`() {
+        val jni = File("../jni/moq5_jni.c").readText()
+        fun define(name: String): Int? = Regex("""^#define $name (\d+)$""", RegexOption.MULTILINE).find(jni)?.groupValues?.get(1)?.toInt()
+        assertEquals(ReceiverEventScalars.COUNT, define("MOQ5_RX_EV_SCALARS"))
+        assertEquals(TrackDescribeScalars.COUNT, define("MOQ5_TD_SCALARS"))
+        assertEquals(TrackDescribeBytes.FIXED, define("MOQ5_TD_FIXED_BYTES"))
+        assertEquals(ReceiverStatsScalars.COUNT, define("MOQ5_RX_STATS_SCALARS"))
+        assertEquals(ReceiverEventScalars.HAS_REPLACEMENT, Regex("""^#define MOQ5_EV_HAS_REPLACEMENT +0x([0-9a-fA-F]+)$""", RegexOption.MULTILINE).find(jni)?.groupValues?.get(1)?.toLong(16))
+    }
+
+    @Test
+    fun `the preflight names the extension lookup the describe row reads the encryption fields through`() {
+        val text = File("../tools/check-jni-endpoint-preflight.sh").readText()
+        assertTrue(Regex("""RX_SET='[^']*\bmoq_msf_ext_find\b[^']*'""").containsMatchIn(text), "RX_SET must name moq_msf_ext_find so both Android images prove it by identity")
+        assertTrue(Regex("""(?m)^RX_N=19$""").containsMatchIn(text), "and count it")
     }
 
     @Test

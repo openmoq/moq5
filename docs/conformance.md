@@ -284,6 +284,38 @@ unusable selected history latches receiver-local CATALOG_UNUSABLE: a later
 live generation cannot rescue that bootstrap, and the shared endpoint is not
 made fatal. Live non-Normal status markers are not catalog JSON.
 
+### Catalog revisions
+
+The companion names the transport and LOC pairing, not the catalog revision.
+The receiver reads MSF-01 and MSF-02 (draft-ietf-moq-msf-02) catalogs on every
+companion: the revision is the independent catalog's `version`, and a delta
+follows the catalog it applies to (`stats.catalog_revision`). An MSF-01
+catalog keeps its immutable tuples. An MSF-02 catalog may change a declared
+track in place (5.1.6, 5.3): an advisory change publishes a new description
+generation for the same handle (`MOQ_MEDIA_TRACK_UPDATED`, with
+`config_generation`); a change that decides how Objects are parsed or delivered
+replaces the handle (`TRACK_REMOVED` with `replaced_by`, then `TRACK_ADDED`
+with `replaces`), the predecessor's selection moving to the successor, which
+subscribes only once the predecessor's subscription is released; a change
+MSF-02 forbids drops the catalog. A catalog is adopted whole or not at all.
+The catalog subscription and its fill use subscriber priority 0 (MSF 5).
+
+On a "loc" track whose `streamMapping` is `object` (or a value not
+recognized), the receiver restores (Group, Object) order on the live
+subscription in a bounded stage (four open Groups, 64 held Objects, a 300 ms
+window), with the Group ends it takes from the END_OF_GROUP subgroup's FIN
+and from END_OF_GROUP status Objects, and the Objects a RESET cut; such tracks
+report loss on each Object (`has_loss_report`). A publisher that signals no
+Group end delays each Group boundary by up to the window; an END_OF_GROUP
+status Object when the next Group starts removes the wait.
+
+MSF_COMPRESSION (12.1) is checked on catalog and timeline Objects per origin
+(the subscription's, or a Joining FETCH's own Track Properties) and on each
+Object. This build does not decompress: a compressed Object, GZIP included,
+is refused as an unsupported algorithm and never processed as if
+uncompressed. The sender publishes MSF-01 by default and MSF-02 with
+`moq_media_sender_cfg_t.catalog_revision`.
+
 `moq_loc_parse_metadata()` / `moq_loc_encode_metadata()` use the separate
 sized `moq_loc_metadata_t`; the legacy LOC record stays frozen. Raw ticks,
 timescale, marking bytes (1..4), audio level and config presence are retained.

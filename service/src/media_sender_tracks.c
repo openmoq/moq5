@@ -232,6 +232,32 @@ static bool sender_name_taken(const moq_media_sender_t *s, moq_bytes_t name)
 }
 
 
+/* MSF-02 5.2.45: the tracks of one altGroup carry one accessibleWindowTime.
+ * Judged against every track that is or will be in the catalog (removed
+ * and refused tracks never return to it), so no later removal can break it.
+ * CALLER MUST HOLD s->mu; t is not yet registered. */
+static bool sender_alt_window_ok(const moq_media_sender_t *s,
+                                 const moq_media_track_t *t)
+{
+    if (!t->has_alt_group) return true;
+    const moq_msf_track_supplement_t *a = moq_msf_ext_supplement(t->ext,
+                                                                 t->ext_count);
+    bool ah = a && a->has_accessible_window_ms;
+    for (size_t i = 0; i < s->track_count; i++) {
+        const moq_media_track_t *u = s->tracks[i];
+        if (u->removed || u->auth_failed || !u->has_alt_group ||
+            u->alt_group != t->alt_group)
+            continue;
+        const moq_msf_track_supplement_t *b =
+            moq_msf_ext_supplement(u->ext, u->ext_count);
+        bool bh = b && b->has_accessible_window_ms;
+        if (ah != bh || (ah && a->accessible_window_ms != b->accessible_window_ms))
+            return false;
+    }
+    return true;
+}
+
+
 /* True if a REMOVED track named `name` still holds a publisher track (its
  * teardown -- end + remove -- has not finished). A replacement same-name track
  * must defer its own registration until the old publisher track is gone, or
@@ -547,8 +573,11 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     if (is_ts) return MOQ_ERR_UNSUPPORTED;   /* not in this build */
 #endif
     const moq_msf_mpeg2ts_t *ts_rec = NULL;
+    const moq_msf_track_supplement_t *supp_rec = NULL;
     {
-        moq_result_t erc = sender_check_extensions(cfg, &ts_rec);
+        /* The revision is fixed at creation: read without the lock. */
+        moq_result_t erc = sender_check_extensions(cfg, s->catalog_revision,
+                                                   &ts_rec, &supp_rec);
         if (erc < 0) return erc;
     }
     /* Every optional span must be coherent: a non-zero length with a NULL
@@ -830,7 +859,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
 
     /* The packaging-extension records, and an MPEG2TS track's own rules. */
     {
-        moq_result_t xrc = sender_copy_extensions(s, t, ts_rec);
+        moq_result_t xrc = sender_copy_extensions(s, t, ts_rec, supp_rec);
         if (xrc == MOQ_OK && is_ts) xrc = sender_ts_prepare(s, t, cfg);
         if (xrc < 0) { track_free(s, t); return xrc; }
     }
@@ -857,6 +886,25 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
             return MOQ_ERR_NOMEM;
         }
         t->media_timeline = mtl;
+    }
+
+    /* An MSF-02 sender refuses, before registering anything, a track that
+     * its catalog could not carry, and ties each generated timeline to its
+     * media track (track_in_catalog). */
+    if (s->catalog_revision == MOQ_MSF_REVISION_02) {
+        moq_media_track_t *probe[3] = { t, NULL, NULL };
+        size_t np = 1;
+        if (tl) probe[np++] = tl;
+        if (mtl) probe[np++] = mtl;
+        moq_result_t prc = sender_catalog_probe_r02(s, probe, np);
+        if (prc != MOQ_OK) {
+            if (mtl) track_free(s, mtl);
+            if (tl) track_free(s, tl);
+            track_free(s, t);
+            return prc;
+        }
+        if (tl) tl->catalog_needs = t;
+        if (mtl) mtl->catalog_needs = t;
     }
 
     pthread_mutex_lock(&s->mu);
@@ -886,10 +934,13 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     /* Catalog coherence: no duplicate track names. This rejects both an app
      * track whose name collides with an existing track (including a previously
      * generated "<x>.sap" / "<x>.timeline") and a generated timeline name that
-     * collides with an existing app track. */
+     * collides with an existing app track. An MSF-02 catalog also carries one
+     * accessibleWindowTime per altGroup. */
     if (sender_name_taken(s, t->name) ||
         (tl && sender_name_taken(s, tl->name)) ||
-        (mtl && sender_name_taken(s, mtl->name))) {
+        (mtl && sender_name_taken(s, mtl->name)) ||
+        (s->catalog_revision == MOQ_MSF_REVISION_02 &&
+         !sender_alt_window_ok(s, t))) {
         pthread_mutex_unlock(&s->mu);
         if (mtl) track_free(s, mtl);
         if (tl) track_free(s, tl);

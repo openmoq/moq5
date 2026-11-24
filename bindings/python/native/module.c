@@ -641,16 +641,36 @@ static PyObject *receiver_stats_py(PyObject *module, PyObject *capsule)
         Py_DECREF(catalog_complete);
         return NULL;
     }
-    PyObject *result = Py_BuildValue("(KKKKKKKKKOOOO)",
+    /* The block after tracks_malformed (catalog revision, compression and
+     * ordering counters) is one block: a tuple only when the stamp covers
+     * loc_order_forced, None otherwise. */
+    PyObject *block = Py_None;
+    if (st.struct_size >= STATS_FIELD_END(loc_order_forced))
+        block = Py_BuildValue("(kKKKKKKKKK)", (unsigned long)st.catalog_revision,
+            (unsigned long long)st.objects_decompressed, (unsigned long long)st.decompress_failures,
+            (unsigned long long)st.decompress_limited, (unsigned long long)st.compression_refused,
+            (unsigned long long)st.compression_conflicts, (unsigned long long)st.compression_ignored,
+            (unsigned long long)st.event_timeline_headers_ignored, (unsigned long long)st.loc_order_gaps,
+            (unsigned long long)st.loc_order_forced);
+    else
+        Py_INCREF(block);
+    if (!block) {
+        Py_DECREF(catalog_drops);
+        Py_DECREF(catalog_complete);
+        Py_DECREF(tracks_malformed);
+        return NULL;
+    }
+    PyObject *result = Py_BuildValue("(KKKKKKKKKOOOOO)",
         (unsigned long long)st.objects_received, (unsigned long long)st.objects_queued,
         (unsigned long long)st.bytes_queued, (unsigned long long)st.objects_dropped,
         (unsigned long long)st.groups_dropped, (unsigned long long)st.keyframes_dropped,
         (unsigned long long)st.parse_drops, (unsigned long long)st.overflow_events,
         (unsigned long long)st.pause_transitions, st.paused ? Py_True : Py_False,
-        catalog_drops, catalog_complete, tracks_malformed);
+        catalog_drops, catalog_complete, tracks_malformed, block);
     Py_DECREF(catalog_drops);
     Py_DECREF(catalog_complete);
     Py_DECREF(tracks_malformed);
+    Py_DECREF(block);
     return result;
 }
 
@@ -1164,6 +1184,33 @@ static PyObject *description_dict(PyObject *module, PyObject *kind, const moq_me
     }
     if (put(d, "is_live", PyBool_FromLong(desc->is_live)) < 0) goto fail;
     OPT("track_duration_ms", has_track_duration, track_duration_ms);
+    /* The generation block (after has_label) is read whole, only when the
+     * stamp covers config_generation. */
+    bool generation = COVERS(stamp, moq_media_track_desc_t, config_generation);
+    if (put(d, "config_generation", generation ? PyLong_FromUnsignedLong(desc->config_generation)
+                                               : Py_NewRef(Py_None)) < 0 ||
+        put(d, "init_source", generation ? PyLong_FromUnsignedLong(desc->init_source)
+                                         : Py_NewRef(Py_None)) < 0 ||
+        put(d, "init_property_type", generation ? PyLong_FromUnsignedLongLong(desc->init_property_type)
+                                                : Py_NewRef(Py_None)) < 0) goto fail;
+    /* MSF 5.2.38-5.2.41 are on the handle-owned supplement record in the
+     * extension list; each field is gated by its own has_ flag. */
+    const moq_msf_track_supplement_t *sp = NULL;
+    if (COVERS(stamp, moq_media_track_desc_t, extension_count)) {
+        if (desc->extension_count > 0 && !desc->extensions)
+            { event_lost(module, kind, "description.extensions"); goto fail; }
+        sp = moq_msf_ext_supplement(desc->extensions, desc->extension_count);
+        if (sp && sp->struct_size < MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE)
+            { event_lost(module, kind, "description.supplement.struct_size"); goto fail; }
+    }
+#define SUPP(key, has, field) \
+    if (put(d, key, sp && sp->has ? span_copy(module, kind, "description." key, sp->field, 0) \
+                                  : Py_NewRef(Py_None)) < 0) goto fail
+    SUPP("encryption_scheme", has_encryption_scheme, encryption_scheme);
+    SUPP("cipher_suite", has_cipher_suite, cipher_suite);
+    SUPP("key_id", has_key_id, key_id);
+    SUPP("track_base_key", has_track_base_key, track_base_key);
+#undef SUPP
 #undef SPAN
 #undef OPT
     return d;
@@ -1189,7 +1236,7 @@ static PyObject *receiver_poll_track_py(PyObject *module, PyObject *capsule)
     if (!kind) return NULL;
     PyObject *track = NULL, *desc = NULL, *largest = NULL, *expires = NULL, *drop = NULL, *result = NULL;
     PyObject *local_result = NULL, *fill = NULL, *origin = NULL, *delivery_id = NULL;
-    PyObject *created_id = NULL;
+    PyObject *created_id = NULL, *generation = NULL, *replaces = NULL, *replaced_by = NULL;
 
     /* Shape by KNOWN kind: CATALOG_READY carries no handle; the known
      * track-scoped kinds require one; an unknown kind is preserved either
@@ -1305,8 +1352,19 @@ static PyObject *receiver_poll_track_py(PyObject *module, PyObject *capsule)
         COVERS(ev.struct_size, moq_media_track_event_t, initiating_request_id)
             ? PyLong_FromUnsignedLongLong(ev.initiating_request_id) : Py_NewRef(Py_None);
     if (!created_id) goto out;
-    result = Py_BuildValue("(OOOOOOOOOOO)", kind, track, desc, largest, expires, drop, local_result, fill,
-                          origin, delivery_id, created_id);
+    /* The generation of the description the event announces (frozen
+     * prefix), and an MSF-02 replacement's links, one block read only when
+     * the stamp covers replaced_by. */
+    generation = PyLong_FromUnsignedLong(ev.config_generation);
+    if (!generation) goto out;
+    bool linked = COVERS(ev.struct_size, moq_media_track_event_t, replaced_by);
+    replaces = linked && ev.replaces ? track_capsule_new(capsule, ev.replaces) : Py_NewRef(Py_None);
+    if (!replaces) goto out;
+    replaced_by = linked && ev.replaced_by ? track_capsule_new(capsule, ev.replaced_by)
+                                           : Py_NewRef(Py_None);
+    if (!replaced_by) goto out;
+    result = Py_BuildValue("(OOOOOOOOOOOOOO)", kind, track, desc, largest, expires, drop, local_result, fill,
+                          origin, delivery_id, created_id, generation, replaces, replaced_by);
 out:
     Py_XDECREF(kind);
     Py_XDECREF(track);
@@ -1319,6 +1377,9 @@ out:
     Py_XDECREF(origin);
     Py_XDECREF(delivery_id);
     Py_XDECREF(created_id);
+    Py_XDECREF(generation);
+    Py_XDECREF(replaces);
+    Py_XDECREF(replaced_by);
     return result;
 }
 
@@ -2910,6 +2971,9 @@ PyMODINIT_FUNC PyInit__native(void)
     ADD(CMAF_CODEC_UNKNOWN); ADD(CMAF_CODEC_AVC); ADD(CMAF_CODEC_HEVC); ADD(CMAF_CODEC_AV1);
     ADD(CMAF_CODEC_AAC); ADD(CMAF_CODEC_OPUS);
     ADD(MEDIA_PARSE_DROP_MEDIA); ADD(MEDIA_PARSE_DROP_SAP); ADD(MEDIA_PARSE_DROP_MEDIA_TIMELINE);
+    ADD(MEDIA_INIT_SOURCE_NONE); ADD(MEDIA_INIT_SOURCE_INLINE);
+    ADD(MEDIA_INIT_SOURCE_TRACK_PROPERTY); ADD(MEDIA_INIT_SOURCE_OBJECT_PROPERTY);
+    ADD(MSF_REVISION_01); ADD(MSF_REVISION_02);
     ADD(SAP_NONE); ADD(SAP_TYPE_1); ADD(SAP_TYPE_2); ADD(SAP_TYPE_3);
 #undef ADD
     if (PyModule_AddObject(module, "constants", constants) < 0) goto constants_fail;

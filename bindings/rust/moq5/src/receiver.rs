@@ -9,8 +9,8 @@ use crate::cmaf::{CmafSample, InitInfo};
 use crate::endpoint::Endpoint;
 use crate::{
     ffi, sender, sys, CompanionProfile, DeliveryOrigin, Error, GroupOrder, Location,
-    LocationFilter, MediaType, Mpeg2tsRecordRef, Namespace, ObjectMetadata, ObjectStatus,
-    Packaging, Result, SapType, TrackExtension, Version, WaitResult,
+    LocationFilter, MediaType, Mpeg2tsRecordRef, MsfRevision, Namespace, ObjectMetadata,
+    ObjectStatus, Packaging, Result, SapType, TrackExtension, Version, WaitResult,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -286,13 +286,65 @@ pub struct MediaTemplate {
     pub delta_wallclock_ms: u64,
 }
 
+/// Where a track's decoder configuration comes from
+/// (`MOQ_MEDIA_INIT_SOURCE_*`, an open set): see
+/// [`TrackDescription::init_source`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum InitSource {
+    /// The catalog names none.
+    None,
+    /// The catalog itself: [`TrackDescription::init_data`] and
+    /// [`TrackDescription::codec_config`].
+    Inline,
+    /// In band, from the track's properties (an MSF-02 initDataList
+    /// `track-property` entry, 5.1.7 and 12.2): on each object's
+    /// [`ObjectMetadata::video_config`] or
+    /// [`audio_config`](ObjectMetadata::audio_config) from the first object
+    /// on, not at discovery. Only the draft-22 companions deliver such a
+    /// track.
+    TrackProperty,
+    /// In band, on the objects that carry it (an `object-property` entry),
+    /// read the same way. Only the draft-22 companions deliver such a track.
+    ObjectProperty,
+    /// A source this crate does not know.
+    Other(u32),
+}
+
+impl InitSource {
+    fn from_raw(code: u32) -> InitSource {
+        match code {
+            sys::MOQ_MEDIA_INIT_SOURCE_NONE => InitSource::None,
+            sys::MOQ_MEDIA_INIT_SOURCE_INLINE => InitSource::Inline,
+            sys::MOQ_MEDIA_INIT_SOURCE_TRACK_PROPERTY => InitSource::TrackProperty,
+            sys::MOQ_MEDIA_INIT_SOURCE_OBJECT_PROPERTY => InitSource::ObjectProperty,
+            code => InitSource::Other(code),
+        }
+    }
+
+    /// The `MOQ_MEDIA_INIT_SOURCE_*` value.
+    #[must_use]
+    pub fn code(self) -> u32 {
+        match self {
+            InitSource::None => sys::MOQ_MEDIA_INIT_SOURCE_NONE,
+            InitSource::Inline => sys::MOQ_MEDIA_INIT_SOURCE_INLINE,
+            InitSource::TrackProperty => sys::MOQ_MEDIA_INIT_SOURCE_TRACK_PROPERTY,
+            InitSource::ObjectProperty => sys::MOQ_MEDIA_INIT_SOURCE_OBJECT_PROPERTY,
+            InitSource::Other(code) => code,
+        }
+    }
+}
+
 /// A track's catalog description: the current state, copied under the
 /// receiver's lock at the time of the query. Spans and arrays borrow the
 /// track handle, which lives as long as the receiver.
 ///
 /// This is a snapshot of the present, not the image a track event carried:
 /// a live-to-VOD conversion rewrites `is_live` and the track duration on
-/// the same handle, and a later query shows the new values.
+/// the same handle, and an MSF-02 advisory change publishes a new
+/// description generation for it; a later query shows the new values, and
+/// [`config_generation`](TrackDescription::config_generation) says which
+/// generation it is.
 pub struct TrackDescription<'receiver> {
     raw: sys::moq_media_track_desc_t,
     cmaf: Option<sys::moq_cmaf_init_info_t>,
@@ -553,27 +605,118 @@ impl<'receiver> TrackDescription<'receiver> {
         ));
         (reported && self.raw.has_render_group).then_some(self.raw.render_group)
     }
-    /// The catalog's packaging-extension records for the track, each read
-    /// under its own stamp; empty when the track carries none or the
+    /// The track's extension entries; empty when it carries none or the
     /// library did not report the list.
-    pub fn extensions(&self) -> impl Iterator<Item = TrackExtension<'receiver>> {
+    fn extension_entries(&self) -> &'receiver [sys::moq_msf_track_ext_t] {
         let reported = self.covers(ffi::field_end!(
             sys::moq_media_track_desc_t,
             extension_count,
             usize
         ));
-        let entries = if reported {
+        if reported {
             // SAFETY: the entries are owned by the track handle, valid for
             // the receiver's life.
             unsafe { ffi::array(self.raw.extensions, self.raw.extension_count) }
         } else {
             &[]
-        };
+        }
+    }
+    /// The catalog's packaging-extension records for the track, each read
+    /// under its own stamp; empty when the track carries none or the
+    /// library did not report the list.
+    pub fn extensions(&self) -> impl Iterator<Item = TrackExtension<'receiver>> {
         // SAFETY: each entry and the MPEG-TS record it points to are owned
         // by the track handle, valid for the receiver's life.
-        entries
+        self.extension_entries()
             .iter()
             .map(|entry| unsafe { TrackExtension::from_raw(entry) })
+    }
+    /// The track's MSF supplement record (`moq_msf_ext_supplement`): the
+    /// list's entry of that kind, when its record covers the first
+    /// published size.
+    fn supplement(&self) -> Option<&'receiver sys::moq_msf_track_supplement_t> {
+        let entry = self
+            .extension_entries()
+            .iter()
+            .find(|entry| entry.kind == sys::MOQ_MSF_EXT_SUPPLEMENT)?;
+        // SAFETY: the kind selects the union member; the record it points
+        // to is owned by the track handle, valid for the receiver's life.
+        let record = unsafe { entry.u.supplement.as_ref() }?;
+        ffi::covers(record.struct_size, sys::MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE).then_some(record)
+    }
+    /// One span of the supplement record, when its presence flag is set.
+    fn supplement_span(
+        &self,
+        field: impl Fn(&sys::moq_msf_track_supplement_t) -> (bool, sys::moq_bytes_t),
+    ) -> Option<&'receiver [u8]> {
+        let (present, span) = field(self.supplement()?);
+        // SAFETY: the record's spans are owned by the track handle, valid
+        // for the receiver's life.
+        present.then(|| unsafe { ffi::bytes(span) })
+    }
+    /// MSF encryptionScheme (MSF-02 5.2.38): present when the track's
+    /// object payloads are encrypted (4.4.1). libmoq does not decrypt: an
+    /// encrypted `loc` track is delivered with its payload as received and
+    /// its LOC properties, which stay in the clear (4.4.4), and
+    /// [`Receiver::subscribe_track`] refuses an encrypted track of any
+    /// other packaging with [`Error::UNSUPPORTED`]. `None` when absent, or
+    /// when the library did not report the track's supplement record.
+    #[must_use]
+    pub fn encryption_scheme(&self) -> Option<&'receiver [u8]> {
+        self.supplement_span(|record| (record.has_encryption_scheme, record.encryption_scheme))
+    }
+    /// MSF cipherSuite (MSF-02 5.2.39): the AEAD algorithm. `None` when
+    /// absent or not reported.
+    #[must_use]
+    pub fn cipher_suite(&self) -> Option<&'receiver [u8]> {
+        self.supplement_span(|record| (record.has_cipher_suite, record.cipher_suite))
+    }
+    /// MSF keyId (MSF-02 5.2.40): identifies the key material the
+    /// payloads are encrypted with. `None` when absent or not reported.
+    #[must_use]
+    pub fn key_id(&self) -> Option<&'receiver [u8]> {
+        self.supplement_span(|record| (record.has_key_id, record.key_id))
+    }
+    /// MSF trackBaseKey (MSF-02 5.2.41), verbatim (base64): key material
+    /// (13.2), to be handled as a secret. This description's `Debug` output
+    /// never shows it. `None` when absent or not reported.
+    #[must_use]
+    pub fn track_base_key(&self) -> Option<&'receiver [u8]> {
+        self.supplement_span(|record| (record.has_track_base_key, record.track_base_key))
+    }
+    /// Whether the stamp covers the block through `config_generation`,
+    /// which is read whole.
+    fn generation_block(&self) -> bool {
+        self.covers(ffi::field_end!(
+            sys::moq_media_track_desc_t,
+            config_generation,
+            u32
+        ))
+    }
+    /// This description's generation: 0 for the one the track was
+    /// discovered with, n for the one the n-th MSF-02 advisory change
+    /// published (the [`TrackEventKind::Updated`] that announced it carries
+    /// the same number). `None` when the library did not report it.
+    #[must_use]
+    pub fn config_generation(&self) -> Option<u32> {
+        self.generation_block()
+            .then_some(self.raw.config_generation)
+    }
+    /// Where the track's decoder configuration comes from; `None` when the
+    /// library did not report it.
+    #[must_use]
+    pub fn init_source(&self) -> Option<InitSource> {
+        self.generation_block()
+            .then(|| InitSource::from_raw(self.raw.init_source))
+    }
+    /// The property type that carries the decoder configuration in band,
+    /// for [`InitSource::TrackProperty`] and [`InitSource::ObjectProperty`]
+    /// (0x0d VIDEO_CONFIG, 0x0f AUDIO_CONFIG); zero for the other sources.
+    /// `None` when the library did not report it.
+    #[must_use]
+    pub fn init_property_type(&self) -> Option<u64> {
+        self.generation_block()
+            .then_some(self.raw.init_property_type)
     }
     /// The track's MPEG-TS record (`moq_msf_ext_mpeg2ts`): the catalog's
     /// mpeg2ts keys as parsed. `None` when the track carries none, or the
@@ -592,7 +735,8 @@ impl<'receiver> TrackDescription<'receiver> {
     }
 }
 
-// The catalog identity, not the spans a derive would print.
+// The catalog identity and generation, not the spans a derive would print
+// (the track base key among them).
 impl fmt::Debug for TrackDescription<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TrackDescription")
@@ -600,6 +744,7 @@ impl fmt::Debug for TrackDescription<'_> {
             .field("codec", &String::from_utf8_lossy(self.codec()))
             .field("packaging", &String::from_utf8_lossy(self.packaging_name()))
             .field("is_live", &self.is_live())
+            .field("config_generation", &self.config_generation())
             .finish_non_exhaustive()
     }
 }
@@ -608,11 +753,15 @@ impl fmt::Debug for TrackDescription<'_> {
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackEventKind {
-    /// A track was discovered.
+    /// A track was discovered. The successor of a replacement names the
+    /// handle it replaces ([`TrackEvent::replaces`]).
     Added,
-    /// A track converted live to VOD; its description changed in place.
+    /// The track's description changed: a live-to-VOD conversion rewrote it
+    /// in place, or an MSF-02 advisory change published a new generation
+    /// ([`TrackEvent::config_generation`]).
     Updated,
-    /// A later catalog dropped the track.
+    /// A later catalog dropped the track, or an MSF-02 change replaced it
+    /// with a new handle ([`TrackEvent::replaced_by`]).
     Removed,
     /// The track ended: END_OF_TRACK, a completed subscription, or a peer
     /// rejection. See [`TrackEvent::done_status`].
@@ -869,17 +1018,40 @@ impl<'receiver> TrackEvent<'receiver> {
     }
     /// The track's current description, copied now; `None` for an event
     /// without a track. This is the present state, not the image the event
-    /// carried: see [`TrackDescription`].
+    /// carried: see [`TrackDescription`]. Its
+    /// [`config_generation`](TrackDescription::config_generation) may be
+    /// later than the event's own.
     pub fn description(&self) -> Result<Option<TrackDescription<'receiver>>> {
         match self.track() {
             Some(track) => self.receiver.track_description(track).map(Some),
             None => Ok(None),
         }
     }
-    /// Reserved for dynamic configuration; always 0 today.
+    /// The description generation the event announces: 0 for the one the
+    /// track was discovered with, n for the n-th MSF-02 advisory change
+    /// ([`TrackEventKind::Updated`]).
     #[must_use]
     pub fn config_generation(&self) -> u32 {
         self.raw.config_generation
+    }
+    /// For the [`TrackEventKind::Removed`] of an MSF-02 replacement (a
+    /// catalog change that decides how the track's objects are parsed or
+    /// delivered): its successor, a new handle of this receiver, whose
+    /// [`TrackEventKind::Added`] follows at once. The track's selection
+    /// moves to the successor, and a later subscribe, unsubscribe or fill
+    /// on this handle acts on it. `None` for any other event, a plain
+    /// removal, or when the library did not report the field.
+    #[must_use]
+    pub fn replaced_by(&self) -> Option<Track> {
+        event_replaced_by(&self.raw, self.receiver.owner)
+    }
+    /// For the [`TrackEventKind::Added`] that follows a replacement's
+    /// removal: the handle this track replaces. `None` for any other event,
+    /// a track discovered on its own, or when the library did not report
+    /// the field.
+    #[must_use]
+    pub fn replaces(&self) -> Option<Track> {
+        event_replaces(&self.raw, self.receiver.owner)
     }
     /// For [`TrackEventKind::UpdateOk`]: the largest Location known when
     /// delivery resumed, when the peer reported one.
@@ -1023,6 +1195,45 @@ impl<'receiver> TrackEvent<'receiver> {
     pub fn raw(&self) -> &sys::moq_media_track_event_t {
         &self.raw
     }
+}
+
+/// A replacement handle of `event`, tagged as `owner`'s: present only on
+/// an event of `kind` whose stamp covers the replacement block, which is
+/// read whole.
+fn replacement(
+    event: &sys::moq_media_track_event_t,
+    kind: sys::moq_media_track_event_kind_t,
+    handle: *mut sys::moq_media_track_t,
+    owner: u64,
+) -> Option<Track> {
+    let reported = ffi::covers(
+        event.struct_size,
+        ffi::field_end!(
+            sys::moq_media_track_event_t,
+            replaced_by,
+            *mut sys::moq_media_track_t
+        ),
+    );
+    if reported && event.kind == kind {
+        NonNull::new(handle).map(|raw| Track { raw, owner })
+    } else {
+        None
+    }
+}
+
+/// The successor a replacement's REMOVED names.
+fn event_replaced_by(event: &sys::moq_media_track_event_t, owner: u64) -> Option<Track> {
+    replacement(
+        event,
+        sys::MOQ_MEDIA_TRACK_REMOVED,
+        event.replaced_by,
+        owner,
+    )
+}
+
+/// The predecessor the successor's ADDED names.
+fn event_replaces(event: &sys::moq_media_track_event_t, owner: u64) -> Option<Track> {
+    replacement(event, sys::MOQ_MEDIA_TRACK_ADDED, event.replaces, owner)
 }
 
 // The kind and the handle, not the raw record a derive would print.
@@ -1621,6 +1832,103 @@ pub struct ReceiverStats {
     pub gap_tails_unknown: Option<u64>,
     pub reorder_refused: Option<u64>,
     pub tracks_malformed: Option<u64>,
+    /// The MSF revision of the effective catalog, meaningful once
+    /// [`TrackEventKind::CatalogReady`] was queued.
+    pub catalog_revision: Option<MsfRevision>,
+    /// Catalog and media-timeline objects decompressed (MSF-02 12.1).
+    pub objects_decompressed: Option<u64>,
+    /// Compressed objects whose data was malformed.
+    pub decompress_failures: Option<u64>,
+    /// Compressed objects over the decompressed-size cap.
+    pub decompress_limited: Option<u64>,
+    /// Objects and subscriptions refused for their compression: an
+    /// algorithm this build does not decompress, a repeated or malformed
+    /// property, or a compressed MSF-01 catalog.
+    pub compression_refused: Option<u64>,
+    /// Objects carrying the object compression property where the track
+    /// property is set.
+    pub compression_conflicts: Option<u64>,
+    /// Timeline objects whose compression property was not interpreted
+    /// under an MSF-01 catalog.
+    pub compression_ignored: Option<u64>,
+    /// SAP-timeline objects whose origin carried an event-timeline header.
+    pub event_timeline_headers_ignored: Option<u64>,
+    /// Objects the in-group ordering stage of an `object`-mapped LOC track
+    /// gave up on (a policy, not proof the network lost them).
+    pub loc_order_gaps: Option<u64>,
+    /// Advances the ordering stage's capacity policy forced.
+    pub loc_order_forced: Option<u64>,
+}
+
+impl ReceiverStats {
+    /// The snapshot in `stats`, each appended field under the stamp.
+    fn from_raw(stats: &sys::moq_media_receiver_stats_t) -> ReceiverStats {
+        let reported = |end: usize| ffi::covers(stats.struct_size, end);
+        // The compression and ordering block is read whole.
+        let block = reported(ffi::field_end!(
+            sys::moq_media_receiver_stats_t,
+            loc_order_forced,
+            u64
+        ));
+        ReceiverStats {
+            objects_received: stats.objects_received,
+            objects_queued: stats.objects_queued,
+            bytes_queued: stats.bytes_queued,
+            objects_dropped: stats.objects_dropped,
+            groups_dropped: stats.groups_dropped,
+            keyframes_dropped: stats.keyframes_dropped,
+            parse_drops: stats.parse_drops,
+            overflow_events: stats.overflow_events,
+            pause_transitions: stats.pause_transitions,
+            paused: stats.paused,
+            catalog_drops: reported(ffi::field_end!(
+                sys::moq_media_receiver_stats_t,
+                catalog_drops,
+                u64
+            ))
+            .then_some(stats.catalog_drops),
+            catalog_complete: reported(ffi::field_end!(
+                sys::moq_media_receiver_stats_t,
+                catalog_complete,
+                bool
+            ))
+            .then_some(stats.catalog_complete),
+            gaps_reported: reported(ffi::field_end!(
+                sys::moq_media_receiver_stats_t,
+                gaps_reported,
+                u64
+            ))
+            .then_some(stats.gaps_reported),
+            gap_tails_unknown: reported(ffi::field_end!(
+                sys::moq_media_receiver_stats_t,
+                gap_tails_unknown,
+                u64
+            ))
+            .then_some(stats.gap_tails_unknown),
+            reorder_refused: reported(ffi::field_end!(
+                sys::moq_media_receiver_stats_t,
+                reorder_refused,
+                u64
+            ))
+            .then_some(stats.reorder_refused),
+            tracks_malformed: reported(ffi::field_end!(
+                sys::moq_media_receiver_stats_t,
+                tracks_malformed,
+                u64
+            ))
+            .then_some(stats.tracks_malformed),
+            catalog_revision: block.then(|| MsfRevision::from_code(stats.catalog_revision)),
+            objects_decompressed: block.then_some(stats.objects_decompressed),
+            decompress_failures: block.then_some(stats.decompress_failures),
+            decompress_limited: block.then_some(stats.decompress_limited),
+            compression_refused: block.then_some(stats.compression_refused),
+            compression_conflicts: block.then_some(stats.compression_conflicts),
+            compression_ignored: block.then_some(stats.compression_ignored),
+            event_timeline_headers_ignored: block.then_some(stats.event_timeline_headers_ignored),
+            loc_order_gaps: block.then_some(stats.loc_order_gaps),
+            loc_order_forced: block.then_some(stats.loc_order_forced),
+        }
+    }
 }
 
 /// A CMSF content-protection entry resolved from a receiver's catalog.
@@ -2046,7 +2354,9 @@ impl Receiver {
     /// subscribe validates them and leaves the subscription as it is.
     /// [`Error::UNSUPPORTED`] when the track has no delivery path, or when
     /// a location or fill cannot be carried by the negotiated draft and
-    /// companion; nothing is recorded then.
+    /// companion; nothing is recorded then. On a handle an MSF-02
+    /// replacement removed ([`TrackEvent::replaced_by`]) the call acts on
+    /// the newest handle that replaced it.
     pub fn subscribe_track(&self, track: Track, options: Option<SubscribeOptions>) -> Result<()> {
         let track = self.own(track)?;
         // The nested records the options point at, alive through the call.
@@ -2109,7 +2419,9 @@ impl Receiver {
     /// [`Error::WRONG_STATE`] when the track is not subscribed (or was
     /// disabled), has ended, failed or been removed; [`Error::UNSUPPORTED`]
     /// outside the draft-22 companion; [`Error::INVAL`] for a malformed
-    /// option; [`Error::CLOSED`] for a terminal receiver or endpoint.
+    /// option; [`Error::CLOSED`] for a terminal receiver or endpoint. On a
+    /// handle an MSF-02 replacement removed the request goes to the newest
+    /// handle that replaced it.
     pub fn fill_track(&self, track: Track, fill: FillOptions) -> Result<()> {
         let track = self.own(track)?;
         let location = fill.location.map(LocationFilter::as_raw);
@@ -2141,7 +2453,8 @@ impl Receiver {
     }
 
     /// Pause a track's delivery and purge its queued objects. A later
-    /// subscribe resumes it.
+    /// subscribe resumes it. On a handle an MSF-02 replacement removed the
+    /// call acts on the newest handle that replaced it.
     pub fn unsubscribe_track(&self, track: Track) -> Result<()> {
         let track = self.own(track)?;
         // SAFETY: a live receiver and one of its handles.
@@ -2202,55 +2515,7 @@ impl Receiver {
         // SAFETY: a live receiver and a writable struct of the size passed.
         ffi::check(unsafe { sys::moq_media_receiver_get_stats(self.as_ptr(), &mut stats, size) })?;
         ffi::check_stamp(stats.struct_size, RECEIVER_STATS_V0, size)?;
-        let reported = |end: usize| ffi::covers(stats.struct_size, end);
-        Ok(ReceiverStats {
-            objects_received: stats.objects_received,
-            objects_queued: stats.objects_queued,
-            bytes_queued: stats.bytes_queued,
-            objects_dropped: stats.objects_dropped,
-            groups_dropped: stats.groups_dropped,
-            keyframes_dropped: stats.keyframes_dropped,
-            parse_drops: stats.parse_drops,
-            overflow_events: stats.overflow_events,
-            pause_transitions: stats.pause_transitions,
-            paused: stats.paused,
-            catalog_drops: reported(ffi::field_end!(
-                sys::moq_media_receiver_stats_t,
-                catalog_drops,
-                u64
-            ))
-            .then_some(stats.catalog_drops),
-            catalog_complete: reported(ffi::field_end!(
-                sys::moq_media_receiver_stats_t,
-                catalog_complete,
-                bool
-            ))
-            .then_some(stats.catalog_complete),
-            gaps_reported: reported(ffi::field_end!(
-                sys::moq_media_receiver_stats_t,
-                gaps_reported,
-                u64
-            ))
-            .then_some(stats.gaps_reported),
-            gap_tails_unknown: reported(ffi::field_end!(
-                sys::moq_media_receiver_stats_t,
-                gap_tails_unknown,
-                u64
-            ))
-            .then_some(stats.gap_tails_unknown),
-            reorder_refused: reported(ffi::field_end!(
-                sys::moq_media_receiver_stats_t,
-                reorder_refused,
-                u64
-            ))
-            .then_some(stats.reorder_refused),
-            tracks_malformed: reported(ffi::field_end!(
-                sys::moq_media_receiver_stats_t,
-                tracks_malformed,
-                u64
-            ))
-            .then_some(stats.tracks_malformed),
-        })
+        Ok(ReceiverStats::from_raw(&stats))
     }
 
     /// What the receiver is: its effective configuration, the resolved
@@ -2358,5 +2623,322 @@ mod tests {
         }
         assert_eq!(TrackState::from_raw(99), TrackState::Other(99));
         assert_eq!(TrackState::Other(99).code(), 99);
+    }
+
+    #[test]
+    fn init_sources_round_trip() {
+        let named = [
+            (InitSource::None, sys::MOQ_MEDIA_INIT_SOURCE_NONE),
+            (InitSource::Inline, sys::MOQ_MEDIA_INIT_SOURCE_INLINE),
+            (
+                InitSource::TrackProperty,
+                sys::MOQ_MEDIA_INIT_SOURCE_TRACK_PROPERTY,
+            ),
+            (
+                InitSource::ObjectProperty,
+                sys::MOQ_MEDIA_INIT_SOURCE_OBJECT_PROPERTY,
+            ),
+        ];
+        for (source, raw) in named {
+            assert_eq!(source.code(), raw);
+            assert_eq!(InitSource::from_raw(raw), source);
+        }
+        assert_eq!(InitSource::from_raw(9), InitSource::Other(9));
+        assert_eq!(InitSource::Other(9).code(), 9);
+    }
+
+    /// A description of `raw`, whose spans and records `storage` keeps
+    /// alive for as long as the view is used.
+    fn view<T: ?Sized>(raw: sys::moq_media_track_desc_t, _storage: &T) -> TrackDescription<'_> {
+        TrackDescription {
+            raw,
+            cmaf: None,
+            _receiver: PhantomData,
+        }
+    }
+
+    #[test]
+    fn descriptions_report_the_generation_block_under_its_stamp() {
+        let raw = sys::moq_media_track_desc_t {
+            struct_size: mem::size_of::<sys::moq_media_track_desc_t>() as u32,
+            init_property_type: 0x0d,
+            init_source: sys::MOQ_MEDIA_INIT_SOURCE_TRACK_PROPERTY,
+            config_generation: 3,
+            ..Default::default()
+        };
+        let description = view(raw, &());
+        assert_eq!(description.config_generation(), Some(3));
+        assert_eq!(description.init_source(), Some(InitSource::TrackProperty));
+        assert_eq!(description.init_property_type(), Some(0x0d));
+
+        // One block: a stamp through its last field reports all of it, one
+        // short of that none of it.
+        let end = ffi::field_end!(sys::moq_media_track_desc_t, config_generation, u32);
+        let exact = view(
+            sys::moq_media_track_desc_t {
+                struct_size: end as u32,
+                ..raw
+            },
+            &(),
+        );
+        assert_eq!(exact.config_generation(), Some(3));
+        assert_eq!(exact.init_property_type(), Some(0x0d));
+        let short = view(
+            sys::moq_media_track_desc_t {
+                struct_size: (end - 1) as u32,
+                ..raw
+            },
+            &(),
+        );
+        assert_eq!(short.config_generation(), None);
+        assert_eq!(short.init_source(), None);
+        assert_eq!(short.init_property_type(), None);
+
+        // The discovered generation is zero, a value; an inline source has
+        // no property type; an unknown source keeps its value.
+        let inline = view(
+            sys::moq_media_track_desc_t {
+                init_property_type: 0,
+                init_source: sys::MOQ_MEDIA_INIT_SOURCE_INLINE,
+                config_generation: 0,
+                ..raw
+            },
+            &(),
+        );
+        assert_eq!(inline.config_generation(), Some(0));
+        assert_eq!(inline.init_source(), Some(InitSource::Inline));
+        assert_eq!(inline.init_property_type(), Some(0));
+        let unknown = view(
+            sys::moq_media_track_desc_t {
+                init_source: 9,
+                ..raw
+            },
+            &(),
+        );
+        assert_eq!(unknown.init_source(), Some(InitSource::Other(9)));
+    }
+
+    static SCHEME: &[u8] = b"moq-secure-objects";
+    static SUITE: &[u8] = b"aes-128-gcm-sha256";
+    static KEY_ID: &[u8] = b"key-2024-q1-premium";
+    static BASE_KEY: &[u8] = b"MTIzNDU2Nzg5MDEyMzQ1Ng==";
+
+    fn supplement(struct_size: usize) -> sys::moq_msf_track_supplement_t {
+        sys::moq_msf_track_supplement_t {
+            struct_size: struct_size as u32,
+            has_encryption_scheme: true,
+            encryption_scheme: ffi::span(SCHEME),
+            has_cipher_suite: true,
+            cipher_suite: ffi::span(SUITE),
+            has_key_id: true,
+            key_id: ffi::span(KEY_ID),
+            has_track_base_key: true,
+            track_base_key: ffi::span(BASE_KEY),
+            ..Default::default()
+        }
+    }
+
+    fn supplement_entry(
+        record: *const sys::moq_msf_track_supplement_t,
+    ) -> sys::moq_msf_track_ext_t {
+        sys::moq_msf_track_ext_t {
+            kind: sys::MOQ_MSF_EXT_SUPPLEMENT,
+            u: sys::moq_msf_track_ext__bindgen_ty_1 { supplement: record },
+        }
+    }
+
+    fn with_extensions(entries: &[sys::moq_msf_track_ext_t]) -> sys::moq_media_track_desc_t {
+        sys::moq_media_track_desc_t {
+            struct_size: mem::size_of::<sys::moq_media_track_desc_t>() as u32,
+            extensions: entries.as_ptr(),
+            extension_count: entries.len(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn encryption_fields_come_from_the_supplement_record() {
+        let record = supplement(mem::size_of::<sys::moq_msf_track_supplement_t>());
+        let entries = [
+            sys::moq_msf_track_ext_t {
+                kind: 7,
+                u: sys::moq_msf_track_ext__bindgen_ty_1 {
+                    mpeg2ts: ptr::null(),
+                },
+            },
+            supplement_entry(&record),
+        ];
+        let description = view(with_extensions(&entries), &entries);
+        assert_eq!(description.encryption_scheme(), Some(SCHEME));
+        assert_eq!(description.cipher_suite(), Some(SUITE));
+        assert_eq!(description.key_id(), Some(KEY_ID));
+        assert_eq!(description.track_base_key(), Some(BASE_KEY));
+        // The key material never reaches the description's Debug output.
+        let printed = format!("{description:?}");
+        assert!(!printed.contains("MTIz"), "{printed}");
+        assert!(!printed.contains(&format!("{:?}", BASE_KEY)), "{printed}");
+
+        // Each field under its own presence flag.
+        let partial = sys::moq_msf_track_supplement_t {
+            has_cipher_suite: false,
+            has_track_base_key: false,
+            ..record
+        };
+        let entries = [supplement_entry(&partial)];
+        let description = view(with_extensions(&entries), &entries);
+        assert_eq!(description.encryption_scheme(), Some(SCHEME));
+        assert_eq!(description.cipher_suite(), None);
+        assert_eq!(description.key_id(), Some(KEY_ID));
+        assert_eq!(description.track_base_key(), None);
+
+        // A record below its first published size, a missing record, no
+        // supplement entry, or a description stamp short of the list: none.
+        let small = supplement(sys::MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE - 1);
+        let entries = [supplement_entry(&small)];
+        let description = view(with_extensions(&entries), &entries);
+        assert_eq!(description.encryption_scheme(), None);
+        assert_eq!(description.track_base_key(), None);
+        let floor = supplement(sys::MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE);
+        let entries = [supplement_entry(&floor)];
+        let description = view(with_extensions(&entries), &entries);
+        assert_eq!(description.encryption_scheme(), Some(SCHEME));
+        let entries = [supplement_entry(ptr::null())];
+        let description = view(with_extensions(&entries), &entries);
+        assert_eq!(description.key_id(), None);
+        let description = view(with_extensions(&[]), &());
+        assert_eq!(description.encryption_scheme(), None);
+        let entries = [supplement_entry(&record)];
+        let short = sys::moq_media_track_desc_t {
+            struct_size: sys::MOQ_MEDIA_TRACK_DESC_V0_SIZE as u32,
+            ..with_extensions(&entries)
+        };
+        let description = view(short, &entries);
+        assert_eq!(description.encryption_scheme(), None);
+        assert_eq!(description.cipher_suite(), None);
+    }
+
+    #[test]
+    fn replacement_handles_need_their_kind_and_stamp() {
+        let mut old = 1u8;
+        let mut new = 2u8;
+        let old = ptr::addr_of_mut!(old).cast::<sys::moq_media_track_t>();
+        let new = ptr::addr_of_mut!(new).cast::<sys::moq_media_track_t>();
+        let full = mem::size_of::<sys::moq_media_track_event_t>() as u32;
+        let removed = sys::moq_media_track_event_t {
+            struct_size: full,
+            kind: sys::MOQ_MEDIA_TRACK_REMOVED,
+            track: old,
+            replaced_by: new,
+            ..Default::default()
+        };
+        let added = sys::moq_media_track_event_t {
+            struct_size: full,
+            kind: sys::MOQ_MEDIA_TRACK_ADDED,
+            track: new,
+            replaces: old,
+            ..Default::default()
+        };
+        let successor = event_replaced_by(&removed, 5).expect("a REMOVED names its successor");
+        assert_eq!(successor.as_ptr(), new);
+        assert_eq!(successor.owner, 5, "tagged as the receiver's own");
+        assert_eq!(event_replaces(&removed, 5), None);
+        let predecessor = event_replaces(&added, 5).expect("the ADDED names its predecessor");
+        assert_eq!((predecessor.as_ptr(), predecessor.owner), (old, 5));
+        assert_eq!(event_replaced_by(&added, 5), None);
+
+        // A plain removal or discovery names none.
+        let plain = sys::moq_media_track_event_t {
+            replaced_by: ptr::null_mut(),
+            ..removed
+        };
+        assert_eq!(event_replaced_by(&plain, 5), None);
+        // Another kind never decodes as a replacement, whatever its tail.
+        for kind in [sys::MOQ_MEDIA_TRACK_UPDATED, sys::MOQ_MEDIA_TRACK_ENDED, 99] {
+            let other = sys::moq_media_track_event_t {
+                kind,
+                replaces: old,
+                replaced_by: new,
+                ..removed
+            };
+            assert_eq!(event_replaced_by(&other, 5), None);
+            assert_eq!(event_replaces(&other, 5), None);
+        }
+        // One block: a stamp short of replaced_by reports neither handle.
+        let end = ffi::field_end!(
+            sys::moq_media_track_event_t,
+            replaced_by,
+            *mut sys::moq_media_track_t
+        );
+        let short = |event: sys::moq_media_track_event_t| sys::moq_media_track_event_t {
+            struct_size: (end - 1) as u32,
+            ..event
+        };
+        assert_eq!(event_replaced_by(&short(removed), 5), None);
+        assert_eq!(event_replaces(&short(added), 5), None);
+        let exact = sys::moq_media_track_event_t {
+            struct_size: end as u32,
+            ..removed
+        };
+        assert!(event_replaced_by(&exact, 5).is_some());
+    }
+
+    #[test]
+    fn stats_map_the_catalog_revision_and_counter_block() {
+        let raw = sys::moq_media_receiver_stats_t {
+            struct_size: mem::size_of::<sys::moq_media_receiver_stats_t>() as u32,
+            tracks_malformed: 1,
+            catalog_revision: sys::MOQ_MSF_REVISION_02,
+            objects_decompressed: 2,
+            decompress_failures: 3,
+            decompress_limited: 4,
+            compression_refused: 5,
+            compression_conflicts: 6,
+            compression_ignored: 7,
+            event_timeline_headers_ignored: 8,
+            loc_order_gaps: 9,
+            loc_order_forced: 10,
+            ..Default::default()
+        };
+        let stats = ReceiverStats::from_raw(&raw);
+        assert_eq!(stats.tracks_malformed, Some(1));
+        assert_eq!(stats.catalog_revision, Some(MsfRevision::Msf02));
+        assert_eq!(stats.objects_decompressed, Some(2));
+        assert_eq!(stats.decompress_failures, Some(3));
+        assert_eq!(stats.decompress_limited, Some(4));
+        assert_eq!(stats.compression_refused, Some(5));
+        assert_eq!(stats.compression_conflicts, Some(6));
+        assert_eq!(stats.compression_ignored, Some(7));
+        assert_eq!(stats.event_timeline_headers_ignored, Some(8));
+        assert_eq!(stats.loc_order_gaps, Some(9));
+        assert_eq!(stats.loc_order_forced, Some(10));
+        let revision = |code| {
+            ReceiverStats::from_raw(&sys::moq_media_receiver_stats_t {
+                catalog_revision: code,
+                ..raw
+            })
+            .catalog_revision
+        };
+        assert_eq!(revision(sys::MOQ_MSF_REVISION_01), Some(MsfRevision::Msf01));
+        assert_eq!(revision(5), Some(MsfRevision::Other(5)));
+
+        // One block: a stamp short of loc_order_forced reports none of it,
+        // and the earlier appended counters as before.
+        let end = ffi::field_end!(sys::moq_media_receiver_stats_t, loc_order_forced, u64);
+        let exact = ReceiverStats::from_raw(&sys::moq_media_receiver_stats_t {
+            struct_size: end as u32,
+            ..raw
+        });
+        assert_eq!(exact.loc_order_forced, Some(10));
+        let short = ReceiverStats::from_raw(&sys::moq_media_receiver_stats_t {
+            struct_size: (end - 1) as u32,
+            ..raw
+        });
+        assert_eq!(short.tracks_malformed, Some(1));
+        assert_eq!(short.catalog_revision, None);
+        assert_eq!(short.objects_decompressed, None);
+        assert_eq!(short.compression_refused, None);
+        assert_eq!(short.event_timeline_headers_ignored, None);
+        assert_eq!(short.loc_order_gaps, None);
+        assert_eq!(short.loc_order_forced, None);
     }
 }

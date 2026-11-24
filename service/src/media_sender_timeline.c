@@ -15,11 +15,13 @@ static size_t u64_to_dec(uint8_t *dst, uint64_t v)
 
 
 /* Serialize records[start,end) as a CMSF §3.6.1 SAP timeline JSON array:
- * [{"l":[group,object],"data":[sapType,ept_ms]},...]. *out is a new rcbuf. */
+ * [{"l":[group,object],"data":[sapType,ept_ms]},...]. The Location index
+ * key is `key`: 'l' as CMSF-01 3.6.1 spells it, or 'L' in an MSF-02
+ * catalog's timeline (MSF-02 8.2). *out is a new rcbuf. */
 static moq_result_t sap_encode_records(const moq_alloc_t *alloc,
                                        const sender_sap_rec_t *recs,
                                        uint32_t start, uint32_t end,
-                                       moq_rcbuf_t **out)
+                                       uint8_t key, moq_rcbuf_t **out)
 {
     *out = NULL;
     /* Conservative upper bound: the "[]" wrapper (2) + per record 20 bytes of
@@ -35,7 +37,9 @@ static moq_result_t sap_encode_records(const moq_alloc_t *alloc,
     buf[n++] = '[';
     for (uint32_t i = start; i < end; i++) {
         if (i > start) buf[n++] = ',';
-        memcpy(buf + n, "{\"l\":[", 6); n += 6;
+        memcpy(buf + n, "{\"l\":[", 6);
+        buf[n + 2] = key;
+        n += 6;
         n += u64_to_dec(buf + n, recs[i].media_group);
         buf[n++] = ',';
         n += u64_to_dec(buf + n, recs[i].media_object);
@@ -176,7 +180,8 @@ void sender_emit_sap_for(moq_media_sender_t *s, moq_media_track_t *tl,
                        tl->sap_recs[to].media_group == g) to++;
                 obj = tl->sap_obj_id;
             }
-            if (sap_encode_records(&s->alloc, tl->sap_recs, from, to,
+            uint8_t key = s->catalog_revision == MOQ_MSF_REVISION_02 ? 'L' : 'l';
+            if (sap_encode_records(&s->alloc, tl->sap_recs, from, to, key,
                                    &payload) != MOQ_OK)
                 return;
             lead = tl->sap_base_seq + to;

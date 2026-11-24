@@ -22,6 +22,7 @@ add_library(moq-service
     src/endpoint_uri.c
     src/media_auth.c
     src/media_receiver.c
+    src/media_receiver_order.c
     src/media_merge.c
     ${MOQ_MEDIA_SENDER_SOURCES}
 )
@@ -234,6 +235,22 @@ if(MOQ_BUILD_TESTS)
     endif()
     add_test(NAME media_auth COMMAND test_media_auth)
     set_tests_properties(media_auth PROPERTIES TIMEOUT 10)
+
+    # The receiver's in-group ordering stage is internal: the test compiles
+    # its source directly, so nothing is exported for it.
+    add_executable(test_media_receiver_order
+        tests/test_media_receiver_order.c src/media_receiver_order.c)
+    target_include_directories(test_media_receiver_order PRIVATE src)
+    target_link_libraries(test_media_receiver_order PRIVATE moq::core)
+    target_compile_features(test_media_receiver_order PRIVATE c_std_11)
+    target_compile_definitions(test_media_receiver_order PRIVATE MOQ_BUILDING)
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_media_receiver_order PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME media_receiver_order COMMAND test_media_receiver_order)
+    set_tests_properties(media_receiver_order PROPERTIES TIMEOUT 10)
 
     # The two-path merge needs the MPEG-TS reorder window.
     if(TARGET moq::mpeg2ts)
@@ -665,7 +682,8 @@ if(MOQ_BUILD_TESTS)
         set_tests_properties(media_receiver_init PROPERTIES TIMEOUT 30)
 
         add_library(moq-service-receiver-test-internals OBJECT
-            src/media_receiver.c src/media_auth.c src/endpoint.c src/endpoint_uri.c)
+            src/media_receiver.c src/media_receiver_order.c src/media_auth.c
+            src/endpoint.c src/endpoint_uri.c)
         target_include_directories(moq-service-receiver-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -689,6 +707,18 @@ if(MOQ_BUILD_TESTS)
         target_include_directories(test_media_catalog_update PRIVATE
             ${PROJECT_SOURCE_DIR}/tests/unit)
         add_test(NAME media_catalog_update COMMAND test_media_catalog_update)
+
+        add_executable(test_media_receiver_msf02
+            tests/test_media_receiver_msf02.c)
+        target_link_libraries(test_media_receiver_msf02 PRIVATE
+            moq-service-receiver-test-internals)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_media_receiver_msf02 PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+        endif()
+        add_test(NAME media_receiver_msf02 COMMAND test_media_receiver_msf02)
+        set_tests_properties(media_receiver_msf02 PROPERTIES TIMEOUT 120)
 
         # The media player over a real publisher, with the receiver on a
         # bare test endpoint (the receiver test seams).
@@ -808,6 +838,7 @@ if(MOQ_BUILD_TESTS)
             # endpoint-only support rather than a second receiver object.
             add_executable(test_media_receiver_companion
                 tests/test_media_receiver_companion.c
+                src/media_receiver_order.c
                 tests/receiver_legacy_ts_caller.c)
             target_link_libraries(test_media_receiver_companion PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
@@ -823,7 +854,8 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(media_receiver_companion PROPERTIES TIMEOUT 30)
 
             add_executable(test_media_receiver_track_options
-                tests/test_media_receiver_track_options.c)
+                tests/test_media_receiver_track_options.c
+                src/media_receiver_order.c)
             target_link_libraries(test_media_receiver_track_options PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_track_options PRIVATE
@@ -838,7 +870,8 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(media_receiver_track_options PROPERTIES TIMEOUT 30)
 
             add_executable(test_media_receiver_ack_failure
-                tests/test_media_receiver_ack_failure.c)
+                tests/test_media_receiver_ack_failure.c
+                src/media_receiver_order.c)
             target_link_libraries(test_media_receiver_ack_failure PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_ack_failure PRIVATE
@@ -853,7 +886,8 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(media_receiver_ack_failure PROPERTIES TIMEOUT 30)
 
             add_executable(test_media_receiver_delivery_failure
-                tests/test_media_receiver_delivery_failure.c)
+                tests/test_media_receiver_delivery_failure.c
+                src/media_receiver_order.c)
             target_link_libraries(test_media_receiver_delivery_failure PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_delivery_failure PRIVATE
@@ -868,7 +902,8 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(media_receiver_delivery_failure PROPERTIES TIMEOUT 30)
 
             add_executable(test_media_receiver_update_failure
-                tests/test_media_receiver_update_failure.c)
+                tests/test_media_receiver_update_failure.c
+                src/media_receiver_order.c)
             target_link_libraries(test_media_receiver_update_failure PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_update_failure PRIVATE
@@ -883,7 +918,8 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(media_receiver_update_failure PROPERTIES TIMEOUT 30)
 
             add_executable(test_media_receiver_metadata_copy
-                tests/test_media_receiver_metadata_copy.c)
+                tests/test_media_receiver_metadata_copy.c
+                src/media_receiver_order.c)
             target_link_libraries(test_media_receiver_metadata_copy PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_metadata_copy PRIVATE
@@ -898,7 +934,8 @@ if(MOQ_BUILD_TESTS)
             set_tests_properties(media_receiver_metadata_copy PROPERTIES TIMEOUT 30)
 
             add_executable(test_media_receiver_loc05
-                tests/test_media_receiver_loc05.c)
+                tests/test_media_receiver_loc05.c
+                src/media_receiver_order.c)
             target_link_libraries(test_media_receiver_loc05 PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_loc05 PRIVATE
@@ -914,7 +951,8 @@ if(MOQ_BUILD_TESTS)
 
             add_executable(test_media_receiver_origin
                 tests/test_media_receiver_origin.c
-                tests/receiver_legacy_ts_caller.c)
+                tests/receiver_legacy_ts_caller.c
+                src/media_receiver_order.c)
             target_link_libraries(test_media_receiver_origin PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_origin PRIVATE
@@ -930,7 +968,8 @@ if(MOQ_BUILD_TESTS)
             # Fill loss on the stream-terminal lane, draft 22.
             add_executable(test_media_receiver_fill_lane
                 tests/test_media_receiver_fill_lane.c
-                tests/receiver_legacy_ts_caller.c)
+                tests/receiver_legacy_ts_caller.c
+                src/media_receiver_order.c)
             target_link_libraries(test_media_receiver_fill_lane PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_fill_lane PRIVATE
@@ -946,7 +985,8 @@ if(MOQ_BUILD_TESTS)
             # Retirement and reorder-window ownership through the real hook.
             add_executable(test_media_receiver_lane_hook
                 tests/test_media_receiver_lane_hook.c
-                tests/receiver_legacy_ts_caller.c)
+                tests/receiver_legacy_ts_caller.c
+                src/media_receiver_order.c)
             target_link_libraries(test_media_receiver_lane_hook PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_lane_hook PRIVATE
@@ -968,7 +1008,8 @@ if(MOQ_BUILD_TESTS)
 
             add_executable(test_media_receiver_fill_control
                 tests/test_media_receiver_fill_control.c
-                tests/receiver_legacy_ts_caller.c)
+                tests/receiver_legacy_ts_caller.c
+                src/media_receiver_order.c)
             target_link_libraries(test_media_receiver_fill_control PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_fill_control PRIVATE
@@ -985,7 +1026,8 @@ if(MOQ_BUILD_TESTS)
             # terminal after the fill's Objects and its loss summary.
             if(TARGET moq::mpeg2ts)
                 add_executable(test_media_receiver_ts_fill
-                    tests/test_media_receiver_ts_fill.c)
+                    tests/test_media_receiver_ts_fill.c
+                    src/media_receiver_order.c)
                 target_link_libraries(test_media_receiver_ts_fill PRIVATE
                     moq-service-endpoint-test-internals moq::msf moq::mpeg2ts)
                 target_include_directories(test_media_receiver_ts_fill PRIVATE
@@ -1003,7 +1045,8 @@ if(MOQ_BUILD_TESTS)
 
                 # The stream-terminal lane behind an MPEG2TS reorder window.
                 add_executable(test_media_receiver_ts_lane
-                    tests/test_media_receiver_ts_lane.c)
+                    tests/test_media_receiver_ts_lane.c
+                    src/media_receiver_order.c)
                 target_link_libraries(test_media_receiver_ts_lane PRIVATE
                     moq-service-endpoint-test-internals moq::msf moq::mpeg2ts)
                 target_include_directories(test_media_receiver_ts_lane PRIVATE
@@ -1153,7 +1196,8 @@ if(MOQ_BUILD_TESTS)
             # thread when the receiver is destroyed elsewhere, also when every
             # allocation destroy could make is refused (white-box).
             add_executable(test_media_receiver_facade_teardown
-                tests/test_media_receiver_facade_teardown.c)
+                tests/test_media_receiver_facade_teardown.c
+                src/media_receiver_order.c)
             target_link_libraries(test_media_receiver_facade_teardown PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::sim)
             target_include_directories(test_media_receiver_facade_teardown PRIVATE
@@ -1171,7 +1215,8 @@ if(MOQ_BUILD_TESTS)
             # buffers were copied; a parked TS status keeps its own copy of
             # shared properties (white-box).
             add_executable(test_media_receiver_epoch_handoff
-                tests/test_media_receiver_epoch_handoff.c)
+                tests/test_media_receiver_epoch_handoff.c
+                src/media_receiver_order.c)
             target_link_libraries(test_media_receiver_epoch_handoff PRIVATE
                 moq-service-endpoint-test-internals moq::msf moq::loc ${_MOQ_SERVICE_TS_LIBS})
             target_include_directories(test_media_receiver_epoch_handoff PRIVATE
@@ -1399,6 +1444,24 @@ if(MOQ_BUILD_TESTS)
                 PRIVATE ${PROJECT_SOURCE_DIR}/tests/unit)
             add_test(NAME media_sender_catalog_generatedat
                 COMMAND test_media_sender_catalog_generatedat)
+
+            # The catalog revision a sender publishes (MSF-01 by default,
+            # MSF-02 on request). The SAP-key case drives a real SimPair
+            # subscriber, so this target links moq::sim directly.
+            add_executable(test_media_sender_msf02
+                tests/test_media_sender_msf02.c)
+            target_link_libraries(test_media_sender_msf02 PRIVATE
+                moq-service-sender-test-internals moq::sim Threads::Threads)
+            target_include_directories(test_media_sender_msf02
+                PRIVATE ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(TARGET moq::mpeg2ts)
+                target_compile_definitions(test_media_sender_msf02 PRIVATE
+                    MOQ_TEST_HAVE_MPEG2TS)
+            endif()
+            target_compile_options(test_media_sender_msf02 PRIVATE
+                $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-Wall;-Wextra;-Wpedantic;-Werror>)
+            add_test(NAME media_sender_msf02 COMMAND test_media_sender_msf02)
+            set_tests_properties(media_sender_msf02 PROPERTIES TIMEOUT 60)
         endif()
 
         # Lifecycle callbacks (on_ready / on_closed): deterministic, no network.
@@ -1547,7 +1610,8 @@ if(MOQ_BUILD_TESTS)
         # duplicate endpoint.c. Requires moq::msf and moq::sim.
         if(TARGET moq::sim)
             add_library(moq-service-refresh-test-internals OBJECT
-                ${MOQ_MEDIA_SENDER_TEST_SOURCES} src/media_receiver.c src/media_auth.c
+                ${MOQ_MEDIA_SENDER_TEST_SOURCES} src/media_receiver.c
+                src/media_receiver_order.c src/media_auth.c
                 src/endpoint.c src/endpoint_uri.c)
             target_include_directories(moq-service-refresh-test-internals
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include

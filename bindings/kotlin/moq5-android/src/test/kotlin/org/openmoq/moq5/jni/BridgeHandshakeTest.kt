@@ -136,18 +136,20 @@ internal class BridgeAbiSkewLowTest {
     }
 
     @Test
-    fun `epoch 17, whose track-event carrier had no appended-field scalars, is refused at the handshake`() {
-        // 17 is the last epoch at which `nativeReceiverPollTrack` filled 12
-        // scalars (and 16 the last whose object carrier filled 17). This
-        // Kotlin side reads 23 of each; a native side still at 17 must be
-        // refused before any row runs, never tolerated as "not observed".
-        assertTrue(NativeBridge.ABI_EPOCH > 17, "this binding must sit past epoch 17, is at ${NativeBridge.ABI_EPOCH}")
-        assertEquals(18, NativeBridge.ABI_EPOCH, "the fixture one epoch back must be 17 for this row to hold; update the row with the next bump")
+    fun `epoch 18, whose receiver carriers had no replacement, generation or appended stats slots, is refused at the handshake`() {
+        // 18 is the last epoch at which `nativeReceiverPollTrack` filled 23
+        // scalars, `nativeTrackDescribe` 35 scalars and 13 fixed byte fields,
+        // and `nativeReceiverStats` 16 scalars (17 the last whose track-event
+        // carrier filled 12). This Kotlin side reads 26, 39 and 17, and 27; a
+        // native side still at 18 must be refused before any row runs, never
+        // tolerated as "not observed".
+        assertTrue(NativeBridge.ABI_EPOCH > 18, "this binding must sit past epoch 18, is at ${NativeBridge.ABI_EPOCH}")
+        assertEquals(19, NativeBridge.ABI_EPOCH, "the fixture one epoch back must be 18 for this row to hold; update the row with the next bump")
         val bridge = BridgeInitializer()
         val outcome = bridge.initialize(BridgeDsos.image("bridge_epoch_low"))
         assertTrue(outcome is BridgeInit.AbiMismatch, "expected an ABI mismatch, got $outcome")
         outcome as BridgeInit.AbiMismatch
-        assertEquals(17, outcome.observed)
+        assertEquals(18, outcome.observed)
         assertEquals(NativeBridge.ABI_EPOCH, outcome.expected)
         assertFalse(bridge.isReady)
     }

@@ -771,6 +771,21 @@ void moq_media_sender_test_mark_registered(moq_media_sender_t *s)
 }
 
 
+/* The same sentinel on one track only, so a test can order registrations
+ * (a generated timeline before its media track, say). */
+void moq_media_sender_test_register_track(moq_media_sender_t *s,
+                                          moq_media_track_t *track);
+
+void moq_media_sender_test_register_track(moq_media_sender_t *s,
+                                          moq_media_track_t *track)
+{
+    pthread_mutex_lock(&s->mu);
+    if (track && !track->is_catalog && !track->removed && !track->pub_track)
+        track->pub_track = (moq_pub_track_t *)(uintptr_t)0x1;
+    pthread_mutex_unlock(&s->mu);
+}
+
+
 /* Stage one catalog generation and hand the dense wire object list (object 0 =
  * independent base, objects 1..N = deltaUpdate objects) to the caller, which
  * reconstructs the receiver-effective catalog exactly as a peer would. Transfers

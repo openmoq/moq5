@@ -83,18 +83,20 @@ EP_N=11
 # attach/close rows' five, the event rows' description and terminal readers,
 # the object row's poll and release, the control rows' subscribe,
 # unsubscribe and state, and the record rows' polls and stats. The description
-# is read through the locked copy. Judged by identity in every image, like the
+# is read through the locked copy, and its encryption fields through the
+# catalog's extension lookup. Judged by identity in every image, like the
 # endpoint set, whenever the ABI
 # table carries the receiver rows (the rows are the only reason the substrate
 # must be present).
 RX_SET='moq_media_receiver_cfg_init moq_media_receiver_attach moq_media_receiver_destroy
 moq_media_receiver_wait moq_media_receiver_poll_track moq_media_receiver_track_desc_copy
+moq_msf_ext_find
 moq_media_receiver_is_closed moq_media_receiver_is_fatal moq_media_receiver_fatal_code
 moq_media_receiver_poll_object moq_media_object_cleanup
 moq_media_receiver_track_subscribe_cfg_init moq_media_receiver_subscribe_track
 moq_media_receiver_unsubscribe_track moq_media_receiver_track_state
 moq_media_receiver_poll_sap moq_media_receiver_poll_media_timeline moq_media_receiver_get_stats'
-RX_N=18
+RX_N=19
 RECEIVER_ROWS='nativeReceiverAttach|(J[[BIIJIZ[BI[J)I
 nativeReceiverClose|(JJ)I'
 

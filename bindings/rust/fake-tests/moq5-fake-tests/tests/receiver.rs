@@ -1,6 +1,7 @@
 //! Receiver rows: configuration mapping through the sized presets, track
-//! events with every stamped field, description snapshots and their
-//! extension records, owned objects and their release (whole or within a
+//! events with every stamped field, replacements naming both handles,
+//! description snapshots with their generation, init source, extension
+//! records and encryption fields, owned objects and their release (whole or within a
 //! charge), draft-22 metadata, the stream-terminal lane, timeline records,
 //! subscriptions with locations and fills, fill cancellation, state, content
 //! protection, the receiver's information and the stamped statistics.
@@ -12,10 +13,11 @@ use std::time::Duration;
 use moq5::cmaf::CmafSample;
 use moq5::{
     CompanionProfile, DeliveryOrigin, Endpoint, EndpointConfig, Error, FillError, FillOptions,
-    FillReason, GroupOrder, Location, LocationFilter, MediaType, Mpeg2tsKeys, Mpeg2tsMode,
-    Mpeg2tsTimestampMode, Namespace, ObjectStatus, OverflowPolicy, Packaging, ParseDropClass,
-    PollWithin, Receiver, ReceiverConfig, SapType, StartMode, StreamTerminalKind, SubscribeOptions,
-    TimeDomain, TimeMode, Track, TrackEventKind, TrackExtension, TrackState, Version, WaitResult,
+    FillReason, GroupOrder, InitSource, Location, LocationFilter, MediaType, Mpeg2tsKeys,
+    Mpeg2tsMode, Mpeg2tsTimestampMode, MsfRevision, Namespace, ObjectStatus, OverflowPolicy,
+    Packaging, ParseDropClass, PollWithin, Receiver, ReceiverConfig, SapType, StartMode,
+    StreamTerminalKind, SubscribeOptions, TimeDomain, TimeMode, Track, TrackEventKind,
+    TrackExtension, TrackState, Version, WaitResult,
 };
 use moq5_fake_tests as fake;
 use moq5_fake_tests::{sys, Suite};
@@ -192,6 +194,9 @@ fn raw_description(is_live: bool) -> sys::moq_media_track_desc_t {
         has_render_group: true,
         render_group: 0,
         has_label: true,
+        init_property_type: 0x0d,
+        init_source: sys::MOQ_MEDIA_INIT_SOURCE_TRACK_PROPERTY,
+        config_generation: 2,
         ..Default::default()
     };
     description.template_.start_media_ms = 10;
@@ -479,6 +484,7 @@ fn event_fields_outside_the_stamp_are_absent() {
     update.largest_group = 5;
     update.has_done_status = true;
     update.done_status = 2;
+    update.config_generation = 1;
     let v0 = std::mem::offset_of!(sys::moq_media_track_event_t, config_generation) + 4;
     s.set("poll_track_stamp", v0 as i64);
     push_event(update);
@@ -500,6 +506,25 @@ fn event_fields_outside_the_stamp_are_absent() {
     assert_eq!(event.delivery_initiating_request_id(), None);
     assert_eq!(event.fill_unreported_loss(), None);
     assert_eq!(event.done_status(), None);
+    assert_eq!(event.config_generation(), 1, "in the v0 prefix");
+    // A replacement whose library record ends at done_status reports no
+    // handles: its REMOVED and ADDED read as a plain removal and discovery.
+    let through_done = std::mem::offset_of!(sys::moq_media_track_event_t, done_status) + 8;
+    s.set("poll_track_stamp", through_done as i64);
+    let mut removed = raw_event(&receiver, sys::MOQ_MEDIA_TRACK_REMOVED, 0);
+    removed.replaced_by = raw_track(&receiver, 1);
+    push_event(removed);
+    let mut added = raw_event(&receiver, sys::MOQ_MEDIA_TRACK_ADDED, 1);
+    added.replaces = raw_track(&receiver, 0);
+    push_event(added);
+    for _ in 0..2 {
+        let event = receiver
+            .poll_track()
+            .expect("poll_track on a live receiver")
+            .expect("the pushed event is pollable");
+        assert_eq!(event.replaced_by(), None);
+        assert_eq!(event.replaces(), None);
+    }
     s.set("poll_track_stamp", (v0 - 1) as i64);
     push_event(update);
     assert_eq!(receiver.poll_track().err(), Some(Error::ABI_MISMATCH));
@@ -571,6 +596,14 @@ fn descriptions_are_current_snapshots() {
         Some(0),
         "zero is a value when present"
     );
+    assert_eq!(description.config_generation(), Some(2));
+    assert_eq!(description.init_source(), Some(InitSource::TrackProperty));
+    assert_eq!(description.init_property_type(), Some(0x0d));
+    assert_eq!(
+        description.encryption_scheme(),
+        None,
+        "no supplement record"
+    );
     assert!(format!("{description:?}").contains("video"));
 
     // The service rewrites the handle's description in place on a
@@ -631,6 +664,19 @@ fn descriptions_are_current_snapshots() {
         .expect("the description of a discovered track copies");
     assert_eq!(description.name(), b"video");
     assert_eq!(description.alt_group(), None, "appended, not reported");
+    assert_eq!(description.config_generation(), None);
+    assert_eq!(description.init_source(), None);
+    assert_eq!(description.init_property_type(), None);
+    // A stamp through has_label, short of the generation block.
+    set_description(&receiver, 0, &raw_description(true));
+    let through_label = std::mem::offset_of!(sys::moq_media_track_desc_t, has_label) + 1;
+    s.set("desc_stamp", through_label as i64);
+    let description = receiver
+        .track_description(track)
+        .expect("the description of a discovered track copies");
+    assert_eq!(description.label(), Some(&b"Main"[..]));
+    assert_eq!(description.config_generation(), None);
+    assert_eq!(description.init_source(), None);
     s.set("desc_stamp", (sys::MOQ_MEDIA_TRACK_DESC_V0_SIZE - 1) as i64);
     assert_eq!(
         receiver.track_description(track).err(),
@@ -721,6 +767,150 @@ fn foreign_tracks_never_reach_the_service() {
     assert_eq!(second.track_state(track), Err(Error::INVAL));
     assert_eq!(s.get("desc_copy"), before);
     assert!(s.take_log().is_empty());
+}
+
+/// An MSF-02 replacement as the library reports it: the old handle's
+/// REMOVED names its successor, and the successor's ADDED, right after it,
+/// names its predecessor. Both are handles of this receiver, usable as
+/// such.
+#[test]
+fn replacements_name_both_handles() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    let old = track(&receiver, 0);
+    let mut removed = raw_event(&receiver, sys::MOQ_MEDIA_TRACK_REMOVED, 0);
+    removed.replaced_by = raw_track(&receiver, 1);
+    push_event(removed);
+    let mut added = raw_event(&receiver, sys::MOQ_MEDIA_TRACK_ADDED, 1);
+    added.replaces = raw_track(&receiver, 0);
+    push_event(added);
+    let next = || {
+        receiver
+            .poll_track()
+            .expect("poll_track on a live receiver")
+            .expect("the pushed event is pollable")
+    };
+    let event = next();
+    assert_eq!(event.kind(), TrackEventKind::Removed);
+    assert_eq!(event.track(), Some(old));
+    let successor = event
+        .replaced_by()
+        .expect("a replacement's REMOVED names its successor");
+    assert_eq!(successor.as_ptr(), raw_track(&receiver, 1));
+    assert_eq!(event.replaces(), None);
+    let event = next();
+    assert_eq!(event.kind(), TrackEventKind::Added);
+    assert_eq!(event.track(), Some(successor));
+    assert_eq!(event.replaces(), Some(old));
+    assert_eq!(event.replaced_by(), None);
+    // SAFETY: a live receiver of the provider.
+    unsafe {
+        fake::moq5_fake_set_track_state(receiver.as_ptr(), 1, sys::MOQ_MEDIA_TRACK_STATE_ACTIVE)
+    };
+    assert_eq!(receiver.track_state(successor), Ok(TrackState::Active));
+
+    // A plain removal names no successor; an advisory update reports the
+    // generation it published.
+    push_event(raw_event(&receiver, sys::MOQ_MEDIA_TRACK_REMOVED, 2));
+    assert_eq!(next().replaced_by(), None);
+    let mut updated = raw_event(&receiver, sys::MOQ_MEDIA_TRACK_UPDATED, 1);
+    updated.config_generation = 3;
+    push_event(updated);
+    let event = next();
+    assert_eq!(event.kind(), TrackEventKind::Updated);
+    assert_eq!(event.config_generation(), 3);
+    assert_eq!(event.replaces(), None);
+}
+
+static ENCRYPTION_SCHEME: &[u8] = b"moq-secure-objects";
+static SUITE: &[u8] = b"aes-128-gcm-sha256";
+static KEY_ID: &[u8] = b"key-2024-q1-premium";
+static BASE_KEY: &[u8] = b"MTIzNDU2Nzg5MDEyMzQ1Ng==";
+
+/// The encryption fields of an encrypted LOC track come from the
+/// description's supplement record, each under its own presence flag, and
+/// the key material never reaches the description's Debug output.
+#[test]
+fn descriptions_carry_the_supplement_encryption_fields() {
+    let s = fake::suite();
+    let record = sys::moq_msf_track_supplement_t {
+        struct_size: std::mem::size_of::<sys::moq_msf_track_supplement_t>() as u32,
+        has_encryption_scheme: true,
+        encryption_scheme: fake::span(ENCRYPTION_SCHEME),
+        has_cipher_suite: true,
+        cipher_suite: fake::span(SUITE),
+        has_key_id: true,
+        key_id: fake::span(KEY_ID),
+        has_track_base_key: true,
+        track_base_key: fake::span(BASE_KEY),
+        ..Default::default()
+    };
+    let without_key = sys::moq_msf_track_supplement_t {
+        has_track_base_key: false,
+        ..record
+    };
+    let short = sys::moq_msf_track_supplement_t {
+        struct_size: (sys::MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE - 1) as u32,
+        ..record
+    };
+    let entry = |record: &sys::moq_msf_track_supplement_t| sys::moq_msf_track_ext_t {
+        kind: sys::MOQ_MSF_EXT_SUPPLEMENT,
+        u: sys::moq_msf_track_ext__bindgen_ty_1 { supplement: record },
+    };
+    let entries = [entry(&record)];
+    let without_key_entries = [entry(&without_key)];
+    let short_entries = [entry(&short)];
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    let mut description = raw_description(true);
+    description.packaging = fake::span(b"loc");
+    description.extensions = entries.as_ptr();
+    description.extension_count = entries.len();
+    // The provider copies the description; its pointers reach locals that
+    // outlive the receiver.
+    set_description(&receiver, 0, &description);
+    let track = track(&receiver, 0);
+    let copy = receiver
+        .track_description(track)
+        .expect("the description of a discovered track copies");
+    assert_eq!(copy.encryption_scheme(), Some(ENCRYPTION_SCHEME));
+    assert_eq!(copy.cipher_suite(), Some(SUITE));
+    assert_eq!(copy.key_id(), Some(KEY_ID));
+    assert_eq!(copy.track_base_key(), Some(BASE_KEY));
+    assert!(
+        copy.mpeg2ts().is_none(),
+        "the supplement is no MPEG-TS record"
+    );
+    let printed = format!("{copy:?}");
+    assert!(!printed.contains("MTIz"), "{printed}");
+    assert!(!printed.contains(&format!("{BASE_KEY:?}")), "{printed}");
+
+    description.extensions = without_key_entries.as_ptr();
+    set_description(&receiver, 0, &description);
+    let copy = receiver
+        .track_description(track)
+        .expect("the description of a discovered track copies");
+    assert_eq!(copy.key_id(), Some(KEY_ID));
+    assert_eq!(copy.track_base_key(), None);
+
+    // A record below its first published size is not read as one, and a
+    // description stamp short of the extension list reports none.
+    description.extensions = short_entries.as_ptr();
+    set_description(&receiver, 0, &description);
+    let copy = receiver
+        .track_description(track)
+        .expect("the description of a discovered track copies");
+    assert_eq!(copy.encryption_scheme(), None);
+    description.extensions = entries.as_ptr();
+    set_description(&receiver, 0, &description);
+    s.set("desc_stamp", sys::MOQ_MEDIA_TRACK_DESC_V0_SIZE as i64);
+    let copy = receiver
+        .track_description(track)
+        .expect("the description of a discovered track copies");
+    assert_eq!(copy.encryption_scheme(), None);
+    assert_eq!(copy.track_base_key(), None);
+    drop(receiver);
 }
 
 static RELEASES: AtomicUsize = AtomicUsize::new(0);
@@ -1230,6 +1420,10 @@ fn stats_are_read_under_the_stamp() {
     s.set("rstats_catalog_drops", 3);
     s.set("rstats_catalog_complete", 1);
     s.set("rstats_tracks_malformed", 2);
+    s.set(
+        "rstats_catalog_revision",
+        i64::from(sys::MOQ_MSF_REVISION_02),
+    );
     let stats = receiver.stats().expect("stats on a live receiver");
     assert_eq!(stats.objects_received, 11);
     assert!(!stats.paused);
@@ -1239,6 +1433,44 @@ fn stats_are_read_under_the_stamp() {
     assert_eq!(stats.gap_tails_unknown, Some(1));
     assert_eq!(stats.reorder_refused, Some(2));
     assert_eq!(stats.tracks_malformed, Some(2));
+    assert_eq!(stats.catalog_revision, Some(MsfRevision::Msf02));
+    assert_eq!(
+        (
+            stats.objects_decompressed,
+            stats.decompress_failures,
+            stats.decompress_limited
+        ),
+        (Some(21), Some(22), Some(23))
+    );
+    assert_eq!(
+        (
+            stats.compression_refused,
+            stats.compression_conflicts,
+            stats.compression_ignored
+        ),
+        (Some(24), Some(25), Some(26))
+    );
+    assert_eq!(stats.event_timeline_headers_ignored, Some(27));
+    assert_eq!(
+        (stats.loc_order_gaps, stats.loc_order_forced),
+        (Some(28), Some(29))
+    );
+    s.set("rstats_catalog_revision", 0);
+    let stats = receiver.stats().expect("stats on a live receiver");
+    assert_eq!(
+        stats.catalog_revision,
+        Some(MsfRevision::Msf01),
+        "zero is MSF-01"
+    );
+    // A library whose record ends at tracks_malformed reports no block.
+    let through_malformed =
+        std::mem::offset_of!(sys::moq_media_receiver_stats_t, tracks_malformed) + 8;
+    s.set("receiver_stats_stamp", through_malformed as i64);
+    let stats = receiver.stats().expect("stats on a live receiver");
+    assert_eq!(stats.tracks_malformed, Some(2));
+    assert_eq!(stats.catalog_revision, None);
+    assert_eq!(stats.objects_decompressed, None);
+    assert_eq!(stats.loc_order_forced, None);
     let v0 = std::mem::offset_of!(sys::moq_media_receiver_stats_t, paused) + 1;
     s.set("receiver_stats_stamp", v0 as i64);
     let stats = receiver.stats().expect("stats on a live receiver");
@@ -1246,6 +1478,8 @@ fn stats_are_read_under_the_stamp() {
     assert_eq!(stats.catalog_drops, None);
     assert_eq!(stats.catalog_complete, None);
     assert_eq!(stats.tracks_malformed, None);
+    assert_eq!(stats.catalog_revision, None);
+    assert_eq!(stats.loc_order_gaps, None);
     s.set("receiver_stats_stamp", (v0 - 1) as i64);
     assert_eq!(receiver.stats(), Err(Error::ABI_MISMATCH));
     s.set("receiver_stats_stamp", 9999);

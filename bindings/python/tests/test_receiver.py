@@ -501,7 +501,7 @@ class ReceiverShellTests(unittest.TestCase):
             self.assertFalse(stats.catalog_complete)
             self.assertIsNone(stats.tracks_malformed)
             # OK with a malformed stamp is a BINDING fault, never a native code
-            for size, detail in ((80, "below"), (200, "exceeds")):
+            for size, detail in ((80, "below"), (_native._test_layout()["stats_sizeof"] + 1, "exceeds")):
                 _native._test_stats_size(size)
                 with self.assertRaises(moq5.BindingError) as caught:
                     receiver.stats()

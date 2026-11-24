@@ -236,6 +236,18 @@ internal class ScriptedEndpointBackend(private val failures: TestFailures) : End
     /** The C fails [track] with no event saying so: only a state read shows it. */
     internal fun failTrackSilently(track: Long) = lock.withLock { failedTracks += track }
 
+    /* MSF-02 replacements, as the C models them: a polled REMOVED naming a
+     * successor moves the replaced track's desire to it, a command on a
+     * replaced track acts on the newest track of its chain, and a state read
+     * on a replaced track is refused WRONG_STATE. */
+    private val successorOf = mutableMapOf<Long, Long>()
+
+    private fun chainHeadLocked(track: Long): Long {
+        var t = track
+        repeat(successorOf.size) { t = successorOf[t] ?: t }
+        return t
+    }
+
     /** Overrides for one command's answer (null = the scripted semantics), and hooks run INSIDE the command after its answer is decided. */
     internal var subscribeResult: BackendCommandResult? = null
     internal var unsubscribeResult: BackendCommandResult? = null
@@ -932,6 +944,11 @@ internal class ScriptedEndpointBackend(private val failures: TestFailures) : End
             }
             val next = trackQueue.removeFirstOrNull()
             if (next != null && next.kind == BackendTrackEventKind.Ended) endedTracks += next.track
+            val successor = next?.replacedBy
+            if (next != null && next.kind == BackendTrackEventKind.Removed && successor != null) {
+                successorOf[next.track] = successor
+                if (desiredTracks.remove(next.track)) desiredTracks += successor
+            }
             if (next != null && (next.kind == BackendTrackEventKind.LocalFailure || next.kind == BackendTrackEventKind.UpdateLocalFailure ||
                     (next.kind == BackendTrackEventKind.DeliveryLocalFailure && next.deliveryOrigin == BackendDeliveryOrigin.Live))) {
                 failedTracks += next.track
@@ -1004,12 +1021,13 @@ internal class ScriptedEndpointBackend(private val failures: TestFailures) : End
             enterLocked("subscribeTrack")
             noteServiceThreadLocked("subscribeTrack")
             if (token !in liveChildren) r = r.copy(violations = r.violations + "subscribeTrack of a token that is not a live child: $token")
+            val head = chainHeadLocked(track)
             val result =
                 subscribeResult ?: when {
-                    track in endedTracks || track in failedTracks -> BackendCommandResult.Refused(MoqResultCode(-5))
+                    head in endedTracks || head in failedTracks -> BackendCommandResult.Refused(MoqResultCode(-5))
                     else -> {
-                        desiredTracks += track
-                        issuedTracks += track
+                        desiredTracks += head
+                        issuedTracks += head
                         BackendCommandResult.Ok
                     }
                 }
@@ -1031,8 +1049,9 @@ internal class ScriptedEndpointBackend(private val failures: TestFailures) : End
             // the desire and purges (the C purges under the queue lock).
             val result = unsubscribeResult ?: BackendCommandResult.Ok
             if (result is BackendCommandResult.Ok) {
-                desiredTracks -= track
-                objectQueue.removeAll { it.track == track }
+                val head = chainHeadLocked(track)
+                desiredTracks -= head
+                objectQueue.removeAll { it.track == head }
             }
             r = r.copy(unsubscribeCalls = r.unsubscribeCalls + TrackCall(track, Thread.currentThread().threadId()), objectsLeftQueued = objectQueue.size, callOrder = r.callOrder + "track-unsubscribe")
             afterUnsubscribe?.invoke()
@@ -1053,6 +1072,7 @@ internal class ScriptedEndpointBackend(private val failures: TestFailures) : End
                 when {
                     override is BackendCommandResult.Refused -> BackendTrackStateResult.Refused(override.code)
                     override is BackendCommandResult.Bridge -> BackendTrackStateResult.Bridge(override.failure)
+                    track in successorOf -> BackendTrackStateResult.Refused(MoqResultCode(-5))
                     track in failedTracks -> BackendTrackStateResult.State(6)
                     track in endedTracks -> BackendTrackStateResult.State(5)
                     track !in desiredTracks -> BackendTrackStateResult.State(if (track in issuedTracks) 3 else 0)

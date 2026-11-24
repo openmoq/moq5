@@ -15,11 +15,15 @@ internal class ReceiverStatsRowTest {
 
     @Test
     fun `the real stats cross field by field -- received and queued objects, a purge's drops, and the loss counters`() =
-        ok("receiverstats", "at rest every slot 0; feed two objects (4 and 6 bytes) -> received 2, queued 2, bytes 10; poll one -> queued 1, bytes 6; unsubscribe purges -> queued 0, bytes 0, dropped exactly 1, keyframes dropped 0 (no LOC frame marking), received still 2; gaps, unknown tails, reorder refusals and malformed tracks 0; paused 0, catalog complete 0")
+        ok("receiverstats", "at rest every slot 0 but the covered block's flag; feed two objects (4 and 6 bytes) -> received 2, queued 2, bytes 10; poll one -> queued 1, bytes 6; unsubscribe purges -> queued 0, bytes 0, dropped exactly 1, keyframes dropped 0 (no LOC frame marking), received still 2; gaps, unknown tails, reorder refusals and malformed tracks 0; paused 0, catalog complete 0")
 
     @Test
     fun `catalog completion latches from an isComplete catalog and is not the receiver's terminal`() =
         ok("receiverstatscomplete", "a generation-2 catalog with isComplete:true and no tracks -> catalog complete 1, catalog drops 0; one generation-3 catalog object after completion -> catalog drops exactly 1, complete still 1; the receiver is not fatal")
+
+    @Test
+    fun `the appended block crosses when the stamp covers it, with an MSF-02 catalog's revision`() =
+        ok("receiverstatsrevision", "before any catalog the block is covered (slot 16 = 1); after an MSF-02 catalog CATALOG_REVISION = 1 and every compression, header and ordering counter 0; the shipped decoder yields CatalogRevision.Msf02")
 
     @Test
     fun `malformed carriers refuse before any native read, and foreign or stale tokens are the registry's refusal`() =

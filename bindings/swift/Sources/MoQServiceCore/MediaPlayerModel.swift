@@ -190,6 +190,10 @@ public enum PlayerEndCause: Sendable, Hashable {
     case localFailure
     case closed
     case fatal
+    /// An MSF-02 catalog change replaced the track's handle
+    /// (``PlayerEvent/trackReplaced(_:replacement:)``); playback continues on
+    /// the replacement.
+    case replaced
     case unknown(UInt32)
 }
 
@@ -262,5 +266,10 @@ public enum PlayerEvent: Sendable {
     case timingIndependent(renderGroup: Int32?)
     case syncUnavailable(renderGroup: Int32?, reason: UInt32)
     case knowledgeForgotten(PlayerTrack, firstGroupID: UInt64, lastGroupID: UInt64)
+    /// An MSF-02 catalog changed the track in a decode- or delivery-critical
+    /// way, so a new handle replaces it. A selected track ends with
+    /// ``PlayerEndCause/replaced`` and the replacement is selected with its
+    /// configuration once announced.
+    case trackReplaced(PlayerTrack, replacement: PlayerTrack)
     case unknown(kind: UInt32, track: PlayerTrack?)
 }

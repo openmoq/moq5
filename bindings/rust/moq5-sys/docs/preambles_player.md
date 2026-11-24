@@ -49,8 +49,28 @@ EVENT records on a separate queue and never interleave with OUTPUT.
 
 This release supports RAW/LOC video and the RAW/LOC audio codecs `opus`
 and `mp4a.40.2`, on drafts 16, 18 and 22. CMAF, MPEG-2 TS, dependent
-spatial layers and timeline tracks are refused at selection with
-MOQ_ERR_UNSUPPORTED; the receiver serves them directly.
+spatial layers, timeline tracks and tracks whose catalog entry declares
+an encryptionScheme (MSF 4.4.1: the player plays clear media only) are
+refused at selection with MOQ_ERR_UNSUPPORTED; the receiver serves them
+directly.
+
+Replacement: when an MSF-02 catalog changes a declared track in a
+decode- or delivery-critical way, the receiver replaces its handle
+(moq_media_track_event_t.replaced_by). The player reports TRACK_REPLACED
+for the old handle in place of TRACK_REMOVED. A selected track still
+playing ends at once, END{REPLACED, IMMEDIATE}, and its selection moves
+to the new handle: once the receiver announces that handle, the player
+selects it with the old selection's start, independent_timing and
+shared_epoch, so playback continues behind the decoder reset its own
+CONFIGURE implies. While the selection is moving, the old track's slot
+is kept for it (another selection may find no room, MOQ_ERR_LIMIT) and
+ENDED does not fire. A new handle the player cannot select (other than
+for want of a slot) is offered as TRACK_AVAILABLE instead, and the
+selection the receiver moved to it is withdrawn. So it is for a track
+whose END was already out: it moves no selection, and is released. An
+advisory change (TRACK_UPDATED at the receiver) does not affect
+playback. As the receiver documents, a replacement does not guarantee
+that the new handle's first Objects use the new configuration.
 
 Threading: the player owns no thread. Every call on a player, wait and
 the observers included, is made by the application on one thread at a

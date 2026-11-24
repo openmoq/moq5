@@ -1191,45 +1191,56 @@ int main(void)
         MOQ_TEST_PASS("catalog_update.overcap_delta_refused");
     }
 
-    /* -- the receiver reads catalogs through the MSF-01 extent ------------- *
-     * An MSF-02 catalog ("draft-02") is not understood: as the first catalog
-     * it leaves no usable effective one. */
+    /* -- the receiver reads catalogs of both revisions ---------------------- *
+     * An MSF-02 catalog ("draft-02") is adopted as such. */
     {
         moq_media_receiver_t *r = moq_media_receiver_test_new(false);
         ingest(r, 0, 0, "{\"version\":\"draft-02\",\"generatedAt\":1,"
                         "\"tracks\":[" TRK("a", "video") "]}");
         n = drain(r, k, tr, 16);
-        MOQ_TEST_CHECK_EQ_INT(count_kind(k, tr, n, MOQ_MEDIA_CATALOG_READY, NULL, NULL), 0);
-        MOQ_TEST_CHECK(moq_media_receiver_test_is_fatal(r));
-        MOQ_TEST_CHECK_EQ_U64(moq_media_receiver_test_fatal_code(r),
-                              MOQ_MEDIA_RECEIVER_FATAL_CATALOG_UNUSABLE);
+        MOQ_TEST_CHECK_EQ_INT(count_kind(k, tr, n, MOQ_MEDIA_CATALOG_READY, NULL, NULL), 1);
+        MOQ_TEST_CHECK(!moq_media_receiver_test_is_fatal(r));
+        moq_media_receiver_stats_t st;
+        MOQ_TEST_CHECK(moq_media_receiver_get_stats(r, &st, sizeof(st)) == MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(st.catalog_revision, MOQ_MSF_REVISION_02);
         moq_media_receiver_test_free(r);
-        MOQ_TEST_PASS("catalog_update.msf02_catalog_not_read");
+        MOQ_TEST_PASS("catalog_update.msf02_catalog_read");
     }
 
-    /* ... and an MSF-01 catalog's publishTracks are not read: neither a
-     * malformed array nor a duplicated entry changes what is adopted. */
+    /* ... and an MSF-01 catalog's publishTracks are read (MSF-01 5.1.5): a
+     * malformed array, or a name repeated within it (5.2.3), makes the
+     * catalog unusable, while well-formed ones are adopted. */
     {
-        static const char *const cats[] = {
+        static const char *const bad[] = {
             "{\"version\":\"1\",\"tracks\":[" TRK("a", "video") "],"
             "\"publishTracks\":{}}",
             "{\"version\":\"1\",\"tracks\":[" TRK("a", "video") "],"
             "\"publishTracks\":[" TRK("p", "log") "," TRK("p", "log") "]}",
         };
-        for (size_t i = 0; i < sizeof(cats) / sizeof(cats[0]); i++) {
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
             moq_media_receiver_t *r = moq_media_receiver_test_new(false);
-            ingest(r, 0, 0, cats[i]);
+            ingest(r, 0, 0, bad[i]);
             n = drain(r, k, tr, 16);
             MOQ_TEST_CHECK_EQ_INT(count_kind(k, tr, n, MOQ_MEDIA_CATALOG_READY,
-                                             NULL, NULL), 1);
-            MOQ_TEST_CHECK(!moq_media_receiver_test_is_fatal(r));
-            MOQ_TEST_CHECK(moq_media_receiver_test_track_count(r) == 1);
+                                             NULL, NULL), 0);
+            MOQ_TEST_CHECK(moq_media_receiver_test_is_fatal(r));
+            MOQ_TEST_CHECK_EQ_U64(moq_media_receiver_test_fatal_code(r),
+                                  MOQ_MEDIA_RECEIVER_FATAL_CATALOG_UNUSABLE);
             moq_media_receiver_test_free(r);
         }
-        MOQ_TEST_PASS("catalog_update.msf01_publish_tracks_not_read");
+        moq_media_receiver_t *r = moq_media_receiver_test_new(false);
+        ingest(r, 0, 0, "{\"version\":\"1\",\"tracks\":[" TRK("a", "video") "],"
+                        "\"publishTracks\":[" TRK("p", "log") "," TRK("q", "log") "]}");
+        n = drain(r, k, tr, 16);
+        MOQ_TEST_CHECK_EQ_INT(count_kind(k, tr, n, MOQ_MEDIA_CATALOG_READY, NULL, NULL), 1);
+        MOQ_TEST_CHECK(!moq_media_receiver_test_is_fatal(r));
+        MOQ_TEST_CHECK(moq_media_receiver_test_track_count(r) == 1);
+        moq_media_receiver_test_free(r);
+        MOQ_TEST_PASS("catalog_update.msf01_publish_tracks_read");
     }
 
-    /* ... and a delta that only MSF-02 can express ("update") is dropped. */
+    /* ... and on an MSF-01 base a delta that only MSF-02 can express
+     * ("update") is dropped: a delta follows its base's revision. */
     {
         moq_media_receiver_t *r = moq_media_receiver_test_new(false);
         ingest(r, 0, 0, CAT2(TRK("a", "video"), TRK("b", "audio")));
@@ -1240,7 +1251,7 @@ int main(void)
         MOQ_TEST_CHECK_EQ_U64(moq_media_receiver_test_catalog_drops(r), d0 + 1);
         MOQ_TEST_CHECK(!moq_media_receiver_test_is_fatal(r));
         moq_media_receiver_test_free(r);
-        MOQ_TEST_PASS("catalog_update.msf02_delta_not_read");
+        MOQ_TEST_PASS("catalog_update.msf02_delta_on_msf01_base_dropped");
     }
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

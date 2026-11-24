@@ -82,6 +82,11 @@ package enum TerminalFailure: Sendable, Equatable {
 /// receiver's life) always maps to the same ID, so the Swift side can keep
 /// one `MediaTrack` instance per handle. `trackDescription` is a deep copy
 /// taken AT poll time on the service thread — no C borrow crosses this seam.
+/// `configGeneration` is the generation of the description the event
+/// announces. An MSF-02 replacement links two handles: its `.removed` names
+/// the successor (`replacedByHandleID`) and the `.added` right after it names
+/// the predecessor (`replacesHandleID`); both are nil on every other event
+/// and when the native event does not carry them.
 @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
 package struct ReceiverPolledEvent: Sendable {
     package enum Kind: Sendable {
@@ -101,18 +106,27 @@ package struct ReceiverPolledEvent: Sendable {
     package var parseDropClass: ParseDropClass?
     package var parseDropTotal: UInt64
     package var parseDropDelta: UInt64
+    package var configGeneration: UInt32
+    package var replacesHandleID: UInt64?
+    package var replacedByHandleID: UInt64?
 
     package init(kind: Kind, handleID: UInt64,
                  trackDescription: TrackDescription?,
                  parseDropClass: ParseDropClass? = nil,
                  parseDropTotal: UInt64 = 0,
-                 parseDropDelta: UInt64 = 0) {
+                 parseDropDelta: UInt64 = 0,
+                 configGeneration: UInt32 = 0,
+                 replacesHandleID: UInt64? = nil,
+                 replacedByHandleID: UInt64? = nil) {
         self.kind = kind
         self.handleID = handleID
         self.trackDescription = trackDescription
         self.parseDropClass = parseDropClass
         self.parseDropTotal = parseDropTotal
         self.parseDropDelta = parseDropDelta
+        self.configGeneration = configGeneration
+        self.replacesHandleID = replacesHandleID
+        self.replacedByHandleID = replacedByHandleID
     }
 }
 

@@ -63,6 +63,9 @@ internal object TrustRouteProbe {
     /** Mirrors `MOQ5_CTOR_FAULT_DESC_COPY_REFUSE`: the next track-description copy is refused with MOQ_ERR_INVAL, not performed. */
     const val DESC_COPY_REFUSE_ONCE: String = "desc-copy-refuse-once-v1"
 
+    /** Mirrors `MOQ5_CTOR_FAULT_DESC_COPY_RESTAMP_V0`: the next copy is whole, then stamped with the v0 size, so every appended byte lies outside the stamp. */
+    const val DESC_COPY_RESTAMP_V0_ONCE: String = "desc-copy-restamp-v0-once-v1"
+
     /**
      * The exact Android `authType` for this route: the TLS 1.3 key-exchange
      * constant Conscrypt names for every TLS 1.3 suite. A QUIC client never
@@ -320,7 +323,9 @@ internal object TrustRouteProbe {
      * bytes (negative: the whole struct), with [values] in header order --
      * local_result, initiating_request_id, fill_reason, fill_error_domain,
      * fill_error_code, delivery_origin, delivery_initiating_request_id, and the
-     * fill-loss causes, group and object.
+     * fill-loss causes, group and object -- then, optionally, the replacement
+     * links replaces and replaced_by, each 0 (NULL), 1 (the first real handle
+     * the product polled) or 2 (the last).
      */
     @JvmStatic external fun nativeArmTrackEvent(kind: Int, stamp: Long, values: LongArray)
 
@@ -345,6 +350,8 @@ internal object TrustRouteProbe {
         const val DELIVERY_ID = 7
         const val FILL_LOSS_CAUSES = 8
         const val FILL_LOSS_OBJECT = 9
+        const val REPLACES = 10
+        const val REPLACED_BY = 11
     }
 
     /**

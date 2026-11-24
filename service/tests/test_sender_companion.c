@@ -94,19 +94,29 @@ PIN(offsetof(moq_media_sender_cfg_t, has_initial_group_id) >= AUTH_CFG_EXTENT,
     "the initial Group ID pair never uses the auth padding");
 PIN(offsetof(moq_media_sender_cfg_t, initial_group_id) > offsetof(moq_media_sender_cfg_t, has_initial_group_id),
     "flag before value");
+/* The sizeof through initial_group_id: what every caller built before the
+ * catalog revision passes as struct_size. */
+#define GROUP_CFG_EXTENT \
+    (((offsetof(moq_media_sender_cfg_t, initial_group_id) + sizeof(uint64_t) + ALIGNOF(old_sender_cfg_t) - 1) / \
+      ALIGNOF(old_sender_cfg_t)) * ALIGNOF(old_sender_cfg_t))
+PIN(offsetof(moq_media_sender_cfg_t, catalog_revision) == GROUP_CFG_EXTENT,
+    "the catalog revision starts at the old sizeof");
 PIN(sizeof(moq_media_sender_cfg_t) ==
-    ((offsetof(moq_media_sender_cfg_t, initial_group_id) + sizeof(uint64_t) + ALIGNOF(old_sender_cfg_t) - 1) /
+    ((offsetof(moq_media_sender_cfg_t, _reserved_catalog_revision) + 4u + ALIGNOF(old_sender_cfg_t) - 1) /
      ALIGNOF(old_sender_cfg_t)) * ALIGNOF(old_sender_cfg_t), "full cfg extent");
 #if UINTPTR_MAX == UINT64_MAX
-PIN(sizeof(old_sender_cfg_t) == 176 && sizeof(old_companion_sender_cfg_t) == 184 && sizeof(moq_media_sender_cfg_t) == 208, "LP64 cfg pin");
+PIN(sizeof(old_sender_cfg_t) == 176 && sizeof(old_companion_sender_cfg_t) == 184 &&
+    GROUP_CFG_EXTENT == 208 && sizeof(moq_media_sender_cfg_t) == 216, "LP64 cfg pin");
 PIN(sizeof(old_send_object_t) == 72 && sizeof(old_metadata_send_object_t) == 80 &&
     sizeof(moq_media_send_object_t) == 88, "LP64 object pin");
 #elif defined(__arm__)
-PIN(sizeof(old_sender_cfg_t) == 112 && sizeof(old_companion_sender_cfg_t) == 120 && sizeof(moq_media_sender_cfg_t) == 144, "ARM cfg pin");
+PIN(sizeof(old_sender_cfg_t) == 112 && sizeof(old_companion_sender_cfg_t) == 120 &&
+    GROUP_CFG_EXTENT == 144 && sizeof(moq_media_sender_cfg_t) == 152, "ARM cfg pin");
 PIN(sizeof(old_send_object_t) == 56 && sizeof(old_metadata_send_object_t) == 64 &&
     sizeof(moq_media_send_object_t) == 72, "ARM object pin");
 #elif defined(__i386__)
-PIN(sizeof(old_sender_cfg_t) == 104 && sizeof(old_companion_sender_cfg_t) == 108 && sizeof(moq_media_sender_cfg_t) == 132, "i686 cfg pin");
+PIN(sizeof(old_sender_cfg_t) == 104 && sizeof(old_companion_sender_cfg_t) == 108 &&
+    GROUP_CFG_EXTENT == 132 && sizeof(moq_media_sender_cfg_t) == 140, "i686 cfg pin");
 PIN(sizeof(old_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 48 : 52), "i686 old object pin");
 PIN(sizeof(old_metadata_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 52 : 56), "i686 object-through-metadata pin");
 PIN(sizeof(moq_media_send_object_t) == (sizeof(moq_sap_type_t) == 1 ? 56 : 60), "i686 full object pin");

@@ -3,10 +3,12 @@ package org.openmoq.moq5.engine
 import org.openmoq.moq5.CencInfo
 import org.openmoq.moq5.CmafCodecKind
 import org.openmoq.moq5.CmafInitInfo
+import org.openmoq.moq5.InitSource
 import org.openmoq.moq5.MediaBytes
 import org.openmoq.moq5.MediaType
 import org.openmoq.moq5.PackagingKind
 import org.openmoq.moq5.TrackDescription
+import org.openmoq.moq5.TrackEncryption
 import org.openmoq.moq5.UnknownNativeValueException
 import org.openmoq.moq5.jni.TrackDescribeBytes
 import org.openmoq.moq5.jni.TrackDescribeScalars
@@ -20,7 +22,11 @@ import org.openmoq.moq5.jni.TrackDescribeScalars
  * folded into an invented case. 64-bit scalars are reinterpreted as `ULong`
  * with all their bits. Byte fields: the name is always present; an optional
  * byte attribute with no presence bit of its own is `null` when its native
- * span is empty; attributes with a presence bit follow the bit.
+ * span is empty; attributes with a presence bit follow the bit. The appended
+ * fields follow the [TrackDescribeScalars.HAS] mask: the generation block is
+ * null unless the copy's stamp covered it, and each encryption field is null
+ * unless the catalog carried it. The init source is an open set, so an
+ * unknown value is [InitSource.Unknown], not a refusal.
  */
 internal object TrackDescriptionCodec {
     fun mediaTypeOf(raw: Long): MediaType? =
@@ -50,6 +56,11 @@ internal object TrackDescriptionCodec {
             else -> throw UnknownNativeValueException("cmaf codec kind", raw)
         }
 
+    private const val ENCRYPTION_HAS =
+        TrackDescribeScalars.HAS_ENCRYPTION_SCHEME or TrackDescribeScalars.HAS_CIPHER_SUITE or
+            TrackDescribeScalars.HAS_KEY_ID or TrackDescribeScalars.HAS_TRACK_BASE_KEY
+    private const val KNOWN_HAS = TrackDescribeScalars.HAS_GENERATION or ENCRYPTION_HAS
+
     /** The array length the carrier must have for these scalars. */
     fun expectedByteFields(scalars: LongArray): Int =
         TrackDescribeBytes.FIXED + scalars[TrackDescribeScalars.DEPENDS_COUNT].toInt() + scalars[TrackDescribeScalars.CP_REF_ID_COUNT].toInt()
@@ -61,6 +72,22 @@ internal object TrackDescriptionCodec {
         fun u32(i: Int) = scalars[i].toUInt()
         fun u64(i: Int) = scalars[i].toULong()
         fun optional(i: Int): MediaBytes? = bytes[i].takeIf { it.isNotEmpty() }?.let(::MediaBytes)
+        val has = scalars[TrackDescribeScalars.HAS]
+        if (has and KNOWN_HAS.inv() != 0L) throw UnknownNativeValueException("describe presence", has)
+        fun covered(bit: Long): Boolean = has and bit != 0L
+        fun carried(bit: Long, i: Int): MediaBytes? = if (covered(bit)) MediaBytes(bytes[i]) else null
+        val generation = covered(TrackDescribeScalars.HAS_GENERATION)
+        val encryption =
+            if (has and ENCRYPTION_HAS == 0L) {
+                null
+            } else {
+                TrackEncryption(
+                    scheme = carried(TrackDescribeScalars.HAS_ENCRYPTION_SCHEME, TrackDescribeBytes.ENCRYPTION_SCHEME),
+                    cipherSuite = carried(TrackDescribeScalars.HAS_CIPHER_SUITE, TrackDescribeBytes.CIPHER_SUITE),
+                    keyId = carried(TrackDescribeScalars.HAS_KEY_ID, TrackDescribeBytes.KEY_ID),
+                    trackBaseKey = carried(TrackDescribeScalars.HAS_TRACK_BASE_KEY, TrackDescribeBytes.TRACK_BASE_KEY),
+                )
+            }
         val hasInit = flag(TrackDescribeScalars.HAS_INIT)
         val init =
             if (!hasInit) {
@@ -118,6 +145,10 @@ internal object TrackDescriptionCodec {
             depends = depends,
             trackDurationMs = if (flag(TrackDescribeScalars.HAS_TRACK_DURATION)) u64(TrackDescribeScalars.TRACK_DURATION_MS) else null,
             isLive = flag(TrackDescribeScalars.IS_LIVE),
+            configGeneration = if (generation) u32(TrackDescribeScalars.DESC_GENERATION) else null,
+            initSource = if (generation) InitSource.ofNative(u32(TrackDescribeScalars.INIT_SOURCE)) else null,
+            initPropertyType = if (generation && scalars[TrackDescribeScalars.INIT_PROPERTY_TYPE] != 0L) u64(TrackDescribeScalars.INIT_PROPERTY_TYPE) else null,
+            encryption = encryption,
         )
     }
 }

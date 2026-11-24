@@ -170,6 +170,7 @@ internal class JniEndpointBackend private constructor(
                         description = description,
                         parseDropsTotal = sc[ReceiverEventScalars.PARSE_DROPS_TOTAL].toULong(),
                         parseDropsDelta = sc[ReceiverEventScalars.PARSE_DROPS_DELTA].toULong(),
+                        configGeneration = sc[ReceiverEventScalars.CONFIG_GENERATION].toUInt(),
                     ),
                 )
             }
@@ -189,11 +190,14 @@ internal class JniEndpointBackend private constructor(
      * library's stamp covered it (null otherwise: unobserved, never zero).
      * Every other kind leaves them zero in C and null here. A value outside
      * its closed C set is the bridge's contract broken, like an unknown kind.
+     * The replacement link is the successor on a REMOVED and the predecessor
+     * on an ADDED; a zero token is the C's NULL.
      */
     private fun appendedFields(sc: LongArray, base: BackendTrackEvent): BackendTrackEventResult {
         val has = sc[ReceiverEventScalars.HAS]
         fun covered(bit: Long): Boolean = has and bit != 0L
         fun refused(what: String, raw: Long) = BackendTrackEventResult.Bridge(failure("receiver-poll-track-$what", raw.toInt()))
+        fun link(slot: Int): Long? = if (covered(ReceiverEventScalars.HAS_REPLACEMENT)) sc[slot].takeIf { it != 0L } else null
         val local = if (covered(ReceiverEventScalars.HAS_LOCAL_RESULT)) MoqResultCode(sc[ReceiverEventScalars.LOCAL_RESULT].toInt()) else null
         val initiating = if (covered(ReceiverEventScalars.HAS_INITIATING_ID)) RequestId(sc[ReceiverEventScalars.INITIATING_ID].toULong()) else null
         val event =
@@ -228,6 +232,8 @@ internal class JniEndpointBackend private constructor(
                     base.copy(initiatingRequestId = initiating, fillReason = reason, fillErrorDomain = domain, fillErrorCode = code, fillLoss = loss)
                 }
                 BackendTrackEventKind.FillCreated -> base.copy(initiatingRequestId = initiating)
+                BackendTrackEventKind.Added -> base.copy(replaces = link(ReceiverEventScalars.REPLACES))
+                BackendTrackEventKind.Removed -> base.copy(replacedBy = link(ReceiverEventScalars.REPLACED_BY))
                 else -> base
             }
         return BackendTrackEventResult.Event(event)

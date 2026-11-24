@@ -248,12 +248,13 @@ typedef struct moq_media_sender_cfg {
      * D22_MSF01_LOC04_PUBLIC or D22_MSF01_LOC05_PUBLIC still requires the
      * tail. On drafts 16/18 the tail is ignored, as with LEGACY.
      *
-     * Every companion publishes the MSF-01 catalog: version
-     * "draft-01"; every track's init_data in the root initDataList,
-     * referenced by initRef (no per-track initData); a CMAF track without
-     * init_data refused by add_track (CMSF-01 3.1); an added track with
-     * init_data published as a full catalog, not a delta. This also applies
-     * before AUTO resolves.
+     * Every companion publishes the catalog revision catalog_revision
+     * selects -- MSF-01, version "draft-01", by default; the companion names
+     * the transport and LOC pairing, not the revision -- with every track's
+     * init_data in the root initDataList, referenced by initRef (no
+     * per-track initData); a CMAF track without init_data refused by
+     * add_track (CMSF-01 3.1); an added track with init_data published as a
+     * full catalog, not a delta. This also applies before AUTO resolves.
      *
      * D22_MSF01_LOC04_PUBLIC and D22_MSF01_LOC05_PUBLIC select each track's
      * Group IDs (media, generated timeline and catalog) starting at the
@@ -305,6 +306,18 @@ typedef struct moq_media_sender_cfg {
     uint32_t                             _reserved_initial_group_id;
     bool                                 has_initial_group_id;
     uint64_t                             initial_group_id;
+    /* Appended after initial_group_id. MSF revision of the published catalog
+     * (MOQ_MSF_REVISION_*). Zero, absent or partially covered: REVISION_01, as
+     * before this field existed; the sized initializers leave it zero.
+     * REVISION_02: "version":"draft-02", generatedAt on every delta, SAP
+     * records keyed "L", and add_track refuses a RAW/LOC track the MSF-02
+     * 5.2.4.1 table would reject (MOQ_ERR_INVAL; see moq_media_sender_add_track
+     * for every MSF-02 rule it applies). Orthogonal to companion_profile.
+     * Unknown values fail creation (MOQ_ERR_INVAL).
+     * _reserved_catalog_revision is never read: it keeps the next appended
+     * field past this layout's sizeof on every target. */
+    moq_msf_revision_t                   catalog_revision;
+    uint8_t                              _reserved_catalog_revision[4];
 } moq_media_sender_cfg_t;
 
 /* Plain init leaves backpressure UNSET on purpose -- the choice is forced,
@@ -433,7 +446,9 @@ typedef struct moq_media_track_cfg {
      * object written to THIS track MUST declare sap_type TYPE_1 or TYPE_2 --
      * write() returns MOQ_ERR_INVAL for a missing declaration or NONE / UNKNOWN
      * / TYPE_3 at a group start. Mid-group declared TYPE_1/2/3 produce records;
-     * mid-group NONE is an ordinary frame (no record). Default false => no
+     * mid-group NONE is an ordinary frame (no record). Each record names its
+     * Object's Location under "l" (CMSF-01 3.6.1), or "L" when the sender's
+     * catalog_revision is REVISION_02 (MSF-02 8.2). Default false => no
      * timeline track and a byte-identical catalog + wire to today. The
      * generated track is published with its own MOQT track and is NOT a media
      * track: apps never write to it (write() rejects its handle). One timeline
@@ -503,19 +518,36 @@ typedef struct moq_media_track_cfg {
     bool        has_publisher_priority;
     uint8_t     publisher_priority;
 
-    /* Packaging-extension records for this track's catalog entry, one per
-     * kind (see moq_msf_track_ext_t). An MPEG2TS track carries exactly one
+    /* Extension records for this track's catalog entry, one per kind (see
+     * moq_msf_track_ext_t). An MPEG2TS track carries exactly one
      * MOQ_MSF_EXT_MPEG2TS record (draft-gregoire-moq-msfts: mode, packet
      * size, program number, ...); read it back with
-     * moq_msf_ext_mpeg2ts(extensions, extension_count). Borrowed for the
-     * call: add_track deep-copies the entry array, each record (up to its own
+     * moq_msf_ext_mpeg2ts(extensions, extension_count). A track of any
+     * packaging may carry one MOQ_MSF_EXT_SUPPLEMENT record
+     * (moq_msf_track_supplement_t) with the MSF-02 fields the sender can
+     * honour: packagingMetadata (its "streamMapping", if given, "group": the
+     * sender sends every Object of a Group on one subgroup, MSF-02 4.1.1),
+     * keyframeSpacing and accessibleWindowTime. Borrowed for the call:
+     * add_track deep-copies the entry array, each record (up to its own
      * struct_size), its spans and its si_pids. add_track returns
      * MOQ_ERR_INVAL for a count without an array, an unknown or NONE kind, a
      * kind listed twice, a NULL record, a record below its first published
      * size, a kind that does not belong to the track's packaging, an MPEG2TS
      * track without its record, or a record that fails
-     * moq_msf_track_mpeg2ts_check(). Empty (the default) for other
-     * packagings.
+     * moq_msf_track_mpeg2ts_check(); and for a supplement with a malformed
+     * bit, a present span without bytes, a streamMapping other than "group",
+     * any of encryptionScheme, cipherSuite, keyId and trackBaseKey (the
+     * sender does not encrypt, so it announces no encryption, and its
+     * catalog is not encrypted end to end, so it carries no key material:
+     * MSF-02 13.2), "depends" entries or has_depends (a renderGroup
+     * dependency must resolve in every catalog, MSF-02 5.2.15, which
+     * remove_track could not keep true), or, unless catalog_revision is
+     * REVISION_02, any field at all (MSF-01 defines none of them; an empty
+     * record changes nothing). In an MSF-02 catalog the fields follow
+     * moq_msf_catalog_encode's rules, and the tracks of one altGroup carry
+     * one accessibleWindowTime (MSF-02 5.2.45): a track whose window, or its
+     * absence, differs from that of a track already added to its altGroup is
+     * MOQ_ERR_INVAL. Empty (the default) adds nothing.
      *
      * Appended after publisher_priority, aligned as uint64_t (the ABI's own
      * alignment for it, as on the priority pair), so the block starts at or
@@ -679,6 +711,20 @@ MOQ_API void moq_media_track_cfg_init_sized(moq_media_track_cfg_t *cfg,
  * non-empty codec (5.2.18) and a non-zero bitrate (5.2.22), and an audio track
  * MUST additionally carry a non-zero samplerate (5.2.28) and a non-empty
  * channel_config (5.2.29). A track missing a required field is MOQ_ERR_INVAL.
+ *
+ * A sender whose catalog_revision is REVISION_02 authors the track as
+ * MSF-02 requires, and refuses with MOQ_ERR_INVAL, before registering
+ * anything, a track its catalog could not carry: a "loc" track without a
+ * field MSF-02 5.2.4.1 requires of its (packaging, role) -- codec, bitrate,
+ * samplerate and channel_config for role "audio"; codec, bitrate and
+ * framerate for "video"; codec, samplerate, channel_config and lang for
+ * "audiodescription"; codec and framerate for "signlanguage" (the role is
+ * the configured one, or the media type's) -- a name that is not UTF-8 or
+ * holds NUL (MSF-02 11.2.1), or a supplement moq_msf_catalog_encode refuses
+ * (see moq_media_track_cfg_t.extensions). Other packagings gain no
+ * required field, and the MSF-01 rules above still apply. A generated
+ * timeline names its media track in "depends", which must resolve (MSF-02
+ * 5.2.15), so it is in the catalog only while its media track is.
  *
  * MPEG2TS tracks (draft-gregoire-moq-msfts). The catalog entry is
  * packaging "mpeg2ts", mimeType "video/mp2t", the record's mpeg2ts* fields,

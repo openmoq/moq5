@@ -140,6 +140,10 @@ bool track_in_catalog(const moq_media_track_t *t, bool only_registered)
 {
     if (t->is_catalog || t->removed || t->auth_failed) return false;
     if (only_registered && (!t->pub_track || t->publish_auth.prepared)) return false;
+    /* An MSF-02 timeline's "depends" must resolve (MSF-02 5.2.15), so it
+     * joins and leaves the catalog with its media track. */
+    if (t->catalog_needs && !track_in_catalog(t->catalog_needs, only_registered))
+        return false;
     return true;
 }
 
@@ -320,7 +324,10 @@ static moq_result_t sender_build_catalog_at(moq_media_sender_t *s,
          * marked removed (complete_finalized), so the loop above already
          * yields an empty tracks array. */
         cat.is_complete = s->complete_finalized;
-        cat.version_form = MOQ_MSF_VERSION_FORM_DRAFT_NAME;   /* MSF-01 5.1.1 */
+        /* "draft-01" (MSF-01 5.1.1); an MSF-02 catalog is "draft-02", its
+         * one spelling (MSF-02 5.1.1), whatever version_form says. */
+        cat.version_form = MOQ_MSF_VERSION_FORM_DRAFT_NAME;
+        cat.revision = s->catalog_revision;
         rc = moq_msf_catalog_encode(&s->alloc, &cat, out);
     }
 
@@ -330,6 +337,36 @@ static moq_result_t sender_build_catalog_at(moq_media_sender_t *s,
     s->alloc.free(b64, cap * sizeof(moq_rcbuf_t *), s->alloc.ctx);
     s->alloc.free(idl, cap * sizeof(moq_msf_init_data_entry_t), s->alloc.ctx);
     return rc;
+}
+
+
+/* MSF-02 authoring is strict, and the encoder is the one authority on what
+ * it accepts: encode `tracks` (a media track and its generated timelines, as
+ * the catalog will carry them) as a one-off MSF-02 catalog, so add_track
+ * refuses what every later catalog build would fail on -- the 5.2.4.1
+ * required fields, the 11.2.1 naming rule, a supplement's own syntax.
+ * Returns MOQ_OK, MOQ_ERR_INVAL for a track the encoder refuses, or
+ * MOQ_ERR_NOMEM. Reads only the tracks given, which are not yet registered;
+ * no lock is needed. */
+moq_result_t sender_catalog_probe_r02(moq_media_sender_t *s,
+                                      moq_media_track_t *const *tracks,
+                                      size_t n)
+{
+    moq_msf_track_t mt[3];
+    if (n == 0 || n > sizeof(mt) / sizeof(mt[0])) return MOQ_ERR_INVAL;
+    for (size_t i = 0; i < n; i++) track_fill_msf(tracks[i], &mt[i]);
+    moq_msf_catalog_t cat;
+    memset(&cat, 0, sizeof(cat));
+    cat.struct_size = sizeof(cat);
+    cat.version = MOQ_MSF_VERSION;
+    cat.tracks = mt;
+    cat.track_count = n;
+    cat.revision = MOQ_MSF_REVISION_02;
+    moq_rcbuf_t *probe = NULL;
+    moq_result_t rc = moq_msf_catalog_encode(&s->alloc, &cat, &probe);
+    if (probe) moq_rcbuf_decref(probe);
+    if (rc == MOQ_ERR_NOMEM) return rc;
+    return rc == MOQ_OK ? MOQ_OK : MOQ_ERR_INVAL;
 }
 
 
@@ -398,12 +435,15 @@ static bool rcbuf_bytes_eq(const moq_rcbuf_t *a, const moq_rcbuf_t *b)
  * rcbuf. An ADD op carries full, self-contained tracks (packaging/isLive forced
  * on so the encoder emits them). Init-bearing additions use a full independent
  * generation because deltas cannot carry the root initDataList;
- * a REMOVE op carries only the track name (MSF 5.1.6). Returns MOQ_OK with *out
- * set. */
+ * a REMOVE op carries only the track name (MSF 5.1.6). An MSF-02 delta also
+ * carries generatedAt, the stamp of the generation it belongs to, and no other
+ * root field (MSF-02 5.3); an MSF-01 delta is written without it. Returns
+ * MOQ_OK with *out set. */
 static moq_result_t sender_build_delta_op(moq_media_sender_t *s,
                                           moq_msf_delta_op_kind_t kind,
                                           moq_media_track_t *const *tracks,
-                                          size_t n, moq_rcbuf_t **out)
+                                          size_t n, uint64_t generated_at,
+                                          moq_rcbuf_t **out)
 {
     *out = NULL;
     if (n == 0) return MOQ_ERR_INVAL;
@@ -431,6 +471,11 @@ static moq_result_t sender_build_delta_op(moq_media_sender_t *s,
         cat.struct_size = sizeof(cat);
         cat.delta_update = &op;
         cat.delta_update_count = 1;
+        cat.revision = s->catalog_revision;
+        if (s->catalog_revision == MOQ_MSF_REVISION_02) {
+            cat.has_generated_at = true;
+            cat.generated_at = generated_at;
+        }
         rc = moq_msf_catalog_encode(&s->alloc, &cat, out);
     }
 
@@ -620,9 +665,12 @@ bool sender_stage_generation(moq_media_sender_t *s)
     moq_rcbuf_incref(base);
     /* REMOVE object before ADD object so the receiver observes remove-then-add
      * per tuple (immutable-tuple safety for same-name reuse). */
-    if (nr > 0) rc = sender_build_delta_op(s, MOQ_MSF_DELTA_OP_REMOVE, rems, nr, &rem_obj);
+    if (nr > 0)
+        rc = sender_build_delta_op(s, MOQ_MSF_DELTA_OP_REMOVE, rems, nr, stamp,
+                                   &rem_obj);
     if (rc == MOQ_OK && na > 0)
-        rc = sender_build_delta_op(s, MOQ_MSF_DELTA_OP_ADD, adds, na, &add_obj);
+        rc = sender_build_delta_op(s, MOQ_MSF_DELTA_OP_ADD, adds, na, stamp,
+                                   &add_obj);
 
     s->alloc.free(adds, s->track_count * sizeof(*adds), s->alloc.ctx);
     s->alloc.free(rems, s->track_count * sizeof(*rems), s->alloc.ctx);

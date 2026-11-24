@@ -70,19 +70,86 @@ void sender_ts_free(moq_media_sender_t *s, moq_media_track_t *t);
 static size_t sender_align8(size_t n) { return (n + 7u) & ~(size_t)7u; }
 
 
+/* A caller's track supplement read into a zeroed current record up to its
+ * own struct_size, which the caller has checked covers the first published
+ * layout (an older or a newer layout is never read through this type). */
+static void sender_supp_read(const moq_msf_track_supplement_t *src,
+                             moq_msf_track_supplement_t *out)
+{
+    uint32_t size;
+    memcpy(&size, src, sizeof(size));
+    moq_msf_track_supplement_init(out);
+    memcpy(out, src, size < sizeof(*out) ? size : sizeof(*out));
+    out->struct_size = (uint32_t)sizeof(*out);
+}
+
+
+/* The supplement content a sender can honour (see moq_media_track_cfg_t.
+ * extensions). No allocation. */
+static moq_result_t sender_check_supplement(const moq_msf_track_supplement_t *src,
+                                            moq_msf_revision_t rev)
+{
+    uint32_t size;
+    memcpy(&size, src, sizeof(size));
+    if (size < MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE) return MOQ_ERR_INVAL;
+    moq_msf_track_supplement_t sp;
+    sender_supp_read(src, &sp);
+    if (sp.malformed) return MOQ_ERR_INVAL;
+    /* The sender does not encrypt, so it announces no encryption (MSF-02
+     * 4.4.1: encryptionScheme means the payload is encrypted; without it
+     * cipherSuite and keyId describe nothing), and it never puts key material
+     * in its catalog, which is not encrypted end to end (MSF-02 13.2). */
+    if (sp.has_encryption_scheme || sp.has_cipher_suite || sp.has_key_id ||
+        sp.has_track_base_key)
+        return MOQ_ERR_INVAL;
+    /* A renderGroup dependency must resolve in every catalog (MSF-02
+     * 5.2.15), which remove_track could not keep true; has_depends belongs
+     * to a delta op track. */
+    if (sp.has_depends || sp.depends_render_group_count > 0)
+        return MOQ_ERR_INVAL;
+    if (sp.has_packaging_metadata) {
+        moq_bytes_t pm = sp.packaging_metadata, v;
+        if (pm.len > 0 && !pm.data) return MOQ_ERR_INVAL;
+        /* The publisher facade sends every Object of a Group on one
+         * subgroup: "group" mode (MSF-02 4.1.1), the only one it can
+         * honour. */
+        if (moq_msf_packaging_metadata_find(pm, "streamMapping", &v) &&
+            !(v.len == 5 && memcmp(v.data, "group", 5) == 0))
+            return MOQ_ERR_INVAL;
+    }
+    /* MSF-01 defines none of the remaining fields. */
+    if (rev != MOQ_MSF_REVISION_02 &&
+        (sp.has_packaging_metadata || sp.has_keyframe_spacing ||
+         sp.has_accessible_window_ms))
+        return MOQ_ERR_INVAL;
+    return MOQ_OK;
+}
+
+
 /* The list rules (the catalog encoder's, restated for add_track): an array
  * when count > 0, a known kind once, a record of at least its first
  * published size with coherent spans, and only on the packaging the kind
- * belongs to. Sets *rec to the MPEG2TS record (or NULL). No allocation. */
+ * belongs to; then each kind's own sender rules. Sets *rec to the MPEG2TS
+ * record and *supp to the supplement (or NULL). No allocation. */
 moq_result_t sender_check_extensions(const moq_media_track_cfg_t *cfg,
-                                     const moq_msf_mpeg2ts_t **rec)
+                                     moq_msf_revision_t rev,
+                                     const moq_msf_mpeg2ts_t **rec,
+                                     const moq_msf_track_supplement_t **supp)
 {
     *rec = NULL;
+    *supp = NULL;
     if (cfg->extension_count > 0 && !cfg->extensions) return MOQ_ERR_INVAL;
     if (!sender_product_fits(cfg->extension_count, sizeof(moq_msf_track_ext_t)))
         return MOQ_ERR_INVAL;
     for (size_t i = 0; i < cfg->extension_count; i++) {
         const moq_msf_track_ext_t *e = &cfg->extensions[i];
+        if (e->kind == MOQ_MSF_EXT_SUPPLEMENT) {
+            if (*supp || !e->u.supplement) return MOQ_ERR_INVAL;
+            moq_result_t rc = sender_check_supplement(e->u.supplement, rev);
+            if (rc != MOQ_OK) return rc;
+            *supp = e->u.supplement;
+            continue;
+        }
         if (e->kind != MOQ_MSF_EXT_MPEG2TS) return MOQ_ERR_INVAL;
         if (*rec) return MOQ_ERR_INVAL;                   /* duplicate kind */
         const moq_msf_mpeg2ts_t *m = e->u.mpeg2ts;
@@ -102,57 +169,101 @@ moq_result_t sender_check_extensions(const moq_media_track_cfg_t *cfg,
 }
 
 
-/* Deep-copy the checked list into one block (entries, record, SI PIDs,
- * names), so the caller's buffers need not outlive add_track. */
+/* Deep-copy the checked records into one block -- the entries in kind
+ * order, then each record with what it owns (the MPEG2TS record's SI PIDs
+ * and names, the supplement's packagingMetadata) -- so the caller's buffers
+ * need not outlive add_track. Every size is checked before the one
+ * allocation, and nothing is changed on failure. */
 moq_result_t sender_copy_extensions(moq_media_sender_t *s,
                                     moq_media_track_t *t,
-                                    const moq_msf_mpeg2ts_t *src)
+                                    const moq_msf_mpeg2ts_t *src,
+                                    const moq_msf_track_supplement_t *supp_src)
 {
-    if (!src) return MOQ_OK;
-    size_t pids = src->si_pid_count * sizeof(uint32_t);
-    size_t need = sender_align8(sizeof(moq_msf_track_ext_t));
-    if (!sender_sum_fits(&need, sender_align8(sizeof(moq_msf_mpeg2ts_t))) ||
-        pids > SIZE_MAX - 8u ||
-        !sender_sum_fits(&need, sender_align8(pids)) ||
-        src->mode_name.len > SIZE_MAX - 8u ||
-        !sender_sum_fits(&need, sender_align8(src->mode_name.len)) ||
-        src->timestamp_mode_name.len > SIZE_MAX - 8u ||
-        !sender_sum_fits(&need, sender_align8(src->timestamp_mode_name.len)))
+    size_t entries = (src ? 1u : 0u) + (supp_src ? 1u : 0u);
+    if (entries == 0) return MOQ_OK;
+    moq_msf_track_supplement_t supp;
+    moq_bytes_t pm = { NULL, 0 };
+    if (supp_src) {
+        sender_supp_read(supp_src, &supp);
+        if (supp.has_packaging_metadata) pm = supp.packaging_metadata;
+    }
+    size_t pids = src ? src->si_pid_count * sizeof(uint32_t) : 0u;
+    size_t need = sender_align8(entries * sizeof(moq_msf_track_ext_t));
+    if (src &&
+        (!sender_sum_fits(&need, sender_align8(sizeof(moq_msf_mpeg2ts_t))) ||
+         pids > SIZE_MAX - 8u ||
+         !sender_sum_fits(&need, sender_align8(pids)) ||
+         src->mode_name.len > SIZE_MAX - 8u ||
+         !sender_sum_fits(&need, sender_align8(src->mode_name.len)) ||
+         src->timestamp_mode_name.len > SIZE_MAX - 8u ||
+         !sender_sum_fits(&need, sender_align8(src->timestamp_mode_name.len))))
+        return MOQ_ERR_INVAL;
+    if (supp_src &&
+        (!sender_sum_fits(&need,
+                          sender_align8(sizeof(moq_msf_track_supplement_t))) ||
+         pm.len > SIZE_MAX - 8u ||
+         !sender_sum_fits(&need, sender_align8(pm.len))))
         return MOQ_ERR_INVAL;
     uint8_t *blk = (uint8_t *)s->alloc.alloc(need, s->alloc.ctx);
     if (!blk) return MOQ_ERR_NOMEM;
     memset(blk, 0, need);
     moq_msf_track_ext_t *list = (moq_msf_track_ext_t *)(void *)blk;
-    size_t off = sender_align8(sizeof(moq_msf_track_ext_t));
-    moq_msf_mpeg2ts_t *rec = (moq_msf_mpeg2ts_t *)(void *)(blk + off);
-    off += sender_align8(sizeof(*rec));
-    moq_msf_mpeg2ts_init(rec);
-    memcpy(rec, src, src->struct_size < sizeof(*rec) ? src->struct_size
-                                                     : sizeof(*rec));
-    rec->struct_size = (uint32_t)sizeof(*rec);
-    rec->si_pids = NULL;
-    rec->mode_name = (moq_bytes_t){ NULL, 0 };
-    rec->timestamp_mode_name = (moq_bytes_t){ NULL, 0 };
-    if (pids > 0) {
-        memcpy(blk + off, src->si_pids, pids);
-        rec->si_pids = (uint32_t *)(void *)(blk + off);
-        off += sender_align8(pids);
+    size_t off = sender_align8(entries * sizeof(moq_msf_track_ext_t));
+    size_t k = 0;
+    if (src) {
+        moq_msf_mpeg2ts_t *rec = (moq_msf_mpeg2ts_t *)(void *)(blk + off);
+        off += sender_align8(sizeof(*rec));
+        moq_msf_mpeg2ts_init(rec);
+        memcpy(rec, src, src->struct_size < sizeof(*rec) ? src->struct_size
+                                                         : sizeof(*rec));
+        rec->struct_size = (uint32_t)sizeof(*rec);
+        rec->si_pids = NULL;
+        rec->mode_name = (moq_bytes_t){ NULL, 0 };
+        rec->timestamp_mode_name = (moq_bytes_t){ NULL, 0 };
+        if (pids > 0) {
+            memcpy(blk + off, src->si_pids, pids);
+            rec->si_pids = (uint32_t *)(void *)(blk + off);
+            off += sender_align8(pids);
+        }
+        if (src->mode_name.len > 0) {
+            memcpy(blk + off, src->mode_name.data, src->mode_name.len);
+            rec->mode_name = (moq_bytes_t){ blk + off, src->mode_name.len };
+            off += sender_align8(src->mode_name.len);
+        }
+        if (src->timestamp_mode_name.len > 0) {
+            memcpy(blk + off, src->timestamp_mode_name.data,
+                   src->timestamp_mode_name.len);
+            rec->timestamp_mode_name =
+                (moq_bytes_t){ blk + off, src->timestamp_mode_name.len };
+            off += sender_align8(src->timestamp_mode_name.len);
+        }
+        list[k].kind = MOQ_MSF_EXT_MPEG2TS;
+        list[k++].u.mpeg2ts = rec;
     }
-    if (src->mode_name.len > 0) {
-        memcpy(blk + off, src->mode_name.data, src->mode_name.len);
-        rec->mode_name = (moq_bytes_t){ blk + off, src->mode_name.len };
-        off += sender_align8(src->mode_name.len);
+    if (supp_src) {
+        /* Only the fields sender_check_supplement admits; every other one
+         * stays absent. */
+        moq_msf_track_supplement_t *rec =
+            (moq_msf_track_supplement_t *)(void *)(blk + off);
+        off += sender_align8(sizeof(*rec));
+        moq_msf_track_supplement_init(rec);
+        if (supp.has_packaging_metadata) {
+            rec->has_packaging_metadata = true;
+            if (pm.len > 0) {
+                memcpy(blk + off, pm.data, pm.len);
+                rec->packaging_metadata = (moq_bytes_t){ blk + off, pm.len };
+            }
+        }
+        rec->has_keyframe_spacing = supp.has_keyframe_spacing;
+        rec->keyframe_spacing = supp.has_keyframe_spacing ? supp.keyframe_spacing : 0;
+        rec->has_accessible_window_ms = supp.has_accessible_window_ms;
+        rec->accessible_window_ms =
+            supp.has_accessible_window_ms ? supp.accessible_window_ms : 0;
+        list[k].kind = MOQ_MSF_EXT_SUPPLEMENT;
+        list[k++].u.supplement = rec;
     }
-    if (src->timestamp_mode_name.len > 0) {
-        memcpy(blk + off, src->timestamp_mode_name.data,
-               src->timestamp_mode_name.len);
-        rec->timestamp_mode_name =
-            (moq_bytes_t){ blk + off, src->timestamp_mode_name.len };
-    }
-    list[0].kind = MOQ_MSF_EXT_MPEG2TS;
-    list[0].u.mpeg2ts = rec;
     t->ext = list;
-    t->ext_count = 1;
+    t->ext_count = k;
     t->ext_block_size = need;
     return MOQ_OK;
 }
@@ -161,8 +272,8 @@ moq_result_t sender_copy_extensions(moq_media_sender_t *s,
 /* The sender-owned record of a track (NULL for other packagings). */
 moq_msf_mpeg2ts_t *sender_ts_record(moq_media_track_t *t)
 {
-    return t->ext_count ? (moq_msf_mpeg2ts_t *)(uintptr_t)t->ext[0].u.mpeg2ts
-                        : NULL;
+    return (moq_msf_mpeg2ts_t *)(uintptr_t)moq_msf_ext_mpeg2ts(t->ext,
+                                                              t->ext_count);
 }
 
 

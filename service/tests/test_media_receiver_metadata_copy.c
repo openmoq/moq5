@@ -651,6 +651,9 @@ static void legacy_resume(moq_version_t version)
         moq_sub_object_t so;
         MOQ_TEST_CHECK(moq_sub_poll_object(f.r->sub, &so) == MOQ_OK);
         receiver_on_media_object(f.r, f.bad, &so, now(&f));
+        /* The receiver always takes its facade's stream terminals, as its
+         * pump does after every Object; a full queue would hold the tick. */
+        receiver_poll_stream_terminals(f.r, now(&f));
         if (g == 3) {
             MOQ_TEST_CHECK(f.r->paused && charged(f.r) == 6);
             receiver_reconcile_delivery(f.r, now(&f));

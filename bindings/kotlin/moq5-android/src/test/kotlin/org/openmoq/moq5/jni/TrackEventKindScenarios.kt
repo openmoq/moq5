@@ -215,6 +215,52 @@ internal object TrackEventKindScenarios {
         println("RESULT ok")
     }
 
+    /**
+     * The replacement links are one block: published only when the stamp
+     * covers `replaced_by`, as the borrowed tokens of real handles, and
+     * decoded on the kinds that carry them (the successor on a REMOVED, the
+     * predecessor on an ADDED); an unobserved block is null, never a zero
+     * token.
+     */
+    fun replacementStamps() {
+        val r = Rig()
+        val second = r.b.pollTrack(r.rx)
+        check(second is BackendTrackEventResult.Event && second.event.kind == BackendTrackEventKind.Added && second.event.track != r.a, "setup: the real ADDED(b); got $second")
+        val tb = (second as BackendTrackEventResult.Event).event.track
+        fun links(predecessor: Long, successor: Long) = values() + longArrayOf(predecessor, successor)
+        val raw = LongArray(ReceiverEventScalars.COUNT)
+        fun rawPoll(kind: Int, v: LongArray, stamp: Long): LongArray {
+            TrustRouteProbe.nativeArmTrackEvent(kind, stamp, v)
+            raw.fill(EndpointAbi.SENTINEL)
+            check(NativeBridge.nativeReceiverPollTrack(r.root, r.rx, raw) == EndpointAbi.OK, "raw poll of kind $kind")
+            return raw
+        }
+        val replacedBy = r.at(TrustRouteProbe.EventLayout.REPLACED_BY)
+        check(r.at(TrustRouteProbe.EventLayout.REPLACES) < replacedBy && replacedBy + 8 <= r.at(TrustRouteProbe.EventLayout.SIZE), "setup: the block is the event's tail")
+        rawPoll(3, links(0, 1), -1).let {
+            check(it[ReceiverEventScalars.HAS] and ReceiverEventScalars.HAS_REPLACEMENT != 0L && it[ReceiverEventScalars.TRACK] == tb, "a whole stamp publishes the block; got ${it.toList()}")
+            check(it[ReceiverEventScalars.REPLACED_BY] == r.a && it[ReceiverEventScalars.REPLACES] == 0L, "the successor's token, and a NULL predecessor as zero")
+        }
+        rawPoll(3, links(0, 1), replacedBy + 7).let {
+            check(it[ReceiverEventScalars.HAS] and ReceiverEventScalars.HAS_REPLACEMENT == 0L, "a stamp inside replaced_by: no HAS bit; got ${it.toList()}")
+            check(it[ReceiverEventScalars.REPLACED_BY] == 0L && it[ReceiverEventScalars.REPLACES] == 0L, "both slots zeroed")
+        }
+        rawPoll(1, links(1, 0), replacedBy).let {
+            check(it[ReceiverEventScalars.HAS] and ReceiverEventScalars.HAS_REPLACEMENT == 0L && it[ReceiverEventScalars.REPLACES] == 0L, "replaces covered, replaced_by not: the block is all or nothing; got ${it.toList()}")
+        }
+        expect(r.scripted(3, links(0, 1)), BackendTrackEvent(BackendTrackEventKind.Removed, tb, null, replacedBy = r.a), "REMOVED names its successor")
+        expect(r.scripted(3, links(0, 1), replacedBy + 7), BackendTrackEvent(BackendTrackEventKind.Removed, tb, null), "an unobserved successor is null")
+        expect(r.scripted(3, links(1, 0)), BackendTrackEvent(BackendTrackEventKind.Removed, tb, null), "a REMOVED carries no predecessor")
+        val added = r.scripted(1, links(1, 0))
+        check(added is BackendTrackEventResult.Event && added.event.kind == BackendTrackEventKind.Added && added.event.replaces == r.a && added.event.replacedBy == null, "ADDED names its predecessor; got $added")
+        val plain = r.scripted(1, links(0, 0))
+        check(plain is BackendTrackEventResult.Event && plain.event.replaces == null, "a NULL predecessor is null, not token zero; got $plain")
+        // The scripted answers consumed nothing real: discovery continues.
+        check(r.b.pollTrack(r.rx).let { it is BackendTrackEventResult.Event && it.event.kind == BackendTrackEventKind.CatalogReady }, "then the real CATALOG_READY")
+        r.finish("receiverreplacementstamps", 8)
+        println("RESULT ok")
+    }
+
     /** The FAILED state crosses as 6 and reads as [TrackState.Failed]; the next read is the real one again. */
     fun failedState() {
         val r = Rig()

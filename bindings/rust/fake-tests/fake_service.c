@@ -1249,6 +1249,10 @@ moq_result_t moq_media_receiver_get_stats(const moq_media_receiver_t *r,
         .catalog_complete = get("rstats_catalog_complete") != 0,
         .gaps_reported = 5, .gap_tails_unknown = 1, .reorder_refused = 2,
         .tracks_malformed = (uint64_t)get("rstats_tracks_malformed"),
+        .catalog_revision = (uint32_t)get("rstats_catalog_revision"),
+        .objects_decompressed = 21, .decompress_failures = 22, .decompress_limited = 23,
+        .compression_refused = 24, .compression_conflicts = 25, .compression_ignored = 26,
+        .event_timeline_headers_ignored = 27, .loc_order_gaps = 28, .loc_order_forced = 29,
     };
     size_t n = out_size < sizeof st ? out_size : sizeof st;
     memcpy(out, &st, n);

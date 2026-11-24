@@ -27,6 +27,7 @@ PyObject *test_receiver_state(PyObject *, PyObject *);
 PyObject *test_receiver_queue(PyObject *, PyObject *);
 PyObject *test_stats(PyObject *, PyObject *);
 PyObject *test_stats_size(PyObject *, PyObject *);
+PyObject *test_stats_msf02(PyObject *, PyObject *);
 PyObject *test_new_track(PyObject *, PyObject *);
 PyObject *test_send_track_state(PyObject *, PyObject *);
 PyObject *test_subscribe_result(PyObject *, PyObject *);
@@ -174,6 +175,7 @@ PyObject *moq5_test_track_capsule(PyObject *receiver_capsule, struct moq_media_t
     {"_test_receiver_queue", test_receiver_queue, METH_VARARGS, NULL}, \
     {"_test_stats", test_stats, METH_VARARGS, NULL}, \
     {"_test_stats_size", test_stats_size, METH_O, NULL}, \
+    {"_test_stats_msf02", test_stats_msf02, METH_VARARGS, NULL}, \
     {"_test_new_track", test_new_track, METH_O, NULL}, \
     {"_test_track_state", test_track_state, METH_VARARGS, NULL}, \
     {"_test_subscribe_result", test_subscribe_result, METH_O, NULL}, \

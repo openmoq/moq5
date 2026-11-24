@@ -29,7 +29,7 @@ internal object NativeBridge {
      * LibMoQ version describes the library release, not the layout of this
      * method table, and the two move independently.
      */
-    const val ABI_EPOCH: Int = 18
+    const val ABI_EPOCH: Int = 19
 
     /** Mirrors `MOQ5_FEATURE_BRIDGE_HANDSHAKE`. */
     const val FEATURE_BRIDGE_HANDSHAKE: Long = 0x1L
@@ -191,11 +191,13 @@ internal object NativeBridge {
      * `MOQ_ERR_INVAL` before anything is polled. Returns `MOQ_OK` with the
      * block filled (the track slot carries a BORROWED child token under the
      * receiver, minted on the handle's first sight and stable until the
-     * receiver closes; zero for CATALOG_READY), `MOQ_DONE` when the queue is
+     * receiver closes; zero for CATALOG_READY; the replacement slots carry
+     * the other track's token the same way), `MOQ_DONE` when the queue is
      * empty, `MOQ_ERR_CLOSED` when empty and terminal (the terminal slots
      * then carry `moq_media_receiver_is_fatal` and `_fatal_code`), or the
      * registry's exact refusal. A refused token mint after the event was
-     * consumed is the registry's code and nothing is published.
+     * consumed -- the track's or a replacement link's -- is the registry's
+     * code and nothing is published.
      */
     external fun nativeReceiverPollTrack(root: Long, child: Long, scalars: LongArray?): Int
 

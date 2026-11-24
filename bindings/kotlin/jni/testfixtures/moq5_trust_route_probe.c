@@ -207,6 +207,10 @@ static char g_ctor_fault[32];      /* the armed one-shot token, or empty */
  * without being performed -- the input a row needs to prove the describe row
  * reports the refusal and releases both pins. */
 #define MOQ5_CTOR_FAULT_DESC_COPY_REFUSE "desc-copy-refuse-once-v1"
+/* One-shot: the next track-description copy is performed whole, then stamped
+ * with the description's frozen v0 size -- every appended byte present but
+ * outside the stamp, so a reader that ignores the stamp is caught. */
+#define MOQ5_CTOR_FAULT_DESC_COPY_RESTAMP_V0 "desc-copy-restamp-v0-once-v1"
 static long g_desc_copies;  /* track-description copies the product requested */
 
 static long moq5_read_consulted(void)
@@ -231,7 +235,8 @@ static int moq5_ctor_fault_take(const char *token)
 }
 
 /* The product's track-description copy, redirected here at compile time:
- * counted, refused once when armed, otherwise forwarded unchanged. */
+ * counted, refused once or restamped once when armed, otherwise forwarded
+ * unchanged. */
 moq_result_t moq5_test_track_desc_copy(const moq_media_receiver_t *r, const moq_media_track_t *track,
                                        moq_media_track_desc_t *out, size_t out_size);
 moq_result_t moq5_test_track_desc_copy(const moq_media_receiver_t *r, const moq_media_track_t *track,
@@ -241,22 +246,32 @@ moq_result_t moq5_test_track_desc_copy(const moq_media_receiver_t *r, const moq_
     g_desc_copies++;
     pthread_mutex_unlock(&g_cnt_mu);
     if (moq5_ctor_fault_take(MOQ5_CTOR_FAULT_DESC_COPY_REFUSE)) return MOQ_ERR_INVAL;
+    if (moq5_ctor_fault_take(MOQ5_CTOR_FAULT_DESC_COPY_RESTAMP_V0)) {
+        moq_result_t rc = moq_media_receiver_track_desc_copy(r, track, out, out_size);
+        if (rc == MOQ_OK) out->struct_size = (uint32_t)MOQ_MEDIA_TRACK_DESC_V0_SIZE;
+        return rc;
+    }
     return moq_media_receiver_track_desc_copy(r, track, out, out_size);
 }
 
 /* -- scripted track events and track states -------------------------------- *
  * The product's track-event poll and track-state read, redirected here at
  * compile time. Unarmed, both forward unchanged, and the poll remembers the
- * last real track handle it delivered. Armed, the NEXT poll answers ONE
- * scripted event on that real handle -- every field as the row gave it,
- * stamped with the row's struct_size (never past the caller's buffer, and
- * nothing written beyond the stamp) -- and the NEXT state read answers the
- * scripted state. They reach the event kinds and the FAILED state whose real
- * producers need a live peer, through the product's actual conversion. */
+ * first and the last real track handles it delivered. Armed, the NEXT poll
+ * answers ONE scripted event on the last real handle -- every field as the
+ * row gave it, stamped with the row's struct_size (never past the caller's
+ * buffer, and nothing written beyond the stamp); its replacement links, when
+ * the row names them, are those real handles -- and the NEXT state read
+ * answers the scripted state. They reach the event kinds and the FAILED state
+ * whose real producers need a live peer, through the product's actual
+ * conversion. */
 static pthread_mutex_t g_ev_mu = PTHREAD_MUTEX_INITIALIZER;
 static moq_media_track_event_t g_ev;            /* kind 0: unarmed */
 static size_t g_ev_stamp;
 static const moq_media_track_t *g_ev_track;     /* the last real handle delivered */
+static const moq_media_track_t *g_ev_first;     /* the first real handle delivered */
+static int g_ev_replaces;                       /* 0: NULL, 1: the first real handle, 2: the last */
+static int g_ev_replaced_by;
 static int g_state_armed;
 static moq_media_track_state_t g_state;
 static long g_ev_scripted;                      /* scripted events delivered */
@@ -272,6 +287,10 @@ moq_result_t moq5_test_receiver_poll_track(moq_media_receiver_t *r, moq_media_tr
         e.struct_size = (uint32_t)n;
         e.track = (moq_media_track_t *)(uintptr_t)g_ev_track;
         e.desc = moq_media_track_desc_get(g_ev_track);
+        e.replaces = g_ev_replaces == 0 ? NULL
+                   : (moq_media_track_t *)(uintptr_t)(g_ev_replaces == 1 ? g_ev_first : g_ev_track);
+        e.replaced_by = g_ev_replaced_by == 0 ? NULL
+                      : (moq_media_track_t *)(uintptr_t)(g_ev_replaced_by == 1 ? g_ev_first : g_ev_track);
         memcpy(ev, &e, n);
         memset(&g_ev, 0, sizeof g_ev);
         g_ev_scripted++;
@@ -288,6 +307,7 @@ moq_result_t moq5_test_receiver_poll_track(moq_media_receiver_t *r, moq_media_tr
     if (rc == MOQ_OK && ev != NULL && ev->track != NULL) {
         pthread_mutex_lock(&g_ev_mu);
         g_ev_track = ev->track;
+        if (g_ev_first == NULL) g_ev_first = ev->track;
         pthread_mutex_unlock(&g_ev_mu);
     }
     return rc;
@@ -987,15 +1007,24 @@ static jlong JNICALL ledger_nativeDescCopies(JNIEnv *env, jclass self)
  * initiating_request_id, fill_reason, fill_error_domain, fill_error_code,
  * delivery_origin, delivery_initiating_request_id,
  * fill_unreported_loss_causes, _group, _object. */
+/* Ten values in header order, or twelve: then the last two name the
+ * replacement links (replaces, replaced_by) as 0 (NULL), 1 (the first real
+ * handle polled) or 2 (the last). */
 static void JNICALL ledger_nativeArmTrackEvent(JNIEnv *env, jclass self, jint kind, jlong stamp, jlongArray values)
 {
-    jlong v[10];
+    jlong v[12] = { 0 };
+    jsize n;
     (void)self;
-    if (values == NULL || (*env)->GetArrayLength(env, values) != 10) {
-        moq5_latch("recorder: a scripted track event needs exactly ten values");
+    n = values == NULL ? 0 : (*env)->GetArrayLength(env, values);
+    if (n != 10 && n != 12) {
+        moq5_latch("recorder: a scripted track event needs exactly ten or twelve values");
         return;
     }
-    (*env)->GetLongArrayRegion(env, values, 0, 10, v);
+    (*env)->GetLongArrayRegion(env, values, 0, n, v);
+    if (v[10] < 0 || v[10] > 2 || v[11] < 0 || v[11] > 2) {
+        moq5_latch("recorder: a scripted replacement link is 0, 1 or 2");
+        return;
+    }
     pthread_mutex_lock(&g_ev_mu);
     memset(&g_ev, 0, sizeof g_ev);
     g_ev.kind = (moq_media_track_event_kind_t)kind;
@@ -1009,6 +1038,8 @@ static void JNICALL ledger_nativeArmTrackEvent(JNIEnv *env, jclass self, jint ki
     g_ev.fill_unreported_loss_causes = (uint32_t)v[7];
     g_ev.fill_unreported_loss_group = (uint64_t)v[8];
     g_ev.fill_unreported_loss_object = (uint64_t)v[9];
+    g_ev_replaces = (int)v[10];
+    g_ev_replaced_by = (int)v[11];
     g_ev_stamp = stamp < 0 ? sizeof g_ev : (size_t)stamp;
     pthread_mutex_unlock(&g_ev_mu);
 }
@@ -1026,10 +1057,11 @@ static void JNICALL ledger_nativeArmTrackState(JNIEnv *env, jclass self, jint st
 /* The event struct's layout, for exact stamps: sizeof, then the offsets of
  * local_result, initiating_request_id, fill_reason, fill_error_domain,
  * fill_error_code, delivery_origin, delivery_initiating_request_id,
- * fill_unreported_loss_causes and fill_unreported_loss_object. */
+ * fill_unreported_loss_causes, fill_unreported_loss_object, replaces and
+ * replaced_by. */
 static jlongArray JNICALL ledger_nativeTrackEventLayout(JNIEnv *env, jclass self)
 {
-    jlong v[10];
+    jlong v[12];
     jlongArray out;
     (void)self;
     v[0] = (jlong)sizeof(moq_media_track_event_t);
@@ -1042,8 +1074,10 @@ static jlongArray JNICALL ledger_nativeTrackEventLayout(JNIEnv *env, jclass self
     v[7] = (jlong)offsetof(moq_media_track_event_t, delivery_initiating_request_id);
     v[8] = (jlong)offsetof(moq_media_track_event_t, fill_unreported_loss_causes);
     v[9] = (jlong)offsetof(moq_media_track_event_t, fill_unreported_loss_object);
-    out = (*env)->NewLongArray(env, 10);
-    if (out != NULL) (*env)->SetLongArrayRegion(env, out, 0, 10, v);
+    v[10] = (jlong)offsetof(moq_media_track_event_t, replaces);
+    v[11] = (jlong)offsetof(moq_media_track_event_t, replaced_by);
+    out = (*env)->NewLongArray(env, 12);
+    if (out != NULL) (*env)->SetLongArrayRegion(env, out, 0, 12, v);
     return out;
 }
 

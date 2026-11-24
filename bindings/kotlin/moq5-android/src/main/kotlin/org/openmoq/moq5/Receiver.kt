@@ -145,9 +145,82 @@ public data class CmafInitInfo(
 )
 
 /**
+ * Where a track's decoder configuration comes from
+ * (`moq_media_track_desc_t.init_source`, `MOQ_MEDIA_INIT_SOURCE_*`). An open
+ * set: a value this binding does not know is carried as [Unknown], never
+ * folded into a known case.
+ */
+public sealed interface InitSource {
+    /** The catalog names no configuration source. */
+    public data object None : InitSource
+
+    /** From the catalog itself: [TrackDescription.initData] and the codec configuration. */
+    public data object Inline : InitSource
+
+    /**
+     * In band, in the property [TrackDescription.initPropertyType] names, on
+     * the track (MSF-02 5.1.7, 12.2): observable on each object's metadata
+     * from the first object on, not at discovery.
+     */
+    public data object TrackProperty : InitSource
+
+    /** In band, in the property [TrackDescription.initPropertyType] names, on each object. */
+    public data object ObjectProperty : InitSource
+
+    /** A source this binding does not know, by its native value. */
+    public data class Unknown(public val raw: UInt) : InitSource
+
+    public companion object {
+        /** The C value: 0..3 are the named sources, anything else is [Unknown]. */
+        public fun ofNative(raw: UInt): InitSource =
+            when (raw) {
+                0u -> None
+                1u -> Inline
+                2u -> TrackProperty
+                3u -> ObjectProperty
+                else -> Unknown(raw)
+            }
+    }
+}
+
+/**
+ * A track's MSF encryption fields (MSF 5.2.38-5.2.41), verbatim from the
+ * catalog; each is null when the catalog did not carry it.
+ *
+ * A present [scheme] means the object payload is encrypted and this library
+ * does not decrypt it: a "loc" track is delivered as received (ciphertext,
+ * with its LOC properties in plaintext), and a track of any other packaging
+ * cannot be subscribed. [cipherSuite], [keyId] and [trackBaseKey] are what an
+ * application needs to decrypt.
+ *
+ * [trackBaseKey] is KEY MATERIAL (MSF-02 13.2): handle it as a secret.
+ * [toString] never prints it, only whether it is present; do not log it or
+ * the [MediaBytes] it is.
+ */
+public class TrackEncryption(
+    public val scheme: MediaBytes? = null,
+    public val cipherSuite: MediaBytes? = null,
+    public val keyId: MediaBytes? = null,
+    public val trackBaseKey: MediaBytes? = null,
+) {
+    override fun equals(other: Any?): Boolean =
+        other is TrackEncryption && scheme == other.scheme && cipherSuite == other.cipherSuite && keyId == other.keyId && trackBaseKey == other.trackBaseKey
+
+    override fun hashCode(): Int {
+        var h = scheme.hashCode()
+        h = 31 * h + cipherSuite.hashCode()
+        h = 31 * h + keyId.hashCode()
+        return 31 * h + trackBaseKey.hashCode()
+    }
+
+    override fun toString(): String =
+        "TrackEncryption(scheme=$scheme, cipherSuite=$cipherSuite, keyId=$keyId, trackBaseKey=${if (trackBaseKey == null) "null" else "<redacted>"})"
+}
+
+/**
  * An immutable snapshot of a track's description (`moq_media_track_desc_t`,
  * every field of its v0 layout except the media template, which is deferred
- * with the SAP/timeline surface).
+ * with the SAP/timeline surface, and the generation block appended after it).
  *
  * Byte fields: [name] is the track's identity and is always present, even
  * when empty. The other byte fields are optional catalog attributes with no
@@ -157,6 +230,14 @@ public data class CmafInitInfo(
  * ([catalogWidth], [catalogHeight], [catalogSamplerate]) are distinct from
  * the init-derived ones in [init]: the catalog claims, the init segment
  * proves.
+ *
+ * [configGeneration] is the description's generation: 0 for the one the
+ * track was discovered with, n for the one the n-th MSF-02 advisory change
+ * published. A snapshot is the CURRENT generation when it was taken, so it may
+ * be newer than the generation a [TrackEvent.Updated] announced. It,
+ * [initSource] and [initPropertyType] are null when the native library did
+ * not report them (a shorter description), never a zero. [encryption] is null
+ * when the catalog carried none of the encryption fields.
  */
 public data class TrackDescription(
     public val name: MediaBytes,
@@ -188,31 +269,59 @@ public data class TrackDescription(
     public val depends: List<MediaBytes> = emptyList(),
     public val trackDurationMs: ULong? = null,
     public val isLive: Boolean = true,
+    public val configGeneration: UInt? = null,
+    public val initSource: InitSource? = null,
+    /**
+     * The property type that carries the configuration for
+     * [InitSource.TrackProperty] and [InitSource.ObjectProperty] (0x0D
+     * VIDEO_CONFIG, 0x0F AUDIO_CONFIG); null for every other source, and when
+     * not reported.
+     */
+    public val initPropertyType: ULong? = null,
+    public val encryption: TrackEncryption? = null,
 )
 
 /**
  * A track's durable catalog state. `Present` is a track the catalog lists;
- * `Removed` was dropped by a later catalog generation; `Ended` was ended or
+ * `Removed` was dropped by a later catalog generation, or replaced by a new
+ * track (see [MediaTrack.replacedBy]); `Ended` was ended or
  * rejected by the peer; `Failed` failed LOCALLY in this receiver (initial ACK
  * retention, LIVE delivery admission or UPDATE admission; a track whose state
  * read answers [TrackState.Failed] is folded in the same way). No terminal
  * state discards the track: the C handle stays valid, inert, until the
  * receiver is destroyed, and so does the [MediaTrack]. A failed track stays
  * `Failed` when it later ends, as the C keeps it FAILED; only a catalog
- * removal replaces it. A live-to-VOD conversion is an EVENT
- * ([TrackEvent.Updated]) that re-snapshots the description and leaves the
- * track `Present`. A fill child's outcome never changes its parent's presence.
+ * removal replaces it. A live-to-VOD conversion and an MSF-02 advisory change
+ * are EVENTS ([TrackEvent.Updated]) that re-snapshot the description and leave
+ * the track `Present`. A fill child's outcome never changes its parent's
+ * presence.
+ *
+ * An MSF-02 catalog change that decides how objects are parsed or delivered
+ * (packaging, role, codec, timescale, the resolved init, the content
+ * protection, the stream mapping, `encryptionScheme`, ...) REPLACES a track: the
+ * old track becomes `Removed` ([TrackEvent.Removed] with `replaced`), and its
+ * successor is a new track, announced right after it ([TrackEvent.Added] with
+ * `replaces`). The two are linked through [MediaTrack.replacedBy] and
+ * [MediaTrack.replaces]. The old track's selection moves to its successor,
+ * and a [MediaReceiver.subscribe] or [MediaReceiver.unsubscribe] issued on
+ * the old track acts on the newest track of its replacement chain.
  */
 public enum class TrackPresence { Present, Removed, Ended, Failed }
 
 /**
  * One discovered track: an identity, not a value. The same native handle is
  * always the same instance, so a track may be used as a map key and compared
- * with `===`. Its [description] is an immutable snapshot, replaced only on
- * the one mutation the C tier sanctions (live to VOD); [presence] and
- * [parseDrops] are the durable state the receiver's events fold into it.
- * Every field is written on the endpoint's service worker and read from any
- * thread.
+ * with `===`. Its [description] is an immutable snapshot, replaced on the
+ * changes the C tier sanctions (live to VOD, and an MSF-02 advisory
+ * generation); [presence] and [parseDrops] are the durable state the
+ * receiver's events fold into it. Every field is written on the endpoint's
+ * service worker and read from any thread.
+ *
+ * [replaces] and [replacedBy] link the tracks of a replacement chain (see
+ * [TrackPresence]): [replaces] is set when the track is announced as a
+ * successor, [replacedBy] once that successor has been announced. A replaced
+ * track whose successor was never announced (the receiver was closed first)
+ * keeps a null [replacedBy].
  *
  * [isRetired] is true once the receiver that discovered the track has been
  * closed: the snapshot stays readable, and nothing native is ever touched
@@ -228,6 +337,16 @@ public class MediaTrack internal constructor(
 
     @Volatile
     public var presence: TrackPresence = TrackPresence.Present
+        internal set
+
+    /** The track this one replaced, or null when it was not announced as a successor. */
+    @Volatile
+    public var replaces: MediaTrack? = null
+        internal set
+
+    /** The track that replaced this one, once its successor was announced; null otherwise. */
+    @Volatile
+    public var replacedBy: MediaTrack? = null
         internal set
 
     /** Cumulative media objects dropped at parse for this track, from the receiver's coalesced diagnostics. */
@@ -298,12 +417,30 @@ public sealed interface EventHistoryPolicy {
  * this receiver ([MoqResultCode]), never a peer error or an END_OF_TRACK.
  */
 public sealed interface TrackEvent {
-    public data class Added(public val track: MediaTrack) : TrackEvent
+    /**
+     * A new track. [replaces] is the track it replaced (an MSF-02 critical
+     * change), announced immediately before as [Removed] with `replaced`; null
+     * for any other new track.
+     */
+    public data class Added(public val track: MediaTrack, public val replaces: MediaTrack? = null) : TrackEvent
 
-    /** The description was re-snapshotted in place (live to VOD); the track stays present. */
-    public data class Updated(public val track: MediaTrack) : TrackEvent
+    /**
+     * The track's description changed and was re-snapshotted; the track stays
+     * present. Either a live-to-VOD conversion, written on the current
+     * generation, or an MSF-02 advisory change, which publishes generation
+     * [configGeneration]. The [MediaTrack.description] snapshot is the current
+     * generation when the event was drained, so its own
+     * [TrackDescription.configGeneration] may be newer than [configGeneration]
+     * (a later change was already adopted).
+     */
+    public data class Updated(public val track: MediaTrack, public val configGeneration: UInt) : TrackEvent
 
-    public data class Removed(public val track: MediaTrack) : TrackEvent
+    /**
+     * The track left the catalog. [replaced] is true when a new track replaced
+     * it (an MSF-02 critical change): its successor's [Added] follows, and
+     * links the two ([MediaTrack.replacedBy]).
+     */
+    public data class Removed(public val track: MediaTrack, public val replaced: Boolean = false) : TrackEvent
 
     public data class Ended(public val track: MediaTrack) : TrackEvent
 
@@ -519,7 +656,10 @@ public class ReceiverClosedException internal constructor() : IllegalStateExcept
  * The track can no longer take this operation: [presence] is
  * [TrackPresence.Ended] or [TrackPresence.Failed] (a subscribe on an ended or
  * locally failed track) or [TrackPresence.Removed] (any command, or a state
- * read, on a track a later catalog dropped). Never [TrackPresence.Present].
+ * read, on a track a later catalog dropped; a command on a replaced track acts
+ * on its successor instead, and a state read on it is refused). For a
+ * command on a replaced track, [presence] is that of the track it acted on.
+ * Never [TrackPresence.Present].
  */
 public class TrackUnavailableException internal constructor(
     public val presence: TrackPresence,
@@ -595,6 +735,23 @@ public class MediaTimelineRecord internal constructor(
  * counted. [catalogComplete] is MSF §5.1.3 completion, latched by an
  * `isComplete` catalog -- not receiver close, not a terminal, not a track's
  * end.
+ *
+ * The fields from [catalogRevision] on are one block: each is null when the
+ * native library did not report it (a shorter stats record), never a zero.
+ * [catalogRevision] is the effective catalog's MSF revision, meaningful once
+ * the inventory is [ReceiverInventory.catalogReady] (before that the native
+ * zero reads as [CatalogRevision.Msf01]). The compression counters (MSF-02
+ * 12.1) count catalog and media-timeline objects: [objectsDecompressed],
+ * [decompressFailures] (malformed compressed data) and [decompressLimited]
+ * (over the decompressed-size cap); [compressionRefused] (an algorithm this
+ * build does not decompress, a repeated or malformed property, or a
+ * compressed MSF-01 catalog), [compressionConflicts] (an object property
+ * where the track property is set) and [compressionIgnored] (a timeline's
+ * property under an MSF-01 catalog). [eventTimelineHeadersIgnored] counts
+ * SAP-timeline objects whose origin carried an event-timeline header.
+ * [locOrderGaps] counts objects the in-group ordering stage of an
+ * "object"-mapped LOC track gave up on (a policy, not proof the network lost
+ * them), and [locOrderForced] the advances its capacity forced.
  */
 public data class ReceiverStats(
     public val objectsReceived: ULong,
@@ -613,7 +770,43 @@ public data class ReceiverStats(
     public val gapTailsUnknown: ULong,
     public val reorderRefused: ULong,
     public val tracksMalformed: ULong,
+    public val catalogRevision: CatalogRevision? = null,
+    public val objectsDecompressed: ULong? = null,
+    public val decompressFailures: ULong? = null,
+    public val decompressLimited: ULong? = null,
+    public val compressionRefused: ULong? = null,
+    public val compressionConflicts: ULong? = null,
+    public val compressionIgnored: ULong? = null,
+    public val eventTimelineHeadersIgnored: ULong? = null,
+    public val locOrderGaps: ULong? = null,
+    public val locOrderForced: ULong? = null,
 )
+
+/**
+ * The MSF revision a catalog follows (`moq_msf_revision_t`,
+ * `MOQ_MSF_REVISION_*`). An open set: a value this binding does not know is
+ * carried as [Unknown].
+ */
+public sealed interface CatalogRevision {
+    /** draft-ietf-moq-msf-01 (the native zero). */
+    public data object Msf01 : CatalogRevision
+
+    /** draft-ietf-moq-msf-02. */
+    public data object Msf02 : CatalogRevision
+
+    /** A revision this binding does not know, by its native value. */
+    public data class Unknown(public val raw: UInt) : CatalogRevision
+
+    public companion object {
+        /** The C value: 0 and 1 are the named revisions, anything else is [Unknown]. */
+        public fun ofNative(raw: UInt): CatalogRevision =
+            when (raw) {
+                0u -> Msf01
+                1u -> Msf02
+                else -> Unknown(raw)
+            }
+    }
+}
 
 /** `moq_object_status_t`: exactly the three values `session.h` declares. */
 public enum class ObjectStatus { Normal, EndOfGroup, EndOfTrack }
@@ -826,10 +1019,15 @@ public class MediaReceiver internal constructor(
      * subscription is first issued; an existing one is not reconfigured).
      * [priority] `null` sends no priority.
      *
+     * On a track a replacement removed ([MediaTrack.replacedBy]) the command
+     * acts on the newest track of its replacement chain, and whether that
+     * track is already wanted decides whether a command is sent; the
+     * replacement already moved the old track's selection there.
+     *
      * @throws ForeignTrackException the track is another receiver's
      * @throws ReceiverClosedException this receiver is closed, or reached a clean terminal
      * @throws ReceiverFatalException the receiver reached its fatal terminal
-     * @throws TrackUnavailableException the track is Ended, Failed or Removed
+     * @throws TrackUnavailableException the track (or the newest track of its replacement chain) is Ended, Failed or Removed
      * @throws TrackNotSubscribableException the track cannot be subscribed
      */
     public suspend fun subscribe(track: MediaTrack, start: StartMode = StartMode.Current, priority: UByte? = null) {
@@ -842,12 +1040,13 @@ public class MediaReceiver internal constructor(
      * queued objects are purged and delivery is paused, not torn down, so a
      * later [subscribe] resumes it cheaply; the track and its catalog handle
      * stay valid. A no-op on a track that is not wanted, or that has ended;
-     * a locally failed track is still disabled.
+     * a locally failed track is still disabled. On a replaced track it acts
+     * on the newest track of the replacement chain, as [subscribe] does.
      *
      * @throws ForeignTrackException the track is another receiver's
      * @throws ReceiverClosedException this receiver is closed, or reached a clean terminal
      * @throws ReceiverFatalException the receiver reached its fatal terminal
-     * @throws TrackUnavailableException the track is Removed
+     * @throws TrackUnavailableException the track is Removed and not replaced, or the newest track of its replacement chain is Removed
      */
     public suspend fun unsubscribe(track: MediaTrack) {
         own(track)
@@ -861,11 +1060,12 @@ public class MediaReceiver internal constructor(
      * failed one, which keeps [TrackState.Failed]: that is still read from the
      * native receiver while it is attached, so a failure no event reported is
      * not lost. A [TrackState.Failed] read is also folded into the track's
-     * [MediaTrack.presence].
+     * [MediaTrack.presence]. A replaced track has no state of its own: read
+     * its successor's.
      *
      * @throws ForeignTrackException the track is another receiver's
      * @throws ReceiverClosedException this receiver is closed
-     * @throws TrackUnavailableException the track is Removed
+     * @throws TrackUnavailableException the track is Removed, replaced included
      */
     public suspend fun trackState(track: MediaTrack): TrackState {
         own(track)

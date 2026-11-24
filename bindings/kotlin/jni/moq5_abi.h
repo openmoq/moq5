@@ -19,7 +19,7 @@
 
 /* The private bridge ABI epoch. Bumped whenever the registered method table,
  * its descriptors, or the layout of anything passed across it changes. */
-#define MOQ5_ABI_EPOCH 18
+#define MOQ5_ABI_EPOCH 19
 
 /* The JNI version the bridge requires. */
 #define MOQ5_JNI_VERSION JNI_VERSION_1_6

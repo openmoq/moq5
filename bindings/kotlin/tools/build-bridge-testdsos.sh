@@ -146,6 +146,7 @@ done
 # CMake target does.
 compile_sub "$repo/media/object/src/media_object.c" $MEDIA_INCLUDES -I"$repo/media/loc/src"
 compile_sub "$repo/service/src/media_receiver.c" $MEDIA_INCLUDES -DMOQ_MEDIA_RECEIVER_TESTING=1
+compile_sub "$repo/service/src/media_receiver_order.c" $MEDIA_INCLUDES
 # The media SENDER: the sender rows execute the shipped C on the host too, with
 # no testing seam -- a live, unconnected root already answers every pre-ready
 # path the rows pin.

@@ -1611,8 +1611,12 @@ static void test_fetch_object_before_ok(void) {
         memcmp(moq_rcbuf_data(item.u.object.payload), "hello", 5) == 0);
     moq_sub_fetch_item_cleanup(&item);
 
-    /* Nothing more until FETCH_OK arrives. */
+    /* Nothing more until FETCH_OK arrives, and no FETCH_OK result yet. */
     MOQ_TEST_CHECK(moq_sub_poll_fetch(sub, &item) == MOQ_DONE);
+    moq_sub_fetch_result_t result;
+    MOQ_TEST_CHECK(moq_sub_get_fetch_result(sub, req, &result,
+        sizeof(result)) == MOQ_OK);
+    MOQ_TEST_CHECK(result.flags == 0 && result.track_properties.len == 0);
 
     /* FETCH_OK (End=[0,1]); the object stream already FIN'd, so the session
      * follows with FETCH_COMPLETE. */
@@ -1625,6 +1629,12 @@ static void test_fetch_object_before_ok(void) {
         moq_buf_writer_offset(&cw), now) >= 0);
     MOQ_TEST_CHECK(moq_sub_tick(sub, now) == MOQ_OK);
 
+    /* The tick that consumed FETCH_OK recorded it, ahead of its item. */
+    MOQ_TEST_CHECK(moq_sub_get_fetch_result(sub, req, &result,
+        sizeof(result)) == MOQ_OK);
+    MOQ_TEST_CHECK(result.flags == MOQ_SUB_FETCH_RESULT_RESPONSE_SEEN);
+    MOQ_TEST_CHECK(result.track_properties.len == 0);
+
     MOQ_TEST_CHECK(moq_sub_poll_fetch(sub, &item) == MOQ_OK);
     MOQ_TEST_CHECK(item.kind == MOQ_SUB_FETCH_OK);
     MOQ_TEST_CHECK(item.request == req);
@@ -1635,6 +1645,9 @@ static void test_fetch_object_before_ok(void) {
     moq_sub_fetch_item_cleanup(&item);
 
     MOQ_TEST_CHECK(moq_sub_poll_fetch(sub, &item) == MOQ_DONE);
+    /* Polling the terminal released the request. */
+    MOQ_TEST_CHECK(moq_sub_get_fetch_result(sub, req, &result,
+        sizeof(result)) == MOQ_ERR_INVAL);
 
     moq_sub_destroy(sub);
     { moq_event_t d;

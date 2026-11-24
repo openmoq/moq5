@@ -386,6 +386,23 @@ static moq_media_companion_profile_t sender_cfg_companion(
 }
 
 
+/* The configured catalog revision, read by byte offset: the caller's object
+ * may be an older, smaller struct, never read through this type past its
+ * struct_size. Absent or partially covered is REVISION_01, as before the
+ * field existed; the reserved bytes after it are never read. */
+static moq_msf_revision_t sender_cfg_catalog_revision(
+    const moq_media_sender_cfg_t *cfg)
+{
+    uint32_t size;
+    memcpy(&size, cfg, sizeof(size));
+    moq_msf_revision_t rev = MOQ_MSF_REVISION_01;
+    const size_t at = offsetof(moq_media_sender_cfg_t, catalog_revision);
+    if (size >= at + sizeof(rev))
+        memcpy(&rev, (const uint8_t *)cfg + at, sizeof(rev));
+    return rev;
+}
+
+
 moq_result_t sender_validate_cfg(const moq_media_sender_cfg_t *cfg)
 {
     if (!cfg) return MOQ_ERR_INVAL;
@@ -395,6 +412,9 @@ moq_result_t sender_validate_cfg(const moq_media_sender_cfg_t *cfg)
     if (companion != MOQ_MEDIA_COMPANION_AUTO &&
         companion != MOQ_MEDIA_COMPANION_LEGACY_MSF01_LOC01 &&
         !sender_companion_d22(companion))
+        return MOQ_ERR_INVAL;
+    moq_msf_revision_t rev = sender_cfg_catalog_revision(cfg);
+    if (rev != MOQ_MSF_REVISION_01 && rev != MOQ_MSF_REVISION_02)
         return MOQ_ERR_INVAL;
     if (cfg->namespace_.count == 0 || !cfg->namespace_.parts)
         return MOQ_ERR_INVAL;
@@ -490,6 +510,7 @@ void sender_copy_cfg_tail(moq_media_sender_t *s,
 {
     s->companion_profile = sender_cfg_companion(cfg);
     s->companion_auto = s->companion_profile == MOQ_MEDIA_COMPANION_AUTO;
+    s->catalog_revision = sender_cfg_catalog_revision(cfg);
     size_t cb_off = offsetof(moq_media_sender_cfg_t, callbacks);
     if (cfg->struct_size > cb_off) {
         const moq_media_sender_callbacks_t *cb = &cfg->callbacks;

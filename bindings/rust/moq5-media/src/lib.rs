@@ -13,7 +13,7 @@
 //!   declares ([`Mpeg2tsRecord`]) and what a received catalog carries
 //!   ([`Mpeg2tsRecordRef`], [`TrackExtension`]).
 //! - The media value types: [`MediaType`], [`Packaging`], [`SapType`],
-//!   [`CompanionProfile`] and [`TimeDomain`].
+//!   [`CompanionProfile`], [`MsfRevision`] and [`TimeDomain`].
 //!
 //! Errors are the core crate's [`moq5_core::Error`]. The service crate
 //! (`moq5`) re-exports every name here. The raw C API stays available as
@@ -40,4 +40,4 @@ pub use metadata::{LocMetadata, Marking, ObjectMetadata};
 pub use mpeg2ts::{
     Mpeg2tsKeys, Mpeg2tsMode, Mpeg2tsRecord, Mpeg2tsRecordRef, Mpeg2tsTimestampMode, TrackExtension,
 };
-pub use types::{CompanionProfile, MediaType, Packaging, SapType, TimeDomain};
+pub use types::{CompanionProfile, MediaType, MsfRevision, Packaging, SapType, TimeDomain};

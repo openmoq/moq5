@@ -814,6 +814,11 @@ internal class EndpointEngine(
     // own state first: a track that failed locally without an event saying
     // so (credentials, or an event short of its origin) is FAILED there, and
     // that is the expected answer, not a breach.
+    //
+    // A command on a track an MSF-02 replacement removed is forwarded: the C
+    // acts on the newest track of its replacement chain, and the binding keeps
+    // that track's desired state, which the replacement moved there. A state
+    // read on a replaced track stays refused, as the C refuses it.
 
     /** What the drain-then-check prelude found: null means proceed to the backend. */
     private fun controlPreludeLocked(b: EndpointBackend, token: Long, model: ReceiverModel, track: MediaTrack, mutating: Boolean): Throwable? {
@@ -824,18 +829,29 @@ internal class EndpointEngine(
             is ReceiverTerminal.Fatal -> return if (mutating) ReceiverFatalException(t.code) else null
             is ReceiverTerminal.Closed -> return if (mutating) ReceiverClosedException() else null
         }
-        if (track.presence == TrackPresence.Removed) return TrackUnavailableException(TrackPresence.Removed)
+        if (track.presence == TrackPresence.Removed && !(mutating && model.isReplaced(track.token))) return TrackUnavailableException(TrackPresence.Removed)
         return null
     }
 
-    /** Caller holds the lock. Explain a refused command by draining again; null when the code cannot be explained. */
-    private fun explainRefusalLocked(b: EndpointBackend, op: String, code: Int, model: ReceiverModel, track: MediaTrack): Throwable {
+    /**
+     * Caller holds the lock. The track a command on [track] acts on: [track]
+     * itself, or the newest track of its replacement chain. Falls back to
+     * [track] while that successor's ADDED is not integrated.
+     */
+    private fun commandTargetLocked(model: ReceiverModel, track: MediaTrack): MediaTrack = model.resolve(model.chainHead(track.token)) ?: track
+
+    /**
+     * Caller holds the lock. Explain a refused command by draining again; null when the code cannot be explained.
+     * A command's refusal is judged on the track it acted on, after the drain ([command]); a state read's on [track].
+     */
+    private fun explainRefusalLocked(b: EndpointBackend, op: String, code: Int, model: ReceiverModel, track: MediaTrack, command: Boolean = true): Throwable {
         when (code) {
             MOQ_ERR_WRONG_STATE -> {
                 if (drainReceiverLocked(b)) return bridgeFailure!!
-                if (track.presence == TrackPresence.Present && nativeStateFailedLocked(b, model, track)) return TrackUnavailableException(TrackPresence.Failed)
-                return when (track.presence) {
-                    TrackPresence.Removed, TrackPresence.Ended, TrackPresence.Failed -> TrackUnavailableException(track.presence)
+                val acted = if (command) commandTargetLocked(model, track) else track
+                if (acted.presence == TrackPresence.Present && nativeStateFailedLocked(b, model, acted)) return TrackUnavailableException(TrackPresence.Failed)
+                return when (acted.presence) {
+                    TrackPresence.Removed, TrackPresence.Ended, TrackPresence.Failed -> TrackUnavailableException(acted.presence)
                     TrackPresence.Present -> quarantineLocked(BridgeFailure("$op-wrong-state", code))
                 }
             }
@@ -874,11 +890,14 @@ internal class EndpointEngine(
             val outcome: Throwable? =
                 lock.withLock {
                     controlPreludeLocked(b, token, model, track, mutating = true)?.let { return@withLock it }
-                    if (track.presence == TrackPresence.Ended || track.presence == TrackPresence.Failed) return@withLock TrackUnavailableException(track.presence)
-                    if (model.isDesired(track.token)) return@withLock null
+                    val target = commandTargetLocked(model, track)
+                    if (target !== track && target.presence == TrackPresence.Removed) return@withLock TrackUnavailableException(TrackPresence.Removed)
+                    if (target.presence == TrackPresence.Ended || target.presence == TrackPresence.Failed) return@withLock TrackUnavailableException(target.presence)
+                    val head = model.chainHead(track.token)
+                    if (model.isDesired(head)) return@withLock null
                     when (val r = b.subscribeTrack(token, track.token, start, priority)) {
                         is BackendCommandResult.Ok -> {
-                            model.setDesired(track.token, true)
+                            model.setDesired(head, true)
                             null
                         }
                         is BackendCommandResult.Refused -> explainRefusalLocked(b, "track-subscribe", r.code.value, model, track)
@@ -895,10 +914,13 @@ internal class EndpointEngine(
             val outcome: Throwable? =
                 lock.withLock {
                     controlPreludeLocked(b, token, model, track, mutating = true)?.let { return@withLock it }
-                    if (!model.isDesired(track.token)) return@withLock null
+                    val target = commandTargetLocked(model, track)
+                    if (target !== track && target.presence == TrackPresence.Removed) return@withLock TrackUnavailableException(TrackPresence.Removed)
+                    val head = model.chainHead(track.token)
+                    if (!model.isDesired(head)) return@withLock null
                     when (val r = b.unsubscribeTrack(token, track.token)) {
                         is BackendCommandResult.Ok -> {
-                            model.setDesired(track.token, false)
+                            model.setDesired(head, false)
                             null
                         }
                         is BackendCommandResult.Refused -> explainRefusalLocked(b, "track-unsubscribe", r.code.value, model, track)
@@ -937,7 +959,7 @@ internal class EndpointEngine(
                         is BackendTrackStateResult.State ->
                             TrackState.ofNative(r.raw).also { if (it == TrackState.Failed) model.markFailed(track) }
                         is BackendTrackStateResult.Refused -> {
-                            failure = explainRefusalLocked(b, "track-state", r.code.value, model, track)
+                            failure = explainRefusalLocked(b, "track-state", r.code.value, model, track, command = false)
                             null
                         }
                         is BackendTrackStateResult.Bridge -> {
