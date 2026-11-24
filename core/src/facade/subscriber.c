@@ -1524,6 +1524,10 @@ moq_result_t moq_sub_subscribe(moq_subscriber_t *sub,
         scfg.delivery_timeout_flags |= MOQ_SUBSCRIBE_SUBGROUP_DELIVERY_TIMEOUT;
         scfg.subgroup_delivery_timeout_ms = *cfg->subgroup_delivery_timeout_ms;
     }
+    if (STCFG_HAS(forward) && cfg->forward) {
+        scfg.has_forward = true;
+        scfg.forward = *cfg->forward;
+    }
 #undef STCFG_HAS
 #undef STCFG_MIN
 

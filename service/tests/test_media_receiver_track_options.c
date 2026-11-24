@@ -33,6 +33,7 @@ typedef struct options_cfg {
     const moq_fill_cfg_t *fill;
     const uint64_t *object_delivery_timeout_ms;
     const uint64_t *subgroup_delivery_timeout_ms;
+    const bool *forward;
 } options_cfg_t;
 
 /* The extent a caller had before the delivery timeouts were appended. */
@@ -57,6 +58,9 @@ _Static_assert(offsetof(options_cfg_t, object_delivery_timeout_ms) ==
 _Static_assert(offsetof(options_cfg_t, subgroup_delivery_timeout_ms) ==
                offsetof(moq_media_receiver_track_subscribe_cfg_t, subgroup_delivery_timeout_ms),
                "independent subgroup delivery timeout offset");
+_Static_assert(offsetof(options_cfg_t, forward) ==
+               offsetof(moq_media_receiver_track_subscribe_cfg_t, forward),
+               "independent forward offset");
 
 static int failures;
 static unsigned calls;
@@ -69,6 +73,7 @@ static const moq_fill_cfg_t *caller_fill;
 static bool seen_object_dt, seen_subgroup_dt;
 static uint64_t object_dt_seen, subgroup_dt_seen;
 static const uint64_t *caller_object_dt, *caller_subgroup_dt;
+static bool seen_forward_set, seen_forward;
 
 static moq_result_t observed_subscribe(moq_subscriber_t *sub,
     const moq_sub_track_cfg_t *cfg, uint64_t now_us, moq_sub_track_t **out)
@@ -100,6 +105,8 @@ static moq_result_t observed_subscribe(moq_subscriber_t *sub,
         subgroup_dt_seen = *cfg->subgroup_delivery_timeout_ms;
         MOQ_TEST_CHECK(cfg->subgroup_delivery_timeout_ms != caller_subgroup_dt);
     }
+    seen_forward_set = cfg->forward != NULL;
+    if (seen_forward_set) seen_forward = *cfg->forward;
     return moq_sub_subscribe(sub, cfg, now_us, out);
 }
 
@@ -138,6 +145,7 @@ static bool start(fixture_t *f, moq_version_t version)
     caller_location = caller_fill_location = NULL;
     caller_fill = NULL;
     caller_object_dt = caller_subgroup_dt = NULL;
+    seen_forward_set = seen_forward = false;
     moq_alloc_t alloc = test_allocator(&f->ledger);
     moq_simpair_cfg_t pair_cfg = MOQ_SIMPAIR_CFG_INIT;
     pair_cfg.alloc = &alloc;
@@ -589,7 +597,8 @@ static void test_delivery_timeout_refusals(void)
 
 static void test_delivery_timeout_tails(void)
 {
-    for (size_t n = OPTIONS_BEFORE_TIMEOUTS; n < sizeof(options_cfg_t); n++) {
+    /* Sizes that end inside the delivery-timeout tail (before `forward`). */
+    for (size_t n = OPTIONS_BEFORE_TIMEOUTS; n < offsetof(options_cfg_t, forward); n++) {
         fixture_t f;
         bool ready = start(&f, MOQ_VERSION_DRAFT_18);
         MOQ_TEST_CHECK(ready);
@@ -610,8 +619,107 @@ static void test_delivery_timeout_tails(void)
     MOQ_TEST_PASS("track_options_delivery_timeout_partial_tails");
 }
 
+/* The forward pointer is read only when struct_size covers all of it. */
+static void test_forward_tails(void)
+{
+    for (size_t n = offsetof(options_cfg_t, forward); n <= sizeof(options_cfg_t); n++) {
+        fixture_t f;
+        bool ready = start(&f, MOQ_VERSION_DRAFT_18);
+        MOQ_TEST_CHECK(ready);
+        if (!ready) { finish(&f); continue; }
+        const bool off = false;
+        options_cfg_t cfg = {0};
+        cfg.struct_size = (uint32_t)n;
+        cfg.forward = &off;
+        MOQ_TEST_CHECK(subscribe(&f, &cfg) == MOQ_OK);
+        reconcile(&f);
+        bool covered = n >= offsetof(options_cfg_t, forward) + sizeof(cfg.forward);
+        MOQ_TEST_CHECK(calls == 1 && seen_forward_set == covered);
+        MOQ_TEST_CHECK(f.track->passive == covered);
+        finish(&f);
+    }
+    MOQ_TEST_PASS("track_options_forward_partial_tails");
+}
+
+/* A passive track (forward = &false) subscribes with Forward 0, stays
+ * subscribed while silent for 60 s of reconciliation, raises no track event,
+ * and sends no SUBSCRIBE_UPDATE. forward = &true subscribes with Forward 1. */
+static void test_passive_forward(moq_version_t version)
+{
+    for (int passive = 1; passive >= 0; --passive) {
+        fixture_t f;
+        bool ready = start(&f, version);
+        MOQ_TEST_CHECK(ready);
+        if (!ready) { finish(&f); continue; }
+        const bool fwd = !passive;
+        options_cfg_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.struct_size = sizeof(cfg);
+        cfg.forward = &fwd;
+        MOQ_TEST_CHECK_EQ_INT(subscribe(&f, &cfg), MOQ_OK);
+        reconcile(&f);
+        MOQ_TEST_CHECK(seen_forward_set && seen_forward == fwd);
+        MOQ_TEST_CHECK(f.track->passive == (bool)passive);
+        MOQ_TEST_CHECK(f.track->forward_sent == fwd);
+
+        /* The server sees the SUBSCRIBE with that Forward State and accepts it. */
+        moq_session_t *server = moq_simpair_server(f.pair);
+        moq_simpair_run_until_quiescent(f.pair, 32, NULL);
+        moq_event_t ev;
+        bool got = false;
+        for (unsigned j = 0; j < 8 && moq_session_poll_events(server, &ev, 1); j++) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
+                got = true;
+                MOQ_TEST_CHECK(ev.u.subscribe_request.forward == fwd);
+                moq_accept_subscribe_cfg_t acc;
+                moq_accept_subscribe_cfg_init(&acc);
+                MOQ_TEST_CHECK_EQ_INT(moq_session_accept_subscribe(server,
+                    ev.u.subscribe_request.sub, &acc, moq_simpair_now_us(f.pair)), MOQ_OK);
+            }
+            moq_event_cleanup(&ev);
+        }
+        MOQ_TEST_CHECK(got);
+        moq_simpair_run_until_quiescent(f.pair, 32, NULL);
+
+        /* 60 s of silence with the receiver reconciling every second. */
+        unsigned events = 0, updates = 0, fill_terminals = 0;
+        for (int s = 0; s < 60; ++s) {
+            moq_simpair_advance_to(f.pair, moq_simpair_now_us(f.pair) + 1000000);
+            /* The endpoint's full receiver pass (receiver_hook): the routed
+             * tick, reconciliation, MPEG-TS timers, completions, retirement. */
+            moq_media_receiver_test_pump(f.receiver, moq_simpair_client(f.pair),
+                                         moq_simpair_now_us(f.pair));
+            moq_simpair_run_until_quiescent(f.pair, 32, NULL);
+            moq_media_track_event_t te;
+            while (moq_media_receiver_poll_track(f.receiver, &te, sizeof(te)) == MOQ_OK) {
+                /* Draft 22 joins a live track with a current-group fill; with
+                 * nothing published it ends at once (FILL_TERMINAL). A passive
+                 * track takes no join fill. */
+                if (te.kind == MOQ_MEDIA_TRACK_FILL_TERMINAL) fill_terminals++;
+                else events++;
+            }
+            while (moq_session_poll_events(server, &ev, 1)) {
+                if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED) updates++;
+                moq_event_cleanup(&ev);
+            }
+        }
+        MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(f.receiver));
+        MOQ_TEST_CHECK(f.track->requested && f.track->sub_track != NULL);
+        MOQ_TEST_CHECK_EQ_INT((int)events, 0);
+        MOQ_TEST_CHECK_EQ_INT((int)fill_terminals,
+                              (!passive && version == MOQ_VERSION_DRAFT_22) ? 1 : 0);
+        MOQ_TEST_CHECK_EQ_INT((int)updates, 0);
+        MOQ_TEST_CHECK(f.track->forward_sent == fwd);
+        finish(&f);
+    }
+    MOQ_TEST_PASS(version == MOQ_VERSION_DRAFT_22 ? "track_options_passive_forward_d22"
+                                                  : "track_options_passive_forward_d18");
+}
+
 int main(void)
 {
+    test_passive_forward(MOQ_VERSION_DRAFT_18);
+    test_passive_forward(MOQ_VERSION_DRAFT_22);
     test_copy_and_selection();
     test_authoritative_location();
     test_refusals();
@@ -621,6 +729,7 @@ int main(void)
     test_delivery_timeouts();
     test_delivery_timeout_refusals();
     test_delivery_timeout_tails();
+    test_forward_tails();
     printf("receiver_track_options: %d failures\n", failures);
     return failures ? 1 : 0;
 }

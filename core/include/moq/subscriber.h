@@ -242,6 +242,14 @@ typedef struct moq_sub_track_cfg {
      * before anything is sent. */
     const uint64_t                  *object_delivery_timeout_ms;
     const uint64_t                  *subgroup_delivery_timeout_ms;
+    /* Appended: the SUBSCRIBE's Forward State, borrowed for the call.
+     * Non-NULL selects it with its value; NULL leaves the session default
+     * (Forward 1). With Forward 0 the publisher sends no Objects until a
+     * subscription update sets Forward 1. Whether a FETCH can still be
+     * served depends on what the relay holds. Every draft carries Forward
+     * on SUBSCRIBE. A pointer keeps the struct's alignment; read only when
+     * struct_size covers the whole pointer. */
+    const bool                      *forward;
 } moq_sub_track_cfg_t;
 
 /*

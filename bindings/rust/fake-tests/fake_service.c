@@ -23,6 +23,7 @@
 
 #include <inttypes.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1093,10 +1094,15 @@ moq_result_t moq_media_receiver_subscribe_track(moq_media_receiver_t *r, moq_med
         } else {
             snprintf(fill, sizeof fill, "none");
         }
+        const char *forward = "none";
+        if (cfg->struct_size >= offsetof(moq_media_receiver_track_subscribe_cfg_t, forward) +
+                                   sizeof(cfg->forward) &&
+            cfg->forward)
+            forward = *cfg->forward ? "1" : "0";
         logf_("subscribe track=%d start=%d priority=%s program=%u location=%d fill=%d "
-              "loc=%s fill_cfg=%s struct_size=%u",
+              "loc=%s fill_cfg=%s forward=%s struct_size=%u",
               i, (int)cfg->start, prio, cfg->mpeg2ts_program_number, cfg->location ? 1 : 0,
-              cfg->fill ? 1 : 0, loc, fill, cfg->struct_size);
+              cfg->fill ? 1 : 0, loc, fill, forward, cfg->struct_size);
         if (cfg->struct_size < MOQ_MEDIA_RECEIVER_TRACK_SUBSCRIBE_CFG_V0_SIZE) return MOQ_ERR_INVAL;
     } else {
         logf_("subscribe track=%d config=none", i);
