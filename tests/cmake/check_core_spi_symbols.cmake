@@ -61,6 +61,7 @@ set(BASE_SYMBOLS
     moq_core_internal_track_properties_validate
     moq_core_internal_rcbuf_transferable
     moq_core_internal_sub_tick_routed
+    moq_core_internal_sub_fetch_request_id
 )
 set(FAMILY_PREFIX "moq_core_internal_")
 
