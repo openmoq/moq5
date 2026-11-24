@@ -88,6 +88,8 @@ struct sub_track_options {
      * (zero included); errc::unsupported on a draft without them. */
     std::optional<uint64_t> object_delivery_timeout_ms   = {};
     std::optional<uint64_t> subgroup_delivery_timeout_ms = {};
+    /* The SUBSCRIBE's Forward state; unset sends Forward 1. */
+    std::optional<bool> forward = {};
 };
 
 class polled_object {
@@ -648,6 +650,8 @@ public:
             c.object_delivery_timeout_ms = &*options.object_delivery_timeout_ms;
         if (options.subgroup_delivery_timeout_ms)
             c.subgroup_delivery_timeout_ms = &*options.subgroup_delivery_timeout_ms;
+        if (options.forward)
+            c.forward = &*options.forward;
 
         moq_sub_track_t *t = nullptr;
         auto rc = moq_sub_subscribe(s_, &c, now, &t);

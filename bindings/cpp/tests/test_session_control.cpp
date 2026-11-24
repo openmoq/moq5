@@ -390,16 +390,20 @@ static int test_facades()
     tc.track = moq::bytes_view("v");
     moq::sub_track_options to;
     to.object_delivery_timeout_ms = 100;
+    to.forward = false;
     auto t = sub.subscribe(tc, to, 1);
     MOQ_CHECK(t.ok());
     settle(p.client, p.server, 2);
     std::optional<moq::subscription> ssub;
     std::optional<uint64_t> asked;
+    std::optional<bool> forward;
     MOQ_CHECK((take<moq::extended_event::subscribe_request>(p.server, [&](const auto &e) {
         ssub = e.sub;
+        forward = e.forward;
         if (e.options) asked = e.options->object_delivery_timeout_ms;
     })));
     MOQ_CHECK(asked && *asked == 100);
+    MOQ_CHECK(forward && !*forward);
     if (ssub && t.ok()) {
         moq::reject_subscribe_config rj;
         rj.error_code = moq::request_error::redirect;

@@ -192,6 +192,7 @@ PIN_AFTER(moq_sub_track_cfg_t, auth_token_count, location);
 PIN_AFTER(moq_sub_track_cfg_t, auth_token_count, fill);
 PIN_THROUGH(moq_sub_track_cfg_t, fill, 80, 44, 44, 8, 4, 4);
 PIN_AFTER(moq_sub_track_cfg_t, fill, rendezvous_timeout_ms);
+PIN_AFTER(moq_sub_track_cfg_t, subgroup_delivery_timeout_ms, forward);
 
 /* The subscriber's delivery timeouts on an accepted PUBLISH start past the
  * layout that ends at the expiry pair. */
@@ -651,7 +652,9 @@ PIN_AT(moq_sub_track_cfg_t, rendezvous_timeout_ms, 80, 44, 44);
  * and keep the struct's alignment. */
 PIN_AT(moq_sub_track_cfg_t, object_delivery_timeout_ms, 88, 48, 48);
 PIN_AT(moq_sub_track_cfg_t, subgroup_delivery_timeout_ms, 96, 52, 52);
-PIN_SIZE(moq_sub_track_cfg_t, 104, 56, 56);
+/* The initial Forward State pointer starts at the previous sizeof. */
+PIN_AT(moq_sub_track_cfg_t, forward, 104, 56, 56);
+PIN_SIZE(moq_sub_track_cfg_t, 112, 60, 60);
 PIN_AT(moq_subscribe_tracks_cfg_t, options_flags, 48, 24, 24);
 PIN_AT(moq_subscribe_tracks_cfg_t, group_order, 52, 28, 28);
 PIN_AT(moq_subscribe_tracks_cfg_t, include_properties, 56, 32, 32);

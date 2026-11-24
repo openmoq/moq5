@@ -968,6 +968,18 @@ typedef struct moq_media_receiver_track_subscribe_cfg {
      * values must be equal; otherwise MOQ_ERR_INVAL. */
     const uint64_t                  *object_delivery_timeout_ms;
     const uint64_t                  *subgroup_delivery_timeout_ms;
+    /* Appended: the subscription's initial Forward State, borrowed for the
+     * call (read only when struct_size covers the whole pointer). NULL keeps
+     * Forward 1. Non-NULL false subscribes with Forward 0: the track is
+     * wanted and known but passive, the publisher sends it no Objects, and
+     * the receiver never raises its Forward State itself (flow control and
+     * subscribe_track resumes leave it at 0). It applies only when the
+     * subscription is first issued, as the other options do. A passive track
+     * takes no implicit current-group join fill on draft 22. A passive track
+     * that stays silent is not an error and raises no event. In this version
+     * passive is fixed for the subscription's life: the receiver has no call
+     * to raise Forward on it later. */
+    const bool                      *forward;
 } moq_media_receiver_track_subscribe_cfg_t;
 
 /* Frozen v0 sizeof: through priority, rounded to the original uint32_t
