@@ -39,5 +39,34 @@ int main(void)
     CHECK(moq_msf_track_to_media_info_sized(NULL, NULL, &track, sizeof(track),
                                             MOQ_VERSION_DRAFT_16, NULL, 0,
                                             NULL) == MOQ_ERR_INVAL);
+
+    /* The MSF-02 catalog surface: each call refuses its missing arguments,
+     * so no allocator is needed. */
+    moq_msf_catalog_t cat;
+    moq_msf_validate_cfg_t vcfg;
+    moq_msf_track_supplement_t supp;
+    moq_bytes_t fields[2];
+    size_t nfields = 0;
+    uint64_t value = 0;
+    moq_bytes_t none = { NULL, 0 };
+    moq_namespace_t no_ns = { NULL, 0 };
+    moq_msf_validate_cfg_init(&vcfg);
+    CHECK(vcfg.struct_size == sizeof(vcfg));
+    moq_msf_track_supplement_init(&supp);
+    CHECK(supp.struct_size == sizeof(supp));
+    CHECK(moq_msf_catalog_parse_sized(NULL, none, &cat, sizeof(cat)) ==
+          MOQ_ERR_INVAL);
+    CHECK(moq_msf_catalog_apply_delta_sized(NULL, &cat, &cat, &vcfg, &cat,
+                                            sizeof(cat)) == MOQ_ERR_INVAL);
+    CHECK(moq_msf_catalog_check(NULL, &cat, &vcfg, NULL) == MOQ_ERR_INVAL);
+    CHECK(moq_msf_track_supplement(NULL) == NULL);
+    CHECK(moq_msf_ext_supplement(NULL, 0) == NULL);
+    CHECK(moq_msf_namespace_split(none, fields, 2, &nfields) == MOQ_ERR_PROTO);
+    CHECK(!moq_msf_track_matches(NULL, no_ns, no_ns, none));
+    CHECK(!moq_msf_packaging_metadata_find(none, "streamMapping", &none));
+    CHECK(moq_msf_track_stream_mapping(NULL) == MOQ_MSF_STREAM_MAPPING_GROUP);
+    CHECK(moq_msf_switch_point_group(2, 0, 15, 30, &value) == MOQ_OK &&
+          value == 1);
+    CHECK(moq_msf_init_data_property_type(NULL, &value) == MOQ_ERR_INVAL);
     return 0;
 }

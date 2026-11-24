@@ -1191,6 +1191,58 @@ int main(void)
         MOQ_TEST_PASS("catalog_update.overcap_delta_refused");
     }
 
+    /* -- the receiver reads catalogs through the MSF-01 extent ------------- *
+     * An MSF-02 catalog ("draft-02") is not understood: as the first catalog
+     * it leaves no usable effective one. */
+    {
+        moq_media_receiver_t *r = moq_media_receiver_test_new(false);
+        ingest(r, 0, 0, "{\"version\":\"draft-02\",\"generatedAt\":1,"
+                        "\"tracks\":[" TRK("a", "video") "]}");
+        n = drain(r, k, tr, 16);
+        MOQ_TEST_CHECK_EQ_INT(count_kind(k, tr, n, MOQ_MEDIA_CATALOG_READY, NULL, NULL), 0);
+        MOQ_TEST_CHECK(moq_media_receiver_test_is_fatal(r));
+        MOQ_TEST_CHECK_EQ_U64(moq_media_receiver_test_fatal_code(r),
+                              MOQ_MEDIA_RECEIVER_FATAL_CATALOG_UNUSABLE);
+        moq_media_receiver_test_free(r);
+        MOQ_TEST_PASS("catalog_update.msf02_catalog_not_read");
+    }
+
+    /* ... and an MSF-01 catalog's publishTracks are not read: neither a
+     * malformed array nor a duplicated entry changes what is adopted. */
+    {
+        static const char *const cats[] = {
+            "{\"version\":\"1\",\"tracks\":[" TRK("a", "video") "],"
+            "\"publishTracks\":{}}",
+            "{\"version\":\"1\",\"tracks\":[" TRK("a", "video") "],"
+            "\"publishTracks\":[" TRK("p", "log") "," TRK("p", "log") "]}",
+        };
+        for (size_t i = 0; i < sizeof(cats) / sizeof(cats[0]); i++) {
+            moq_media_receiver_t *r = moq_media_receiver_test_new(false);
+            ingest(r, 0, 0, cats[i]);
+            n = drain(r, k, tr, 16);
+            MOQ_TEST_CHECK_EQ_INT(count_kind(k, tr, n, MOQ_MEDIA_CATALOG_READY,
+                                             NULL, NULL), 1);
+            MOQ_TEST_CHECK(!moq_media_receiver_test_is_fatal(r));
+            MOQ_TEST_CHECK(moq_media_receiver_test_track_count(r) == 1);
+            moq_media_receiver_test_free(r);
+        }
+        MOQ_TEST_PASS("catalog_update.msf01_publish_tracks_not_read");
+    }
+
+    /* ... and a delta that only MSF-02 can express ("update") is dropped. */
+    {
+        moq_media_receiver_t *r = moq_media_receiver_test_new(false);
+        ingest(r, 0, 0, CAT2(TRK("a", "video"), TRK("b", "audio")));
+        (void)drain(r, k, tr, 16);
+        uint64_t d0 = moq_media_receiver_test_catalog_drops(r);
+        ingest(r, 0, 1, "{\"generatedAt\":2,\"deltaUpdate\":[{\"op\":\"update\","
+                        "\"tracks\":[{\"parentName\":\"a\",\"label\":\"x\"}]}]}");
+        MOQ_TEST_CHECK_EQ_U64(moq_media_receiver_test_catalog_drops(r), d0 + 1);
+        MOQ_TEST_CHECK(!moq_media_receiver_test_is_fatal(r));
+        moq_media_receiver_test_free(r);
+        MOQ_TEST_PASS("catalog_update.msf02_delta_not_read");
+    }
+
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

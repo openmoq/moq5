@@ -47,6 +47,35 @@ static inline bool fuzz_msf_ts_eq(const moq_msf_mpeg2ts_t *a,
     return true;
 }
 
+static inline bool fuzz_msf_supp_eq(const moq_msf_track_supplement_t *a,
+                                    const moq_msf_track_supplement_t *b)
+{
+    if (!a || !b || a->struct_size < MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE ||
+        b->struct_size < MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE ||
+        a->malformed != b->malformed || a->has_depends != b->has_depends)
+        return false;
+#define FUZZ_SUPP_SPAN(has, f) \
+    if (a->has != b->has || (a->has && !fuzz_msf_span_eq(a->f, b->f))) return false
+#define FUZZ_SUPP_NUM(has, f) \
+    if (a->has != b->has || (a->has && a->f != b->f)) return false
+    FUZZ_SUPP_SPAN(has_packaging_metadata, packaging_metadata);
+    FUZZ_SUPP_NUM(has_keyframe_spacing, keyframe_spacing);
+    FUZZ_SUPP_NUM(has_accessible_window_ms, accessible_window_ms);
+    FUZZ_SUPP_SPAN(has_encryption_scheme, encryption_scheme);
+    FUZZ_SUPP_SPAN(has_cipher_suite, cipher_suite);
+    FUZZ_SUPP_SPAN(has_key_id, key_id);
+    FUZZ_SUPP_SPAN(has_track_base_key, track_base_key);
+#undef FUZZ_SUPP_SPAN
+#undef FUZZ_SUPP_NUM
+    if (a->depends_render_group_count != b->depends_render_group_count ||
+        (a->depends_render_group_count &&
+         (!a->depends_render_groups || !b->depends_render_groups)))
+        return false;
+    for (size_t i = 0; i < a->depends_render_group_count; i++)
+        if (a->depends_render_groups[i] != b->depends_render_groups[i]) return false;
+    return true;
+}
+
 /* Parsed/encoded lists contain at most one record per known kind. Preserve
  * list membership as well as the complete typed record, on every packaging. */
 static inline bool fuzz_msf_extensions_eq(const moq_msf_track_t *a,
@@ -57,8 +86,14 @@ static inline bool fuzz_msf_extensions_eq(const moq_msf_track_t *a,
     for (size_t i = 0; i < a->extension_count; i++) {
         const moq_msf_track_ext_t *x = &a->extensions[i];
         const moq_msf_track_ext_t *y = &b->extensions[i];
-        if (x->kind != y->kind || x->kind != MOQ_MSF_EXT_MPEG2TS ||
-            !fuzz_msf_ts_eq(x->u.mpeg2ts, y->u.mpeg2ts)) return false;
+        if (x->kind != y->kind) return false;
+        if (x->kind == MOQ_MSF_EXT_MPEG2TS) {
+            if (!fuzz_msf_ts_eq(x->u.mpeg2ts, y->u.mpeg2ts)) return false;
+        } else if (x->kind == MOQ_MSF_EXT_SUPPLEMENT) {
+            if (!fuzz_msf_supp_eq(x->u.supplement, y->u.supplement)) return false;
+        } else {
+            return false;
+        }
     }
     return true;
 }

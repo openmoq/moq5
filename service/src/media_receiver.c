@@ -2616,6 +2616,20 @@ static void receiver_join_current_group(moq_location_filter_cfg_t *loc,
     fill->location = fill_loc;
 }
 
+/* Parse a catalog object through the MSF-01 extent of the catalog API: the
+ * MSF-01 vocabulary only, with no publishTracks and no track supplements,
+ * which this receiver's adoption and retained-state accounting do not
+ * cover. The storage past that extent is zeroed, so the whole struct is
+ * defined wherever it is copied. */
+static moq_result_t receiver_parse_catalog(moq_media_receiver_t *r,
+                                           moq_bytes_t json,
+                                           moq_msf_catalog_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    return moq_msf_catalog_parse_sized(&r->alloc, json, out,
+                                       MOQ_MSF_CATALOG_SIZE_THROUGH_VERSION_FORM);
+}
+
 /* Ingest one catalog object (network thread). object 0 = an independent catalog
  * generation (parse → adopt). object >= 1 in the latest group = a delta applied
  * in strict sequence onto the current effective catalog
@@ -2650,7 +2664,7 @@ static void receiver_ingest_catalog(moq_media_receiver_t *r,
         }
 
         moq_msf_catalog_t cand;
-        moq_result_t rc = moq_msf_catalog_parse(&r->alloc, json, &cand);
+        moq_result_t rc = receiver_parse_catalog(r, json, &cand);
         if (rc != MOQ_OK || cand.delta_update) {        /* delta on object 0 */
             if (rc == MOQ_OK) moq_msf_catalog_cleanup(&r->alloc, &cand);
             if (first) { receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_CATALOG_UNUSABLE); return; }
@@ -2720,13 +2734,14 @@ static void receiver_ingest_catalog(moq_media_receiver_t *r,
     }
 
     moq_msf_catalog_t delta;
-    moq_result_t rc = moq_msf_catalog_parse(&r->alloc, json, &delta);
+    moq_result_t rc = receiver_parse_catalog(r, json, &delta);
     if (rc != MOQ_OK || !delta.delta_update) {   /* not a delta object */
         if (rc == MOQ_OK) moq_msf_catalog_cleanup(&r->alloc, &delta);
         receiver_desync(r);
         return;
     }
     moq_msf_catalog_t cand;
+    memset(&cand, 0, sizeof(cand));   /* the apply writes the MSF-01 extent */
     /* Bound the delta before it builds the effective catalog: the receiver
      * never retains more than max_stable_handles tracks, so a delta that would
      * exceed that is refused (MOQ_ERR_PROTO -> desync) before any O(n) work.
@@ -3012,7 +3027,8 @@ static void receiver_bootstrap_object(moq_media_receiver_t *r,
     }
     moq_bytes_t json = { moq_rcbuf_data(item->u.object.payload), moq_rcbuf_len(item->u.object.payload) };
     moq_msf_catalog_t parsed, candidate;
-    moq_result_t rc = moq_msf_catalog_parse(&r->alloc, json, &parsed);
+    memset(&candidate, 0, sizeof(candidate));   /* the apply writes the MSF-01 extent */
+    moq_result_t rc = receiver_parse_catalog(r, json, &parsed);
     if (rc != MOQ_OK) { receiver_bootstrap_fail(r); return; }
     if (!b->have_base) {
         if (parsed.delta_update) {

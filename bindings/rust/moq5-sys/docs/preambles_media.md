@@ -91,5 +91,10 @@ moq_alloc_t. All borrows are valid until moq_msf_catalog_cleanup()
 is called. The original JSON input need not be kept alive after
 moq_msf_catalog_parse() returns.
 
+Two catalog revisions are understood, MSF-01 and MSF-02 (see
+moq_msf_revision_t). A caller whose catalog struct ends at version_form
+(the MSF-01 extent) sees MSF-01 only; the full struct sees both.
+
 @see draft-ietf-moq-msf-01
+@see draft-ietf-moq-msf-02
 ```

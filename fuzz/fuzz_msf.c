@@ -30,10 +30,10 @@
  *      catalog/track/delta/initData/contentProtection field (catalog_eq),
  *      pass identity validation on an independent catalog, and re-encode
  *      byte-for-byte identically (canonical JSON idempotence).
- *   5. moq_msf_catalog_apply_delta_ex with bounded moq_msf_apply_limits_t
- *      returns only {MOQ_OK, MOQ_ERR_INVAL, MOQ_ERR_PROTO, MOQ_ERR_NOMEM},
- *      and MUST refuse applying a delta to a terminal isComplete catalog with
- *      MOQ_ERR_PROTO (MSF §5.1.3).
+ *   5. moq_msf_catalog_apply_delta_sized with bounded moq_msf_validate_cfg_t
+ *      limits returns only {MOQ_OK, MOQ_ERR_INVAL, MOQ_ERR_PROTO,
+ *      MOQ_ERR_NOMEM}, and MUST refuse applying a delta to a terminal
+ *      isComplete catalog with MOQ_ERR_PROTO (MSF §5.1.3).
  *   6. moq_msf_media_timeline_decode (zero-cap count probe vs bounded decode)
  *      and moq_msf_media_timeline_encode round-trip decoded records
  *      identically.
@@ -41,6 +41,12 @@
  *      canonical Base64 round-trip in both directions.
  *   8. Every allocation made through the counting allocator is freed with its
  *      exact byte size before LLVMFuzzerTestOneInput returns.
+ *   9. The MSF-01 symbol and the full-extent parse agree where both accept
+ *      an input; moq_msf_catalog_check returns only {MOQ_OK, MOQ_ERR_PROTO,
+ *      MOQ_ERR_NOMEM} on a parsed independent catalog; a delta applied to a
+ *      fixed MSF-02 base under a known catalog namespace yields, on MOQ_OK,
+ *      an MSF-02 catalog that passes the check; the naming, stream-mapping
+ *      and init-property accessors return only their documented results.
  */
 
 typedef struct {
@@ -120,6 +126,18 @@ static void check_track_slices(const moq_msf_track_t *t)
         check_dom_slice(t->depends[i]);
     for (size_t i = 0; i < t->cp_ref_id_count; i++)
         check_dom_slice(t->cp_ref_ids[i]);
+    const moq_msf_track_supplement_t *sp = moq_msf_track_supplement(t);
+    if (sp) {
+        if (sp->struct_size != sizeof(*sp))
+            __builtin_trap();
+        if (sp->has_packaging_metadata) check_dom_slice(sp->packaging_metadata);
+        if (sp->has_encryption_scheme) check_dom_slice(sp->encryption_scheme);
+        if (sp->has_cipher_suite) check_dom_slice(sp->cipher_suite);
+        if (sp->has_key_id) check_dom_slice(sp->key_id);
+        if (sp->has_track_base_key) check_dom_slice(sp->track_base_key);
+        if (sp->depends_render_group_count > 0 && !sp->depends_render_groups)
+            __builtin_trap();
+    }
 }
 
 static void check_catalog_invariants(const moq_msf_catalog_t *cat)
@@ -130,7 +148,8 @@ static void check_catalog_invariants(const moq_msf_catalog_t *cat)
     if (cat->delta_update) {
         if (cat->delta_update_count == 0 || cat->track_count != 0 ||
             cat->tracks != NULL || cat->is_complete ||
-            cat->init_data_count != 0 || cat->content_protection_count != 0)
+            cat->init_data_count != 0 || cat->content_protection_count != 0 ||
+            cat->publish_track_count != 0 || cat->publish_tracks != NULL)
             __builtin_trap();
         for (size_t i = 0; i < cat->delta_update_count; i++) {
             const moq_msf_delta_op_t *op = &cat->delta_update[i];
@@ -142,8 +161,15 @@ static void check_catalog_invariants(const moq_msf_catalog_t *cat)
     } else {
         if (cat->version != MOQ_MSF_VERSION)
             __builtin_trap();
+        if (cat->revision != MOQ_MSF_REVISION_01 &&
+            cat->revision != MOQ_MSF_REVISION_02)
+            __builtin_trap();
         for (size_t i = 0; i < cat->track_count; i++)
             check_track_slices(&cat->tracks[i]);
+        if (cat->publish_track_count > 0 && !cat->publish_tracks)
+            __builtin_trap();
+        for (size_t i = 0; i < cat->publish_track_count; i++)
+            check_track_slices(&cat->publish_tracks[i]);
         for (size_t i = 0; i < cat->init_data_count; i++) {
             check_dom_slice(cat->init_data_list[i].id);
             check_dom_slice(cat->init_data_list[i].type);
@@ -289,7 +315,8 @@ static bool track_eq(const moq_msf_track_t *a, const moq_msf_track_t *b)
 
 static bool catalog_eq(const moq_msf_catalog_t *a, const moq_msf_catalog_t *b)
 {
-    if (a->version != b->version ||
+    if (a->version != b->version || a->revision != b->revision ||
+        a->publish_track_count != b->publish_track_count ||
         a->has_generated_at != b->has_generated_at ||
         (a->has_generated_at && a->generated_at != b->generated_at) ||
         a->is_complete != b->is_complete ||
@@ -302,6 +329,10 @@ static bool catalog_eq(const moq_msf_catalog_t *a, const moq_msf_catalog_t *b)
 
     for (size_t i = 0; i < a->track_count; i++) {
         if (!track_eq(&a->tracks[i], &b->tracks[i]))
+            return false;
+    }
+    for (size_t i = 0; i < a->publish_track_count; i++) {
+        if (!track_eq(&a->publish_tracks[i], &b->publish_tracks[i]))
             return false;
     }
     for (size_t i = 0; i < a->init_data_count; i++) {
@@ -365,6 +396,126 @@ static const char k_fixed_delta_json[] =
     "{\"name\":\"__fuzz_delta_track\",\"packaging\":\"loc\","
     "\"isLive\":true,\"role\":\"audio\",\"codec\":\"opus\"}"
     "]}]}";
+
+static const char k_r02_base_json[] =
+    "{\"version\":\"draft-02\",\"generatedAt\":1746104600000,\"tracks\":["
+    "{\"name\":\"video\",\"packaging\":\"loc\",\"isLive\":true,"
+    "\"role\":\"video\",\"renderGroup\":1,\"codec\":\"av01\","
+    "\"bitrate\":1500000,\"framerate\":30},"
+    "{\"name\":\"video-1080\",\"namespace\":\"example.com/custom\","
+    "\"packaging\":\"loc\",\"isLive\":true,\"role\":\"video\","
+    "\"codec\":\"av01\",\"bitrate\":2000000,\"framerate\":30},"
+    "{\"name\":\"audio\",\"packaging\":\"loc\",\"isLive\":true,"
+    "\"role\":\"audio\",\"renderGroup\":1,\"codec\":\"opus\","
+    "\"bitrate\":32000,\"samplerate\":48000,\"channelConfig\":\"2\"}"
+    "]}";
+
+/* The MSF-01 symbol against the full-extent parse of the same input. */
+static void fuzz_frozen_agreement(const moq_alloc_t *alloc, moq_bytes_t slice,
+                                  const moq_msf_catalog_t *full, moq_result_t frc)
+{
+    moq_msf_catalog_t old;
+    moq_result_t orc = (moq_msf_catalog_parse)(alloc, slice, &old);
+    if (orc != MOQ_OK && orc != MOQ_ERR_PROTO && orc != MOQ_ERR_NOMEM)
+        __builtin_trap();
+    if (orc != MOQ_OK) return;
+    if (old.struct_size != MOQ_MSF_CATALOG_SIZE_THROUGH_VERSION_FORM)
+        __builtin_trap();
+    if (frc == MOQ_OK) {
+        if (full->track_count != old.track_count ||
+            full->delta_update_count != old.delta_update_count ||
+            (full->delta_update != NULL) != (old.delta_update != NULL))
+            __builtin_trap();
+        if (!full->delta_update && full->revision != MOQ_MSF_REVISION_01)
+            __builtin_trap();
+        for (size_t i = 0; i < old.track_count; i++)
+            if (!bytes_eq(old.tracks[i].name, full->tracks[i].name) ||
+                old.tracks[i].extension_count > full->tracks[i].extension_count)
+                __builtin_trap();
+    }
+    moq_msf_catalog_cleanup(alloc, &old);
+}
+
+/* The naming, stream-mapping and init-property accessors. */
+static void fuzz_accessors(const moq_msf_catalog_t *cat)
+{
+    size_t lim = cat->track_count < 8 ? cat->track_count : 8;
+    for (size_t i = 0; i < lim; i++) {
+        const moq_msf_track_t *t = &cat->tracks[i];
+        moq_msf_stream_mapping_t m = moq_msf_track_stream_mapping(t);
+        if (m > MOQ_MSF_STREAM_MAPPING_UNRECOGNIZED)
+            __builtin_trap();
+        const moq_msf_track_supplement_t *s = moq_msf_track_supplement(t);
+        moq_bytes_t v;
+        if (s && s->has_packaging_metadata &&
+            moq_msf_packaging_metadata_find(s->packaging_metadata,
+                                            "streamMapping", &v))
+            check_dom_slice(v);
+        if (!t->has_namespace)
+            continue;
+        moq_bytes_t fields[MOQ_MSF_NAMESPACE_MAX_FIELDS];
+        size_t n = 0;
+        moq_result_t rc = moq_msf_namespace_split(
+            t->namespace_, fields, MOQ_MSF_NAMESPACE_MAX_FIELDS, &n);
+        if (rc == MOQ_OK) {
+            /* An MSF-02 parse guarantees UTF-8 naming, so its tracks match
+             * their own names; MSF-01 bytes may not be UTF-8, which never
+             * matches. */
+            moq_namespace_t ns = { fields, n };
+            moq_namespace_t none = { NULL, 0 };
+            bool m = moq_msf_track_matches(t, none, ns, t->name);
+            if (cat->revision == MOQ_MSF_REVISION_02 && !m)
+                __builtin_trap();
+        } else if (rc != MOQ_ERR_PROTO || n != 0) {
+            __builtin_trap();
+        }
+    }
+    size_t idl = cat->init_data_count < 8 ? cat->init_data_count : 8;
+    for (size_t i = 0; i < idl; i++) {
+        uint64_t type = 0;
+        moq_result_t rc =
+            moq_msf_init_data_property_type(&cat->init_data_list[i], &type);
+        if (rc != MOQ_OK && rc != MOQ_ERR_PROTO && rc != MOQ_ERR_INVAL)
+            __builtin_trap();
+    }
+}
+
+/* A delta onto a fixed MSF-02 base, under a known catalog namespace. */
+static void fuzz_apply_r02(const moq_alloc_t *alloc, const moq_msf_catalog_t *delta)
+{
+    moq_msf_catalog_t base;
+    if (moq_msf_catalog_parse(alloc, (moq_bytes_t){
+            (const uint8_t *)k_r02_base_json, sizeof(k_r02_base_json) - 1 },
+            &base) != MOQ_OK)
+        __builtin_trap();
+    static const moq_bytes_t k_ns[2] = {
+        { (const uint8_t *)"conference.example.com", 22 },
+        { (const uint8_t *)"alice", 5 },
+    };
+    moq_msf_validate_cfg_t cfg;
+    moq_msf_validate_cfg_init(&cfg);
+    cfg.catalog_namespace = (moq_namespace_t){ k_ns, 2 };
+    cfg.max_delta_ops = 32;
+    cfg.max_effective_tracks = 64;
+    moq_msf_catalog_t out;
+    moq_result_t rc = moq_msf_catalog_apply_delta_sized(alloc, &base, delta, &cfg,
+                                                        &out, sizeof(out));
+    if (rc != MOQ_OK && rc != MOQ_ERR_INVAL && rc != MOQ_ERR_PROTO &&
+        rc != MOQ_ERR_NOMEM)
+        __builtin_trap();
+    if (rc == MOQ_OK) {
+        check_catalog_invariants(&out);
+        if (out.revision != MOQ_MSF_REVISION_02 || out.delta_update)
+            __builtin_trap();
+        moq_result_t crc = moq_msf_catalog_check(alloc, &out, &cfg, NULL);
+        if (crc != MOQ_OK && crc != MOQ_ERR_NOMEM)
+            __builtin_trap();
+        moq_msf_catalog_cleanup(alloc, &out);
+    } else if (out.struct_size != sizeof(out) || out._dom != NULL) {
+        __builtin_trap();
+    }
+    moq_msf_catalog_cleanup(alloc, &base);
+}
 
 static void fuzz_media_timeline_path(const moq_alloc_t *alloc,
                                      moq_bytes_t slice)
@@ -485,17 +636,27 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (rc != MOQ_OK && rc != MOQ_ERR_PROTO && rc != MOQ_ERR_NOMEM)
         __builtin_trap();
 
+    fuzz_frozen_agreement(&alloc, slice, &cat, rc);
+
     if (rc == MOQ_OK) {
         check_catalog_invariants(&cat);
 
         /* 3. Identity validation and lookup helpers. */
         moq_result_t vrc = moq_msf_catalog_validate_identities(&alloc, &cat);
+        moq_msf_catalog_error_t why = MOQ_MSF_CATALOG_OK;
+        moq_result_t crc = moq_msf_catalog_check(&alloc, &cat, NULL, &why);
         if (cat.delta_update) {
-            if (vrc != MOQ_ERR_INVAL)
+            if (vrc != MOQ_ERR_INVAL || crc != MOQ_ERR_INVAL)
                 __builtin_trap();
+            fuzz_apply_r02(&alloc, &cat);
         } else {
             if (vrc != MOQ_OK && vrc != MOQ_ERR_PROTO && vrc != MOQ_ERR_NOMEM)
                 __builtin_trap();
+            if (crc != vrc ||
+                (crc == MOQ_ERR_PROTO) != (why != MOQ_MSF_CATALOG_OK) ||
+                why > MOQ_MSF_CATALOG_ERR_DUPLICATE_PUBLISH_TRACK)
+                __builtin_trap();
+            fuzz_accessors(&cat);
         }
 
         static const char *const k_roles[] = {
@@ -569,9 +730,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         }
 
         /* 5. Delta application with bounded resource limits. */
-        moq_msf_apply_limits_t limits;
-        memset(&limits, 0, sizeof(limits));
-        limits.struct_size = sizeof(limits);
+        moq_msf_validate_cfg_t limits;
+        moq_msf_validate_cfg_init(&limits);
         limits.max_delta_ops = 32;
         limits.max_effective_tracks = 64;
 
@@ -585,8 +745,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 __builtin_trap();
 
             moq_msf_catalog_t applied;
-            moq_result_t arc = moq_msf_catalog_apply_delta_ex(
-                &alloc, &base_cat, &cat, &limits, &applied);
+            moq_result_t arc = moq_msf_catalog_apply_delta_sized(
+                &alloc, &base_cat, &cat, &limits, &applied, sizeof(applied));
             if (arc != MOQ_OK && arc != MOQ_ERR_INVAL &&
                 arc != MOQ_ERR_PROTO && arc != MOQ_ERR_NOMEM)
                 __builtin_trap();
@@ -607,8 +767,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 __builtin_trap();
 
             moq_msf_catalog_t applied;
-            moq_result_t arc = moq_msf_catalog_apply_delta_ex(
-                &alloc, &cat, &delta_cat, &limits, &applied);
+            moq_result_t arc = moq_msf_catalog_apply_delta_sized(
+                &alloc, &cat, &delta_cat, &limits, &applied, sizeof(applied));
             if (cat.is_complete) {
                 /* MSF §5.1.3: terminal isComplete catalog must reject deltas. */
                 if (arc != MOQ_ERR_PROTO)

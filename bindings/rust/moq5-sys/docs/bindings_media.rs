@@ -3,7 +3,7 @@
 // by scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: fe64a92ba931 (native headers modified in the worktree)
+// libmoq commit: 11f7cd4698b6
 // SDK: libmoq-service.pc Requires: libmoq; libmoq-sim.pc Requires: libmoq-core
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -33,8 +33,12 @@ pub const MOQ_MSF_MPEG2TS_F_SI_PIDS: u32 = 64;
 pub const MOQ_MSF_MPEG2TS_F_RANDOM_ACCESS: u32 = 128;
 pub const MOQ_MSF_MPEG2TS_F_TIMESTAMP_MODE: u32 = 256;
 pub const MOQ_MSF_MPEG2TS_F_SCTE35_PID: u32 = 512;
+pub const MOQ_MSF_SUPPLEMENT_F_NAMESPACE: u32 = 1;
+pub const MOQ_MSF_SUPPLEMENT_F_PARENT_NAMESPACE: u32 = 2;
 pub const MOQ_MSF_EXT_NONE: u32 = 0;
 pub const MOQ_MSF_EXT_MPEG2TS: u32 = 1;
+pub const MOQ_MSF_EXT_SUPPLEMENT: u32 = 2;
+pub const MOQ_MSF_NAMESPACE_MAX_FIELDS: u32 = 32;
 #[doc = " draft-ietf-moq-loc-01: drafts 16 and 18"]
 pub const MOQ_LOC_PROFILE_01: moq_loc_profile = 1;
 #[doc = " draft-ietf-moq-loc-02; reserved, never selected"]
@@ -970,8 +974,10 @@ unsafe extern "C" {
         dst: *mut moq_media_object_input_t,
     ) -> moq_result_t;
 }
-#[doc = " How the root \"version\" (MSF-01 5.1.1) is spelled on the wire. Fixed-width\n for ABI stability. Values are never renumbered.\n   NUMERAL     (0) the JSON String \"1\": a compatibility form, not the\n               MSF-01 draft convention -- the form this encoder has always\n               emitted and that existing receivers accept. Zero, so an\n               absent or zeroed field selects it.\n   DRAFT_NAME  (1) the JSON String \"draft-01\": 5.1.1's convention for\n               catalogs against an Internet-Draft release.\n The parser accepts both, and for compatibility the MSF-00 numeric 1\n (reported as NUMERAL), and reports which one it read; a reader of a parsed\n catalog must tolerate forms it does not know. The encoder accepts only the forms defined here and\n rejects any other value with MOQ_ERR_INVAL."]
+#[doc = " How the root \"version\" (MSF-01 5.1.1) is spelled on the wire. Fixed-width\n for ABI stability. Values are never renumbered.\n   NUMERAL     (0) the JSON String \"1\": a compatibility form, not the\n               MSF-01 draft convention -- the form this encoder has always\n               emitted and that existing receivers accept. Zero, so an\n               absent or zeroed field selects it.\n   DRAFT_NAME  (1) the JSON String \"draft-01\": 5.1.1's convention for\n               catalogs against an Internet-Draft release.\n The parser accepts both, and for compatibility the MSF-00 numeric 1\n (reported as NUMERAL), and reports which one it read; a reader of a parsed\n catalog must tolerate forms it does not know. The encoder accepts only the forms defined here and\n rejects any other value with MOQ_ERR_INVAL. An MSF-02 catalog has one\n spelling, \"draft-02\": the parser reports it as DRAFT_NAME and the encoder\n ignores this field for it."]
 pub type moq_msf_version_form_t = u32;
+#[doc = " The MSF revision a catalog follows. Fixed-width for ABI stability. Values\n are never renumbered; a reader must tolerate values it does not know.\n   REVISION_01 (0) draft-ietf-moq-msf-01. Zero, so an absent or zeroed\n                   field selects it.\n   REVISION_02 (1) draft-ietf-moq-msf-02.\n An independent catalog's revision is its root \"version\" (5.1.1): \"1\", the\n MSF-00 numeric 1 and \"draft-01\" are REVISION_01; \"draft-02\" is\n REVISION_02. A delta carries no version (MSF-02 5.3) and follows the\n catalog it is applied to."]
+pub type moq_msf_revision_t = u32;
 #[doc = " MSF-01 media timeline template (§5.2.15 / §7.4): a fixed-duration-segment\n media timeline expressed inline on a media track, as the JSON array\n   [startMediaTime, deltaMediaTime, [startGroup,startObject],\n    [deltaGroup,deltaObject], startWallclock, deltaWallclock]\n All six values are non-negative integers: media/wallclock times are\n milliseconds and the Location pairs are MOQT Group/Object IDs (and deltas).\n The entry n is computed as mediaTime[n]=start+(n*delta), location[n]=\n [startGroup+(n*deltaGroup), startObject+(n*deltaObject)], likewise wallclock."]
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -1176,7 +1182,98 @@ unsafe extern "C" {
     #[doc = " Zero and stamp min(m_size, this build's size); nothing is written when\n m_size cannot hold struct_size. The macro passes the caller's sizeof."]
     pub fn moq_msf_mpeg2ts_init_sized(m: *mut moq_msf_mpeg2ts_t, m_size: usize);
 }
-#[doc = " -- Packaging extensions ----------------------------------------------\n Where a packaging or extension draft's catalog fields go:\n   - a few independent scalar keys sit flat on moq_msf_track_t as has_X /\n     X pairs, like CMSF's maxGrpSapStartingType / maxObjSapStartingType;\n   - a cohesive record -- several keys validated together, with their own\n     enums, arrays, malformed bits and a _check function -- is a sized\n     struct of its own (leading struct_size, its own _init and _check)\n     carried in the track's extension list, at most one entry per kind.\n\n Parsed: the list and its records are catalog-owned and freed by cleanup;\n spans inside a record borrow from the DOM. Encode: the list and the\n records are borrowed for the call. A clone op inherits the parent's\n entries and merges, by kind, the ones it carries.\n\n The encoder refuses a list with a NULL array, an unknown kind, a kind\n listed twice, a NULL record, a record whose struct_size is below its first\n published size, or a kind on a track whose packaging it does not belong\n to (MOQ_MSF_EXT_MPEG2TS: packaging \"mpeg2ts\"). The parser records a kind\n on any track; the kind's own _check judges it. */\n/* Extension kind. Fixed-width uint32_t for ABI stability. Values are never\n renumbered. Unknown kinds must be ignored by a reader (the encoder\n refuses them)."]
+#[doc = " MSF track fields that moq_msf_track_t, whose layout is fixed, cannot hold.\n One record per track, on any packaging, carried in the track's extension\n list under MOQ_MSF_EXT_SUPPLEMENT. Later MSF track fields are appended here.\n\n Scalars follow the catalog's leniency: a value of the wrong JSON type, or\n a number that is negative or not an integer, is absent. Spans borrow the\n DOM on parse and are borrowed for the call on encode.\n\n Which revision reads which field:\n   - encryptionScheme, cipherSuite, keyId, trackBaseKey: defined by MSF-01\n     and MSF-02 alike (5.2.38-5.2.41) and parsed in both;\n   - packagingMetadata, keyframeSpacing, accessibleWindowTime and Number\n     \"depends\" entries: MSF-02 only. In an MSF-01 catalog they are keys a\n     parser ignores (an MSF-01 \"depends\" holding a Number is malformed, as\n     before); a delta's op tracks carry them for apply to judge against the\n     base's revision. The encoder refuses them in an MSF-01 catalog.\n A parse into the MSF-01 extent produces no supplement at all."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct moq_msf_track_supplement {
+    #[doc = " Sized record: moq_msf_track_supplement_init() stamps it. A reader\n refuses a record smaller than MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE and reads\n a later field only when struct_size covers it."]
+    pub struct_size: u32,
+    #[doc = " MSF-02 5.2.5 packagingMetadata, verbatim; read it with\n moq_msf_packaging_metadata_find or moq_msf_track_stream_mapping."]
+    pub has_packaging_metadata: bool,
+    pub packaging_metadata: moq_bytes_t,
+    #[doc = " MSF-02 5.2.46 keyframeSpacing: Objects per keyframe interval."]
+    pub has_keyframe_spacing: bool,
+    pub keyframe_spacing: u64,
+    #[doc = " MSF-02 5.2.45 accessibleWindowTime: wallclock milliseconds behind the\n live edge that content stays accessible."]
+    pub has_accessible_window_ms: bool,
+    pub accessible_window_ms: u64,
+    #[doc = " MSF 5.2.38-5.2.41, verbatim. encryptionScheme present means the Object\n payload is encrypted (MSF-02 4.4.1) and this library does not decrypt\n it. cipherSuite, keyId and trackBaseKey are what an application needs to\n decrypt; trackBaseKey is key material (MSF-02 13.2): handle it as a\n secret."]
+    pub has_encryption_scheme: bool,
+    pub encryption_scheme: moq_bytes_t,
+    pub has_cipher_suite: bool,
+    pub cipher_suite: moq_bytes_t,
+    pub has_key_id: bool,
+    pub key_id: moq_bytes_t,
+    pub has_track_base_key: bool,
+    pub track_base_key: moq_bytes_t,
+    #[doc = " MSF-02 5.2.15: the Number entries of \"depends\" (renderGroup ids); the\n String entries stay in moq_msf_track_t.depends. Catalog-owned (freed by\n cleanup) on parse; borrowed for the call on encode. has_depends: on a\n \"clone\" or \"update\" op track, the object carried a \"depends\" key, so\n the op replaces both lists (an empty array clears them); false\n elsewhere."]
+    pub has_depends: bool,
+    pub depends_render_groups: *const ::std::os::raw::c_int,
+    pub depends_render_group_count: usize,
+    #[doc = " MOQ_MSF_SUPPLEMENT_F_*: on a delta op track, a naming key present with\n a value that is not a String. apply judges them against the base's\n revision; the encoder refuses any."]
+    pub malformed: u32,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of moq_msf_track_supplement"]
+        [::std::mem::size_of::<moq_msf_track_supplement>() - 184usize];
+    ["Alignment of moq_msf_track_supplement"]
+        [::std::mem::align_of::<moq_msf_track_supplement>() - 8usize];
+    ["Offset of field: moq_msf_track_supplement::struct_size"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, struct_size) - 0usize];
+    ["Offset of field: moq_msf_track_supplement::has_packaging_metadata"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, has_packaging_metadata) - 4usize];
+    ["Offset of field: moq_msf_track_supplement::packaging_metadata"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, packaging_metadata) - 8usize];
+    ["Offset of field: moq_msf_track_supplement::has_keyframe_spacing"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, has_keyframe_spacing) - 24usize];
+    ["Offset of field: moq_msf_track_supplement::keyframe_spacing"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, keyframe_spacing) - 32usize];
+    ["Offset of field: moq_msf_track_supplement::has_accessible_window_ms"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, has_accessible_window_ms) - 40usize];
+    ["Offset of field: moq_msf_track_supplement::accessible_window_ms"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, accessible_window_ms) - 48usize];
+    ["Offset of field: moq_msf_track_supplement::has_encryption_scheme"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, has_encryption_scheme) - 56usize];
+    ["Offset of field: moq_msf_track_supplement::encryption_scheme"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, encryption_scheme) - 64usize];
+    ["Offset of field: moq_msf_track_supplement::has_cipher_suite"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, has_cipher_suite) - 80usize];
+    ["Offset of field: moq_msf_track_supplement::cipher_suite"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, cipher_suite) - 88usize];
+    ["Offset of field: moq_msf_track_supplement::has_key_id"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, has_key_id) - 104usize];
+    ["Offset of field: moq_msf_track_supplement::key_id"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, key_id) - 112usize];
+    ["Offset of field: moq_msf_track_supplement::has_track_base_key"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, has_track_base_key) - 128usize];
+    ["Offset of field: moq_msf_track_supplement::track_base_key"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, track_base_key) - 136usize];
+    ["Offset of field: moq_msf_track_supplement::has_depends"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, has_depends) - 152usize];
+    ["Offset of field: moq_msf_track_supplement::depends_render_groups"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, depends_render_groups) - 160usize];
+    ["Offset of field: moq_msf_track_supplement::depends_render_group_count"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, depends_render_group_count) - 168usize];
+    ["Offset of field: moq_msf_track_supplement::malformed"]
+        [::std::mem::offset_of!(moq_msf_track_supplement, malformed) - 176usize];
+};
+impl Default for moq_msf_track_supplement {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " MSF track fields that moq_msf_track_t, whose layout is fixed, cannot hold.\n One record per track, on any packaging, carried in the track's extension\n list under MOQ_MSF_EXT_SUPPLEMENT. Later MSF track fields are appended here.\n\n Scalars follow the catalog's leniency: a value of the wrong JSON type, or\n a number that is negative or not an integer, is absent. Spans borrow the\n DOM on parse and are borrowed for the call on encode.\n\n Which revision reads which field:\n   - encryptionScheme, cipherSuite, keyId, trackBaseKey: defined by MSF-01\n     and MSF-02 alike (5.2.38-5.2.41) and parsed in both;\n   - packagingMetadata, keyframeSpacing, accessibleWindowTime and Number\n     \"depends\" entries: MSF-02 only. In an MSF-01 catalog they are keys a\n     parser ignores (an MSF-01 \"depends\" holding a Number is malformed, as\n     before); a delta's op tracks carry them for apply to judge against the\n     base's revision. The encoder refuses them in an MSF-01 catalog.\n A parse into the MSF-01 extent produces no supplement at all."]
+pub type moq_msf_track_supplement_t = moq_msf_track_supplement;
+unsafe extern "C" {
+    #[doc = " Zero and stamp min(s_size, this build's size); nothing is written when\n s_size cannot hold struct_size. The macro passes the caller's sizeof."]
+    pub fn moq_msf_track_supplement_init_sized(s: *mut moq_msf_track_supplement_t, s_size: usize);
+}
+#[doc = " -- Packaging extensions ----------------------------------------------\n Where a packaging or extension draft's catalog fields go:\n   - a few independent scalar keys sit flat on moq_msf_track_t as has_X /\n     X pairs, like CMSF's maxGrpSapStartingType / maxObjSapStartingType;\n   - a cohesive record -- several keys validated together, with their own\n     enums, arrays, malformed bits and a _check function -- is a sized\n     struct of its own (leading struct_size, its own _init and _check)\n     carried in the track's extension list, at most one entry per kind.\n\n Parsed: the list and its records are catalog-owned and freed by cleanup;\n spans inside a record borrow from the DOM. Encode: the list and the\n records are borrowed for the call. A clone op inherits the parent's\n entries and merges, by kind, the ones it carries.\n\n The encoder refuses a list with a NULL array, an unknown kind, a kind\n listed twice, a NULL record, a record whose struct_size is below its first\n published size, or a kind on a track whose packaging it does not belong\n to (MOQ_MSF_EXT_MPEG2TS: packaging \"mpeg2ts\"; MOQ_MSF_EXT_SUPPLEMENT: any\n packaging). The parser records a kind on any track, listing kinds in\n ascending order; the kind's own _check judges it. */\n/* Extension kind. Fixed-width uint32_t for ABI stability. Values are never\n renumbered. Unknown kinds must be ignored by a reader (the encoder\n refuses them)."]
 pub type moq_msf_ext_kind_t = u32;
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1188,6 +1285,7 @@ pub struct moq_msf_track_ext {
 #[derive(Copy, Clone)]
 pub union moq_msf_track_ext__bindgen_ty_1 {
     pub mpeg2ts: *const moq_msf_mpeg2ts_t,
+    pub supplement: *const moq_msf_track_supplement_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -1197,6 +1295,8 @@ const _: () = {
         [::std::mem::align_of::<moq_msf_track_ext__bindgen_ty_1>() - 8usize];
     ["Offset of field: moq_msf_track_ext__bindgen_ty_1::mpeg2ts"]
         [::std::mem::offset_of!(moq_msf_track_ext__bindgen_ty_1, mpeg2ts) - 0usize];
+    ["Offset of field: moq_msf_track_ext__bindgen_ty_1::supplement"]
+        [::std::mem::offset_of!(moq_msf_track_ext__bindgen_ty_1, supplement) - 0usize];
 };
 impl Default for moq_msf_track_ext__bindgen_ty_1 {
     fn default() -> Self {
@@ -1289,7 +1389,7 @@ pub struct moq_msf_track {
     #[doc = " mimeType (MSF 5.2.19); JSON key \"mimeType\""]
     pub has_mime_type: bool,
     pub mime_type: moq_bytes_t,
-    #[doc = " depends (MSF 5.2.14): track names this track applies to / depends on.\n JSON key \"depends\". Borrows from the DOM; the array is freed by cleanup."]
+    #[doc = " depends (MSF-01 5.2.14, MSF-02 5.2.15): the String entries, track names\n this track applies to / depends on. JSON key \"depends\". MSF-02 also has\n Number entries (renderGroup ids); those are in the track's supplement\n (moq_msf_track_supplement_t). Borrows from the DOM; the array is freed\n by cleanup."]
     pub depends: *mut moq_bytes_t,
     pub depends_count: usize,
     #[doc = " contentProtectionRefIDs[] (CMSF 4.1.2)"]
@@ -1301,7 +1401,7 @@ pub struct moq_msf_track {
     #[doc = " maxObjSapStartingType (CMSF 3.5.2.2)"]
     pub has_max_obj_sap: bool,
     pub max_obj_sap: u32,
-    #[doc = " MSF-01 deltaUpdate clone operation (5.2.33/5.2.34). parentName/\n parentNamespace are only meaningful on a track object inside a \"clone\"\n op; they are absent on independent/add/remove tracks."]
+    #[doc = " deltaUpdate clone and (MSF-02) update operations (MSF-01 5.2.33/\n 5.2.34, MSF-02 5.2.34/5.2.35). parentName/parentNamespace are only\n meaningful on a track object inside a \"clone\" or \"update\" op; they are\n absent on independent/add/remove tracks. On an \"update\" track, name is\n empty when the object carries none."]
     pub has_parent_name: bool,
     pub parent_name: moq_bytes_t,
     pub has_parent_namespace: bool,
@@ -1464,15 +1564,23 @@ unsafe extern "C" {
     #[doc = " The draft-gregoire-moq-msfts record of a track, or NULL."]
     pub fn moq_msf_track_mpeg2ts(track: *const moq_msf_track_t) -> *const moq_msf_mpeg2ts_t;
 }
+unsafe extern "C" {
+    #[doc = " The supplement record of a catalog track, or NULL (also for a NULL track).\n For an extension list that is not on a moq_msf_track_t, such as a media\n receiver's track description, use moq_msf_ext_supplement."]
+    pub fn moq_msf_track_supplement(
+        track: *const moq_msf_track_t,
+    ) -> *const moq_msf_track_supplement_t;
+}
 #[doc = " add new tracks"]
 pub const MOQ_MSF_DELTA_OP_ADD: moq_msf_delta_op_kind = 1;
 #[doc = " remove tracks (track objects: name[,namespace])"]
 pub const MOQ_MSF_DELTA_OP_REMOVE: moq_msf_delta_op_kind = 2;
 #[doc = " clone from a parent track, with overrides"]
 pub const MOQ_MSF_DELTA_OP_CLONE: moq_msf_delta_op_kind = 3;
-#[doc = " MSF-01 delta update operation kind (5.1.6)."]
+#[doc = " change fields of a declared track, found by\n parentName[, parentNamespace]"]
+pub const MOQ_MSF_DELTA_OP_UPDATE: moq_msf_delta_op_kind = 4;
+#[doc = " Delta update operation kind (5.1.6). UPDATE is MSF-02 only: an MSF-01\n parse refuses it and so does an apply onto an MSF-01 base."]
 pub type moq_msf_delta_op_kind = ::std::os::raw::c_uint;
-#[doc = " MSF-01 delta update operation kind (5.1.6)."]
+#[doc = " Delta update operation kind (5.1.6). UPDATE is MSF-02 only: an MSF-01\n parse refuses it and so does an apply onto an MSF-01 base."]
 pub use self::moq_msf_delta_op_kind as moq_msf_delta_op_kind_t;
 #[doc = " One delta update operation: an op kind plus its track objects (5.1.6)."]
 #[repr(C)]
@@ -1684,10 +1792,18 @@ pub struct moq_msf_catalog {
     pub _dom_size: usize,
     #[doc = " Appended after `_dom_size`; read by the encoder only when struct_size\n covers it (absent = NUMERAL). A value other than NUMERAL or DRAFT_NAME\n is rejected with MOQ_ERR_INVAL. The parser sets it to the form it read\n (NUMERAL for the MSF-00 numeric 1); apply_delta carries the base's form\n to the applied catalog. Not written for a delta, which has no version."]
     pub version_form: moq_msf_version_form_t,
+    #[doc = " Never read: covers the tail padding after version_form, so the block\n below starts at or after the complete sizeof of the layout that ends\n with version_form, on every target."]
+    pub _reserved_revision: u32,
+    #[doc = " One block, revision through publish_track_count, read and written\n whole: present only when the extent (struct_size, or the size passed\n to a sized entry point) covers publish_track_count. Every entry point\n refuses an extent that covers revision but not the whole block\n (MOQ_ERR_INVAL); an extent short of revision is the MSF-01 extent.\n\n revision: see moq_msf_revision_t. For a parsed delta it is the earliest\n revision whose vocabulary covers it (REVISION_02 when it holds an\n \"update\" op, a Number \"depends\" entry, or an MSF-02-only track field);\n apply judges a delta by the base's revision, never by this.\n\n publish_tracks (MSF 5.1.5): tracks the subscriber may publish to, laid\n out as `tracks`: catalog-owned on parse and freed by cleanup, borrowed\n for the call on encode. A delta never carries them (MSF-02 5.3)."]
+    pub revision: moq_msf_revision_t,
+    #[doc = " never read"]
+    pub _reserved_publish_tracks: u32,
+    pub publish_tracks: *mut moq_msf_track_t,
+    pub publish_track_count: usize,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_msf_catalog"][::std::mem::size_of::<moq_msf_catalog>() - 120usize];
+    ["Size of moq_msf_catalog"][::std::mem::size_of::<moq_msf_catalog>() - 144usize];
     ["Alignment of moq_msf_catalog"][::std::mem::align_of::<moq_msf_catalog>() - 8usize];
     ["Offset of field: moq_msf_catalog::struct_size"]
         [::std::mem::offset_of!(moq_msf_catalog, struct_size) - 0usize];
@@ -1721,6 +1837,16 @@ const _: () = {
         [::std::mem::offset_of!(moq_msf_catalog, _dom_size) - 104usize];
     ["Offset of field: moq_msf_catalog::version_form"]
         [::std::mem::offset_of!(moq_msf_catalog, version_form) - 112usize];
+    ["Offset of field: moq_msf_catalog::_reserved_revision"]
+        [::std::mem::offset_of!(moq_msf_catalog, _reserved_revision) - 116usize];
+    ["Offset of field: moq_msf_catalog::revision"]
+        [::std::mem::offset_of!(moq_msf_catalog, revision) - 120usize];
+    ["Offset of field: moq_msf_catalog::_reserved_publish_tracks"]
+        [::std::mem::offset_of!(moq_msf_catalog, _reserved_publish_tracks) - 124usize];
+    ["Offset of field: moq_msf_catalog::publish_tracks"]
+        [::std::mem::offset_of!(moq_msf_catalog, publish_tracks) - 128usize];
+    ["Offset of field: moq_msf_catalog::publish_track_count"]
+        [::std::mem::offset_of!(moq_msf_catalog, publish_track_count) - 136usize];
 };
 impl Default for moq_msf_catalog {
     fn default() -> Self {
@@ -1734,7 +1860,17 @@ impl Default for moq_msf_catalog {
 pub type moq_msf_catalog_t = moq_msf_catalog;
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Parse an MSF catalog from JSON.\n\n Allocates the JSON DOM and track array via alloc. All string\n fields in the result borrow from the DOM. Call\n moq_msf_catalog_cleanup() to release.\n\n Optional scalar fields with malformed values (negative unsigned integers,\n fractional pixel counts, out-of-range numbers) are silently treated\n as absent rather than failing the parse. A present but malformed\n STRUCTURED field is an exception: a \"template\" that is not a well-formed\n 6-tuple (5.2.15 / §7.4) is a PROTO error, not silently dropped. The\n mpeg2ts* keys are recorded as present-but-malformed instead (see\n moq_msf_mpeg2ts_t), so that the track check can reject the track; a\n \"remove\" delta track carrying one is a PROTO error like any other field. Only\n missing required fields (version, tracks, track name/packaging/isLive)\n and structurally invalid JSON cause parse failure.\n\n Returns MOQ_OK on success.\n Returns MOQ_ERR_INVAL if alloc, json.data, or out is NULL.\n Returns MOQ_ERR_PROTO on malformed JSON or missing required fields.\n Returns MOQ_ERR_NOMEM on allocation failure."]
+    #[doc = " Parse an MSF catalog from JSON.\n\n Allocates the JSON DOM and track array via alloc. All string\n fields in the result borrow from the DOM. Call\n moq_msf_catalog_cleanup() to release.\n\n Optional scalar fields with malformed values (negative unsigned integers,\n fractional pixel counts, out-of-range numbers) are silently treated\n as absent rather than failing the parse. A present but malformed\n STRUCTURED field is an exception: a \"template\" that is not a well-formed\n 6-tuple (5.2.15 / §7.4) is a PROTO error, not silently dropped. The\n mpeg2ts* keys are recorded as present-but-malformed instead (see\n moq_msf_mpeg2ts_t), so that the track check can reject the track; a\n \"remove\" delta track carrying one is a PROTO error like any other field. Only\n missing required fields (version, tracks, track name/packaging/isLive)\n and structurally invalid JSON cause parse failure.\n\n moq_msf_catalog_parse_sized parses into out_size bytes of *out:\n   - out_size in the MSF-01 extent (MOQ_MSF_CATALOG_V0_SIZE up to, not\n     including, the block that starts at `revision`): MSF-01 only. A\n     \"draft-02\" version, an \"update\" op and a Number \"depends\" entry are\n     MOQ_ERR_PROTO, publishTracks is ignored, and no track carries a\n     MOQ_MSF_EXT_SUPPLEMENT record;\n   - out_size covering the whole block (MOQ_MSF_CATALOG_SIZE_THROUGH_\n     PUBLISH_TRACKS or more): both revisions, publishTracks, and the\n     supplement records.\n It writes min(out_size, sizeof(moq_msf_catalog_t)) bytes and stamps\n out->struct_size with that count.\n\n Returns MOQ_OK on success.\n Returns MOQ_ERR_INVAL if alloc, json.data, or out is NULL, if out_size is\n   below MOQ_MSF_CATALOG_V0_SIZE, or if out_size covers part of the block\n   that starts at `revision` (nothing is written).\n Returns MOQ_ERR_PROTO on malformed JSON, a missing required field, an\n   unsupported version, or (MSF-02 catalogs) a naming violation of\n   MSF-02 5.2.2, 5.2.3 or 11.2.\n Returns MOQ_ERR_NOMEM on allocation failure."]
+    pub fn moq_msf_catalog_parse_sized(
+        alloc: *const moq_alloc_t,
+        json: moq_bytes_t,
+        out: *mut moq_msf_catalog_t,
+        out_size: usize,
+    ) -> moq_result_t;
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " The sized parse with the size of moq_msf_catalog_t in the caller's\n header (the macro below, which takes (alloc, json, out)). The macro is\n variadic only so that an unparenthesized compound literal, such as\n (moq_bytes_t){ p, n }, stays one argument. The exported symbol of this\n name parses into MOQ_MSF_CATALOG_SIZE_THROUGH_VERSION_FORM bytes: MSF-01\n only, as described above."]
     pub fn moq_msf_catalog_parse(
         alloc: *const moq_alloc_t,
         json: moq_bytes_t,
@@ -1742,11 +1878,12 @@ unsafe extern "C" {
     ) -> moq_result_t;
 }
 unsafe extern "C" {
+    #[doc = " Release everything a parse or an apply allocated into *cat:\n publish_tracks only when cat->struct_size covers the block that starts at\n `revision`. NULL alloc or cat is a no-op; so is a second call."]
     pub fn moq_msf_catalog_cleanup(alloc: *const moq_alloc_t, cat: *mut moq_msf_catalog_t);
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Apply a delta catalog (5.1.6) to a base independent catalog, producing a new\n independent catalog in *out. Operations are applied in order: \"add\" appends\n new tracks, \"remove\" drops tracks matched by name (and namespace when the\n remove track specifies one), and \"clone\" appends a copy of a matched parent\n track with the clone's fields overriding the inherited values.\n\n Track matching uses the Track Name, additionally requiring the Track\n Namespace to match when the op track carries one (catalog-level namespace\n inheritance is not resolved). The Namespace|Name tuple is immutable once\n declared (5.3), so the ops enforce: \"add\" fails if the tuple already exists,\n \"clone\" fails if the parent is absent or the new tuple already exists, and\n \"remove\" fails if the target tuple is not present.\n\n *out is fully owned (like a parsed catalog) and MUST be released with\n moq_msf_catalog_cleanup. The effective catalog must be encodable\n (every resulting track passes the encoder's validation), otherwise the\n call fails and *out is left zeroed.\n\n A catalog with is_complete (5.1.3) is terminal: it admits no further tracks\n or content, so applying any delta to such a base is rejected (MOQ_ERR_PROTO).\n\n Returns MOQ_ERR_INVAL if any argument is NULL, base is itself a delta, or\n   delta is not a delta (delta_update == NULL).\n Returns MOQ_ERR_PROTO on a complete (terminal) base, a tuple-semantics\n   violation (duplicate add, clone parent absent, clone tuple collision,\n   remove target absent), or an invalid effective catalog.\n Returns MOQ_ERR_NOMEM on allocation failure."]
+    #[doc = " Apply a delta catalog (5.1.6) to a base independent catalog, producing a new\n independent catalog in *out. Operations are applied in order: \"add\" appends\n new tracks, \"remove\" drops tracks matched by name (and namespace when the\n remove track specifies one), and \"clone\" appends a copy of a matched parent\n track with the clone's fields overriding the inherited values.\n\n Track matching uses the Track Name, additionally requiring the Track\n Namespace to match when the op track carries one (catalog-level namespace\n inheritance is not resolved). The Namespace|Name tuple is immutable once\n declared (5.3), so the ops enforce: \"add\" fails if the tuple already exists,\n \"clone\" fails if the parent is absent or the new tuple already exists, and\n \"remove\" fails if the target tuple is not present.\n\n *out is fully owned (like a parsed catalog) and MUST be released with\n moq_msf_catalog_cleanup. The effective catalog must be encodable\n (every resulting track passes the encoder's validation), otherwise the\n call fails and *out is left zeroed.\n\n A catalog with is_complete (5.1.3) is terminal: it admits no further tracks\n or content, so applying any delta to such a base is rejected (MOQ_ERR_PROTO).\n\n This function and moq_msf_catalog_apply_delta_ex apply MSF-01 deltas only:\n each is moq_msf_catalog_apply_delta_sized writing the MSF-01 extent\n (MOQ_MSF_CATALOG_SIZE_THROUGH_VERSION_FORM bytes of *out), and each refuses\n an MSF-02 base with MOQ_ERR_INVAL rather than downgrade it; use\n moq_msf_catalog_apply_delta_sized for MSF-02.\n\n Returns MOQ_ERR_INVAL if any argument is NULL, base is itself a delta,\n   delta is not a delta (delta_update == NULL), or base is an MSF-02\n   catalog.\n Returns MOQ_ERR_PROTO on a complete (terminal) base, a tuple-semantics\n   violation (duplicate add, clone parent absent, clone tuple collision,\n   remove target absent), or an invalid effective catalog.\n Returns MOQ_ERR_NOMEM on allocation failure."]
     pub fn moq_msf_catalog_apply_delta(
         alloc: *const moq_alloc_t,
         base: *const moq_msf_catalog_t,
@@ -1788,9 +1925,125 @@ unsafe extern "C" {
         out: *mut moq_msf_catalog_t,
     ) -> moq_result_t;
 }
+#[doc = " What a catalog is judged against by moq_msf_catalog_check and\n moq_msf_catalog_apply_delta_sized. Initialize with\n moq_msf_validate_cfg_init; a zeroed struct with struct_size stamped is the\n default (namespace unknown, no limits)."]
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct moq_msf_validate_cfg {
+    pub struct_size: u32,
+    #[doc = " The Track Namespace the catalog track was received under: a track\n without \"namespace\" inherits it (MSF-02 5.2.2), and so does a \"clone\"\n or \"update\" op track without \"parentNamespace\" (5.2.35). Borrowed for\n the call. count == 0: unknown, so a track without \"namespace\" matches\n only another track without one. Read for MSF-02 catalogs only."]
+    pub catalog_namespace: moq_namespace_t,
+    #[doc = " apply only; 0 = no limit"]
+    pub max_delta_ops: usize,
+    #[doc = " apply only; 0 = no limit"]
+    pub max_effective_tracks: usize,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of moq_msf_validate_cfg"][::std::mem::size_of::<moq_msf_validate_cfg>() - 40usize];
+    ["Alignment of moq_msf_validate_cfg"][::std::mem::align_of::<moq_msf_validate_cfg>() - 8usize];
+    ["Offset of field: moq_msf_validate_cfg::struct_size"]
+        [::std::mem::offset_of!(moq_msf_validate_cfg, struct_size) - 0usize];
+    ["Offset of field: moq_msf_validate_cfg::catalog_namespace"]
+        [::std::mem::offset_of!(moq_msf_validate_cfg, catalog_namespace) - 8usize];
+    ["Offset of field: moq_msf_validate_cfg::max_delta_ops"]
+        [::std::mem::offset_of!(moq_msf_validate_cfg, max_delta_ops) - 24usize];
+    ["Offset of field: moq_msf_validate_cfg::max_effective_tracks"]
+        [::std::mem::offset_of!(moq_msf_validate_cfg, max_effective_tracks) - 32usize];
+};
+impl Default for moq_msf_validate_cfg {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[doc = " What a catalog is judged against by moq_msf_catalog_check and\n moq_msf_catalog_apply_delta_sized. Initialize with\n moq_msf_validate_cfg_init; a zeroed struct with struct_size stamped is the\n default (namespace unknown, no limits)."]
+pub type moq_msf_validate_cfg_t = moq_msf_validate_cfg;
+unsafe extern "C" {
+    #[doc = " Zero and stamp min(cfg_size, this build's size); nothing is written when\n cfg_size cannot hold struct_size. The macro passes the caller's sizeof."]
+    pub fn moq_msf_validate_cfg_init_sized(cfg: *mut moq_msf_validate_cfg_t, cfg_size: usize);
+}
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Inbound semantic validation of an INDEPENDENT catalog's identity spaces,\n intended for a receiver to run before adopting a peer-supplied catalog. The\n raw parser is deliberately lenient (fuzz/raw callers); this is the strict\n inbound gate. Checks, in O(n) via a temporary index:\n   - track Namespace|Name tuples are unique (§5.2.3);\n   - initDataList ids are unique (§5.1.7);\n   - contentProtection refIDs are unique (CMSF §4.1.1.1).\n Returns MOQ_OK if all identity spaces are unique, MOQ_ERR_PROTO on the first\n duplicate, MOQ_ERR_INVAL if cat is NULL, is a delta, or has malformed\n caller-provided identity storage, MOQ_ERR_NOMEM on allocation failure. Does\n not mutate cat."]
+    #[doc = " Apply a delta (5.1.6) to an independent base, writing the effective\n catalog into out_size bytes of *out as moq_msf_catalog_parse_sized writes\n a parse (stamped, owned, released with moq_msf_catalog_cleanup). The delta\n is judged by the BASE's revision:\n   - MSF-01: the rules of moq_msf_catalog_apply_delta_ex. An \"update\" op or\n     a Number \"depends\" entry is MOQ_ERR_PROTO; MSF-02-only supplement\n     fields in an op track are dropped, as an MSF-01 parse ignores those\n     keys; supplement malformed bits are ignored.\n   - MSF-02 (5.3): the delta carries generatedAt (has_generated_at) and no\n     other root field -- for a parsed delta per what its JSON held, for a\n     caller-built one per track_count, is_complete, init_data_count,\n     content_protection_count and publish_track_count; an \"add\" track\n     carries packaging and isLive (5.2.4.1); op tracks follow 5.2.2, 5.2.3\n     and 11.2; \"update\" changes a declared track in place, carrying no other\n     name or namespace than its target's, never turning isLive from false\n     to true (5.2.8) and never changing a present template (7.4.2); tracks\n     are matched by Full Track Name with cfg->catalog_namespace; and after\n     every op the effective catalog passes moq_msf_catalog_check.\n Ops apply in order; \"clone\" and \"update\" inherit the target's extension\n records and fold in, field by field, those the op track carries. The\n effective catalog keeps the base's revision, version form, initDataList,\n contentProtections and publishTracks. Keys this library does not model are\n not carried into it. cfg may be NULL (the default).\n\n Returns MOQ_OK.\n Returns MOQ_ERR_INVAL for NULL alloc, base, delta or out; a base that is a\n   delta; a delta that is not one; an out_size below MOQ_MSF_CATALOG_V0_SIZE\n   or covering part of the block at `revision`; an MSF-02 base with an\n   out_size in the MSF-01 extent; a base or delta whose struct_size covers\n   part of that block; a revision this build does not know; a cfg below its\n   first published size; or malformed caller storage.\n Returns MOQ_ERR_PROTO for a complete (terminal) base, an exceeded limit, an\n   illogical op (5.3), a rule above broken, or an invalid effective catalog.\n Returns MOQ_ERR_NOMEM on allocation failure.\n On any error *out is zeroed and its struct_size stamped (nothing is\n written when out_size is refused)."]
+    pub fn moq_msf_catalog_apply_delta_sized(
+        alloc: *const moq_alloc_t,
+        base: *const moq_msf_catalog_t,
+        delta: *const moq_msf_catalog_t,
+        cfg: *const moq_msf_validate_cfg_t,
+        out: *mut moq_msf_catalog_t,
+        out_size: usize,
+    ) -> moq_result_t;
+}
+#[doc = " Why a catalog is invalid (moq_msf_catalog_check). Fixed-width for ABI\n stability; values are never renumbered; a reader must tolerate values it\n does not know."]
+pub type moq_msf_catalog_error_t = u32;
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " The inbound semantic check of an INDEPENDENT catalog, for a receiver to run\n before adopting a peer's catalog (the parser is deliberately lenient). In\n O(n), with temporary indexes:\n   - Full Track Names are unique within `tracks` and, separately, within\n     `publish_tracks` (a name may be both: an event timeline can be either,\n     MSF-02 8). MSF-01 compares the name and the namespace as written;\n     MSF-02 compares the name bytes and the namespace fields (11.2.2), a\n     track without \"namespace\" inheriting cfg->catalog_namespace when it is\n     known;\n   - initDataList ids are unique (5.1.7);\n   - contentProtection refIDs are unique (CMSF 4.1.1.1);\n   - MSF-02 only (5.2.15): each String \"depends\" entry of a track in\n     `tracks` names exactly one OTHER track in `tracks`, by name bytes; each\n     Number entry is the renderGroup of at least one track in `tracks` (the\n     declaring track counts).\n Does not mutate cat. cfg and reason may be NULL.\n\n Returns MOQ_OK (*reason MOQ_MSF_CATALOG_OK).\n Returns MOQ_ERR_PROTO with *reason naming the first violation found.\n Returns MOQ_ERR_INVAL for NULL alloc or cat, a delta, a struct_size that\n   covers part of the block at `revision`, a revision this build does not\n   know, a cfg below its first published size, or malformed caller storage.\n Returns MOQ_ERR_NOMEM on allocation failure."]
+    pub fn moq_msf_catalog_check(
+        alloc: *const moq_alloc_t,
+        cat: *const moq_msf_catalog_t,
+        cfg: *const moq_msf_validate_cfg_t,
+        reason: *mut moq_msf_catalog_error_t,
+    ) -> moq_result_t;
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " Split a \"namespace\" (or \"parentNamespace\") string into its Track Namespace\n fields (MSF-02 5.2.2): at every '/', yielding 1 to\n MOQ_MSF_NAMESPACE_MAX_FIELDS fields, each non-empty. The fields borrow ns.\n Writes up to cap fields to out; *out_count is always written: the field\n count, or 0 when ns is not a valid namespace. out == NULL with cap == 0 is\n a count probe.\n Returns MOQ_OK when every field fit; MOQ_ERR_BUFFER when more than cap\n (*out_count says how many); MOQ_ERR_PROTO for an empty string, an empty\n field (a leading, trailing or doubled '/'), or more than 32 fields;\n MOQ_ERR_INVAL for a NULL out_count, a NULL out with cap > 0, or ns.data\n NULL with ns.len > 0."]
+    pub fn moq_msf_namespace_split(
+        ns: moq_bytes_t,
+        out: *mut moq_bytes_t,
+        cap: usize,
+        out_count: *mut usize,
+    ) -> moq_result_t;
+}
+unsafe extern "C" {
+    #[doc = " Whether a catalog track names the MOQT track (ns, name): its name bytes\n equal `name` and its namespace fields equal ns, by exact byte comparison\n (MSF-02 11.2.2, 11.2.3: MOQT bytes that are not UTF-8 never match). A track\n with \"namespace\" has the fields of that string; one without inherits\n catalog_namespace, the namespace the catalog track was received under,\n and matches nothing while that is unknown (count 0). A catalog-namespace\n field holding '/' is one field. Observing; false for a NULL track or\n malformed arguments, including a span that claims bytes with no buffer."]
+    pub fn moq_msf_track_matches(
+        track: *const moq_msf_track_t,
+        catalog_namespace: moq_namespace_t,
+        ns: moq_namespace_t,
+        name: moq_bytes_t,
+    ) -> bool;
+}
+unsafe extern "C" {
+    #[doc = " The value of `key` in a packagingMetadata string (MSF-02 5.2.5): pairs\n \"key=value\" separated by ';', keys and values case-sensitive; the first\n occurrence of a key is used, and a pair without '=' names no key. On true,\n *out_value borrows metadata. False when the key is absent, or for NULL key\n or out_value, or metadata.data NULL with metadata.len > 0."]
+    pub fn moq_msf_packaging_metadata_find(
+        metadata: moq_bytes_t,
+        key: *const ::std::os::raw::c_char,
+        out_value: *mut moq_bytes_t,
+    ) -> bool;
+}
+#[doc = " How a \"loc\" track maps Objects to MOQT streams (MSF-02 4.1.1).\n Fixed-width for ABI stability; values are never renumbered; a reader must\n tolerate values it does not know.\n   GROUP        (0) every Object of a Group in one Subgroup, in Object ID\n                    order: the \"group\" value, and the default when the key\n                    is absent;\n   OBJECT       (1) every Object in its own Subgroup: \"object\";\n   UNRECOGNIZED (2) any other value. A publisher must choose one of the two\n                    modes, so this is a publisher error; the value is\n                    reported, not coerced to GROUP. One complete Object per\n                    Object still holds (4.1.1), whatever the mode."]
+pub type moq_msf_stream_mapping_t = u32;
+unsafe extern "C" {
+    #[doc = " A track's stream mapping: its supplement's packagingMetadata\n \"streamMapping\" key on a \"loc\" track; GROUP when the key is absent\n (4.1.1), for every packaging other than \"loc\" (which defines no such key),\n and for NULL. Observing."]
+    pub fn moq_msf_track_stream_mapping(track: *const moq_msf_track_t) -> moq_msf_stream_mapping_t;
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " A valid switch point between alternate tracks with different keyframe\n spacing (MSF-02 6.3.2): from Group `group`, Object `object` of a source\n track with keyframeSpacing source_spacing, to a target track with\n keyframeSpacing target_spacing, when (group * source_spacing + object) /\n target_spacing is an integer: that integer is the target Group, joined at\n Object 0.\n Returns MOQ_OK with *out_target_group; MOQ_DONE when this position is no\n switch point; MOQ_ERR_INVAL for a NULL out_target_group, a zero spacing,\n object >= source_spacing, or a position past UINT64_MAX."]
+    pub fn moq_msf_switch_point_group(
+        group: u64,
+        object: u64,
+        source_spacing: u64,
+        target_spacing: u64,
+        out_target_group: *mut u64,
+    ) -> moq_result_t;
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " The property type a \"track-property\" or \"object-property\" initDataList\n entry names (MSF-02 5.1.7): its \"data\", 1 to 16 hexadecimal digits with an\n optional 0x or 0X prefix (\"0x0D\", \"0d\" and \"d\" all name 13). The\n initialization data itself is that property's value (12.2), carried in the\n track's or the Objects' properties, not in the catalog.\n Returns MOQ_OK with *out_type; MOQ_ERR_PROTO when data is not such a\n number (*out_type untouched); MOQ_ERR_INVAL for NULL arguments, an entry of\n another type (such as \"inline\"), or data.data NULL with data.len > 0."]
+    pub fn moq_msf_init_data_property_type(
+        entry: *const moq_msf_init_data_entry_t,
+        out_type: *mut u64,
+    ) -> moq_result_t;
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " moq_msf_catalog_check(alloc, cat, NULL, NULL): the identity spaces of an\n independent catalog are unique, and an MSF-02 catalog's \"depends\" entries\n resolve. Kept for existing callers."]
     pub fn moq_msf_catalog_validate_identities(
         alloc: *const moq_alloc_t,
         cat: *const moq_msf_catalog_t,
@@ -1896,7 +2149,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Encode an MSF catalog to JSON.\n\n Produces a UTF-8 JSON string in an moq_rcbuf_t.\n String fields in the catalog are borrowed moq_bytes_t and must\n remain valid for the duration of this call.\n\n Returns MOQ_OK on success with *out_json set.\n Returns MOQ_ERR_INVAL if alloc, cat, or out_json is NULL, if\n   version != MOQ_MSF_VERSION, or if a string field has data==NULL\n   with len > 0, or if an mpeg2ts rule below is broken.\n Returns MOQ_ERR_NOMEM on allocation failure (*out_json is NULL).\n\n mpeg2ts tracks (draft-gregoire-moq-msfts) are authored strictly, from each\n track's MOQ_MSF_EXT_MPEG2TS record (the extension-list rules are under\n moq_msf_track_ext_t):\n   - an independent track with packaging \"mpeg2ts\" must pass\n     moq_msf_track_mpeg2ts_check(), carry a timestamp mode only of a\n     recognized value, and, when it has initRef, reference an \"inline\"\n     initDataList entry whose Base64 data decodes to whole source packets\n     (Use of MSF Initialization Data);\n   - a delta \"add\" track carrying mpeg2ts fields must have packaging\n     \"mpeg2ts\" and pass the same check;\n   - a delta \"clone\" track's mpeg2ts overrides must each be valid on their\n     own (in range, not malformed, a recognized mode, 188 or 192, and no\n     pair of overrides that the rules forbid together); the fields it\n     inherits are judged when the delta is applied;\n   - mpeg2ts fields on any other packaging are refused."]
+    #[doc = " Encode an MSF catalog to JSON.\n\n Produces a UTF-8 JSON string in an moq_rcbuf_t.\n String fields in the catalog are borrowed moq_bytes_t and must\n remain valid for the duration of this call.\n\n Returns MOQ_OK on success with *out_json set.\n Returns MOQ_ERR_INVAL if alloc, cat, or out_json is NULL, if\n   version != MOQ_MSF_VERSION, or if a string field has data==NULL\n   with len > 0, or if an mpeg2ts rule below is broken.\n Returns MOQ_ERR_NOMEM on allocation failure (*out_json is NULL).\n\n mpeg2ts tracks (draft-gregoire-moq-msfts) are authored strictly, from each\n track's MOQ_MSF_EXT_MPEG2TS record (the extension-list rules are under\n moq_msf_track_ext_t):\n   - an independent track with packaging \"mpeg2ts\" must pass\n     moq_msf_track_mpeg2ts_check(), carry a timestamp mode only of a\n     recognized value, and, when it has initRef, reference an \"inline\"\n     initDataList entry whose Base64 data decodes to whole source packets\n     (Use of MSF Initialization Data);\n   - a delta \"add\" track carrying mpeg2ts fields must have packaging\n     \"mpeg2ts\" and pass the same check;\n   - a delta \"clone\" track's mpeg2ts overrides must each be valid on their\n     own (in range, not malformed, a recognized mode, 188 or 192, and no\n     pair of overrides that the rules forbid together); the fields it\n     inherits are judged when the delta is applied;\n   - mpeg2ts fields on any other packaging are refused.\n\n The catalog's revision (moq_msf_catalog_t.revision, read when struct_size\n covers the block that starts there) selects the spelling and the rules:\n   - MSF-01: version \"1\" or \"draft-01\" by version_form. The \"update\" op,\n     Number \"depends\" entries and the other MSF-02-only supplement fields\n     are refused; timelines carry mimeType \"application/json\", and an event\n     timeline also carries depends.\n   - MSF-02: version \"draft-02\". A delta carries generatedAt and no other\n     root field than deltaUpdate (5.3): nonzero init_data_count or\n     content_protection_count, or a parsed delta whose JSON held another\n     root key, even an empty one, is refused (an MSF-01 delta is written\n     without those fields, as before). Names\n     are non-empty, naming strings are UTF-8 without NUL and namespaces split\n     into 1..32 non-empty fields (5.2.2, 5.2.3, 11.2); a track carries the\n     fields its (packaging, role) requires (5.2.4.1); tracks of one altGroup\n     carry one accessibleWindowTime (5.2.45); keyframeSpacing is above 0;\n     packagingMetadata is \"key=value\" pairs, and a \"loc\" streamMapping is\n     \"group\" or \"object\" (4.1.1, 5.2.5); an initDataList entry is \"inline\",\n     \"track-property\" or \"object-property\", the last two naming a property\n     type in hex (5.1.7). A media timeline carries depends (7.2). The\n     catalog passes moq_msf_catalog_check (its \"depends\" entries resolve,\n     5.2.15).\n Full Track Names are unique within tracks and, separately, within\n publish_tracks, which are emitted after tracks and before initDataList.\n MOQ_ERR_INVAL also covers a struct_size that covers part of the block at\n `revision`, a revision this build does not know, and publish_tracks on a\n delta."]
     pub fn moq_msf_catalog_encode(
         alloc: *const moq_alloc_t,
         cat: *const moq_msf_catalog_t,

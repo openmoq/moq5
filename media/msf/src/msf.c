@@ -34,16 +34,85 @@ bool moq_msf_checked_array_bytes(size_t count, size_t elem, size_t *out_bytes)
 
 /* -- Allocator bridge ------------------------------------------------ */
 
+/* json.h makes one allocation for the whole DOM. The bridge prepends the
+ * catalog's header (msf_dom_hdr_t) to it, so the block a parse owns is
+ * [header | DOM], and every span still lies inside [_dom, _dom + _dom_size). */
 typedef struct {
     const moq_alloc_t *alloc;
-    size_t             total;
+    size_t             total;   /* bytes of the block, header included */
+    uint8_t           *base;    /* the block */
 } alloc_ctx_t;
+
+/* The header's share of the block: a multiple of every alignment the DOM
+ * needs, so the DOM keeps the allocator's alignment. */
+#define MSF_DOM_HDR_BYTES 16u
+#define MSF_DOM_MAGIC     UINT32_C(0x4d534632)
+
+_Static_assert(MSF_DOM_HDR_BYTES >= sizeof(msf_dom_hdr_t) &&
+               MSF_DOM_HDR_BYTES % _Alignof(void *) == 0 &&
+               MSF_DOM_HDR_BYTES % _Alignof(size_t) == 0 &&
+               MSF_DOM_HDR_BYTES % _Alignof(uint64_t) == 0,
+               "the DOM after the header stays aligned");
 
 static void *json_alloc_bridge(void *user, size_t size)
 {
     alloc_ctx_t *ctx = (alloc_ctx_t *)user;
-    ctx->total += size;
-    return ctx->alloc->alloc(size, ctx->alloc->ctx);
+    /* A second allocation would have no owner: refuse it. */
+    if (ctx->base || size > SIZE_MAX - MSF_DOM_HDR_BYTES) return NULL;
+    size_t total = size + MSF_DOM_HDR_BYTES;
+    uint8_t *p = (uint8_t *)ctx->alloc->alloc(total, ctx->alloc->ctx);
+    if (!p) return NULL;
+    memset(p, 0, MSF_DOM_HDR_BYTES);
+    ctx->base = p;
+    ctx->total = total;
+    return p + MSF_DOM_HDR_BYTES;
+}
+
+const msf_dom_hdr_t *moq_msf_dom_hdr(const moq_msf_catalog_t *cat)
+{
+    if (!cat || !cat->_dom || cat->_dom_size < MSF_DOM_HDR_BYTES) return NULL;
+    const msf_dom_hdr_t *h = (const msf_dom_hdr_t *)cat->_dom;
+    return h->magic == MSF_DOM_MAGIC ? h : NULL;
+}
+
+/* -- Catalog extents ------------------------------------------------- */
+
+_Static_assert(MOQ_MSF_CATALOG_V0_SIZE == offsetof(moq_msf_catalog_t, version_form),
+               "the first published layout ends where version_form starts");
+_Static_assert(offsetof(moq_msf_catalog_t, revision) ==
+               MOQ_MSF_CATALOG_SIZE_THROUGH_VERSION_FORM + 4,
+               "revision lies past the slot that covers version_form's padding");
+_Static_assert(offsetof(moq_msf_catalog_t, publish_tracks) ==
+               offsetof(moq_msf_catalog_t, _reserved_publish_tracks) + 4,
+               "publish_tracks follows its reserved slot");
+
+#define MSF_CATALOG_SIZE_THROUGH_REVISION \
+    (offsetof(moq_msf_catalog_t, revision) + sizeof(moq_msf_revision_t))
+
+msf_extent_t moq_msf_extent_of(size_t size)
+{
+    if (size < MOQ_MSF_CATALOG_V0_SIZE) return MSF_EXTENT_SHORT;
+    if (size < MSF_CATALOG_SIZE_THROUGH_REVISION) return MSF_EXTENT_R01;
+    if (size < MOQ_MSF_CATALOG_SIZE_THROUGH_PUBLISH_TRACKS)
+        return MSF_EXTENT_PARTIAL;
+    return MSF_EXTENT_FULL;
+}
+
+moq_msf_revision_t moq_msf_catalog_revision_of(const moq_msf_catalog_t *cat)
+{
+    return moq_msf_extent_of(cat->struct_size) == MSF_EXTENT_FULL
+               ? cat->revision : MOQ_MSF_REVISION_01;
+}
+
+size_t moq_msf_publish_tracks_of(const moq_msf_catalog_t *cat,
+                                 const moq_msf_track_t **tracks)
+{
+    if (moq_msf_extent_of(cat->struct_size) != MSF_EXTENT_FULL) {
+        *tracks = NULL;
+        return 0;
+    }
+    *tracks = cat->publish_tracks;
+    return cat->publish_track_count;
 }
 
 /* -- Helpers --------------------------------------------------------- */
@@ -162,13 +231,23 @@ static moq_msf_version_form_t catalog_version_form(const moq_msf_catalog_t *cat)
  * understand.
  */
 static bool version_is_supported(const json_object_element_t *e,
-                                 moq_msf_version_form_t *form)
+                                 bool allow_r02,
+                                 moq_msf_version_form_t *form,
+                                 moq_msf_revision_t *rev)
 {
     json_string_t *s = json_value_as_string(e->value);
+    *rev = MOQ_MSF_REVISION_01;
     if (s) {
         if (str_eq(s, "1")) { *form = MOQ_MSF_VERSION_FORM_NUMERAL; return true; }
         if (str_eq(s, "draft-01")) {
             *form = MOQ_MSF_VERSION_FORM_DRAFT_NAME;
+            return true;
+        }
+        /* MSF-02 5.1.1: "draft-02", understood only by a caller whose
+         * catalog struct holds the MSF-02 block. */
+        if (allow_r02 && str_eq(s, "draft-02")) {
+            *form = MOQ_MSF_VERSION_FORM_DRAFT_NAME;
+            *rev = MOQ_MSF_REVISION_02;
             return true;
         }
         return false;
@@ -217,12 +296,54 @@ static moq_result_t get_string_array(const moq_alloc_t *alloc,
     return MOQ_OK;
 }
 
-/* A parsed track's extension list: one entry and its record, allocated
- * together on the track's first mpeg2ts* key and freed with the track. */
+/* A parsed track's extension list and its records: one block per track that
+ * carries any, allocated on its first record and freed with the track. The
+ * entries come first, so a parsed track's list pointer is its block. */
+#define MSF_EXT_ROWS       2
+#define MSF_ROW_MPEG2TS    0u
+#define MSF_ROW_SUPPLEMENT 1u
 typedef struct msf_ext_block {
-    moq_msf_track_ext_t entry;
-    moq_msf_mpeg2ts_t   ts;
+    moq_msf_track_ext_t        entries[MSF_EXT_ROWS];  /* ascending kind */
+    uint32_t                   present;     /* bit r: moq_msf_ext_kinds[r] */
+    moq_msf_mpeg2ts_t          ts;          /* row 0 */
+    moq_msf_track_supplement_t supplement;  /* row 1 */
 } msf_ext_block_t;
+
+static void *block_record(msf_ext_block_t *b, size_t row)
+{
+    return row == 0 ? (void *)&b->ts : (void *)&b->supplement;
+}
+
+/* Point an entry at a record of its kind. */
+static void ext_entry_set(moq_msf_track_ext_t *e, moq_msf_ext_kind_t kind,
+                          const void *rec)
+{
+    e->kind = kind;
+    if (kind == MOQ_MSF_EXT_SUPPLEMENT)
+        e->u.supplement = (const moq_msf_track_supplement_t *)rec;
+    else
+        e->u.mpeg2ts = (const moq_msf_mpeg2ts_t *)rec;
+}
+
+const void *moq_msf_ext_record(const moq_msf_track_ext_t *e)
+{
+    switch (e->kind) {
+    case MOQ_MSF_EXT_MPEG2TS:    return e->u.mpeg2ts;
+    case MOQ_MSF_EXT_SUPPLEMENT: return e->u.supplement;
+    default:                     return NULL;
+    }
+}
+
+/* Rebuild a block's list from its present records, in kind order. */
+static void block_relist(msf_ext_block_t *b, moq_msf_track_t *t)
+{
+    size_t k = 0;
+    for (size_t r = 0; r < MSF_EXT_ROWS; r++)
+        if (b->present & (1u << r))
+            ext_entry_set(&b->entries[k++], moq_msf_ext_kinds[r].kind,
+                          block_record(b, r));
+    t->extension_count = k;
+}
 
 /* moq_msf_mpeg2ts_t as first published: through `malformed`. */
 #define MSF_TS_V0 (offsetof(moq_msf_mpeg2ts_t, malformed) + sizeof(uint32_t))
@@ -271,9 +392,9 @@ static void free_track_allocs(const moq_alloc_t *alloc, moq_msf_track_t *t)
     if (t->extensions) {
         /* A parsed track's list is one parse block (msf_ext_block_t). */
         msf_ext_block_t *b = (msf_ext_block_t *)(uintptr_t)t->extensions;
-        if (b->ts.si_pids)
-            alloc->free(b->ts.si_pids, b->ts.si_pid_count * sizeof(uint32_t),
-                        alloc->ctx);
+        for (size_t r = 0; r < MSF_EXT_ROWS; r++)
+            if (b->present & (1u << r))
+                moq_msf_ext_kinds[r].free_owned(alloc, block_record(b, r));
         alloc->free(b, sizeof(*b), alloc->ctx);
         t->extensions = NULL;
         t->extension_count = 0;
@@ -516,22 +637,49 @@ static bool mpeg2ts_key_known(const json_string_t *name)
     return false;
 }
 
-/* The mpeg2ts record of a track being parsed, allocated with its list entry
- * on first use. NULL on allocation failure. */
-static moq_msf_mpeg2ts_t *parse_ts_rec(const moq_alloc_t *alloc,
-                                       moq_msf_track_t *t)
+/* The record of registry row `row` on a track being parsed, allocated with
+ * the track's block on first use. NULL on allocation failure. */
+static void *parse_ext_rec(const moq_alloc_t *alloc, moq_msf_track_t *t,
+                           size_t row)
 {
-    if (t->extensions)
-        return &((msf_ext_block_t *)(uintptr_t)t->extensions)->ts;
-    msf_ext_block_t *b = (msf_ext_block_t *)alloc->alloc(sizeof(*b), alloc->ctx);
-    if (!b) return NULL;
-    memset(b, 0, sizeof(*b));
-    moq_msf_mpeg2ts_init(&b->ts);
-    b->entry.kind = MOQ_MSF_EXT_MPEG2TS;
-    b->entry.u.mpeg2ts = &b->ts;
-    t->extensions = &b->entry;
-    t->extension_count = 1;
-    return &b->ts;
+    msf_ext_block_t *b = (msf_ext_block_t *)(uintptr_t)t->extensions;
+    if (!b) {
+        b = (msf_ext_block_t *)alloc->alloc(sizeof(*b), alloc->ctx);
+        if (!b) return NULL;
+        memset(b, 0, sizeof(*b));
+        t->extensions = &b->entries[0];
+        t->extension_count = 0;
+    }
+    void *rec = block_record(b, row);
+    if (!(b->present & (1u << row))) {
+        moq_msf_ext_kinds[row].init(rec);
+        b->present |= 1u << row;
+        block_relist(b, t);
+    }
+    return rec;
+}
+
+/* After a track's keys: drop records that ended up holding nothing (a key
+ * whose value was malformed and so absent), and the block with them, so a
+ * track carries exactly the records it has fields for. */
+static void parse_ext_finish(const moq_alloc_t *alloc, moq_msf_track_t *t)
+{
+    msf_ext_block_t *b = (msf_ext_block_t *)(uintptr_t)t->extensions;
+    if (!b) return;
+    for (size_t r = 0; r < MSF_EXT_ROWS; r++) {
+        if ((b->present & (1u << r)) &&
+            moq_msf_ext_kinds[r].is_empty(block_record(b, r))) {
+            moq_msf_ext_kinds[r].free_owned(alloc, block_record(b, r));
+            b->present &= ~(1u << r);
+        }
+    }
+    if (!b->present) {
+        alloc->free(b, sizeof(*b), alloc->ctx);
+        t->extensions = NULL;
+        t->extension_count = 0;
+        return;
+    }
+    block_relist(b, t);
 }
 
 static void free_cp_allocs(const moq_alloc_t *alloc,
@@ -638,7 +786,24 @@ typedef enum {
                    * may be omitted -- the §5.6.4 example does) */
     PT_CLONE,     /* delta "clone" track: name + parentName required */
     PT_REMOVE,    /* delta "remove" track: only name (+optional namespace) */
+    PT_UPDATE,    /* delta "update" track (MSF-02): parentName required */
 } parse_track_mode_t;
+
+/* Whether a track's extension list holds nothing but a supplement whose
+ * only content is malformed bits: what a remove track may carry, for apply
+ * to judge (MSF-02 5.2.2). */
+static bool ext_only_malformed_bits(const moq_msf_track_t *t)
+{
+    if (t->extension_count != 1 || !t->extensions ||
+        t->extensions[0].kind != MOQ_MSF_EXT_SUPPLEMENT)
+        return false;
+    const moq_msf_track_supplement_t *s = t->extensions[0].u.supplement;
+    if (!s || s->struct_size < MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE || !s->malformed)
+        return false;
+    moq_msf_track_supplement_t rest = *s;
+    rest.malformed = 0;
+    return moq_msf_supplement_is_empty(&rest);
+}
 
 /* True when a track carries nothing beyond name and (optionally) namespace --
  * the only fields a delta "remove" op track may hold (MSF 5.1.6). */
@@ -655,7 +820,7 @@ static bool track_is_name_namespace_only(const moq_msf_track_t *t)
            !t->has_max_obj_sap && !t->has_parent_name &&
            !t->has_parent_namespace && !t->has_packaging && !t->has_is_live &&
            !t->has_template && !t->has_track_duration &&
-           t->extension_count == 0;
+           (t->extension_count == 0 || ext_only_malformed_bits(t));
 }
 
 /* Parse a JSON number value as a non-negative integer uint64. Rejects a sign,
@@ -717,11 +882,140 @@ static moq_result_t parse_template(const json_value_t *v,
     return MOQ_OK;
 }
 
-static moq_result_t parse_track(const moq_alloc_t *alloc,
+/* MSF-02 11.2.1: a naming string (a name, a namespace, a "depends" String)
+ * maps to bytes as UTF-8 of Unicode scalar values; authoring also never
+ * writes NUL. */
+static bool naming_bytes_ok(moq_bytes_t b, bool authoring)
+{
+    if (b.len > 0 && !b.data) return false;
+    if (!moq_msf_utf8_valid(b.data, b.len)) return false;
+    return !authoring || b.len == 0 || !memchr(b.data, 0, b.len);
+}
+
+static bool naming_ns_ok(moq_bytes_t ns, bool authoring)
+{
+    return moq_msf_namespace_syntax_ok(ns) && naming_bytes_ok(ns, authoring);
+}
+
+/* The MSF-02 naming rules of one track (5.2.2, 5.2.3, 5.2.15, 5.2.34,
+ * 5.2.35, 11.2): non-empty names, namespaces of 1..32 non-empty fields, and
+ * naming strings that map to bytes. An update op track may omit its name. */
+static bool track_naming_ok_r02(const moq_msf_track_t *t, bool name_required,
+                                bool authoring)
+{
+    if (name_required && t->name.len == 0) return false;
+    if (!naming_bytes_ok(t->name, authoring)) return false;
+    if (t->has_namespace && !naming_ns_ok(t->namespace_, authoring)) return false;
+    if (t->has_parent_name &&
+        (t->parent_name.len == 0 || !naming_bytes_ok(t->parent_name, authoring)))
+        return false;
+    if (t->has_parent_namespace && !naming_ns_ok(t->parent_namespace, authoring))
+        return false;
+    if (t->depends_count > 0 && !t->depends) return false;
+    for (size_t i = 0; i < t->depends_count; i++)
+        if (!naming_bytes_ok(t->depends[i], authoring)) return false;
+    return true;
+}
+
+/* What a parse may read: the caller's extent decides the vocabulary. */
+typedef struct parse_ctx {
+    const moq_alloc_t *alloc;
+    bool               full;      /* the full extent: MSF-02 vocabulary */
+    moq_msf_revision_t rev;       /* the independent catalog's revision */
+    bool               delta;     /* parsing delta op tracks */
+    bool               r02_vocab; /* an op track used MSF-02 vocabulary */
+} parse_ctx_t;
+
+/* What a parse reads into extension records. MSF-02-only track keys are
+ * read for an MSF-02 catalog and for delta op tracks, which apply judges
+ * against the base's revision. */
+static unsigned parse_caps(const parse_ctx_t *pc)
+{
+    unsigned caps = 0;
+    if (pc->full) {
+        caps |= MSF_CAP_FULL;
+        if (pc->delta || pc->rev == MOQ_MSF_REVISION_02) caps |= MSF_CAP_R02;
+    }
+    return caps;
+}
+
+/* A JSON number holding an integer in int's range, in plain integer form. */
+static bool num_value_int(const json_value_t *v, int *out)
+{
+    json_number_t *n = json_value_as_number((json_value_t *)v);
+    if (!n || n->number_size == 0) return false;
+    char *endp;
+    errno = 0;
+    long x = strtol(n->number, &endp, 10);
+    if (errno == ERANGE || endp != n->number + n->number_size) return false;
+    if (x < INT_MIN || x > INT_MAX) return false;
+    *out = (int)x;
+    return true;
+}
+
+/* "depends" (MSF 5.2.14 / MSF-02 5.2.15): String entries are track names, in
+ * moq_msf_track_t.depends; Number entries are renderGroup ids, in the
+ * supplement, and only MSF-02 vocabulary has them. On a clone or update op
+ * track the key's presence is recorded (has_depends): the op replaces both
+ * lists. Anything else in the array is malformed. */
+static moq_result_t parse_depends(parse_ctx_t *pc, const json_value_t *val,
+                                  moq_msf_track_t *t, parse_track_mode_t mode)
+{
+    const moq_alloc_t *alloc = pc->alloc;
+    bool numbers_ok = (parse_caps(pc) & MSF_CAP_R02) != 0;
+    json_array_t *a = json_value_as_array((json_value_t *)val);
+    if (!a) return MOQ_ERR_PROTO;
+    size_t ns = 0, nn = 0;
+    int dummy;
+    for (json_array_element_t *e = a->start; e; e = e->next) {
+        if (json_value_as_string(e->value)) ns++;
+        else if (numbers_ok && num_value_int(e->value, &dummy)) nn++;
+        else return MOQ_ERR_PROTO;
+    }
+    size_t sbytes = 0, nbytes = 0;
+    if (ns > 0) {
+        if (!moq_msf_checked_array_bytes(ns, sizeof(moq_bytes_t), &sbytes))
+            return MOQ_ERR_NOMEM;
+        t->depends = (moq_bytes_t *)alloc->alloc(sbytes, alloc->ctx);
+        if (!t->depends) return MOQ_ERR_NOMEM;
+    }
+    t->depends_count = ns;     /* freed with the track on any failure below */
+    bool op_presence = pc->full && pc->delta &&
+                       (mode == PT_CLONE || mode == PT_UPDATE);
+    int *groups = NULL;
+    if (nn > 0) {
+        if (!moq_msf_checked_array_bytes(nn, sizeof(int), &nbytes))
+            return MOQ_ERR_NOMEM;
+        groups = (int *)alloc->alloc(nbytes, alloc->ctx);
+        if (!groups) return MOQ_ERR_NOMEM;
+    }
+    size_t si = 0, gi = 0;
+    for (json_array_element_t *e = a->start; e; e = e->next) {
+        json_string_t *str = json_value_as_string(e->value);
+        if (str) t->depends[si++] = bytes_from_json_string(str);
+        else (void)num_value_int(e->value, &groups[gi++]);
+    }
+    if (nn > 0 || op_presence) {
+        moq_msf_track_supplement_t *sp = (moq_msf_track_supplement_t *)
+            parse_ext_rec(alloc, t, MSF_ROW_SUPPLEMENT);
+        if (!sp) {
+            if (groups) alloc->free(groups, nbytes, alloc->ctx);
+            return MOQ_ERR_NOMEM;
+        }
+        sp->depends_render_groups = groups;
+        sp->depends_render_group_count = nn;
+        sp->has_depends = op_presence;
+    }
+    return MOQ_OK;
+}
+
+static moq_result_t parse_track(parse_ctx_t *pc,
                                  const json_value_t *val,
                                  moq_msf_track_t *t,
                                  parse_track_mode_t mode)
 {
+    const moq_alloc_t *alloc = pc->alloc;
+    const unsigned caps = parse_caps(pc);
     memset(t, 0, sizeof(*t));
     t->struct_size = sizeof(*t);
 
@@ -729,12 +1023,14 @@ static moq_result_t parse_track(const moq_alloc_t *alloc,
     if (!obj) return MOQ_ERR_PROTO;
 
     bool got_name = false, got_packaging = false, got_is_live = false;
+    bool seen_name = false;
     bool seen_cp_refs = false;
     bool seen_depends = false;
     bool seen_template = false;
 
     for (json_object_element_t *e = obj->start; e; e = e->next) {
         if (str_eq(e->name, "name")) {
+            seen_name = true;
             got_name = get_string(e, &t->name);
         } else if (str_eq(e->name, "packaging")) {
             got_packaging = get_string(e, &t->packaging);
@@ -742,6 +1038,20 @@ static moq_result_t parse_track(const moq_alloc_t *alloc,
             got_is_live = get_bool(e, &t->is_live);
         } else if (str_eq(e->name, "namespace")) {
             t->has_namespace = get_string(e, &t->namespace_);
+            if (!t->has_namespace) {
+                /* MSF-02 5.2.2: a namespace that is not a String makes an
+                 * MSF-02 catalog invalid; on a delta op track it is recorded
+                 * for apply to judge against the base's revision. MSF-01
+                 * treats it as absent. */
+                if (pc->rev == MOQ_MSF_REVISION_02 && !pc->delta)
+                    return MOQ_ERR_PROTO;
+                if (pc->full && pc->delta) {
+                    moq_msf_track_supplement_t *sp = (moq_msf_track_supplement_t *)
+                        parse_ext_rec(alloc, t, MSF_ROW_SUPPLEMENT);
+                    if (!sp) return MOQ_ERR_NOMEM;
+                    sp->malformed |= MOQ_MSF_SUPPLEMENT_F_NAMESPACE;
+                }
+            }
         } else if (str_eq(e->name, "role")) {
             t->has_role = get_string(e, &t->role);
         } else if (str_eq(e->name, "codec")) {
@@ -787,9 +1097,8 @@ static moq_result_t parse_track(const moq_alloc_t *alloc,
         } else if (str_eq(e->name, "depends")) {
             if (seen_depends) return MOQ_ERR_PROTO;  /* duplicate; caller frees first */
             seen_depends = true;
-            moq_result_t rc = get_string_array(alloc, e->value,
-                &t->depends, &t->depends_count);
-            if (rc < 0) return rc;   /* present but not an array of strings */
+            moq_result_t rc = parse_depends(pc, e->value, t, mode);
+            if (rc < 0) return rc;   /* present but malformed */
         } else if (str_eq(e->name, "contentProtectionRefIDs")) {
             if (seen_cp_refs) return MOQ_ERR_PROTO;  /* duplicate; caller frees first */
             seen_cp_refs = true;
@@ -808,31 +1117,45 @@ static moq_result_t parse_track(const moq_alloc_t *alloc,
             moq_result_t rc = parse_template(e->value, &t->template_);
             if (rc < 0) return rc;
             t->has_template = true;
-        } else if (e->name->string_size > 7 &&
-                   memcmp(e->name->string, "mpeg2ts", 7) == 0) {
-            /* draft-gregoire-moq-msfts track fields; any other mpeg2ts* key
-             * is not understood and ignored. */
-            if (mpeg2ts_key_known(e->name)) {
-                moq_msf_mpeg2ts_t *m = parse_ts_rec(alloc, t);
-                if (!m) return MOQ_ERR_NOMEM;  /* caller frees the track */
-                moq_result_t mrc;
-                parse_mpeg2ts_key(alloc, e, m, &mrc);
-                if (mrc < 0) return mrc;
-            }
         } else if (str_eq(e->name, "parentName")) {
             t->has_parent_name = get_string(e, &t->parent_name);
         } else if (str_eq(e->name, "parentNamespace")) {
             t->has_parent_namespace = get_string(e, &t->parent_namespace);
+            if (!t->has_parent_namespace && pc->full && pc->delta) {
+                moq_msf_track_supplement_t *sp = (moq_msf_track_supplement_t *)
+                    parse_ext_rec(alloc, t, MSF_ROW_SUPPLEMENT);
+                if (!sp) return MOQ_ERR_NOMEM;
+                sp->malformed |= MOQ_MSF_SUPPLEMENT_F_PARENT_NAMESPACE;
+            }
+        } else {
+            /* A key an extension kind owns (the mpeg2ts* keys of
+             * draft-gregoire-moq-msfts, the supplement's MSF keys); any other
+             * key is not understood and ignored. */
+            for (size_t r = 0; r < moq_msf_ext_kind_count; r++) {
+                const msf_ext_kind_ops_t *k = &moq_msf_ext_kinds[r];
+                if (!k->key_known(e->name, caps)) continue;
+                void *rec = parse_ext_rec(alloc, t, r);
+                if (!rec) return MOQ_ERR_NOMEM;   /* caller frees the track */
+                moq_result_t rc = k->parse_key(alloc, e, rec);
+                if (rc < 0) return rc;
+                break;
+            }
         }
     }
+    parse_ext_finish(alloc, t);
+    /* A delta's revision follows the vocabulary its op tracks use. */
+    if (pc->delta && moq_msf_supplement_has_r02_fields(moq_msf_supplement_of(t)))
+        pc->r02_vocab = true;
 
     /* Record presence of the otherwise-required keys for clone-override
      * fidelity (the encoder still emits them unconditionally for full/add). */
     t->has_packaging = got_packaging;
     t->has_is_live = got_is_live;
 
-    /* MSF 5.2.33/34: parentName/parentNamespace MUST only appear in a clone op. */
-    if (mode != PT_CLONE && (t->has_parent_name || t->has_parent_namespace))
+    /* MSF 5.2.34/5.2.35: parentName/parentNamespace appear only in a clone
+     * or (MSF-02) an update op. */
+    if (mode != PT_CLONE && mode != PT_UPDATE &&
+        (t->has_parent_name || t->has_parent_namespace))
         return MOQ_ERR_PROTO;
 
     switch (mode) {
@@ -856,7 +1179,19 @@ static moq_result_t parse_track(const moq_alloc_t *alloc,
          * hold any other field. */
         if (!got_name || !track_is_name_namespace_only(t)) return MOQ_ERR_PROTO;
         break;
+    case PT_UPDATE:
+        /* MSF-02 5.1.6 update: parentName names the track; a name, when the
+         * object carries one, is a non-empty String (apply holds it to the
+         * target's: an update never renames). */
+        if (!t->has_parent_name || (seen_name && (!got_name || t->name.len == 0)))
+            return MOQ_ERR_PROTO;
+        break;
     }
+    /* An MSF-02 catalog's own tracks follow MSF-02's naming rules; a delta's
+     * op tracks are judged by apply, against the base's revision. */
+    if (!pc->delta && pc->rev == MOQ_MSF_REVISION_02 &&
+        !track_naming_ok_r02(t, true, false))
+        return MOQ_ERR_PROTO;
 
     return MOQ_OK;
 }
@@ -897,8 +1232,41 @@ static void free_delta_op_allocs(const moq_alloc_t *alloc,
     op->track_count = 0;
 }
 
+/* Parse a JSON array of track objects into a catalog-owned array (NULL/0
+ * when empty). On failure nothing stays allocated. */
+static moq_result_t parse_track_array(parse_ctx_t *pc, const json_array_t *arr,
+                                      parse_track_mode_t mode,
+                                      moq_msf_track_t **out, size_t *out_count)
+{
+    const moq_alloc_t *alloc = pc->alloc;
+    *out = NULL;
+    *out_count = 0;
+    size_t n = arr->length;
+    if (n == 0) return MOQ_OK;
+    size_t tbytes;
+    if (!moq_msf_checked_array_bytes(n, sizeof(moq_msf_track_t), &tbytes))
+        return MOQ_ERR_NOMEM;
+    moq_msf_track_t *tracks = (moq_msf_track_t *)alloc->alloc(tbytes, alloc->ctx);
+    if (!tracks) return MOQ_ERR_NOMEM;
+    size_t parsed = 0;
+    const json_array_element_t *ae = arr->start;
+    for (size_t i = 0; i < n && ae; i++, ae = ae->next) {
+        moq_result_t rc = parse_track(pc, ae->value, &tracks[parsed], mode);
+        if (rc < 0) {
+            free_track_allocs(alloc, &tracks[parsed]);   /* the failed track */
+            for (size_t j = 0; j < parsed; j++) free_track_allocs(alloc, &tracks[j]);
+            alloc->free(tracks, tbytes, alloc->ctx);
+            return rc;
+        }
+        parsed++;
+    }
+    *out = tracks;
+    *out_count = parsed;
+    return MOQ_OK;
+}
+
 /* Parse one deltaUpdate operation object (MSF 5.1.6): {op, tracks:[...]}. */
-static moq_result_t parse_delta_op(const moq_alloc_t *alloc,
+static moq_result_t parse_delta_op(parse_ctx_t *pc,
                                    const json_value_t *val,
                                    moq_msf_delta_op_t *out)
 {
@@ -929,112 +1297,112 @@ static moq_result_t parse_delta_op(const moq_alloc_t *alloc,
     if (bytes_eq_lit(op_str, "add"))         { out->op = MOQ_MSF_DELTA_OP_ADD;    mode = PT_ADD; }
     else if (bytes_eq_lit(op_str, "remove")) { out->op = MOQ_MSF_DELTA_OP_REMOVE; mode = PT_REMOVE; }
     else if (bytes_eq_lit(op_str, "clone"))  { out->op = MOQ_MSF_DELTA_OP_CLONE;  mode = PT_CLONE; }
+    else if (pc->full && bytes_eq_lit(op_str, "update")) {
+        /* MSF-02 5.1.6, read only by a caller whose struct holds MSF-02. */
+        out->op = MOQ_MSF_DELTA_OP_UPDATE;
+        mode = PT_UPDATE;
+        pc->r02_vocab = true;
+    }
     else return MOQ_ERR_PROTO;                /* unknown op type */
 
-    size_t n = tracks_arr->length;
-    if (n == 0) return MOQ_ERR_PROTO;         /* an op MUST carry >= 1 track */
-
-    size_t tbytes;
-    if (!moq_msf_checked_array_bytes(n, sizeof(moq_msf_track_t), &tbytes))
-        return MOQ_ERR_NOMEM;
-    moq_msf_track_t *tracks = (moq_msf_track_t *)alloc->alloc(
-        tbytes, alloc->ctx);
-    if (!tracks) return MOQ_ERR_NOMEM;
-
-    size_t parsed = 0;
-    json_array_element_t *ae = tracks_arr->start;
-    for (size_t i = 0; i < n && ae; i++, ae = ae->next) {
-        moq_result_t rc = parse_track(alloc, ae->value, &tracks[parsed], mode);
-        if (rc < 0) {
-            free_track_allocs(alloc, &tracks[parsed]);
-            for (size_t j = 0; j < parsed; j++) free_track_allocs(alloc, &tracks[j]);
-            alloc->free(tracks, tbytes, alloc->ctx);
-            return rc;
-        }
-        parsed++;
-    }
-
-    out->tracks = tracks;
-    out->track_count = parsed;
-    return MOQ_OK;
+    if (tracks_arr->length == 0) return MOQ_ERR_PROTO;  /* >= 1 track */
+    return parse_track_array(pc, tracks_arr, mode, &out->tracks,
+                             &out->track_count);
 }
 
 /* -- Public API ------------------------------------------------------ */
 
-moq_result_t moq_msf_catalog_parse(const moq_alloc_t *alloc,
-                                    moq_bytes_t json,
-                                    moq_msf_catalog_t *out)
+static void free_track_array(const moq_alloc_t *alloc, moq_msf_track_t *tracks,
+                             size_t count)
 {
-    if (!alloc || !json.data || !out) return MOQ_ERR_INVAL;
+    if (!tracks) return;
+    for (size_t i = 0; i < count; i++) free_track_allocs(alloc, &tracks[i]);
+    alloc->free(tracks, count * sizeof(moq_msf_track_t), alloc->ctx);
+}
+
+/* Parse a document into a catalog of the full layout. `full` selects the
+ * MSF-02 vocabulary (the caller's extent holds the MSF-02 block). On error
+ * everything is released and *out is zeroed. */
+static moq_result_t parse_doc(const moq_alloc_t *alloc, moq_bytes_t json,
+                              bool full, moq_msf_catalog_t *out)
+{
     memset(out, 0, sizeof(*out));
     out->struct_size = sizeof(*out);
 
-    alloc_ctx_t actx = { .alloc = alloc, .total = 0 };
+    alloc_ctx_t actx = { .alloc = alloc, .total = 0, .base = NULL };
     json_parse_result_t err;
     json_value_t *root = json_parse_ex(
         json.data, json.len, json_parse_flags_default,
         json_alloc_bridge, &actx, &err);
     if (!root) {
+        if (actx.base) alloc->free(actx.base, actx.total, alloc->ctx);
         if (err.error == json_parse_error_allocator_failed)
             return MOQ_ERR_NOMEM;
         return MOQ_ERR_PROTO;
     }
-    out->_dom = root;
+    out->_dom = actx.base;
     out->_dom_size = actx.total;
+    msf_dom_hdr_t *hdr = (msf_dom_hdr_t *)(void *)actx.base;
+    hdr->magic = MSF_DOM_MAGIC;
 
+    moq_result_t rc = MOQ_ERR_PROTO;
+    parse_ctx_t pc = { .alloc = alloc, .full = full,
+                       .rev = MOQ_MSF_REVISION_01, .delta = false,
+                       .r02_vocab = false };
     json_object_t *top = json_value_as_object(root);
-    if (!top) {
-        moq_msf_catalog_cleanup(alloc, out);
-        return MOQ_ERR_PROTO;
-    }
+    if (!top) goto fail;
 
     bool got_version = false;
     bool seen_tracks = false;
     bool seen_is_complete = false;
     json_array_t *tracks_arr = NULL;
+    json_array_t *publish_arr = NULL;
     json_array_t *idl_arr = NULL;
     json_array_t *cp_arr = NULL;
     json_array_t *delta_arr = NULL;
 
     for (json_object_element_t *e = top->start; e; e = e->next) {
         if (str_eq(e->name, "version")) {
-            if (!version_is_supported(e, &out->version_form)) {
-                moq_msf_catalog_cleanup(alloc, out);
-                return MOQ_ERR_PROTO;
-            }
+            hdr->root_keys |= MSF_ROOT_VERSION;
+            if (!version_is_supported(e, full, &out->version_form, &pc.rev))
+                goto fail;
             out->version = MOQ_MSF_VERSION;
             got_version = true;
         } else if (str_eq(e->name, "tracks")) {
+            hdr->root_keys |= MSF_ROOT_TRACKS;
             seen_tracks = true;
             tracks_arr = json_value_as_array(e->value);
         } else if (str_eq(e->name, "generatedAt")) {
+            hdr->root_keys |= MSF_ROOT_GENERATED_AT;
             out->has_generated_at = get_u64(e, &out->generated_at);
         } else if (str_eq(e->name, "isComplete")) {
             /* MSF 5.1.3: only the TRUE state is meaningful; a false/malformed
              * value is treated as absent (the spec forbids emitting false). The
              * key's presence is still recorded so a delta carrying it is
              * rejected below. */
+            hdr->root_keys |= MSF_ROOT_IS_COMPLETE;
             seen_is_complete = true;
             bool b = false;
             if (get_bool(e, &b) && b) out->is_complete = true;
+        } else if (str_eq(e->name, "publishTracks")) {
+            /* MSF 5.1.5, read only by a caller whose struct holds it. */
+            hdr->root_keys |= MSF_ROOT_PUBLISH_TRACKS;
+            if (full) {
+                publish_arr = json_value_as_array(e->value);
+                if (!publish_arr) goto fail;   /* present but not an array */
+            }
         } else if (str_eq(e->name, "initDataList")) {
+            hdr->root_keys |= MSF_ROOT_INIT_DATA_LIST;
             idl_arr = json_value_as_array(e->value);
-            if (!idl_arr) {   /* present but not an array */
-                moq_msf_catalog_cleanup(alloc, out);
-                return MOQ_ERR_PROTO;
-            }
+            if (!idl_arr) goto fail;           /* present but not an array */
         } else if (str_eq(e->name, "contentProtections")) {
+            hdr->root_keys |= MSF_ROOT_CONTENT_PROTECTIONS;
             cp_arr = json_value_as_array(e->value);
-            if (!cp_arr) {    /* present but not an array */
-                moq_msf_catalog_cleanup(alloc, out);
-                return MOQ_ERR_PROTO;
-            }
+            if (!cp_arr) goto fail;            /* present but not an array */
         } else if (str_eq(e->name, "deltaUpdate")) {
+            hdr->root_keys |= MSF_ROOT_DELTA_UPDATE;
             delta_arr = json_value_as_array(e->value);
-            if (!delta_arr) {  /* present but not an array */
-                moq_msf_catalog_cleanup(alloc, out);
-                return MOQ_ERR_PROTO;
-            }
+            if (!delta_arr) goto fail;         /* present but not an array */
         }
     }
 
@@ -1043,79 +1411,47 @@ moq_result_t moq_msf_catalog_parse(const moq_alloc_t *alloc,
      * operation (5.1.3: completion is signalled by an independent catalog). */
     if (delta_arr) {
         if (got_version || seen_tracks || seen_is_complete ||
-            delta_arr->length == 0) {
-            moq_msf_catalog_cleanup(alloc, out);
-            return MOQ_ERR_PROTO;
-        }
+            delta_arr->length == 0)
+            goto fail;
         size_t oc = delta_arr->length;
         size_t ob;
         if (!moq_msf_checked_array_bytes(oc, sizeof(moq_msf_delta_op_t), &ob)) {
-            moq_msf_catalog_cleanup(alloc, out);
-            return MOQ_ERR_NOMEM;
+            rc = MOQ_ERR_NOMEM;
+            goto fail;
         }
         moq_msf_delta_op_t *ops = (moq_msf_delta_op_t *)alloc->alloc(
             ob, alloc->ctx);
-        if (!ops) {
-            moq_msf_catalog_cleanup(alloc, out);
-            return MOQ_ERR_NOMEM;
-        }
+        if (!ops) { rc = MOQ_ERR_NOMEM; goto fail; }
+        pc.delta = true;
         size_t poc = 0;
         json_array_element_t *oe = delta_arr->start;
         for (size_t i = 0; i < oc && oe; i++, oe = oe->next) {
-            moq_result_t rc = parse_delta_op(alloc, oe->value, &ops[poc]);
+            rc = parse_delta_op(&pc, oe->value, &ops[poc]);
             if (rc < 0) {
                 for (size_t j = 0; j < poc; j++) free_delta_op_allocs(alloc, &ops[j]);
                 alloc->free(ops, ob, alloc->ctx);
-                moq_msf_catalog_cleanup(alloc, out);
-                return rc;
+                goto fail;
             }
             poc++;
         }
         out->delta_update = ops;
         out->delta_update_count = poc;
+        /* A delta has no version: report the earliest revision whose
+         * vocabulary covers it. */
+        out->revision = pc.r02_vocab ? MOQ_MSF_REVISION_02 : MOQ_MSF_REVISION_01;
         return MOQ_OK;   /* a delta carries no tracks/idl/cp of its own */
     }
 
-    if (!got_version || !tracks_arr) {
-        moq_msf_catalog_cleanup(alloc, out);
-        return MOQ_ERR_PROTO;
-    }
+    if (!got_version || !tracks_arr) goto fail;
+    out->revision = pc.rev;
 
-    size_t count = tracks_arr->length;
-    if (count == 0) {
-        out->tracks = NULL;
-        out->track_count = 0;
-    } else {
-        size_t tb;
-        if (!moq_msf_checked_array_bytes(count, sizeof(moq_msf_track_t), &tb)) {
-            moq_msf_catalog_cleanup(alloc, out);
-            return MOQ_ERR_NOMEM;
-        }
-        moq_msf_track_t *tracks = (moq_msf_track_t *)alloc->alloc(
-            tb, alloc->ctx);
-        if (!tracks) {
-            moq_msf_catalog_cleanup(alloc, out);
-            return MOQ_ERR_NOMEM;
-        }
-
-        size_t parsed = 0;
-        json_array_element_t *ae = tracks_arr->start;
-        for (size_t i = 0; i < count && ae; i++, ae = ae->next) {
-            moq_result_t rc = parse_track(alloc, ae->value, &tracks[parsed],
-                                          PT_FULL);
-            if (rc < 0) {
-                free_track_allocs(alloc, &tracks[parsed]); /* the failed track */
-                for (size_t j = 0; j < parsed; j++)
-                    free_track_allocs(alloc, &tracks[j]);
-                alloc->free(tracks, tb, alloc->ctx);
-                moq_msf_catalog_cleanup(alloc, out);
-                return rc;
-            }
-            parsed++;
-        }
-
-        out->tracks = tracks;
-        out->track_count = parsed;
+    rc = parse_track_array(&pc, tracks_arr, PT_FULL, &out->tracks,
+                           &out->track_count);
+    if (rc < 0) goto fail;
+    if (publish_arr) {
+        rc = parse_track_array(&pc, publish_arr, PT_FULL, &out->publish_tracks,
+                               &out->publish_track_count);
+        if (rc < 0) goto fail;
     }
 
     /* Initialization Data List (MSF 5.1.7) -- present after tracks in the
@@ -1125,24 +1461,20 @@ moq_result_t moq_msf_catalog_parse(const moq_alloc_t *alloc,
         size_t ib;
         if (!moq_msf_checked_array_bytes(ic, sizeof(moq_msf_init_data_entry_t),
                                          &ib)) {
-            moq_msf_catalog_cleanup(alloc, out);
-            return MOQ_ERR_NOMEM;
+            rc = MOQ_ERR_NOMEM;
+            goto fail;
         }
         moq_msf_init_data_entry_t *entries =
             (moq_msf_init_data_entry_t *)alloc->alloc(ib, alloc->ctx);
-        if (!entries) {
-            moq_msf_catalog_cleanup(alloc, out);
-            return MOQ_ERR_NOMEM;
-        }
+        if (!entries) { rc = MOQ_ERR_NOMEM; goto fail; }
 
         size_t pic = 0;
         json_array_element_t *ie = idl_arr->start;
         for (size_t i = 0; i < ic && ie; i++, ie = ie->next) {
-            moq_result_t rc = parse_init_data_entry(ie->value, &entries[pic]);
+            rc = parse_init_data_entry(ie->value, &entries[pic]);
             if (rc < 0) {
                 alloc->free(entries, ib, alloc->ctx);
-                moq_msf_catalog_cleanup(alloc, out);
-                return rc;
+                goto fail;
             }
             pic++;
         }
@@ -1157,25 +1489,21 @@ moq_result_t moq_msf_catalog_parse(const moq_alloc_t *alloc,
         size_t cb;
         if (!moq_msf_checked_array_bytes(
                 cc, sizeof(moq_cmsf_content_protection_t), &cb)) {
-            moq_msf_catalog_cleanup(alloc, out);
-            return MOQ_ERR_NOMEM;
+            rc = MOQ_ERR_NOMEM;
+            goto fail;
         }
         moq_cmsf_content_protection_t *cps =
             (moq_cmsf_content_protection_t *)alloc->alloc(cb, alloc->ctx);
-        if (!cps) {
-            moq_msf_catalog_cleanup(alloc, out);
-            return MOQ_ERR_NOMEM;
-        }
+        if (!cps) { rc = MOQ_ERR_NOMEM; goto fail; }
 
         size_t pcc = 0;
         json_array_element_t *ce = cp_arr->start;
         for (size_t i = 0; i < cc && ce; i++, ce = ce->next) {
-            moq_result_t rc = parse_content_protection(alloc, ce->value, &cps[pcc]);
+            rc = parse_content_protection(alloc, ce->value, &cps[pcc]);
             if (rc < 0) {
                 for (size_t j = 0; j < pcc; j++) free_cp_allocs(alloc, &cps[j]);
                 alloc->free(cps, cb, alloc->ctx);
-                moq_msf_catalog_cleanup(alloc, out);
-                return rc;
+                goto fail;
             }
             pcc++;
         }
@@ -1185,12 +1513,57 @@ moq_result_t moq_msf_catalog_parse(const moq_alloc_t *alloc,
     }
 
     return MOQ_OK;
+
+fail:
+    moq_msf_catalog_cleanup(alloc, out);
+    memset(out, 0, sizeof(*out));
+    return rc;
+}
+
+/* The sized parse: refuse an extent it cannot honour before writing; then
+ * write min(out_size, sizeof) bytes of the result (zeroed on error) and stamp
+ * that count. */
+static moq_result_t parse_impl(const moq_alloc_t *alloc, moq_bytes_t json,
+                               moq_msf_catalog_t *out, size_t out_size)
+{
+    if (!alloc || !json.data || !out) return MOQ_ERR_INVAL;
+    msf_extent_t x = moq_msf_extent_of(out_size);
+    if (x == MSF_EXTENT_SHORT || x == MSF_EXTENT_PARTIAL) return MOQ_ERR_INVAL;
+    size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
+    moq_msf_catalog_t cat;
+    moq_result_t rc = parse_doc(alloc, json, x == MSF_EXTENT_FULL, &cat);
+    cat.struct_size = (uint32_t)n;
+    memcpy(out, &cat, n);
+    return rc;
+}
+
+moq_result_t moq_msf_catalog_parse_sized(const moq_alloc_t *alloc,
+                                         moq_bytes_t json,
+                                         moq_msf_catalog_t *out,
+                                         size_t out_size)
+{
+    return parse_impl(alloc, json, out, out_size);
+}
+
+/* Parenthesized: defines the exported MSF-01 symbol, not the header's
+ * sized macro. */
+moq_result_t (moq_msf_catalog_parse)(const moq_alloc_t *alloc,
+                                      moq_bytes_t json,
+                                      moq_msf_catalog_t *out)
+{
+    return parse_impl(alloc, json, out,
+                      MOQ_MSF_CATALOG_SIZE_THROUGH_VERSION_FORM);
 }
 
 void moq_msf_catalog_cleanup(const moq_alloc_t *alloc,
                               moq_msf_catalog_t *cat)
 {
     if (!alloc || !cat) return;
+    if (moq_msf_extent_of(cat->struct_size) == MSF_EXTENT_FULL) {
+        free_track_array(alloc, cat->publish_tracks, cat->publish_track_count);
+        cat->publish_tracks = NULL;
+        cat->publish_track_count = 0;
+    }
     if (cat->tracks) {
         for (size_t i = 0; i < cat->track_count; i++)
             free_track_allocs(alloc, &cat->tracks[i]);
@@ -1236,10 +1609,10 @@ static bool bytes_eq(moq_bytes_t a, moq_bytes_t b);   /* defined below */
  * byte-span empty-slot sentinel (len == SIZE_MAX) and does not claim content
  * with a NULL data pointer. Parsed catalogs never violate this; public callers
  * that hand-build a catalog can, so identity spans are checked before any
- * hash/memcmp reaches ns_index_* / bs_index_*. */
+ * hash/memcmp reaches the identity indexes. */
 static bool ident_span_ok(moq_bytes_t b)
 {
-    if (b.len == SIZE_MAX) return false;      /* reserved bs_index sentinel */
+    if (b.len == SIZE_MAX) return false;      /* the indexes' empty-slot sentinel */
     if (b.len > 0 && !b.data) return false;   /* content with no buffer */
     return true;
 }
@@ -1286,10 +1659,13 @@ static void ts_merge_clone(moq_msf_mpeg2ts_t *em, const moq_msf_mpeg2ts_t *cm)
 #undef MPEG2TS_OVERRIDE
 }
 
-static void apply_clone_overrides(moq_msf_track_t *eff,
-                                  const moq_msf_track_t *c)
+/* The fields an op track carries override the inherited or existing ones
+ * (clone, update). The namespace is the clone's to set: an update names its
+ * target and never moves it. */
+static void apply_field_overrides(moq_msf_track_t *eff,
+                                  const moq_msf_track_t *c,
+                                  moq_msf_revision_t rev, bool namespace_too)
 {
-    eff->name = c->name;                 /* the new track name is mandatory */
     /* Parent markers do not belong on an effective independent track. */
     eff->has_parent_name = false;
     eff->has_parent_namespace = false;
@@ -1301,7 +1677,9 @@ static void apply_clone_overrides(moq_msf_track_t *eff,
     eff->has_packaging = true;           /* an effective full track has both */
     eff->has_is_live = true;
 
-    if (c->has_namespace)      { eff->has_namespace = true; eff->namespace_ = c->namespace_; }
+    if (namespace_too && c->has_namespace) {
+        eff->has_namespace = true; eff->namespace_ = c->namespace_;
+    }
     if (c->has_role)           { eff->has_role = true; eff->role = c->role; }
     if (c->has_codec)          { eff->has_codec = true; eff->codec = c->codec; }
     if (c->has_init_data)      { eff->has_init_data = true; eff->init_data = c->init_data; }
@@ -1324,11 +1702,58 @@ static void apply_clone_overrides(moq_msf_track_t *eff,
     if (c->has_mime_type)      { eff->has_mime_type = true; eff->mime_type = c->mime_type; }
     if (c->has_max_grp_sap)    { eff->has_max_grp_sap = true; eff->max_grp_sap = c->max_grp_sap; }
     if (c->has_max_obj_sap)    { eff->has_max_obj_sap = true; eff->max_obj_sap = c->max_obj_sap; }
-    if (c->depends_count > 0)  { eff->depends = c->depends; eff->depends_count = c->depends_count; }
+    /* MSF-02: an op that carried "depends" replaces the list, even with an
+     * empty one; MSF-01 replaces it only with entries. */
+    const moq_msf_track_supplement_t *cs =
+        rev == MOQ_MSF_REVISION_02 ? moq_msf_supplement_of(c) : NULL;
+    if ((cs && cs->has_depends) || c->depends_count > 0) {
+        eff->depends = c->depends; eff->depends_count = c->depends_count;
+    }
     if (c->cp_ref_id_count > 0){ eff->cp_ref_ids = c->cp_ref_ids; eff->cp_ref_id_count = c->cp_ref_id_count; }
     /* eff began as a copy of the parent, so it already inherits the parent's
      * template; a clone carrying its own template overrides it (5.2.15). */
     if (c->has_template)       { eff->has_template = true; eff->template_ = c->template_; }
+}
+
+static void apply_clone_overrides(moq_msf_track_t *eff,
+                                  const moq_msf_track_t *c,
+                                  moq_msf_revision_t rev)
+{
+    eff->name = c->name;                 /* the new track name is mandatory */
+    apply_field_overrides(eff, c, rev, true);
+}
+
+static bool template_eq(const moq_msf_media_template_t *a,
+                        const moq_msf_media_template_t *b)
+{
+    return a->start_media_ms == b->start_media_ms &&
+           a->delta_media_ms == b->delta_media_ms &&
+           a->start_group == b->start_group &&
+           a->start_object == b->start_object &&
+           a->delta_group == b->delta_group &&
+           a->delta_object == b->delta_object &&
+           a->start_wallclock_ms == b->start_wallclock_ms &&
+           a->delta_wallclock_ms == b->delta_wallclock_ms;
+}
+
+/* MSF-02 "update" (5.1.6) on its target: a name or namespace the op carries
+ * is the target's own, so an update never renames; isLive never turns from
+ * false to true (5.2.8); a template the target has never changes (7.4.2),
+ * though one may be added. */
+static bool update_allowed(const msf_ident_mode_t *mode,
+                           const moq_msf_track_t *target,
+                           const moq_msf_track_t *u)
+{
+    if (u->name.len > 0 && !bytes_eq(u->name, target->name)) return false;
+    if (u->has_namespace &&
+        !moq_msf_ident_eq(mode, true, u->namespace_, target->name,
+                          target->has_namespace, target->namespace_, target->name))
+        return false;
+    if (u->has_is_live && u->is_live && !target->is_live) return false;
+    if (u->has_template && target->has_template &&
+        !template_eq(&u->template_, &target->template_))
+        return false;
+    return true;
 }
 
 /* One temporary allocation, with its size for the free. */
@@ -1337,13 +1762,30 @@ typedef struct msf_tmp_block {
     size_t n;
 } msf_tmp_block_t;
 
-/* A clone's extension list: the parent's entries, with each kind the clone
- * carries merged into a fresh record (for mpeg2ts, key by key) or appended.
- * The merged list and record live in one allocation that the caller keeps
- * until the effective catalog is encoded (*block, *block_size). */
+/* The alignment of every record kind, for packing records after a list. */
+#define MSF_REC_ALIGN 8u
+_Static_assert(MSF_REC_ALIGN % _Alignof(moq_msf_mpeg2ts_t) == 0 &&
+               MSF_REC_ALIGN % _Alignof(moq_msf_track_supplement_t) == 0 &&
+               MSF_REC_ALIGN % _Alignof(moq_msf_track_ext_t) == 0,
+               "records packed after a list stay aligned");
+
+static bool align_up(size_t n, size_t *out)
+{
+    if (n > SIZE_MAX - (MSF_REC_ALIGN - 1)) return false;
+    *out = (n + MSF_REC_ALIGN - 1) / MSF_REC_ALIGN * MSF_REC_ALIGN;
+    return true;
+}
+
+/* A clone's or update's extension list: the target's entries, with each
+ * kind the op track carries folded, field by field, into a fresh record
+ * (the kind's merge), or appended. The merged list and records live in one
+ * allocation the caller keeps until the effective catalog is encoded
+ * (*block, *block_size). Spans and arrays stay borrowed from the catalogs
+ * they came from. */
 static moq_result_t clone_merge_ext(const moq_alloc_t *alloc,
                                     moq_msf_track_t *eff,
                                     const moq_msf_track_t *c,
+                                    moq_msf_revision_t rev,
                                     void **block, size_t *block_size)
 {
     *block = NULL;
@@ -1356,44 +1798,52 @@ static moq_result_t clone_merge_ext(const moq_alloc_t *alloc,
             if (c->extensions[i].kind == c->extensions[j].kind)
                 return MOQ_ERR_INVAL;
     if (pn > SIZE_MAX / 2 || cn > SIZE_MAX / 2) return MOQ_ERR_NOMEM;
-    size_t list_bytes;
+    size_t list_bytes, off;
     if (!moq_msf_checked_array_bytes(pn + cn, sizeof(moq_msf_track_ext_t),
-                                     &list_bytes))
+                                     &list_bytes) ||
+        !align_up(list_bytes, &off))
         return MOQ_ERR_NOMEM;
-    size_t off = (list_bytes + _Alignof(moq_msf_mpeg2ts_t) - 1) /
-                 _Alignof(moq_msf_mpeg2ts_t) * _Alignof(moq_msf_mpeg2ts_t);
-    if (off > SIZE_MAX - sizeof(moq_msf_mpeg2ts_t)) return MOQ_ERR_NOMEM;
-    size_t bytes = off + sizeof(moq_msf_mpeg2ts_t);
+    size_t bytes = off;
+    for (size_t j = 0; j < cn; j++) {
+        const msf_ext_kind_ops_t *k = moq_msf_ext_kind_ops(c->extensions[j].kind);
+        size_t rs;
+        if (!k) return MOQ_ERR_INVAL;
+        if (!align_up(k->record_size, &rs) || rs > SIZE_MAX - bytes)
+            return MOQ_ERR_NOMEM;
+        bytes += rs;
+    }
     uint8_t *mem = (uint8_t *)alloc->alloc(bytes, alloc->ctx);
     if (!mem) return MOQ_ERR_NOMEM;
     moq_msf_track_ext_t *list = (moq_msf_track_ext_t *)(void *)mem;
-    moq_msf_mpeg2ts_t *rec = (moq_msf_mpeg2ts_t *)(void *)(mem + off);
-    size_t k = 0;
-    for (size_t i = 0; i < pn; i++) list[k++] = eff->extensions[i];
+    size_t k_n = 0;
+    for (size_t i = 0; i < pn; i++) list[k_n++] = eff->extensions[i];
     for (size_t j = 0; j < cn; j++) {
         const moq_msf_track_ext_t *ce = &c->extensions[j];
-        size_t at = k;
-        for (size_t i = 0; i < k; i++)
+        const msf_ext_kind_ops_t *k = moq_msf_ext_kind_ops(ce->kind);
+        void *rec = mem + off;
+        size_t rs;
+        (void)align_up(k->record_size, &rs);
+        off += rs;
+        size_t at = k_n;
+        for (size_t i = 0; i < k_n; i++)
             if (list[i].kind == ce->kind) { at = i; break; }
-        moq_msf_track_ext_t ne = *ce;
-        if (ce->kind == MOQ_MSF_EXT_MPEG2TS && ce->u.mpeg2ts &&
-            ce->u.mpeg2ts->struct_size >= MSF_TS_V0) {
-            moq_msf_mpeg2ts_init(rec);
-            const moq_msf_mpeg2ts_t *pm = at < k ? list[at].u.mpeg2ts : NULL;
-            if (pm && pm->struct_size >= MSF_TS_V0) {
-                size_t n = pm->struct_size < sizeof(*rec) ? pm->struct_size
-                                                          : sizeof(*rec);
-                memcpy(rec, pm, n);
-                rec->struct_size = sizeof(*rec);
+        k->init(rec);
+        const void *inherited = at < k_n ? moq_msf_ext_record(&list[at]) : NULL;
+        if (inherited) {
+            uint32_t isz;
+            memcpy(&isz, inherited, sizeof(isz));
+            if (isz >= k->v0_size) {
+                memcpy(rec, inherited, isz < k->record_size ? isz : k->record_size);
+                uint32_t stamp = (uint32_t)k->record_size;
+                memcpy(rec, &stamp, sizeof(stamp));
             }
-            ts_merge_clone(rec, ce->u.mpeg2ts);
-            ne.u.mpeg2ts = rec;
         }
-        list[at] = ne;
-        if (at == k) k++;
+        k->merge(rec, moq_msf_ext_record(ce), rev);
+        ext_entry_set(&list[at], ce->kind, rec);
+        if (at == k_n) k_n++;
     }
     eff->extensions = list;
-    eff->extension_count = k;
+    eff->extension_count = k_n;
     *block = mem;
     *block_size = bytes;
     return MOQ_OK;
@@ -1405,240 +1855,204 @@ static moq_result_t catalog_encode_impl(const moq_alloc_t *alloc,
                                         const moq_msf_catalog_t *cat,
                                         moq_rcbuf_t **out_json, bool strict_cp);
 
-/* ------------------------------------------------------------------------- *
- * Identity index: an open-addressing hash set (linear probing, tombstones)
- * mapping a track's Namespace|Name identity to its slot in a track array.
- * apply_delta_ex drives every lookup through it so the per-op cost is O(1)
- * amortized instead of a per-op linear scan (O(n)) -- the whole apply is
- * O(base + delta) rather than O(n^2). validate_identities reuses it for O(n)
- * duplicate detection over the track array.
- *
- * Slots hold a track index (>= 0), NIDX_EMPTY, or NIDX_TOMB (a removed entry
- * whose probe chain must stay intact). Load factor is kept <= 0.5.            */
+/* -- Caller storage ------------------------------------------------------
+ * What a public caller building a catalog by hand can get wrong and a parse
+ * never produces: a span that claims bytes with no buffer, an array that
+ * claims entries with none, an extension entry without a usable record.
+ * apply refuses these as MOQ_ERR_INVAL before it judges anything, so that
+ * whatever the effective catalog then fails is the peer's (MOQ_ERR_PROTO). */
 
-#if defined(MOQ_MSF_TESTING)
-/* Test-only compare counter (not MOQ_API; absent from the shipped library,
- * which never defines MOQ_MSF_TESTING). Proves the indexed lookup does O(n),
- * not O(n^2), identity compares -- see tests/test_msf_scaling.c. */
-size_t moq_msf_test_identity_compares = 0;
-#endif
+static bool span_ok(moq_bytes_t b) { return b.len == 0 || b.data != NULL; }
 
-#define NIDX_EMPTY  ((long)-1)
-#define NIDX_TOMB   ((long)-2)
-
-typedef struct {
-    long   *slot;   /* cap entries */
-    size_t  cap;    /* power of two */
-    size_t  mask;   /* cap - 1 */
-} ns_index_t;
-
-static uint64_t ident_hash(bool has_ns, moq_bytes_t ns, moq_bytes_t name)
+static bool spans_ok(const moq_bytes_t *v, size_t n)
 {
-    uint64_t h = 1469598103934665603ULL;          /* FNV-1a offset basis */
-    uint8_t nb = has_ns ? 1u : 0u;
-    h ^= nb; h *= 1099511628211ULL;
-    for (size_t i = 0; i < name.len; i++) {
-        h ^= (uint8_t)name.data[i]; h *= 1099511628211ULL;
-    }
-    if (has_ns)
-        for (size_t i = 0; i < ns.len; i++) {
-            h ^= (uint8_t)ns.data[i]; h *= 1099511628211ULL;
-        }
-    return h;
-}
-
-/* Full Namespace|Name identity equality. Per MSF §5.2.2 an omitted namespace is
- * catalog-namespace inheritance, NOT a wildcard: this layer cannot resolve the
- * catalog namespace, so a name-only reference (has_ns false) matches only tracks
- * that ALSO omit a namespace, never an arbitrary explicit-namespace track (the
- * two identity classes never collide, as track_tuple_eq already enforces on the
- * authoring path). */
-static bool ident_eq_track(bool has_ns, moq_bytes_t ns, moq_bytes_t name,
-                           const moq_msf_track_t *t)
-{
-#if defined(MOQ_MSF_TESTING)
-    moq_msf_test_identity_compares++;
-#endif
-    if (t->name.len != name.len ||
-        (name.len && memcmp(t->name.data, name.data, name.len) != 0))
-        return false;
-    if (has_ns != t->has_namespace) return false;
-    if (has_ns &&
-        (t->namespace_.len != ns.len ||
-         (ns.len && memcmp(t->namespace_.data, ns.data, ns.len) != 0)))
-        return false;
+    if (n > 0 && !v) return false;
+    for (size_t i = 0; i < n; i++)
+        if (!span_ok(v[i])) return false;
     return true;
 }
 
-static moq_result_t ns_index_init(ns_index_t *ix, size_t nslots,
-                                  const moq_alloc_t *alloc)
+/* The extension list: a known kind at most once, each with a record of at
+ * least its first published size. */
+static bool ext_list_ok(const moq_msf_track_t *t)
 {
-    size_t cap = 8;
-    /* cap >= 2 * nslots, power of two, wrap-guarded. */
-    while (cap < nslots || (cap >> 1) < nslots) {
-        if (cap > (SIZE_MAX >> 1)) return MOQ_ERR_NOMEM;
-        cap <<= 1;
+    if (t->extension_count > 0 && !t->extensions) return false;
+    for (size_t i = 0; i < t->extension_count; i++) {
+        const moq_msf_track_ext_t *e = &t->extensions[i];
+        const msf_ext_kind_ops_t *k = moq_msf_ext_kind_ops(e->kind);
+        const void *rec = moq_msf_ext_record(e);
+        if (!k || !rec) return false;
+        uint32_t size;
+        memcpy(&size, rec, sizeof(size));
+        if (size < k->v0_size || !k->storage_ok(rec)) return false;
+        for (size_t j = i + 1; j < t->extension_count; j++)
+            if (t->extensions[j].kind == e->kind) return false;
     }
-    size_t bytes;
-    if (!moq_msf_checked_array_bytes(cap, sizeof(long), &bytes))
-        return MOQ_ERR_NOMEM;
-    ix->slot = (long *)alloc->alloc(bytes, alloc->ctx);
-    if (!ix->slot) return MOQ_ERR_NOMEM;
-    for (size_t i = 0; i < cap; i++) ix->slot[i] = NIDX_EMPTY;
-    ix->cap = cap; ix->mask = cap - 1;
+    return true;
+}
+
+static bool track_storage_ok(const moq_msf_track_t *t)
+{
+    if (!span_ok(t->name) || !span_ok(t->packaging)) return false;
+#define OPT_SPAN(has, f) if (t->has && !span_ok(t->f)) return false
+    OPT_SPAN(has_namespace, namespace_);
+    OPT_SPAN(has_role, role);
+    OPT_SPAN(has_codec, codec);
+    OPT_SPAN(has_init_data, init_data);
+    OPT_SPAN(has_init_track, init_track);
+    OPT_SPAN(has_channel_config, channel_config);
+    OPT_SPAN(has_lang, lang);
+    OPT_SPAN(has_label, label);
+    OPT_SPAN(has_init_ref, init_ref);
+    OPT_SPAN(has_event_type, event_type);
+    OPT_SPAN(has_mime_type, mime_type);
+    OPT_SPAN(has_parent_name, parent_name);
+    OPT_SPAN(has_parent_namespace, parent_namespace);
+#undef OPT_SPAN
+    if (!spans_ok(t->depends, t->depends_count)) return false;
+    if (!spans_ok(t->cp_ref_ids, t->cp_ref_id_count)) return false;
+    return ext_list_ok(t);
+}
+
+static bool tracks_storage_ok(const moq_msf_track_t *t, size_t n)
+{
+    if (n > 0 && !t) return false;
+    for (size_t i = 0; i < n; i++)
+        if (!track_storage_ok(&t[i])) return false;
+    return true;
+}
+
+static bool url_storage_ok(const moq_cmsf_url_t *u)
+{
+    return !u->present || (span_ok(u->url) && (!u->has_type || span_ok(u->type)));
+}
+
+/* An independent base: its tracks, publish tracks, initDataList and
+ * contentProtections, and the version form the effective catalog keeps. */
+static bool base_storage_ok(const moq_msf_catalog_t *c)
+{
+    if (moq_msf_catalog_revision_of(c) == MOQ_MSF_REVISION_01 &&
+        catalog_has_version_form(c) &&
+        c->version_form != MOQ_MSF_VERSION_FORM_NUMERAL &&
+        c->version_form != MOQ_MSF_VERSION_FORM_DRAFT_NAME)
+        return false;
+    if (!tracks_storage_ok(c->tracks, c->track_count)) return false;
+    for (size_t i = 0; i < c->track_count; i++)
+        if (!track_identity_ok(&c->tracks[i])) return false;
+    const moq_msf_track_t *pt;
+    size_t pn = moq_msf_publish_tracks_of(c, &pt);
+    if (!tracks_storage_ok(pt, pn)) return false;
+    if (c->init_data_count > 0 && !c->init_data_list) return false;
+    for (size_t i = 0; i < c->init_data_count; i++) {
+        const moq_msf_init_data_entry_t *e = &c->init_data_list[i];
+        if (!span_ok(e->id) || !span_ok(e->type) || !span_ok(e->data))
+            return false;
+    }
+    if (c->content_protection_count > 0 && !c->content_protections) return false;
+    for (size_t i = 0; i < c->content_protection_count; i++) {
+        const moq_cmsf_content_protection_t *cp = &c->content_protections[i];
+        const moq_cmsf_drm_system_t *ds = &cp->drm_system;
+        if (!span_ok(cp->ref_id) || !span_ok(cp->scheme) ||
+            !spans_ok(cp->default_kids, cp->default_kid_count) ||
+            !span_ok(ds->system_id) || !url_storage_ok(&ds->la_url) ||
+            !url_storage_ok(&ds->cert_url) || !url_storage_ok(&ds->auth_url) ||
+            (ds->has_pssh && !span_ok(ds->pssh)) ||
+            (ds->has_robustness && !span_ok(ds->robustness)))
+            return false;
+    }
+    return true;
+}
+
+/* -- Validate cfg ---------------------------------------------------------- */
+
+_Static_assert(MOQ_MSF_VALIDATE_CFG_V0_SIZE == sizeof(moq_msf_validate_cfg_t),
+               "the validate cfg's first published layout is the whole struct");
+
+void moq_msf_validate_cfg_init_sized(moq_msf_validate_cfg_t *cfg,
+                                     size_t cfg_size)
+{
+    if (!cfg || cfg_size < sizeof(uint32_t)) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    memset(cfg, 0, n);
+    uint32_t stamp = (uint32_t)n;
+    memcpy(cfg, &stamp, sizeof(stamp));
+}
+
+/* Read a caller's cfg through its own extent into a local of this build's
+ * layout. NULL is the default. A catalog namespace must be a valid MOQT
+ * namespace: up to 32 fields, each non-empty. */
+moq_result_t moq_msf_read_validate_cfg(const moq_msf_validate_cfg_t *cfg,
+                                       moq_msf_validate_cfg_t *local)
+{
+    memset(local, 0, sizeof(*local));
+    local->struct_size = sizeof(*local);
+    if (!cfg) return MOQ_OK;
+    uint32_t size;
+    memcpy(&size, cfg, sizeof(size));
+    if (size < MOQ_MSF_VALIDATE_CFG_V0_SIZE) return MOQ_ERR_INVAL;
+    memcpy(local, cfg, MOQ_MSF_VALIDATE_CFG_V0_SIZE);
+    local->struct_size = sizeof(*local);
+    const moq_namespace_t *ns = &local->catalog_namespace;
+    if (ns->count > MOQ_MSF_NAMESPACE_MAX_FIELDS) return MOQ_ERR_INVAL;
+    if (ns->count > 0 && !ns->parts) return MOQ_ERR_INVAL;
+    for (size_t i = 0; i < ns->count; i++)
+        if (ns->parts[i].len == 0 || !ns->parts[i].data) return MOQ_ERR_INVAL;
     return MOQ_OK;
 }
 
-static void ns_index_free(ns_index_t *ix, const moq_alloc_t *alloc)
+/* -- Apply ------------------------------------------------------------------- */
+
+typedef struct apply_in {
+    size_t          lim_ops;      /* 0 = no limit */
+    size_t          lim_tracks;   /* 0 = no limit */
+    moq_namespace_t catalog_ns;   /* count 0 = unknown */
+    bool            legacy;       /* the MSF-01 entry points */
+} apply_in_t;
+
+/* MSF-02 5.3: a delta carries generatedAt and no other root field. A parsed
+ * delta is judged by what its JSON held, whatever the values; its public
+ * fields, and those of a caller-built delta, must be empty too. */
+static bool delta_roots_ok_r02(const moq_msf_catalog_t *delta)
 {
-    if (ix->slot) alloc->free(ix->slot, ix->cap * sizeof(long), alloc->ctx);
-    ix->slot = NULL; ix->cap = 0;
+    if (!delta->has_generated_at) return false;
+    const msf_dom_hdr_t *h = moq_msf_dom_hdr(delta);
+    if (h && (h->root_keys & ~(uint32_t)(MSF_ROOT_GENERATED_AT |
+                                         MSF_ROOT_DELTA_UPDATE)) != 0)
+        return false;
+    const moq_msf_track_t *pt;
+    return delta->track_count == 0 && !delta->is_complete &&
+           delta->init_data_count == 0 && delta->content_protection_count == 0 &&
+           moq_msf_publish_tracks_of(delta, &pt) == 0;
 }
 
-/* Live track index for `identity`, resolving stored slots against `tracks`;
- * or -1 if absent (tombstones are skipped, EMPTY ends the probe). */
-static long ns_index_find(const ns_index_t *ix, const moq_msf_track_t *tracks,
-                          bool has_ns, moq_bytes_t ns, moq_bytes_t name)
+/* The work of apply; *out is written only by the final parse. */
+static moq_result_t apply_run(const moq_alloc_t *alloc,
+                              const moq_msf_catalog_t *base,
+                              const moq_msf_catalog_t *delta,
+                              const apply_in_t *in,
+                              moq_msf_catalog_t *out, size_t out_size)
 {
-    uint64_t h = ident_hash(has_ns, ns, name);
-    size_t i = (size_t)h & ix->mask;
-    for (size_t p = 0; p <= ix->mask; p++) {
-        long s = ix->slot[i];
-        if (s == NIDX_EMPTY) return -1;
-        if (s >= 0 && ident_eq_track(has_ns, ns, name, &tracks[s])) return s;
-        i = (i + 1) & ix->mask;
-    }
-    return -1;
-}
-
-/* Insert track index `ti` (identity read from tracks[ti]). The caller must
- * have confirmed the identity is absent (via ns_index_find) first. */
-static void ns_index_insert(ns_index_t *ix, const moq_msf_track_t *tracks,
-                            long ti)
-{
-    const moq_msf_track_t *t = &tracks[ti];
-    uint64_t h = ident_hash(t->has_namespace, t->namespace_, t->name);
-    size_t i = (size_t)h & ix->mask;
-    for (size_t p = 0; p <= ix->mask; p++) {
-        long s = ix->slot[i];
-        if (s == NIDX_EMPTY || s == NIDX_TOMB) { ix->slot[i] = ti; return; }
-        i = (i + 1) & ix->mask;
-    }
-    /* Unreachable: load factor <= 0.5 guarantees a free slot. */
-}
-
-static void ns_index_remove(ns_index_t *ix, const moq_msf_track_t *tracks,
-                            bool has_ns, moq_bytes_t ns, moq_bytes_t name)
-{
-    uint64_t h = ident_hash(has_ns, ns, name);
-    size_t i = (size_t)h & ix->mask;
-    for (size_t p = 0; p <= ix->mask; p++) {
-        long s = ix->slot[i];
-        if (s == NIDX_EMPTY) return;
-        if (s >= 0 && ident_eq_track(has_ns, ns, name, &tracks[s])) {
-            ix->slot[i] = NIDX_TOMB; return;
-        }
-        i = (i + 1) & ix->mask;
-    }
-}
-
-/* ------------------------------------------------------------------------- *
- * Byte-span index: the same open-addressing set keyed on a single byte span,
- * for the initDataList-id and contentProtection-refID uniqueness checks in
- * validate_identities. Both arrays are peer-controlled with no numeric cap
- * (only the upstream object byte cap), so their uniqueness check must be O(n),
- * not O(n^2). Keys are borrowed and valid for the validate call. An empty slot
- * is marked by len == SIZE_MAX (no real key uses it), so a zero-length key is
- * still storable. */
-typedef struct { moq_bytes_t *key; size_t cap; size_t mask; } bs_index_t;
-
-static uint64_t bs_hash(moq_bytes_t k)
-{
-    uint64_t h = 1469598103934665603ULL;
-    for (size_t i = 0; i < k.len; i++) { h ^= (uint8_t)k.data[i]; h *= 1099511628211ULL; }
-    return h;
-}
-
-static moq_result_t bs_index_init(bs_index_t *ix, size_t nslots,
-                                  const moq_alloc_t *alloc)
-{
-    size_t cap = 8;
-    while (cap < nslots || (cap >> 1) < nslots) {
-        if (cap > (SIZE_MAX >> 1)) return MOQ_ERR_NOMEM;
-        cap <<= 1;
-    }
-    size_t bytes;
-    if (!moq_msf_checked_array_bytes(cap, sizeof(moq_bytes_t), &bytes))
-        return MOQ_ERR_NOMEM;
-    ix->key = (moq_bytes_t *)alloc->alloc(bytes, alloc->ctx);
-    if (!ix->key) return MOQ_ERR_NOMEM;
-    for (size_t i = 0; i < cap; i++) { ix->key[i].data = NULL; ix->key[i].len = SIZE_MAX; }
-    ix->cap = cap; ix->mask = cap - 1;
-    return MOQ_OK;
-}
-
-static void bs_index_free(bs_index_t *ix, const moq_alloc_t *alloc)
-{
-    if (ix->key) alloc->free(ix->key, ix->cap * sizeof(moq_bytes_t), alloc->ctx);
-    ix->key = NULL; ix->cap = 0;
-}
-
-/* Insert k if absent; return true if k was already present (a duplicate). */
-static bool bs_index_add_dup(bs_index_t *ix, moq_bytes_t k)
-{
-    uint64_t h = bs_hash(k);
-    size_t i = (size_t)h & ix->mask;
-    for (size_t p = 0; p <= ix->mask; p++) {
-        moq_bytes_t *s = &ix->key[i];
-        if (s->len == SIZE_MAX) { *s = k; return false; }   /* empty -> insert */
-#if defined(MOQ_MSF_TESTING)
-        moq_msf_test_identity_compares++;
-#endif
-        if (s->len == k.len &&
-            (k.len == 0 || (s->data && k.data &&
-                            memcmp(s->data, k.data, k.len) == 0)))
-            return true;
-        i = (i + 1) & ix->mask;
-    }
-    return false;   /* unreachable: load factor <= 0.5 */
-}
-
-moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
-                                            const moq_msf_catalog_t *base,
-                                            const moq_msf_catalog_t *delta,
-                                            const moq_msf_apply_limits_t *limits,
-                                            moq_msf_catalog_t *out)
-{
-    if (!alloc || !base || !delta || !out) return MOQ_ERR_INVAL;
+    if (moq_msf_extent_of(base->struct_size) == MSF_EXTENT_PARTIAL ||
+        moq_msf_extent_of(delta->struct_size) == MSF_EXTENT_PARTIAL)
+        return MOQ_ERR_INVAL;
     if (base->delta_update) return MOQ_ERR_INVAL;     /* base must be independent */
     if (!delta->delta_update) return MOQ_ERR_INVAL;   /* delta must be a delta */
+    moq_msf_revision_t rev = moq_msf_catalog_revision_of(base);
+    if (rev != MOQ_MSF_REVISION_01 && rev != MOQ_MSF_REVISION_02)
+        return MOQ_ERR_INVAL;
+    /* Never downgrade an MSF-02 catalog into the MSF-01 extent. */
+    if (rev == MOQ_MSF_REVISION_02 &&
+        (in->legacy || moq_msf_extent_of(out_size) != MSF_EXTENT_FULL))
+        return MOQ_ERR_INVAL;
     /* MSF 5.1.3: isComplete is terminal -- a complete catalog commits that no
      * tracks or content will follow, so applying any delta to it is a protocol
      * error (and would otherwise drop the MUST-NOT-be-removed isComplete). */
     if (base->is_complete) return MOQ_ERR_PROTO;
-    /* Public callers can hand-build a catalog: reject a nonzero count with a
-     * NULL array, and any identity span that would fault or collide with the
-     * index sentinel, before any dereference / hash. */
-    if (base->track_count > 0 && !base->tracks) return MOQ_ERR_INVAL;
-    for (size_t i = 0; i < base->track_count; i++)
-        if (!track_identity_ok(&base->tracks[i])) return MOQ_ERR_INVAL;
-    memset(out, 0, sizeof(*out));
-
-    /* ABI-safe limits read: a field is honored only if the caller's struct is
-     * large enough to carry it (a zero field is "no limit"). */
-    size_t lim_ops = 0, lim_tracks = 0;
-    if (limits) {
-        if (limits->struct_size >=
-            offsetof(moq_msf_apply_limits_t, max_delta_ops) + sizeof(size_t))
-            lim_ops = limits->max_delta_ops;
-        if (limits->struct_size >=
-            offsetof(moq_msf_apply_limits_t, max_effective_tracks) + sizeof(size_t))
-            lim_tracks = limits->max_effective_tracks;
-    }
+    if (!base_storage_ok(base)) return MOQ_ERR_INVAL;
 
     /* Cap-before-apply: refuse an over-large delta before allocating the
      * effective catalog, building the index, or scanning any identity. */
-    if (lim_ops && delta->delta_update_count > lim_ops)
+    if (in->lim_ops && delta->delta_update_count > in->lim_ops)
         return MOQ_ERR_PROTO;
 
     /* Capacity = base tracks + every add/clone track (removes only shrink).
@@ -1649,41 +2063,97 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
     for (size_t i = 0; i < delta->delta_update_count; i++) {
         const moq_msf_delta_op_t *op = &delta->delta_update[i];
         if (op->track_count > 0 && !op->tracks) return MOQ_ERR_INVAL;
-        if (op->op == MOQ_MSF_DELTA_OP_CLONE) clones += op->track_count;
-        /* Per-op-track identity spans are validated in the apply loop below --
-         * after the overflow guards, so a lying (huge) track_count is rejected
-         * as NOMEM before anything iterates it. */
+        if (op->op != MOQ_MSF_DELTA_OP_ADD && op->op != MOQ_MSF_DELTA_OP_REMOVE &&
+            op->op != MOQ_MSF_DELTA_OP_CLONE && op->op != MOQ_MSF_DELTA_OP_UPDATE)
+            return MOQ_ERR_INVAL;
+        /* clone and update merge extension lists: one block per track. */
+        if (op->op == MOQ_MSF_DELTA_OP_CLONE || op->op == MOQ_MSF_DELTA_OP_UPDATE) {
+            if (op->track_count > SIZE_MAX - clones) return MOQ_ERR_NOMEM;
+            clones += op->track_count;
+        }
         if (op->op == MOQ_MSF_DELTA_OP_ADD || op->op == MOQ_MSF_DELTA_OP_CLONE) {
             if (op->track_count > SIZE_MAX - cap)
                 return MOQ_ERR_NOMEM;
             cap += op->track_count;
         }
     }
-    if (lim_tracks && cap > lim_tracks)
+    if (in->lim_tracks && cap > in->lim_tracks)
         return MOQ_ERR_PROTO;
+    size_t eff_bytes = 0, merged_bytes = 0;
+    if (!moq_msf_checked_array_bytes(cap, sizeof(moq_msf_track_t), &eff_bytes) ||
+        !moq_msf_checked_array_bytes(clones, sizeof(msf_tmp_block_t),
+                                     &merged_bytes))
+        return MOQ_ERR_NOMEM;
+    /* Per-op-track storage, after the wrap guards above: a lying track_count
+     * is refused as NOMEM before anything iterates it. */
+    for (size_t i = 0; i < delta->delta_update_count; i++) {
+        const moq_msf_delta_op_t *op = &delta->delta_update[i];
+        for (size_t j = 0; j < op->track_count; j++)
+            if (!track_storage_ok(&op->tracks[j])) return MOQ_ERR_INVAL;
+    }
+
+    if (rev == MOQ_MSF_REVISION_02 && !delta_roots_ok_r02(delta))
+        return MOQ_ERR_PROTO;
+    /* MSF-01 has no "update" op and no Number "depends" entries (MSF-02
+     * 5.1.6, 5.2.15). The other MSF-02-only supplement fields an op carries
+     * are dropped by the MSF-01 re-encode, as an MSF-01 parse ignores those
+     * keys. MSF-02: an "add" track carries packaging and isLive (5.2.4.1). */
+    for (size_t i = 0; i < delta->delta_update_count; i++) {
+        const moq_msf_delta_op_t *op = &delta->delta_update[i];
+        if (rev == MOQ_MSF_REVISION_01 && op->op == MOQ_MSF_DELTA_OP_UPDATE)
+            return MOQ_ERR_PROTO;
+        if (rev == MOQ_MSF_REVISION_02 && op->op == MOQ_MSF_DELTA_OP_ADD)
+            for (size_t j = 0; j < op->track_count; j++)
+                if (!op->tracks[j].has_packaging || !op->tracks[j].has_is_live)
+                    return MOQ_ERR_PROTO;
+    }
+    if (rev == MOQ_MSF_REVISION_01) {
+        for (size_t i = 0; i < delta->delta_update_count; i++) {
+            const moq_msf_delta_op_t *op = &delta->delta_update[i];
+            for (size_t j = 0; j < op->track_count; j++) {
+                const moq_msf_track_supplement_t *sp =
+                    moq_msf_supplement_of(&op->tracks[j]);
+                if (sp && sp->depends_render_group_count > 0)
+                    return MOQ_ERR_PROTO;
+            }
+        }
+    } else {
+        /* MSF-02: op tracks follow the naming rules (5.2.2, 5.2.3, 11.2),
+         * including the naming keys the parse found malformed. */
+        for (size_t i = 0; i < delta->delta_update_count; i++) {
+            const moq_msf_delta_op_t *op = &delta->delta_update[i];
+            for (size_t j = 0; j < op->track_count; j++) {
+                const moq_msf_track_t *ot = &op->tracks[j];
+                const moq_msf_track_supplement_t *sp = moq_msf_supplement_of(ot);
+                if ((sp && sp->malformed) ||
+                    !track_naming_ok_r02(ot, op->op != MOQ_MSF_DELTA_OP_UPDATE,
+                                         false))
+                    return MOQ_ERR_PROTO;
+            }
+        }
+    }
 
     moq_msf_track_t *eff = NULL;
     uint8_t         *removed = NULL;
-    size_t eff_bytes = 0, rem_bytes = 0;
+    size_t rem_bytes = 0;
     /* Merged extension lists of clone tracks, kept until the encode. */
     msf_tmp_block_t *merged = NULL;
-    size_t merged_bytes = 0, merged_n = 0;
+    size_t merged_n = 0;
     if (clones > 0) {
-        if (!moq_msf_checked_array_bytes(clones, sizeof(msf_tmp_block_t),
-                                         &merged_bytes))
-            return MOQ_ERR_NOMEM;
         merged = (msf_tmp_block_t *)alloc->alloc(merged_bytes, alloc->ctx);
         if (!merged) return MOQ_ERR_NOMEM;
     }
-    ns_index_t ix = { NULL, 0, 0 };
+    /* MSF-02 compares Full Track Names by namespace fields, a track without
+     * "namespace" inheriting the catalog's (5.2.2, 11.2.2). */
+    msf_ident_mode_t mode = { .fields = rev == MOQ_MSF_REVISION_02,
+                              .catalog_ns = in->catalog_ns };
+    msf_index_t ix = { NULL, 0, 0, mode };
     if (cap > 0) {
         moq_result_t arc = MOQ_ERR_NOMEM;
-        if (!moq_msf_checked_array_bytes(cap, sizeof(moq_msf_track_t),
-                                         &eff_bytes) ||
-            !(eff = (moq_msf_track_t *)alloc->alloc(eff_bytes, alloc->ctx)) ||
+        if (!(eff = (moq_msf_track_t *)alloc->alloc(eff_bytes, alloc->ctx)) ||
             !moq_msf_checked_array_bytes(cap, sizeof(uint8_t), &rem_bytes) ||
             !(removed = (uint8_t *)alloc->alloc(rem_bytes, alloc->ctx)) ||
-            (arc = ns_index_init(&ix, cap, alloc)) < 0) {
+            (arc = moq_msf_index_init(&ix, cap, &mode, alloc)) < 0) {
             if (removed) alloc->free(removed, rem_bytes, alloc->ctx);
             if (eff) alloc->free(eff, eff_bytes, alloc->ctx);
             if (merged) alloc->free(merged, merged_bytes, alloc->ctx);
@@ -1695,7 +2165,7 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
     size_t n = 0;
     for (size_t i = 0; i < base->track_count; i++) {
         eff[n] = base->tracks[i];
-        ns_index_insert(&ix, eff, (long)n);
+        moq_msf_index_insert(&ix, eff, (long)n);
         n++;
     }
 
@@ -1706,7 +2176,8 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
             const moq_msf_track_t *ot = &op->tracks[j];
             /* Reject a NULL/sentinel identity span before it is hashed. */
             if (!track_identity_ok(ot) ||
-                (op->op == MOQ_MSF_DELTA_OP_CLONE &&
+                ((op->op == MOQ_MSF_DELTA_OP_CLONE ||
+                  op->op == MOQ_MSF_DELTA_OP_UPDATE) &&
                  (!ident_span_ok(ot->parent_name) ||
                   (ot->has_parent_namespace &&
                    !ident_span_ok(ot->parent_namespace))))) {
@@ -1715,36 +2186,50 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
             if (op->op == MOQ_MSF_DELTA_OP_ADD) {
                 /* 5.1.6/5.3: add declares a NEW tuple -- a collision is a bad
                  * delta (the tuple is immutable once declared). */
-                if (ns_index_find(&ix, eff, ot->has_namespace,
+                if (moq_msf_index_find(&ix, eff, ot->has_namespace,
                                   ot->namespace_, ot->name) >= 0) {
                     rc = MOQ_ERR_PROTO; break;
                 }
                 eff[n] = *ot; removed[n] = 0;
-                ns_index_insert(&ix, eff, (long)n); n++;
+                moq_msf_index_insert(&ix, eff, (long)n); n++;
             } else if (op->op == MOQ_MSF_DELTA_OP_REMOVE) {
-                long idx = ns_index_find(&ix, eff, ot->has_namespace,
+                long idx = moq_msf_index_find(&ix, eff, ot->has_namespace,
                                          ot->namespace_, ot->name);
                 if (idx < 0) { rc = MOQ_ERR_PROTO; break; }  /* not declared */
                 removed[idx] = 1;
-                ns_index_remove(&ix, eff, ot->has_namespace,
+                moq_msf_index_remove(&ix, eff, ot->has_namespace,
                                 ot->namespace_, ot->name);
+            } else if (op->op == MOQ_MSF_DELTA_OP_UPDATE) {
+                /* MSF-02: change the target in place; its Full Track Name, and
+                 * so its index entry and position, stay. */
+                long idx = moq_msf_index_find(&ix, eff, ot->has_parent_namespace,
+                                              ot->parent_namespace, ot->parent_name);
+                if (idx < 0) { rc = MOQ_ERR_PROTO; break; }  /* unknown track */
+                moq_msf_track_t e = eff[(size_t)idx];
+                if (!update_allowed(&mode, &e, ot)) { rc = MOQ_ERR_PROTO; break; }
+                apply_field_overrides(&e, ot, rev, false);
+                msf_tmp_block_t *mb = &merged[merged_n];
+                rc = clone_merge_ext(alloc, &e, ot, rev, &mb->p, &mb->n);
+                if (rc < 0) break;
+                if (mb->p) merged_n++;
+                eff[(size_t)idx] = e;
             } else { /* CLONE */
-                long idx = ns_index_find(&ix, eff, ot->has_parent_namespace,
+                long idx = moq_msf_index_find(&ix, eff, ot->has_parent_namespace,
                                          ot->parent_namespace, ot->parent_name);
                 if (idx < 0) { rc = MOQ_ERR_PROTO; break; }  /* parent absent */
                 moq_msf_track_t e = eff[(size_t)idx];
-                apply_clone_overrides(&e, ot);
+                apply_clone_overrides(&e, ot, rev);
                 msf_tmp_block_t *mb = &merged[merged_n];
-                rc = clone_merge_ext(alloc, &e, ot, &mb->p, &mb->n);
+                rc = clone_merge_ext(alloc, &e, ot, rev, &mb->p, &mb->n);
                 if (rc < 0) break;
                 if (mb->p) merged_n++;
                 /* The cloned tuple MUST be new. */
-                if (ns_index_find(&ix, eff, e.has_namespace,
+                if (moq_msf_index_find(&ix, eff, e.has_namespace,
                                   e.namespace_, e.name) >= 0) {
                     rc = MOQ_ERR_PROTO; break;
                 }
                 eff[n] = e; removed[n] = 0;
-                ns_index_insert(&ix, eff, (long)n); n++;
+                moq_msf_index_insert(&ix, eff, (long)n); n++;
             }
         }
     }
@@ -1755,7 +2240,7 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
         for (size_t i = 0; i < n; i++)
             if (!removed[i]) eff[live++] = eff[i];
 
-    ns_index_free(&ix, alloc);
+    moq_msf_index_free(&ix, alloc);
     if (removed) alloc->free(removed, rem_bytes, alloc->ctx);
 
     moq_rcbuf_t *json = NULL;
@@ -1764,8 +2249,13 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
         memset(&mid, 0, sizeof(mid));
         mid.struct_size = sizeof(mid);
         mid.version = MOQ_MSF_VERSION;
-        /* The applied catalog keeps the base's version spelling. */
+        /* The applied catalog keeps the base's revision, version spelling and
+         * publish tracks. */
+        mid.revision = rev;
         mid.version_form = catalog_version_form(base);
+        const moq_msf_track_t *pt;
+        mid.publish_track_count = moq_msf_publish_tracks_of(base, &pt);
+        mid.publish_tracks = (moq_msf_track_t *)(uintptr_t)pt;
         mid.tracks = eff;
         mid.track_count = live;
         if (delta->has_generated_at) {
@@ -1780,8 +2270,10 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
         /* Receive path: re-encode the (leniently-parsed) base CP as-is so an
          * inbound catalog with non-CMSF-strict contentProtection still applies
          * its delta. Authoring strictness is enforced only via the public
-         * moq_msf_catalog_encode. */
+         * moq_msf_catalog_encode. Caller storage was checked above, so a
+         * catalog this encode refuses is the peer's error. */
         rc = catalog_encode_impl(alloc, &mid, &json, /*strict_cp=*/false);
+        if (rc == MOQ_ERR_INVAL) rc = MOQ_ERR_PROTO;
     }
 
     for (size_t i = 0; i < merged_n; i++)
@@ -1791,9 +2283,73 @@ moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
     if (rc < 0) return rc;
 
     moq_bytes_t jb = { moq_rcbuf_data(json), moq_rcbuf_len(json) };
-    rc = moq_msf_catalog_parse(alloc, jb, out);
+    rc = parse_impl(alloc, jb, out, out_size);
     moq_rcbuf_decref(json);
+    /* MSF-02 5.3: the catalog every op leaves must be valid, with names
+     * compared under the catalog namespace the caller gave. */
+    if (rc == MOQ_OK && rev == MOQ_MSF_REVISION_02) {
+        moq_msf_validate_cfg_t vc;
+        moq_msf_validate_cfg_init(&vc);
+        vc.catalog_namespace = in->catalog_ns;
+        rc = moq_msf_catalog_check(alloc, out, &vc, NULL);
+        if (rc == MOQ_ERR_INVAL) rc = MOQ_ERR_PROTO;
+        if (rc < 0) moq_msf_catalog_cleanup(alloc, out);
+    }
     return rc;
+}
+
+/* Every apply entry point: refuse what cannot be written, run, and leave
+ * *out zeroed and stamped on any later error. */
+static moq_result_t apply_impl(const moq_alloc_t *alloc,
+                               const moq_msf_catalog_t *base,
+                               const moq_msf_catalog_t *delta,
+                               const moq_msf_validate_cfg_t *cfg,
+                               apply_in_t *in,
+                               moq_msf_catalog_t *out, size_t out_size)
+{
+    if (!alloc || !base || !delta || !out) return MOQ_ERR_INVAL;
+    msf_extent_t ox = moq_msf_extent_of(out_size);
+    if (ox == MSF_EXTENT_SHORT || ox == MSF_EXTENT_PARTIAL) return MOQ_ERR_INVAL;
+    size_t on = out_size < sizeof(*out) ? out_size : sizeof(*out);
+    moq_msf_validate_cfg_t c;
+    moq_result_t rc = moq_msf_read_validate_cfg(cfg, &c);
+    if (rc == MOQ_OK) {
+        if (cfg) {
+            in->lim_ops = c.max_delta_ops;
+            in->lim_tracks = c.max_effective_tracks;
+            in->catalog_ns = c.catalog_namespace;
+        }
+        rc = apply_run(alloc, base, delta, in, out, out_size);
+    }
+    if (rc < 0) {
+        moq_msf_catalog_t z;
+        memset(&z, 0, sizeof(z));
+        z.struct_size = (uint32_t)on;
+        memcpy(out, &z, on);
+    }
+    return rc;
+}
+
+moq_result_t moq_msf_catalog_apply_delta_ex(const moq_alloc_t *alloc,
+                                            const moq_msf_catalog_t *base,
+                                            const moq_msf_catalog_t *delta,
+                                            const moq_msf_apply_limits_t *limits,
+                                            moq_msf_catalog_t *out)
+{
+    /* ABI-safe limits read: a field is honored only if the caller's struct is
+     * large enough to carry it (a zero field is "no limit"). */
+    apply_in_t in = { .lim_ops = 0, .lim_tracks = 0,
+                      .catalog_ns = { NULL, 0 }, .legacy = true };
+    if (limits) {
+        if (limits->struct_size >=
+            offsetof(moq_msf_apply_limits_t, max_delta_ops) + sizeof(size_t))
+            in.lim_ops = limits->max_delta_ops;
+        if (limits->struct_size >=
+            offsetof(moq_msf_apply_limits_t, max_effective_tracks) + sizeof(size_t))
+            in.lim_tracks = limits->max_effective_tracks;
+    }
+    return apply_impl(alloc, base, delta, NULL, &in, out,
+                      MOQ_MSF_CATALOG_SIZE_THROUGH_VERSION_FORM);
 }
 
 moq_result_t moq_msf_catalog_apply_delta(const moq_alloc_t *alloc,
@@ -1805,78 +2361,16 @@ moq_result_t moq_msf_catalog_apply_delta(const moq_alloc_t *alloc,
     return moq_msf_catalog_apply_delta_ex(alloc, base, delta, NULL, out);
 }
 
-moq_result_t moq_msf_catalog_validate_identities(const moq_alloc_t *alloc,
-                                                 const moq_msf_catalog_t *cat)
+moq_result_t moq_msf_catalog_apply_delta_sized(const moq_alloc_t *alloc,
+                                               const moq_msf_catalog_t *base,
+                                               const moq_msf_catalog_t *delta,
+                                               const moq_msf_validate_cfg_t *cfg,
+                                               moq_msf_catalog_t *out,
+                                               size_t out_size)
 {
-    if (!alloc || !cat) return MOQ_ERR_INVAL;
-    if (cat->delta_update) return MOQ_ERR_INVAL;   /* independent catalogs only */
-    /* Public callers can hand-build a catalog: a nonzero count with a NULL
-     * array is invalid input, rejected before any dereference. */
-    if (cat->track_count > 0 && !cat->tracks) return MOQ_ERR_INVAL;
-    if (cat->init_data_count > 0 && !cat->init_data_list) return MOQ_ERR_INVAL;
-    if (cat->content_protection_count > 0 && !cat->content_protections)
-        return MOQ_ERR_INVAL;
-
-    /* §5.2.3: Namespace|Name tuples are unique within the catalog. O(n) via the
-     * identity index (the peer-controlled, potentially large, vector). */
-    if (cat->track_count > 0) {
-        ns_index_t ix = { NULL, 0, 0 };
-        moq_result_t rc = ns_index_init(&ix, cat->track_count, alloc);
-        if (rc < 0) return rc;
-        for (size_t i = 0; i < cat->track_count; i++) {
-            const moq_msf_track_t *t = &cat->tracks[i];
-            if (!track_identity_ok(t)) {               /* NULL / sentinel span */
-                ns_index_free(&ix, alloc);
-                return MOQ_ERR_INVAL;
-            }
-            if (ns_index_find(&ix, cat->tracks, t->has_namespace,
-                              t->namespace_, t->name) >= 0) {
-                ns_index_free(&ix, alloc);
-                return MOQ_ERR_PROTO;                  /* duplicate tuple */
-            }
-            ns_index_insert(&ix, cat->tracks, (long)i);
-        }
-        ns_index_free(&ix, alloc);
-    }
-
-    /* §5.1.7: initDataList ids are unique. O(n) via the byte-span index -- the
-     * array is peer-controlled with no numeric cap, so it cannot be an O(n^2)
-     * scan. */
-    if (cat->init_data_count > 0) {
-        bs_index_t bx = { NULL, 0, 0 };
-        moq_result_t rc = bs_index_init(&bx, cat->init_data_count, alloc);
-        if (rc < 0) return rc;
-        for (size_t i = 0; i < cat->init_data_count; i++) {
-            if (!ident_span_ok(cat->init_data_list[i].id)) {
-                bs_index_free(&bx, alloc);
-                return MOQ_ERR_INVAL;
-            }
-            if (bs_index_add_dup(&bx, cat->init_data_list[i].id)) {
-                bs_index_free(&bx, alloc);
-                return MOQ_ERR_PROTO;
-            }
-        }
-        bs_index_free(&bx, alloc);
-    }
-
-    /* CMSF §4.1.1.1: contentProtection refIDs are unique. O(n), same reason. */
-    if (cat->content_protection_count > 0) {
-        bs_index_t bx = { NULL, 0, 0 };
-        moq_result_t rc = bs_index_init(&bx, cat->content_protection_count, alloc);
-        if (rc < 0) return rc;
-        for (size_t i = 0; i < cat->content_protection_count; i++) {
-            if (!ident_span_ok(cat->content_protections[i].ref_id)) {
-                bs_index_free(&bx, alloc);
-                return MOQ_ERR_INVAL;
-            }
-            if (bs_index_add_dup(&bx, cat->content_protections[i].ref_id)) {
-                bs_index_free(&bx, alloc);
-                return MOQ_ERR_PROTO;
-            }
-        }
-        bs_index_free(&bx, alloc);
-    }
-    return MOQ_OK;
+    apply_in_t in = { .lim_ops = 0, .lim_tracks = 0,
+                      .catalog_ns = { NULL, 0 }, .legacy = false };
+    return apply_impl(alloc, base, delta, cfg, &in, out, out_size);
 }
 
 const moq_msf_track_t *moq_msf_catalog_find_role(
@@ -1923,7 +2417,7 @@ const moq_cmsf_content_protection_t *moq_msf_catalog_find_content_protection(
 
 /* -- Encoder --------------------------------------------------------- */
 
-typedef struct {
+typedef struct msf_enc_buf {
     uint8_t *buf;
     size_t   cap;
     size_t   pos;
@@ -2067,19 +2561,6 @@ static bool bytes_eq(moq_bytes_t a, moq_bytes_t b)
     if (a.len != b.len) return false;
     if (a.len == 0) return true;
     return a.data && b.data && memcmp(a.data, b.data, a.len) == 0;
-}
-
-/* MSF §5.2.3 identity of a track within a catalog: a name is unique *per
- * namespace*, so two tracks collide only when both name and namespace match.
- * A track with no namespace and one with a namespace are in different
- * namespaces and never collide on name alone. */
-static bool track_tuple_eq(const moq_msf_track_t *x, const moq_msf_track_t *y)
-{
-    if (!bytes_eq(x->name, y->name)) return false;
-    if (x->has_namespace != y->has_namespace) return false;
-    if (x->has_namespace && !bytes_eq(x->namespace_, y->namespace_))
-        return false;
-    return true;
 }
 
 static bool bytes_eq_lit(moq_bytes_t v, const char *lit)
@@ -2271,6 +2752,13 @@ moq_result_t moq_msf_track_mpeg2ts_init_data(const moq_alloc_t *alloc,
                          out_packets, reason);
 }
 
+/* How many entries a track's "depends" holds. */
+static size_t track_depends_count(const moq_msf_track_t *t)
+{
+    const moq_msf_track_supplement_t *sp = moq_msf_supplement_of(t);
+    return t->depends_count + (sp ? sp->depends_render_group_count : 0);
+}
+
 /* Validate the optional (has_*-gated) track spans and arrays. Shared by full
  * track validation and clone-op track validation. */
 static moq_result_t validate_track_optionals(const moq_msf_track_t *t)
@@ -2301,25 +2789,9 @@ static moq_result_t validate_track_optionals(const moq_msf_track_t *t)
         if (!validate_bytes(t->cp_ref_ids[i]) || t->cp_ref_ids[i].len == 0)
             return MOQ_ERR_INVAL;
 
-    /* The extension list: a known kind at most once, with a sized record. */
-    if (t->extension_count > 0 && !t->extensions) return MOQ_ERR_INVAL;
-    for (size_t i = 0; i < t->extension_count; i++) {
-        const moq_msf_track_ext_t *e = &t->extensions[i];
-        if (e->kind != MOQ_MSF_EXT_MPEG2TS) return MOQ_ERR_INVAL;
-        if (!e->u.mpeg2ts || e->u.mpeg2ts->struct_size < MSF_TS_V0)
-            return MOQ_ERR_INVAL;
-        for (size_t j = i + 1; j < t->extension_count; j++)
-            if (t->extensions[j].kind == e->kind) return MOQ_ERR_INVAL;
-    }
-    const moq_msf_mpeg2ts_t *m = track_ts(t);
-    if (m) {
-        if (m->has_si_pids && m->si_pid_count > 0 && !m->si_pids)
-            return MOQ_ERR_INVAL;
-        if (m->has_mode && !validate_bytes(m->mode_name)) return MOQ_ERR_INVAL;
-        if (m->has_timestamp_mode && !validate_bytes(m->timestamp_mode_name))
-            return MOQ_ERR_INVAL;
-    }
-
+    /* The extension list: a known kind at most once, with a sized record
+     * whose own storage is coherent. */
+    if (!ext_list_ok(t)) return MOQ_ERR_INVAL;
     return MOQ_OK;
 }
 
@@ -2370,7 +2842,8 @@ static bool ts_overrides_ok(const moq_msf_track_t *t, const moq_msf_mpeg2ts_t *m
     return true;
 }
 
-static moq_result_t validate_track(const moq_msf_track_t *t, bool strict)
+static moq_result_t validate_track(const moq_msf_track_t *t, bool strict,
+                                   moq_msf_revision_t rev)
 {
     if (!validate_bytes(t->name) || t->name.len == 0) return MOQ_ERR_INVAL;
     if (!validate_bytes(t->packaging) || t->packaging.len == 0) return MOQ_ERR_INVAL;
@@ -2378,19 +2851,23 @@ static moq_result_t validate_track(const moq_msf_track_t *t, bool strict)
     moq_result_t rc = validate_track_optionals(t);
     if (rc < 0) return rc;
 
-    /* draft-gregoire-moq-msfts: authoring applies the subscriber's track
-     * check, refuses an unrecognized timestamp mode, and keeps mpeg2ts keys
-     * off other packagings. The receive-path re-encode keeps what a peer
-     * sent. */
-    const moq_msf_mpeg2ts_t *m = track_ts(t);
-    if (strict) {
-        if (bytes_eq_lit(t->packaging, "mpeg2ts")) {
-            if (!m || ts_check(t, m, NULL) != MOQ_OK || !ts_mode_authorable(m))
-                return MOQ_ERR_INVAL;
-        } else if (m) {                  /* the kind belongs to "mpeg2ts" */
-            return MOQ_ERR_INVAL;
-        }
+    /* Each record judged by its kind: strictly when authoring, and by the
+     * receive path's rules on apply's re-encode. */
+    for (size_t i = 0; i < t->extension_count; i++) {
+        const moq_msf_track_ext_t *e = &t->extensions[i];
+        rc = moq_msf_ext_kind_ops(e->kind)->validate(moq_msf_ext_record(e), t,
+                                                     strict, rev);
+        if (rc < 0) return rc;
     }
+    /* draft-gregoire-moq-msfts: an authored mpeg2ts track carries its record
+     * (Mode and Packet Size are required). */
+    if (strict && bytes_eq_lit(t->packaging, "mpeg2ts") && !track_ts(t))
+        return MOQ_ERR_INVAL;
+    /* MSF-02 authoring: names map to bytes and namespaces split (11.2), and
+     * the fields its (packaging, role) requires are present (5.2.4.1). */
+    if (strict && rev == MOQ_MSF_REVISION_02 &&
+        (!track_naming_ok_r02(t, true, true) || !moq_msf_required_fields_ok(t)))
+        return MOQ_ERR_INVAL;
 
     /* MSF 5.2.35: trackDuration MUST NOT be present on a live track. */
     if (t->has_track_duration && t->is_live) return MOQ_ERR_INVAL;
@@ -2401,23 +2878,26 @@ static moq_result_t validate_track(const moq_msf_track_t *t, bool strict)
         (!t->has_event_type || t->event_type.len == 0)) return MOQ_ERR_INVAL;
     if (!is_event_timeline && t->has_event_type) return MOQ_ERR_INVAL;
 
-    /* MSF §8.2: an eventtimeline track MUST carry mimeType "application/json"
-     * and a non-empty depends list (the tracks it applies to). mimeType and
+    /* MSF-01 §8.2: an eventtimeline track MUST carry mimeType
+     * "application/json" and a non-empty depends list (the tracks it applies
+     * to). MSF-02 8.3 asks only for eventType, checked above. mimeType and
      * depends stay optional, free-form metadata for other packaging types. */
-    if (is_event_timeline) {
+    if (is_event_timeline && rev == MOQ_MSF_REVISION_01) {
         if (!t->has_mime_type ||
             !bytes_eq_lit(t->mime_type, "application/json")) return MOQ_ERR_INVAL;
         if (t->depends_count == 0) return MOQ_ERR_INVAL;
     }
 
-    /* MSF §7.2: an explicit media timeline track (packaging "mediatimeline")
-     * MUST carry mimeType "application/json" and a non-empty depends list
-     * naming the tracks it applies to. (eventType is already forbidden above
-     * for any non-eventtimeline packaging.) */
+    /* §7.2: an explicit media timeline track (packaging "mediatimeline") MUST
+     * carry a non-empty depends list naming what it applies to, in both
+     * revisions; MSF-01 also requires mimeType "application/json". (eventType
+     * is already forbidden above for any non-eventtimeline packaging.) */
     if (bytes_eq_lit(t->packaging, "mediatimeline")) {
-        if (!t->has_mime_type ||
-            !bytes_eq_lit(t->mime_type, "application/json")) return MOQ_ERR_INVAL;
-        if (t->depends_count == 0) return MOQ_ERR_INVAL;
+        if (rev == MOQ_MSF_REVISION_01 &&
+            (!t->has_mime_type ||
+             !bytes_eq_lit(t->mime_type, "application/json")))
+            return MOQ_ERR_INVAL;
+        if (track_depends_count(t) == 0) return MOQ_ERR_INVAL;
     }
 
     return MOQ_OK;
@@ -2428,9 +2908,19 @@ static moq_result_t validate_track(const moq_msf_track_t *t, bool strict)
  * track carries parentName + a new name + optional overrides. */
 static moq_result_t validate_delta_track(moq_msf_delta_op_kind_t op,
                                          const moq_msf_track_t *t,
-                                         bool strict)
+                                         bool strict, moq_msf_revision_t rev)
 {
-    if (!validate_bytes(t->name) || t->name.len == 0) return MOQ_ERR_INVAL;
+    /* An update names its target by parentName; its name may be absent. */
+    if (!validate_bytes(t->name) ||
+        (t->name.len == 0 && op != MOQ_MSF_DELTA_OP_UPDATE))
+        return MOQ_ERR_INVAL;
+    if (!ext_list_ok(t)) return MOQ_ERR_INVAL;
+    const moq_msf_track_supplement_t *sp = moq_msf_supplement_of(t);
+    if (sp && moq_msf_supplement_validate(sp, t, strict, rev) < 0)
+        return MOQ_ERR_INVAL;
+    if (strict && rev == MOQ_MSF_REVISION_02 &&
+        !track_naming_ok_r02(t, op != MOQ_MSF_DELTA_OP_UPDATE, true))
+        return MOQ_ERR_INVAL;
     const moq_msf_mpeg2ts_t *m = track_ts(t);
     bool has_ts = m != NULL;
     if (op == MOQ_MSF_DELTA_OP_ADD) {
@@ -2441,6 +2931,10 @@ static moq_result_t validate_delta_track(moq_msf_delta_op_kind_t op,
             return MOQ_ERR_INVAL;
         moq_result_t rc = validate_track_optionals(t);
         if (rc < 0) return rc;
+        /* MSF-02 authoring: an added track is a whole track (5.2.4.1). */
+        if (strict && rev == MOQ_MSF_REVISION_02 && t->has_packaging &&
+            !moq_msf_required_fields_ok(t))
+            return MOQ_ERR_INVAL;
         /* Authoring: mpeg2ts fields make a whole mpeg2ts track. */
         if (strict && has_ts &&
             (!t->has_packaging || !bytes_eq_lit(t->packaging, "mpeg2ts") ||
@@ -2457,7 +2951,7 @@ static moq_result_t validate_delta_track(moq_msf_delta_op_kind_t op,
         if (t->has_namespace && !validate_bytes(t->namespace_)) return MOQ_ERR_INVAL;
         return MOQ_OK;
     }
-    /* CLONE */
+    /* CLONE, UPDATE */
     if (!t->has_parent_name || !validate_bytes(t->parent_name) ||
         t->parent_name.len == 0) return MOQ_ERR_INVAL;
     if (t->has_parent_namespace && !validate_bytes(t->parent_namespace))
@@ -2606,9 +3100,308 @@ static void enc_track_mpeg2ts(enc_buf_t *b, const moq_msf_mpeg2ts_t *m, bool *f)
 #undef MPEG2TS_BAD
 }
 
+/* -- Extension kinds ---------------------------------------------------------
+ * The rows of moq_msf_ext_kinds: how each record kind is parsed, merged,
+ * judged, emitted, released and compared. */
+
+static void ts_init(void *rec)
+{
+    moq_msf_mpeg2ts_init_sized((moq_msf_mpeg2ts_t *)rec, sizeof(moq_msf_mpeg2ts_t));
+}
+
+static bool ts_key_known(const json_string_t *name, unsigned caps)
+{
+    (void)caps;   /* both extents and both revisions */
+    return name->string_size > 7 && memcmp(name->string, "mpeg2ts", 7) == 0 &&
+           mpeg2ts_key_known(name);
+}
+
+static moq_result_t ts_parse_key(const moq_alloc_t *alloc,
+                                 const json_object_element_t *e, void *rec)
+{
+    moq_result_t rc = MOQ_OK;
+    (void)parse_mpeg2ts_key(alloc, e, (moq_msf_mpeg2ts_t *)rec, &rc);
+    return rc;
+}
+
+static void ts_merge(void *dst, const void *o, moq_msf_revision_t rev)
+{
+    (void)rev;
+    ts_merge_clone((moq_msf_mpeg2ts_t *)dst, (const moq_msf_mpeg2ts_t *)o);
+}
+
+static bool ts_storage_ok(const void *rec)
+{
+    const moq_msf_mpeg2ts_t *m = (const moq_msf_mpeg2ts_t *)rec;
+    if (m->has_si_pids && m->si_pid_count > 0 && !m->si_pids) return false;
+    if (m->has_mode && !validate_bytes(m->mode_name)) return false;
+    if (m->has_timestamp_mode && !validate_bytes(m->timestamp_mode_name))
+        return false;
+    return true;
+}
+
+/* draft-gregoire-moq-msfts: authoring applies the subscriber's track check,
+ * refuses an unrecognized timestamp mode, and keeps mpeg2ts keys off other
+ * packagings. The receive-path re-encode keeps what a peer sent. */
+static moq_result_t ts_validate(const void *rec, const moq_msf_track_t *t,
+                                bool strict, moq_msf_revision_t rev)
+{
+    (void)rev;
+    if (!strict) return MOQ_OK;
+    const moq_msf_mpeg2ts_t *m = (const moq_msf_mpeg2ts_t *)rec;
+    if (!bytes_eq_lit(t->packaging, "mpeg2ts")) return MOQ_ERR_INVAL;
+    if (ts_check(t, m, NULL) != MOQ_OK || !ts_mode_authorable(m))
+        return MOQ_ERR_INVAL;
+    return MOQ_OK;
+}
+
+static void ts_encode(enc_buf_t *b, const void *rec, moq_msf_revision_t rev,
+                      bool *f)
+{
+    (void)rev;
+    enc_track_mpeg2ts(b, (const moq_msf_mpeg2ts_t *)rec, f);
+}
+
+static void ts_free_owned(const moq_alloc_t *alloc, void *rec)
+{
+    moq_msf_mpeg2ts_t *m = (moq_msf_mpeg2ts_t *)rec;
+    if (m->si_pids)
+        alloc->free(m->si_pids, m->si_pid_count * sizeof(uint32_t), alloc->ctx);
+    m->si_pids = NULL;
+    m->si_pid_count = 0;
+}
+
+/* Semantic equality: values, malformed bits, and the names an unrecognized
+ * enum value was spelled with. */
+static bool ts_equal(const void *pa, const void *pb)
+{
+    const moq_msf_mpeg2ts_t *a = (const moq_msf_mpeg2ts_t *)pa;
+    const moq_msf_mpeg2ts_t *b = (const moq_msf_mpeg2ts_t *)pb;
+    if (!a || !b) return a == b;
+    if (a->malformed != b->malformed) return false;
+#define TS_FIELD(f) \
+    if (a->has_##f != b->has_##f || (a->has_##f && a->f != b->f)) return false
+    TS_FIELD(mode);
+    TS_FIELD(packet_size);
+    TS_FIELD(es_pid);
+    TS_FIELD(program_number);
+    TS_FIELD(pcr_pid);
+    TS_FIELD(mux_rate);
+    TS_FIELD(random_access);
+    TS_FIELD(timestamp_mode);
+    TS_FIELD(scte35_pid);
+#undef TS_FIELD
+    if (a->has_mode && a->mode == MOQ_MSF_MPEG2TS_MODE_UNRECOGNIZED &&
+        !bytes_eq(a->mode_name, b->mode_name))
+        return false;
+    if (a->has_timestamp_mode &&
+        a->timestamp_mode == MOQ_MSF_MPEG2TS_TIMESTAMP_UNRECOGNIZED &&
+        !bytes_eq(a->timestamp_mode_name, b->timestamp_mode_name))
+        return false;
+    if (a->has_si_pids != b->has_si_pids) return false;
+    if (a->has_si_pids) {
+        if (a->si_pid_count != b->si_pid_count) return false;
+        for (size_t i = 0; i < a->si_pid_count; i++)
+            if (a->si_pids[i] != b->si_pids[i]) return false;
+    }
+    return true;
+}
+
+static bool ts_is_empty(const void *rec)
+{
+    const moq_msf_mpeg2ts_t *m = (const moq_msf_mpeg2ts_t *)rec;
+    return !m->has_mode && !m->has_packet_size && !m->has_es_pid &&
+           !m->has_program_number && !m->has_pcr_pid && !m->has_mux_rate &&
+           !m->has_si_pids && !m->has_random_access && !m->has_timestamp_mode &&
+           !m->has_scte35_pid && !m->malformed;
+}
+
+static void supp_init(void *rec)
+{
+    moq_msf_track_supplement_init_sized((moq_msf_track_supplement_t *)rec,
+                                        sizeof(moq_msf_track_supplement_t));
+}
+
+/* The supplement's own keys. The encryption keys are MSF-01 and MSF-02
+ * fields alike; the rest are MSF-02 vocabulary. A parse into the MSF-01
+ * extent reads none of them. ("depends" Numbers and the malformed bits come
+ * from the "depends" and naming keys.) */
+static bool supp_key_known(const json_string_t *name, unsigned caps)
+{
+    if (!(caps & MSF_CAP_FULL)) return false;
+    if (str_eq(name, "encryptionScheme") || str_eq(name, "cipherSuite") ||
+        str_eq(name, "keyId") || str_eq(name, "trackBaseKey"))
+        return true;
+    if (!(caps & MSF_CAP_R02)) return false;
+    return str_eq(name, "packagingMetadata") || str_eq(name, "keyframeSpacing") ||
+           str_eq(name, "accessibleWindowTime");
+}
+
+/* A lenient read: a value of the wrong JSON type, or a number that is not a
+ * non-negative integer, is absent. */
+static void supp_span(const json_object_element_t *e, bool *has, moq_bytes_t *v)
+{
+    *has = get_string(e, v);
+    if (!*has) *v = (moq_bytes_t){ NULL, 0 };
+}
+
+static void supp_u64(const json_object_element_t *e, bool *has, uint64_t *v)
+{
+    *has = get_u64(e, v);
+    if (!*has) *v = 0;
+}
+
+static moq_result_t supp_parse_key(const moq_alloc_t *alloc,
+                                   const json_object_element_t *e, void *rec)
+{
+    (void)alloc;
+    moq_msf_track_supplement_t *s = (moq_msf_track_supplement_t *)rec;
+    if (str_eq(e->name, "encryptionScheme"))
+        supp_span(e, &s->has_encryption_scheme, &s->encryption_scheme);
+    else if (str_eq(e->name, "cipherSuite"))
+        supp_span(e, &s->has_cipher_suite, &s->cipher_suite);
+    else if (str_eq(e->name, "keyId"))
+        supp_span(e, &s->has_key_id, &s->key_id);
+    else if (str_eq(e->name, "trackBaseKey"))
+        supp_span(e, &s->has_track_base_key, &s->track_base_key);
+    else if (str_eq(e->name, "packagingMetadata"))
+        supp_span(e, &s->has_packaging_metadata, &s->packaging_metadata);
+    else if (str_eq(e->name, "keyframeSpacing"))
+        supp_u64(e, &s->has_keyframe_spacing, &s->keyframe_spacing);
+    else if (str_eq(e->name, "accessibleWindowTime"))
+        supp_u64(e, &s->has_accessible_window_ms, &s->accessible_window_ms);
+    return MOQ_OK;
+}
+
+static void supp_merge(void *dst, const void *o, moq_msf_revision_t rev)
+{
+    moq_msf_supplement_merge((moq_msf_track_supplement_t *)dst,
+                             (const moq_msf_track_supplement_t *)o, rev);
+}
+
+static bool supp_storage_ok(const void *rec)
+{
+    return moq_msf_supplement_storage_ok((const moq_msf_track_supplement_t *)rec);
+}
+
+static moq_result_t supp_validate(const void *rec, const moq_msf_track_t *t,
+                                  bool strict, moq_msf_revision_t rev)
+{
+    return moq_msf_supplement_validate((const moq_msf_track_supplement_t *)rec,
+                                       t, strict, rev);
+}
+
+/* The supplement's scalar keys (its "depends" Numbers go with the String
+ * entries). An MSF-01 catalog has none of the MSF-02 keys: the receive-path
+ * re-encode drops them, authoring has refused them. */
+static void supp_encode(enc_buf_t *b, const void *rec, moq_msf_revision_t rev,
+                        bool *f)
+{
+    const moq_msf_track_supplement_t *s = (const moq_msf_track_supplement_t *)rec;
+    if (rev == MOQ_MSF_REVISION_02) {
+        if (s->has_packaging_metadata) {
+            enc_comma(b, f);
+            enc_key_string(b, "packagingMetadata", s->packaging_metadata);
+        }
+        if (s->has_keyframe_spacing) {
+            enc_comma(b, f);
+            enc_key_u64(b, "keyframeSpacing", s->keyframe_spacing);
+        }
+        if (s->has_accessible_window_ms) {
+            enc_comma(b, f);
+            enc_key_u64(b, "accessibleWindowTime", s->accessible_window_ms);
+        }
+    }
+    if (s->has_encryption_scheme) {
+        enc_comma(b, f);
+        enc_key_string(b, "encryptionScheme", s->encryption_scheme);
+    }
+    if (s->has_cipher_suite) {
+        enc_comma(b, f);
+        enc_key_string(b, "cipherSuite", s->cipher_suite);
+    }
+    if (s->has_key_id) {
+        enc_comma(b, f);
+        enc_key_string(b, "keyId", s->key_id);
+    }
+    if (s->has_track_base_key) {
+        enc_comma(b, f);
+        enc_key_string(b, "trackBaseKey", s->track_base_key);
+    }
+}
+
+static void supp_free_owned(const moq_alloc_t *alloc, void *rec)
+{
+    moq_msf_track_supplement_t *s = (moq_msf_track_supplement_t *)rec;
+    if (s->depends_render_groups)
+        alloc->free((void *)(uintptr_t)s->depends_render_groups,
+                    s->depends_render_group_count * sizeof(int), alloc->ctx);
+    s->depends_render_groups = NULL;
+    s->depends_render_group_count = 0;
+}
+
+static bool supp_equal(const void *a, const void *b)
+{
+    return moq_msf_supplement_equal((const moq_msf_track_supplement_t *)a,
+                                    (const moq_msf_track_supplement_t *)b);
+}
+
+static bool supp_is_empty(const void *rec)
+{
+    return moq_msf_supplement_is_empty((const moq_msf_track_supplement_t *)rec);
+}
+
+/* In ascending kind order; the parse block holds the records at the same
+ * rows (MSF_ROW_*). */
+const msf_ext_kind_ops_t moq_msf_ext_kinds[] = {
+    {
+        .kind = MOQ_MSF_EXT_MPEG2TS,
+        .record_size = sizeof(moq_msf_mpeg2ts_t),
+        .v0_size = MOQ_MSF_MPEG2TS_V0_SIZE,
+        .init = ts_init,
+        .key_known = ts_key_known,
+        .parse_key = ts_parse_key,
+        .merge = ts_merge,
+        .storage_ok = ts_storage_ok,
+        .validate = ts_validate,
+        .encode = ts_encode,
+        .free_owned = ts_free_owned,
+        .equal = ts_equal,
+        .is_empty = ts_is_empty,
+    },
+    {
+        .kind = MOQ_MSF_EXT_SUPPLEMENT,
+        .record_size = sizeof(moq_msf_track_supplement_t),
+        .v0_size = MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE,
+        .init = supp_init,
+        .key_known = supp_key_known,
+        .parse_key = supp_parse_key,
+        .merge = supp_merge,
+        .storage_ok = supp_storage_ok,
+        .validate = supp_validate,
+        .encode = supp_encode,
+        .free_owned = supp_free_owned,
+        .equal = supp_equal,
+        .is_empty = supp_is_empty,
+    },
+};
+const size_t moq_msf_ext_kind_count =
+    sizeof(moq_msf_ext_kinds) / sizeof(moq_msf_ext_kinds[0]);
+
+_Static_assert(sizeof(moq_msf_ext_kinds) / sizeof(moq_msf_ext_kinds[0]) ==
+               MSF_EXT_ROWS, "one parse-block record per kind");
+
+const msf_ext_kind_ops_t *moq_msf_ext_kind_ops(moq_msf_ext_kind_t kind)
+{
+    for (size_t r = 0; r < moq_msf_ext_kind_count; r++)
+        if (moq_msf_ext_kinds[r].kind == kind) return &moq_msf_ext_kinds[r];
+    return NULL;
+}
+
 /* Emit the optional (has_*-gated) track fields, managing the leading comma via
  * *f. Does NOT emit name / packaging / isLive / parent fields. */
-static void enc_track_optionals(enc_buf_t *b, const moq_msf_track_t *t, bool *f)
+static void enc_track_optionals(enc_buf_t *b, const moq_msf_track_t *t, bool *f,
+                                moq_msf_revision_t rev)
 {
     if (t->has_namespace)      { enc_comma(b, f); enc_key_string(b, "namespace", t->namespace_); }
     if (t->has_role)           { enc_comma(b, f); enc_key_string(b, "role", t->role); }
@@ -2652,13 +3445,25 @@ static void enc_track_optionals(enc_buf_t *b, const moq_msf_track_t *t, bool *f)
         enc_u64_raw(b, tpl->delta_wallclock_ms);
         enc_char(b, ']');
     }
-    if (t->depends_count > 0) {
+    /* One "depends" array: the String entries, then (MSF-02) the Number
+     * entries. An op track that carried the key emits it even when empty, so
+     * that it still clears the inherited lists. */
+    const moq_msf_track_supplement_t *sp = moq_msf_supplement_of(t);
+    size_t ngroups = sp && rev == MOQ_MSF_REVISION_02
+                         ? sp->depends_render_group_count : 0;
+    if (t->depends_count > 0 || ngroups > 0 || (sp && sp->has_depends)) {
         enc_comma(b, f);
         enc_key(b, "depends");
         enc_char(b, '[');
         for (size_t i = 0; i < t->depends_count; i++) {
             if (i > 0) enc_char(b, ',');
             enc_json_string(b, t->depends[i].data, t->depends[i].len);
+        }
+        for (size_t i = 0; i < ngroups; i++) {
+            if (i > 0 || t->depends_count > 0) enc_char(b, ',');
+            char num[16];
+            snprintf(num, sizeof(num), "%d", sp->depends_render_groups[i]);
+            enc_lit(b, num);
         }
         enc_char(b, ']');
     }
@@ -2672,11 +3477,16 @@ static void enc_track_optionals(enc_buf_t *b, const moq_msf_track_t *t, bool *f)
         }
         enc_char(b, ']');
     }
-    const moq_msf_mpeg2ts_t *m = track_ts(t);
-    if (m) enc_track_mpeg2ts(b, m, f);
+    /* Extension records, in kind order. */
+    for (size_t r = 0; r < moq_msf_ext_kind_count; r++) {
+        const moq_msf_track_ext_t *e = moq_msf_ext_find(
+            t->extensions, t->extension_count, moq_msf_ext_kinds[r].kind);
+        if (e) moq_msf_ext_kinds[r].encode(b, moq_msf_ext_record(e), rev, f);
+    }
 }
 
-static void enc_track(enc_buf_t *b, const moq_msf_track_t *t)
+static void enc_track(enc_buf_t *b, const moq_msf_track_t *t,
+                      moq_msf_revision_t rev)
 {
     enc_char(b, '{');
     bool f = true;
@@ -2684,13 +3494,13 @@ static void enc_track(enc_buf_t *b, const moq_msf_track_t *t)
     enc_comma(b, &f); enc_key_string(b, "name", t->name);
     enc_comma(b, &f); enc_key_string(b, "packaging", t->packaging);
     enc_comma(b, &f); enc_key_bool(b, "isLive", t->is_live);
-    enc_track_optionals(b, t, &f);
+    enc_track_optionals(b, t, &f, rev);
     enc_char(b, '}');
 }
 
 /* Emit a delta op track object per op kind (MSF 5.1.6). */
 static void enc_delta_op_track(enc_buf_t *b, moq_msf_delta_op_kind_t op,
-                               const moq_msf_track_t *t)
+                               const moq_msf_track_t *t, moq_msf_revision_t rev)
 {
     enc_char(b, '{');
     bool f = true;
@@ -2701,13 +3511,23 @@ static void enc_delta_op_track(enc_buf_t *b, moq_msf_delta_op_kind_t op,
         enc_char(b, '}');
         return;
     }
+    if (op == MOQ_MSF_DELTA_OP_UPDATE) {
+        enc_comma(b, &f); enc_key_string(b, "parentName", t->parent_name);
+        if (t->has_parent_namespace) { enc_comma(b, &f); enc_key_string(b, "parentNamespace", t->parent_namespace); }
+        if (t->name.len > 0) { enc_comma(b, &f); enc_key_string(b, "name", t->name); }
+        if (t->has_packaging) { enc_comma(b, &f); enc_key_string(b, "packaging", t->packaging); }
+        if (t->has_is_live)   { enc_comma(b, &f); enc_key_bool(b, "isLive", t->is_live); }
+        enc_track_optionals(b, t, &f, rev);
+        enc_char(b, '}');
+        return;
+    }
     if (op == MOQ_MSF_DELTA_OP_CLONE) {
         enc_comma(b, &f); enc_key_string(b, "parentName", t->parent_name);
         if (t->has_parent_namespace) { enc_comma(b, &f); enc_key_string(b, "parentNamespace", t->parent_namespace); }
         enc_comma(b, &f); enc_key_string(b, "name", t->name);
         if (t->has_packaging) { enc_comma(b, &f); enc_key_string(b, "packaging", t->packaging); }
         if (t->has_is_live)   { enc_comma(b, &f); enc_key_bool(b, "isLive", t->is_live); }
-        enc_track_optionals(b, t, &f);
+        enc_track_optionals(b, t, &f, rev);
         enc_char(b, '}');
         return;
     }
@@ -2716,7 +3536,7 @@ static void enc_delta_op_track(enc_buf_t *b, moq_msf_delta_op_kind_t op,
     enc_comma(b, &f); enc_key_string(b, "name", t->name);
     if (t->has_packaging) { enc_comma(b, &f); enc_key_string(b, "packaging", t->packaging); }
     if (t->has_is_live)   { enc_comma(b, &f); enc_key_bool(b, "isLive", t->is_live); }
-    enc_track_optionals(b, t, &f);
+    enc_track_optionals(b, t, &f, rev);
     enc_char(b, '}');
 }
 
@@ -2771,12 +3591,14 @@ static const char *delta_op_name(moq_msf_delta_op_kind_t op)
     case MOQ_MSF_DELTA_OP_ADD:    return "add";
     case MOQ_MSF_DELTA_OP_REMOVE: return "remove";
     case MOQ_MSF_DELTA_OP_CLONE:  return "clone";
+    case MOQ_MSF_DELTA_OP_UPDATE: return "update";
     }
     return "add";
 }
 
 static size_t enc_catalog_to(uint8_t *buf, size_t cap,
-                              const moq_msf_catalog_t *cat)
+                              const moq_msf_catalog_t *cat,
+                              moq_msf_revision_t rev)
 {
     enc_buf_t b = { buf, cap, 0, false };
 
@@ -2803,7 +3625,7 @@ static size_t enc_catalog_to(uint8_t *buf, size_t cap,
             enc_char(&b, '[');
             for (size_t j = 0; j < op->track_count; j++) {
                 if (j > 0) enc_char(&b, ',');
-                enc_delta_op_track(&b, op->op, &op->tracks[j]);
+                enc_delta_op_track(&b, op->op, &op->tracks[j], rev);
             }
             enc_char(&b, ']');
             enc_char(&b, '}');
@@ -2819,13 +3641,18 @@ static size_t enc_catalog_to(uint8_t *buf, size_t cap,
      * has emitted cross-impl (E2E case D captured fixture). A caller that
      * selects MOQ_MSF_VERSION_FORM_DRAFT_NAME gets 5.1.1's draft-name
      * convention, "draft-01". */
-    bool draft_name =
-        catalog_version_form(cat) == MOQ_MSF_VERSION_FORM_DRAFT_NAME;
-    enc_lit(&b, draft_name ? "{\"version\":\"draft-" : "{\"version\":\"");
-    { char num[8];
-      snprintf(num, sizeof(num), draft_name ? "%02d" : "%d", cat->version);
-      enc_lit(&b, num); }
-    enc_char(&b, '"');
+    if (rev == MOQ_MSF_REVISION_02) {
+        /* MSF-02 5.1.1: the one spelling, "draft-02". */
+        enc_lit(&b, "{\"version\":\"draft-02\"");
+    } else {
+        bool draft_name =
+            catalog_version_form(cat) == MOQ_MSF_VERSION_FORM_DRAFT_NAME;
+        enc_lit(&b, draft_name ? "{\"version\":\"draft-" : "{\"version\":\"");
+        { char num[8];
+          snprintf(num, sizeof(num), draft_name ? "%02d" : "%d", cat->version);
+          enc_lit(&b, num); }
+        enc_char(&b, '"');
+    }
 
     if (cat->has_generated_at) {
         enc_char(&b, ',');
@@ -2851,9 +3678,21 @@ static size_t enc_catalog_to(uint8_t *buf, size_t cap,
     enc_lit(&b, ",\"tracks\":[");
     for (size_t i = 0; i < cat->track_count; i++) {
         if (i > 0) enc_char(&b, ',');
-        enc_track(&b, &cat->tracks[i]);
+        enc_track(&b, &cat->tracks[i], rev);
     }
     enc_char(&b, ']');
+
+    /* MSF 5.1.5 publishTracks, between tracks and initDataList. */
+    const moq_msf_track_t *pt;
+    size_t pn = moq_msf_publish_tracks_of(cat, &pt);
+    if (pn > 0) {
+        enc_lit(&b, ",\"publishTracks\":[");
+        for (size_t i = 0; i < pn; i++) {
+            if (i > 0) enc_char(&b, ',');
+            enc_track(&b, &pt[i], rev);
+        }
+        enc_char(&b, ']');
+    }
 
     /* initDataList MUST follow the tracks array (MSF 5.1.7). */
     if (cat->init_data_count > 0) {
@@ -2885,6 +3724,25 @@ moq_result_t moq_msf_catalog_encode(const moq_alloc_t *alloc,
     return catalog_encode_impl(alloc, cat, out_json, /*strict_cp=*/true);
 }
 
+/* Authoring: Full Track Names are unique within one track array (MSF 5.2.3):
+ * within tracks and within publishTracks, not across them (an event timeline
+ * can be in both, MSF-02 8). */
+static bool tracks_unique(const moq_msf_track_t *t, size_t n,
+                          moq_msf_revision_t rev)
+{
+    /* MSF-02 compares namespace fields (11.2.2); with no catalog namespace
+     * an inherited name is its own class, as when authoring one. */
+    msf_ident_mode_t mode = { .fields = rev == MOQ_MSF_REVISION_02,
+                              .catalog_ns = { NULL, 0 } };
+    for (size_t i = 0; i < n; i++)
+        for (size_t j = i + 1; j < n; j++)
+            if (moq_msf_ident_eq(&mode, t[i].has_namespace, t[i].namespace_,
+                                 t[i].name, t[j].has_namespace,
+                                 t[j].namespace_, t[j].name))
+                return false;
+    return true;
+}
+
 static moq_result_t catalog_encode_impl(const moq_alloc_t *alloc,
                                         const moq_msf_catalog_t *cat,
                                         moq_rcbuf_t **out_json, bool strict_cp)
@@ -2892,40 +3750,69 @@ static moq_result_t catalog_encode_impl(const moq_alloc_t *alloc,
     if (!alloc || !cat || !out_json) return MOQ_ERR_INVAL;
     *out_json = NULL;
 
+    /* The MSF-02 block is read whole or not at all. */
+    if (moq_msf_extent_of(cat->struct_size) == MSF_EXTENT_PARTIAL)
+        return MOQ_ERR_INVAL;
+    moq_msf_revision_t rev = moq_msf_catalog_revision_of(cat);
+    if (rev != MOQ_MSF_REVISION_01 && rev != MOQ_MSF_REVISION_02)
+        return MOQ_ERR_INVAL;
+
     /* The version form is a closed authoring input: absent (a caller struct
      * that ends before it) or NUMERAL selects "1", DRAFT_NAME selects
-     * "draft-01", anything else is rejected rather than spelled as "1". */
-    if (catalog_has_version_form(cat) &&
+     * "draft-01", anything else is rejected rather than spelled as "1". An
+     * MSF-02 catalog has the one spelling and ignores the field. */
+    if (rev == MOQ_MSF_REVISION_01 && catalog_has_version_form(cat) &&
         cat->version_form != MOQ_MSF_VERSION_FORM_NUMERAL &&
         cat->version_form != MOQ_MSF_VERSION_FORM_DRAFT_NAME)
         return MOQ_ERR_INVAL;
+
+    const moq_msf_track_t *pt;
+    size_t pn = moq_msf_publish_tracks_of(cat, &pt);
 
     /* A delta catalog (MSF 5.1.6/5.3): no version/tracks; >= 1 op, each with
      * >= 1 op-validated track. */
     if (cat->delta_update) {
         if (cat->track_count > 0 || cat->delta_update_count == 0)
             return MOQ_ERR_INVAL;
-        /* MSF 5.1.3: a delta never carries completion. */
-        if (cat->is_complete) return MOQ_ERR_INVAL;
+        /* MSF 5.1.3: a delta never carries completion; MSF 5.3: nor
+         * publishTracks. */
+        if (cat->is_complete || pn > 0) return MOQ_ERR_INVAL;
+        /* MSF-02 5.3: a delta carries generatedAt and no other root field
+         * than deltaUpdate, so authoring refuses root data it would otherwise
+         * leave out, and a parsed delta's root keys however empty. MSF-01
+         * deltas keep being written without it. */
+        if (rev == MOQ_MSF_REVISION_02 &&
+            (!cat->has_generated_at || cat->init_data_count > 0 ||
+             cat->content_protection_count > 0))
+            return MOQ_ERR_INVAL;
+        const msf_dom_hdr_t *hdr = moq_msf_dom_hdr(cat);
+        if (rev == MOQ_MSF_REVISION_02 && hdr &&
+            (hdr->root_keys & ~(uint32_t)(MSF_ROOT_GENERATED_AT |
+                                          MSF_ROOT_DELTA_UPDATE)) != 0)
+            return MOQ_ERR_INVAL;
         for (size_t i = 0; i < cat->delta_update_count; i++) {
             const moq_msf_delta_op_t *op = &cat->delta_update[i];
             /* Reject an unknown op kind before encoding it (API footgun for
              * callers building a catalog directly). */
             if (op->op != MOQ_MSF_DELTA_OP_ADD &&
                 op->op != MOQ_MSF_DELTA_OP_REMOVE &&
-                op->op != MOQ_MSF_DELTA_OP_CLONE) return MOQ_ERR_INVAL;
+                op->op != MOQ_MSF_DELTA_OP_CLONE &&
+                op->op != MOQ_MSF_DELTA_OP_UPDATE) return MOQ_ERR_INVAL;
+            /* "update" is MSF-02 vocabulary. */
+            if (op->op == MOQ_MSF_DELTA_OP_UPDATE && rev != MOQ_MSF_REVISION_02)
+                return MOQ_ERR_INVAL;
             if (op->track_count == 0 || !op->tracks) return MOQ_ERR_INVAL;
             for (size_t j = 0; j < op->track_count; j++) {
                 moq_result_t rc = validate_delta_track(op->op, &op->tracks[j],
-                                                       strict_cp);
+                                                       strict_cp, rev);
                 if (rc < 0) return rc;
             }
         }
-        size_t dn = enc_catalog_to(NULL, 0, cat);
+        size_t dn = enc_catalog_to(NULL, 0, cat, rev);
         if (dn == 0) return MOQ_ERR_INVAL;
         uint8_t *dbuf = (uint8_t *)alloc->alloc(dn, alloc->ctx);
         if (!dbuf) return MOQ_ERR_NOMEM;
-        size_t dw = enc_catalog_to(dbuf, dn, cat);
+        size_t dw = enc_catalog_to(dbuf, dn, cat, rev);
         if (dw != dn) { alloc->free(dbuf, dn, alloc->ctx); return MOQ_ERR_INVAL; }
         moq_result_t rc = moq_rcbuf_create(alloc, dbuf, dn, out_json);
         alloc->free(dbuf, dn, alloc->ctx);
@@ -2934,19 +3821,34 @@ static moq_result_t catalog_encode_impl(const moq_alloc_t *alloc,
 
     if (cat->version != MOQ_MSF_VERSION) return MOQ_ERR_INVAL;
     if (cat->track_count > 0 && !cat->tracks) return MOQ_ERR_INVAL;
+    if (pn > 0 && !pt) return MOQ_ERR_INVAL;
 
     for (size_t i = 0; i < cat->track_count; i++) {
-        moq_result_t rc = validate_track(&cat->tracks[i], strict_cp);
+        moq_result_t rc = validate_track(&cat->tracks[i], strict_cp, rev);
+        if (rc < 0) return rc;
+    }
+    /* MSF 5.1.5: a publish track has the structure of a track. */
+    for (size_t i = 0; i < pn; i++) {
+        moq_result_t rc = validate_track(&pt[i], strict_cp, rev);
         if (rc < 0) return rc;
     }
     /* MSF §5.2.3: a track name is unique per namespace within the catalog.
      * Authoring only (strict_cp) -- the lenient receive re-encode preserves
      * whatever the peer sent, matching the contentProtection refID rule below. */
-    if (strict_cp)
-        for (size_t i = 0; i < cat->track_count; i++)
-            for (size_t j = i + 1; j < cat->track_count; j++)
-                if (track_tuple_eq(&cat->tracks[i], &cat->tracks[j]))
-                    return MOQ_ERR_INVAL;
+    if (strict_cp && (!tracks_unique(cat->tracks, cat->track_count, rev) ||
+                      !tracks_unique(pt, pn, rev)))
+        return MOQ_ERR_INVAL;
+    /* MSF-02 5.2.45: one accessibleWindowTime per alternate group. */
+    if (strict_cp && rev == MOQ_MSF_REVISION_02 &&
+        !moq_msf_alt_group_windows_ok(cat->tracks, cat->track_count))
+        return MOQ_ERR_INVAL;
+    /* MSF-02 authoring writes only what the inbound check accepts: unique
+     * names and resolving "depends" entries (5.2.15). */
+    if (strict_cp && rev == MOQ_MSF_REVISION_02) {
+        moq_result_t crc = moq_msf_catalog_check(alloc, cat, NULL, NULL);
+        if (crc == MOQ_ERR_NOMEM) return crc;
+        if (crc != MOQ_OK) return MOQ_ERR_INVAL;
+    }
 
     if (cat->init_data_count > 0 && !cat->init_data_list) return MOQ_ERR_INVAL;
     for (size_t i = 0; i < cat->init_data_count; i++) {
@@ -2954,6 +3856,11 @@ static moq_result_t catalog_encode_impl(const moq_alloc_t *alloc,
         if (!validate_bytes(e->id) || e->id.len == 0) return MOQ_ERR_INVAL;
         if (!validate_bytes(e->type) || e->type.len == 0) return MOQ_ERR_INVAL;
         if (!validate_bytes(e->data)) return MOQ_ERR_INVAL;
+        /* MSF-02 5.1.7 authoring: one of the three types, a property type
+         * in hex. */
+        if (strict_cp && rev == MOQ_MSF_REVISION_02 &&
+            !moq_msf_init_entry_authorable_r02(e))
+            return MOQ_ERR_INVAL;
     }
     /* MSF §5.1.7 / CMSF §3.1: each initDataList id is unique within the
      * catalog. Authoring only (strict_cp), as for track tuples above. */
@@ -2998,13 +3905,13 @@ static moq_result_t catalog_encode_impl(const moq_alloc_t *alloc,
         }
 
     /* Measure pass: buf=NULL, counts bytes needed. */
-    size_t needed = enc_catalog_to(NULL, 0, cat);
+    size_t needed = enc_catalog_to(NULL, 0, cat, rev);
     if (needed == 0) return MOQ_ERR_INVAL;
 
     uint8_t *buf = (uint8_t *)alloc->alloc(needed, alloc->ctx);
     if (!buf) return MOQ_ERR_NOMEM;
 
-    size_t written = enc_catalog_to(buf, needed, cat);
+    size_t written = enc_catalog_to(buf, needed, cat, rev);
     if (written != needed) {
         alloc->free(buf, needed, alloc->ctx);
         return MOQ_ERR_INVAL;

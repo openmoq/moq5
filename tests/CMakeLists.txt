@@ -987,6 +987,13 @@ foreach(_abi_dir sim/include media/loc/include media/object/include
 endforeach()
 add_test(NAME abi_layout_d22 COMMAND test_abi_layout_d22)
 
+# Static layout pins of the MSF catalog structs, when the catalog is built.
+if(TARGET moq-msf)
+    add_executable(test_abi_layout_msf02 unit/test_abi_layout_msf02.c)
+    target_link_libraries(test_abi_layout_msf02 PRIVATE moq::msf)
+    add_test(NAME abi_layout_msf02 COMMAND test_abi_layout_msf02)
+endif()
+
 add_executable(test_publisher_fill_layout unit/test_publisher_fill_layout.c)
 target_link_libraries(test_publisher_fill_layout PRIVATE moq::core)
 add_test(NAME publisher_fill_layout COMMAND test_publisher_fill_layout)

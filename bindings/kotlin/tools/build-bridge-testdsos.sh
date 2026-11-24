@@ -136,7 +136,9 @@ compile_sub "$repo/service/src/media_auth.c"
 # build never defines, so the recorder can feed a catalog to a receiver with
 # no peer and the REAL poll_track answers real discovery.
 MEDIA_INCLUDES="-I$repo/media/msf/include -I$repo/media/object/include -I$repo/media/loc/include -I$repo/media/cmaf/include -I$repo/media/codec_signaling/include"
-for _m in "$repo/media/msf/src/msf.c" "$repo/media/msf/src/msf_media.c" \
+for _m in "$repo/media/msf/src/msf.c" "$repo/media/msf/src/msf_check.c" \
+          "$repo/media/msf/src/msf_names.c" "$repo/media/msf/src/msf_supplement.c" \
+          "$repo/media/msf/src/msf_media.c" \
           "$repo/media/loc/src/loc.c" "$repo/media/cmaf/src/cmaf.c"; do
     compile_sub "$_m" $MEDIA_INCLUDES
 done

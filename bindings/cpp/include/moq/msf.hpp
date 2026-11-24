@@ -116,6 +116,13 @@ struct track_view {
     /// owning parsed_catalog. Every key is gated by its has_* flag. Check an
     /// mpeg2ts track with parsed_catalog::mpeg2ts_check before using it.
     const moq_msf_mpeg2ts_t *mpeg2ts = nullptr;
+
+    /// The MSF track fields moq_msf_track_t cannot hold (encryption,
+    /// MSF-02 packaging metadata, keyframe spacing, accessible window,
+    /// Number "depends" entries), read through moq_msf_track_supplement:
+    /// nullptr when the track carries none. Borrows from the owning
+    /// parsed_catalog's DOM.
+    const moq_msf_track_supplement_t *supplement = nullptr;
 };
 
 struct init_data_view {
@@ -145,11 +152,13 @@ struct content_protection_view {
     drm_system_view   drm_system;
 };
 
-/// MSF-01 5.1.6 delta operation kind. Values match moq_msf_delta_op_kind_t.
+/// 5.1.6 delta operation kind. Values match moq_msf_delta_op_kind_t;
+/// update is MSF-02 only.
 enum class delta_op_kind {
     add    = MOQ_MSF_DELTA_OP_ADD,
     remove = MOQ_MSF_DELTA_OP_REMOVE,
     clone  = MOQ_MSF_DELTA_OP_CLONE,
+    update = MOQ_MSF_DELTA_OP_UPDATE,
 };
 
 namespace detail {
@@ -236,6 +245,7 @@ inline track_view view_from(const moq_msf_track_t &t) {
     if (t.has_parent_name)      v.parent_name      = sv(t.parent_name);
     if (t.has_parent_namespace) v.parent_namespace = sv(t.parent_namespace);
     v.mpeg2ts = moq_msf_track_mpeg2ts(&t);
+    v.supplement = moq_msf_track_supplement(&t);
     return v;
 }
 
@@ -289,6 +299,10 @@ public:
 
     int version() const { return cat_.version; }
 
+    /// The catalog's MSF revision (MOQ_MSF_REVISION_01 or _02); for a delta,
+    /// the earliest revision whose vocabulary covers it.
+    moq_msf_revision_t revision() const { return cat_.revision; }
+
     std::optional<uint64_t> generated_at() const {
         if (cat_.has_generated_at) return cat_.generated_at;
         return std::nullopt;
@@ -301,6 +315,12 @@ public:
 
     track_view track(size_t i) const {
         return detail::view_from(cat_.tracks[i]);
+    }
+
+    /// MSF 5.1.5 publish tracks: tracks the subscriber may publish to.
+    size_t publish_track_count() const { return cat_.publish_track_count; }
+    track_view publish_track(size_t i) const {
+        return detail::view_from(cat_.publish_tracks[i]);
     }
 
     /// The subscriber's check of track i as an mpeg2ts track

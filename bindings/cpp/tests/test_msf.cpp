@@ -634,6 +634,38 @@ int main()
         MOQ_CHECK(enc.error().code() == moq::errc::invalid);
     }
 
+    // MSF-02: the revision, publish tracks, an update op and the supplement.
+    {
+        auto r = moq::msf::parse(moq::bytes_view(
+            R"({"version":"draft-02","tracks":[{"name":"v","packaging":"loc",)"
+            R"("isLive":true,"keyId":"k","keyframeSpacing":15}],)"
+            R"("publishTracks":[{"name":"log","packaging":"moqlog","isLive":true}]})"));
+        MOQ_CHECK(r.ok());
+        MOQ_CHECK(r->revision() == MOQ_MSF_REVISION_02);
+        MOQ_CHECK(r->publish_track_count() == 1);
+        MOQ_CHECK(r->publish_track(0).name == "log");
+        auto tv = r->track(0);
+        MOQ_CHECK(tv.supplement != nullptr);
+        if (tv.supplement) {
+            MOQ_CHECK(tv.supplement->has_keyframe_spacing &&
+                      tv.supplement->keyframe_spacing == 15);
+            MOQ_CHECK(moq::msf::detail::sv(tv.supplement->key_id) == "k");
+        }
+        MOQ_CHECK(r->publish_track(0).supplement == nullptr);
+
+        auto d = moq::msf::parse(moq::bytes_view(
+            R"({"generatedAt":1,"deltaUpdate":[{"op":"update","tracks":[)"
+            R"({"parentName":"v","bitrate":5}]}]})"));
+        MOQ_CHECK(d.ok());
+        MOQ_CHECK(d->revision() == MOQ_MSF_REVISION_02);
+        MOQ_CHECK(d->delta_op(0).kind() == moq::msf::delta_op_kind::update);
+        MOQ_CHECK(d->delta_op(0).track(0).parent_name.value_or("") == "v");
+
+        auto old = moq::msf::parse(moq::bytes_view(
+            R"({"version":"1","tracks":[]})"));
+        MOQ_CHECK(old.ok() && old->revision() == MOQ_MSF_REVISION_01);
+    }
+
     std::printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

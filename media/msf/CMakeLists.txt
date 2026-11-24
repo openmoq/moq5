@@ -1,4 +1,9 @@
-set(_MSF_SOURCES src/msf.c)
+set(_MSF_CORE_SOURCES
+    src/msf.c
+    src/msf_check.c
+    src/msf_names.c
+    src/msf_supplement.c)
+set(_MSF_SOURCES ${_MSF_CORE_SOURCES})
 if(TARGET moq::media-object AND TARGET moq::cmaf)
     list(APPEND _MSF_SOURCES src/msf_media.c)
 endif()
@@ -67,6 +72,20 @@ if(MOQ_BUILD_TESTS)
     endif()
     add_test(NAME msf COMMAND test_msf)
 
+    # The exact export set of moq-msf, in static and shared builds.
+    set(_MSF_HAS_MEDIA OFF)
+    if(TARGET moq::media-object AND TARGET moq::cmaf)
+        set(_MSF_HAS_MEDIA ON)
+    endif()
+    add_test(NAME msf_symbols COMMAND ${CMAKE_COMMAND}
+        -DNM=${CMAKE_NM} -DREADELF=${CMAKE_READELF}
+        -DELF=$<STREQUAL:${CMAKE_EXECUTABLE_FORMAT},ELF>
+        -DLIBRARY=$<TARGET_FILE:moq-msf>
+        -DSHARED=$<BOOL:${BUILD_SHARED_LIBS}>
+        -DMEDIA=${_MSF_HAS_MEDIA}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_symbols.cmake)
+    set_tests_properties(msf_symbols PROPERTIES TIMEOUT 90 LABELS "media;msf")
+
     # draft-gregoire-moq-msfts catalog fields, against the draft's examples.
     add_executable(test_msf_mpeg2ts tests/test_msf_mpeg2ts.c)
     target_link_libraries(test_msf_mpeg2ts PRIVATE moq::msf)
@@ -77,6 +96,18 @@ if(MOQ_BUILD_TESTS)
             $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
     endif()
     add_test(NAME msf_mpeg2ts COMMAND test_msf_mpeg2ts)
+
+    # draft-ietf-moq-msf-02 catalogs beside MSF-01, against the draft's
+    # examples.
+    add_executable(test_msf02 tests/test_msf02.c)
+    target_link_libraries(test_msf02 PRIVATE moq::msf)
+    target_compile_definitions(test_msf02 PRIVATE
+        MOQ_MSF_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_msf02 PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME msf02 COMMAND test_msf02)
 
     # The sized-companion cases use LOC through moq::msf's PUBLIC
     # moq::media-object dependency; do not repeat that static archive here.
@@ -90,10 +121,10 @@ if(MOQ_BUILD_TESTS)
         add_test(NAME msf_media COMMAND test_msf_media)
     endif()
 
-    # Structural O(n) proof for apply_delta identity lookups: recompile msf.c
-    # with MOQ_MSF_TESTING so the test-only compare counter is present (it is
+    # Structural O(n) proof for apply_delta identity lookups: recompile the
+    # library sources with MOQ_MSF_TESTING so the test-only compare counter is present (it is
     # absent from the shipped moq-msf library, which never defines the macro).
-    add_executable(test_msf_scaling tests/test_msf_scaling.c src/msf.c)
+    add_executable(test_msf_scaling tests/test_msf_scaling.c ${_MSF_CORE_SOURCES})
     target_compile_definitions(test_msf_scaling PRIVATE MOQ_MSF_TESTING MOQ_BUILDING)
     target_include_directories(test_msf_scaling PRIVATE include)
     target_link_libraries(test_msf_scaling PRIVATE moq::core)
@@ -104,9 +135,9 @@ if(MOQ_BUILD_TESTS)
     add_test(NAME msf_scaling COMMAND test_msf_scaling)
 
     # The checked array sizer is hidden in the shipped library, so its boundary
-    # is exercised against msf.c compiled directly, the same way as above;
+    # is exercised against the sources compiled directly, the same way as above;
     # test_msf keeps linking the real library for everything public.
-    add_executable(test_msf_checked_array tests/test_msf_checked_array.c src/msf.c)
+    add_executable(test_msf_checked_array tests/test_msf_checked_array.c ${_MSF_CORE_SOURCES})
     target_compile_definitions(test_msf_checked_array PRIVATE MOQ_BUILDING)
     target_include_directories(test_msf_checked_array PRIVATE include)
     target_link_libraries(test_msf_checked_array PRIVATE moq::core)
