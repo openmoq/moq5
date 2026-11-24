@@ -869,6 +869,25 @@ if(MOQ_BUILD_TESTS)
                 COMMAND test_media_receiver_track_options)
             set_tests_properties(media_receiver_track_options PROPERTIES TIMEOUT 30)
 
+            # Standalone FETCH of a media track: created/terminal events, the
+            # FETCH origin, cancel, withdraw, the per-track bound and session
+            # close, over a simulated pair on drafts 16, 18 and 22.
+            add_executable(test_media_receiver_fetch
+                tests/test_media_receiver_fetch.c
+                src/media_receiver_order.c)
+            target_link_libraries(test_media_receiver_fetch PRIVATE
+                moq-service-endpoint-test-internals moq::msf moq::sim)
+            target_include_directories(test_media_receiver_fetch PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                target_compile_options(test_media_receiver_fetch PRIVATE
+                    -Wall -Wextra -Wpedantic
+                    $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            endif()
+            add_test(NAME media_receiver_fetch
+                COMMAND test_media_receiver_fetch)
+            set_tests_properties(media_receiver_fetch PROPERTIES TIMEOUT 30)
+
             add_executable(test_media_receiver_ack_failure
                 tests/test_media_receiver_ack_failure.c
                 src/media_receiver_order.c)
@@ -1042,6 +1061,27 @@ if(MOQ_BUILD_TESTS)
                 endif()
                 add_test(NAME media_receiver_ts_fill COMMAND test_media_receiver_ts_fill)
                 set_tests_properties(media_receiver_ts_fill PROPERTIES TIMEOUT 30)
+
+                # Standalone fetches of an MPEG2TS track: origin, intact
+                # payloads, the live reorder window bypassed, the terminal
+                # after the Objects and the peer-gap loss summary.
+                add_executable(test_media_receiver_ts_fetch
+                    tests/test_media_receiver_ts_fetch.c
+                    src/media_receiver_order.c)
+                target_link_libraries(test_media_receiver_ts_fetch PRIVATE
+                    moq-service-endpoint-test-internals moq::msf moq::mpeg2ts)
+                target_include_directories(test_media_receiver_ts_fetch PRIVATE
+                    ${PROJECT_SOURCE_DIR}/tests/unit
+                    ${PROJECT_SOURCE_DIR}/media/mpeg2ts/tests)
+                target_compile_definitions(test_media_receiver_ts_fetch PRIVATE
+                    ${_MOQ_SERVICE_TS_DEFS})
+                if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                    target_compile_options(test_media_receiver_ts_fetch PRIVATE
+                        -Wall -Wextra -Wpedantic
+                        $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+                endif()
+                add_test(NAME media_receiver_ts_fetch COMMAND test_media_receiver_ts_fetch)
+                set_tests_properties(media_receiver_ts_fetch PROPERTIES TIMEOUT 30)
 
                 # The stream-terminal lane behind an MPEG2TS reorder window.
                 add_executable(test_media_receiver_ts_lane

@@ -123,6 +123,24 @@ _Static_assert(offsetof(moq_media_receiver_cfg_t, resource_auth) >=
                sizeof(frozen_stream_receiver_cfg_t),
                "auth overlaps the complete stream-terminal allocation");
 
+/* The complete allocation through resource_auth: the fetch bound starts at
+ * or past its sizeof, never in its tail padding. */
+typedef struct frozen_auth_receiver_cfg {
+    frozen_ts_receiver_cfg_t prefix;
+    _Alignas(uint64_t) moq_media_companion_profile_t companion_profile;
+    uint8_t reserved_companion[4];
+    uint32_t max_stream_terminals;
+    bool surface_stream_terminals;
+    uint8_t reserved_stream_terminals[3];
+    const moq_media_auth_cfg_t *resource_auth;
+} frozen_auth_receiver_cfg_t;
+_Static_assert(offsetof(moq_media_receiver_cfg_t, resource_auth) ==
+               offsetof(frozen_auth_receiver_cfg_t, resource_auth),
+               "old resource_auth moved");
+_Static_assert(offsetof(moq_media_receiver_cfg_t, max_fetches_per_track) >=
+               sizeof(frozen_auth_receiver_cfg_t),
+               "the fetch bound overlaps the complete resource_auth allocation");
+
 /* Test seams (media_receiver.c / endpoint.c, MOQ_MEDIA_RECEIVER_TESTING). */
 moq_result_t moq_media_receiver_test_construct(const moq_media_receiver_cfg_t *cfg,
                                                moq_media_receiver_t **out);
