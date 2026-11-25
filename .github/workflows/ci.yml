@@ -913,7 +913,7 @@ jobs:
           cat "$out/headers.stdout"
           cat "$out/headers.stderr" >&2
           test ! -s "$out/headers.stderr"
-          test "$(grep -c '^PASSED:' "$out/headers.stdout")" -eq 14
+          test "$(grep -c '^PASSED:' "$out/headers.stdout")" -eq 18
       - name: Retain frame measurements and controls
         if: always()
         uses: actions/upload-artifact@v6
