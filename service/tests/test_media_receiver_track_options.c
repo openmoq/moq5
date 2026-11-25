@@ -178,6 +178,11 @@ static bool start(fixture_t *f, moq_version_t version)
     f->receiver->joins_by_fill = version == MOQ_VERSION_DRAFT_22;
     moq_sub_cfg_t sub_cfg;
     moq_sub_cfg_init_sized(&sub_cfg, sizeof(sub_cfg));
+    /* The receiver's own acknowledgement hook, as receiver_hook installs it,
+     * so an UPDATE's OK ends it in flight (the raise tests send updates). */
+    moq_sub_callbacks_init(&sub_cfg.callbacks);
+    sub_cfg.callbacks.ctx = f->receiver;
+    sub_cfg.on_update_ok = receiver_on_update_ok;
     if (moq_sub_create(client, &alloc, &sub_cfg, &f->receiver->sub) != MOQ_OK)
         return false;
     moq_media_receiver_test_ingest(f->receiver, 0, 0, catalog, sizeof(catalog) - 1);
@@ -716,6 +721,144 @@ static void test_passive_forward(moq_version_t version)
                                                   : "track_options_passive_forward_d18");
 }
 
+/* Accept the SUBSCRIBE the server sees; returns whether one arrived. */
+static bool accept_subscribe(fixture_t *f)
+{
+    moq_session_t *server = moq_simpair_server(f->pair);
+    moq_simpair_run_until_quiescent(f->pair, 32, NULL);
+    moq_event_t ev;
+    bool got = false;
+    for (unsigned j = 0; j < 8 && moq_session_poll_events(server, &ev, 1); j++) {
+        if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
+            got = true;
+            moq_accept_subscribe_cfg_t acc;
+            moq_accept_subscribe_cfg_init(&acc);
+            MOQ_TEST_CHECK_EQ_INT(moq_session_accept_subscribe(server,
+                ev.u.subscribe_request.sub, &acc, moq_simpair_now_us(f->pair)), MOQ_OK);
+        }
+        moq_event_cleanup(&ev);
+    }
+    moq_simpair_run_until_quiescent(f->pair, 32, NULL);
+    return got;
+}
+
+/* Pump the receiver `seconds` times one second apart; count the server's
+ * SUBSCRIBE_UPDATEDs (with the last Forward State), its FETCH requests, and the
+ * receiver's fill terminals. */
+typedef struct { unsigned updates, fetches, fill_terminals; bool last_forward; } pumped_t;
+static pumped_t pump(fixture_t *f, int seconds)
+{
+    pumped_t p = {0};
+    moq_session_t *server = moq_simpair_server(f->pair);
+    for (int s = 0; s < seconds; ++s) {
+        moq_simpair_advance_to(f->pair, moq_simpair_now_us(f->pair) + 1000000);
+        moq_media_receiver_test_pump(f->receiver, moq_simpair_client(f->pair),
+                                     moq_simpair_now_us(f->pair));
+        moq_simpair_run_until_quiescent(f->pair, 32, NULL);
+        moq_media_track_event_t te;
+        while (moq_media_receiver_poll_track(f->receiver, &te, sizeof(te)) == MOQ_OK)
+            if (te.kind == MOQ_MEDIA_TRACK_FILL_TERMINAL) p.fill_terminals++;
+        moq_event_t ev;
+        while (moq_session_poll_events(server, &ev, 1)) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED && ev.u.subscribe_updated.has_forward) {
+                p.updates++;
+                p.last_forward = ev.u.subscribe_updated.forward;
+            }
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED && ev.u.subscribe_updated.answer_owed) {
+                /* a relay answers the update; the receiver holds the next one
+                 * until it does */
+                moq_accept_subscription_update_cfg_t acc;
+                moq_accept_subscription_update_cfg_init(&acc);
+                acc.update_request_id = ev.u.subscribe_updated.update_request_id;
+                MOQ_TEST_CHECK_EQ_INT(moq_session_accept_subscription_update(server,
+                    ev.u.subscribe_updated.sub, &acc, moq_simpair_now_us(f->pair)), MOQ_OK);
+            }
+            if (ev.kind == MOQ_EVENT_FETCH_REQUEST) p.fetches++;
+            moq_event_cleanup(&ev);
+        }
+    }
+    return p;
+}
+
+/* A passive track raised sends one SUBSCRIBE_UPDATE with Forward 1 and nothing
+ * else (no FETCH, no fill, on drafts 18 and 22); lowering sends Forward 0; a
+ * raise and lower before reconciliation send nothing; a repeated raise sends
+ * nothing more. */
+static void test_raise_lower(moq_version_t version)
+{
+    fixture_t f;
+    bool ready = start(&f, version);
+    MOQ_TEST_CHECK(ready);
+    if (!ready) { finish(&f); return; }
+    const bool off = false;
+    options_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.struct_size = sizeof(cfg);
+    cfg.forward = &off;
+    MOQ_TEST_CHECK_EQ_INT(subscribe(&f, &cfg), MOQ_OK);
+    reconcile(&f);
+    MOQ_TEST_CHECK(f.track->passive && !f.track->forward_sent);
+    MOQ_TEST_CHECK(accept_subscribe(&f));
+    pumped_t p = pump(&f, 2);
+    MOQ_TEST_CHECK_EQ_INT((int)p.updates, 0);
+
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.receiver, f.track, true), MOQ_OK);
+    p = pump(&f, 3);
+    MOQ_TEST_CHECK_EQ_INT((int)p.updates, 1);
+    MOQ_TEST_CHECK(p.last_forward);
+    MOQ_TEST_CHECK_EQ_INT((int)p.fetches, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)p.fill_terminals, 0);
+    MOQ_TEST_CHECK(f.track->forward_sent);
+
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.receiver, f.track, true), MOQ_OK);
+    p = pump(&f, 2);
+    MOQ_TEST_CHECK_EQ_INT((int)p.updates, 0);            /* already forwarding */
+
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.receiver, f.track, false), MOQ_OK);
+    p = pump(&f, 3);
+    MOQ_TEST_CHECK_EQ_INT((int)p.updates, 1);
+    MOQ_TEST_CHECK(!p.last_forward);
+    MOQ_TEST_CHECK(!f.track->forward_sent);
+
+    /* raise then lower before the executor runs: nothing goes out */
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.receiver, f.track, true), MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.receiver, f.track, false), MOQ_OK);
+    p = pump(&f, 3);
+    MOQ_TEST_CHECK_EQ_INT((int)p.updates, 0);
+    MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(f.receiver));
+    finish(&f);
+    MOQ_TEST_PASS(version == MOQ_VERSION_DRAFT_22 ? "track_options_raise_lower_d22"
+                                                  : "track_options_raise_lower_d18");
+}
+
+/* Refusals: NULL arguments; a forwarding (not passive) track; a disabled one. */
+static void test_raise_refusals(void)
+{
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(NULL, NULL, true), MOQ_ERR_INVAL);
+    fixture_t f;
+    bool ready = start(&f, MOQ_VERSION_DRAFT_18);
+    MOQ_TEST_CHECK(ready);
+    if (!ready) { finish(&f); return; }
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.receiver, NULL, true), MOQ_ERR_INVAL);
+    /* not subscribed yet */
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.receiver, f.track, true),
+                          MOQ_ERR_WRONG_STATE);
+    const bool on = true;
+    options_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.struct_size = sizeof(cfg);
+    cfg.forward = &on;
+    MOQ_TEST_CHECK_EQ_INT(subscribe(&f, &cfg), MOQ_OK);
+    reconcile(&f);
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.receiver, f.track, true),
+                          MOQ_ERR_WRONG_STATE);     /* a forwarding track */
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_unsubscribe_track(f.receiver, f.track), MOQ_OK);
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.receiver, f.track, false),
+                          MOQ_ERR_WRONG_STATE);     /* disabled */
+    finish(&f);
+    MOQ_TEST_PASS("track_options_raise_refusals");
+}
+
 int main(void)
 {
     test_passive_forward(MOQ_VERSION_DRAFT_18);
@@ -730,6 +873,9 @@ int main(void)
     test_delivery_timeout_refusals();
     test_delivery_timeout_tails();
     test_forward_tails();
+    test_raise_lower(MOQ_VERSION_DRAFT_18);
+    test_raise_lower(MOQ_VERSION_DRAFT_22);
+    test_raise_refusals();
     printf("receiver_track_options: %d failures\n", failures);
     return failures ? 1 : 0;
 }

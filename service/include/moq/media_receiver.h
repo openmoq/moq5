@@ -1056,9 +1056,9 @@ typedef struct moq_media_receiver_track_subscribe_cfg {
      * subscribe_track resumes leave it at 0). It applies only when the
      * subscription is first issued, as the other options do. A passive track
      * takes no implicit current-group join fill on draft 22. A passive track
-     * that stays silent is not an error and raises no event. In this version
-     * passive is fixed for the subscription's life: the receiver has no call
-     * to raise Forward on it later. */
+     * that stays silent is not an error and raises no event. The app can
+     * raise and lower its Forward State later with
+     * moq_media_receiver_set_track_forward(). */
     const bool                      *forward;
 } moq_media_receiver_track_subscribe_cfg_t;
 
@@ -1164,6 +1164,29 @@ MOQ_API moq_result_t moq_media_receiver_subscribe_track(
  * again. */
 MOQ_API moq_result_t moq_media_receiver_unsubscribe_track(
     moq_media_receiver_t *r, moq_media_track_t *track);
+
+/* Raise (forward = true) or lower (false) the Forward State of a track the
+ * app subscribed passively (track subscribe cfg forward = &false). Records the
+ * intent and wakes the executor, which sends one REQUEST_UPDATE with the
+ * Forward State once the subscription is established and no other update of
+ * the track is in flight, as for flow control: intents that cancel out before
+ * the update goes out send nothing. Flow control still applies to a raised
+ * track (a FLOW_CONTROL pause sends Forward 0 until resumed). Raising issues no
+ * join fill on any draft; Objects the publisher sends after the update reach
+ * the track as live deliveries. The intent survives a re-subscription of the
+ * same track within one receiver (unsubscribe_track then subscribe_track):
+ * the new SUBSCRIBE goes out with Forward 0, as the track's options ask, and
+ * an update to Forward 1 follows once it is established. A new receiver
+ * starts passive.
+ *
+ * Returns:
+ *   MOQ_OK            recorded (also when the Forward State already matches)
+ *   MOQ_ERR_INVAL     NULL r or track, or a foreign track
+ *   MOQ_ERR_WRONG_STATE  not subscribed passively, disabled by
+ *                     unsubscribe_track, ended, failed or removed
+ *   MOQ_ERR_CLOSED    the receiver or its endpoint is terminal */
+MOQ_API moq_result_t moq_media_receiver_set_track_forward(
+    moq_media_receiver_t *r, moq_media_track_t *track, bool forward);
 
 /* Request a D22 fill on `track`'s existing subscription: an UPDATE carrying
  * `fill` (draft-22 sections 3.4 and 9.5). The subscription, its filter and
