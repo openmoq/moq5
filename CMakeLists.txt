@@ -51,6 +51,10 @@ if(MOQ_BUILD_CMAF_PACKAGER AND
     message(FATAL_ERROR
         "MOQ_BUILD_CMAF_PACKAGER=ON requires MOQ_BUILD_CMAF=ON and MOQ_BUILD_CODEC_SIGNALING=ON")
 endif()
+option(MOQ_BUILD_LOCMAF            "Build moq-locmaf LOCMAF encoder/decoder" OFF)
+if(MOQ_BUILD_LOCMAF AND NOT MOQ_BUILD_CMAF)
+    message(FATAL_ERROR "MOQ_BUILD_LOCMAF=ON requires MOQ_BUILD_CMAF=ON")
+endif()
 if(MOQ_BUILD_LOC AND MOQ_BUILD_CMAF)
     set(_MOQ_MEDIA_OBJECT_DEFAULT ON)
 else()
@@ -178,6 +182,13 @@ endif()
 
 if(MOQ_BUILD_CMAF_PACKAGER)
     add_subdirectory(media/cmaf_packager)
+endif()
+
+# -- LOCMAF encoder/decoder -------------------------------------------
+# Depends on moq-core and moq-cmaf; after the CMAF writer, whose round trip
+# its tests use when that target exists.
+if(MOQ_BUILD_LOCMAF)
+    add_subdirectory(media/locmaf)
 endif()
 
 # -- Media object normalizer ----------------------------------------
@@ -558,6 +569,9 @@ if(MOQ_BUILD_MEDIA_OBJECT)
 endif()
 if(MOQ_BUILD_CMAF_PACKAGER)
     string(APPEND LIBMOQ_PC_LIBS " -lmoq-cmaf-packager")
+endif()
+if(MOQ_BUILD_LOCMAF)
+    string(APPEND LIBMOQ_PC_LIBS " -lmoq-locmaf")
 endif()
 if(MOQ_BUILD_CMAF)
     string(APPEND LIBMOQ_PC_LIBS " -lmoq-cmaf")

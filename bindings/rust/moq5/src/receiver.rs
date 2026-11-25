@@ -351,11 +351,29 @@ pub struct TrackDescription<'receiver> {
     _receiver: PhantomData<&'receiver Receiver>,
 }
 
+/// The record's capability extents, the only sizes the library stamps: a
+/// field block is reported whole or not at all.
+fn cmaf_record_extent(limit: usize) -> usize {
+    let extents = [
+        sys::MOQ_CMAF_INIT_INFO_V0_SIZE,
+        mem::offset_of!(sys::moq_cmaf_init_info_t, sample_entry) + mem::size_of::<u32>(),
+        mem::offset_of!(sys::moq_cmaf_init_info_t, _reserved_sample_entry) + mem::size_of::<u32>(),
+        mem::offset_of!(sys::moq_cmaf_init_info_t, default_constant_iv)
+            + mem::size_of::<sys::moq_bytes_t>(),
+        mem::size_of::<sys::moq_cmaf_init_info_t>(),
+    ];
+    extents
+        .into_iter()
+        .filter(|&e| e <= limit)
+        .max()
+        .unwrap_or(0)
+}
+
 /// Copy the receiver's parsed CMAF record into this crate's size of it.
 /// The library's record may be smaller (an older library) or larger (a newer
-/// one) than this crate's, so only the bytes both its stamp and this crate's
-/// size cover are read, and the copy is stamped with that count. A record
-/// stamped below its frozen floor is an ABI mismatch.
+/// one) than this crate's, so only the largest whole extent both its stamp
+/// and this crate's size cover is read, and the copy is stamped with it. A
+/// record stamped below its frozen floor is an ABI mismatch.
 fn copy_cmaf_record(
     record: *const sys::moq_cmaf_init_info_t,
 ) -> Result<Option<sys::moq_cmaf_init_info_t>> {
@@ -369,7 +387,7 @@ fn copy_cmaf_record(
         return Err(Error::ABI_MISMATCH);
     }
     let mut copy = sys::moq_cmaf_init_info_t::default();
-    let n = stamp.min(mem::size_of_val(&copy));
+    let n = cmaf_record_extent(stamp.min(mem::size_of_val(&copy)));
     // SAFETY: the record holds `stamp` bytes and copy holds its own size;
     // n is at most both, and the two never overlap.
     unsafe {

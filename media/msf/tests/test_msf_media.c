@@ -1,5 +1,6 @@
 #include <moq/msf_media.h>
 #include <moq/loc.h>
+#include "media_builders.h"   /* CMAF headers with trex */
 #include <stddef.h>
 #include <moq/rcbuf.h>
 #include <stdio.h>
@@ -1108,12 +1109,22 @@ int main(void)
                 moq_result_t rc = moq_msf_track_to_media_info_sized(
                     alloc, &t, &info, sizeof(info), MOQ_VERSION_DRAFT_22,
                     &out.rec, sizes[k], &init_buf);
-                size_t written = sizes[k] < full ? sizes[k] : full;
+                /* The record is cleared to the caller's size; a parsed header
+                 * is then written and stamped by whole extent only. */
+                size_t cleared = sizes[k] < full ? sizes[k] : full;
+                size_t written = !cmaf ? cleared
+                               : sizes[k] >= full ? full
+                               : sizes[k] >= offsetof(moq_cmaf_init_info_t, sample_entry) +
+                                              sizeof(uint32_t)
+                                   ? offsetof(moq_cmaf_init_info_t, sample_entry) +
+                                         sizeof(uint32_t)
+                                   : MOQ_CMAF_INIT_INFO_V0_SIZE;
                 if (sizes[k] < MOQ_CMAF_INIT_INFO_V0_SIZE) {
                     /* Refused: neither output is touched. */
                     CHECK(rc == MOQ_ERR_INVAL);
                     CHECK(init_buf == NULL);
                     written = 0;
+                    cleared = 0;
                     CHECK(((const unsigned char *)&info)[0] == 0xAB);
                 } else {
                     CHECK(rc == MOQ_OK);
@@ -1128,10 +1139,70 @@ int main(void)
                         CHECK(out.rec.sample_entry ==
                               (cmaf ? UINT32_C(0x61766331) : 0u)); /* 'avc1' */
                 }
-                for (size_t i = written; i < sizeof(out.raw); i++)
+                for (size_t i = written; i < cleared; i++)
+                    CHECK(out.raw[i] == 0);
+                for (size_t i = cleared; i < sizeof(out.raw); i++)
                     CHECK(out.raw[i] == 0xAB);
                 if (init_buf) moq_rcbuf_decref(init_buf);
             }
+        }
+        if (b64.buf) moq_rcbuf_decref(b64.buf);
+    }
+
+    /* -- msf_media_init_extent_matrix: the parsed CMAF record reaches the
+     *    caller by whole capability extent, as moq_cmaf_parse_init_sized()
+     *    writes it: a size just short of the header-facts block gets the
+     *    extent before it, never part of the block. */
+    {
+        static const uint32_t trex4[4] = { 1, 3000, 0, 0x01010000u };
+        uint8_t init_raw[512];
+        size_t init_len = moq_test_build_cmaf_init_trex(init_raw, 1, 90000, trex4, 1, true);
+        b64_result_t b64 = encode_b64(alloc, init_raw, init_len);
+        CHECK(b64.buf != NULL);
+        moq_msf_track_t t;
+        memset(&t, 0, sizeof(t));
+        t.struct_size = sizeof(t);
+        t.name = lit("video");
+        t.packaging = lit("cmaf");
+        t.has_role = true;
+        t.role = lit("video");
+        t.has_codec = true;
+        t.codec = lit("avc1.64001e");
+        t.has_init_data = true;
+        t.init_data = b64.bytes;
+        const size_t full = sizeof(moq_cmaf_init_info_t);
+        const size_t ext[] = { MOQ_CMAF_INIT_INFO_V0_SIZE,
+                               MOQ_CMAF_INIT_INFO_SIZE_THROUGH_SAMPLE_ENTRY,
+                               MOQ_CMAF_INIT_INFO_SIZE_THROUGH_RESERVED,
+                               MOQ_CMAF_INIT_INFO_SIZE_THROUGH_CONSTANT_IV, full };
+        for (size_t size = MOQ_CMAF_INIT_INFO_V0_SIZE; b64.buf && size <= full + 8; size++) {
+            union {
+                moq_cmaf_init_info_t rec;
+                unsigned char raw[sizeof(moq_cmaf_init_info_t) + 16];
+            } out;
+            memset(out.raw, 0xA5, sizeof(out.raw));
+            moq_media_track_info_t info;
+            moq_rcbuf_t *init_buf = NULL;
+            moq_result_t rc = moq_msf_track_to_media_info_sized(
+                alloc, &t, &info, sizeof(info), MOQ_VERSION_DRAFT_16,
+                &out.rec, size, &init_buf);
+            CHECK(rc == MOQ_OK);
+            size_t want = MOQ_CMAF_INIT_INFO_V0_SIZE;
+            for (size_t e = 0; e < sizeof(ext) / sizeof(ext[0]); e++)
+                if (ext[e] <= size) want = ext[e];
+            size_t cleared = size < full ? size : full;
+            CHECK_EQ_U32(out.rec.struct_size, (uint32_t)want);
+            if (want >= MOQ_CMAF_INIT_INFO_SIZE_THROUGH_CONSTANT_IV) {
+                CHECK(out.rec.trak_count == 1 && out.rec.has_trex);
+                CHECK_EQ_U32(out.rec.trex_default_sample_duration, 3000);
+                CHECK_EQ_U32(out.rec.trex_default_sample_flags, 0x01010000u);
+            }
+            bool clean = true;
+            for (size_t i = want; i < cleared; i++) clean &= out.raw[i] == 0;
+            for (size_t i = cleared; i < sizeof(out.raw); i++) clean &= out.raw[i] == 0xA5;
+            if (!clean) fprintf(stderr, "  out_init_size %zu\n", size);
+            CHECK(clean);
+            if (init_buf) moq_rcbuf_decref(init_buf);
         }
         if (b64.buf) moq_rcbuf_decref(b64.buf);
     }

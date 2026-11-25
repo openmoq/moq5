@@ -7,7 +7,10 @@
  *      - Returns only MOQ_OK or MOQ_ERR_PROTO for non-NULL arguments.
  *      - On MOQ_OK, codec_config (and scheme / default_kid when has_cenc)
  *        point within [buf, buf + size], and CENC fields are zeroed when
- *        !has_cenc or exact-width (4 and 16 bytes) when has_cenc.
+ *        !has_cenc or exact-width (4 and 16 bytes) when has_cenc; the
+ *        constant IV is empty, or 8 or 16 bytes within the input on a
+ *        protected track with no per-sample IV; the trex values are zero
+ *        unless has_trex.
  *      - On MOQ_ERR_PROTO the record carries no partial observation.
  *      - A record of only the v0 floor gets the same result, the same
  *        prefix, and no byte written past the floor.
@@ -19,9 +22,10 @@
  *        out.sample_count > 4 and <= size, and retrying with a buffer of
  *        exactly out.sample_count samples succeeds with MOQ_OK and yields
  *        the same sample_count, track_id, chunk_count, and mdat slice.
- *      - On MOQ_OK, mdat points within [buf, buf + size], sample_count >= 1,
- *        chunk_count >= 1, and moq_cmaf_sap_from_sample_flags() never
- *        fabricates exact SAP 1/2/3 from flags alone.
+ *      - On MOQ_OK, mdat points within [buf, buf + size], chunk_count >= 1
+ *        (sample_count may be 0: an event-only chunk), and
+ *        moq_cmaf_sap_from_sample_flags() never fabricates exact SAP 1/2/3
+ *        from flags alone.
  *   3. moq_cmaf_validate_object():
  *      - Returns only MOQ_OK (valid == true, reason == MOQ_CMAF_OK) or
  *        MOQ_ERR_PROTO (valid == false, reason != MOQ_CMAF_OK).
@@ -92,6 +96,26 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                 check_slice_in(buf, size, init.scheme);
                 check_slice_in(buf, size, init.default_kid);
             }
+            if (init.default_constant_iv.len != 0) {
+                if (!init.has_cenc || init.default_is_protected != 1 ||
+                    init.default_per_sample_iv_size != 0 ||
+                    (init.default_constant_iv.len != 8 &&
+                     init.default_constant_iv.len != 16))
+                    __builtin_trap();
+                check_slice_in(buf, size, init.default_constant_iv);
+            } else if (init.default_constant_iv.data != NULL) {
+                __builtin_trap();
+            }
+            if (!init.has_cenc && (init.tenc_version != 0 ||
+                init.default_crypt_byte_block != 0 ||
+                init.default_skip_byte_block != 0))
+                __builtin_trap();
+            if (!init.has_trex &&
+                (init.trex_default_sample_description_index != 0 ||
+                 init.trex_default_sample_duration != 0 ||
+                 init.trex_default_sample_size != 0 ||
+                 init.trex_default_sample_flags != 0))
+                __builtin_trap();
         } else {
             const unsigned char *raw = (const unsigned char *)&init;
             if (init.struct_size != sizeof(init))
@@ -133,8 +157,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             if (frag.sample_count != 0)
                 __builtin_trap();
         } else if (frc == MOQ_OK) {
-            if (frag.sample_count == 0 || frag.sample_count > 4 ||
-                frag.chunk_count == 0)
+            if (frag.sample_count > 4 || frag.chunk_count == 0)
                 __builtin_trap();
             check_slice_in(buf, size, frag.mdat);
             for (size_t i = 0; i < frag.sample_count; i++) {

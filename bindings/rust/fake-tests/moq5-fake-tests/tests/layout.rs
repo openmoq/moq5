@@ -106,7 +106,11 @@ fn rust_side() -> BTreeMap<String, Entry> {
         moq_cmaf_init_info_t {
             struct_size, codec_kind, timescale, width, height, samplerate, channel_count,
             codec_config, track_id, has_cenc, scheme, default_is_protected,
-            default_per_sample_iv_size, default_kid, sample_entry,
+            default_per_sample_iv_size, default_kid, sample_entry, _reserved_sample_entry,
+            trak_count, has_trex, trex_default_sample_description_index,
+            trex_default_sample_duration, trex_default_sample_size, trex_default_sample_flags,
+            tenc_version, default_crypt_byte_block, default_skip_byte_block,
+            default_constant_iv,
         }
         moq_cmaf_sample_t { duration, size, flags, composition_offset }
         moq_msf_media_template_t {

@@ -3,7 +3,7 @@
 // by scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: be3d065ad3b6
+// libmoq commit: a9bcafb84252
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -381,10 +381,28 @@ pub struct moq_cmaf_init_info {
     pub default_kid: moq_bytes_t,
     #[doc = " Appended after default_kid. The sample entry's format as its four\n bytes read big-endian, (a<<24)|(b<<16)|(c<<8)|d: the entry type of a\n clear entry ('avc1', 'avc3', 'hvc1', 'hev1', ...), or the sinf frma\n original format of an encrypted one ('encv'/'enca' are never reported).\n A value the parser does not recognize, including zero, is reported\n exactly as read: whether it was reported is the stamp's coverage, never\n the value."]
     pub sample_entry: u32,
+    #[doc = " Covers the tail padding after sample_entry on targets that have it.\n Never written with meaning and never read."]
+    pub _reserved_sample_entry: u32,
+    #[doc = " trak boxes in moov. A CMAF header has exactly one; 0 when moov's\n children do not parse to its end (counted, never a parse failure)."]
+    pub trak_count: u32,
+    #[doc = " ISO/IEC 14496-12 8.8.3 TrackExtendsBox: the mvex/trex whose track_ID is\n track_id. has_trex is false (and the four values zero) when moov has no\n mvex, no matching trex, track_id is 0, or the trex is shorter than its\n 24-byte body."]
+    pub has_trex: bool,
+    pub trex_default_sample_description_index: u32,
+    #[doc = " timescale units"]
+    pub trex_default_sample_duration: u32,
+    #[doc = " bytes"]
+    pub trex_default_sample_size: u32,
+    #[doc = " sample_flags"]
+    pub trex_default_sample_flags: u32,
+    #[doc = " CENC (ISO/IEC 23001-7 8.2) TrackEncryptionBox beyond the v0 fields,\n zero unless has_cenc: the tenc version (0 or 1); the version-1 pattern\n (default_crypt_byte_block, default_skip_byte_block, zero for version 0);\n and the default constant IV, present (8 or 16 bytes, BORROWED) only when\n default_isProtected is 1, default_Per_Sample_IV_Size is 0 and the box\n carries a well-formed constant IV; otherwise empty."]
+    pub tenc_version: u8,
+    pub default_crypt_byte_block: u8,
+    pub default_skip_byte_block: u8,
+    pub default_constant_iv: moq_bytes_t,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_cmaf_init_info"][::std::mem::size_of::<moq_cmaf_init_info>() - 104usize];
+    ["Size of moq_cmaf_init_info"][::std::mem::size_of::<moq_cmaf_init_info>() - 152usize];
     ["Alignment of moq_cmaf_init_info"][::std::mem::align_of::<moq_cmaf_init_info>() - 8usize];
     ["Offset of field: moq_cmaf_init_info::struct_size"]
         [::std::mem::offset_of!(moq_cmaf_init_info, struct_size) - 0usize];
@@ -416,6 +434,30 @@ const _: () = {
         [::std::mem::offset_of!(moq_cmaf_init_info, default_kid) - 80usize];
     ["Offset of field: moq_cmaf_init_info::sample_entry"]
         [::std::mem::offset_of!(moq_cmaf_init_info, sample_entry) - 96usize];
+    ["Offset of field: moq_cmaf_init_info::_reserved_sample_entry"]
+        [::std::mem::offset_of!(moq_cmaf_init_info, _reserved_sample_entry) - 100usize];
+    ["Offset of field: moq_cmaf_init_info::trak_count"]
+        [::std::mem::offset_of!(moq_cmaf_init_info, trak_count) - 104usize];
+    ["Offset of field: moq_cmaf_init_info::has_trex"]
+        [::std::mem::offset_of!(moq_cmaf_init_info, has_trex) - 108usize];
+    ["Offset of field: moq_cmaf_init_info::trex_default_sample_description_index"][::std::mem::offset_of!(
+        moq_cmaf_init_info,
+        trex_default_sample_description_index
+    ) - 112usize];
+    ["Offset of field: moq_cmaf_init_info::trex_default_sample_duration"]
+        [::std::mem::offset_of!(moq_cmaf_init_info, trex_default_sample_duration) - 116usize];
+    ["Offset of field: moq_cmaf_init_info::trex_default_sample_size"]
+        [::std::mem::offset_of!(moq_cmaf_init_info, trex_default_sample_size) - 120usize];
+    ["Offset of field: moq_cmaf_init_info::trex_default_sample_flags"]
+        [::std::mem::offset_of!(moq_cmaf_init_info, trex_default_sample_flags) - 124usize];
+    ["Offset of field: moq_cmaf_init_info::tenc_version"]
+        [::std::mem::offset_of!(moq_cmaf_init_info, tenc_version) - 128usize];
+    ["Offset of field: moq_cmaf_init_info::default_crypt_byte_block"]
+        [::std::mem::offset_of!(moq_cmaf_init_info, default_crypt_byte_block) - 129usize];
+    ["Offset of field: moq_cmaf_init_info::default_skip_byte_block"]
+        [::std::mem::offset_of!(moq_cmaf_init_info, default_skip_byte_block) - 130usize];
+    ["Offset of field: moq_cmaf_init_info::default_constant_iv"]
+        [::std::mem::offset_of!(moq_cmaf_init_info, default_constant_iv) - 136usize];
 };
 impl Default for moq_cmaf_init_info {
     fn default() -> Self {
@@ -434,7 +476,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Parse the first trak from a CMAF init segment into the caller's record of\n out_size bytes (sizeof the caller's record).\n\n On MOQ_OK, min(out_size, sizeof(current)) bytes are written and that count\n is stamped in out->struct_size; bytes past it are never touched. Only the\n first sample entry of the first trak is read.\n\n Returns MOQ_ERR_INVAL, writing nothing, if init_segment.data or out is\n NULL, or out_size is below MOQ_CMAF_INIT_INFO_V0_SIZE.\n Returns MOQ_ERR_PROTO on malformed boxes or missing required data; the\n record is then left as moq_cmaf_init_info_init_sized(out, out_size) leaves\n it, carrying no partial observation."]
+    #[doc = " Parse the first trak from a CMAF init segment into the caller's record of\n out_size bytes (sizeof the caller's record).\n\n On MOQ_OK, the largest capability extent that out_size holds is written\n and stamped in out->struct_size: the v0 prefix, then through sample_entry,\n through _reserved_sample_entry, through default_constant_iv, and the whole\n current record. Bytes past the stamp are never touched, so a size that\n cuts a field gets the extent before it. Only the first sample entry of the\n first trak is read; trak_count counts every trak in moov.\n\n Returns MOQ_ERR_INVAL, writing nothing, if init_segment.data or out is\n NULL, or out_size is below MOQ_CMAF_INIT_INFO_V0_SIZE.\n Returns MOQ_ERR_PROTO on malformed boxes or missing required data; the\n record is then left as moq_cmaf_init_info_init_sized(out, out_size) leaves\n it, carrying no partial observation."]
     pub fn moq_cmaf_parse_init_sized(
         init_segment: moq_bytes_t,
         out: *mut moq_cmaf_init_info_t,
@@ -547,7 +589,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[must_use]
-    #[doc = " Parse a CMAF media fragment (moof+mdat).\n\n When the object holds multiple CMAF chunks (successive moof+mdat pairs,\n CMSF §3.3), the sample table, base decode time, track_id, and mdat are taken\n from the FIRST chunk; out->chunk_count reports how many chunks the object\n contains so callers can fall back to the full object bytes when they need the\n later chunks (a per-chunk mdat-range table is future API).\n\n Returns MOQ_OK on success.\n Returns MOQ_ERR_INVAL if fragment.data or out is NULL.\n Returns MOQ_ERR_PROTO on malformed boxes, missing trun, zero samples, or a\n   structurally invalid sample table -- including a trun that declares more\n   samples than its per-sample records (or the fragment) can hold. A\n   malformed fragment NEVER surfaces a required count: out->sample_count\n   stays 0 on PROTO, so an attacker cannot drive an oversized allocation via\n   the resize-and-retry contract below.\n Returns MOQ_ERR_BUFFER ONLY for a structurally valid fragment whose sample\n   count exceeds sample_cap; out->sample_count is then the (trusted, fragment-\n   bounded) required count. The BUFFER signal is withheld until the whole\n   fragment has been validated (moof->mdat ordering, mdat presence, no\n   trailing bytes), so it always means \"valid fragment, grow the buffer\"."]
+    #[doc = " Parse a CMAF media fragment (moof+mdat).\n\n When the object holds multiple CMAF chunks (successive moof+mdat pairs,\n CMSF §3.3), the sample table, base decode time, track_id, and mdat are taken\n from the FIRST chunk; out->chunk_count reports how many chunks the object\n contains so callers can fall back to the full object bytes when they need the\n later chunks (a per-chunk mdat-range table is future API).\n\n Returns MOQ_OK on success.\n Returns MOQ_ERR_INVAL if fragment.data or out is NULL.\n A trun whose sample_count is 0 (an event-only chunk) is valid: MOQ_OK with\n   sample_count 0; the mdat is still required and may be empty.\n Returns MOQ_ERR_PROTO on malformed boxes, missing trun, or a structurally\n   invalid sample table -- including a trun that declares more samples than\n   its per-sample records (or the fragment) can hold. A\n   malformed fragment NEVER surfaces a required count: out->sample_count\n   stays 0 on PROTO, so an attacker cannot drive an oversized allocation via\n   the resize-and-retry contract below.\n Returns MOQ_ERR_BUFFER ONLY for a structurally valid fragment whose sample\n   count exceeds sample_cap; out->sample_count is then the (trusted, fragment-\n   bounded) required count. The BUFFER signal is withheld until the whole\n   fragment has been validated (moof->mdat ordering, mdat presence, no\n   trailing bytes), so it always means \"valid fragment, grow the buffer\"."]
     pub fn moq_cmaf_parse_fragment(
         fragment: moq_bytes_t,
         out: *mut moq_cmaf_fragment_info_t,

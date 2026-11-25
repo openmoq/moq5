@@ -74,6 +74,37 @@ typedef struct moq_cmaf_init_info {
      * exactly as read: whether it was reported is the stamp's coverage, never
      * the value. */
     uint32_t              sample_entry;
+
+    /* Covers the tail padding after sample_entry on targets that have it.
+     * Never written with meaning and never read. */
+    uint32_t              _reserved_sample_entry;
+
+    /* Appended after sample_entry, as one block: read any of these only when
+     * struct_size covers the whole block, through default_constant_iv
+     * (MOQ_CMAF_INIT_INFO_SIZE_THROUGH_CONSTANT_IV). */
+
+    /* trak boxes in moov. A CMAF header has exactly one; 0 when moov's
+     * children do not parse to its end (counted, never a parse failure). */
+    uint32_t              trak_count;
+    /* ISO/IEC 14496-12 8.8.3 TrackExtendsBox: the mvex/trex whose track_ID is
+     * track_id. has_trex is false (and the four values zero) when moov has no
+     * mvex, no matching trex, track_id is 0, or the trex is shorter than its
+     * 24-byte body. */
+    bool                  has_trex;
+    uint32_t              trex_default_sample_description_index;
+    uint32_t              trex_default_sample_duration;   /* timescale units */
+    uint32_t              trex_default_sample_size;       /* bytes */
+    uint32_t              trex_default_sample_flags;      /* sample_flags */
+    /* CENC (ISO/IEC 23001-7 8.2) TrackEncryptionBox beyond the v0 fields,
+     * zero unless has_cenc: the tenc version (0 or 1); the version-1 pattern
+     * (default_crypt_byte_block, default_skip_byte_block, zero for version 0);
+     * and the default constant IV, present (8 or 16 bytes, BORROWED) only when
+     * default_isProtected is 1, default_Per_Sample_IV_Size is 0 and the box
+     * carries a well-formed constant IV; otherwise empty. */
+    uint8_t               tenc_version;
+    uint8_t               default_crypt_byte_block;
+    uint8_t               default_skip_byte_block;
+    moq_bytes_t           default_constant_iv;
 } moq_cmaf_init_info_t;
 
 /* Frozen v0 prefix: everything through default_kid. A caller's record must
@@ -81,6 +112,17 @@ typedef struct moq_cmaf_init_info {
  * caller's size covers them. */
 #define MOQ_CMAF_INIT_INFO_V0_SIZE \
     (offsetof(moq_cmaf_init_info_t, default_kid) + sizeof(moq_bytes_t))
+
+/* Capability extents: the only sizes the parser stamps. A reader may rely on
+ * a field only when struct_size covers its extent. */
+#define MOQ_CMAF_INIT_INFO_SIZE_THROUGH_SAMPLE_ENTRY \
+    (offsetof(moq_cmaf_init_info_t, sample_entry) + sizeof(uint32_t))
+#define MOQ_CMAF_INIT_INFO_SIZE_THROUGH_RESERVED \
+    (offsetof(moq_cmaf_init_info_t, _reserved_sample_entry) + sizeof(uint32_t))
+/* The record through default_constant_iv: what a reader of the header facts
+ * block above must see covered. */
+#define MOQ_CMAF_INIT_INFO_SIZE_THROUGH_CONSTANT_IV \
+    (offsetof(moq_cmaf_init_info_t, default_constant_iv) + sizeof(moq_bytes_t))
 
 /*
  * Clear and stamp min(info_size, sizeof(current)) bytes. Writes nothing when
@@ -95,9 +137,12 @@ MOQ_API void moq_cmaf_init_info_init_sized(moq_cmaf_init_info_t *info,
  * Parse the first trak from a CMAF init segment into the caller's record of
  * out_size bytes (sizeof the caller's record).
  *
- * On MOQ_OK, min(out_size, sizeof(current)) bytes are written and that count
- * is stamped in out->struct_size; bytes past it are never touched. Only the
- * first sample entry of the first trak is read.
+ * On MOQ_OK, the largest capability extent that out_size holds is written
+ * and stamped in out->struct_size: the v0 prefix, then through sample_entry,
+ * through _reserved_sample_entry, through default_constant_iv, and the whole
+ * current record. Bytes past the stamp are never touched, so a size that
+ * cuts a field gets the extent before it. Only the first sample entry of the
+ * first trak is read; trak_count counts every trak in moov.
  *
  * Returns MOQ_ERR_INVAL, writing nothing, if init_segment.data or out is
  * NULL, or out_size is below MOQ_CMAF_INIT_INFO_V0_SIZE.
@@ -182,9 +227,11 @@ MOQ_API void moq_cmaf_fragment_info_init(moq_cmaf_fragment_info_t *info,
  *
  * Returns MOQ_OK on success.
  * Returns MOQ_ERR_INVAL if fragment.data or out is NULL.
- * Returns MOQ_ERR_PROTO on malformed boxes, missing trun, zero samples, or a
- *   structurally invalid sample table -- including a trun that declares more
- *   samples than its per-sample records (or the fragment) can hold. A
+ * A trun whose sample_count is 0 (an event-only chunk) is valid: MOQ_OK with
+ *   sample_count 0; the mdat is still required and may be empty.
+ * Returns MOQ_ERR_PROTO on malformed boxes, missing trun, or a structurally
+ *   invalid sample table -- including a trun that declares more samples than
+ *   its per-sample records (or the fragment) can hold. A
  *   malformed fragment NEVER surfaces a required count: out->sample_count
  *   stays 0 on PROTO, so an attacker cannot drive an oversized allocation via
  *   the resize-and-retry contract below.

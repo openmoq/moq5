@@ -57,6 +57,7 @@ foreach(_fuzz_lib
         moq-core-test-internals
         moq-loc
         moq-cmaf
+        moq-locmaf
         moq-mpeg2ts
         moq-cmaf-packager
         moq-codec-signaling
@@ -180,6 +181,33 @@ if(TARGET moq-cmaf)
              ${CMAKE_CURRENT_SOURCE_DIR}/corpus/cmaf -runs=0)
     math(EXPR _fuzz_target_count "${_fuzz_target_count} + 1")
     math(EXPR _fuzz_test_count "${_fuzz_test_count} + 2")
+endif()
+
+if(TARGET moq-locmaf)
+    add_executable(fuzz_locmaf fuzz_locmaf.c)
+    target_link_libraries(fuzz_locmaf PRIVATE moq::locmaf)
+    target_compile_options(fuzz_locmaf PRIVATE ${FUZZ_FLAGS})
+    target_link_options(fuzz_locmaf PRIVATE ${FUZZ_FLAGS})
+    add_test(NAME fuzz_locmaf_smoke
+             COMMAND fuzz_locmaf -runs=1 -max_len=0)
+    add_test(NAME fuzz_locmaf_corpus
+             COMMAND fuzz_locmaf
+             ${CMAKE_CURRENT_SOURCE_DIR}/corpus/locmaf -runs=0)
+    # The encoder harness draws its chunks from the tests' generator.
+    add_executable(fuzz_locmaf_encode fuzz_locmaf_encode.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../media/locmaf/tests/locmaf_fixtures.c)
+    target_include_directories(fuzz_locmaf_encode PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../media/locmaf/tests)
+    target_link_libraries(fuzz_locmaf_encode PRIVATE moq::locmaf)
+    target_compile_options(fuzz_locmaf_encode PRIVATE ${FUZZ_FLAGS})
+    target_link_options(fuzz_locmaf_encode PRIVATE ${FUZZ_FLAGS})
+    add_test(NAME fuzz_locmaf_encode_smoke
+             COMMAND fuzz_locmaf_encode -runs=1 -max_len=0)
+    add_test(NAME fuzz_locmaf_encode_corpus
+             COMMAND fuzz_locmaf_encode
+             ${CMAKE_CURRENT_SOURCE_DIR}/corpus/locmaf_encode -runs=0)
+    math(EXPR _fuzz_target_count "${_fuzz_target_count} + 2")
+    math(EXPR _fuzz_test_count "${_fuzz_test_count} + 4")
 endif()
 
 if(TARGET moq-msf)

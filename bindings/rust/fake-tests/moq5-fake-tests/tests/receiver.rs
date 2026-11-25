@@ -752,6 +752,57 @@ fn cmaf_records_are_read_within_their_stamp() {
     set_description(&receiver, 0, &raw_description(true));
 }
 
+/// The binding copies the library's record by whole capability extent, as
+/// the library stamps it: a stamp just short of the header-facts block
+/// copies the extent before it (the facts stay unreported), the extent
+/// through the constant IV copies the block whole.
+#[test]
+fn cmaf_records_copy_whole_extents() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    set_description(&receiver, 0, &raw_description(true));
+    let track = track(&receiver, 0);
+    let reserved_end = std::mem::offset_of!(sys::moq_cmaf_init_info_t, _reserved_sample_entry)
+        + std::mem::size_of::<u32>();
+    let facts_end = std::mem::offset_of!(sys::moq_cmaf_init_info_t, default_constant_iv)
+        + std::mem::size_of::<sys::moq_bytes_t>();
+    let full = std::mem::size_of::<sys::moq_cmaf_init_info_t>();
+    let mut record = CMAF_RECORD.0;
+    record.trak_count = 1;
+    record.has_trex = true;
+    record.trex_default_sample_duration = 3000;
+    record.trex_default_sample_flags = 0x0101_0000;
+    let rows = [
+        (reserved_end, reserved_end),
+        (reserved_end + 4, reserved_end),
+        (facts_end - 1, reserved_end),
+        (facts_end, facts_end),
+        (full, full),
+        (full + 16, full),
+    ];
+    for (stamp, copied_stamp) in rows {
+        let stamped = StampedRecord::new(record, stamp);
+        let mut description = raw_description(true);
+        description.cmaf = stamped.as_ptr();
+        set_description(&receiver, 0, &description);
+        let copied = receiver
+            .track_description(track)
+            .expect("a record at or above its floor copies");
+        let raw = *copied.init_info().expect("the record is reported").raw();
+        assert_eq!(raw.struct_size as usize, copied_stamp, "stamp {stamp}");
+        let has_facts = copied_stamp >= facts_end;
+        assert_eq!(raw.has_trex, has_facts, "stamp {stamp}");
+        assert_eq!(raw.trak_count, u32::from(has_facts), "stamp {stamp}");
+        assert_eq!(
+            raw.trex_default_sample_duration,
+            if has_facts { 3000 } else { 0 },
+            "stamp {stamp}"
+        );
+        set_description(&receiver, 0, &raw_description(true));
+    }
+}
+
 #[test]
 fn foreign_tracks_never_reach_the_service() {
     let s = fake::suite();

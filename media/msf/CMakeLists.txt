@@ -112,7 +112,10 @@ if(MOQ_BUILD_TESTS)
     # The sized-companion cases use LOC through moq::msf's PUBLIC
     # moq::media-object dependency; do not repeat that static archive here.
     if(TARGET moq::media-object AND TARGET moq::cmaf AND TARGET moq::loc)
-        add_executable(test_msf_media tests/test_msf_media.c)
+        add_executable(test_msf_media tests/test_msf_media.c
+            ${PROJECT_SOURCE_DIR}/tests/support/media_builders.c)
+        target_include_directories(test_msf_media PRIVATE
+            ${PROJECT_SOURCE_DIR}/tests/support)
         target_link_libraries(test_msf_media PRIVATE moq::msf)
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
             target_compile_options(test_msf_media PRIVATE -Wall -Wextra -Wpedantic

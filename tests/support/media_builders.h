@@ -78,4 +78,46 @@ size_t moq_test_build_cmaf_init_cenc(uint8_t *out, uint32_t track_id,
                                      uint8_t iv_size, const uint8_t kid[16],
                                      uint8_t tenc_version, uint32_t omit);
 
+/*
+ * Extra tenc and moov content for moq_test_build_cmaf_init_cenc_ex():
+ *   pattern            tenc byte 5 (version 1: crypt << 4 | skip);
+ *   constant_iv_size   when nonzero, written after the KID, followed by
+ *   constant_iv        constant_iv_len bytes (may be fewer than the size
+ *                      byte claims, for truncation cases);
+ *   with_trex          append mvex(trex) for track_id with trex[] =
+ *                      { sdi, duration, size, flags }.
+ */
+typedef struct moq_test_cenc_init_opts {
+    uint8_t        pattern;
+    uint8_t        constant_iv_size;
+    const uint8_t *constant_iv;
+    size_t         constant_iv_len;
+    bool           with_trex;
+    uint32_t       trex[4];
+} moq_test_cenc_init_opts_t;
+
+/* moq_test_build_cmaf_init_cenc() with the options above (NULL = none). */
+size_t moq_test_build_cmaf_init_cenc_ex(uint8_t *out, uint32_t track_id,
+                                        uint32_t timescale,
+                                        uint16_t w, uint16_t h,
+                                        const uint8_t *avcc, size_t avcc_len,
+                                        const char scheme[4],
+                                        uint8_t default_is_protected,
+                                        uint8_t iv_size, const uint8_t kid[16],
+                                        uint8_t tenc_version, uint32_t omit,
+                                        const moq_test_cenc_init_opts_t *opts);
+
+/*
+ * A clear AVC CMAF init segment with `traks` trak boxes (the first carries
+ * tkhd track_ID = track_id, each later one track_id + its index) and, when
+ * with_mvex, a trailing mvex holding one trex for track_id with
+ * trex4 = { sample_description_index, duration, size, flags }:
+ *   ftyp + moov(trak* [mvex(trex)])
+ * Returns bytes written (at most 160 + 132 * traks).
+ */
+size_t moq_test_build_cmaf_init_trex(uint8_t *out, uint32_t track_id,
+                                     uint32_t timescale,
+                                     const uint32_t trex4[4],
+                                     unsigned traks, bool with_mvex);
+
 #endif /* MOQ_TEST_MEDIA_BUILDERS_H */

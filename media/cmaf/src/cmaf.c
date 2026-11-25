@@ -109,6 +109,12 @@ static int find_box_nested_rc(const uint8_t *data, size_t len,
 _Static_assert(MOQ_CMAF_INIT_INFO_V0_SIZE ==
                offsetof(moq_cmaf_init_info_t, sample_entry),
                "sample_entry starts at the v0 floor, outside its tail padding");
+_Static_assert(offsetof(moq_cmaf_init_info_t, _reserved_sample_entry) ==
+               MOQ_CMAF_INIT_INFO_V0_SIZE + sizeof(uint32_t),
+               "the reserved word follows sample_entry");
+_Static_assert(offsetof(moq_cmaf_init_info_t, trak_count) ==
+               MOQ_CMAF_INIT_INFO_V0_SIZE + 2 * sizeof(uint32_t),
+               "the header-facts block starts past every released sizeof");
 
 void moq_cmaf_init_info_init_sized(moq_cmaf_init_info_t *info, size_t info_size)
 {
@@ -326,6 +332,24 @@ static moq_result_t parse_cenc_sinf(const uint8_t *eb, size_t eb_len,
     out->default_kid.data = tp + 8;
     out->default_kid.len = 16;
 
+    /* Beyond the v0 fields: the version, its pattern, and a constant IV
+     * (8.2.2: default_constant_IV_size and the IV follow the KID when the
+     * track is protected with no per-sample IV). A constant IV that is not
+     * 8 or 16 bytes, or that runs past the box, is not reported; it never
+     * fails the parse. */
+    out->tenc_version = tp[0];
+    if (tp[0] == 1) {
+        out->default_crypt_byte_block = (uint8_t)(tp[5] >> 4);
+        out->default_skip_byte_block = (uint8_t)(tp[5] & 0x0F);
+    }
+    if (tp[6] == 1 && tp[7] == 0 && tlen >= 25) {
+        size_t n = tp[24];
+        if ((n == 8 || n == 16) && tlen - 25 >= n) {
+            out->default_constant_iv.data = tp + 25;
+            out->default_constant_iv.len = n;
+        }
+    }
+
     out->has_cenc = true;
     return MOQ_OK;
 }
@@ -396,6 +420,62 @@ static moq_result_t parse_stsd_entry(const uint8_t *stsd_box,
     }
 
     return extract_codec_config(effective, eb, eb_len, out);
+}
+
+/* The mvex/trex of track_id (ISO/IEC 14496-12 8.8.3): the first trex in
+ * mvex whose track_ID matches, read only when its body holds all 24 bytes
+ * (FullBox, track_ID, then the four defaults). A child that does not parse
+ * ends the search. */
+static void read_trex(const uint8_t *mvex_body, size_t len, uint32_t track_id,
+                      moq_cmaf_init_info_t *out)
+{
+    if (track_id == 0) return;
+    size_t pos = 0;
+    while (pos < len) {
+        box_t b;
+        if (read_box(&b, mvex_body + pos, len - pos) < 0) return;
+        if (box_type(mvex_body + pos) == FOURCC('t','r','e','x')) {
+            const uint8_t *p = mvex_body + pos + b.hdr;
+            size_t r = b.size - b.hdr;
+            if (r >= 8 && rd32(p + 4) == track_id) {
+                if (r < 24) return;
+                out->has_trex = true;
+                out->trex_default_sample_description_index = rd32(p + 8);
+                out->trex_default_sample_duration = rd32(p + 12);
+                out->trex_default_sample_size = rd32(p + 16);
+                out->trex_default_sample_flags = rd32(p + 20);
+                return;
+            }
+        }
+        pos += b.size;
+    }
+}
+
+/* Count moov's trak children and take the trex of track_id from its mvex.
+ * Never fails the parse: a child that does not parse leaves trak_count 0
+ * and ends the walk, and the trex is taken only from an mvex met before it. */
+static void count_traks_and_trex(const uint8_t *moov_body, size_t len,
+                                 uint32_t track_id, moq_cmaf_init_info_t *out)
+{
+    const uint8_t *mvex = NULL;
+    size_t mvex_len = 0;
+    uint32_t traks = 0;
+    bool whole = true;
+    size_t pos = 0;
+    while (pos < len) {
+        box_t b;
+        if (read_box(&b, moov_body + pos, len - pos) < 0) { whole = false; break; }
+        uint32_t type = box_type(moov_body + pos);
+        if (type == FOURCC('t','r','a','k')) {
+            if (traks < UINT32_MAX) traks++;
+        } else if (type == FOURCC('m','v','e','x') && !mvex) {
+            mvex = moov_body + pos + b.hdr;
+            mvex_len = b.size - b.hdr;
+        }
+        pos += b.size;
+    }
+    out->trak_count = whole ? traks : 0;
+    if (mvex) read_trex(mvex, mvex_len, track_id, out);
 }
 
 /* The one init parser: fills a complete, zeroed current-size record. */
@@ -480,9 +560,38 @@ static moq_result_t parse_init_full(moq_bytes_t init_segment,
                      FOURCC('s','t','s','d'), &stsd) != 0)
         return MOQ_ERR_PROTO;
 
-    return parse_stsd_entry(stsd,
+    rc = parse_stsd_entry(stsd,
         (stbl_box.size - stbl_box.hdr) - (size_t)(stsd - (stbl + stbl_box.hdr)),
         out);
+    if (rc < 0) return rc;
+
+    /* The header facts: moov parsed to its trak above, so it is found. */
+    const uint8_t *moov;
+    if (find_box_rc(init_segment.data, init_segment.len,
+                    FOURCC('m','o','o','v'), &moov) == 0) {
+        box_t mb;
+        if (read_box(&mb, moov,
+                init_segment.len - (size_t)(moov - init_segment.data)) == 0)
+            count_traks_and_trex(moov + mb.hdr, mb.size - mb.hdr,
+                                 out->track_id, out);
+    }
+    return MOQ_OK;
+}
+
+/* The largest capability extent out_size holds (out_size >= the v0 floor):
+ * the only sizes the sized parse writes and stamps. */
+static size_t init_info_extent(size_t out_size)
+{
+    static const size_t extents[] = {
+        MOQ_CMAF_INIT_INFO_SIZE_THROUGH_SAMPLE_ENTRY,
+        MOQ_CMAF_INIT_INFO_SIZE_THROUGH_RESERVED,
+        MOQ_CMAF_INIT_INFO_SIZE_THROUGH_CONSTANT_IV,
+        sizeof(moq_cmaf_init_info_t),
+    };
+    size_t w = MOQ_CMAF_INIT_INFO_V0_SIZE;
+    for (size_t i = 0; i < sizeof(extents) / sizeof(extents[0]); i++)
+        if (extents[i] <= out_size) w = extents[i];
+    return w;
 }
 
 moq_result_t moq_cmaf_parse_init_sized(moq_bytes_t init_segment,
@@ -491,8 +600,9 @@ moq_result_t moq_cmaf_parse_init_sized(moq_bytes_t init_segment,
 {
     if (!init_segment.data || !out || out_size < MOQ_CMAF_INIT_INFO_V0_SIZE)
         return MOQ_ERR_INVAL;
-    /* Parse into a private complete record, then hand over the caller's
-     * prefix: a smaller caller never has bytes past its size written, and a
+    /* Parse into a private complete record, then hand over the largest
+     * whole extent the caller's size holds: a smaller caller never has bytes
+     * past its size written, a field is never handed over in part, and a
      * failed parse leaves no partial observation behind. */
     moq_cmaf_init_info_t full;
     moq_cmaf_init_info_init_sized(&full, sizeof(full));
@@ -501,7 +611,7 @@ moq_result_t moq_cmaf_parse_init_sized(moq_bytes_t init_segment,
         moq_cmaf_init_info_init_sized(out, out_size);
         return rc;
     }
-    size_t n = out_size < sizeof(full) ? out_size : sizeof(full);
+    size_t n = init_info_extent(out_size);
     memcpy(out, &full, n);
     out->struct_size = (uint32_t)n;
     return MOQ_OK;
@@ -588,7 +698,8 @@ static moq_result_t parse_trun(const uint8_t *box, size_t avail,
         p += 4; r -= 4;
     }
 
-    if (count == 0) return MOQ_ERR_PROTO;
+    /* sample_count 0 is a valid event-only chunk (ISO/IEC 14496-12 8.8.8
+     * puts no lower bound on it): no records, no buffer needed. */
 
     /* Validate the sample table is structurally possible BEFORE exposing
      * count as a required allocation size. A per-sample record is the sum of
@@ -624,7 +735,7 @@ static moq_result_t parse_trun(const uint8_t *box, size_t avail,
      * parse_fragment() can still reject a malformed remainder (missing mdat,
      * bad moof->mdat ordering, trailing bytes) as PROTO. Only a fully valid
      * fragment whose count exceeds sample_cap returns BUFFER. */
-    if (!out->samples || count > out->sample_cap) {
+    if (count > 0 && (!out->samples || count > out->sample_cap)) {
         *need_buffer = true;
         return MOQ_OK;
     }
@@ -773,7 +884,7 @@ moq_result_t moq_cmaf_parse_fragment(moq_bytes_t fragment,
     if (!expect_moof)
         return MOQ_ERR_PROTO;   /* trailing moof with no mdat */
     out->chunk_count = chunks;
-    if (!got_trun || required_count == 0)
+    if (!got_trun)
         return MOQ_ERR_PROTO;
     if (!got_mdat)
         return MOQ_ERR_PROTO;

@@ -710,6 +710,348 @@ static size_t build_entry_init(uint8_t *buf, size_t cap, uint32_t entry,
     return p;
 }
 
+/* ============ CMAF header facts and zero-sample truns =============== */
+
+static const uint8_t *find_fourcc(const uint8_t *buf, size_t len,
+                                  const char type[4])
+{
+    for (size_t i = 4; i + 4 <= len; i++)
+        if (memcmp(buf + i, type, 4) == 0) return buf + i - 4;
+    return NULL;
+}
+
+/* Parse into a full record, reporting the result. */
+static moq_result_t parse_full(const uint8_t *buf, size_t len,
+                               moq_cmaf_init_info_t *info)
+{
+    memset(info, 0xEE, sizeof(*info));
+    return moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, info,
+                                     sizeof(*info));
+}
+
+static void test_header_facts(void)
+{
+    static const uint32_t trex4[4] = { 1, 3000, 0, 0x01010000u };
+    static const uint8_t kid[16] = { 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+                                     0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,
+                                     0x1C, 0x1D, 0x1E, 0x1F };
+    static const uint8_t avcc[] = { 0x01, 0x64, 0x00, 0x1E, 0xFF };
+    static const uint8_t civ[16] = { 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
+                                     0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB,
+                                     0xAC, 0xAD, 0xAE, 0xAF };
+    moq_cmaf_init_info_t info;
+
+    /* init_trex_defaults: the trex of the track, all four values. */
+    {
+        uint8_t buf[512];
+        size_t len = moq_test_build_cmaf_init_trex(buf, 1, 90000, trex4, 1, true);
+        CHECK(parse_full(buf, len, &info) == MOQ_OK);
+        CHECK(info.struct_size == sizeof(info));
+        CHECK(info.track_id == 1 && info.timescale == 90000);
+        CHECK(info.trak_count == 1);
+        CHECK(info.has_trex);
+        CHECK(info.trex_default_sample_description_index == 1);
+        CHECK(info.trex_default_sample_duration == 3000);
+        CHECK(info.trex_default_sample_size == 0);
+        CHECK(info.trex_default_sample_flags == 0x01010000u);
+        CHECK(!info.has_cenc && info.tenc_version == 0 &&
+              info.default_constant_iv.data == NULL &&
+              info.default_constant_iv.len == 0);
+        CHECK(info._reserved_sample_entry == 0);
+    }
+
+    /* init_trex_other_track: a trex for another track is not this one's. */
+    {
+        uint8_t buf[512];
+        size_t len = moq_test_build_cmaf_init_trex(buf, 1, 90000, trex4, 1, true);
+        const uint8_t *trex = find_fourcc(buf, len, "trex");
+        CHECK(trex != NULL);
+        if (trex) buf[(size_t)(trex - buf) + 15] = 9;   /* track_ID 1 -> 9 */
+        CHECK(parse_full(buf, len, &info) == MOQ_OK);
+        CHECK(info.trak_count == 1 && !info.has_trex);
+        CHECK(info.trex_default_sample_description_index == 0 &&
+              info.trex_default_sample_duration == 0 &&
+              info.trex_default_sample_size == 0 &&
+              info.trex_default_sample_flags == 0);
+    }
+
+    /* init_trex_short: a trex below its 24-byte body is not reported. The
+     * mvex is the last box, so trimming its last four bytes keeps every
+     * enclosing size exact. */
+    {
+        uint8_t buf[512];
+        size_t len = moq_test_build_cmaf_init_trex(buf, 1, 90000, trex4, 1, true);
+        const uint8_t *trex = find_fourcc(buf, len, "trex");
+        const uint8_t *mvex = find_fourcc(buf, len, "mvex");
+        const uint8_t *moov = find_fourcc(buf, len, "moov");
+        CHECK(trex && mvex && moov);
+        if (trex && mvex && moov) {
+            buf[(size_t)(trex - buf) + 3] = 28;
+            buf[(size_t)(mvex - buf) + 3] = 36;
+            size_t at = (size_t)(moov - buf);
+            uint32_t msz = ((uint32_t)buf[at] << 24) | ((uint32_t)buf[at + 1] << 16) |
+                           ((uint32_t)buf[at + 2] << 8) | buf[at + 3];
+            wr32(buf + at, msz - 4);
+            len -= 4;
+        }
+        CHECK(parse_full(buf, len, &info) == MOQ_OK);
+        CHECK(info.trak_count == 1 && !info.has_trex);
+        CHECK(info.trex_default_sample_flags == 0);
+    }
+
+    /* init_no_mvex: no trex, the parse still succeeds. */
+    {
+        uint8_t buf[512];
+        size_t len = moq_test_build_cmaf_init_trex(buf, 1, 90000, trex4, 1, false);
+        CHECK(parse_full(buf, len, &info) == MOQ_OK);
+        CHECK(info.trak_count == 1 && !info.has_trex);
+        CHECK(info.codec_kind == MOQ_CMAF_CODEC_AVC);
+    }
+
+    /* init_two_traks: both counted; the first trak is the record's. */
+    {
+        uint8_t buf[512];
+        size_t len = moq_test_build_cmaf_init_trex(buf, 1, 90000, trex4, 2, true);
+        CHECK(parse_full(buf, len, &info) == MOQ_OK);
+        CHECK(info.trak_count == 2 && info.track_id == 1 && info.has_trex);
+    }
+
+    /* init_moov_tail_malformed: a child that overruns moov leaves the count
+     * at 0, and the parse succeeds as before. */
+    {
+        uint8_t buf[512];
+        size_t len = moq_test_build_cmaf_init_trex(buf, 1, 90000, trex4, 1, false);
+        const uint8_t *moov = find_fourcc(buf, len, "moov");
+        CHECK(moov != NULL);
+        if (moov) {
+            size_t at = (size_t)(moov - buf);
+            uint32_t msz = ((uint32_t)buf[at] << 24) | ((uint32_t)buf[at + 1] << 16) |
+                           ((uint32_t)buf[at + 2] << 8) | buf[at + 3];
+            wr32(buf + at, msz + 8);
+            wr32(buf + len, 0x100);                 /* overruns moov */
+            memcpy(buf + len + 4, "junk", 4);
+            len += 8;
+        }
+        CHECK(parse_full(buf, len, &info) == MOQ_OK);
+        CHECK(info.trak_count == 0);
+        CHECK(info.codec_kind == MOQ_CMAF_CODEC_AVC && info.timescale == 90000);
+    }
+
+    /* init_tenc_v1_pattern: crypt 1, skip 9; a v0 tenc reports no pattern. */
+    {
+        uint8_t buf[1024];
+        moq_test_cenc_init_opts_t o = { .pattern = 0x19 };
+        size_t len = moq_test_build_cmaf_init_cenc_ex(buf, 1, 90000, 64, 64,
+            avcc, sizeof(avcc), "cbcs", 1, 8, kid, 1, MOQ_TEST_CENC_OK, &o);
+        CHECK(parse_full(buf, len, &info) == MOQ_OK);
+        CHECK(info.has_cenc && info.tenc_version == 1);
+        CHECK(info.default_crypt_byte_block == 1);
+        CHECK(info.default_skip_byte_block == 9);
+        CHECK(info.default_constant_iv.len == 0);
+        len = moq_test_build_cmaf_init_cenc_ex(buf, 1, 90000, 64, 64,
+            avcc, sizeof(avcc), "cenc", 1, 8, kid, 0, MOQ_TEST_CENC_OK, &o);
+        CHECK(parse_full(buf, len, &info) == MOQ_OK);
+        CHECK(info.has_cenc && info.tenc_version == 0);
+        CHECK(info.default_crypt_byte_block == 0 && info.default_skip_byte_block == 0);
+    }
+
+    /* init_cbcs_constant_iv_16 and _8: borrowed from the input. */
+    for (size_t n = 8; n <= 16; n += 8) {
+        uint8_t buf[1024];
+        moq_test_cenc_init_opts_t o = { .pattern = 0x19,
+            .constant_iv_size = (uint8_t)n, .constant_iv = civ,
+            .constant_iv_len = n, .with_trex = true,
+            .trex = { 1, 0, 0, 0x01010000u } };
+        size_t len = moq_test_build_cmaf_init_cenc_ex(buf, 1, 90000, 64, 64,
+            avcc, sizeof(avcc), "cbcs", 1, 0, kid, 1, MOQ_TEST_CENC_OK, &o);
+        CHECK(parse_full(buf, len, &info) == MOQ_OK);
+        CHECK(info.default_constant_iv.len == n);
+        CHECK(info.default_constant_iv.data >= buf &&
+              info.default_constant_iv.data + n <= buf + len);
+        if (info.default_constant_iv.len == n)
+            CHECK(memcmp(info.default_constant_iv.data, civ, n) == 0);
+        CHECK(info.has_trex && info.trex_default_sample_flags == 0x01010000u);
+        CHECK(info.trak_count == 1);
+    }
+
+    /* init_constant_iv_truncated, and the cases that carry no constant IV:
+     * a size byte that is not 8 or 16, a per-sample IV size, unprotected. */
+    {
+        static const struct { uint8_t size; size_t len; uint8_t iv; uint8_t prot; }
+        rows[] = { { 16, 8, 0, 1 }, { 12, 12, 0, 1 }, { 8, 8, 8, 1 },
+                   { 8, 8, 0, 0 }, { 16, 15, 0, 1 } };
+        for (size_t r = 0; r < sizeof(rows) / sizeof(rows[0]); r++) {
+            uint8_t buf[1024];
+            moq_test_cenc_init_opts_t o = { .constant_iv_size = rows[r].size,
+                .constant_iv = civ, .constant_iv_len = rows[r].len };
+            size_t len = moq_test_build_cmaf_init_cenc_ex(buf, 1, 90000, 64, 64,
+                avcc, sizeof(avcc), "cbcs", rows[r].prot, rows[r].iv, kid, 1,
+                MOQ_TEST_CENC_OK, &o);
+            CHECK(parse_full(buf, len, &info) == MOQ_OK);
+            CHECK(info.has_cenc);
+            CHECK(info.default_constant_iv.data == NULL &&
+                  info.default_constant_iv.len == 0);
+        }
+    }
+}
+
+/* The record with every header fact set, for the extent matrix. */
+static size_t build_facts_init(uint8_t *buf)
+{
+    static const uint8_t kid[16] = { 1, 2, 3, 4, 5, 6, 7, 8,
+                                     9, 10, 11, 12, 13, 14, 15, 16 };
+    static const uint8_t avcc[] = { 0x01, 0x64, 0x00, 0x1E, 0xFF };
+    static const uint8_t civ[16] = { 0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5,
+                                     0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB,
+                                     0xCC, 0xCD, 0xCE, 0xCF };
+    moq_test_cenc_init_opts_t o = { .pattern = 0x19, .constant_iv_size = 16,
+        .constant_iv = civ, .constant_iv_len = 16, .with_trex = true,
+        .trex = { 2, 1024, 7, 0x02000000u } };
+    return moq_test_build_cmaf_init_cenc_ex(buf, 3, 48000, 64, 64,
+        avcc, sizeof(avcc), "cbcs", 1, 0, kid, 1, MOQ_TEST_CENC_OK, &o);
+}
+
+static void test_init_extents(void)
+{
+    uint8_t buf[1024];
+    size_t len = build_facts_init(buf);
+    const size_t full = sizeof(moq_cmaf_init_info_t);
+    const size_t ext[] = { MOQ_CMAF_INIT_INFO_V0_SIZE,
+                           MOQ_CMAF_INIT_INFO_SIZE_THROUGH_SAMPLE_ENTRY,
+                           MOQ_CMAF_INIT_INFO_SIZE_THROUGH_RESERVED,
+                           MOQ_CMAF_INIT_INFO_SIZE_THROUGH_CONSTANT_IV, full };
+
+    moq_cmaf_init_info_t ref;
+    CHECK(parse_full(buf, len, &ref) == MOQ_OK);
+    CHECK(ref.has_trex && ref.trak_count == 1 && ref.tenc_version == 1 &&
+          ref.default_constant_iv.len == 16 && ref.sample_entry != 0);
+
+    /* The extents are ordered and the reserved word covers the old tail. */
+    CHECK(MOQ_CMAF_INIT_INFO_SIZE_THROUGH_SAMPLE_ENTRY ==
+          MOQ_CMAF_INIT_INFO_V0_SIZE + sizeof(uint32_t));
+    CHECK(MOQ_CMAF_INIT_INFO_SIZE_THROUGH_RESERVED ==
+          MOQ_CMAF_INIT_INFO_V0_SIZE + 2 * sizeof(uint32_t));
+    CHECK(offsetof(moq_cmaf_init_info_t, trak_count) ==
+          MOQ_CMAF_INIT_INFO_SIZE_THROUGH_RESERVED);
+    CHECK(MOQ_CMAF_INIT_INFO_SIZE_THROUGH_CONSTANT_IV <= full);
+
+    /* init_extent_matrix: every size from the floor to past the record. */
+    for (size_t out_size = MOQ_CMAF_INIT_INFO_V0_SIZE; out_size <= full + 8;
+         out_size++) {
+        union {
+            moq_cmaf_init_info_t rec;
+            unsigned char raw[sizeof(moq_cmaf_init_info_t) + 16];
+        } out;
+        memset(out.raw, 0xA5, sizeof(out.raw));
+        size_t want = MOQ_CMAF_INIT_INFO_V0_SIZE;
+        for (size_t e = 0; e < sizeof(ext) / sizeof(ext[0]); e++)
+            if (ext[e] <= out_size) want = ext[e];
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &out.rec,
+                                        out_size) == MOQ_OK);
+        CHECK(out.rec.struct_size == want);
+        CHECK(memcmp(out.raw + sizeof(uint32_t),
+                     (const unsigned char *)&ref + sizeof(uint32_t),
+                     want - sizeof(uint32_t)) == 0);
+        for (size_t b = want; b < sizeof(out.raw); b++)
+            if (out.raw[b] != 0xA5) { CHECK(out.raw[b] == 0xA5); break; }
+    }
+
+    /* init_extent_old_lp64: the released LP64 size (104) is the reserved
+     * extent, so an old caller gets exactly the bytes it got before: the v0
+     * prefix, sample_entry and four zero bytes. The ILP32 size (68) is the
+     * sample_entry extent there; tests/unit/test_abi_layout_d22.c pins both
+     * on each data model. */
+    if (sizeof(void *) == 8) {
+        CHECK(MOQ_CMAF_INIT_INFO_SIZE_THROUGH_RESERVED == 104);
+        union {
+            moq_cmaf_init_info_t rec;
+            unsigned char raw[sizeof(moq_cmaf_init_info_t)];
+        } out;
+        memset(out.raw, 0xA5, sizeof(out.raw));
+        CHECK(moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len }, &out.rec,
+                                        104) == MOQ_OK);
+        CHECK(out.rec.struct_size == 104);
+        CHECK(out.rec.sample_entry == ref.sample_entry);
+        CHECK(out.raw[100] == 0 && out.raw[101] == 0 && out.raw[102] == 0 &&
+              out.raw[103] == 0);
+        for (size_t b = 104; b < sizeof(out.raw); b++)
+            if (out.raw[b] != 0xA5) { CHECK(out.raw[b] == 0xA5); break; }
+    }
+}
+
+/* moof(mfhd traf(tfhd tfdt trun[count 0, data-offset])) + mdat(payload). */
+static size_t build_event_chunk(uint8_t *out, const uint8_t *payload,
+                                size_t payload_len, bool with_mdat)
+{
+    size_t p = 0;
+    p += box_hdr(out + p, 8 + 16 + 8 + 16 + 20 + 20, "moof");
+    p += box_hdr(out + p, 16, "mfhd");
+    wr32(out + p, 0); p += 4;
+    wr32(out + p, 0); p += 4;
+    p += box_hdr(out + p, 8 + 16 + 20 + 20, "traf");
+    p += box_hdr(out + p, 16, "tfhd");
+    wr32(out + p, 0x00020000); p += 4;
+    wr32(out + p, 1); p += 4;
+    p += box_hdr(out + p, 20, "tfdt");
+    wr32(out + p, 0x01000000); p += 4;
+    wr32(out + p, 0); p += 4;
+    wr32(out + p, 96000); p += 4;
+    p += box_hdr(out + p, 20, "trun");
+    wr32(out + p, 0x00000001); p += 4;          /* data-offset-present */
+    wr32(out + p, 0); p += 4;                   /* sample_count 0 */
+    wr32(out + p, 96); p += 4;                  /* moof 88 + mdat header */
+    if (with_mdat) {
+        p += box_hdr(out + p, (uint32_t)(8 + payload_len), "mdat");
+        if (payload_len) { memcpy(out + p, payload, payload_len); p += payload_len; }
+    }
+    return p;
+}
+
+static void test_zero_sample_trun(void)
+{
+    /* frag_zero_samples_ok: an event-only chunk parses with no samples and
+     * an empty mdat. */
+    {
+        uint8_t buf[256];
+        size_t n = build_event_chunk(buf, NULL, 0, true);
+        moq_cmaf_sample_t samples[4];
+        moq_cmaf_fragment_info_t frag;
+        moq_cmaf_fragment_info_init(&frag, samples, 4);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ buf, n }, &frag) == MOQ_OK);
+        CHECK(frag.sample_count == 0 && frag.chunk_count == 1);
+        CHECK(frag.mdat.data == buf + n && frag.mdat.len == 0);
+        CHECK(frag.has_base_decode_time && frag.base_decode_time == 96000);
+        CHECK(frag.track_id == 1);
+    }
+    /* frag_zero_samples_null_table: no sample table is needed for none. */
+    {
+        uint8_t buf[256];
+        size_t n = build_event_chunk(buf, (const uint8_t *)"ab", 2, true);
+        moq_cmaf_fragment_info_t frag;
+        moq_cmaf_fragment_info_init(&frag, NULL, 0);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ buf, n }, &frag) == MOQ_OK);
+        CHECK(frag.sample_count == 0 && frag.mdat.len == 2);
+    }
+    /* The mdat is still required. */
+    {
+        uint8_t buf[256];
+        size_t n = build_event_chunk(buf, NULL, 0, false);
+        moq_cmaf_fragment_info_t frag;
+        moq_cmaf_fragment_info_init(&frag, NULL, 0);
+        CHECK(moq_cmaf_parse_fragment((moq_bytes_t){ buf, n }, &frag) == MOQ_ERR_PROTO);
+        CHECK(frag.sample_count == 0);
+    }
+    /* Object validation still requires samples (CMSF section 3.4). */
+    {
+        uint8_t buf[256];
+        size_t n = build_event_chunk(buf, NULL, 0, true);
+        moq_cmaf_object_report_t rep;
+        CHECK(moq_cmaf_validate_object(NULL, (moq_bytes_t){ buf, n }, &rep)
+              == MOQ_ERR_PROTO);
+        CHECK(rep.reason == MOQ_CMAF_ERR_NO_SAMPLES);
+    }
+}
+
 /* ================================================================== */
 
 int main(void)
@@ -2063,7 +2405,11 @@ int main(void)
             memset(out.raw, 0xEE, sizeof(out.raw));
             moq_result_t rc = moq_cmaf_parse_init_sized((moq_bytes_t){ buf, len },
                                                         &out.rec, sizes[k]);
-            size_t written = sizes[k] < full ? sizes[k] : full;
+            /* Whole extents only: a size that cuts sample_entry gets the v0
+             * prefix, never part of the field. */
+            size_t written = sizes[k] >= full ? full
+                           : sizes[k] >= entry_end ? entry_end
+                           : MOQ_CMAF_INIT_INFO_V0_SIZE;
             if (sizes[k] < MOQ_CMAF_INIT_INFO_V0_SIZE) {
                 CHECK(rc == MOQ_ERR_INVAL);
                 written = 0;
@@ -2110,6 +2456,10 @@ int main(void)
                 CHECK(out.raw[b] == 0xEE);
         }
     }
+
+    test_header_facts();
+    test_init_extents();
+    test_zero_sample_trun();
 
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

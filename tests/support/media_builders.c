@@ -100,6 +100,17 @@ size_t moq_test_build_cmaf_chunk_no_samples(uint8_t *out, uint32_t track_id,
     return p;
 }
 
+/* mvex( trex(track_id, sdi, duration, size, flags) ): 40 bytes. */
+static size_t put_mvex_trex(uint8_t *b, uint32_t track_id, const uint32_t trex4[4])
+{
+    size_t p = moq_test_box_hdr(b, 40, "mvex");
+    p += moq_test_box_hdr(b + p, 32, "trex");
+    wr32(b + p, 0); p += 4;          /* version + flags */
+    wr32(b + p, track_id); p += 4;
+    for (int i = 0; i < 4; i++) { wr32(b + p, trex4[i]); p += 4; }
+    return p;
+}
+
 size_t moq_test_build_cmaf_init_cenc(uint8_t *out, uint32_t track_id,
                                      uint32_t timescale,
                                      uint16_t w, uint16_t h,
@@ -109,6 +120,26 @@ size_t moq_test_build_cmaf_init_cenc(uint8_t *out, uint32_t track_id,
                                      uint8_t iv_size, const uint8_t kid[16],
                                      uint8_t tenc_version, uint32_t omit)
 {
+    return moq_test_build_cmaf_init_cenc_ex(out, track_id, timescale, w, h,
+        avcc, avcc_len, scheme, default_is_protected, iv_size, kid,
+        tenc_version, omit, NULL);
+}
+
+size_t moq_test_build_cmaf_init_cenc_ex(uint8_t *out, uint32_t track_id,
+                                        uint32_t timescale,
+                                        uint16_t w, uint16_t h,
+                                        const uint8_t *avcc, size_t avcc_len,
+                                        const char scheme[4],
+                                        uint8_t default_is_protected,
+                                        uint8_t iv_size, const uint8_t kid[16],
+                                        uint8_t tenc_version, uint32_t omit,
+                                        const moq_test_cenc_init_opts_t *opts)
+{
+    const moq_test_cenc_init_opts_t none = { 0 };
+    if (!opts) opts = &none;
+    size_t civ_bytes = opts->constant_iv_size ? 1 + opts->constant_iv_len : 0;
+    size_t mvex_box = opts->with_trex ? 40 : 0;
+
     /* Bottom-up sizes (0 = box omitted). */
     size_t avcc_box = (omit & MOQ_TEST_CENC_OMIT_AVCC) ? 0 : (8 + avcc_len);
     size_t frma_box = (omit & MOQ_TEST_CENC_OMIT_FRMA) ? 0 : 12;     /* hdr + 4cc */
@@ -117,7 +148,8 @@ size_t moq_test_build_cmaf_init_cenc(uint8_t *out, uint32_t track_id,
     size_t tenc_body = (omit & MOQ_TEST_CENC_OMIT_TENC) ? 0
                      : ((omit & MOQ_TEST_CENC_SHORT_TENC) ? 10
                        : ((omit & MOQ_TEST_CENC_ONE_SHORT_TENC) ? 23
-                         : ((omit & MOQ_TEST_CENC_TRAILING_TENC) ? 28 : 24)));
+                         : ((omit & MOQ_TEST_CENC_TRAILING_TENC) ? 28
+                           : 24 + civ_bytes)));
     size_t tenc_box = (omit & MOQ_TEST_CENC_OMIT_TENC) ? 0 : (8 + tenc_body);
     size_t schi_box = (omit & MOQ_TEST_CENC_OMIT_SCHI) ? 0 : (8 + tenc_box);
     size_t sinf_box = (omit & MOQ_TEST_CENC_OMIT_SINF)
@@ -130,7 +162,7 @@ size_t moq_test_build_cmaf_init_cenc(uint8_t *out, uint32_t track_id,
     size_t mdia_box = 8 + mdhd_box + minf_box;
     size_t tkhd_box = 24;
     size_t trak_box = 8 + tkhd_box + mdia_box;
-    size_t moov_box = 8 + trak_box;
+    size_t moov_box = 8 + trak_box + mvex_box;
 
     size_t p = 0;
 
@@ -208,7 +240,7 @@ size_t moq_test_build_cmaf_init_cenc(uint8_t *out, uint32_t track_id,
                     memset(out + p, 0, 6); p += 6; /* truncated body (<24) */
                 } else {
                     out[p++] = 0;                  /* reserved */
-                    out[p++] = 0;                  /* reserved (pattern in v1) */
+                    out[p++] = opts->pattern;      /* reserved (pattern in v1) */
                     out[p++] = default_is_protected;
                     out[p++] = iv_size;
                     size_t kid_len = (omit & MOQ_TEST_CENC_ONE_SHORT_TENC)
@@ -216,11 +248,75 @@ size_t moq_test_build_cmaf_init_cenc(uint8_t *out, uint32_t track_id,
                     memcpy(out + p, kid, kid_len); p += kid_len;
                     if (omit & MOQ_TEST_CENC_TRAILING_TENC) {
                         memset(out + p, 0, 4); p += 4;  /* trailing data */
+                    } else if (opts->constant_iv_size) {
+                        out[p++] = opts->constant_iv_size;
+                        if (opts->constant_iv_len) {
+                            memcpy(out + p, opts->constant_iv,
+                                   opts->constant_iv_len);
+                            p += opts->constant_iv_len;
+                        }
                     }
                 }
             }
         }
     }
 
+    if (opts->with_trex)
+        p += put_mvex_trex(out + p, track_id, opts->trex);
+    return p;
+}
+
+size_t moq_test_build_cmaf_init_trex(uint8_t *out, uint32_t track_id,
+                                     uint32_t timescale,
+                                     const uint32_t trex4[4],
+                                     unsigned traks, bool with_mvex)
+{
+    static const uint8_t avcc[] = { 0x01, 0x64, 0x00, 0x1E, 0xFF };
+    /* One trak: tkhd(24) mdia(mdhd(28) minf(stbl(stsd(avc1(78 + avcC))))). */
+    size_t avcc_box = 8 + sizeof(avcc);
+    size_t avc1_box = 8 + 78 + avcc_box;
+    size_t stsd_box = 8 + 8 + avc1_box;
+    size_t stbl_box = 8 + stsd_box;
+    size_t minf_box = 8 + stbl_box;
+    size_t mdia_box = 8 + 28 + minf_box;
+    size_t trak_box = 8 + 24 + mdia_box;
+    size_t moov_box = 8 + (size_t)traks * trak_box + (with_mvex ? 40 : 0);
+
+    size_t p = 0;
+    p += moq_test_box_hdr(out + p, 20, "ftyp");
+    memcpy(out + p, "cmfc", 4); p += 4;
+    wr32(out + p, 0); p += 4;
+    memcpy(out + p, "iso6", 4); p += 4;
+
+    p += moq_test_box_hdr(out + p, (uint32_t)moov_box, "moov");
+    for (unsigned t = 0; t < traks; t++) {
+        p += moq_test_box_hdr(out + p, (uint32_t)trak_box, "trak");
+        p += moq_test_box_hdr(out + p, 24, "tkhd");
+        wr32(out + p, 0); p += 4;
+        wr32(out + p, 0); p += 4;
+        wr32(out + p, 0); p += 4;
+        wr32(out + p, track_id + t); p += 4;
+        p += moq_test_box_hdr(out + p, (uint32_t)mdia_box, "mdia");
+        p += moq_test_box_hdr(out + p, 28, "mdhd");
+        wr32(out + p, 0); p += 4;
+        wr32(out + p, 0); p += 4;
+        wr32(out + p, 0); p += 4;
+        wr32(out + p, timescale); p += 4;
+        wr32(out + p, 0); p += 4;
+        p += moq_test_box_hdr(out + p, (uint32_t)minf_box, "minf");
+        p += moq_test_box_hdr(out + p, (uint32_t)stbl_box, "stbl");
+        p += moq_test_box_hdr(out + p, (uint32_t)stsd_box, "stsd");
+        wr32(out + p, 0); p += 4;
+        wr32(out + p, 1); p += 4;
+        p += moq_test_box_hdr(out + p, (uint32_t)avc1_box, "avc1");
+        memset(out + p, 0, 78);
+        wr16(out + p + 24, 640);
+        wr16(out + p + 26, 360);
+        p += 78;
+        p += moq_test_box_hdr(out + p, (uint32_t)avcc_box, "avcC");
+        memcpy(out + p, avcc, sizeof(avcc)); p += sizeof(avcc);
+    }
+    if (with_mvex)
+        p += put_mvex_trex(out + p, track_id, trex4);
     return p;
 }

@@ -6,8 +6,8 @@
 # on the freestanding C headers, so no sysroot is needed. The two targets
 # differ in the alignment uint64_t gets inside a struct (8 on ARM, 4 on
 # i686), so the struct layout pins in tests/unit/test_abi_layout_d22.c,
-# tests/unit/test_abi_layout_mpeg2ts.c and tests/unit/test_abi_layout_msf02.c
-# are compiled for both as well, in
+# tests/unit/test_abi_layout_mpeg2ts.c, tests/unit/test_abi_layout_msf02.c and
+# media/locmaf/tests/locmaf_layout_probe.c are compiled for both as well, in
 # normal and short-enum modes, with every tier whose public headers are
 # freestanding. Each mode pins its own ABI; these
 # checks do not imply that objects built with different enum modes can mix.
@@ -37,6 +37,7 @@ EOF
 LAYOUT_INCLUDES=()
 for dir in core/include sim/include media/loc/include media/object/include \
            media/msf/include media/cmaf/include media/mpeg2ts/include \
+           media/locmaf/include \
            service/include relay/include \
            adapters/mvfst/include adapters/proxygen/include; do
     if [ -d "$ROOT/$dir" ]; then
@@ -69,6 +70,13 @@ for target in armv8m.main-none-eabi i686-linux-gnu; do
                 status=1
             fi
         done
+        if "$CC" --target="$target" "${LAYOUT_FLAGS[@]}" \
+            "${LAYOUT_INCLUDES[@]}" "$ROOT/media/locmaf/tests/locmaf_layout_probe.c"; then
+            echo "PASSED: locmaf_layout_probe.c pins hold for $target ($mode enums)"
+        else
+            echo "FAILED: locmaf_layout_probe.c pins broken for $target ($mode enums)"
+            status=1
+        fi
     done
 done
 

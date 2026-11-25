@@ -1202,7 +1202,25 @@ _Static_assert(MOQ_CMAF_INIT_INFO_V0_SIZE == ABI_PICK(96, 64, 64),
                "moq_cmaf_init_info_t: v0 floor");
 PIN_AFTER(moq_cmaf_init_info_t, default_kid, sample_entry);
 PIN_AT(moq_cmaf_init_info_t, sample_entry, 96, 64, 64);
-PIN_SIZE(moq_cmaf_init_info_t, 104, 68, 68);
+/* The released sizes are capability extents: LP64's old sizeof (104) is the
+ * extent through the reserved word that names its tail padding, and ILP32's
+ * (68) is the extent through sample_entry, which had none. The header-facts
+ * block starts past both. */
+_Static_assert(MOQ_CMAF_INIT_INFO_SIZE_THROUGH_SAMPLE_ENTRY == ABI_PICK(100, 68, 68),
+               "moq_cmaf_init_info_t: extent through sample_entry");
+_Static_assert(MOQ_CMAF_INIT_INFO_SIZE_THROUGH_RESERVED == ABI_PICK(104, 72, 72),
+               "moq_cmaf_init_info_t: extent through the reserved word");
+PIN_AT(moq_cmaf_init_info_t, _reserved_sample_entry, 100, 68, 68);
+PIN_AT(moq_cmaf_init_info_t, trak_count, 104, 72, 72);
+PIN_AT(moq_cmaf_init_info_t, has_trex, 108, 76, 76);
+PIN_AT(moq_cmaf_init_info_t, trex_default_sample_description_index, 112, 80, 80);
+PIN_AT(moq_cmaf_init_info_t, trex_default_sample_flags, 124, 92, 92);
+PIN_AT(moq_cmaf_init_info_t, tenc_version, 128, 96, 96);
+PIN_AT(moq_cmaf_init_info_t, default_skip_byte_block, 130, 98, 98);
+PIN_AT(moq_cmaf_init_info_t, default_constant_iv, 136, 100, 100);
+_Static_assert(MOQ_CMAF_INIT_INFO_SIZE_THROUGH_CONSTANT_IV == ABI_PICK(152, 108, 108),
+               "moq_cmaf_init_info_t: extent through default_constant_iv");
+PIN_SIZE(moq_cmaf_init_info_t, 152, 108, 108);
 PIN_AT(moq_media_receiver_info_t, max_bytes, 16, 16, 16);
 PIN_AT(moq_media_receiver_info_t, companion_profile, 28, 28, 28);
 PIN_AT(moq_media_receiver_info_t, track_events_polled, 40, 40, 40);

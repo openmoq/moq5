@@ -226,11 +226,13 @@ moq_result_t moq_msf_track_to_media_info_sized(
 
             if (out_init) {
                 /* The caller's record is out_init_size bytes, which may be
-                 * smaller than this build's: hand over only its prefix. */
-                size_t n = out_init_size < sizeof(parsed) ?
-                           out_init_size : sizeof(parsed);
-                memcpy(out_init, &parsed, n);
-                out_init->struct_size = (uint32_t)n;
+                 * smaller than this build's: the parser writes the largest
+                 * whole capability extent it holds, never part of one. */
+                rc = moq_cmaf_parse_init_sized(raw, out_init, out_init_size);
+                if (rc < 0) {
+                    moq_rcbuf_decref(decoded);
+                    return rc;
+                }
                 *out_init_buf = decoded;
             } else {
                 moq_rcbuf_decref(decoded);
