@@ -439,6 +439,9 @@ struct moq_media_track {
     bool             forward_sent;     /* last forward state sent (pause) */
     bool             forward_desired;
     bool             passive;          /* subscribed with Forward 0 (option) */
+    bool             raised;           /* r->mu: the app raised the passive track
+                                          (moq_media_receiver_set_track_forward);
+                                          reconciliation forwards it while set */
     /* -- update-acknowledgment attribution state machine --------------- *
      * app_gen bumps on every subscribe_track/unsubscribe_track call that
      * CHANGES desired_subscribed; reconciled_app_gen is the newest app
@@ -7815,6 +7818,7 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
          * toggle or silently swallow the toggle's own future update. */
         pthread_mutex_lock(&r->mu);
         bool want = t->desired_subscribed;
+        bool raised = t->raised;
         uint64_t gen_snap = t->app_gen;
         pthread_mutex_unlock(&r->mu);
         /* Queued objects for a disabled track are purged in unsubscribe_track
@@ -7825,7 +7829,9 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
          * its attribution, and must stay unreconciled for the next pass. */
         RECONCILE_RACE_HOOK();
 
-        bool target = want && flow_allows && !t->passive;
+        /* A passive track forwards only while the app raised it; raising
+         * sends this update alone (never a join fill, on any draft). */
+        bool target = want && flow_allows && (!t->passive || raised);
         t->forward_desired = target;
         if (t->forward_desired == t->forward_sent) {
             moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
@@ -9980,6 +9986,35 @@ moq_result_t moq_media_receiver_unsubscribe_track(
      * that arrive before the forward=false update lands are dropped at intake. */
     obj_compact_locked(r, keep_not_track, track);
     track->has_drop_filter = false;
+    pthread_mutex_unlock(&r->mu);
+
+    moq_endpoint_wake(r->ep);
+    return MOQ_OK;
+}
+
+moq_result_t moq_media_receiver_set_track_forward(
+    moq_media_receiver_t *r, moq_media_track_t *track, bool forward)
+{
+    if (!r || !track) return MOQ_ERR_INVAL;
+    if (r->ep && moq_endpoint_is_closed(r->ep)) return MOQ_ERR_CLOSED;
+
+    pthread_mutex_lock(&r->mu);
+    if (r->fatal) { pthread_mutex_unlock(&r->mu); return MOQ_ERR_CLOSED; }
+    if (!receiver_owns_track(r, track)) {
+        pthread_mutex_unlock(&r->mu);
+        return MOQ_ERR_INVAL;
+    }
+    /* Only a track the app subscribed passively, still wanted and alive. */
+    bool passive = track->desired_options.has_forward && !track->desired_options.forward;
+    if (!passive || !track->desired_subscribed || track->removed || track->ended ||
+        track->auth_failed || track->local_result != MOQ_OK) {
+        pthread_mutex_unlock(&r->mu);
+        return MOQ_ERR_WRONG_STATE;
+    }
+    if (track->raised != forward) {
+        track->raised = forward;
+        track->app_gen++;          /* state-changing app intent */
+    }
     pthread_mutex_unlock(&r->mu);
 
     moq_endpoint_wake(r->ep);
