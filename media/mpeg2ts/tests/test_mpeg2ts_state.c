@@ -1280,6 +1280,70 @@ static void test_receiver_reorder(void)
     free(rx);
 }
 
+/* MOQ_MPEG2TS_OBJ_JOINABLE: a known mid-Group join starts the window after
+ * the join grace, not after the whole window; Object 0, a swapped first pair
+ * and a started window keep today's rules. Window 300 ms, grace 50 ms. */
+static void test_receiver_join_grace(void)
+{
+    uint8_t good[188];
+    tb_pkt_t p = { .pid = 0x101 };
+    tb_packet(good, &p);
+    moq_bytes_t G = B(good, 188);
+    const uint32_t J = MOQ_MPEG2TS_OBJ_JOINABLE;
+    const uint64_t W = 300000, GR = MOQ_MPEG2TS_JOIN_GRACE_US;
+    moq_mpeg2ts_reorder_slot_t slots[4];
+    moq_mpeg2ts_delivery_t d;
+    CHECK(GR < W);
+
+    /* Not joinable: a mid-Group head waits the whole window (unchanged). */
+    moq_mpeg2ts_receiver_t *rx = new_rx(MOQ_MPEG2TS_PID_AUTO, slots, 4, W);
+    CHECK(moq_mpeg2ts_receiver_offer(rx, 1000, 7, 12, 0, G, NULL) == MOQ_OK);
+    CHECK(moq_mpeg2ts_receiver_next_deadline_us(rx) == 1000 + W);
+    CHECK(moq_mpeg2ts_receiver_poll(rx, 1000 + GR, &d, sizeof(d)) == MOQ_DONE);
+    CHECK(moq_mpeg2ts_receiver_poll(rx, 1000 + W, &d, sizeof(d)) == MOQ_OK && d.object == 12);
+    free(rx);
+
+    /* Joinable mid-Group head: due after the grace, no gap, joined mid-Group. */
+    rx = new_rx(MOQ_MPEG2TS_PID_AUTO, slots, 4, W);
+    CHECK(moq_mpeg2ts_receiver_offer(rx, 1000, 7, 12, J, G, NULL) == MOQ_OK);
+    CHECK(moq_mpeg2ts_receiver_next_deadline_us(rx) == 1000 + GR);
+    CHECK(moq_mpeg2ts_receiver_poll(rx, 1000 + GR - 1, &d, sizeof(d)) == MOQ_DONE);
+    CHECK(moq_mpeg2ts_receiver_poll(rx, 1000 + GR, &d, sizeof(d)) == MOQ_OK);
+    CHECK(d.group == 7 && d.object == 12 && d.result.joined_mid_group && !d.result.gap);
+    /* Started: the flag no longer shortens anything. A hole waits the window. */
+    CHECK(moq_mpeg2ts_receiver_offer(rx, 2000, 7, 14, J, G, NULL) == MOQ_OK);
+    CHECK(moq_mpeg2ts_receiver_next_deadline_us(rx) == 2000 + W);
+    CHECK(moq_mpeg2ts_receiver_poll(rx, 2000 + GR, &d, sizeof(d)) == MOQ_DONE);
+    CHECK(moq_mpeg2ts_receiver_offer(rx, 2010, 7, 13, J, G, NULL) == MOQ_OK);
+    CHECK(moq_mpeg2ts_receiver_poll(rx, 2010, &d, sizeof(d)) == MOQ_OK && d.object == 13);
+    CHECK(moq_mpeg2ts_receiver_poll(rx, 2010, &d, sizeof(d)) == MOQ_OK && d.object == 14);
+    free(rx);
+
+    /* A swapped first pair inside the grace goes out in order. */
+    rx = new_rx(MOQ_MPEG2TS_PID_AUTO, slots, 4, W);
+    CHECK(moq_mpeg2ts_receiver_offer(rx, 1000, 7, 13, J, G, NULL) == MOQ_OK);
+    CHECK(moq_mpeg2ts_receiver_offer(rx, 1020, 7, 12, J, G, NULL) == MOQ_OK);
+    CHECK(moq_mpeg2ts_receiver_poll(rx, 1020, &d, sizeof(d)) == MOQ_DONE);
+    CHECK(moq_mpeg2ts_receiver_poll(rx, 1000 + GR, &d, sizeof(d)) == MOQ_OK && d.object == 12);
+    CHECK(!d.result.gap);
+    CHECK(moq_mpeg2ts_receiver_poll(rx, 1000 + GR, &d, sizeof(d)) == MOQ_OK && d.object == 13);
+    CHECK(!d.result.gap);
+    free(rx);
+
+    /* Object 0 is released at once, joinable or not (unchanged). */
+    rx = new_rx(MOQ_MPEG2TS_PID_AUTO, slots, 4, W);
+    CHECK(moq_mpeg2ts_receiver_offer(rx, 1000, 8, 0, J, G, NULL) == MOQ_OK);
+    CHECK(moq_mpeg2ts_receiver_poll(rx, 1000, &d, sizeof(d)) == MOQ_OK);
+    CHECK(d.group == 8 && d.object == 0 && !d.result.joined_mid_group);
+    free(rx);
+
+    /* A window shorter than the grace bounds it. */
+    rx = new_rx(MOQ_MPEG2TS_PID_AUTO, slots, 4, 20000);
+    CHECK(moq_mpeg2ts_receiver_offer(rx, 1000, 7, 12, J, G, NULL) == MOQ_OK);
+    CHECK(moq_mpeg2ts_receiver_next_deadline_us(rx) == 1000 + 20000);
+    free(rx);
+}
+
 /* -- Packetizer --------------------------------------------------------------- */
 
 typedef struct emitted {
@@ -2243,6 +2307,7 @@ int main(void)
     test_receiver_rejected_run();
     test_receiver_group_end();
     test_receiver_reorder();
+    test_receiver_join_grace();
     test_packetizer_lead_in();
     test_packetizer_rai_before_pes();
     test_switch_renditions();

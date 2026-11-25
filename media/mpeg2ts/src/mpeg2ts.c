@@ -1819,8 +1819,20 @@ static moq_mpeg2ts_reorder_slot_t *rx_head(const moq_mpeg2ts_receiver_t *rx,
     return head;
 }
 
-/* The earliest arrival of a held Object plus the window, saturating: the
- * one expiry rule shared by poll() and deadline(). */
+/* How long a held Object may wait: the window, or for a joinable Object of
+ * a receiver that has not started, the join grace bounded by the window. */
+static uint64_t rx_wait_us(const moq_mpeg2ts_receiver_t *rx,
+                           const moq_mpeg2ts_reorder_slot_t *s)
+{
+    uint64_t w = rx->_cfg.reorder_window_us;
+    if (!rx->_started && (s->flags & MOQ_MPEG2TS_OBJ_JOINABLE) &&
+        MOQ_MPEG2TS_JOIN_GRACE_US < w)
+        w = MOQ_MPEG2TS_JOIN_GRACE_US;
+    return w;
+}
+
+/* The earliest arrival of a held Object plus its wait, saturating: the one
+ * expiry rule shared by poll() and deadline(). */
 static uint64_t rx_expiry(const moq_mpeg2ts_receiver_t *rx)
 {
     uint64_t best = UINT64_MAX;
@@ -1828,8 +1840,8 @@ static uint64_t rx_expiry(const moq_mpeg2ts_receiver_t *rx)
     for (size_t i = 0; i < rx->_cfg.reorder_slot_count; i++) {
         const moq_mpeg2ts_reorder_slot_t *s = &rx->_cfg.reorder_slots[i];
         if (!s->used) continue;
-        uint64_t d = s->arrival_us > UINT64_MAX - rx->_cfg.reorder_window_us
-                   ? UINT64_MAX : s->arrival_us + rx->_cfg.reorder_window_us;
+        uint64_t w = rx_wait_us(rx, s);
+        uint64_t d = s->arrival_us > UINT64_MAX - w ? UINT64_MAX : s->arrival_us + w;
         if (!any || d < best) best = d;
         any = true;
     }

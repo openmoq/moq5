@@ -365,6 +365,11 @@ struct moq_media_track {
     /* The join PSI (mpeg2ts_join_psi) went out with an Object of generation
      * ts_gen the application polled: no later Object of it carries it. */
     bool             ts_join_delivered;
+    /* Executor only: a raise of this passive track's Forward State is under
+     * way, so the relay starts it mid-Group; its Objects may start the
+     * window without waiting for Object 0 (MOQ_MPEG2TS_OBJ_JOINABLE) until
+     * the window releases its first Object. */
+    bool             ts_rejoin;
     receiver_track_options_t desired_options;
 
     /* Data path (network-thread state). */
@@ -5750,6 +5755,7 @@ typedef struct receiver_ts {
     uint64_t                    status_seq, status_us;
     bool                        end_pending;
     uint64_t                    end_group, end_object;
+    bool                        released_any;   /* the window released an Object */
 } receiver_ts_t;
 
 /* The window ctx of a track's END_OF_TRACK (an address no holder has). */
@@ -5987,6 +5993,8 @@ static bool receiver_ts_drain(moq_media_receiver_t *r, moq_media_track_t *t,
             return true;
         }
         ts->has_parked = false;
+        ts->released_any = true;
+        t->ts_rejoin = false;      /* the window has started */
     }
     ts_set_stalled(r, ts, false);
     if (ts->end_pending) {
@@ -6225,6 +6233,7 @@ static void receiver_on_ts_object(moq_media_receiver_t *r,
     moq_bytes_t pl = { so->payload ? moq_rcbuf_data(so->payload) : NULL,
                        so->payload ? moq_rcbuf_len(so->payload) : 0 };
     uint32_t flags = so->end_of_group ? MOQ_MPEG2TS_OBJ_SUBGROUP_ENDS_GROUP : 0u;
+    if (t->ts_rejoin && !ts->released_any) flags |= MOQ_MPEG2TS_OBJ_JOINABLE;
     moq_result_t rc = moq_mpeg2ts_receiver_offer(&ts->rx, now_us,
                                                  so->group_id, so->object_id,
                                                  flags, pl, h);
@@ -7832,6 +7841,38 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
         /* A passive track forwards only while the app raised it; raising
          * sends this update alone (never a join fill, on any draft). */
         bool target = want && flow_allows && (!t->passive || raised);
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+        /* A raise of a passive MPEG-TS track: the relay starts forwarding it
+         * mid-Group, so its first Objects may start the window at once
+         * instead of waiting for Object 0 or the whole window. A window that
+         * already released Objects before a lower is started afresh, since
+         * the raised stream resumes past its last Location. */
+        if (target && t->passive && !t->forward_sent && !t->ts_rejoin && t->ts) {
+            receiver_ts_t *ts = (receiver_ts_t *)t->ts;
+            if (!ts->released_any) {
+                t->ts_rejoin = true;
+            } else {
+                /* Objects still held from before the lower are not wanted;
+                 * they count as received and dropped, so none vanishes. */
+                uint64_t held = 0;
+                for (size_t i = 0; i < ts->slot_count; i++)
+                    if (ts->slots[i].used && ts->slots[i].ctx &&
+                        ts->slots[i].ctx != RECEIVER_TS_END_MARK) held++;
+                if (ts->has_parked && ts->parked.ctx &&
+                    ts->parked.ctx != RECEIVER_TS_END_MARK) held++;
+                if (receiver_ts_start(r, t, t->desired_ts_program)) {
+                    t->ts_rejoin = true;
+                    if (held) {
+                        pthread_mutex_lock(&r->mu);
+                        r->stats.objects_received += held;
+                        r->stats.objects_dropped += held;
+                        pthread_mutex_unlock(&r->mu);
+                    }
+                }
+                /* else: allocation failed; the next pass tries again */
+            }
+        }
+#endif
         t->forward_desired = target;
         if (t->forward_desired == t->forward_sent) {
             moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
