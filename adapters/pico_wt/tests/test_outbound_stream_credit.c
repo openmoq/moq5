@@ -16,7 +16,8 @@
  * raw-bidi-cancel parks a FETCH above the peer's bidi credit and cancels it
  * before any credit arrives. Neither RESET_STREAM nor STOP_SENDING may name
  * the parked stream: the peer never opened it, and a frame for it is a
- * STREAM_LIMIT_ERROR (RFC 9000 section 4.6) that closes the connection.
+ * STREAM_LIMIT_ERROR (RFC 9000 section 4.6) that closes the connection. Once
+ * credit arrives, both deferred frames go out and the connection stays up.
  */
 #include "pico_wt_harness.h"
 #include <moq/moq.h>
@@ -539,6 +540,21 @@ static void run(bool wt, bool bidi, bool reset, bool cancel, uint8_t discriminat
         CHECK(p.forbidden == 0 && p.resets == 0 && p.stops == 0);
         CHECK(rc == 0 && healthy(&p));
         CHECK(picoquic_find_stream(p.receiver, p.target_sid) == NULL);
+        /* Release credit as the held rows do: the deferred RESET_STREAM and
+         * STOP_SENDING for the parked stream now go out, the peer sees both,
+         * and the connection stays up. */
+        for (unsigned i = 0; i < permitted; i++) {
+            moq_done_subscribe_cfg_t done;
+            moq_done_subscribe_cfg_init(&done);
+            CHECK(moq_session_done_subscribe(p.h.server_session, p.server_sub[i], &done, p.h.now) == MOQ_OK);
+        }
+        rc = pump(&p, 500000);
+        printf("%s granted: pump=%d healthy=%d grant=%"PRIu64" forbidden=%u target frames/reset/stop=%u/%u/%u\n",
+               row, rc, healthy(&p), p.observed_credit, p.forbidden, p.frames, p.resets, p.stops);
+        CHECK(rc == 0 && healthy(&p));
+        CHECK(p.grant_rx > 0 && p.observed_credit > p.initial_credit);
+        CHECK(p.forbidden == 0 && p.frames == 0);
+        CHECK(p.resets > 0 && p.stops > 0);
         goto done;
     }
     CHECK((bidi ? subscribe(&p, permitted) : publish(&p, permitted, !reset)) == MOQ_OK);

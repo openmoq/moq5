@@ -11,3 +11,4 @@
 0009-stateless-reset-ingress.patch
 0010-refuse-stop-after-direct-receive.patch
 0011-serialize-crypto-provider-initialization.patch
+0012-defer-stop-sending-above-stream-credit.patch

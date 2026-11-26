@@ -1,0 +1,95 @@
+Defer STOP_SENDING for a local stream above the peer's stream limit
+
+Applies to picoquic 36f49b73d532369882d97474ac018655b6739a58, after 0001 to
+0011.
+
+picoquic already holds STREAM and RESET_STREAM frames for a locally initiated
+stream whose rank is above the peer's MAX_STREAMS, and sends them once credit
+arrives (picoquic_add_output_streams). picoquic_stop_sending() queued its
+frame at once. An application that cancels a request whose bidirectional
+stream is still waiting for credit therefore sent STOP_SENDING for a stream
+the peer had not opened, which RFC 9000 Section 4.6 makes a STREAM_LIMIT_ERROR
+that closes the connection.
+
+The request is now recorded and the frame deferred the same way: when the
+stream comes within credit, picoquic_add_output_streams() queues the deferred
+RESET_STREAM (as before) and then the deferred STOP_SENDING. A stream within
+credit is unchanged.
+
+diff --git a/picoquic/streams.c b/picoquic/streams.c
+index fbeb374..906b35b 100644
+--- a/picoquic/streams.c
++++ b/picoquic/streams.c
+@@ -592,6 +592,35 @@ uint64_t picoquic_get_next_local_stream_id(picoquic_cnx_t* cnx, int is_unidir)
+ * frame, and forwarded at the first occasion.
+ */
+ 
++/* Whether a locally initiated stream is above the peer's current stream
++ * limit for its type: the peer has not seen it, so no frame may name it yet
++ * (RFC 9000 Section 4.6). STREAM and RESET_STREAM frames wait for credit;
++ * STOP_SENDING does the same. */
++static int picoquic_local_stream_above_credit(picoquic_cnx_t* cnx, uint64_t stream_id)
++{
++    return IS_LOCAL_STREAM_ID(stream_id, cnx->client_mode) &&
++        STREAM_RANK_FROM_ID(stream_id) > ((IS_BIDIR_STREAM_ID(stream_id)) ?
++            cnx->max_streams_bidir_remote : cnx->max_streams_unidir_remote);
++}
++
++static int picoquic_queue_stop_sending_frame(picoquic_cnx_t* cnx, picoquic_stream_head_t* stream)
++{
++    uint8_t buffer[128];
++    uint8_t* bytes;
++    int more_data = 0;
++    int is_pure_ack = 0;
++    int ret = 0;
++
++    if ((bytes = picoquic_format_stop_sending_frame(stream, buffer,
++        buffer + sizeof(buffer), &more_data, &is_pure_ack)) == NULL || more_data != 0) {
++        ret = PICOQUIC_ERROR_UNEXPECTED_ERROR;
++    }
++    else if (bytes > buffer) {
++        ret = picoquic_queue_misc_frame(cnx, buffer, bytes - buffer, is_pure_ack, picoquic_packet_context_application);
++    }
++    return ret;
++}
++
+ int picoquic_stop_sending(picoquic_cnx_t* cnx,
+     uint64_t stream_id, uint64_t local_stream_error)
+ {
+@@ -627,19 +656,12 @@ int picoquic_stop_sending(picoquic_cnx_t* cnx,
+         stream->app_stream_ctx = NULL;
+ 
+         if (!stream->stop_sending_requested) {
+-            uint8_t buffer[128];
+-            uint8_t* bytes;
+-            int more_data = 0;
+-            int is_pure_ack = 0;
+-
+             stream->local_stop_error = local_stream_error;
+             stream->stop_sending_requested = 1;
+-            if ((bytes = picoquic_format_stop_sending_frame(stream, buffer,
+-                buffer + sizeof(buffer), &more_data, &is_pure_ack)) == NULL) {
+-                ret = PICOQUIC_ERROR_UNEXPECTED_ERROR;
+-            }
+-            else {
+-                ret = picoquic_queue_misc_frame(cnx, buffer, bytes - buffer, is_pure_ack, picoquic_packet_context_application);
++            /* A stream above the peer's credit keeps the request; the frame
++             * goes out when credit arrives (picoquic_add_output_streams). */
++            if (!picoquic_local_stream_above_credit(cnx, stream_id)) {
++                ret = picoquic_queue_stop_sending_frame(cnx, stream);
+             }
+         }
+     }
+@@ -967,6 +989,12 @@ void picoquic_add_output_streams(picoquic_cnx_t* cnx, uint64_t old_limit, uint64
+                 else {
+                     picoquic_insert_output_stream(cnx, stream);
+                 }
++                /* A STOP_SENDING requested while the stream was above credit. */
++                if (stream->stop_sending_requested && !stream->stop_sending_sent &&
++                    picoquic_queue_stop_sending_frame(cnx, stream) != 0) {
++                    (void)picoquic_connection_error(cnx, PICOQUIC_TRANSPORT_INTERNAL_ERROR, 0);
++                    break;
++                }
+             }
+         }
+         stream = picoquic_next_stream(stream);
