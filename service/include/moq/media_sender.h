@@ -30,6 +30,11 @@
 extern "C" {
 #endif
 
+/* Defined when this header has moq_media_sender_cfg_t.publish_paused and
+ * moq_media_sender_has_media_demand(), so source built against older and newer
+ * libraries can tell. */
+#define MOQ_MEDIA_SENDER_HAS_PUBLISH_PAUSED 1
+
 typedef struct moq_media_sender moq_media_sender_t;
 
 /* The opaque media-track handle, shared by name with the receiver; each
@@ -320,6 +325,15 @@ typedef struct moq_media_sender_cfg {
      * field past this layout's sizeof on every target. */
     moq_msf_revision_t                   catalog_revision;
     uint8_t                              _reserved_catalog_revision[4];
+    /* Appended after catalog_revision. With publish_tracks, send each PUBLISH
+     * (the catalog's too) with Forward 0: nothing is sent on a publication
+     * until the peer sets it to 1 (REQUEST_UPDATE), and a SUBSCRIBE is still
+     * served. Absent or partially covered: false. Ignored without
+     * publish_tracks. Use a sized initializer to set it.
+     * _reserved_publish_paused is never read: it keeps the next appended field
+     * past this layout's sizeof on every target. */
+    bool                                 publish_paused;
+    uint8_t                              _reserved_publish_paused[7];
 } moq_media_sender_cfg_t;
 
 /* Plain init leaves backpressure UNSET on purpose -- the choice is forced,
@@ -1375,6 +1389,14 @@ MOQ_API moq_result_t moq_media_sender_take_new_group_request(
  * catalog-only subscription (a receiver that fetched the catalog but subscribed
  * to no media) does NOT make this true. */
 MOQ_API bool moq_media_sender_has_media_subscriber(const moq_media_sender_t *s);
+
+/* True if ANY app-visible media track would put media on the wire now: it has a
+ * subscriber, or (publish_tracks) its publication is accepted and forwarding.
+ * The "should I encode media?" helper for a publish_tracks sender, whose peer
+ * may take every track by PUBLISH and send no SUBSCRIBE. Same tracks and thread
+ * safety as moq_media_sender_has_media_subscriber(); NULL is false. No demand
+ * callback fires for a publication: poll this. */
+MOQ_API bool moq_media_sender_has_media_demand(const moq_media_sender_t *s);
 
 /* is_closed: clean close / drained. is_fatal: connect, certificate,
  * protocol, transport, or sender failure (catalog encode, setup, namespace

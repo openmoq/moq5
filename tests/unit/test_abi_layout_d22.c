@@ -1276,7 +1276,12 @@ PIN_THROUGH(moq_media_sender_cfg_t, initial_group_id, 208, 132, 144, 8, 4, 8);
 PIN_AFTER(moq_media_sender_cfg_t, initial_group_id, catalog_revision);
 PIN_AT(moq_media_sender_cfg_t, catalog_revision, 208, 132, 144);
 PIN_AT(moq_media_sender_cfg_t, _reserved_catalog_revision, 212, 136, 148);
-PIN_SIZE(moq_media_sender_cfg_t, 216, 140, 152);
+/* catalog_revision's reserved bytes end at the layout's sizeof on every
+ * target, so publish_paused starts exactly there. */
+PIN_AFTER(moq_media_sender_cfg_t, _reserved_catalog_revision, publish_paused);
+PIN_AT(moq_media_sender_cfg_t, publish_paused, 216, 140, 152);
+PIN_AT(moq_media_sender_cfg_t, _reserved_publish_paused, 217, 141, 153);
+PIN_SIZE(moq_media_sender_cfg_t, 224, 148, 160);
 /* The media track's Track Properties start exactly at the sizeof of the
  * layout that ends at the MPEG2TS block (its enum members change that sizeof
  * under short enums, so the pin is relational), never in its tail padding.

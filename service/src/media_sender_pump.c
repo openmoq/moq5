@@ -40,6 +40,7 @@ void sender_fire_closed(moq_media_sender_t *s, bool is_fatal,
             left = t;
         }
         t->active_subs = 0;
+        t->publication_forwards = false;
     }
     /* Terminal (incl. a CLEAN close): disarm the managed wake atomically with
      * the close latch, so a cached finite deadline cannot survive to a cycle
@@ -212,6 +213,10 @@ static moq_result_t sender_publish_track(moq_media_sender_t *s,
     pthread_mutex_lock(&s->mu);
     if (t->removed || t->auth_failed || s->fatal) rc = MOQ_DONE;
     else {
+        if (s->publish_paused) {
+            cfg.has_forward = true;
+            cfg.forward = false;
+        }
         rc = moq_pub_publish_track(s->pub, t->pub_track, &cfg, now_us);
 #ifdef MOQ_MEDIA_SENDER_TESTING
         t->test_publish_attempts++;
@@ -364,6 +369,8 @@ void sender_resync_track_demand(moq_media_sender_t *s,
 {
     size_t real = (s->pub && t->pub_track)
         ? moq_pub_active_subscriptions(s->pub, t->pub_track) : 0;
+    bool forwards = s->publish_tracks && s->pub && t->pub_track &&
+        moq_pub_track_forward(s->pub, t->pub_track);
 #ifdef MOQ_MEDIA_SENDER_TESTING
     if (t->test_demand_set) real = t->test_demand;
 #endif
@@ -372,6 +379,7 @@ void sender_resync_track_demand(moq_media_sender_t *s,
     /* A close may precede publisher event consumption. Its zero demand is
      * final even if a later resync still sees live facade subscriptions. */
     if (s->closed_fired) { pthread_mutex_unlock(&s->mu); return; }
+    t->publication_forwards = forwards;
     size_t old = t->active_subs;
     if (real == old) { pthread_mutex_unlock(&s->mu); return; }
     t->active_subs = real;

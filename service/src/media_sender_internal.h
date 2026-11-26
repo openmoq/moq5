@@ -257,6 +257,8 @@ struct moq_media_track {
     uint64_t              new_group_value;
 
     moq_pub_track_t      *pub_track;         /* NULL until the hook adds it */
+    bool                  publication_forwards; /* mirrored (mu): its accepted
+                                              * PUBLISH forwards */
     size_t                active_subs;       /* mirrored subscriber count (mu);
                                                 reconciled on the network thread
                                                 from moq_pub_active_subscriptions()
@@ -532,6 +534,7 @@ struct moq_media_sender {
     moq_media_send_backpressure_t backpressure;
     bool             validate_cmaf;       /* CMSF §3.3/§3.4 object validation;
                                              strict by default (cfg_init) */
+    bool             publish_paused;      /* those PUBLISHes carry Forward 0 */
     bool             publish_tracks;      /* publisher-initiated PUBLISH per
                                              track + live initial catalog */
     bool             drop_without_demand; /* drop queued media without demand
