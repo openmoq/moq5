@@ -3,7 +3,7 @@
 // by scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: f208243e7287
+// libmoq commit: 8c4f81a1a655
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: x86_64-unknown-linux-gnu with bindgen 0.73.2, libclang from (clang-sys search) (Ubuntu clang version 18.1.3 (1ubuntu1))
 
@@ -26,6 +26,7 @@ pub const MOQ_MEDIA_AUTH_SCOPE_NONE: u32 = 0;
 pub const MOQ_MEDIA_AUTH_SCOPE_SERVICE: u32 = 1;
 pub const MOQ_MEDIA_AUTH_SCOPE_TRACK: u32 = 2;
 pub const MOQ_MEDIA_AUTH_SCOPE_REQUEST: u32 = 3;
+pub const MOQ_MEDIA_SENDER_HAS_PUBLISH_PAUSED: u32 = 1;
 pub const MOQ_MEDIA_SENDER_FATAL_CATALOG_ENCODE: u32 = 1;
 pub const MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED: u32 = 2;
 pub const MOQ_MEDIA_SENDER_FATAL_NAMESPACE_REJECTED: u32 = 3;
