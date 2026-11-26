@@ -30,6 +30,11 @@
 extern "C" {
 #endif
 
+/* Defined when this header has moq_media_sender_cfg_t.publish_paused and
+ * moq_media_sender_has_media_demand(), so source built against older and newer
+ * libraries can tell. */
+#define MOQ_MEDIA_SENDER_HAS_PUBLISH_PAUSED 1
+
 typedef struct moq_media_sender moq_media_sender_t;
 
 /* The opaque media-track handle, shared by name with the receiver; each

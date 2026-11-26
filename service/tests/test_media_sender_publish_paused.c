@@ -16,6 +16,10 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifndef MOQ_MEDIA_SENDER_HAS_PUBLISH_PAUSED
+#error "media_sender.h must advertise publish_paused to source consumers"
+#endif
+
 static int failures = 0;
 
 /* Test seam (media_sender.c, MOQ_MEDIA_SENDER_TESTING). */
