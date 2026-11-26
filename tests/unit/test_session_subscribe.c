@@ -1,9 +1,9 @@
 #include "test_session_support.h"
 #include "../../core/src/session/session_internal.h"
 #include <moq/control_d18.h>
+#include <moq/subscriber.h>
 #ifdef MOQ_TEST_SIM
 #include <moq/sim.h>
-#include <moq/subscriber.h>
 #endif
 
 /* Tracking allocator for the no-slot carrier arena test: counts every alloc/realloc/free
