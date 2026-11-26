@@ -8,6 +8,7 @@ set(MOQ_MEDIA_SENDER_SOURCES
     src/media_sender.c
     src/media_sender_catalog.c
     src/media_sender_complete.c
+    src/media_sender_locmaf.c
     src/media_sender_mpeg2ts.c
     src/media_sender_pump.c
     src/media_sender_timeline.c
@@ -123,6 +124,19 @@ if(TARGET moq::mpeg2ts)
     set(_MOQ_SERVICE_TS_DEFS MOQ_SERVICE_HAVE_MPEG2TS=1)
     set(_MOQ_SERVICE_TS_LIBS moq::mpeg2ts)
 endif()
+# LOCMAF packaging (draft-einarsson-moq-locmaf-01): the receiver's decoding
+# stage and the sender's encoder come from moq::locmaf when it is in the
+# build. Without it LOCMAF tracks have no delivery path and the sender
+# refuses them (MOQ_ERR_UNSUPPORTED); the ABI is the same either way.
+set(_MOQ_SERVICE_LM_DEFS "")
+set(_MOQ_SERVICE_LM_LIBS "")
+set(_MOQ_SERVICE_LM_SOURCES "")
+if(TARGET moq::locmaf)
+    set(_MOQ_SERVICE_LM_DEFS MOQ_SERVICE_HAVE_LOCMAF=1)
+    set(_MOQ_SERVICE_LM_LIBS moq::locmaf)
+    set(_MOQ_SERVICE_LM_SOURCES src/media_receiver_locmaf.c)
+    target_sources(moq-service PRIVATE ${_MOQ_SERVICE_LM_SOURCES})
+endif()
 # The media player (<moq/media_player.h>) composes the receiver with the
 # playback engine, so it is built when the engine is.
 if(TARGET moq::playback)
@@ -130,9 +144,11 @@ if(TARGET moq::playback)
     target_link_libraries(moq-service PUBLIC moq::playback)
 endif()
 target_compile_definitions(moq-service PRIVATE ${_MOQ_SERVICE_FACADE_DEFS}
-                                               ${_MOQ_SERVICE_TS_DEFS})
+                                               ${_MOQ_SERVICE_TS_DEFS}
+                                               ${_MOQ_SERVICE_LM_DEFS})
 target_link_libraries(moq-service PUBLIC ${_MOQ_SERVICE_FACADE_LIBS}
-                                          ${_MOQ_SERVICE_TS_LIBS})
+                                          ${_MOQ_SERVICE_TS_LIBS}
+                                          ${_MOQ_SERVICE_LM_LIBS})
 
 set_target_properties(moq-service PROPERTIES
     C_VISIBILITY_PRESET hidden
@@ -683,14 +699,16 @@ if(MOQ_BUILD_TESTS)
 
         add_library(moq-service-receiver-test-internals OBJECT
             src/media_receiver.c src/media_receiver_order.c src/media_auth.c
-            src/endpoint.c src/endpoint_uri.c)
+            src/endpoint.c src/endpoint_uri.c ${_MOQ_SERVICE_LM_SOURCES})
         target_include_directories(moq-service-receiver-test-internals
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(moq-service-receiver-test-internals
-            PUBLIC moq::core moq::msf Threads::Threads ${_MOQ_SERVICE_TS_LIBS})
+            PUBLIC moq::core moq::msf Threads::Threads ${_MOQ_SERVICE_TS_LIBS}
+                   ${_MOQ_SERVICE_LM_LIBS})
         target_compile_definitions(moq-service-receiver-test-internals
-            PRIVATE ${_MOQ_SERVICE_TS_DEFS} MOQ_MEDIA_RECEIVER_TESTING=1 ${_MOQ_SERVICE_FACADE_DEFS})
+            PRIVATE ${_MOQ_SERVICE_TS_DEFS} ${_MOQ_SERVICE_LM_DEFS}
+                    MOQ_MEDIA_RECEIVER_TESTING=1 ${_MOQ_SERVICE_FACADE_DEFS})
         target_link_libraries(moq-service-receiver-test-internals
             PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
         target_compile_features(moq-service-receiver-test-internals
@@ -1022,6 +1040,33 @@ if(MOQ_BUILD_TESTS)
             add_test(NAME media_receiver_fill_control COMMAND test_media_receiver_fill_control)
             set_tests_properties(media_receiver_fill_control PROPERTIES TIMEOUT 30)
 
+            # LOCMAF tracks: live decoding, Group slots and their accounting,
+            # and the fill hand-off (white-box).
+            if(TARGET moq::locmaf)
+                foreach(_lm_test media_receiver_locmaf media_receiver_locmaf_fill)
+                    add_executable(test_${_lm_test}
+                        tests/test_${_lm_test}.c
+                        ${PROJECT_SOURCE_DIR}/tests/support/media_builders.c
+                        src/media_receiver_order.c ${_MOQ_SERVICE_LM_SOURCES})
+                    target_link_libraries(test_${_lm_test} PRIVATE
+                        moq-service-endpoint-test-internals moq::msf moq::loc
+                        ${_MOQ_SERVICE_TS_LIBS} ${_MOQ_SERVICE_LM_LIBS})
+                    target_include_directories(test_${_lm_test} PRIVATE
+                        ${PROJECT_SOURCE_DIR}/tests/unit
+                        ${PROJECT_SOURCE_DIR}/tests/support)
+                    target_compile_definitions(test_${_lm_test} PRIVATE
+                        ${_MOQ_SERVICE_TS_DEFS} ${_MOQ_SERVICE_LM_DEFS})
+                    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+                        target_compile_options(test_${_lm_test} PRIVATE
+                            -Wall -Wextra -Wpedantic
+                            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+                    endif()
+                    add_test(NAME ${_lm_test} COMMAND test_${_lm_test})
+                    set_tests_properties(${_lm_test} PROPERTIES TIMEOUT 60
+                        LABELS "service;locmaf")
+                endforeach()
+            endif()
+
             # Fills of an MPEG2TS track: per-fill delivery domains, the
             # terminal after the fill's Objects and its loss summary.
             if(TARGET moq::mpeg2ts)
@@ -1311,9 +1356,11 @@ if(MOQ_BUILD_TESTS)
             PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(moq-service-sender-test-internals
-            PUBLIC moq::core moq::msf Threads::Threads ${_MOQ_SERVICE_TS_LIBS})
+            PUBLIC moq::core moq::msf Threads::Threads ${_MOQ_SERVICE_TS_LIBS}
+                   ${_MOQ_SERVICE_LM_LIBS})
         target_compile_definitions(moq-service-sender-test-internals
-            PRIVATE ${_MOQ_SERVICE_TS_DEFS} MOQ_MEDIA_SENDER_TESTING=1 ${_MOQ_SERVICE_FACADE_DEFS})
+            PRIVATE ${_MOQ_SERVICE_TS_DEFS} ${_MOQ_SERVICE_LM_DEFS}
+                    MOQ_MEDIA_SENDER_TESTING=1 ${_MOQ_SERVICE_FACADE_DEFS})
         target_link_libraries(moq-service-sender-test-internals
             PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
         target_compile_features(moq-service-sender-test-internals
@@ -1612,15 +1659,16 @@ if(MOQ_BUILD_TESTS)
             add_library(moq-service-refresh-test-internals OBJECT
                 ${MOQ_MEDIA_SENDER_TEST_SOURCES} src/media_receiver.c
                 src/media_receiver_order.c src/media_auth.c
-                src/endpoint.c src/endpoint_uri.c)
+                src/endpoint.c src/endpoint_uri.c ${_MOQ_SERVICE_LM_SOURCES})
             target_include_directories(moq-service-refresh-test-internals
                 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
             target_link_libraries(moq-service-refresh-test-internals
                 PUBLIC moq::core moq::msf Threads::Threads
-                       ${_MOQ_SERVICE_TS_LIBS})
+                       ${_MOQ_SERVICE_TS_LIBS} ${_MOQ_SERVICE_LM_LIBS})
             target_compile_definitions(moq-service-refresh-test-internals
-                PRIVATE ${_MOQ_SERVICE_TS_DEFS} MOQ_MEDIA_SENDER_TESTING=1 MOQ_MEDIA_RECEIVER_TESTING=1
+                PRIVATE ${_MOQ_SERVICE_TS_DEFS} ${_MOQ_SERVICE_LM_DEFS}
+                MOQ_MEDIA_SENDER_TESTING=1 MOQ_MEDIA_RECEIVER_TESTING=1
                 ${_MOQ_SERVICE_FACADE_DEFS})
             target_link_libraries(moq-service-refresh-test-internals
                 PUBLIC ${_MOQ_SERVICE_FACADE_LIBS})
@@ -1694,6 +1742,27 @@ if(MOQ_BUILD_TESTS)
                 target_link_libraries(test_media_late_joiner_fill PRIVATE moq::playback)
                 target_compile_definitions(test_media_late_joiner_fill PRIVATE
                     LJ_HAVE_PLAYBACK)
+            endif()
+
+            # LOCMAF end to end: a production sender's encoder and wire
+            # buffers, and a production receiver's decoding, on every draft.
+            if(TARGET moq::locmaf)
+                add_executable(test_media_sender_locmaf
+                    tests/test_media_sender_locmaf.c
+                    ${PROJECT_SOURCE_DIR}/tests/support/media_builders.c)
+                target_link_libraries(test_media_sender_locmaf PRIVATE
+                    moq-service-refresh-test-internals moq::sim)
+                target_include_directories(test_media_sender_locmaf PRIVATE
+                    ${PROJECT_SOURCE_DIR}/tests/unit
+                    ${PROJECT_SOURCE_DIR}/tests/support)
+                if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+                    target_compile_options(test_media_sender_locmaf PRIVATE
+                        -Wall -Wextra -Wpedantic
+                        $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+                endif()
+                add_test(NAME media_sender_locmaf COMMAND test_media_sender_locmaf)
+                set_tests_properties(media_sender_locmaf PROPERTIES TIMEOUT 60
+                    LABELS "service;locmaf")
             endif()
 
             # Negotiated-profile closure tests. Two independent directions
@@ -1875,6 +1944,30 @@ if(MOQ_BUILD_TESTS)
                     --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
             set_tests_properties(media_mpeg2ts_loopback PROPERTIES
                 LABELS "network" TIMEOUT 120 RESOURCE_LOCK service_network)
+        endif()
+
+        # LOCMAF through the service tier over a real loopback, both drafts:
+        # the sender's and the receiver's halves, each against a raw-session
+        # server.
+        if(TARGET moq::locmaf)
+            add_executable(test_media_locmaf_loopback
+                tests/test_media_locmaf_loopback.c
+                ${PROJECT_SOURCE_DIR}/tests/support/media_builders.c)
+            target_link_libraries(test_media_locmaf_loopback PRIVATE
+                moq::service moq::adapter-picoquic-threaded moq::msf
+                moq::locmaf Threads::Threads)
+            target_include_directories(test_media_locmaf_loopback PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit
+                ${PROJECT_SOURCE_DIR}/tests/support)
+            target_compile_options(test_media_locmaf_loopback PRIVATE
+                -Wall -Wextra -Wpedantic
+                $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+            add_test(NAME media_locmaf_loopback
+                COMMAND test_media_locmaf_loopback
+                    --cert "${MOQ_PICOQUIC_SOURCE_DIR}/certs/cert.pem"
+                    --key "${MOQ_PICOQUIC_SOURCE_DIR}/certs/key.pem")
+            set_tests_properties(media_locmaf_loopback PROPERTIES
+                LABELS "network;locmaf" TIMEOUT 120 RESOURCE_LOCK service_network)
         endif()
 
         add_executable(test_media_receiver_subscribe

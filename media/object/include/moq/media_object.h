@@ -39,6 +39,11 @@ typedef uint32_t moq_media_packaging_t;
  * build that includes moq::mpeg2ts; any other build returns
  * MOQ_ERR_UNSUPPORTED. */
 #define MOQ_MEDIA_PACKAGING_MPEG2TS 3u
+/* MSF packaging "locmaf" (draft-einarsson-moq-locmaf-01). Its Objects depend
+ * on earlier Objects of their group, so the stateless parser below answers
+ * MOQ_ERR_UNSUPPORTED; decode with moq_locmaf_decoder_push() and parse the
+ * canonical chunk as CMAF. */
+#define MOQ_MEDIA_PACKAGING_LOCMAF  4u
 
 /* Why an object was dropped. Fixed-width uint32_t for ABI stability. Values
  * are never renumbered. Unknown reasons must be ignored. */
@@ -316,6 +321,8 @@ MOQ_API void moq_media_parsed_object_init_sized(moq_media_parsed_object_t *out,
  *
  * Returns MOQ_OK on success.
  * MPEG2TS requires parse_sized below, with explicit packet-size context.
+ * LOCMAF is never parsed here (MOQ_ERR_UNSUPPORTED, see
+ * MOQ_MEDIA_PACKAGING_LOCMAF).
  * Returns MOQ_ERR_INVAL on bad struct_size, NULL required pointers,
  *   a covered-but-unsupported transport_version,
  *   invalid packaging/media_type, terminal with payload, normal
@@ -425,7 +432,9 @@ typedef struct moq_media_object_parse_cfg {
  * returns INVAL for TS. Valid TS context in a build without moq::mpeg2ts
  * returns UNSUPPORTED. Empty, partial or invalid-sync TS packets return PROTO
  * with drop reason MOQ_MEDIA_DROP_MALFORMED_MPEG2TS. An MPEG2TS object's
- * properties are not parsed as LOC, so its metadata stays empty. */
+ * properties are not parsed as LOC, so its metadata stays empty.
+ *
+ * LOCMAF returns MOQ_ERR_UNSUPPORTED (see MOQ_MEDIA_PACKAGING_LOCMAF). */
 MOQ_API moq_result_t moq_media_object_parse_sized(
     const moq_media_track_info_t *track,
     const moq_media_object_input_t *in,

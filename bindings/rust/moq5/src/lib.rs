@@ -5,7 +5,9 @@
 //! publishes a namespace with an MSF/CMSF catalog, and a [`Receiver`] that
 //! discovers and receives one. MPEG-TS tracks are written as transport
 //! streams ([`Sender::write_mpeg2ts`]) and described by their records
-//! ([`Mpeg2tsRecordRef`]); on draft 22, objects carry their LOC-04 metadata
+//! ([`Mpeg2tsRecordRef`]); LOCMAF tracks ([`Packaging::Locmaf`]) are
+//! written and received as CMAF chunks, the service encoding and decoding
+//! them; on draft 22, objects carry their LOC-04 metadata
 //! ([`ObjectMetadata`]) and their track's Track Properties, and a
 //! subscription can ask for a fill of what a relay retains
 //! ([`FillOptions`]). With the `player` feature, the `player` module plays
@@ -102,9 +104,9 @@ pub use moq5_core::{
     Result, SliceError, Version,
 };
 pub use moq5_media::{
-    cmaf, CompanionProfile, LocMetadata, Marking, MediaType, Mpeg2tsKeys, Mpeg2tsMode,
-    Mpeg2tsRecord, Mpeg2tsRecordRef, Mpeg2tsTimestampMode, MsfRevision, ObjectMetadata, Packaging,
-    SapType, TimeDomain, TrackExtension,
+    cmaf, CompanionProfile, LocMetadata, LocmafRecordRef, Marking, MediaType, Mpeg2tsKeys,
+    Mpeg2tsMode, Mpeg2tsRecord, Mpeg2tsRecordRef, Mpeg2tsTimestampMode, MsfRevision,
+    ObjectMetadata, Packaging, SapType, TimeDomain, TrackExtension,
 };
 
 mod endpoint;

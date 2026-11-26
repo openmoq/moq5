@@ -150,8 +150,9 @@ compile_sub "$repo/service/src/media_receiver_order.c" $MEDIA_INCLUDES
 # The media SENDER: the sender rows execute the shipped C on the host too, with
 # no testing seam -- a live, unconnected root already answers every pre-ready
 # path the rows pin.
-for _m in media_sender media_sender_catalog media_sender_complete media_sender_mpeg2ts \
-          media_sender_pump media_sender_timeline media_sender_tracks media_sender_write; do
+for _m in media_sender media_sender_catalog media_sender_complete media_sender_locmaf \
+          media_sender_mpeg2ts media_sender_pump media_sender_timeline media_sender_tracks \
+          media_sender_write; do
     compile_sub "$repo/service/src/$_m.c" $MEDIA_INCLUDES
 done
 # The codec signaling utility, compiled WITHOUT any redirect: the recorder's

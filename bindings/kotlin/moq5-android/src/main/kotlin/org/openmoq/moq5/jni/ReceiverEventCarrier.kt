@@ -205,10 +205,12 @@ internal object ReceiverTimelineScalars {
 
 /**
  * The scalar block `nativeReceiverStats` fills: one slot per
- * `moq_media_receiver_stats_t` field, in the struct's order; the two booleans
- * as 0/1. The block after [TRACKS_MALFORMED] is written only when the
- * library's stamp covered all of it, through `loc_order_forced`
- * ([HAS_REVISION_BLOCK] 1); otherwise its slots are zero and unobserved.
+ * `moq_media_receiver_stats_t` field through `loc_order_forced`, in the
+ * struct's order; the two booleans as 0/1. The block after
+ * [TRACKS_MALFORMED] is written only when the library's stamp covered all of
+ * it, through `loc_order_forced` ([HAS_REVISION_BLOCK] 1); otherwise its
+ * slots are zero and unobserved. The LOCMAF counters after
+ * `loc_order_forced` have no slot.
  */
 internal object ReceiverStatsScalars {
     const val OBJECTS_RECEIVED = 0

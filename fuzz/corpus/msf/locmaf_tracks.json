@@ -1,0 +1,18 @@
+{
+  "version": "draft-02",
+  "generatedAt": 1746104606044,
+  "initDataList": [
+    { "id": "v", "type": "inline", "data": "AAAAGGZ0eXBpc282AAAAAGlzbzZjbWZj" }
+  ],
+  "tracks": [
+    { "name": "video", "packaging": "locmaf", "isLive": true, "role": "video",
+      "codec": "avc1.64001f", "initRef": "v", "locmafVersion": "0.3",
+      "packagingMetadata": "streamMapping=object" },
+    { "name": "audio", "packaging": "locmaf", "isLive": true, "role": "audio",
+      "codec": "mp4a.40.2", "initRef": "v", "locmafVersion": 3 },
+    { "name": "next", "packaging": "locmaf", "isLive": true, "role": "video",
+      "codec": "avc1.64001f", "initRef": "v", "locmafVersion": "0.4" },
+    { "name": "plain", "packaging": "cmaf", "isLive": true, "role": "video",
+      "codec": "avc1.64001f", "initRef": "v", "locmafVersion": "0.3" }
+  ]
+}

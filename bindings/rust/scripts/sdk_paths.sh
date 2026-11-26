@@ -23,7 +23,7 @@
 #   moq5_sdk_export_link_mode <prefix> state that mode to the pkg-config crate
 #                                     for every tier package it probes
 #                                     (LIBMOQ_<TIER>_STATIC / _DYNAMIC for the
-#                                     core, sim, media and service), each
+#                                     core, sim, media, locmaf and service), each
 #                                     opposite variable cleared, and set
 #                                     MOQ5_SDK_LINK_MODE; it changes the
 #                                     caller's environment, so it is called
@@ -60,7 +60,7 @@
 
 # The tier packages moq5-sys probes, by the variable stem the pkg-config
 # crate derives from each name.
-MOQ5_SDK_TIER_STEMS="LIBMOQ_CORE LIBMOQ_SIM LIBMOQ_MEDIA LIBMOQ_SERVICE"
+MOQ5_SDK_TIER_STEMS="LIBMOQ_CORE LIBMOQ_SIM LIBMOQ_MEDIA LIBMOQ_LOCMAF LIBMOQ_SERVICE"
 
 moq5_sdk_pkgconfig() {
     local d pc

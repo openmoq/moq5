@@ -314,7 +314,10 @@ empty for MPEG-TS), and `description.init_data` the resolved init bytes.
 kind, dimensions, CENC parameters, and `sample_entry`, the entry's four bytes
 such as `b"avc1"` or `b"avc3"`, the `frma` original format for an encrypted
 entry); it is `None` for LOC and MPEG-TS tracks and for a CMAF track whose
-header did not parse.
+header did not parse. A LOCMAF track (draft-einarsson-moq-locmaf-01) reads
+`Packaging.LOCMAF` with `cmaf` set as for CMAF; the service rebuilds its
+objects as canonical CMAF, so they read `Packaging.CMAF`, and a sender track
+takes `Packaging.LOCMAF` with its CMAF header in `init_data`.
 
 MSF-02 catalogs may change a declared track. An advisory change keeps the
 `Track` and publishes a new description generation: the `UPDATED` event's

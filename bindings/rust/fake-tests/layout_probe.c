@@ -3,13 +3,17 @@
  * members of the player records' unions too), and the frozen v0 floors. The
  * Rust side compares each entry with the bindgen-generated types; a name on
  * one side and not the other is a failure too. The player's records are
- * probed when the test crate is built with its `player` feature. */
+ * probed when the test crate is built with its `player` feature, and the
+ * LOCMAF records moq5-media reads and writes with its `locmaf` feature. */
 
 #include <moq/endpoint.h>
 #include <moq/media_receiver.h>
 #include <moq/media_sender.h>
 #ifdef MOQ5_LAYOUT_PLAYER
 #include <moq/media_player.h>
+#endif
+#ifdef MOQ5_LAYOUT_LOCMAF
+#include <moq/locmaf.h>
 #endif
 
 #include <stddef.h>
@@ -282,6 +286,12 @@ static const moq5_layout_entry_t entries[] = {
     F(moq_media_receiver_stats_t, compression_ignored),
     F(moq_media_receiver_stats_t, event_timeline_headers_ignored),
     F(moq_media_receiver_stats_t, loc_order_gaps), F(moq_media_receiver_stats_t, loc_order_forced),
+    F(moq_media_receiver_stats_t, locmaf_objects_rebuilt),
+    F(moq_media_receiver_stats_t, locmaf_objects_undecodable),
+    F(moq_media_receiver_stats_t, locmaf_objects_expired),
+    F(moq_media_receiver_stats_t, locmaf_objects_late),
+    F(moq_media_receiver_stats_t, locmaf_groups_evicted),
+    F(moq_media_receiver_stats_t, locmaf_resets),
 
     V(MOQ_ENDPOINT_CFG_V0_SIZE), V(MOQ_ENDPOINT_TERMINAL_V0_SIZE),
     V(MOQ_MEDIA_AUTH_REQUEST_V0_SIZE), V(MOQ_MEDIA_AUTH_OUTCOME_INFO_V0_SIZE),
@@ -370,6 +380,9 @@ static const moq5_layout_entry_t entries[] = {
     F(moq_msf_track_supplement_t, depends_render_groups),
     F(moq_msf_track_supplement_t, depends_render_group_count),
     F(moq_msf_track_supplement_t, malformed), V(MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE),
+    S(moq_msf_locmaf_t), F(moq_msf_locmaf_t, struct_size), F(moq_msf_locmaf_t, has_version),
+    F(moq_msf_locmaf_t, version), F(moq_msf_locmaf_t, malformed), V(MOQ_MSF_LOCMAF_V0_SIZE),
+    V(MOQ_MSF_EXT_LOCMAF), V(MOQ_MSF_LOCMAF_F_VERSION), V(MOQ_MEDIA_PACKAGING_LOCMAF),
     S(moq_loc_metadata_t), F(moq_loc_metadata_t, struct_size), F(moq_loc_metadata_t, present),
     F(moq_loc_metadata_t, timestamp), F(moq_loc_metadata_t, timescale),
     F(moq_loc_metadata_t, marking_len), F(moq_loc_metadata_t, marking),
@@ -476,6 +489,69 @@ static const moq5_layout_entry_t entries[] = {
     V(MOQ_MEDIA_PLAYER_FEEDBACK_V0_SIZE), V(MOQ_MEDIA_PLAYER_STATS_V0_SIZE),
     V(MOQ_PLAYBACK_CFG_V0_SIZE), V(MOQ_MEDIA_PLAYER_OUTPUT_DETAIL_MAX),
     V(MOQ_MEDIA_PLAYER_EVENT_DETAIL_MAX),
+#endif
+
+#ifdef MOQ5_LAYOUT_LOCMAF
+    /* The records moq5-media's locmaf module fills, reads or allocates: the
+     * decoder and encoder states are opaque to it, so only their size and
+     * alignment are probed. */
+    S(moq_locmaf_track_t), F(moq_locmaf_track_t, struct_size), F(moq_locmaf_track_t, track_id),
+    F(moq_locmaf_track_t, trex_default_sample_description_index),
+    F(moq_locmaf_track_t, trex_default_sample_duration),
+    F(moq_locmaf_track_t, trex_default_sample_size),
+    F(moq_locmaf_track_t, trex_default_sample_flags), F(moq_locmaf_track_t, is_protected),
+    F(moq_locmaf_track_t, default_per_sample_iv_size), F(moq_locmaf_track_t, _reserved),
+    S(moq_locmaf_gen_box_t), FN(moq_locmaf_gen_box_t, type, "type_"),
+    F(moq_locmaf_gen_box_t, _reserved),
+    F(moq_locmaf_gen_box_t, payload),
+    S(moq_locmaf_sample_t), F(moq_locmaf_sample_t, duration), F(moq_locmaf_sample_t, size),
+    F(moq_locmaf_sample_t, flags), F(moq_locmaf_sample_t, subsample_count),
+    F(moq_locmaf_sample_t, composition_offset), F(moq_locmaf_sample_t, offset),
+    F(moq_locmaf_sample_t, subsample_index), F(moq_locmaf_sample_t, _reserved),
+    S(moq_locmaf_subsample_t), F(moq_locmaf_subsample_t, clear_bytes),
+    F(moq_locmaf_subsample_t, protected_bytes),
+    S(moq_locmaf_chunk_t), F(moq_locmaf_chunk_t, struct_size), F(moq_locmaf_chunk_t, kind),
+    F(moq_locmaf_chunk_t, base_media_decode_time), F(moq_locmaf_chunk_t, sample_description_index),
+    F(moq_locmaf_chunk_t, sample_count), F(moq_locmaf_chunk_t, samples),
+    F(moq_locmaf_chunk_t, per_sample_iv_size), F(moq_locmaf_chunk_t, has_aux_info),
+    F(moq_locmaf_chunk_t, has_subsamples), F(moq_locmaf_chunk_t, _reserved),
+    F(moq_locmaf_chunk_t, ivs), F(moq_locmaf_chunk_t, subsamples),
+    F(moq_locmaf_chunk_t, subsample_total), F(moq_locmaf_chunk_t, gen_boxes),
+    F(moq_locmaf_chunk_t, gen_box_count), F(moq_locmaf_chunk_t, mdat_payload),
+    F(moq_locmaf_chunk_t, raw_boxes),
+    S(moq_locmaf_decoder_cfg_t), F(moq_locmaf_decoder_cfg_t, struct_size),
+    F(moq_locmaf_decoder_cfg_t, max_samples), F(moq_locmaf_decoder_cfg_t, max_subsamples),
+    F(moq_locmaf_decoder_cfg_t, max_gen_boxes), F(moq_locmaf_decoder_cfg_t, track),
+    F(moq_locmaf_decoder_cfg_t, storage), F(moq_locmaf_decoder_cfg_t, storage_size),
+    S(moq_locmaf_decoder_stats_t), F(moq_locmaf_decoder_stats_t, struct_size),
+    F(moq_locmaf_decoder_stats_t, last_reason), F(moq_locmaf_decoder_stats_t, objects_decoded),
+    F(moq_locmaf_decoder_stats_t, full_headers_decoded),
+    F(moq_locmaf_decoder_stats_t, delta_headers_decoded),
+    F(moq_locmaf_decoder_stats_t, raw_boxes_decoded),
+    F(moq_locmaf_decoder_stats_t, objects_unreferenced),
+    F(moq_locmaf_decoder_stats_t, objects_malformed),
+    F(moq_locmaf_decoder_stats_t, objects_limited),
+    F(moq_locmaf_decoder_stats_t, references_discarded),
+    F(moq_locmaf_decoder_stats_t, unknown_fields_skipped),
+    F(moq_locmaf_decoder_stats_t, objects_unsupported),
+    S(moq_locmaf_encoder_cfg_t), F(moq_locmaf_encoder_cfg_t, struct_size),
+    F(moq_locmaf_encoder_cfg_t, max_samples), F(moq_locmaf_encoder_cfg_t, max_subsamples),
+    F(moq_locmaf_encoder_cfg_t, max_gen_boxes), F(moq_locmaf_encoder_cfg_t, track),
+    F(moq_locmaf_encoder_cfg_t, storage), F(moq_locmaf_encoder_cfg_t, storage_size),
+    S(moq_locmaf_encoder_stats_t), F(moq_locmaf_encoder_stats_t, struct_size),
+    F(moq_locmaf_encoder_stats_t, last_reason), F(moq_locmaf_encoder_stats_t, chunks_encoded),
+    F(moq_locmaf_encoder_stats_t, full_headers_written),
+    F(moq_locmaf_encoder_stats_t, delta_headers_written),
+    F(moq_locmaf_encoder_stats_t, raw_boxes_written),
+    F(moq_locmaf_encoder_stats_t, chunks_refused),
+    F(moq_locmaf_encoder_stats_t, stages_committed),
+    F(moq_locmaf_encoder_stats_t, stages_replaced),
+    S(moq_locmaf_decoder_t), S(moq_locmaf_encoder_t),
+    V(MOQ_LOCMAF_TRACK_V0_SIZE), V(MOQ_LOCMAF_CHUNK_V0_SIZE),
+    V(MOQ_LOCMAF_DECODER_CFG_V0_SIZE), V(MOQ_LOCMAF_DECODER_STATS_V0_SIZE),
+    V(MOQ_LOCMAF_ENCODER_CFG_V0_SIZE), V(MOQ_LOCMAF_ENCODER_STATS_V0_SIZE),
+    V(MOQ_LOCMAF_STORAGE_ALIGN), V(MOQ_LOCMAF_OBJECT_FULL), V(MOQ_LOCMAF_OBJECT_DELTA),
+    V(MOQ_LOCMAF_OBJECT_RAW_BOXES),
 #endif
 };
 

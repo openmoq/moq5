@@ -18,6 +18,9 @@
 # - core + media (moq5-sys `media`, and moq5-media): libmoq-media, linking
 #   the five media parsers and moq-core, and nothing of the service;
 # - core + sim + media: both packages;
+# - core + media + locmaf (moq5-sys `locmaf`, and moq5-media `locmaf`):
+#   libmoq-media and libmoq-locmaf, linking the media parsers, moq-locmaf
+#   and moq-core;
 # - service, service + sim, player and player + sim: libmoq-service (and
 #   libmoq-sim);
 # - independent crates unified into one graph (moq5-core with moq5-media;
@@ -25,13 +28,14 @@
 #   beside them): the union, from one SDK.
 # Every positive graph names one pkg-config directory for the whole
 # SDK-owned metadata the build checks. A tier the SDK is stated not to
-# carry (MOQ5_RUST_SIM=0, MOQ5_RUST_PLAYER=0, or MOQ5_RUST_MPEG2TS=0,
-# without which no libmoq-media.pc is installed) is not built; where the
-# SDK lacks its package, its refusal is required instead.
+# carry (MOQ5_RUST_SIM=0, MOQ5_RUST_PLAYER=0, MOQ5_RUST_LOCMAF=0, or
+# MOQ5_RUST_MPEG2TS=0, without which no libmoq-media.pc is installed) is not
+# built; where the SDK lacks its package, its refusal is required instead.
 #
 # The refusals and their matching controls, on views of the real SDK whose
 # pkg-config files are copies still describing its files: a package
-# missing from the view (libmoq-core, libmoq-sim, libmoq-media) while
+# missing from the view (libmoq-core, libmoq-sim, libmoq-media,
+# libmoq-locmaf) while
 # libmoq.pc resolves; a tier package, the service package, or the
 # simulator beside the service resolving from another directory than the
 # rest of the SDK-owned metadata (the service's aggregate libmoq.pc
@@ -62,8 +66,8 @@
 # must fail on the classifier alone. Accepted upstream warnings stay in
 # each inventory, classified.
 #
-# Environment: MOQ5_RUST_SIM, MOQ5_RUST_MPEG2TS and MOQ5_RUST_PLAYER (1 or
-# 0: what the SDK is stated to carry), CARGO (default cargo), PKG_CONFIG
+# Environment: MOQ5_RUST_SIM, MOQ5_RUST_MPEG2TS, MOQ5_RUST_PLAYER and
+# MOQ5_RUST_LOCMAF (1 or 0: what the SDK is stated to carry), CARGO (default cargo), PKG_CONFIG
 # (default pkg-config), PYTHON (default python3), LIBCLANG_PATH as bindgen
 # needs it, and the link mode the caller states (scripts/sdk_paths.sh).
 set -euo pipefail
@@ -74,7 +78,7 @@ CARGO=${CARGO:-cargo}
 # shellcheck source=sdk_paths.sh
 . "$HERE/scripts/sdk_paths.sh"
 rm -rf "$WORK"; mkdir -p "$WORK"
-for stated in MOQ5_RUST_SIM MOQ5_RUST_MPEG2TS MOQ5_RUST_PLAYER; do
+for stated in MOQ5_RUST_SIM MOQ5_RUST_MPEG2TS MOQ5_RUST_PLAYER MOQ5_RUST_LOCMAF; do
     case ${!stated:-} in 1|0) ;; *) echo "tier_graphs.sh: $stated must state 1 or 0" >&2; exit 2 ;; esac
 done
 pc_dir=$(moq5_sdk_pkgconfig "$PREFIX")
@@ -258,7 +262,8 @@ for control in one:pass twice:fail distinct:fail none:fail; do
 done
 
 media_libs="moq-cmaf moq-core moq-loc moq-media-object moq-mpeg2ts moq-msf"
-SIM=$MOQ5_RUST_SIM MPEG2TS=$MOQ5_RUST_MPEG2TS PLAYER=$MOQ5_RUST_PLAYER
+locmaf_libs="moq-cmaf moq-core moq-loc moq-locmaf moq-media-object moq-mpeg2ts moq-msf"
+SIM=$MOQ5_RUST_SIM MPEG2TS=$MOQ5_RUST_MPEG2TS PLAYER=$MOQ5_RUST_PLAYER LOCMAF=$MOQ5_RUST_LOCMAF
 
 # -- the supported graphs ----------------------------------------------------
 expect_graph core "$pc_dir" "core (enabled tier features: none: the default core)" libmoq-core moq-core \
@@ -281,6 +286,19 @@ if [ "$MPEG2TS" = 1 ]; then
         expect_graph core-sim-media "$pc_dir" "core + sim + media (enabled tier features: sim, media)" \
             "libmoq-media, libmoq-sim" "$media_libs moq-sim" -- -p moq5-sys --features sim,media
     fi
+    if [ "$LOCMAF" = 1 ]; then
+        expect_graph core-media-locmaf "$pc_dir" "core + media + locmaf (enabled tier features: media, locmaf)" \
+            "libmoq-media, libmoq-locmaf" "$locmaf_libs" -- -p moq5-sys --features locmaf
+        expect_graph locmaf-crate "$pc_dir" "core + media + locmaf (enabled tier features: media, locmaf)" \
+            "libmoq-media, libmoq-locmaf" "$locmaf_libs" -- -p moq5-media --features locmaf
+    fi
+fi
+if [ "$LOCMAF" = 1 ]; then
+    # Beside the service, LOCMAF's package follows the service's closure.
+    expect_graph service-locmaf "$pc_dir" \
+        "core + media + locmaf + service (enabled tier features: media, locmaf, service)" \
+        "libmoq-service, libmoq-locmaf" "+moq-service moq-locmaf moq-cmaf moq-core" \
+        -- -p moq5-core -p moq5-media -p moq5 --features moq5-media/locmaf
 fi
 expect_graph service "$pc_dir" "core + media + service (enabled tier features: media, service)" libmoq-service \
     "+moq-service moq-core" -- -p moq5-sys --features service
@@ -371,6 +389,11 @@ expect_refusal missing-sim "pkg-config finds no \`libmoq-sim.pc\`" "MOQ_BUILD_SI
     -- "PKG_CONFIG_LIBDIR=$(view no-sim libmoq libmoq-core):$providers" -- -p moq5-sys --features sim
 expect_refusal missing-media "pkg-config finds no \`libmoq-media.pc\`" "MOQ_BUILD_MPEG2TS" \
     -- "PKG_CONFIG_LIBDIR=$(view no-media libmoq libmoq-core):$providers" -- -p moq5-sys --features media
+if [ "$MPEG2TS" = 1 ]; then
+    expect_refusal missing-locmaf "pkg-config finds no \`libmoq-locmaf.pc\`" "MOQ_BUILD_LOCMAF=ON" \
+        -- "PKG_CONFIG_LIBDIR=$(view no-locmaf libmoq libmoq-core libmoq-media):$providers" \
+        -- -p moq5-sys --features locmaf
+fi
 # A tier stated not carried: the SDK's own refusal when it lacks the
 # package; a package it has anyway is left out by the statement, said so.
 if [ "$SIM" = 0 ]; then
@@ -379,6 +402,14 @@ if [ "$SIM" = 0 ]; then
     else
         expect_refusal sdk-without-sim "pkg-config finds no \`libmoq-sim.pc\`" \
             -- "PKG_CONFIG_LIBDIR=$pc_dir:$providers" -- -p moq5-sys --features sim
+    fi
+fi
+if [ "$LOCMAF" = 0 ]; then
+    if [ -f "$pc_dir/libmoq-locmaf.pc" ]; then
+        echo "note the SDK carries libmoq-locmaf.pc; its graphs are left out (MOQ5_RUST_LOCMAF=0)"
+    elif [ "$MPEG2TS" = 1 ]; then
+        expect_refusal sdk-without-locmaf "pkg-config finds no \`libmoq-locmaf.pc\`" \
+            -- "PKG_CONFIG_LIBDIR=$pc_dir:$providers" -- -p moq5-sys --features locmaf
     fi
 fi
 if [ "$MPEG2TS" = 0 ]; then

@@ -32,7 +32,9 @@ static size_t object(uint8_t *out, size_t cap, unsigned kind, const char *props_
 static moq_result_t push(lm_dec_t *dec, uint64_t o, unsigned kind, const char *props,
                          size_t payload, moq_locmaf_chunk_t *ch, moq_locmaf_reason_t *why)
 {
-    uint8_t obj[4096];
+    /* The chunk borrows the Object's bytes (its IVs, the mdat payload), so
+     * they stay until the next push. */
+    static uint8_t obj[4096];
     size_t n = object(obj, sizeof(obj), kind, props, payload);
     *why = (moq_locmaf_reason_t)0xEEEE;
     memset(ch, 0, sizeof(*ch));

@@ -84,7 +84,47 @@
  *    AUDIO_CONFIG (0x0F) on role "audio" on a draft-22 companion: the legacy
  *    companion carries no per-Object configuration, so a decoder would get
  *    media without it (desc.init_source says where it comes from);
- *  - an MSF-02 "loc" audio or video track without a codec.
+ *  - an MSF-02 "loc" audio or video track without a codec;
+ *  - a LOCMAF track (packaging "locmaf", draft-einarsson-moq-locmaf-01)
+ *    whose locmafVersion this build does not support, or is missing or
+ *    malformed; whose CMAF Header is not inline, does not parse, does not
+ *    have exactly one trak or has no trex; or in a build without
+ *    moq::locmaf.
+ *
+ * LOCMAF. A LOCMAF track's description has info.packaging
+ * MOQ_MEDIA_PACKAGING_LOCMAF and its CMAF Header record in desc.cmaf. Each
+ * of its Objects is decoded against the earlier Objects of its Group and
+ * reaches poll_object as the canonical CMAF chunk it encodes (section 15):
+ * packaging MOQ_MEDIA_PACKAGING_CMAF, the chunk as `fragment`, `payload`
+ * empty, with a loss report. Within a Group Objects surface in Object
+ * order; across Groups, in arrival order. Groups decode independently, up
+ * to two at once per track, so the tail of a Group that arrives after the
+ * next Group began is still delivered; a third concurrent Group closes the
+ * lowest open one (or is itself refused when it is the lowest), and the
+ * Objects of a closed Group that arrive later are dropped. An Object that
+ * cannot be decoded is dropped, reported as a gap on the next delivered
+ * Object of its delivery source: after any loss in a Group -- an Object ID
+ * gap, its stream reset, a datagram or a second subgroup, which the
+ * publisher must not use (section 3), or a refused Object -- deltas are
+ * dropped until a full header resumes the Group, or the next Group starts;
+ * a rawBoxes Object (section 9) is delivered as its boxes but leaves no
+ * reference, so a delta after it is refused. Joining mid-Group (drafts 16
+ * and 18 always, START_CURRENT) therefore drops the deltas until the next
+ * Group; START_NEXT_GROUP avoids it. On draft 22 the live join at the
+ * current Group comes with a fill: the live deltas of that first Group are
+ * held (at most 64, each for at most 300 ms) until the fill has decoded the
+ * Group's Objects before them, from a full header, and then decode in
+ * Location order after the fill's. A fill's Objects are decoded by a
+ * decoder of the fill's own and delivered as FILL; nothing is shared across
+ * origins otherwise, and a Location both deliver is delivered by both. The
+ * track's END_OF_TRACK, and an END_OF_GROUP status Object, follow the
+ * Objects held before them. The counters are in the stats.
+ *
+ * A LOCMAF Object carries no configuration identity: after a replacement a
+ * Group encoded under the previous CMAF Header is rebuilt with the new
+ * Header's facts, undetected (the limitation kept for LOC-01 above). A
+ * LOCMAF track with encryptionScheme, or whose initialization data is a
+ * track or object property, has no delivery path (see above).
  *
  * Compression (MSF-02 12.1). A catalog or timeline Object whose origin's
  * Track Properties or own Object Properties carry MSF_COMPRESSION (0x78)
@@ -377,9 +417,9 @@ typedef struct moq_media_track_desc {
     /* The record parsed from the track's CMAF header: its first trak's codec
      * kind, dimensions, sample rate, channels, sample entry and, for a CENC
      * protected track (CMSF §4.2), the tenc parameters for license
-     * acquisition (libmoq does not decrypt). NULL for every track whose init
-     * data is not a CMAF header that parsed: RAW/LOC, MPEG-2 TS, a CMAF track
-     * without init data or with a malformed one. Its fields are header
+     * acquisition (libmoq does not decrypt). Set for a CMAF or LOCMAF track
+     * whose CMAF header parsed; NULL for every other track: RAW/LOC, MPEG-2
+     * TS, a CMAF track without init data or with a malformed one. Its fields are header
      * observations; the catalog's own declarations (width, height,
      * samplerate, ...) are separate fields below and may differ. A sized
      * record: read a field only when cmaf->struct_size covers all of it.
@@ -1245,9 +1285,13 @@ typedef struct moq_media_object {
     /* Loss report, appended after has_subgroup; available when the stamped
      * struct_size reaches the end of discontinuous. has_loss_report is true
      * when the receiver tracks Location continuity for the Object's track
-     * (MPEG2TS, and a "loc" track whose MSF-02 streamMapping is "object" or
-     * a value not recognized, on its live subscription) and the fields below
-     * are meaningful; false means not tracked, and says nothing about loss.
+     * (MPEG2TS; a LOCMAF track; and a "loc" track whose MSF-02 streamMapping
+     * is "object" or a value not recognized, on its live subscription) and
+     * the fields below are meaningful; false means not tracked, and says
+     * nothing about loss. On a LOCMAF track a gap is a LOCMAF Object
+     * dropped before delivery (one that could not be decoded, held past
+     * its deadline, or of a closed Group), or an Object ID gap within its
+     * Group.
      * For such a LOC track the receiver restores (Group, Object) order, which
      * separate subgroup streams do not keep, through a bounded stage: up to
      * four open Groups and 64 held Objects, each stall waiting at most
@@ -1643,7 +1687,32 @@ typedef struct moq_media_receiver_stats {
     uint64_t event_timeline_headers_ignored;
     uint64_t loc_order_gaps;
     uint64_t loc_order_forced;
+    /* Appended after loc_order_forced; one block, written only when out_size
+     * covers locmaf_resets (MOQ_MEDIA_RECEIVER_STATS_SIZE_THROUGH_LOCMAF).
+     * LOCMAF tracks (draft-einarsson-moq-locmaf-01), whose Objects arrive as
+     * canonical CMAF chunks. Every LOCMAF Object received on a track
+     * subscription is counted once: rebuilt (decoded and handed to delivery;
+     * the queue may still drop it, counted as for any Object), undecodable
+     * (malformed, unsupported, without its reference, or refused by the
+     * per-group rules below), expired (held for a fill hand-off that did not
+     * come in time, or past the hold's capacity) or late (its group already
+     * closed). So, on the subscription, received = rebuilt + undecodable +
+     * expired + late. Objects of a fill are counted as rebuilt or
+     * undecodable. locmaf_groups_evicted: groups closed because a third
+     * group opened while two were in flight; locmaf_resets: decoder resets
+     * for a reset stream, a datagram, a second subgroup or a disabled
+     * track. */
+    uint64_t locmaf_objects_rebuilt;
+    uint64_t locmaf_objects_undecodable;
+    uint64_t locmaf_objects_expired;
+    uint64_t locmaf_objects_late;
+    uint64_t locmaf_groups_evicted;
+    uint64_t locmaf_resets;
 } moq_media_receiver_stats_t;
+
+/* The stats through the LOCMAF block: the out_size that receives it. */
+#define MOQ_MEDIA_RECEIVER_STATS_SIZE_THROUGH_LOCMAF \
+    (offsetof(moq_media_receiver_stats_t, locmaf_resets) + sizeof(uint64_t))
 
 /* Snapshot stats into *out. Pass `out_size = sizeof(*out)`; same size contract as
  * poll_object (requires the v0 base, writes min(out_size, current), stamps the
@@ -1655,7 +1724,9 @@ typedef struct moq_media_receiver_stats {
  *     sizeof(moq_media_receiver_stats_t) gets the appended `catalog_drops` and
  *     `catalog_complete` too;
  *   - any in-between out_size is clamped by prefix (you get a field only if the
- *     full field fits in out_size). */
+ *     full field fits in out_size), except the LOCMAF block, which is written
+ *     whole or not at all: an out_size that ends inside it gets the fields
+ *     through loc_order_forced. */
 MOQ_API moq_result_t moq_media_receiver_get_stats(
     const moq_media_receiver_t *r, moq_media_receiver_stats_t *out,
     size_t out_size);

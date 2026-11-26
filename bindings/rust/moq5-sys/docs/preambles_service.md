@@ -143,7 +143,47 @@ subscribed under them), and these MSF policies:
    AUDIO_CONFIG (0x0F) on role "audio" on a draft-22 companion: the legacy
    companion carries no per-Object configuration, so a decoder would get
    media without it (desc.init_source says where it comes from);
- - an MSF-02 "loc" audio or video track without a codec.
+ - an MSF-02 "loc" audio or video track without a codec;
+ - a LOCMAF track (packaging "locmaf", draft-einarsson-moq-locmaf-01)
+   whose locmafVersion this build does not support, or is missing or
+   malformed; whose CMAF Header is not inline, does not parse, does not
+   have exactly one trak or has no trex; or in a build without
+   moq::locmaf.
+
+LOCMAF. A LOCMAF track's description has info.packaging
+MOQ_MEDIA_PACKAGING_LOCMAF and its CMAF Header record in desc.cmaf. Each
+of its Objects is decoded against the earlier Objects of its Group and
+reaches poll_object as the canonical CMAF chunk it encodes (section 15):
+packaging MOQ_MEDIA_PACKAGING_CMAF, the chunk as `fragment`, `payload`
+empty, with a loss report. Within a Group Objects surface in Object
+order; across Groups, in arrival order. Groups decode independently, up
+to two at once per track, so the tail of a Group that arrives after the
+next Group began is still delivered; a third concurrent Group closes the
+lowest open one (or is itself refused when it is the lowest), and the
+Objects of a closed Group that arrive later are dropped. An Object that
+cannot be decoded is dropped, reported as a gap on the next delivered
+Object of its delivery source: after any loss in a Group -- an Object ID
+gap, its stream reset, a datagram or a second subgroup, which the
+publisher must not use (section 3), or a refused Object -- deltas are
+dropped until a full header resumes the Group, or the next Group starts;
+a rawBoxes Object (section 9) is delivered as its boxes but leaves no
+reference, so a delta after it is refused. Joining mid-Group (drafts 16
+and 18 always, START_CURRENT) therefore drops the deltas until the next
+Group; START_NEXT_GROUP avoids it. On draft 22 the live join at the
+current Group comes with a fill: the live deltas of that first Group are
+held (at most 64, each for at most 300 ms) until the fill has decoded the
+Group's Objects before them, from a full header, and then decode in
+Location order after the fill's. A fill's Objects are decoded by a
+decoder of the fill's own and delivered as FILL; nothing is shared across
+origins otherwise, and a Location both deliver is delivered by both. The
+track's END_OF_TRACK, and an END_OF_GROUP status Object, follow the
+Objects held before them. The counters are in the stats.
+
+A LOCMAF Object carries no configuration identity: after a replacement a
+Group encoded under the previous CMAF Header is rebuilt with the new
+Header's facts, undetected (the limitation kept for LOC-01 above). A
+LOCMAF track with encryptionScheme, or whose initialization data is a
+track or object property, has no delivery path (see above).
 
 Compression (MSF-02 12.1). A catalog or timeline Object whose origin's
 Track Properties or own Object Properties carry MSF_COMPRESSION (0x78)

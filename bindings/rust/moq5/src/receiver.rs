@@ -447,7 +447,9 @@ impl<'receiver> TrackDescription<'receiver> {
         MediaType::from_code(self.raw.info.media_type)
     }
     /// Media packaging, when derived. Non-media tracks (timelines) have
-    /// none; see [`packaging_name`](TrackDescription::packaging_name).
+    /// none; see [`packaging_name`](TrackDescription::packaging_name). A
+    /// LOCMAF track is [`Packaging::Locmaf`], while its objects arrive as
+    /// the CMAF chunks they stand for ([`Packaging::Cmaf`]).
     #[must_use]
     pub fn packaging(&self) -> Option<Packaging> {
         Packaging::from_code(self.raw.info.packaging)
@@ -487,9 +489,10 @@ impl<'receiver> TrackDescription<'receiver> {
         unsafe { ffi::bytes(self.raw.codec_config) }
     }
     /// The record parsed from the track's CMAF header: codec kind,
-    /// dimensions, sample entry, CENC parameters. `None` for every track
-    /// whose init data is not a CMAF header that parsed: RAW/LOC, MPEG-2 TS,
-    /// a CMAF track without init data or with a malformed one. Its fields
+    /// dimensions, sample entry, CENC parameters, header facts. `None` for
+    /// every track whose init data is not a CMAF header that parsed:
+    /// RAW/LOC, MPEG-2 TS, a CMAF or LOCMAF track without init data or with
+    /// a malformed one. Its fields
     /// are header observations; the catalog's own declarations are
     /// [`width`](TrackDescription::width) and its siblings.
     #[must_use]
@@ -1876,16 +1879,41 @@ pub struct ReceiverStats {
     pub loc_order_gaps: Option<u64>,
     /// Advances the ordering stage's capacity policy forced.
     pub loc_order_forced: Option<u64>,
+    /// LOCMAF Objects (draft-einarsson-moq-locmaf-01) rebuilt as canonical
+    /// CMAF and handed to delivery, where the queue may still drop them.
+    /// On a track subscription every LOCMAF Object received is counted once,
+    /// in this counter or one of the next three.
+    pub locmaf_objects_rebuilt: Option<u64>,
+    /// LOCMAF Objects that could not be decoded: malformed, unsupported,
+    /// without their reference, or refused by the per-group rules.
+    pub locmaf_objects_undecodable: Option<u64>,
+    /// LOCMAF Objects held for a fill hand-off that did not come in time, or
+    /// past the hold's capacity.
+    pub locmaf_objects_expired: Option<u64>,
+    /// LOCMAF Objects whose group had already closed.
+    pub locmaf_objects_late: Option<u64>,
+    /// LOCMAF groups closed because a third opened while two were in
+    /// flight.
+    pub locmaf_groups_evicted: Option<u64>,
+    /// LOCMAF decoder resets: a reset stream, a datagram, a second subgroup
+    /// or a disabled track.
+    pub locmaf_resets: Option<u64>,
 }
 
 impl ReceiverStats {
     /// The snapshot in `stats`, each appended field under the stamp.
     fn from_raw(stats: &sys::moq_media_receiver_stats_t) -> ReceiverStats {
         let reported = |end: usize| ffi::covers(stats.struct_size, end);
-        // The compression and ordering block is read whole.
+        // The compression and ordering block is read whole, and so is the
+        // LOCMAF block after it.
         let block = reported(ffi::field_end!(
             sys::moq_media_receiver_stats_t,
             loc_order_forced,
+            u64
+        ));
+        let locmaf = reported(ffi::field_end!(
+            sys::moq_media_receiver_stats_t,
+            locmaf_resets,
             u64
         ));
         ReceiverStats {
@@ -1945,6 +1973,12 @@ impl ReceiverStats {
             event_timeline_headers_ignored: block.then_some(stats.event_timeline_headers_ignored),
             loc_order_gaps: block.then_some(stats.loc_order_gaps),
             loc_order_forced: block.then_some(stats.loc_order_forced),
+            locmaf_objects_rebuilt: locmaf.then_some(stats.locmaf_objects_rebuilt),
+            locmaf_objects_undecodable: locmaf.then_some(stats.locmaf_objects_undecodable),
+            locmaf_objects_expired: locmaf.then_some(stats.locmaf_objects_expired),
+            locmaf_objects_late: locmaf.then_some(stats.locmaf_objects_late),
+            locmaf_groups_evicted: locmaf.then_some(stats.locmaf_groups_evicted),
+            locmaf_resets: locmaf.then_some(stats.locmaf_resets),
         }
     }
 }
@@ -2958,5 +2992,57 @@ mod tests {
         assert_eq!(short.event_timeline_headers_ignored, None);
         assert_eq!(short.loc_order_gaps, None);
         assert_eq!(short.loc_order_forced, None);
+    }
+
+    #[test]
+    fn stats_map_the_locmaf_block_whole() {
+        let raw = sys::moq_media_receiver_stats_t {
+            struct_size: mem::size_of::<sys::moq_media_receiver_stats_t>() as u32,
+            loc_order_forced: 10,
+            locmaf_objects_rebuilt: 11,
+            locmaf_objects_undecodable: 12,
+            locmaf_objects_expired: 13,
+            locmaf_objects_late: 14,
+            locmaf_groups_evicted: 15,
+            locmaf_resets: 16,
+            ..Default::default()
+        };
+        let stats = ReceiverStats::from_raw(&raw);
+        assert_eq!(
+            (
+                stats.locmaf_objects_rebuilt,
+                stats.locmaf_objects_undecodable,
+                stats.locmaf_objects_expired,
+                stats.locmaf_objects_late,
+                stats.locmaf_groups_evicted,
+                stats.locmaf_resets
+            ),
+            (Some(11), Some(12), Some(13), Some(14), Some(15), Some(16))
+        );
+        // One block: a stamp that ends inside it reports none of it, and
+        // the block before it as before.
+        let end = ffi::field_end!(sys::moq_media_receiver_stats_t, locmaf_resets, u64);
+        let exact = ReceiverStats::from_raw(&sys::moq_media_receiver_stats_t {
+            struct_size: end as u32,
+            ..raw
+        });
+        assert_eq!(exact.locmaf_resets, Some(16));
+        for stamp in [
+            end - 1,
+            ffi::field_end!(sys::moq_media_receiver_stats_t, locmaf_objects_rebuilt, u64),
+            ffi::field_end!(sys::moq_media_receiver_stats_t, loc_order_forced, u64),
+        ] {
+            let short = ReceiverStats::from_raw(&sys::moq_media_receiver_stats_t {
+                struct_size: stamp as u32,
+                ..raw
+            });
+            assert_eq!(short.loc_order_forced, Some(10), "stamp {stamp}");
+            assert_eq!(short.locmaf_objects_rebuilt, None, "stamp {stamp}");
+            assert_eq!(short.locmaf_objects_undecodable, None, "stamp {stamp}");
+            assert_eq!(short.locmaf_objects_expired, None, "stamp {stamp}");
+            assert_eq!(short.locmaf_objects_late, None, "stamp {stamp}");
+            assert_eq!(short.locmaf_groups_evicted, None, "stamp {stamp}");
+            assert_eq!(short.locmaf_resets, None, "stamp {stamp}");
+        }
     }
 }

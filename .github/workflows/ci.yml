@@ -741,7 +741,8 @@ jobs:
       # the same ASan build at exit time, ~no extra cost). The `asan` preset
       # enables no external transport adapters (core/media/sim only); this
       # job adds the service tier and the media modules it requires, so the
-      # in-process sender and receiver tests run under the sanitizers too.
+      # in-process sender and receiver tests run under the sanitizers too,
+      # LOCMAF tracks included.
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       ASAN_OPTIONS: detect_leaks=1
     steps:
@@ -753,6 +754,7 @@ jobs:
           -DMOQ_BUILD_MSF=ON
           -DMOQ_BUILD_MEDIA_OBJECT=ON
           -DMOQ_BUILD_SERVICE=ON
+          -DMOQ_BUILD_LOCMAF=ON
 
       - name: Build
         run: cmake --build build/asan
@@ -789,6 +791,7 @@ jobs:
           -DMOQ_BUILD_SIM=ON
           -DMOQ_BUILD_TESTS=ON
           -DMOQ_BUILD_CMAF_PACKAGER=ON
+          -DMOQ_BUILD_LOCMAF=ON
 
       - name: Build
         run: cmake --build build/fuzz-ci
@@ -798,10 +801,12 @@ jobs:
       - name: Test (fuzz smoke + corpus)
         run: ctest --test-dir build/fuzz-ci -R '^fuzz_' --output-on-failure
 
-      - name: Test instrumented writer and installed consumers
+      # LOCMAF with the packager: its round trip through packaged chunks
+      # registers only when both are built.
+      - name: Test instrumented writer, LOCMAF and installed consumers
         env:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: ctest --test-dir build/fuzz-ci -R '^cmaf_packager' --output-on-failure --no-tests=error
+        run: ctest --test-dir build/fuzz-ci -R '^(cmaf_packager|locmaf)' --output-on-failure --no-tests=error
 
       # The nightly deliberately disables tests. Its private D22 codec target
       # must not depend on the test suite being enabled.

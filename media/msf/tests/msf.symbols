@@ -14,6 +14,7 @@ moq_msf_decode_init_data
 moq_msf_encode_init_data
 moq_msf_ext_find
 moq_msf_init_data_property_type
+moq_msf_locmaf_init_sized
 moq_msf_media_timeline_decode
 moq_msf_media_timeline_encode
 moq_msf_mpeg2ts_init_sized
@@ -22,6 +23,8 @@ moq_msf_mpeg2ts_timestamp_mode_name
 moq_msf_namespace_split
 moq_msf_packaging_metadata_find
 moq_msf_switch_point_group
+moq_msf_track_locmaf
+moq_msf_track_locmaf_check
 moq_msf_track_matches
 moq_msf_track_mpeg2ts
 moq_msf_track_mpeg2ts_check

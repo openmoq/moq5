@@ -1,0 +1,13 @@
+{
+  "generatedAt": 1746104606045,
+  "deltaUpdate": [
+    { "op": "clone", "tracks": [
+      { "parentName": "video", "name": "video2", "locmafVersion": "0.3" },
+      { "parentName": "video", "name": "video3", "packaging": "cmaf" } ] },
+    { "op": "update", "tracks": [
+      { "parentName": "audio", "locmafVersion": "0.3" } ] },
+    { "op": "add", "tracks": [
+      { "name": "added", "packaging": "locmaf", "isLive": true,
+        "locmafVersion": "0.3" } ] }
+  ]
+}

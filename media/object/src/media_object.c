@@ -391,6 +391,9 @@ static moq_result_t media_object_parse_into(
         track->media_type != MOQ_MEDIA_TYPE_AUDIO)
         return MOQ_ERR_INVAL;
     bool is_mpeg2ts = track->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS;
+    /* A LOCMAF Object is a delta against its group's earlier Objects: only a
+     * stateful decoder can read it. */
+    if (track->packaging == MOQ_MEDIA_PACKAGING_LOCMAF) return MOQ_ERR_UNSUPPORTED;
     if (track->packaging != MOQ_MEDIA_PACKAGING_RAW &&
         track->packaging != MOQ_MEDIA_PACKAGING_CMAF && !is_mpeg2ts)
         return MOQ_ERR_INVAL;

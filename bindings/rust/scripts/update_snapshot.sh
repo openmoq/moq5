@@ -7,10 +7,11 @@
 #
 #   update_snapshot.sh <sdk-prefix> [tier...]
 #
-# The tiers are core, sim, media, service and player; with none named, all
-# five (the SDK then needs the simulator and the player). Naming tiers
-# updates only those, for an SDK without the others; the core is always
-# built, and a tier's snapshot does not depend on which others are built.
+# The tiers are core, sim, media, locmaf, service and player; with none
+# named, all six (the SDK then needs the simulator, LOCMAF and the player).
+# Naming tiers updates only those, for an SDK without the others; the core
+# is always built, and a tier's snapshot does not depend on which others are
+# built.
 #
 # The generation is the one this script's own cargo invocation built or
 # found fresh: cargo's machine-readable record of moq5-sys's build script in
@@ -28,13 +29,13 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 PREFIX=${1:?sdk prefix}
 shift
 tiers=("$@")
-[ ${#tiers[@]} -gt 0 ] || tiers=(core sim media service player)
+[ ${#tiers[@]} -gt 0 ] || tiers=(core sim media locmaf service player)
 features=()
 for tier in "${tiers[@]}"; do
     case $tier in
         core) ;;
-        sim|media|service|player) features+=("$tier") ;;
-        *) echo "usage: update_snapshot.sh <sdk-prefix> [core|sim|media|service|player...]" >&2; exit 2 ;;
+        sim|media|locmaf|service|player) features+=("$tier") ;;
+        *) echo "usage: update_snapshot.sh <sdk-prefix> [core|sim|media|locmaf|service|player...]" >&2; exit 2 ;;
     esac
 done
 CARGO=${CARGO:-cargo}

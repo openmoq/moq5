@@ -524,6 +524,76 @@ fn refusals_come_back_as_their_codes() {
     assert!(log.iter().any(|l| l == "end_track 1"));
 }
 
+/// A LOCMAF track takes its packaging and CMAF Header like a CMAF track;
+/// what the service refuses comes back as its code, and a write the
+/// service cannot reserve wire space for hands the object back untouched.
+#[test]
+fn locmaf_tracks_reach_the_service_and_refusals_come_back() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let sender = Sender::attach(&endpoint, &SenderConfig::live(namespace()))
+        .expect("the provider accepts the sender attach");
+    s.take_log();
+    let config = SendTrackConfig::new("video", MediaType::Video, Packaging::Locmaf, "avc1.42e01e")
+        .bitrate(1)
+        .init_data(vec![0u8; 24]);
+    let track = sender
+        .add_track(&config)
+        .expect("the provider accepts the track");
+    let added = fake::line(&s.take_log(), "add_track ");
+    assert_eq!(
+        fake::field(&added, "packaging"),
+        sys::MOQ_MEDIA_PACKAGING_LOCMAF.to_string()
+    );
+    assert_eq!(fake::field(&added, "init_data"), "24");
+
+    for code in [
+        sys::MOQ_ERR_INVAL,
+        sys::MOQ_ERR_UNSUPPORTED,
+        sys::MOQ_ERR_NOMEM,
+    ] {
+        s.set("add_track_result", i64::from(code));
+        assert_eq!(
+            sender.add_track(&config).unwrap_err(),
+            Error::from_code(code),
+            "add_track refused with {code}"
+        );
+    }
+    s.set("add_track_result", 0);
+
+    RELEASES.store(0, Ordering::SeqCst);
+    let refusals = [
+        sys::MOQ_ERR_NOMEM,
+        sys::MOQ_ERR_PROTO,
+        sys::MOQ_ERR_UNSUPPORTED,
+    ];
+    for (released, code) in refusals.into_iter().enumerate() {
+        s.set("write_result", i64::from(code));
+        let failure = sender
+            .write(track, SendObject::new(counted_buffer()))
+            .unwrap_err();
+        assert_eq!(failure.error, Error::from_code(code));
+        assert_eq!(
+            failure.object.payload.as_slice(),
+            b"frame",
+            "the chunk comes back"
+        );
+        assert_eq!(RELEASES.load(Ordering::SeqCst), released, "still ours");
+        drop(failure);
+    }
+    assert_eq!(RELEASES.load(Ordering::SeqCst), 3, "released by the caller");
+    assert_eq!(Error::from_code(sys::MOQ_ERR_NOMEM), Error::NOMEM);
+    s.set("write_result", 0);
+    sender
+        .write(track, SendObject::new(counted_buffer()))
+        .expect("the provider accepts the write");
+    assert_eq!(
+        RELEASES.load(Ordering::SeqCst),
+        4,
+        "released by the service"
+    );
+}
+
 #[test]
 fn vod_conversion_and_the_write_level() {
     let s = fake::suite();

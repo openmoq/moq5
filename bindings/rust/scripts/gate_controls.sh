@@ -4,7 +4,7 @@
 # selection on static-only, shared-only and dual prefixes; the exact
 # link-search assertion against a prefix-of-path, an outside directory and
 # the real directory; a failing helper failing a row; a row refusing a
-# player, MPEG-TS or simulator statement the SDK contradicts, or none, and
+# player, MPEG-TS, simulator or LOCMAF statement the SDK contradicts, or none, and
 # passing one it matches; a row stating the SDK's link mode to its builds with the
 # opposite mode inherited; and, with real cargo runs, a build script's
 # printed diagnostic and a package step's warning failing their gates
@@ -198,6 +198,7 @@ onoff_has() {   # onoff_has <include dir> <header>: ON when the directory holds 
 real_player=$(onoff_has "$real_include" media_player.h)
 real_mpeg2ts=$(onoff_has "$real_include" mpeg2ts.h)
 real_sim=$(onoff_has "$real_include" sim.h)
+real_locmaf=$(onoff_has "$real_include" locmaf.h)
 
 # -- a row checks what the SDK is stated to carry ---------------------------
 # A view of the real SDK whose include directory holds only the headers
@@ -222,14 +223,17 @@ EOF
     echo "$view"
 }
 real_pc=$(moq5_sdk_pkgconfig "$PREFIX")
-# The simulator a statement states: none for the views above (they hold no
-# sim.h), the real SDK's for its relocated views below.
+# The simulator and LOCMAF a statement states: none for the views above
+# (they hold no sim.h or locmaf.h), the real SDK's for its relocated views
+# below.
 STATEMENT_SIM=0
+STATEMENT_LOCMAF=0
 statement() {   # statement <label> <pass|fail> <view> <player> <mpeg2ts> [phrase]
     local label=$1 expected=$2 view=$3 player=$4 mpeg2ts=$5 phrase=${6:-}
     check "$label" "$expected" env "MOQ5_RUST_SDK=$view" "MOQ5_RUST_WORK=$WORK/$label-work" \
         "MOQ5_SDK_PKG_CONFIG_PATH=$real_pc" "MOQ5_RUST_PLAYER=$player" "MOQ5_RUST_MPEG2TS=$mpeg2ts" \
-        "MOQ5_RUST_SIM=$STATEMENT_SIM" bash "$HERE/scripts/ctest_row.sh" fmt
+        "MOQ5_RUST_SIM=$STATEMENT_SIM" "MOQ5_RUST_LOCMAF=$STATEMENT_LOCMAF" \
+        bash "$HERE/scripts/ctest_row.sh" fmt
     if [ -n "$phrase" ]; then
         grep -q -F "$phrase" "$WORK/$label.out" && echo "ok   $label-with-the-reason" ||
             { echo "FAIL $label-with-the-reason (expected: $phrase)"; failures=$((failures + 1)); }
@@ -246,9 +250,13 @@ statement statement-player-left-out pass "$both" 0 1 "its rows are left out"
 STATEMENT_SIM=1
 statement statement-sim-the-sdk-lacks fail "$both" 1 1 "has no simulator"
 STATEMENT_SIM=0
+STATEMENT_LOCMAF=1
+statement statement-locmaf-the-sdk-lacks fail "$both" 1 1 "has no LOCMAF"
+STATEMENT_LOCMAF=0
 statement statement-not-1-or-0 fail "$both" yes 1 "MOQ5_RUST_PLAYER must state 1 or 0"
 check statement-unstated fail env -u MOQ5_RUST_MPEG2TS "MOQ5_RUST_SDK=$both" "MOQ5_RUST_WORK=$WORK/unstated-work" \
-    "MOQ5_SDK_PKG_CONFIG_PATH=$real_pc" MOQ5_RUST_PLAYER=1 MOQ5_RUST_SIM=0 bash "$HERE/scripts/ctest_row.sh" fmt
+    "MOQ5_SDK_PKG_CONFIG_PATH=$real_pc" MOQ5_RUST_PLAYER=1 MOQ5_RUST_SIM=0 MOQ5_RUST_LOCMAF=0 \
+    bash "$HERE/scripts/ctest_row.sh" fmt
 grep -q -F "MOQ5_RUST_MPEG2TS must state 1 or 0" "$WORK/statement-unstated.out" &&
     echo "ok   statement-unstated-with-the-reason" ||
     { echo "FAIL statement-unstated-with-the-reason"; failures=$((failures + 1)); }
@@ -485,7 +493,7 @@ warning_pkg_config=$(warning_tool pkg-config "$(command -v "${PKG_CONFIG:-pkg-co
 # check and a real build all find the headers through the metadata, so a
 # fixed include/ would find nothing.
 relocated=$(real_view relocated headers)
-relocated_answer="player=$real_player mpeg2ts=$real_mpeg2ts sim=$real_sim includedir=$relocated/headers"
+relocated_answer="player=$real_player mpeg2ts=$real_mpeg2ts sim=$real_sim locmaf=$real_locmaf includedir=$relocated/headers"
 probe_defaults() {   # probe_defaults <name> <pkg-config>: the defaults, which print their answer and nothing else
     local name=$1 pc=${2:-${PKG_CONFIG:-pkg-config}}
     cmake -DPREFIX="$relocated" "-DPKG_CONFIG=$pc" "-DPC_PATH=${MOQ5_SDK_PKG_CONFIG_PATH:-}" \
@@ -505,6 +513,7 @@ stated_player=0; stated_mpeg2ts=0
 if [ "$real_player" = ON ]; then stated_player=1; fi
 if [ "$real_mpeg2ts" = ON ]; then stated_mpeg2ts=1; fi
 if [ "$real_sim" = ON ]; then STATEMENT_SIM=1; fi
+if [ "$real_locmaf" = ON ]; then STATEMENT_LOCMAF=1; fi
 statement relocated-headers-statement-matching pass "$relocated" "$stated_player" "$stated_mpeg2ts"
 if [ "$stated_mpeg2ts" = 1 ]; then
     statement relocated-headers-statement-refusal-of-carried-mpeg2ts fail "$relocated" "$stated_player" 0 \

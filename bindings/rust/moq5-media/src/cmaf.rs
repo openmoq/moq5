@@ -66,6 +66,33 @@ pub struct Cenc<'segment> {
     pub default_per_sample_iv_size: u8,
 }
 
+/// The defaults a track's TrackExtendsBox gives the samples of its
+/// fragments (ISO/IEC 14496-12 8.8.3). The box's four values, the whole of
+/// its fixed record, so it is not `#[non_exhaustive]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Trex {
+    /// default_sample_description_index.
+    pub default_sample_description_index: u32,
+    /// default_sample_duration, in timescale units.
+    pub default_sample_duration: u32,
+    /// default_sample_size, in bytes.
+    pub default_sample_size: u32,
+    /// default_sample_flags.
+    pub default_sample_flags: u32,
+}
+
+/// The default encryption pattern of a version-1 TrackEncryptionBox
+/// (ISO/IEC 23001-7 8.2): the 16-byte blocks encrypted, then left clear, in
+/// each run. The pair is the whole of that field, so it is not
+/// `#[non_exhaustive]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct EncryptionPattern {
+    /// default_crypt_byte_block.
+    pub crypt_byte_block: u8,
+    /// default_skip_byte_block.
+    pub skip_byte_block: u8,
+}
+
 /// A view of a parsed init segment's first track. Its byte fields borrow
 /// from whatever owns the segment.
 #[derive(Clone, Copy)]
@@ -145,6 +172,59 @@ impl<'segment> InitInfo<'segment> {
         let end = ffi::field_end!(sys::moq_cmaf_init_info_t, sample_entry, u32);
         ffi::covers(self.0.struct_size, end).then(|| self.0.sample_entry.to_be_bytes())
     }
+    /// Whether the library reported the header facts: the block from
+    /// `trak_count` through `default_constant_iv`, which is written whole or
+    /// not at all.
+    fn header_facts(&self) -> bool {
+        let end = ffi::field_end!(
+            sys::moq_cmaf_init_info_t,
+            default_constant_iv,
+            sys::moq_bytes_t
+        );
+        ffi::covers(self.0.struct_size, end)
+    }
+    /// The trak boxes in moov: one in a CMAF Header, 0 when moov's children
+    /// do not parse to its end. `None` when the library did not report the
+    /// header facts.
+    #[must_use]
+    pub fn trak_count(&self) -> Option<u32> {
+        self.header_facts().then_some(self.0.trak_count)
+    }
+    /// The defaults of the mvex/trex whose track_ID is the track's. `None`
+    /// when the header has no such trex (or its body is short), or when the
+    /// library did not report the header facts.
+    #[must_use]
+    pub fn trex(&self) -> Option<Trex> {
+        (self.header_facts() && self.0.has_trex).then_some(Trex {
+            default_sample_description_index: self.0.trex_default_sample_description_index,
+            default_sample_duration: self.0.trex_default_sample_duration,
+            default_sample_size: self.0.trex_default_sample_size,
+            default_sample_flags: self.0.trex_default_sample_flags,
+        })
+    }
+    /// The default pattern of an encrypted track whose tenc is version 1.
+    /// `None` for a clear track, a version-0 tenc, or when the library did
+    /// not report the header facts.
+    #[must_use]
+    pub fn pattern(&self) -> Option<EncryptionPattern> {
+        let v1 = self.header_facts() && self.0.has_cenc && self.0.tenc_version == 1;
+        v1.then_some(EncryptionPattern {
+            crypt_byte_block: self.0.default_crypt_byte_block,
+            skip_byte_block: self.0.default_skip_byte_block,
+        })
+    }
+    /// The tenc default constant IV (8 or 16 bytes): present only for a
+    /// protected track whose default per-sample IV size is 0. `None`
+    /// otherwise, or when the library did not report the header facts.
+    #[must_use]
+    pub fn constant_iv(&self) -> Option<&'segment [u8]> {
+        if !self.header_facts() {
+            return None;
+        }
+        // SAFETY: valid for 'segment by from_raw's contract.
+        let iv = unsafe { ffi::bytes(self.0.default_constant_iv) };
+        (!iv.is_empty()).then_some(iv)
+    }
     /// The raw struct.
     #[must_use]
     pub fn raw(&self) -> &'segment sys::moq_cmaf_init_info_t {
@@ -165,6 +245,10 @@ impl fmt::Debug for InitInfo<'_> {
             .field("track_id", &self.track_id())
             .field("cenc", &self.cenc())
             .field("sample_entry", &self.sample_entry())
+            .field("trak_count", &self.trak_count())
+            .field("trex", &self.trex())
+            .field("pattern", &self.pattern())
+            .field("constant_iv", &self.constant_iv())
             .finish()
     }
 }
@@ -459,15 +543,44 @@ mod tests {
         config: Option<(&[u8; 4], &[u8])>,
         original: Option<&[u8; 4]>,
     ) -> Vec<u8> {
+        init_segment_with(entry, fixed, config, original, None)
+    }
+
+    /// The tenc of [`init_segment_with`] for a version-1 cbcs track with a
+    /// pattern and a default constant IV, and the trex defaults it adds in
+    /// an mvex after the trak.
+    struct Extras {
+        pattern_and_iv: Option<(u8, [u8; 16])>,
+        trex: Option<[u32; 4]>,
+    }
+
+    fn init_segment_with(
+        entry: &[u8; 4],
+        fixed: usize,
+        config: Option<(&[u8; 4], &[u8])>,
+        original: Option<&[u8; 4]>,
+        extras: Option<Extras>,
+    ) -> Vec<u8> {
+        let extras = extras.unwrap_or(Extras {
+            pattern_and_iv: None,
+            trex: None,
+        });
         let mut body = vec![0u8; fixed];
         if let Some((kind, bytes)) = config {
             body.extend(boxed(kind, bytes));
         }
         if let Some(original) = original {
-            let mut tenc = [0u8; 24];
+            let mut tenc = vec![0u8; 24];
             tenc[6] = 1; // default_isProtected
             for (byte, value) in tenc[8..].iter_mut().zip(0x30u8..) {
                 *byte = value; // default_KID
+            }
+            if let Some((pattern, iv)) = extras.pattern_and_iv {
+                tenc[0] = 1; // version 1
+                tenc[5] = pattern; // crypt << 4 | skip
+                tenc[7] = 0; // default_Per_Sample_IV_Size: a constant IV follows
+                tenc.push(16);
+                tenc.extend_from_slice(&iv);
             }
             let sinf = [
                 boxed(b"frma", original),
@@ -491,7 +604,16 @@ mod tests {
             &[mdhd, boxed(b"minf", &boxed(b"stbl", &stsd))].concat(),
         );
         let trak = boxed(b"trak", &[tkhd, mdia].concat());
-        [boxed(b"ftyp", b"isom\0\0\0\0isom"), boxed(b"moov", &trak)].concat()
+        let mut moov = trak;
+        if let Some(defaults) = extras.trex {
+            let mut trex = vec![0u8; 4];
+            trex.extend_from_slice(&7u32.to_be_bytes());
+            for value in defaults {
+                trex.extend_from_slice(&value.to_be_bytes());
+            }
+            moov.extend(boxed(b"mvex", &boxed(b"trex", &trex)));
+        }
+        [boxed(b"ftyp", b"isom\0\0\0\0isom"), boxed(b"moov", &moov)].concat()
     }
 
     #[test]
@@ -548,6 +670,117 @@ mod tests {
             let info = unsafe { InitInfo::from_raw(&raw) };
             assert_eq!(info.sample_entry(), reported, "stamp {stamp}");
         }
+    }
+
+    #[test]
+    fn header_facts_from_a_header() {
+        let iv = [0xa5u8; 16];
+        let extras = Extras {
+            pattern_and_iv: Some((0x19, iv)),
+            trex: Some([1, 3000, 0, 0x0101_0000]),
+        };
+        let init = CmafInit::parse(init_segment_with(
+            b"encv",
+            78,
+            Some((b"avcC", &[0x01, 0x64, 0x00, 0x1f, 0xff])),
+            Some(b"avc1"),
+            Some(extras),
+        ))
+        .expect("an encrypted header with its trex parses");
+        let info = init.info();
+        assert_eq!(info.trak_count(), Some(1));
+        assert_eq!(
+            info.trex(),
+            Some(Trex {
+                default_sample_description_index: 1,
+                default_sample_duration: 3000,
+                default_sample_size: 0,
+                default_sample_flags: 0x0101_0000,
+            })
+        );
+        assert_eq!(
+            info.pattern(),
+            Some(EncryptionPattern {
+                crypt_byte_block: 1,
+                skip_byte_block: 9,
+            })
+        );
+        assert_eq!(info.constant_iv(), Some(&iv[..]));
+        assert!(format!("{info:?}").contains("trak_count"));
+
+        // A clear header without mvex: the block is reported, and says so.
+        let clear =
+            CmafInit::parse(init_segment(b"zzzz", 16, None, None)).expect("a clear header parses");
+        let info = clear.info();
+        assert_eq!(info.trak_count(), Some(1));
+        assert_eq!(info.trex(), None, "no trex for the track");
+        assert_eq!(info.pattern(), None);
+        assert_eq!(info.constant_iv(), None);
+
+        // Version 0 has no pattern; a per-sample IV size leaves no constant
+        // IV.
+        let v0 = CmafInit::parse(init_segment(
+            b"encv",
+            78,
+            Some((b"avcC", &[0x01, 0x64, 0x00, 0x1f, 0xff])),
+            Some(b"avc1"),
+        ))
+        .expect("a version-0 encrypted header parses");
+        assert_eq!(v0.info().pattern(), None);
+        assert_eq!(v0.info().constant_iv(), None);
+    }
+
+    #[test]
+    fn header_facts_need_their_whole_block() {
+        let iv = [7u8; 8];
+        let mut raw = sys::moq_cmaf_init_info_t {
+            has_cenc: true,
+            trak_count: 1,
+            has_trex: true,
+            trex_default_sample_description_index: 1,
+            trex_default_sample_duration: 1024,
+            tenc_version: 1,
+            default_crypt_byte_block: 1,
+            default_skip_byte_block: 9,
+            default_constant_iv: ffi::span(&iv),
+            ..Default::default()
+        };
+        let reserved_end = ffi::field_end!(sys::moq_cmaf_init_info_t, _reserved_sample_entry, u32);
+        let block_end = ffi::field_end!(
+            sys::moq_cmaf_init_info_t,
+            default_constant_iv,
+            sys::moq_bytes_t
+        );
+        for (stamp, reported) in [
+            (sys::MOQ_CMAF_INIT_INFO_V0_SIZE, false),
+            (reserved_end, false),
+            (block_end - 1, false),
+            (block_end, true),
+            (std::mem::size_of::<sys::moq_cmaf_init_info_t>(), true),
+        ] {
+            raw.struct_size = u32::try_from(stamp).expect("a record size fits u32");
+            // SAFETY: the record's one span borrows `iv`, alive here.
+            let info = unsafe { InitInfo::from_raw(&raw) };
+            assert_eq!(info.trak_count().is_some(), reported, "stamp {stamp}");
+            assert_eq!(info.trex().is_some(), reported, "stamp {stamp}");
+            assert_eq!(info.pattern().is_some(), reported, "stamp {stamp}");
+            assert_eq!(info.constant_iv().is_some(), reported, "stamp {stamp}");
+        }
+        // Inside the block, each value says what the header held.
+        raw.has_trex = false;
+        raw.tenc_version = 0;
+        raw.default_constant_iv = sys::moq_bytes_t::default();
+        // SAFETY: the record holds no span.
+        let info = unsafe { InitInfo::from_raw(&raw) };
+        assert_eq!(info.trak_count(), Some(1));
+        assert_eq!(info.trex(), None);
+        assert_eq!(info.pattern(), None, "a version-0 tenc has no pattern");
+        assert_eq!(info.constant_iv(), None);
+        raw.has_cenc = false;
+        raw.tenc_version = 1;
+        // SAFETY: as above.
+        let info = unsafe { InitInfo::from_raw(&raw) };
+        assert_eq!(info.pattern(), None, "a clear track has no pattern");
     }
 
     #[test]

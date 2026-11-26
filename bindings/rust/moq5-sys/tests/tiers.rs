@@ -62,6 +62,46 @@ fn the_service_links_through_its_own_closure() {
 }
 
 #[test]
+fn the_locmaf_tier_links_its_package_beside_the_media_tier() {
+    let locmaf = features(&["locmaf"]);
+    assert_eq!(
+        tier_names(locmaf),
+        ["core", "media", "locmaf"],
+        "locmaf implies media"
+    );
+    assert_eq!(locmaf.packages(), ["libmoq-media", "libmoq-locmaf"]);
+    assert_eq!(locmaf.describe(), "core + media + locmaf");
+    assert_eq!(locmaf.enabled(), "media, locmaf");
+    let with_service = features(&["locmaf", "service", "sim"]);
+    assert_eq!(
+        tier_names(with_service),
+        ["core", "sim", "media", "locmaf", "service"]
+    );
+    assert_eq!(
+        with_service.packages(),
+        ["libmoq-service", "libmoq-locmaf", "libmoq-sim"],
+        "after the service closure that requires the parsers"
+    );
+    assert!(!features(&["player"]).packages().contains(&"libmoq-locmaf"));
+    let closure = tiers::owned_closure(&locmaf.packages(), |package| {
+        Ok(match package {
+            "libmoq-media" | "libmoq-locmaf" => vec!["libmoq-core".to_owned()],
+            _ => Vec::new(),
+        })
+    })
+    .expect("every package resolves");
+    assert_eq!(closure, ["libmoq-media", "libmoq-core", "libmoq-locmaf"]);
+    let text = tiers::missing_package("libmoq-locmaf", locmaf, "(unset)", false);
+    for phrase in [
+        "the graph asks for the core + media + locmaf tiers (features: media, locmaf)",
+        "pkg-config finds no `libmoq-locmaf.pc`",
+        "MOQ_BUILD_LOCMAF=ON",
+    ] {
+        assert!(text.contains(phrase), "{phrase:?} is missing from: {text}");
+    }
+}
+
+#[test]
 fn tiers_unify_into_one_set_of_packages() {
     let both = features(&["sim", "media"]);
     assert_eq!(tier_names(both), ["core", "sim", "media"]);

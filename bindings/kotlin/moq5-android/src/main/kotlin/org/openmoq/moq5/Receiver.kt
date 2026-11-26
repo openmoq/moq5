@@ -113,8 +113,11 @@ public class MediaBytes(bytes: ByteArray) : ByteIdentity(bytes, "MediaBytes")
 /** `moq_media_type_t`: exactly the cases the C header declares. */
 public enum class MediaType { Video, Audio }
 
-/** `moq_media_packaging_t`, the STRUCTURED packaging the media tier derived; the catalog's own `packaging` string stays on [TrackDescription.packaging]. */
-public enum class PackagingKind { Raw, Cmaf }
+/**
+ * `moq_media_packaging_t`, the STRUCTURED packaging the media tier derived; the catalog's own `packaging` string stays on [TrackDescription.packaging].
+ * [Locmaf] is a track's packaging only (draft-einarsson-moq-locmaf-01): the service rebuilds its Objects as canonical CMAF chunks, so they arrive as [MediaPayload.Cmaf].
+ */
+public enum class PackagingKind { Raw, Cmaf, Locmaf }
 
 /** `moq_cmaf_codec_kind_t`; the C `UNKNOWN` is represented as absent (`null`), not as a case. */
 public enum class CmafCodecKind { Avc, Hevc, Av1, Aac, Opus }
@@ -723,7 +726,8 @@ public class MediaTimelineRecord internal constructor(
 
 /**
  * One snapshot of the receiver's statistics (`moq_media_receiver_stats_t`),
- * every field in the struct's order. Counters keep all 64 bits. The drop
+ * every field through `loc_order_forced` in the struct's order; the LOCMAF
+ * counters after it are not carried. Counters keep all 64 bits. The drop
  * counters are distinct: [objectsDropped] (policy eviction, or an
  * unsubscribed track's purge), [parseDrops] (media-level parse failures),
  * [catalogDrops] (non-fatal catalog-update drops). [gapsReported] counts

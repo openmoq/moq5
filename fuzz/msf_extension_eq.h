@@ -76,6 +76,19 @@ static inline bool fuzz_msf_supp_eq(const moq_msf_track_supplement_t *a,
     return true;
 }
 
+static inline bool fuzz_msf_locmaf_eq(const moq_msf_locmaf_t *a,
+                                      const moq_msf_locmaf_t *b)
+{
+    if (!a || !b) return a == b;
+    if (a->has_version != b->has_version || a->malformed != b->malformed)
+        return false;
+    return !a->has_version ||
+           (a->version.len == b->version.len &&
+            (a->version.len == 0 ||
+             (a->version.data && b->version.data &&
+              memcmp(a->version.data, b->version.data, a->version.len) == 0)));
+}
+
 /* Parsed/encoded lists contain at most one record per known kind. Preserve
  * list membership as well as the complete typed record, on every packaging. */
 static inline bool fuzz_msf_extensions_eq(const moq_msf_track_t *a,
@@ -91,6 +104,8 @@ static inline bool fuzz_msf_extensions_eq(const moq_msf_track_t *a,
             if (!fuzz_msf_ts_eq(x->u.mpeg2ts, y->u.mpeg2ts)) return false;
         } else if (x->kind == MOQ_MSF_EXT_SUPPLEMENT) {
             if (!fuzz_msf_supp_eq(x->u.supplement, y->u.supplement)) return false;
+        } else if (x->kind == MOQ_MSF_EXT_LOCMAF) {
+            if (!fuzz_msf_locmaf_eq(x->u.locmaf, y->u.locmaf)) return false;
         } else {
             return false;
         }

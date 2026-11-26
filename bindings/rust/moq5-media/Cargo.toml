@@ -4,12 +4,18 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-description = "Safe Rust API for the libmoq (MOQ5) media parsers: CMAF, LOC metadata, MPEG-TS catalog records"
+description = "Safe Rust API for the libmoq (MOQ5) media parsers: CMAF, LOC metadata, MPEG-TS catalog records, LOCMAF"
 repository = "https://github.com/openmoq/moq5"
 readme = "README.md"
 keywords = ["moq", "media-over-quic", "cmaf", "loc", "mpeg-ts"]
 categories = ["api-bindings", "multimedia", "parser-implementations"]
 publish = false
+
+[features]
+# The LOCMAF encoder and decoder (the `locmaf` module), over moq5-sys's
+# locmaf tier: it needs an SDK built with MOQ_BUILD_LOCMAF=ON and fails the
+# build without one.
+locmaf = ["moq5-sys/locmaf"]
 
 [dependencies]
 moq5-core = { version = "0.1.0", path = "../moq5-core" }
@@ -26,8 +32,27 @@ missing_errors_doc = "warn"
 missing_panics_doc = "warn"
 unwrap_used = "warn"
 
+# The LOCMAF rows exist only with the feature: run without it, they are
+# left out rather than passing with no test.
+[[test]]
+name = "locmaf"
+path = "tests/locmaf.rs"
+required-features = ["locmaf"]
+
+[[test]]
+name = "locmaf_storage"
+path = "tests/locmaf_storage.rs"
+required-features = ["locmaf"]
+
+[[test]]
+name = "locmaf_compile_fail"
+path = "tests/locmaf_compile_fail.rs"
+required-features = ["locmaf"]
+
 [package.metadata.docs.rs]
-# Documented from moq5-sys's cfg(docsrs) core and media snapshots, on the
-# targets those snapshots are verified on (see moq5-sys/Cargo.toml).
+# Documented from moq5-sys's cfg(docsrs) core, media and LOCMAF snapshots,
+# with the locmaf module, on the targets those snapshots are verified on
+# (see moq5-sys/Cargo.toml).
+features = ["locmaf"]
 default-target = "x86_64-unknown-linux-gnu"
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]

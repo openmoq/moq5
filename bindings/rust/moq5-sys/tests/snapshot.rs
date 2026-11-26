@@ -285,6 +285,14 @@ mod media {
     );
 }
 
+#[cfg(feature = "locmaf")]
+mod locmaf {
+    tier!(
+        "locmaf",
+        &["MOQ_LOCMAF_STORAGE_ALIGN", "MOQ_LOCMAF_REASON_LIMIT"]
+    );
+}
+
 #[cfg(feature = "service")]
 mod service {
     tier!("service", &["MOQ_MEDIA_DELIVERY_LIVE"]);

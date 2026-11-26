@@ -1,0 +1,17 @@
+function(run)
+    execute_process(COMMAND ${ARGV} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+    if(NOT rc EQUAL 0)
+        message(FATAL_ERROR "${ARGV}\n${out}\n${err}")
+    endif()
+    if("${out}${err}" MATCHES "[Ww]arning[: ]")
+        message(FATAL_ERROR "unexpected consumer warning: ${out}${err}")
+    endif()
+endfunction()
+set(prefix "${CHECK_DIR}/prefix")
+run("${CMAKE_COMMAND}" --install "${BUILD_DIR}" --prefix "${prefix}")
+run("${CMAKE_COMMAND}" -C "${CONTEXT}" -S "${SOURCE_DIR}/consumer"
+    -B "${CHECK_DIR}/build" "-DCMAKE_PREFIX_PATH=${prefix}"
+    -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF -DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=OFF)
+run("${CMAKE_COMMAND}" --build "${CHECK_DIR}/build")
+run("${CHECK_DIR}/build/consumer_c")
+run("${CHECK_DIR}/build/consumer_cpp")

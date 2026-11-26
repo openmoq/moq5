@@ -18,7 +18,7 @@ import kotlin.test.assertTrue
  * The decoder from the `nativeTrackDescribe` carrier to a [TrackDescription]
  * snapshot. Native enums are mapped only onto the cases the C headers declare
  * (`moq_media_type_t`: VIDEO=1, AUDIO=2; `moq_media_packaging_t`: RAW=1,
- * CMAF=2; `moq_cmaf_codec_kind_t`: UNKNOWN=0, AVC..OPUS=1..5); zero is
+ * CMAF=2, LOCMAF=4; `moq_cmaf_codec_kind_t`: UNKNOWN=0, AVC..OPUS=1..5); zero is
  * "absent" (`null`) and any other value fails closed by name. 64-bit
  * scalars are reinterpreted as `ULong`, never narrowed or signed-compared.
  * The appended fields follow the presence mask: the generation block
@@ -37,6 +37,7 @@ internal class TrackDescriptionCodecTest {
         assertEquals(null, TrackDescriptionCodec.mediaTypeOf(0L))
         assertEquals(PackagingKind.Raw, TrackDescriptionCodec.packagingKindOf(1L))
         assertEquals(PackagingKind.Cmaf, TrackDescriptionCodec.packagingKindOf(2L))
+        assertEquals(PackagingKind.Locmaf, TrackDescriptionCodec.packagingKindOf(4L))
         assertEquals(null, TrackDescriptionCodec.packagingKindOf(0L))
         assertEquals(null, TrackDescriptionCodec.codecKindOf(0L), "CMAF UNKNOWN is absent, not a case")
         assertEquals(listOf(CmafCodecKind.Avc, CmafCodecKind.Hevc, CmafCodecKind.Av1, CmafCodecKind.Aac, CmafCodecKind.Opus), (1L..5L).map { TrackDescriptionCodec.codecKindOf(it) })
@@ -46,10 +47,28 @@ internal class TrackDescriptionCodecTest {
     fun `an unknown native enum value fails closed by field name`() {
         assertEquals("media type", assertFailsWith<UnknownNativeValueException> { TrackDescriptionCodec.mediaTypeOf(3L) }.field)
         assertEquals("packaging kind", assertFailsWith<UnknownNativeValueException> { TrackDescriptionCodec.packagingKindOf(3L) }.field)
+        assertEquals("packaging kind", assertFailsWith<UnknownNativeValueException> { TrackDescriptionCodec.packagingKindOf(5L) }.field)
         assertEquals("cmaf codec kind", assertFailsWith<UnknownNativeValueException> { TrackDescriptionCodec.codecKindOf(6L) }.field)
         assertEquals("media type", assertFailsWith<UnknownNativeValueException> { TrackDescriptionCodec.mediaTypeOf(-1L) }.field)
         val bad = scalars(TrackDescribeScalars.MEDIA_TYPE to 7L)
         assertFailsWith<UnknownNativeValueException> { TrackDescriptionCodec.decode(bytes(), bad) }
+    }
+
+    @Test
+    fun `a LOCMAF description keeps its own packaging kind and the CMAF header facts a CMAF track carries`() {
+        val d = TrackDescriptionCodec.decode(
+            bytes(),
+            scalars(
+                TrackDescribeScalars.MEDIA_TYPE to 1L, TrackDescribeScalars.PACKAGING_KIND to 4L,
+                TrackDescribeScalars.HAS_INIT to 1L, TrackDescribeScalars.INIT_CODEC_KIND to 1L,
+                TrackDescribeScalars.INIT_TIMESCALE to 90_000L, TrackDescribeScalars.INIT_TRACK_ID to 1L,
+            ),
+        )
+        assertEquals(PackagingKind.Locmaf, d.packagingKind)
+        assertEquals(MediaType.Video, d.mediaType)
+        assertEquals(CmafCodecKind.Avc, d.init?.codecKind)
+        assertEquals(90_000u, d.init?.timescale)
+        assertEquals(1u, d.init?.trackId)
     }
 
     @Test

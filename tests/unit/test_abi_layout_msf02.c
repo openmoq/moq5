@@ -100,14 +100,20 @@ _Static_assert(offsetof(moq_msf_track_supplement_t, struct_size) == 0 &&
 _Static_assert(MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE ==
                offsetof(moq_msf_track_supplement_t, malformed) + sizeof(uint32_t),
                "the supplement's first published layout ends with malformed");
+_Static_assert(offsetof(moq_msf_locmaf_t, struct_size) == 0 &&
+               MOQ_MSF_LOCMAF_V0_SIZE ==
+               offsetof(moq_msf_locmaf_t, malformed) + sizeof(uint32_t),
+               "the LOCMAF record's one extent ends with malformed");
+_Static_assert(sizeof(((moq_msf_track_ext_t *)0)->u) == sizeof(void *),
+               "the extension union stays one pointer wide");
 _Static_assert(offsetof(moq_msf_validate_cfg_t, struct_size) == 0 &&
                MOQ_MSF_VALIDATE_CFG_V0_SIZE == sizeof(moq_msf_validate_cfg_t),
                "the validate cfg's first published layout is the whole struct");
 
 /* Values that never renumber. */
 _Static_assert(MOQ_MSF_REVISION_01 == 0 && MOQ_MSF_REVISION_02 == 1, "revisions");
-_Static_assert(MOQ_MSF_EXT_MPEG2TS == 1 && MOQ_MSF_EXT_SUPPLEMENT == 2,
-               "extension kinds");
+_Static_assert(MOQ_MSF_EXT_MPEG2TS == 1 && MOQ_MSF_EXT_SUPPLEMENT == 2 &&
+               MOQ_MSF_EXT_LOCMAF == 3, "extension kinds");
 _Static_assert(MOQ_MSF_DELTA_OP_ADD == 1 && MOQ_MSF_DELTA_OP_REMOVE == 2 &&
                MOQ_MSF_DELTA_OP_CLONE == 3 && MOQ_MSF_DELTA_OP_UPDATE == 4,
                "delta op kinds");

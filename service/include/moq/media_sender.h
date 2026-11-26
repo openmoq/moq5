@@ -131,10 +131,12 @@ typedef struct moq_media_sender_cfg {
                                           a group-start object whose first sample
                                           is known not to be a SAP is rejected (a
                                           sync sample of indeterminate exact SAP
-                                          type is allowed). Affects CMAF tracks
-                                          only; RAW/LOC is unaffected. Set to
-                                          false AFTER cfg_init for deliberate
-                                          passthrough (no per-object checks). */
+                                          type is allowed). Affects CMAF and
+                                          LOCMAF tracks (a LOCMAF write is a
+                                          CMAF chunk); RAW/LOC is unaffected.
+                                          Set to false AFTER cfg_init for
+                                          deliberate passthrough (no
+                                          per-object checks). */
 
     /* CMSF §4 root contentProtections: DRM metadata entries that tracks
      * reference by refID (see moq_media_track_cfg_t.content_protection_ref_ids).
@@ -366,7 +368,8 @@ typedef struct moq_media_track_cfg {
     uint32_t struct_size;
     moq_bytes_t name;                  /* REQUIRED: catalog track name */
     moq_media_type_t      media_type;  /* REQUIRED: VIDEO | AUDIO */
-    moq_media_packaging_t packaging;   /* REQUIRED: RAW | CMAF | MPEG2TS */
+    moq_media_packaging_t packaging;   /* REQUIRED: RAW | CMAF | MPEG2TS |
+                                          LOCMAF */
     moq_bytes_t codec;                 /* codec string, e.g. "avc1.64001f".
                                           MSF-01 5.2.18: REQUIRED for audio and
                                           video tracks (add_track returns
@@ -381,9 +384,10 @@ typedef struct moq_media_track_cfg {
                                           a CMAF init segment, H.264/HEVC
                                           SPS/PPS/VPS, AAC AudioSpecificConfig,
                                           etc. -- i.e. the encoder's extradata.
-                                          Required and nonempty for CMAF on
-                                          every companion, including unresolved
-                                          AUTO, even if validate_cmaf is false.
+                                          Required and nonempty for CMAF and
+                                          LOCMAF on every companion, including
+                                          unresolved AUTO, even if
+                                          validate_cmaf is false.
                                           Otherwise optional. The service
                                           base64-encodes it in root initDataList
                                           with a track initRef; receivers see
@@ -547,7 +551,9 @@ typedef struct moq_media_track_cfg {
      * moq_msf_catalog_encode's rules, and the tracks of one altGroup carry
      * one accessibleWindowTime (MSF-02 5.2.45): a track whose window, or its
      * absence, differs from that of a track already added to its altGroup is
-     * MOQ_ERR_INVAL. Empty (the default) adds nothing.
+     * MOQ_ERR_INVAL. Empty (the default) adds nothing. A MOQ_MSF_EXT_LOCMAF
+     * record is the service's own (a LOCMAF track gets one with the version
+     * this build encodes), so one here is MOQ_ERR_INVAL.
      *
      * Appended after publisher_priority, aligned as uint64_t (the ABI's own
      * alignment for it, as on the priority pair), so the block starts at or
@@ -747,6 +753,20 @@ MOQ_API void moq_media_track_cfg_init_sized(moq_media_track_cfg_t *cfg,
  * negotiation, including unresolved AUTO and validate_cmaf=false. Missing init
  * returns MOQ_ERR_INVAL with *out == NULL, without registering a track or
  * changing the sender.
+ *
+ * LOCMAF tracks (draft-einarsson-moq-locmaf-01). The application writes CMAF
+ * chunks, and the service sends each as a LOCMAF Object: a full header at
+ * the start of every Group, then deltas against the previous Object, on one
+ * subgroup per Group and never as a datagram (section 3). The catalog entry
+ * is packaging "locmaf" with the locmafVersion this build encodes
+ * (MOQ_MSF_LOCMAF_VERSION), a MOQ_MSF_EXT_LOCMAF record the service writes
+ * itself, and init_data -- required, a CMAF Header with exactly one trak and
+ * its trex -- as an "inline" initDataList entry, exactly as for CMAF;
+ * contentProtectionRefIDs follow the CMAF rule. MOQ_ERR_INVAL for init_data
+ * LOCMAF cannot use, or for an application-supplied MOQ_MSF_EXT_LOCMAF
+ * record; MOQ_ERR_NOMEM when the track's encoder cannot be allocated
+ * (nothing is registered). A build without moq::locmaf returns
+ * MOQ_ERR_UNSUPPORTED. Either catalog revision carries the track.
  */
 MOQ_API moq_result_t moq_media_sender_add_track(
     moq_media_sender_t *s, const moq_media_track_cfg_t *cfg,
@@ -910,7 +930,20 @@ typedef struct moq_media_send_object {
  * UNSUPPORTED without transfer or endpoint/session termination. An object
  * that would open a group after Group ID 2^62 - 1 (the library's write-path
  * bound) is MOQ_ERR_LIMIT, without transfer; the track's open group still
- * accepts objects. */
+ * accepts objects.
+ *
+ * On a LOCMAF track each write is one CMAF chunk (genBox-able boxes, then one
+ * moof and its mdat), checked as the encoder would encode it, before
+ * anything is taken: MOQ_ERR_UNSUPPORTED for more than one chunk or one
+ * outside LOCMAF's field model (for example a uuid box in the traf),
+ * MOQ_ERR_PROTO for a malformed chunk, MOQ_ERR_LIMIT beyond the encoder's
+ * limits; with validate_cmaf, also the CMAF checks above. The buffer the
+ * Object will be sent from is reserved at the call and charged to the queue
+ * with the chunk: MOQ_ERR_NOMEM when it cannot be, again with no ownership
+ * taken. The application's properties pass through unchanged, as for CMAF.
+ * An Object that goes out is the chunk's LOCMAF encoding at the Location the
+ * service assigns; a Group the service drops or abandons is never continued
+ * by a delta. */
 MOQ_API moq_result_t moq_media_sender_write(
     moq_media_sender_t *s, moq_media_track_t *track,
     const moq_media_send_object_t *obj);

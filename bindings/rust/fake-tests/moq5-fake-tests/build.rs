@@ -14,6 +14,10 @@ fn main() {
     if env::var_os("CARGO_FEATURE_PLAYER").is_some() {
         build.define("MOQ5_LAYOUT_PLAYER", None);
     }
+    // The LOCMAF records, with the `locmaf` feature (an SDK with LOCMAF).
+    if env::var_os("CARGO_FEATURE_LOCMAF").is_some() {
+        build.define("MOQ5_LAYOUT_LOCMAF", None);
+    }
     build
         .file("../layout_probe.c")
         .warnings(true)

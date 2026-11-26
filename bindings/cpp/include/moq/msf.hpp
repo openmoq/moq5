@@ -8,6 +8,7 @@
 
 #include <cstring>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -61,6 +62,16 @@ public:
     // Null-aware: a default/empty span has items_ == nullptr; avoid pointer
     // arithmetic on a null pointer (UB) -- begin() == end() either way.
     iterator end() const { return iterator(items_ ? items_ + count_ : nullptr); }
+};
+
+/// draft-einarsson-moq-locmaf-01 section 5: a track's LOCMAF record, read
+/// through moq_msf_track_locmaf. Borrows from the owning parsed_catalog.
+/// Judge it with parsed_catalog::locmaf_check before subscribing.
+struct locmaf_view {
+    /// locmafVersion: nullopt when the key is absent; empty when its value
+    /// was not a JSON string (malformed then has MOQ_MSF_LOCMAF_F_VERSION).
+    std::optional<std::string_view> version;
+    uint32_t                        malformed = 0;   ///< MOQ_MSF_LOCMAF_F_*
 };
 
 struct track_view {
@@ -124,6 +135,10 @@ struct track_view {
     /// nullptr when the track carries none. Borrows from the owning
     /// parsed_catalog's DOM.
     const moq_msf_track_supplement_t *supplement = nullptr;
+
+    /// The LOCMAF record: nullopt unless the track carries a locmafVersion
+    /// key, on any packaging.
+    std::optional<locmaf_view> locmaf;
 };
 
 struct init_data_view {
@@ -247,6 +262,13 @@ inline track_view view_from(const moq_msf_track_t &t) {
     if (t.has_parent_namespace) v.parent_namespace = sv(t.parent_namespace);
     v.mpeg2ts = moq_msf_track_mpeg2ts(&t);
     v.supplement = moq_msf_track_supplement(&t);
+    const moq_msf_locmaf_t *lm = moq_msf_track_locmaf(&t);
+    if (lm && lm->struct_size >= MOQ_MSF_LOCMAF_V0_SIZE) {
+        locmaf_view lv;
+        if (lm->has_version) lv.version = sv(lm->version);
+        lv.malformed = lm->malformed;
+        v.locmaf = lv;
+    }
     return v;
 }
 
@@ -361,6 +383,17 @@ public:
     moq_msf_mpeg2ts_error_t mpeg2ts_check(size_t i) const {
         moq_msf_mpeg2ts_error_t why = MOQ_MSF_MPEG2TS_OK;
         (void)moq_msf_track_mpeg2ts_check(&cat_.tracks[i], &why);
+        return why;
+    }
+
+    /// The subscriber's check of track i as a LOCMAF track
+    /// (draft-einarsson-moq-locmaf-01 section 5): MOQ_MSF_LOCMAF_OK, or why
+    /// it must not be subscribed. MOQ_MSF_LOCMAF_ERR_NOT_LOCMAF for another
+    /// packaging; VERSION_UNSUPPORTED for a version this build does not
+    /// decode.
+    moq_msf_locmaf_error_t locmaf_check(size_t i) const {
+        moq_msf_locmaf_error_t why = MOQ_MSF_LOCMAF_OK;
+        (void)moq_msf_track_locmaf_check(&cat_.tracks[i], &why);
         return why;
     }
 
@@ -565,6 +598,13 @@ struct track {
     // MSF-02 5.2.15: the Number entries of "depends" (renderGroup ids),
     // emitted after the String entries in `depends`. Owned by the track.
     std::vector<int> depends_render_groups;
+
+    // draft-einarsson-moq-locmaf-01 section 5 locmafVersion, handed to the C
+    // track as its MOQ_MSF_EXT_LOCMAF record. Owned by the track. Required on
+    // a "locmaf" track (MOQ_MSF_LOCMAF_VERSION is the version this build
+    // decodes) and refused on any other packaging; a "clone" or "update" op
+    // track may carry it as an override.
+    std::optional<std::string> locmaf_version;
 };
 
 // MSF-01 5.1.7 root Initialization Data List entry (authoring; borrowed views).
@@ -745,12 +785,13 @@ inline void fill_c_track_(detail::encode_arena &arena, moq_msf_track_t &d,
     if (s.has_is_live)   d.has_is_live   = true;
     if (s.has_parent_name)      { d.has_parent_name = true;      d.parent_name = s.parent_name.raw(); }
     if (s.has_parent_namespace) { d.has_parent_namespace = true; d.parent_namespace = s.parent_namespace.raw(); }
-    // The extension list (MPEG-2 TS record, then the supplement, in kind
-    // order) and its records, owned by the encode arena. On allocation
-    // failure the arena latches failed(), which encode() checks before
-    // calling moq_msf_catalog_encode.
+    // The extension list (MPEG-2 TS record, the supplement, then the
+    // LOCMAF record, in kind order) and its records, owned by the encode
+    // arena. On allocation failure the arena latches failed(), which
+    // encode() checks before calling moq_msf_catalog_encode.
     const bool supplement = detail::track_has_supplement(s);
-    const size_t ext_count = (s.mpeg2ts ? 1u : 0u) + (supplement ? 1u : 0u);
+    const size_t ext_count = (s.mpeg2ts ? 1u : 0u) + (supplement ? 1u : 0u) +
+                             (s.locmaf_version ? 1u : 0u);
     auto *ext = arena.calloc_n<moq_msf_track_ext_t>(ext_count);
     size_t k = 0;
     if (ext && s.mpeg2ts) {
@@ -767,6 +808,17 @@ inline void fill_c_track_(detail::encode_arena &arena, moq_msf_track_t &d,
         if (const moq_msf_track_supplement_t *rec = detail::build_supplement(arena, s)) {
             ext[k].kind = MOQ_MSF_EXT_SUPPLEMENT;
             ext[k].u.supplement = rec;
+            k++;
+        }
+    }
+    if (ext && s.locmaf_version) {
+        auto *rec = arena.calloc_n<moq_msf_locmaf_t>(1);
+        if (rec) {
+            moq_msf_locmaf_init(rec);
+            rec->has_version = true;
+            rec->version = bytes_view(std::string_view(*s.locmaf_version)).raw();
+            ext[k].kind = MOQ_MSF_EXT_LOCMAF;
+            ext[k].u.locmaf = rec;
             k++;
         }
     }

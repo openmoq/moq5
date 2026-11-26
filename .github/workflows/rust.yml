@@ -58,8 +58,9 @@ jobs:
           cargo --version && rustup run 1.85 cargo --version
 
       # The service SDK the binding links: no adapters, with the player,
-      # MPEG-TS and the simulator (all stated, so a tree without them fails
-      # to configure; the simulator tier's Rust rows need moq-sim),
+      # MPEG-TS, the simulator and LOCMAF (all stated, so a tree without
+      # them fails to configure; the simulator tier's Rust rows need
+      # moq-sim, and LOCMAF's rows moq-locmaf),
       # warnings as errors, the tree's library type (the consumer row that
       # matches it runs). The cross-build row runs where the tree can build
       # the other architecture (macOS); Linux runs the refusal row only.
@@ -74,9 +75,9 @@ jobs:
             -DMOQ_WARNINGS_AS_ERRORS=ON \
             -DMOQ_BUILD_TESTS=ON -DMOQ_BUILD_SIM=ON -DMOQ_BUILD_EXAMPLES=OFF \
             -DMOQ_BUILD_MSF=ON -DMOQ_BUILD_MEDIA_OBJECT=ON -DMOQ_BUILD_SERVICE=ON \
-            -DMOQ_BUILD_PLAYBACK=ON -DMOQ_BUILD_MPEG2TS=ON \
+            -DMOQ_BUILD_PLAYBACK=ON -DMOQ_BUILD_MPEG2TS=ON -DMOQ_BUILD_LOCMAF=ON \
             -DMOQ_BUILD_RUST_BINDING=ON -DMOQ_RUST_RELAY_ROWS=OFF \
-            -DMOQ_RUST_PLAYER=ON -DMOQ_RUST_MPEG2TS=ON
+            -DMOQ_RUST_PLAYER=ON -DMOQ_RUST_MPEG2TS=ON -DMOQ_RUST_LOCMAF=ON
 
       - name: Build
         run: cmake --build build/rust
@@ -167,8 +168,8 @@ jobs:
           rustup toolchain install 1.85 --profile minimal
           rustup default stable
 
-      # The SDK the rows link: the picoquic backends, the player and MPEG-TS,
-      # installed with their pkg-config closure.
+      # The SDK the rows link: the picoquic backends, the player, MPEG-TS and
+      # LOCMAF, installed with their pkg-config closure.
       - name: Build and install the picoquic service SDK
         run: |
           openssl_args=()
@@ -182,7 +183,7 @@ jobs:
             -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/rust-pq-sdk" -DCMAKE_INSTALL_LIBDIR=lib \
             -DMOQ_BUILD_TESTS=OFF -DMOQ_BUILD_SIM=OFF -DMOQ_BUILD_EXAMPLES=OFF \
             -DMOQ_BUILD_MSF=ON -DMOQ_BUILD_MEDIA_OBJECT=ON -DMOQ_BUILD_SERVICE=ON \
-            -DMOQ_BUILD_PLAYBACK=ON -DMOQ_BUILD_MPEG2TS=ON \
+            -DMOQ_BUILD_PLAYBACK=ON -DMOQ_BUILD_MPEG2TS=ON -DMOQ_BUILD_LOCMAF=ON \
             -DMOQ_BUILD_ADAPTER_PICOQUIC=ON -DMOQ_BUILD_PQ_THREADED=ON \
             -DMOQ_BUILD_ADAPTER_PICO_WT=ON -DMOQ_BUILD_PICO_WT_MANAGED=ON \
             "-DMOQ_PICOQUIC_SOURCE_DIR=$MOQ_PICOQUIC_SOURCE_DIR" \
@@ -193,6 +194,8 @@ jobs:
           test -f "$RUNNER_TEMP/rust-pq-sdk/lib/pkgconfig/libmoq-service.pc"
           test -f "$RUNNER_TEMP/rust-pq-sdk/include/moq/media_player.h"
           test -f "$RUNNER_TEMP/rust-pq-sdk/include/moq/mpeg2ts.h"
+          test -f "$RUNNER_TEMP/rust-pq-sdk/include/moq/locmaf.h"
+          test -f "$RUNNER_TEMP/rust-pq-sdk/lib/pkgconfig/libmoq-locmaf.pc"
 
       # The relay, from the same setup scripts the relay job uses, with the
       # Rust rows pointed at the installed picoquic SDK. The cross-build row
@@ -223,7 +226,7 @@ jobs:
             -DMOQ_BUILD_RUST_BINDING=ON -DMOQ_RUST_CROSS_BUILD=OFF \
             -DMOQ_RUST_QUINN_EXAMPLE=ON \
             "-DMOQ_RUST_SDK_PREFIX=$RUNNER_TEMP/rust-pq-sdk" \
-            -DMOQ_RUST_PLAYER=ON -DMOQ_RUST_MPEG2TS=ON \
+            -DMOQ_RUST_PLAYER=ON -DMOQ_RUST_MPEG2TS=ON -DMOQ_RUST_LOCMAF=ON \
             "${openssl_args[@]}"
           cmake --build build/rust-relay --target moq5-relay
 

@@ -9,6 +9,7 @@ features:
 | (none) | the core: the session, its vocabulary, the publisher and subscriber facades | `types`, `rcbuf`, `version`, `location`, `fill`, `cluster`, `session`, `transport_binding`, `connection_target`, `publisher`, `subscriber` | `libmoq-core` |
 | `sim` | the deterministic simulator | `sim` | `libmoq-sim` |
 | `media` | the media parsers | `loc`, `cmaf`, `media_object`, `msf` | `libmoq-media` |
+| `locmaf` (implies `media`) | the LOCMAF encoder and decoder | `locmaf` | `libmoq-locmaf` (beside `libmoq-media` or `libmoq-service`) |
 | `service` (implies `media`) | the managed endpoint, media sender and receiver | `endpoint`, `media_auth`, `media_sender`, `media_receiver` | `libmoq-service` |
 | `player` (implies `service`) | the media player and the playback configuration it takes | `playback` (that configuration), `media_player` | `libmoq-service` |
 
@@ -19,7 +20,8 @@ tier references from a lower one is the lower tier's item, and the traits
 bindgen asks about for those types are read from the lower tiers' generated
 text. A tier's bindings are therefore the same whichever other tiers a
 graph enables. A tier whose headers the SDK lacks fails the build, naming
-the remedy (`MOQ_BUILD_SIM=ON`, `MOQ_BUILD_PLAYBACK=ON`, ...).
+the remedy (`MOQ_BUILD_SIM=ON`, `MOQ_BUILD_LOCMAF=ON`,
+`MOQ_BUILD_PLAYBACK=ON`, ...).
 
 Each `wrapper_<tier>.h` restates the values bindgen cannot evaluate
 (`UINT32_C()` constants, casts, the offsetof-based v0 floors) as
@@ -42,8 +44,9 @@ Cargo unifies features across a dependency graph, so the build script binds
 and links the union of the tiers every crate asked for, from one source:
 the installed SDK, found through pkg-config. There is no other source and no
 fallback. Each tier links through its own package: the core alone through
-`libmoq-core`; the simulator through `libmoq-sim` and the media parsers
-through `libmoq-media` (each `Requires` the core's); the service through
+`libmoq-core`; the simulator through `libmoq-sim`, the media parsers
+through `libmoq-media` and the LOCMAF encoder and decoder through
+`libmoq-locmaf` (each `Requires` the core's); the service through
 `libmoq-service`, whose `Requires` closure carries the core, the media
 parsers and every managed provider the SDK expresses through pkg-config.
 `libmoq.pc` is never probed for a lower tier: it names every component the
@@ -65,7 +68,8 @@ exports the include directories to dependents as `DEP_MOQ_INCLUDE`.
 - `MOQ_PREFIX`: an install prefix whose `lib/pkgconfig` (and `lib64/pkgconfig`
   when present) goes first on `PKG_CONFIG_PATH`.
 - `LIBMOQ_CORE_STATIC`, `LIBMOQ_SIM_STATIC`, `LIBMOQ_MEDIA_STATIC`,
-  `LIBMOQ_SERVICE_STATIC` (each with its `_DYNAMIC` form, and the
+  `LIBMOQ_LOCMAF_STATIC`, `LIBMOQ_SERVICE_STATIC` (each with its `_DYNAMIC`
+  form, and the
   `PKG_CONFIG_ALL_*` forms): the `pkg-config` crate's static/shared
   selection for each package it probes. Unset, the installed libraries
   decide which kind links, but pkg-config then reports only the `.pc` files'
@@ -123,7 +127,8 @@ linked or run.
 Supported SDK builds are the ones that install the tier packages a graph
 needs: `libmoq-core.pc` (every SDK of this tree), `libmoq-sim.pc`
 (`MOQ_BUILD_SIM=ON`), `libmoq-media.pc` (all five media parsers, MPEG-TS
-included) and, for the service, `libmoq-service.pc`: the service tier
+included), `libmoq-locmaf.pc` (`MOQ_BUILD_LOCMAF=ON`) and, for the service,
+`libmoq-service.pc`: the service tier
 without adapters, picoquic raw-QUIC plus PicoWT managed, and the WTQuic
 managed backends. A service built with mvfst, proxygen or the direct MsQuic
 managed backend installs no `libmoq-service.pc` and is not linked; the
@@ -178,7 +183,7 @@ docs.rs list.
 and `docs/preambles_<tier>.md` of its header preambles, compiled only under
 `cfg(docsrs)`, where no SDK exists to generate them from; the core's always,
 each other tier's under its feature. docs.rs documents this crate with
-every tier (`sim` and `player`). Each bindings snapshot's header records
+every tier (`sim`, `locmaf` and `player`). Each bindings snapshot's header records
 the libmoq commit, the packages the generating build linked and their
 `Requires`, and the generating target and tooling (bindgen 0.73, the
 libclang and its version, the output formatted by the toolchain's

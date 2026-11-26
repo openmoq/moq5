@@ -891,12 +891,23 @@ int main(int argc, char **argv)
         /* A size at/above the v0 floor but below sizeof(current) -- the stats
          * struct has trailing padding after `paused` -- is SERVED (clamped),
          * proving the floor is the frozen v0 base, not sizeof(current). The old
-         * `>= sizeof` validation would have rejected this. */
+         * `>= sizeof` validation would have rejected this. A size that ends
+         * inside a field before the LOCMAF block gets exactly that many
+         * bytes. */
+        const size_t inside = offsetof(moq_media_receiver_stats_t, loc_order_forced) +
+                              sizeof(uint64_t) - 1;
+        memset(&sst, 0, sizeof(sst));
+        MOQ_TEST_CHECK_EQ_INT(
+            (int)moq_media_receiver_get_stats(r, &sst, inside), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_INT((int)sst.struct_size, (int)inside);
+        /* The LOCMAF counters are one block: a size that ends inside it gets
+         * the fields before it. */
         memset(&sst, 0, sizeof(sst));
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_media_receiver_get_stats(r, &sst, sizeof(sst) - 1),
             (int)MOQ_OK);
-        MOQ_TEST_CHECK_EQ_INT((int)sst.struct_size, (int)(sizeof(sst) - 1));
+        MOQ_TEST_CHECK_EQ_INT((int)sst.struct_size,
+            (int)offsetof(moq_media_receiver_stats_t, locmaf_objects_rebuilt));
 
         MOQ_TEST_CHECK_EQ_INT(
             (int)moq_media_receiver_subscribe_track(r, v, NULL), (int)MOQ_OK);

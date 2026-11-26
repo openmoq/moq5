@@ -956,6 +956,101 @@ int main()
         }
     }
 
+    // LOCMAF tracks (draft-einarsson-moq-locmaf-01 section 5): the
+    // locmafVersion record as a view, and the subscriber's check.
+    {
+        auto r = moq::msf::parse(moq::bytes_view(
+            R"({"version":"draft-01","tracks":[)"
+            R"({"name":"ok","packaging":"locmaf","isLive":true,"locmafVersion":"0.3"},)"
+            R"({"name":"future","packaging":"locmaf","isLive":true,"locmafVersion":"0.4"},)"
+            R"({"name":"number","packaging":"locmaf","isLive":true,"locmafVersion":3},)"
+            R"({"name":"missing","packaging":"locmaf","isLive":true},)"
+            R"({"name":"plain","packaging":"cmaf","isLive":true}]})"));
+        MOQ_CHECK(r.ok());
+        if (r.ok() && r->track_count() == 5) {
+            auto ok = r->track(0);
+            MOQ_CHECK(ok.locmaf.has_value());
+            if (ok.locmaf) {
+                MOQ_CHECK(ok.locmaf->version == std::optional<std::string_view>("0.3"));
+                MOQ_CHECK(ok.locmaf->malformed == 0);
+            }
+            MOQ_CHECK(r->locmaf_check(0) == MOQ_MSF_LOCMAF_OK);
+            MOQ_CHECK(r->track(1).locmaf && r->track(1).locmaf->version == "0.4");
+            MOQ_CHECK(r->locmaf_check(1) == MOQ_MSF_LOCMAF_ERR_VERSION_UNSUPPORTED);
+            auto num = r->track(2);
+            MOQ_CHECK(num.locmaf && num.locmaf->version && num.locmaf->version->empty());
+            MOQ_CHECK(num.locmaf && num.locmaf->malformed == MOQ_MSF_LOCMAF_F_VERSION);
+            MOQ_CHECK(r->locmaf_check(2) == MOQ_MSF_LOCMAF_ERR_VERSION_MALFORMED);
+            MOQ_CHECK(!r->track(3).locmaf);
+            MOQ_CHECK(r->locmaf_check(3) == MOQ_MSF_LOCMAF_ERR_VERSION_MISSING);
+            MOQ_CHECK(!r->track(4).locmaf);
+            MOQ_CHECK(r->locmaf_check(4) == MOQ_MSF_LOCMAF_ERR_NOT_LOCMAF);
+        }
+    }
+
+    // LOCMAF authoring: the track owns its version string; it is emitted in
+    // either revision, beside a supplement, and refused where it does not
+    // belong.
+    {
+        moq::msf::track t;
+        t.name = "video"; t.packaging = "locmaf"; t.is_live = true;
+        t.has_role = true; t.role = "video";
+        t.has_codec = true; t.codec = "avc1.64001f";
+        {
+            std::string version = MOQ_MSF_LOCMAF_VERSION;
+            t.locmaf_version = version;
+            version.assign("9.9");   // the track holds its own copy
+        }
+        moq::msf::catalog cat;
+        cat.tracks = &t; cat.track_count = 1;
+        for (moq_msf_revision_t rev : {MOQ_MSF_REVISION_01, MOQ_MSF_REVISION_02}) {
+            cat.revision = rev;
+            auto enc = moq::msf::encode(cat);
+            MOQ_CHECK(enc.ok());
+            if (!enc.ok()) continue;
+            std::string_view json(reinterpret_cast<const char *>(enc->data()), enc->size());
+            MOQ_CHECK(json.find(R"("locmafVersion":"0.3")") != std::string_view::npos);
+            auto dec = moq::msf::parse(moq::bytes_view(enc->data(), enc->size()));
+            MOQ_CHECK(dec.ok());
+            if (dec.ok()) {
+                MOQ_CHECK(dec->track(0).locmaf && dec->track(0).locmaf->version == "0.3");
+                MOQ_CHECK(dec->locmaf_check(0) == MOQ_MSF_LOCMAF_OK);
+            }
+        }
+
+        // Beside an MSF-02 supplement, each record keeps its own kind.
+        moq::msf::track both = t;
+        both.keyframe_spacing = 30;
+        cat.tracks = &both;
+        cat.revision = MOQ_MSF_REVISION_02;
+        auto enc = moq::msf::encode(cat);
+        MOQ_CHECK(enc.ok());
+        if (enc.ok()) {
+            auto dec = moq::msf::parse(moq::bytes_view(enc->data(), enc->size()));
+            MOQ_CHECK(dec.ok());
+            if (dec.ok()) {
+                auto v = dec->track(0);
+                MOQ_CHECK(v.locmaf && v.locmaf->version == "0.3");
+                MOQ_CHECK(v.supplement && v.supplement->keyframe_spacing == 30);
+            }
+        }
+
+        // A locmaf track without a version, an empty version, and a version
+        // on another packaging are the C refusal.
+        moq::msf::track bare = t;
+        bare.locmaf_version.reset();
+        moq::msf::track empty = t;
+        empty.locmaf_version = std::string();
+        moq::msf::track stray = t;
+        stray.packaging = "cmaf";
+        cat.revision = MOQ_MSF_REVISION_01;
+        for (const moq::msf::track *bad : {&bare, &empty, &stray}) {
+            cat.tracks = bad;
+            auto r = moq::msf::encode(cat);
+            MOQ_CHECK(!r.ok() && r.error().code() == moq::errc::invalid);
+        }
+    }
+
     // namespace_split(): the MSF-02 5.2.2 fields, borrowed from the input.
     {
         const char text[] = "example.com/live/cam1";

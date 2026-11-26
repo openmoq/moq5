@@ -109,6 +109,22 @@ if(MOQ_BUILD_TESTS)
     endif()
     add_test(NAME msf02 COMMAND test_msf02)
 
+    # draft-einarsson-moq-locmaf-01 catalog fields, in both revisions. With
+    # the LOCMAF library built, the test also pins the version the catalog
+    # gates on to the one the codec implements.
+    add_executable(test_msf_locmaf tests/test_msf_locmaf.c)
+    target_link_libraries(test_msf_locmaf PRIVATE moq::msf)
+    if(TARGET moq::locmaf)
+        target_link_libraries(test_msf_locmaf PRIVATE moq::locmaf)
+        target_compile_definitions(test_msf_locmaf PRIVATE MOQ_TEST_HAVE_LOCMAF)
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        target_compile_options(test_msf_locmaf PRIVATE -Wall -Wextra -Wpedantic
+            $<$<BOOL:${MOQ_WARNINGS_AS_ERRORS}>:-Werror>)
+    endif()
+    add_test(NAME msf_locmaf COMMAND test_msf_locmaf)
+    set_tests_properties(msf_locmaf PROPERTIES LABELS "media;msf")
+
     # The sized-companion cases use LOC through moq::msf's PUBLIC
     # moq::media-object dependency; do not repeat that static archive here.
     if(TARGET moq::media-object AND TARGET moq::cmaf AND TARGET moq::loc)

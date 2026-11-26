@@ -275,7 +275,10 @@ impl SenderConfig {
 /// MSF requires a codec and a bitrate for every audio and video track, and
 /// a sample rate and channel config for audio; the service refuses a track
 /// missing them with [`Error::INVAL`]. An MPEG-TS track needs its record
-/// ([`mpeg2ts`](SendTrackConfig::mpeg2ts)) and a bitrate, and no codec.
+/// ([`mpeg2ts`](SendTrackConfig::mpeg2ts)) and a bitrate, and no codec. A
+/// LOCMAF track ([`Packaging::Locmaf`]) needs its CMAF Header as its
+/// [`init_data`](SendTrackConfig::init_data), as a CMAF track does; the
+/// service declares its locmafVersion.
 ///
 /// The C configuration is built with the sized initializer, so every field
 /// reaches the service.
@@ -1022,6 +1025,12 @@ impl Sender {
     /// error, untouched. Accepted means accepted by the service, not
     /// delivered: under a drop policy an accepted object may still be
     /// evicted.
+    ///
+    /// A LOCMAF track ([`Packaging::Locmaf`]) takes one CMAF chunk per
+    /// write, which the service encodes; besides its refusals of the chunk,
+    /// such a write fails with [`Error::NOMEM`] when the service cannot
+    /// reserve the encoded Object's buffer, and the chunk comes back as
+    /// for any refusal.
     // The error hands the caller's object back by value, as the call took
     // it; boxing it would allocate on every refusal, and a WOULD_BLOCK
     // refusal is the normal retry path of a lossless writer.

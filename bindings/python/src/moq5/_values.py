@@ -598,10 +598,13 @@ class ReceiverTerminal:
 
 
 class Packaging(IntEnum):
-    """Structured media packaging; unknown future values stay integers."""
+    """Structured media packaging; unknown future values stay integers.
+    LOCMAF (draft-einarsson-moq-locmaf-01) is a track's packaging only: the
+    service rebuilds its Objects as canonical CMAF, so they read CMAF."""
 
     RAW = _constants["MEDIA_PACKAGING_RAW"]
     CMAF = _constants["MEDIA_PACKAGING_CMAF"]
+    LOCMAF = _constants["MEDIA_PACKAGING_LOCMAF"]
 
 
 class MediaType(IntEnum):

@@ -745,8 +745,8 @@ fi
 
 # -- the RECEIVER STATS contract ----------------------------------------------
 # One row: one get_stats read on a receiver child, every field of
-# moq_media_receiver_stats_t published exactly once into a fixed scalar
-# block in the struct's order:
+# moq_media_receiver_stats_t through loc_order_forced published exactly once
+# into a fixed scalar block in the struct's order:
 #
 #   nativeReceiverStats(long root, long child, long[] scalars) -> int
 #   descriptor: (JJ[J)I

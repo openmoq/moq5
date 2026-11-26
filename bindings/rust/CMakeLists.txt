@@ -148,25 +148,30 @@ endif()
 # What the SDK carries beyond the service, stated so that a feature it lacks
 # is never a skipped row: the media player (moq5's `player` feature, over
 # <moq/media_player.h>; MOQ_BUILD_PLAYBACK), MPEG-TS (MOQ_BUILD_MPEG2TS,
-# without which the SDK installs no media tier package) and the simulator
-# (moq5-sys's `sim` tier, over <moq/sim.h>; MOQ_BUILD_SIM). Each defaults to
-# what this tree builds, or for a named SDK to the headers its own
-# pkg-config metadata places (scripts/sdk_features.cmake), and every row
-# checks the statement against the SDK it links. MOQ_RUST_PLAYER=OFF leaves
-# the player's rows out explicitly; MOQ_RUST_MPEG2TS is the outcome the
+# without which the SDK installs no media tier package), the simulator
+# (moq5-sys's `sim` tier, over <moq/sim.h>; MOQ_BUILD_SIM) and LOCMAF
+# (moq5-media's `locmaf` feature over moq5-sys's `locmaf` tier, over
+# <moq/locmaf.h>; MOQ_BUILD_LOCMAF). Each defaults to what this tree
+# builds, or for a named SDK to the headers its own pkg-config metadata
+# places (scripts/sdk_features.cmake), and every row checks the statement
+# against the SDK it links. MOQ_RUST_PLAYER=OFF and MOQ_RUST_LOCMAF=OFF
+# leave those rows out explicitly; MOQ_RUST_MPEG2TS is the outcome the
 # MPEG-TS relay rows require: the stream, or the SDK's refusal; with
-# MOQ_RUST_MPEG2TS or MOQ_RUST_SIM off, the tier graph row requires that
-# tier's refusal instead of its graph.
+# MOQ_RUST_MPEG2TS, MOQ_RUST_SIM or MOQ_RUST_LOCMAF off, the tier graph row
+# requires that tier's refusal instead of its graph where the SDK lacks its
+# package.
 include("${CMAKE_CURRENT_SOURCE_DIR}/scripts/sdk_features.cmake")
 set(_rust_player_default OFF)
 set(_rust_mpeg2ts_default OFF)
 set(_rust_sim_default OFF)
+set(_rust_locmaf_default OFF)
 if(MOQ_RUST_SDK_PREFIX)
     moq_rust_sdk_carries("${MOQ_RUST_SDK_PREFIX}" "${MOQ_PKG_CONFIG}" "${MOQ_RUST_SDK_PKG_CONFIG_PATH}"
-        _rust_player_default _rust_mpeg2ts_default _rust_sim_default _rust_sdk_includedir)
+        _rust_player_default _rust_mpeg2ts_default _rust_sim_default _rust_locmaf_default
+        _rust_sdk_includedir)
     message(STATUS "Rust rows: ${MOQ_RUST_SDK_PREFIX} keeps its headers in "
         "'${_rust_sdk_includedir}' (player ${_rust_player_default}, MPEG-TS ${_rust_mpeg2ts_default}, "
-        "simulator ${_rust_sim_default})")
+        "simulator ${_rust_sim_default}, LOCMAF ${_rust_locmaf_default})")
 else()
     if(TARGET moq::playback)
         set(_rust_player_default ON)
@@ -177,6 +182,9 @@ else()
     if(TARGET moq-sim)
         set(_rust_sim_default ON)
     endif()
+    if(TARGET moq-locmaf)
+        set(_rust_locmaf_default ON)
+    endif()
 endif()
 option(MOQ_RUST_PLAYER
     "Qualify moq5's player feature (needs an SDK with the player: MOQ_BUILD_PLAYBACK=ON)" ${_rust_player_default})
@@ -186,6 +194,9 @@ option(MOQ_RUST_MPEG2TS
 option(MOQ_RUST_SIM
     "The SDK carries the simulator (MOQ_BUILD_SIM=ON): the tier graph row builds moq5-sys's sim tier, not its refusal"
     ${_rust_sim_default})
+option(MOQ_RUST_LOCMAF
+    "Qualify moq5-media's locmaf feature over moq5-sys's locmaf tier (needs an SDK with LOCMAF: MOQ_BUILD_LOCMAF=ON)"
+    ${_rust_locmaf_default})
 if(NOT MOQ_RUST_SDK_PREFIX)
     if(MOQ_RUST_PLAYER AND NOT TARGET moq::playback)
         message(FATAL_ERROR
@@ -203,6 +214,10 @@ if(NOT MOQ_RUST_SDK_PREFIX)
         message(FATAL_ERROR
             "MOQ_RUST_SIM=ON needs the simulator in the staged SDK (MOQ_BUILD_SIM=ON); set MOQ_RUST_SIM=OFF to require its refusal instead")
     endif()
+    if(MOQ_RUST_LOCMAF AND NOT TARGET moq-locmaf)
+        message(FATAL_ERROR
+            "MOQ_RUST_LOCMAF=ON needs LOCMAF in the staged SDK (MOQ_BUILD_LOCMAF=ON); set MOQ_RUST_LOCMAF=OFF to leave its rows out explicitly")
+    endif()
 endif()
 if(MOQ_RUST_PLAYER)
     set(_rust_player 1)
@@ -218,6 +233,11 @@ if(MOQ_RUST_SIM)
     set(_rust_sim 1)
 else()
     set(_rust_sim 0)
+endif()
+if(MOQ_RUST_LOCMAF)
+    set(_rust_locmaf 1)
+else()
+    set(_rust_locmaf 0)
 endif()
 
 set(_rust_src "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -242,7 +262,8 @@ set(_rust_env
     "MOQ5_RUST_SOURCE=${PROJECT_SOURCE_DIR}"
     "MOQ5_RUST_PLAYER=${_rust_player}"
     "MOQ5_RUST_MPEG2TS=${_rust_mpeg2ts}"
-    "MOQ5_RUST_SIM=${_rust_sim}")
+    "MOQ5_RUST_SIM=${_rust_sim}"
+    "MOQ5_RUST_LOCMAF=${_rust_locmaf}")
 if(MOQ_RUST_LIBCLANG_PATH)
     list(APPEND _rust_env "LIBCLANG_PATH=${MOQ_RUST_LIBCLANG_PATH}")
 endif()

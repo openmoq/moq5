@@ -84,8 +84,13 @@ func copyTrackDescription(_ desc: moq_media_track_desc_t) -> TrackDescription? {
     case MOQ_MEDIA_TYPE_AUDIO: mediaType = .audio
     default: return nil
     }
-    let packaging: MediaPackaging =
-        desc.info.packaging == MOQ_MEDIA_PACKAGING_CMAF ? .cmaf : .raw
+    /* The service rebuilds a LOCMAF track's Objects as canonical CMAF, so
+     * the track is CMAF to the application. */
+    let packaging: MediaPackaging
+    switch desc.info.packaging {
+    case MOQ_MEDIA_PACKAGING_CMAF, MOQ_MEDIA_PACKAGING_LOCMAF: packaging = .cmaf
+    default: packaging = .raw
+    }
     var copy = TrackDescription(
         name: swiftString(desc.name), mediaType: mediaType, packaging: packaging)
     copy.codec = optionalString(desc.codec)

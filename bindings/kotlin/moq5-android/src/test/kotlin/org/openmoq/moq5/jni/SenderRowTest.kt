@@ -28,5 +28,5 @@ internal class SenderRowTest {
 
     @Test
     fun `malformed carriers refuse before any native call, and foreign or stale tokens are the registry's refusal`() =
-        ok("sendermalformed", "null/short blocks INVAL untouched on attach, add, write, probe, demand, stats; a bad backpressure ordinal INVAL; wrong root REG_OWNER; a track of another sender REG_OWNER; after close REG_STALE")
+        ok("sendermalformed", "null/short blocks INVAL untouched on attach, add, write, probe, demand, stats; a bad backpressure ordinal INVAL; wrong root REG_OWNER, for a LOCMAF track too (its packaging passes the row's checks); a track of another sender REG_OWNER; after close REG_STALE")
 }

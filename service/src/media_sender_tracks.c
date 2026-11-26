@@ -3,6 +3,7 @@
 #include "media_sender_catalog_internal.h"
 #include "media_sender_complete_internal.h"
 #include "media_sender_mpeg2ts_internal.h"
+#include "media_sender_locmaf_internal.h"
 #include "media_sender_write_internal.h"
 #include <moq/vi64.h>
 
@@ -75,6 +76,7 @@ void track_free(moq_media_sender_t *s, moq_media_track_t *t)
     if (!t) return;
     moq_media_auth_operation_clear(&t->publish_auth, &s->alloc);
     sender_ts_free(s, t);
+    sender_lm_free(s, t);
     if (t->ext)
         s->alloc.free(t->ext, t->ext_block_size, s->alloc.ctx);
     if (t->cp_ref_ids)
@@ -566,11 +568,15 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
         cfg->media_type != MOQ_MEDIA_TYPE_AUDIO)
         return MOQ_ERR_INVAL;
     bool is_ts = cfg->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS;
+    bool is_lm = cfg->packaging == MOQ_MEDIA_PACKAGING_LOCMAF;
     if (cfg->packaging != MOQ_MEDIA_PACKAGING_RAW &&
-        cfg->packaging != MOQ_MEDIA_PACKAGING_CMAF && !is_ts)
+        cfg->packaging != MOQ_MEDIA_PACKAGING_CMAF && !is_ts && !is_lm)
         return MOQ_ERR_INVAL;
 #ifndef MOQ_SERVICE_HAVE_MPEG2TS
     if (is_ts) return MOQ_ERR_UNSUPPORTED;   /* not in this build */
+#endif
+#ifndef MOQ_SERVICE_HAVE_LOCMAF
+    if (is_lm) return MOQ_ERR_UNSUPPORTED;   /* not in this build */
 #endif
     const moq_msf_mpeg2ts_t *ts_rec = NULL;
     const moq_msf_track_supplement_t *supp_rec = NULL;
@@ -609,7 +615,10 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     /* CMSF-01 3.1 requires the CMAF header in the catalog on every
      * transport. Refuse missing init before allocation or registration,
      * including unresolved AUTO. Object validation opt-out does not waive it. */
-    if (cfg->packaging == MOQ_MEDIA_PACKAGING_CMAF && cfg->init_data.len == 0)
+    /* A LOCMAF track's header is a CMAF Header, carried the same way
+     * (draft-einarsson-moq-locmaf-01 section 6). */
+    if ((cfg->packaging == MOQ_MEDIA_PACKAGING_CMAF || is_lm) &&
+        cfg->init_data.len == 0)
         return MOQ_ERR_INVAL;
     /* contentProtectionRefIDs: each id must be coherent AND resolve to a
      * configured root contentProtections entry (catalog coherence, not DRM
@@ -831,7 +840,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     bool cmaf_init_parsed = false;
     moq_cmaf_init_info_t ii;
     moq_cmaf_init_info_init(&ii);
-    if (t->packaging == MOQ_MEDIA_PACKAGING_CMAF && t->init_data.len > 0) {
+    if ((t->packaging == MOQ_MEDIA_PACKAGING_CMAF || is_lm) && t->init_data.len > 0) {
         cmaf_init_parsed = (moq_cmaf_parse_init_sized(t->init_data, &ii, sizeof(ii)) == MOQ_OK);
         if (cmaf_init_parsed && ii.track_id != 0) {
             t->has_cmaf_init_track_id = true;
@@ -845,7 +854,7 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
      * init would emit an internally inconsistent catalog, so this is always-on
      * catalog coherence -- like the ref-id-resolution check above -- not gated
      * under validate_cmaf. (No defaultKID<->tenc comparison or DRM semantics.) */
-    if (t->packaging == MOQ_MEDIA_PACKAGING_CMAF && ncpref > 0) {
+    if ((t->packaging == MOQ_MEDIA_PACKAGING_CMAF || is_lm) && ncpref > 0) {
         if (t->init_data.len == 0 || !cmaf_init_parsed || !ii.has_cenc) {
             track_free(s, t);
             return MOQ_ERR_INVAL;
@@ -861,6 +870,9 @@ moq_result_t moq_media_sender_add_track(moq_media_sender_t *s,
     {
         moq_result_t xrc = sender_copy_extensions(s, t, ts_rec, supp_rec);
         if (xrc == MOQ_OK && is_ts) xrc = sender_ts_prepare(s, t, cfg);
+        /* A LOCMAF track's encoder, from its CMAF Header, before anything
+         * is registered. */
+        if (xrc == MOQ_OK && is_lm) xrc = sender_lm_prepare(s, t);
         if (xrc < 0) { track_free(s, t); return xrc; }
     }
 

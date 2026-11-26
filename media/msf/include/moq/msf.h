@@ -278,6 +278,42 @@ MOQ_API void moq_msf_track_supplement_init_sized(moq_msf_track_supplement_t *s,
 #define moq_msf_track_supplement_init(s) \
     moq_msf_track_supplement_init_sized((s), sizeof(*(s)))
 
+/* The catalog locmafVersion this build understands (draft-einarsson-moq-locmaf-01
+ * section 5). */
+#define MOQ_MSF_LOCMAF_VERSION "0.3"
+
+/*
+ * LOCMAF track fields (draft-einarsson-moq-locmaf-01 section 5): the
+ * locmafVersion key, required when packaging is "locmaf" and forbidden
+ * otherwise. The parser records it on any track, in both catalog revisions
+ * (a parser ignores fields it does not understand);
+ * moq_msf_track_locmaf_check() judges it. A value that is not a JSON string
+ * is recorded as present with MOQ_MSF_LOCMAF_F_VERSION set in malformed.
+ *
+ * A caller-built record states presence explicitly: has_version false means
+ * absent; a present version is non-empty UTF-8; malformed is 0. The encoder
+ * refuses anything else. A record below MOQ_MSF_LOCMAF_V0_SIZE is refused
+ * wherever it is read.
+ */
+#define MOQ_MSF_LOCMAF_F_VERSION (1u << 0)
+
+typedef struct moq_msf_locmaf {
+    uint32_t    struct_size;
+    bool        has_version;     /* locmafVersion */
+    moq_bytes_t version;         /* BORROWED from the DOM; empty when malformed */
+    uint32_t    malformed;       /* MOQ_MSF_LOCMAF_F_* */
+} moq_msf_locmaf_t;
+
+/* The record's one capability extent: the whole struct, through
+ * `malformed`. */
+#define MOQ_MSF_LOCMAF_V0_SIZE \
+    (offsetof(moq_msf_locmaf_t, malformed) + sizeof(uint32_t))
+
+/* Zero and stamp min(m_size, this build's size); nothing is written when
+ * m_size cannot hold struct_size. The macro passes the caller's sizeof. */
+MOQ_API void moq_msf_locmaf_init_sized(moq_msf_locmaf_t *m, size_t m_size);
+#define moq_msf_locmaf_init(m) moq_msf_locmaf_init_sized((m), sizeof(*(m)))
+
 /* -- Packaging extensions ----------------------------------------------
  * Where a packaging or extension draft's catalog fields go:
  *   - a few independent scalar keys sit flat on moq_msf_track_t as has_X /
@@ -296,8 +332,9 @@ MOQ_API void moq_msf_track_supplement_init_sized(moq_msf_track_supplement_t *s,
  * listed twice, a NULL record, a record whose struct_size is below its first
  * published size, or a kind on a track whose packaging it does not belong
  * to (MOQ_MSF_EXT_MPEG2TS: packaging "mpeg2ts"; MOQ_MSF_EXT_SUPPLEMENT: any
- * packaging). The parser records a kind on any track, listing kinds in
- * ascending order; the kind's own _check judges it. */
+ * packaging; MOQ_MSF_EXT_LOCMAF: packaging "locmaf"). The parser records a
+ * kind on any track, listing kinds in ascending order; the kind's own _check
+ * judges it. */
 /* Extension kind. Fixed-width uint32_t for ABI stability. Values are never
  * renumbered. Unknown kinds must be ignored by a reader (the encoder
  * refuses them). */
@@ -306,12 +343,14 @@ typedef uint32_t moq_msf_ext_kind_t;
 #define MOQ_MSF_EXT_NONE       0u
 #define MOQ_MSF_EXT_MPEG2TS    1u   /* draft-gregoire-moq-msfts: u.mpeg2ts */
 #define MOQ_MSF_EXT_SUPPLEMENT 2u   /* MSF track fields: u.supplement */
+#define MOQ_MSF_EXT_LOCMAF     3u   /* draft-einarsson-moq-locmaf: u.locmaf */
 
 typedef struct moq_msf_track_ext {
     moq_msf_ext_kind_t kind;
     union {                                 /* select by kind */
         const moq_msf_mpeg2ts_t          *mpeg2ts;
         const moq_msf_track_supplement_t *supplement;
+        const moq_msf_locmaf_t           *locmaf;
     } u;
 } moq_msf_track_ext_t;
 
@@ -334,6 +373,14 @@ static inline const moq_msf_track_supplement_t *moq_msf_ext_supplement(
     const moq_msf_track_ext_t *e =
         moq_msf_ext_find(list, count, MOQ_MSF_EXT_SUPPLEMENT);
     return e ? e->u.supplement : NULL;
+}
+
+static inline const moq_msf_locmaf_t *moq_msf_ext_locmaf(
+    const moq_msf_track_ext_t *list, size_t count)
+{
+    const moq_msf_track_ext_t *e =
+        moq_msf_ext_find(list, count, MOQ_MSF_EXT_LOCMAF);
+    return e ? e->u.locmaf : NULL;
 }
 
 typedef struct moq_msf_track {
@@ -455,6 +502,9 @@ MOQ_API const moq_msf_mpeg2ts_t *moq_msf_track_mpeg2ts(
  * receiver's track description, use moq_msf_ext_supplement. */
 MOQ_API const moq_msf_track_supplement_t *moq_msf_track_supplement(
     const moq_msf_track_t *track);
+
+/* The LOCMAF record of a track, or NULL (also for a NULL track). */
+MOQ_API const moq_msf_locmaf_t *moq_msf_track_locmaf(const moq_msf_track_t *track);
 
 /* Delta update operation kind (5.1.6). UPDATE is MSF-02 only: an MSF-01
  * parse refuses it and so does an apply onto an MSF-01 base. */
@@ -1070,6 +1120,29 @@ MOQ_API const char *moq_msf_mpeg2ts_mode_name(moq_msf_mpeg2ts_mode_t mode);
 MOQ_API const char *moq_msf_mpeg2ts_timestamp_mode_name(
     moq_msf_mpeg2ts_timestamp_mode_t mode);
 
+/* Why a track is not a usable LOCMAF track. */
+typedef enum moq_msf_locmaf_error {
+    MOQ_MSF_LOCMAF_OK = 0,
+    MOQ_MSF_LOCMAF_ERR_NOT_LOCMAF = 1,           /* packaging is not "locmaf" */
+    MOQ_MSF_LOCMAF_ERR_VERSION_MISSING = 2,      /* locmafVersion: required */
+    MOQ_MSF_LOCMAF_ERR_VERSION_MALFORMED = 3,    /* not a non-empty string */
+    MOQ_MSF_LOCMAF_ERR_VERSION_UNSUPPORTED = 4,  /* not MOQ_MSF_LOCMAF_VERSION */
+} moq_msf_locmaf_error_t;
+
+/*
+ * The subscriber's check of one LOCMAF track (draft-einarsson-moq-locmaf-01
+ * section 5): packaging "locmaf", and a locmafVersion this build supports. A
+ * receiver MUST NOT subscribe to a track whose version it does not support.
+ *
+ * Returns MOQ_OK; MOQ_ERR_PROTO with *reason VERSION_MISSING or
+ * VERSION_MALFORMED; MOQ_ERR_UNSUPPORTED with *reason VERSION_UNSUPPORTED (a
+ * well-formed version this build does not implement); MOQ_ERR_INVAL for a
+ * NULL track, a record below MOQ_MSF_LOCMAF_V0_SIZE, or packaging other than
+ * "locmaf" (*reason NOT_LOCMAF). reason may be NULL.
+ */
+MOQ_API moq_result_t moq_msf_track_locmaf_check(const moq_msf_track_t *track,
+                                                moq_msf_locmaf_error_t *reason);
+
 /*
  * Encode an MSF catalog to JSON.
  *
@@ -1098,6 +1171,16 @@ MOQ_API const char *moq_msf_mpeg2ts_timestamp_mode_name(
  *     pair of overrides that the rules forbid together); the fields it
  *     inherits are judged when the delta is applied;
  *   - mpeg2ts fields on any other packaging are refused.
+ *
+ * LOCMAF tracks (draft-einarsson-moq-locmaf-01 section 5), from each track's
+ * MOQ_MSF_EXT_LOCMAF record, in either revision:
+ *   - an independent track or a delta "add" track with packaging "locmaf"
+ *     carries a record with a version (non-empty UTF-8, malformed 0);
+ *   - a record on any other packaging is refused;
+ *   - a delta "clone" or "update" track's record carries a version, as
+ *     above; the packaging it inherits is judged when the delta is applied,
+ *     where a version left on a track whose packaging is not "locmaf" is
+ *     MOQ_ERR_PROTO.
  *
  * The catalog's revision (moq_msf_catalog_t.revision, read when struct_size
  * covers the block that starts there) selects the spelling and the rules:

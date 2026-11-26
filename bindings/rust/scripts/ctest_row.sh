@@ -12,10 +12,12 @@
 #
 # Environment: MOQ5_RUST_SDK (the installed SDK prefix the rows link;
 # required), MOQ5_RUST_WORK (the work directory; required), MOQ5_RUST_PLAYER,
-# MOQ5_RUST_MPEG2TS and MOQ5_RUST_SIM (required, 1 or 0: whether the rows
-# qualify moq5's player feature, whether the SDK carries MPEG-TS, which
-# its media tier package needs, and whether it carries the simulator; each
-# is checked against the SDK's installed headers), MOQ5_RUST_SOURCE
+# MOQ5_RUST_MPEG2TS, MOQ5_RUST_SIM and MOQ5_RUST_LOCMAF (required, 1 or 0:
+# whether the rows qualify moq5's player feature, whether the SDK carries
+# MPEG-TS, which its media tier package needs, whether it carries the
+# simulator, and whether the rows qualify moq5-media's locmaf feature over
+# moq5-sys's locmaf tier; each is checked against the SDK's installed
+# headers), MOQ5_RUST_SOURCE
 # (the libmoq source tree the cross_build row configures a target SDK
 # from), CARGO (default cargo), RUSTUP (default rustup), MOQ5_MSRV_TOOLCHAIN
 # (default 1.85) for the msrv row, MOQ5_RUST_TOOLCHAIN (default stable: the
@@ -157,11 +159,12 @@ carries() {   # carries <prefix> <header>: 1 when the SDK installed moq/<header>
     includedir=$(sdk_pc "$1" --variable=includedir libmoq-service)
     if [ -n "$includedir" ] && [ -f "$includedir/moq/$2" ]; then echo 1; else echo 0; fi
 }
-check_statement() {   # check_statement <prefix>: the stated player, MPEG-TS and simulator against what the SDK installed
-    local prefix=$1 player mpeg2ts sim
+check_statement() {   # check_statement <prefix>: the stated player, MPEG-TS, simulator and LOCMAF against what the SDK installed
+    local prefix=$1 player mpeg2ts sim locmaf
     player=$(carries "$prefix" media_player.h)
     mpeg2ts=$(carries "$prefix" mpeg2ts.h)
     sim=$(carries "$prefix" sim.h)
+    locmaf=$(carries "$prefix" locmaf.h)
     if [ "$PLAYER" = 1 ] && [ "$player" = 0 ]; then
         echo "ctest_row.sh: MOQ5_RUST_PLAYER=1, but the SDK $prefix has no player (MOQ_BUILD_PLAYBACK=ON builds it; MOQ_RUST_PLAYER=OFF leaves the player's rows out)" >&2
         return 1
@@ -178,11 +181,18 @@ check_statement() {   # check_statement <prefix>: the stated player, MPEG-TS and
         echo "ctest_row.sh: MOQ5_RUST_SIM=1, but the SDK $prefix has no simulator (MOQ_BUILD_SIM=ON builds it; MOQ_RUST_SIM=OFF leaves its graphs out)" >&2
         return 1
     fi
+    if [ "$LOCMAF" = 1 ] && [ "$locmaf" = 0 ]; then
+        echo "ctest_row.sh: MOQ5_RUST_LOCMAF=1, but the SDK $prefix has no LOCMAF (MOQ_BUILD_LOCMAF=ON builds it; MOQ_RUST_LOCMAF=OFF leaves its rows out)" >&2
+        return 1
+    fi
     if [ "$PLAYER" = 0 ] && [ "$player" = 1 ]; then
         echo "ctest_row.sh: the SDK $prefix carries the player; its rows are left out (MOQ5_RUST_PLAYER=0)"
     fi
     if [ "$SIM" = 0 ] && [ "$sim" = 1 ]; then
         echo "ctest_row.sh: the SDK $prefix carries the simulator; its graphs are left out (MOQ5_RUST_SIM=0)"
+    fi
+    if [ "$LOCMAF" = 0 ] && [ "$locmaf" = 1 ]; then
+        echo "ctest_row.sh: the SDK $prefix carries LOCMAF; its rows are left out (MOQ5_RUST_LOCMAF=0)"
     fi
 }
 
@@ -209,21 +219,41 @@ echo "ctest_row.sh: SDK $MOQ_PREFIX, link mode $MOQ5_SDK_LINK_MODE" \
 PLAYER=$(stated MOQ5_RUST_PLAYER)
 MPEG2TS=$(stated MOQ5_RUST_MPEG2TS)
 SIM=$(stated MOQ5_RUST_SIM)
+LOCMAF=$(stated MOQ5_RUST_LOCMAF)
 check_statement "$MOQ_PREFIX"
 # A qualified player adds a build with the feature to every build without
 # it (the feature only adds to the crates), and the rows that need an SDK
 # build their crates with it.
 player_features=()
 if [ "$PLAYER" = 1 ]; then player_features=(--features player); fi
-export MOQ5_RUST_PLAYER=$PLAYER MOQ5_RUST_MPEG2TS=$MPEG2TS MOQ5_RUST_SIM=$SIM
+# A qualified LOCMAF builds every product build with moq5-media's locmaf
+# feature (which enables moq5-sys's locmaf tier); the lower tier graphs
+# below build both crates without it, and with it alone.
+locmaf_features=()
+if [ "$LOCMAF" = 1 ]; then locmaf_features=(--features moq5-media/locmaf); fi
+# The fake-provider workspace's own features: the player's rows and the
+# LOCMAF layout rows.
+fake_feature_list=()
+if [ "$PLAYER" = 1 ]; then fake_feature_list+=(player); fi
+if [ "$LOCMAF" = 1 ]; then fake_feature_list+=(locmaf); fi
+fake_features=()
+if [ ${#fake_feature_list[@]} -gt 0 ]; then
+    fake_features=(--features "$(IFS=,; echo "${fake_feature_list[*]}")")
+fi
+export MOQ5_RUST_PLAYER=$PLAYER MOQ5_RUST_MPEG2TS=$MPEG2TS MOQ5_RUST_SIM=$SIM MOQ5_RUST_LOCMAF=$LOCMAF
 echo "ctest_row.sh: the player's rows $([ "$PLAYER" = 1 ] && echo run || echo 'are left out')," \
     "MPEG-TS $([ "$MPEG2TS" = 1 ] && echo carried || echo refused)," \
-    "the simulator $([ "$SIM" = 1 ] && echo carried || echo 'not carried')"
+    "the simulator $([ "$SIM" = 1 ] && echo carried || echo 'not carried')," \
+    "LOCMAF's rows $([ "$LOCMAF" = 1 ] && echo run || echo 'are left out')"
 # The tier graphs the rows also build alone: the core, and each lower tier
-# the SDK carries (its media tier package needs MPEG-TS).
+# the SDK carries (its media tier package needs MPEG-TS, and so does LOCMAF's
+# tier, which implies the media tier).
 tier_graphs=("-p moq5-core" "-p moq5-sys")
 if [ "$MPEG2TS" = 1 ]; then tier_graphs+=("-p moq5-media" "-p moq5-sys --features media"); fi
 if [ "$SIM" = 1 ]; then tier_graphs+=("-p moq5-sys --features sim"); fi
+if [ "$MPEG2TS" = 1 ] && [ "$LOCMAF" = 1 ]; then
+    tier_graphs+=("-p moq5-media --features locmaf" "-p moq5-sys --features locmaf")
+fi
 
 case $ROW in
 fmt)
@@ -231,9 +261,11 @@ fmt)
         "$CARGO" fmt --manifest-path "$HERE/$ws/Cargo.toml" --all -- --check
     done ;;
 clippy)
-    CARGO_TARGET_DIR=$W/target product clippy --all-targets -- -D warnings
+    CARGO_TARGET_DIR=$W/target product clippy --all-targets ${locmaf_features[@]+"${locmaf_features[@]}"} \
+        -- -D warnings
     if [ "$PLAYER" = 1 ]; then
-        CARGO_TARGET_DIR=$W/target product clippy --all-targets --features moq5/player -- -D warnings
+        CARGO_TARGET_DIR=$W/target product clippy --all-targets --features moq5/player \
+            ${locmaf_features[@]+"${locmaf_features[@]}"} -- -D warnings
     fi
     # Each lower tier's graph alone, as a consumer of that tier builds it.
     for graph in "${tier_graphs[@]}"; do
@@ -247,11 +279,13 @@ clippy)
             --manifest-path "$HERE/consumer/Cargo.toml" --all-targets --features player -- -D warnings
     fi
     CARGO_TARGET_DIR=$W/fake-target MOQ5_FAKE_BUILD=$W/fake-build MOQ5_CARGO_SUBCOMMAND=clippy \
-        fake --all-targets ${player_features[@]+"${player_features[@]}"} -- -D warnings ;;
+        fake --all-targets ${fake_features[@]+"${fake_features[@]}"} -- -D warnings ;;
 doc)
-    RUSTDOCFLAGS="-D warnings" CARGO_TARGET_DIR=$W/target product doc --no-deps
+    RUSTDOCFLAGS="-D warnings" CARGO_TARGET_DIR=$W/target product doc --no-deps \
+        ${locmaf_features[@]+"${locmaf_features[@]}"}
     if [ "$PLAYER" = 1 ]; then
-        RUSTDOCFLAGS="-D warnings" CARGO_TARGET_DIR=$W/target product doc --no-deps --features moq5/player
+        RUSTDOCFLAGS="-D warnings" CARGO_TARGET_DIR=$W/target product doc --no-deps --features moq5/player \
+            ${locmaf_features[@]+"${locmaf_features[@]}"}
     fi
     for graph in "${tier_graphs[@]}"; do
         # shellcheck disable=SC2086  # the graph's arguments are split on purpose
@@ -280,10 +314,14 @@ tests)
     # tier rules), the unit tests of every crate, and moq5's compile-fail
     # cases (which build the current crate through cargo in an isolated
     # target). The live rows are #[ignore]d here and run by relay_rows.
-    CARGO_TARGET_DIR=$W/target product test --locked -p moq5-sys -p moq5-core -p moq5-media -p moq5
+    # With LOCMAF, moq5-media's LOCMAF rows (the codec, its storage under a
+    # counting allocator, and its compile-fail cases) and moq5-sys's
+    # locmaf-tier snapshot rows run too.
+    CARGO_TARGET_DIR=$W/target product test --locked -p moq5-sys -p moq5-core -p moq5-media -p moq5 \
+        ${locmaf_features[@]+"${locmaf_features[@]}"}
     if [ "$PLAYER" = 1 ]; then
         CARGO_TARGET_DIR=$W/target product test --locked -p moq5-sys -p moq5-core -p moq5-media -p moq5 \
-            --features moq5/player,moq5-sys/player
+            --features moq5/player,moq5-sys/player ${locmaf_features[@]+"${locmaf_features[@]}"}
     fi
     # Each lower tier's graph alone: its own snapshot rows run against the
     # tiers it enables and no other.
@@ -297,16 +335,16 @@ tier_graphs)
     CARGO_TARGET_DIR=$W/tier-graphs-target bash "$HERE/scripts/tier_graphs.sh" "$MOQ_PREFIX" "$W/tier-graphs" ;;
 fake_tests)
     CARGO_TARGET_DIR=$W/fake-target MOQ5_FAKE_BUILD=$W/fake-build fake_gated fake-tests --no-fail-fast \
-        ${player_features[@]+"${player_features[@]}"} ;;
+        ${fake_features[@]+"${fake_features[@]}"} ;;
 fake_asan)
     # The same rows with the provider under AddressSanitizer (its memory
     # errors, such as a logger reading past a line buffer, are its own),
     # linked with the runtime of the compiler that instrumented it.
     MOQ5_FAKE_SANITIZE=address CARGO_TARGET_DIR=$W/fake-asan-target MOQ5_FAKE_BUILD=$W/fake-asan-build \
-        fake_gated fake-asan --no-fail-fast ${player_features[@]+"${player_features[@]}"} ;;
+        fake_gated fake-asan --no-fail-fast ${fake_features[@]+"${fake_features[@]}"} ;;
 layout)
     CARGO_TARGET_DIR=$W/fake-target MOQ5_FAKE_BUILD=$W/fake-build fake_gated layout --test layout \
-        ${player_features[@]+"${player_features[@]}"} ;;
+        ${fake_features[@]+"${fake_features[@]}"} ;;
 installed_consumer_static|installed_consumer_shared)
     # The service consumer, then the core consumer alone: the link proof
     # that a core-only graph links the core library and nothing above it.
@@ -321,9 +359,14 @@ msrv)
         CARGO_TARGET_DIR=$W/msrv-target toolchain_cargo "$MSRV" check \
             --manifest-path "$HERE/$ws/Cargo.toml" --locked --workspace --all-targets
     done
+    if [ "$LOCMAF" = 1 ]; then
+        CARGO_TARGET_DIR=$W/msrv-target toolchain_cargo "$MSRV" check \
+            --manifest-path "$HERE/Cargo.toml" --locked --workspace --all-targets "${locmaf_features[@]}"
+    fi
     if [ "$PLAYER" = 1 ]; then
         CARGO_TARGET_DIR=$W/msrv-target toolchain_cargo "$MSRV" check \
-            --manifest-path "$HERE/Cargo.toml" --locked --workspace --all-targets --features moq5/player
+            --manifest-path "$HERE/Cargo.toml" --locked --workspace --all-targets --features moq5/player \
+            ${locmaf_features[@]+"${locmaf_features[@]}"}
         CARGO_TARGET_DIR=$W/msrv-target toolchain_cargo "$MSRV" check \
             --manifest-path "$HERE/consumer/Cargo.toml" --locked --all-targets --features player
     fi
@@ -335,7 +378,7 @@ msrv)
     msrv_rustc=$("$RUSTUP" which --toolchain "$MSRV" rustc)
     RUSTC=$msrv_rustc CARGO="$RUSTUP run $MSRV cargo" MOQ5_CARGO_SUBCOMMAND=check \
         CARGO_TARGET_DIR=$W/msrv-fake-target MOQ5_FAKE_BUILD=$W/msrv-fake-build \
-        fake --locked --all-targets ${player_features[@]+"${player_features[@]}"} ;;
+        fake --locked --all-targets ${fake_features[@]+"${fake_features[@]}"} ;;
 gate_controls)
     # The gates' own controls: the diagnostic classifier's negatives and
     # positives, the link-mode selection, the exact link-search assertion,
@@ -402,7 +445,7 @@ cross_refusal)
     echo "refusals recorded under $W/cross-refusal-*.log" ;;
 cross_build)
     # A target SDK configured from the source tree with the caller's cross
-    # arguments and the player, MPEG-TS and the simulator as stated, its
+    # arguments and the player, MPEG-TS, the simulator and LOCMAF as stated, its
     # cache and its own statement checked; then the crates checked for that
     # target against it, without the player and, where it is stated, with
     # it, and moq5-sys's simulator tier: its pass where the simulator is
@@ -420,7 +463,7 @@ cross_build)
     toolchain_rustc=$("$RUSTUP" which --toolchain "$TOOLCHAIN" rustc)
     onoff() { if [ "$1" = 1 ]; then echo ON; else echo OFF; fi; }
     stated_options=("MOQ_BUILD_PLAYBACK=$(onoff "$PLAYER")" "MOQ_BUILD_MPEG2TS=$(onoff "$MPEG2TS")"
-        "MOQ_BUILD_SIM=$(onoff "$SIM")")
+        "MOQ_BUILD_SIM=$(onoff "$SIM")" "MOQ_BUILD_LOCMAF=$(onoff "$LOCMAF")")
     # Configured fresh: a value cached by an earlier run can never stand in
     # for an option this run must state.
     rm -rf "$W/cross-build"

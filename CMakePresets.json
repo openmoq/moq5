@@ -89,7 +89,8 @@
       "binaryDir": "build/cppbind",
       "cacheVariables": {
         "MOQ_BUILD_CPP_BINDING": "ON",
-        "MOQ_BUILD_MSF": "ON"
+        "MOQ_BUILD_MSF": "ON",
+        "MOQ_BUILD_LOCMAF": "ON"
       }
     },
     {

@@ -3,6 +3,7 @@
 #include "media_sender_catalog_internal.h"
 #include "media_sender_complete_internal.h"
 #include "media_sender_mpeg2ts_internal.h"
+#include "media_sender_locmaf_internal.h"
 #include "media_sender_timeline_internal.h"
 
 /* The largest LOC timestamp write() admits for the latched draft `v`. It is
@@ -46,6 +47,8 @@ void preq_entry_release(moq_media_sender_t *s, sender_preq_entry_t *e)
     if (!e->is_end) s->preq_media--;
     if (e->payload)    moq_rcbuf_decref(e->payload);
     if (e->properties) moq_rcbuf_decref(e->properties);
+    if (e->wire_rcbuf) moq_rcbuf_decref(e->wire_rcbuf);
+    sender_lm_wire_free(e->wire_block);
     memset(e, 0, sizeof(*e));
 }
 
@@ -483,6 +486,8 @@ moq_result_t sender_flush_reset(moq_media_sender_t *s,
     t->pending_reset = false;
     t->emit_open = false;
     t->write_blocked = false;
+    /* A LOCMAF Group that was cut short leaves no reference to continue. */
+    sender_lm_reset(t);
     if (t->reset_had_effect) {
         s->stats.groups_abandoned++;
         t->tstats.groups_abandoned++;
@@ -661,6 +666,33 @@ void sender_drain(moq_media_sender_t *s, uint64_t now_us)
             }
         }
 
+        bool new_group = !t->emit_open || t->emit_group != e->group_seq;
+        uint64_t oid = new_group ? 0 : t->emit_obj;
+
+        /* LOCMAF: the chunk becomes the Object for the Location just
+         * assigned, in the buffer write() reserved. A retry after
+         * WOULD_BLOCK resends the same bytes: per-track order holds the
+         * track's next entries back until this one is taken. */
+        moq_rcbuf_t *wire = NULL;
+        if (t->packaging == MOQ_MEDIA_PACKAGING_LOCMAF) {
+            moq_result_t lrc = sender_lm_emit(s, t, e, e->group_seq, oid, &wire);
+            if (lrc != MOQ_OK) {
+                /* A failed wrap is retried with nothing committed; an
+                 * encoder refusal at emit cannot follow a reserved bound,
+                 * and is the sender's failure, as a failed property block
+                 * is. */
+                if (lrc == MOQ_ERR_NOMEM)
+                    s->stats.last_error = MOQ_ERR_NOMEM;
+                else
+                    sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
+                t->drain_hold = true;
+                stop = true;
+                if (wr != rd) s->preq[wr % s->ring_cap] = *e;
+                wr++; rd++;
+                continue;
+            }
+        }
+
         moq_rcbuf_t *props = NULL;
         if (!sender_build_props(s, e, &props)) {
             sender_set_fatal_locked(s, MOQ_MEDIA_SENDER_FATAL_SETUP_FAILED);
@@ -671,14 +703,11 @@ void sender_drain(moq_media_sender_t *s, uint64_t now_us)
             continue;
         }
 
-        bool new_group = !t->emit_open || t->emit_group != e->group_seq;
-        uint64_t oid = new_group ? 0 : t->emit_obj;
-
         moq_pub_object_cfg_t ocfg;
         moq_pub_object_cfg_init_sized(&ocfg, sizeof(ocfg));
         ocfg.group_id = e->group_seq;
         ocfg.object_id = oid;
-        ocfg.payload = e->payload;
+        ocfg.payload = wire ? wire : e->payload;
         ocfg.properties = props;
         /* v0 emits one subgroup per group, so each subgroup IS its group's
          * only (hence last) subgroup: END_OF_GROUP is a subgroup-header bit
@@ -686,8 +715,12 @@ void sender_drain(moq_media_sender_t *s, uint64_t now_us)
          * true for every object. The group is delimited on the wire by the
          * group_id change to the next group. */
         ocfg.end_of_group = true;
-        moq_result_t wrc = moq_pub_write_object_ex(s->pub, t->pub_track,
-                                                   &ocfg, now_us);
+        moq_result_t wrc = MOQ_OK;
+#ifdef MOQ_MEDIA_SENDER_TESTING
+        if (s->test_emit_hook) wrc = s->test_emit_hook(s->test_emit_ctx, &ocfg);
+#endif
+        if (wrc == MOQ_OK)
+            wrc = moq_pub_write_object_ex(s->pub, t->pub_track, &ocfg, now_us);
         if (props) moq_rcbuf_decref(props);   /* facade took its own ref */
 
         if (wrc != MOQ_OK) {
@@ -707,6 +740,7 @@ void sender_drain(moq_media_sender_t *s, uint64_t now_us)
         }
 
         t->write_blocked = false;
+        if (wire) sender_lm_commit(t);   /* the facade holds its own ref */
         t->emit_group = e->group_seq;
         t->emit_open = true;          /* facade subgroup stays open until the
                                          next group; complete groups have no
@@ -928,15 +962,14 @@ moq_result_t sender_admit_locked(moq_media_sender_t *s,
                                  moq_media_track_t *track,
                                  const sender_admit_t *a)
 {
-    /* The queue takes ownership of both refs, so both count toward the
-     * byte budget. */
+    /* The queue takes ownership of both refs, and of a LOCMAF Object's
+     * wire buffer, so each counts toward the byte budget. */
     size_t need = moq_rcbuf_len(a->payload);
-    size_t property_bytes = moq_rcbuf_len(a->properties);
-    if (property_bytes > SIZE_MAX - need) {
+    if (!sender_sum_fits(&need, moq_rcbuf_len(a->properties)) ||
+        !sender_sum_fits(&need, a->wire_block_size)) {
         s->stats.last_error = MOQ_ERR_INVAL;
         return MOQ_ERR_INVAL;
     }
-    need += property_bytes;
 
     /* Would this object open a new group? (Pure -- no mutation until the
      * enqueue is committed.) A sync point that opens a group is a stream
@@ -1110,6 +1143,8 @@ moq_result_t sender_admit_locked(moq_media_sender_t *s,
     e->has_capture_time = a->has_capture_time;
     e->capture_time_us = a->capture_time_us;
     e->bytes = need;
+    e->wire_block = a->wire_block;       /* ownership transfers */
+    e->wire_bound = a->wire_bound;
     /* Carry the SAP declaration so the timeline record is generated at emit
      * time with the real wire Location (a dropped Object then yields no record). */
     if (track->sap_timeline && a->has_sap_type) {
@@ -1246,7 +1281,9 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
      * sap_type is UNKNOWN (an open-GOP independent sample could only be SAP
      * type 3, which is not allowed at a group start). An explicit declaration of
      * TYPE_1/2 overrides this. No ownership is taken on rejection. */
-    if (s->validate_cmaf && track->packaging == MOQ_MEDIA_PACKAGING_CMAF) {
+    /* A LOCMAF track takes CMAF chunks, so they are validated as CMAF. */
+    if (s->validate_cmaf && (track->packaging == MOQ_MEDIA_PACKAGING_CMAF ||
+                             track->packaging == MOQ_MEDIA_PACKAGING_LOCMAF)) {
         moq_bytes_t obj_bytes = {
             moq_rcbuf_data(obj->payload), moq_rcbuf_len(obj->payload) };
         moq_cmaf_init_info_t vinit;
@@ -1426,7 +1463,23 @@ moq_result_t moq_media_sender_write(moq_media_sender_t *s,
         a.has_sap_type = true;
         a.sap_type = (uint8_t)obj->sap_type;
     }
+    /* LOCMAF: the chunk must encode (one CMAF chunk, inside the field
+     * model, within the limits), and the buffer its Object needs is
+     * reserved now, so the drain never allocates more than an rcbuf
+     * header. No ownership is taken on any refusal. */
+    if (track->packaging == MOQ_MEDIA_PACKAGING_LOCMAF) {
+        moq_bytes_t chunk = { moq_rcbuf_data(obj->payload),
+                              moq_rcbuf_len(obj->payload) };
+        moq_result_t lrc = sender_lm_reserve(s, track, chunk, &a.wire_block,
+                                             &a.wire_block_size, &a.wire_bound);
+        if (lrc != MOQ_OK) {
+            s->stats.last_error = lrc;
+            pthread_mutex_unlock(&s->mu);
+            return lrc;
+        }
+    }
     moq_result_t rc = sender_admit_locked(s, track, &a);
+    if (rc != MOQ_OK) sender_lm_wire_free(a.wire_block);
     bool wake = rc == MOQ_OK && s->ready;  /* post-ready: kick the drain */
     pthread_mutex_unlock(&s->mu);
 

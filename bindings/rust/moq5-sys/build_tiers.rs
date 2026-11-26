@@ -67,6 +67,15 @@ pub const MEDIA: Tier = Tier {
                      (MOQ_BUILD_LOC, MOQ_BUILD_CMAF, MOQ_BUILD_MEDIA_OBJECT, MOQ_BUILD_MSF)",
 };
 
+/// The LOCMAF encoder and decoder, over the media tier's CMAF records.
+pub const LOCMAF: Tier = Tier {
+    name: "locmaf",
+    feature: Some("locmaf"),
+    wrapper: "wrapper_locmaf.h",
+    headers: &["moq/locmaf.h"],
+    missing_header: "the `locmaf` feature needs an SDK built with MOQ_BUILD_LOCMAF=ON",
+};
+
 /// The managed endpoint, media sender and media receiver.
 pub const SERVICE: Tier = Tier {
     name: "service",
@@ -92,7 +101,7 @@ pub const PLAYER: Tier = Tier {
 
 /// Every tier, in generation order: a tier is generated after every tier it
 /// references.
-pub const TIERS: [&Tier; 5] = [&CORE, &SIM, &MEDIA, &SERVICE, &PLAYER];
+pub const TIERS: [&Tier; 6] = [&CORE, &SIM, &MEDIA, &LOCMAF, &SERVICE, &PLAYER];
 
 /// The tier features a dependency graph enabled. Cargo unifies features
 /// across the graph, so this is the union of every crate's request.
@@ -102,6 +111,8 @@ pub struct Features {
     pub sim: bool,
     /// `media`.
     pub media: bool,
+    /// `locmaf`.
+    pub locmaf: bool,
     /// `service`.
     pub service: bool,
     /// `player`.
@@ -111,13 +122,16 @@ pub struct Features {
 impl Features {
     /// The features `enabled` reports for each feature name (the build
     /// script reads `CARGO_FEATURE_<NAME>`), closed under the manifest's
-    /// implications: `player` implies `service`, which implies `media`.
+    /// implications: `player` implies `service`, which implies `media`, and
+    /// `locmaf` implies `media`.
     pub fn from_enabled(enabled: impl Fn(&str) -> bool) -> Features {
         let player = enabled("player");
         let service = player || enabled("service");
+        let locmaf = enabled("locmaf");
         Features {
             sim: enabled("sim"),
-            media: service || enabled("media"),
+            media: service || locmaf || enabled("media"),
+            locmaf,
             service,
             player,
         }
@@ -128,6 +142,7 @@ impl Features {
             None => true,
             Some("sim") => self.sim,
             Some("media") => self.media,
+            Some("locmaf") => self.locmaf,
             Some("service") => self.service,
             Some("player") => self.player,
             Some(_) => false,
@@ -165,17 +180,23 @@ impl Features {
     /// The pkg-config packages that carry these tiers, in probe order. Each
     /// tier package requires the ones below it, so the highest package of
     /// each line of tiers is enough: the service's (whose closure brings
-    /// the core and the media parsers), else the media parsers', and the
-    /// simulator's beside either; the core's alone when nothing else is
-    /// asked for. `libmoq.pc` is never one of them: it names every
-    /// component the SDK was built with, adapters included, so linking it
-    /// for a lower tier would pull in a QUIC stack.
+    /// the core and the media parsers), else the media parsers', then
+    /// LOCMAF's and the simulator's beside either; the core's alone when
+    /// nothing else is asked for. LOCMAF's package comes after the
+    /// service's or the parsers': a library named twice is linked where it
+    /// is named last, so the CMAF library it shares with them stays after
+    /// every library that needs it. `libmoq.pc` is never one of them: it
+    /// names every component the SDK was built with, adapters included, so
+    /// linking it for a lower tier would pull in a QUIC stack.
     pub fn packages(self) -> Vec<&'static str> {
         let mut packages = Vec::new();
         if self.service {
             packages.push("libmoq-service");
         } else if self.media {
             packages.push("libmoq-media");
+        }
+        if self.locmaf {
+            packages.push("libmoq-locmaf");
         }
         if self.sim {
             packages.push("libmoq-sim");
@@ -257,6 +278,7 @@ pub fn missing_package(
             "Every SDK that ships this crate's core tier installs it beside the core library."
         }
         "libmoq-sim" => "It is installed by an SDK built with MOQ_BUILD_SIM=ON.",
+        "libmoq-locmaf" => "It is installed by an SDK built with MOQ_BUILD_LOCMAF=ON.",
         "libmoq-media" => {
             "It is installed by an SDK that builds every media parser: MOQ_BUILD_LOC, \
              MOQ_BUILD_CMAF, MOQ_BUILD_MPEG2TS, MOQ_BUILD_MEDIA_OBJECT and MOQ_BUILD_MSF."

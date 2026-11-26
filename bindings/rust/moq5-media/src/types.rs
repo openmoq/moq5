@@ -53,6 +53,13 @@ pub enum Packaging {
     ///
     /// [`Mpeg2tsRecord`]: crate::Mpeg2tsRecord
     Mpeg2ts,
+    /// LOCMAF (draft-einarsson-moq-locmaf-01): CMAF chunks with their moof
+    /// boxes compacted against the track's CMAF Header and, within a group,
+    /// against the chunk before. A track is declared with it; a receiver's
+    /// objects of such a track are the canonical CMAF chunks the service
+    /// rebuilt, so they report [`Packaging::Cmaf`]. A sender takes one CMAF
+    /// chunk per write, with the CMAF Header as the track's init data.
+    Locmaf,
     /// A packaging this crate does not know.
     Other(u32),
 }
@@ -67,6 +74,7 @@ impl Packaging {
             sys::MOQ_MEDIA_PACKAGING_RAW => Some(Packaging::Raw),
             sys::MOQ_MEDIA_PACKAGING_CMAF => Some(Packaging::Cmaf),
             sys::MOQ_MEDIA_PACKAGING_MPEG2TS => Some(Packaging::Mpeg2ts),
+            sys::MOQ_MEDIA_PACKAGING_LOCMAF => Some(Packaging::Locmaf),
             code => Some(Packaging::Other(code)),
         }
     }
@@ -78,6 +86,7 @@ impl Packaging {
             Packaging::Raw => sys::MOQ_MEDIA_PACKAGING_RAW,
             Packaging::Cmaf => sys::MOQ_MEDIA_PACKAGING_CMAF,
             Packaging::Mpeg2ts => sys::MOQ_MEDIA_PACKAGING_MPEG2TS,
+            Packaging::Locmaf => sys::MOQ_MEDIA_PACKAGING_LOCMAF,
             Packaging::Other(code) => code,
         }
     }
@@ -302,5 +311,18 @@ mod tests {
         ] {
             assert_eq!(SapType::from_code(sap.code()), sap);
         }
+    }
+
+    #[test]
+    fn locmaf_is_a_named_packaging() {
+        let locmaf =
+            Packaging::from_code(sys::MOQ_MEDIA_PACKAGING_LOCMAF).expect("a nonzero packaging");
+        assert!(
+            !matches!(locmaf, Packaging::Other(_)),
+            "{locmaf:?} is a named packaging"
+        );
+        assert_eq!(locmaf.code(), sys::MOQ_MEDIA_PACKAGING_LOCMAF);
+        assert_eq!(locmaf, Packaging::Locmaf);
+        assert_eq!(Packaging::from_code(5), Some(Packaging::Other(5)));
     }
 }

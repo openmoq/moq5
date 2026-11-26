@@ -107,6 +107,14 @@ extern "C" {
  *   it is whole source packets with their sync bytes, and left out
  *   otherwise; out_init->codec_config stays empty either way.
  *
+ * LOCMAF ("locmaf", draft-einarsson-moq-locmaf-01):
+ *   The track's locmafVersion is judged first (moq_msf_track_locmaf_check()):
+ *   a version this build does not support returns MOQ_ERR_UNSUPPORTED (a
+ *   receiver MUST NOT subscribe to it), and a missing or malformed one
+ *   MOQ_ERR_INVAL; either way out_info holds only transport_version. Then
+ *   packaging MOQ_MEDIA_PACKAGING_LOCMAF, with media type, initData and
+ *   timescale exactly as for CMAF above: the track's header is a CMAF Header.
+ *
  * alloc is required to decode initData (CMAF, or RAW/LOC or MPEG2TS with
  * out_init_buf). If NULL for such tracks, returns MOQ_ERR_INVAL.
  *
@@ -132,6 +140,8 @@ extern "C" {
  *   - alloc is NULL on an initData decode path that needs it
  *     (CMAF initData, or RAW/LOC initData with out_init_buf)
  * Returns MOQ_ERR_PROTO if CMAF initData is malformed.
+ * Returns MOQ_ERR_UNSUPPORTED for a LOCMAF track whose locmafVersion this
+ *   build does not support.
  * Returns MOQ_ERR_NOMEM if base64 decode allocation fails.
  */
 MOQ_API moq_result_t moq_msf_track_to_media_info_sized(

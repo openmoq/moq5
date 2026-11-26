@@ -42,6 +42,7 @@ internal object TrackDescriptionCodec {
             0L -> null
             1L -> PackagingKind.Raw
             2L -> PackagingKind.Cmaf
+            4L -> PackagingKind.Locmaf
             else -> throw UnknownNativeValueException("packaging kind", raw)
         }
 

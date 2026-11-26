@@ -325,7 +325,7 @@ foreach(pkg IN LISTS packages)
 endforeach()
 
 # A tier that was not built must not have left a package behind.
-foreach(pkg IN ITEMS libmoq-core libmoq-sim libmoq-media)
+foreach(pkg IN ITEMS libmoq-core libmoq-sim libmoq-media libmoq-locmaf)
     list(FIND packages "${pkg}" at)
     if(at EQUAL -1 AND EXISTS "${pcdir}/${pkg}.pc")
         message(FATAL_ERROR "${pkg}.pc is installed but its tier is not built")

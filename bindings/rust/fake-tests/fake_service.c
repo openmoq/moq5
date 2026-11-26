@@ -1253,6 +1253,9 @@ moq_result_t moq_media_receiver_get_stats(const moq_media_receiver_t *r,
         .objects_decompressed = 21, .decompress_failures = 22, .decompress_limited = 23,
         .compression_refused = 24, .compression_conflicts = 25, .compression_ignored = 26,
         .event_timeline_headers_ignored = 27, .loc_order_gaps = 28, .loc_order_forced = 29,
+        .locmaf_objects_rebuilt = 30, .locmaf_objects_undecodable = 31,
+        .locmaf_objects_expired = 32, .locmaf_objects_late = 33, .locmaf_groups_evicted = 34,
+        .locmaf_resets = 35,
     };
     size_t n = out_size < sizeof st ? out_size : sizeof st;
     memcpy(out, &st, n);

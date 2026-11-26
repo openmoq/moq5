@@ -131,6 +131,7 @@ internal fun PackagingKind.nativeOrdinal(): Int =
     when (this) {
         PackagingKind.Raw -> 1
         PackagingKind.Cmaf -> 2
+        PackagingKind.Locmaf -> 4
     }
 
 /**
@@ -147,7 +148,9 @@ internal fun PackagingKind.nativeOrdinal(): Int =
  * microseconds, eight history groups for either generated timeline. The
  * `has_*` fields of the C are the nullability of [maxGroupSap],
  * [maxObjectSap], [trackDuration] and [altGroup]. Content-protection
- * reference ids (CMSF §4.1.2) are not carried yet.
+ * reference ids (CMSF §4.1.2) are not carried yet. A [PackagingKind.Locmaf]
+ * track takes its CMAF Header in [initData] as a CMAF track does, and each
+ * write is one CMAF chunk; the C judges both.
  */
 public data class SendTrackConfig(
     public val name: TrackName,

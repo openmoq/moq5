@@ -1144,9 +1144,17 @@ _Static_assert(offsetof(moq_media_receiver_stats_t, catalog_revision) ==
 _Static_assert(offsetof(moq_media_receiver_stats_t, objects_decompressed) ==
                offsetof(moq_media_receiver_stats_t, catalog_revision) + 8,
                "moq_media_receiver_stats_t: reserved slot after catalog_revision");
-_Static_assert(sizeof(moq_media_receiver_stats_t) ==
+/* The LOCMAF counters start at the complete sizeof through
+ * loc_order_forced and end the record. */
+_Static_assert(offsetof(moq_media_receiver_stats_t, locmaf_objects_rebuilt) ==
                offsetof(moq_media_receiver_stats_t, loc_order_forced) + 8,
-               "moq_media_receiver_stats_t: ends at loc_order_forced");
+               "moq_media_receiver_stats_t: LOCMAF block at the old sizeof");
+_Static_assert(MOQ_MEDIA_RECEIVER_STATS_SIZE_THROUGH_LOCMAF ==
+               offsetof(moq_media_receiver_stats_t, locmaf_objects_rebuilt) + 6 * 8,
+               "moq_media_receiver_stats_t: six LOCMAF counters");
+_Static_assert(sizeof(moq_media_receiver_stats_t) ==
+               MOQ_MEDIA_RECEIVER_STATS_SIZE_THROUGH_LOCMAF,
+               "moq_media_receiver_stats_t: ends at locmaf_resets");
 /* The receiver companion starts at the complete sizeof through the MPEG2TS
  * block (104 LP64, 72 i386, 80 ARM; i386 short enums shift it by 4), never
  * in that layout's tail padding. */

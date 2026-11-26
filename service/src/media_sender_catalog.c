@@ -74,6 +74,8 @@ void track_fill_msf(const moq_media_track_t *t, moq_msf_track_t *m)
 
     if (t->packaging == MOQ_MEDIA_PACKAGING_CMAF)
         m->packaging = (moq_bytes_t){ (const uint8_t *)"cmaf", 4 };
+    else if (t->packaging == MOQ_MEDIA_PACKAGING_LOCMAF)
+        m->packaging = (moq_bytes_t){ (const uint8_t *)"locmaf", 6 };
     else if (t->packaging == MOQ_MEDIA_PACKAGING_MPEG2TS)
         m->packaging = (moq_bytes_t){ (const uint8_t *)"mpeg2ts", 7 };
     else

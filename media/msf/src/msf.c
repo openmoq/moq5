@@ -299,19 +299,25 @@ static moq_result_t get_string_array(const moq_alloc_t *alloc,
 /* A parsed track's extension list and its records: one block per track that
  * carries any, allocated on its first record and freed with the track. The
  * entries come first, so a parsed track's list pointer is its block. */
-#define MSF_EXT_ROWS       2
+#define MSF_EXT_ROWS       3
 #define MSF_ROW_MPEG2TS    0u
 #define MSF_ROW_SUPPLEMENT 1u
+#define MSF_ROW_LOCMAF     2u
 typedef struct msf_ext_block {
     moq_msf_track_ext_t        entries[MSF_EXT_ROWS];  /* ascending kind */
     uint32_t                   present;     /* bit r: moq_msf_ext_kinds[r] */
     moq_msf_mpeg2ts_t          ts;          /* row 0 */
     moq_msf_track_supplement_t supplement;  /* row 1 */
+    moq_msf_locmaf_t           locmaf;      /* row 2 */
 } msf_ext_block_t;
 
 static void *block_record(msf_ext_block_t *b, size_t row)
 {
-    return row == 0 ? (void *)&b->ts : (void *)&b->supplement;
+    switch (row) {
+    case MSF_ROW_MPEG2TS:    return &b->ts;
+    case MSF_ROW_SUPPLEMENT: return &b->supplement;
+    default:                 return &b->locmaf;
+    }
 }
 
 /* Point an entry at a record of its kind. */
@@ -321,6 +327,8 @@ static void ext_entry_set(moq_msf_track_ext_t *e, moq_msf_ext_kind_t kind,
     e->kind = kind;
     if (kind == MOQ_MSF_EXT_SUPPLEMENT)
         e->u.supplement = (const moq_msf_track_supplement_t *)rec;
+    else if (kind == MOQ_MSF_EXT_LOCMAF)
+        e->u.locmaf = (const moq_msf_locmaf_t *)rec;
     else
         e->u.mpeg2ts = (const moq_msf_mpeg2ts_t *)rec;
 }
@@ -330,6 +338,7 @@ const void *moq_msf_ext_record(const moq_msf_track_ext_t *e)
     switch (e->kind) {
     case MOQ_MSF_EXT_MPEG2TS:    return e->u.mpeg2ts;
     case MOQ_MSF_EXT_SUPPLEMENT: return e->u.supplement;
+    case MOQ_MSF_EXT_LOCMAF:     return e->u.locmaf;
     default:                     return NULL;
     }
 }
@@ -372,6 +381,26 @@ const moq_msf_track_ext_t *moq_msf_ext_find(const moq_msf_track_ext_t *list,
 const moq_msf_mpeg2ts_t *moq_msf_track_mpeg2ts(const moq_msf_track_t *track)
 {
     return track ? moq_msf_ext_mpeg2ts(track->extensions, track->extension_count)
+                 : NULL;
+}
+
+/* moq_msf_locmaf_t has one extent: the whole struct, through `malformed`. */
+_Static_assert(MOQ_MSF_LOCMAF_V0_SIZE ==
+               offsetof(moq_msf_locmaf_t, malformed) + sizeof(uint32_t),
+               "msf locmaf record floor");
+
+void moq_msf_locmaf_init_sized(moq_msf_locmaf_t *m, size_t m_size)
+{
+    if (!m || m_size < sizeof(uint32_t)) return;
+    size_t n = m_size < sizeof(*m) ? m_size : sizeof(*m);
+    memset(m, 0, n);
+    uint32_t stamp = (uint32_t)n;
+    memcpy(m, &stamp, sizeof(stamp));
+}
+
+const moq_msf_locmaf_t *moq_msf_track_locmaf(const moq_msf_track_t *track)
+{
+    return track ? moq_msf_ext_locmaf(track->extensions, track->extension_count)
                  : NULL;
 }
 
@@ -1766,6 +1795,7 @@ typedef struct msf_tmp_block {
 #define MSF_REC_ALIGN 8u
 _Static_assert(MSF_REC_ALIGN % _Alignof(moq_msf_mpeg2ts_t) == 0 &&
                MSF_REC_ALIGN % _Alignof(moq_msf_track_supplement_t) == 0 &&
+               MSF_REC_ALIGN % _Alignof(moq_msf_locmaf_t) == 0 &&
                MSF_REC_ALIGN % _Alignof(moq_msf_track_ext_t) == 0,
                "records packed after a list stay aligned");
 
@@ -2691,6 +2721,45 @@ moq_result_t moq_msf_track_mpeg2ts_check(const moq_msf_track_t *t,
     return ts_check(t, m ? m : &none, reason);
 }
 
+/* -- LOCMAF track fields (draft-einarsson-moq-locmaf-01 section 5) ------- */
+
+/* A version an author may write: present, a JSON String, non-empty UTF-8. */
+static bool locmaf_version_authorable(const moq_msf_locmaf_t *m)
+{
+    return m->has_version && m->malformed == 0 && m->version.len > 0 &&
+           m->version.data != NULL &&
+           moq_msf_utf8_valid(m->version.data, m->version.len);
+}
+
+moq_result_t moq_msf_track_locmaf_check(const moq_msf_track_t *t,
+                                        moq_msf_locmaf_error_t *reason)
+{
+    if (reason) *reason = MOQ_MSF_LOCMAF_OK;
+    if (!t) return MOQ_ERR_INVAL;
+    if (!bytes_eq_lit(t->packaging, "locmaf")) {
+        if (reason) *reason = MOQ_MSF_LOCMAF_ERR_NOT_LOCMAF;
+        return MOQ_ERR_INVAL;
+    }
+    const moq_msf_locmaf_t *m = moq_msf_track_locmaf(t);
+    if (m && m->struct_size < MOQ_MSF_LOCMAF_V0_SIZE) return MOQ_ERR_INVAL;
+    moq_msf_locmaf_error_t why = MOQ_MSF_LOCMAF_OK;
+    moq_result_t rc = MOQ_OK;
+    if (!m || !m->has_version) {
+        why = MOQ_MSF_LOCMAF_ERR_VERSION_MISSING;
+        rc = MOQ_ERR_PROTO;
+    } else if (m->malformed || m->version.len == 0 || !m->version.data) {
+        why = MOQ_MSF_LOCMAF_ERR_VERSION_MALFORMED;
+        rc = MOQ_ERR_PROTO;
+    } else if (!bytes_eq_lit(m->version, MOQ_MSF_LOCMAF_VERSION)) {
+        /* Section 5: the version names behaviour the wire bytes cannot show,
+         * so an unknown one is never decoded. */
+        why = MOQ_MSF_LOCMAF_ERR_VERSION_UNSUPPORTED;
+        rc = MOQ_ERR_UNSUPPORTED;
+    }
+    if (reason) *reason = why;
+    return rc;
+}
+
 /* Resolve initRef and check the entry: "inline", Base64, whole packets of
  * packet_size each with its sync byte. On MOQ_OK *out (when non-NULL) owns
  * the decoded packets. */
@@ -2863,6 +2932,10 @@ static moq_result_t validate_track(const moq_msf_track_t *t, bool strict,
      * (Mode and Packet Size are required). */
     if (strict && bytes_eq_lit(t->packaging, "mpeg2ts") && !track_ts(t))
         return MOQ_ERR_INVAL;
+    /* draft-einarsson-moq-locmaf-01 section 5: an authored locmaf track
+     * carries locmafVersion. */
+    if (strict && bytes_eq_lit(t->packaging, "locmaf") && !moq_msf_track_locmaf(t))
+        return MOQ_ERR_INVAL;
     /* MSF-02 authoring: names map to bytes and namespaces split (11.2), and
      * the fields its (packaging, role) requires are present (5.2.4.1). */
     if (strict && rev == MOQ_MSF_REVISION_02 &&
@@ -2923,6 +2996,7 @@ static moq_result_t validate_delta_track(moq_msf_delta_op_kind_t op,
         return MOQ_ERR_INVAL;
     const moq_msf_mpeg2ts_t *m = track_ts(t);
     bool has_ts = m != NULL;
+    const moq_msf_locmaf_t *lm = moq_msf_track_locmaf(t);
     if (op == MOQ_MSF_DELTA_OP_ADD) {
         /* Lenient like the parser: packaging may be omitted in the example;
          * if present it must be non-empty. Optional spans must be coherent. */
@@ -2943,6 +3017,12 @@ static moq_result_t validate_delta_track(moq_msf_delta_op_kind_t op,
         if (strict && t->has_packaging && bytes_eq_lit(t->packaging, "mpeg2ts") &&
             !has_ts)
             return MOQ_ERR_INVAL;            /* Mode and Packet Size missing */
+        /* LOCMAF: an added track is a whole track, with its version exactly
+         * when its packaging is "locmaf". */
+        if (strict && (lm || (t->has_packaging && bytes_eq_lit(t->packaging, "locmaf"))) &&
+            (!lm || !t->has_packaging || !bytes_eq_lit(t->packaging, "locmaf") ||
+             !locmaf_version_authorable(lm)))
+            return MOQ_ERR_INVAL;
         return MOQ_OK;
     }
     if (op == MOQ_MSF_DELTA_OP_REMOVE) {
@@ -2964,6 +3044,12 @@ static moq_result_t validate_delta_track(moq_msf_delta_op_kind_t op,
     if (strict && has_ts &&
         ((t->has_packaging && !bytes_eq_lit(t->packaging, "mpeg2ts")) ||
          !ts_overrides_ok(t, m)))
+        return MOQ_ERR_INVAL;
+    /* A LOCMAF override carries a version; the packaging it lands on is
+     * judged when the delta is applied. */
+    if (strict && lm &&
+        ((t->has_packaging && !bytes_eq_lit(t->packaging, "locmaf")) ||
+         !locmaf_version_authorable(lm)))
         return MOQ_ERR_INVAL;
     return MOQ_OK;
 }
@@ -3351,6 +3437,111 @@ static bool supp_is_empty(const void *rec)
     return moq_msf_supplement_is_empty((const moq_msf_track_supplement_t *)rec);
 }
 
+static void lm_init(void *rec)
+{
+    moq_msf_locmaf_init_sized((moq_msf_locmaf_t *)rec, sizeof(moq_msf_locmaf_t));
+}
+
+/* locmafVersion, in both extents and both revisions (C.3 of the
+ * composition: a packaging extension's keys are not MSF-02 vocabulary). */
+static bool lm_key_known(const json_string_t *name, unsigned caps)
+{
+    (void)caps;
+    return str_eq(name, "locmafVersion");
+}
+
+/* A String is the version; any other JSON value is present and malformed,
+ * so that the track check refuses the track. */
+static moq_result_t lm_parse_key(const moq_alloc_t *alloc,
+                                 const json_object_element_t *e, void *rec)
+{
+    (void)alloc;
+    moq_msf_locmaf_t *m = (moq_msf_locmaf_t *)rec;
+    m->has_version = true;
+    if (get_string(e, &m->version)) {
+        m->malformed &= ~MOQ_MSF_LOCMAF_F_VERSION;
+    } else {
+        m->version = (moq_bytes_t){ NULL, 0 };
+        m->malformed |= MOQ_MSF_LOCMAF_F_VERSION;
+    }
+    return MOQ_OK;
+}
+
+/* An override that carries locmafVersion replaces the inherited one,
+ * malformed bit included. */
+static void lm_merge(void *dst, const void *o, moq_msf_revision_t rev)
+{
+    (void)rev;
+    moq_msf_locmaf_t *d = (moq_msf_locmaf_t *)dst;
+    const moq_msf_locmaf_t *c = (const moq_msf_locmaf_t *)o;
+    if (!c->has_version) return;
+    d->has_version = true;
+    d->version = c->version;
+    d->malformed = (d->malformed & ~MOQ_MSF_LOCMAF_F_VERSION) |
+                   (c->malformed & MOQ_MSF_LOCMAF_F_VERSION);
+}
+
+static bool lm_storage_ok(const void *rec)
+{
+    const moq_msf_locmaf_t *m = (const moq_msf_locmaf_t *)rec;
+    return !m->has_version || validate_bytes(m->version);
+}
+
+/* Section 5: locmafVersion is present when packaging is "locmaf" and absent
+ * otherwise. Authoring also requires a well-formed version. The receive-path
+ * re-encode of an applied delta keeps a peer's malformed or missing version
+ * (the track check refuses that track), but refuses a version that the
+ * effective track carries on another packaging: an op that changed the
+ * packaging away from "locmaf" while inheriting the record. */
+static moq_result_t lm_validate(const void *rec, const moq_msf_track_t *t,
+                                bool strict, moq_msf_revision_t rev)
+{
+    (void)rev;
+    const moq_msf_locmaf_t *m = (const moq_msf_locmaf_t *)rec;
+    bool present = m->has_version || m->malformed != 0;
+    if (present && !bytes_eq_lit(t->packaging, "locmaf")) return MOQ_ERR_INVAL;
+    if (strict && !locmaf_version_authorable(m)) return MOQ_ERR_INVAL;
+    return MOQ_OK;
+}
+
+/* A malformed version is written as null, so that the receive-path
+ * re-encode keeps a peer's invalid track invalid. */
+static void lm_encode(enc_buf_t *b, const void *rec, moq_msf_revision_t rev,
+                      bool *f)
+{
+    (void)rev;
+    const moq_msf_locmaf_t *m = (const moq_msf_locmaf_t *)rec;
+    if (!m->has_version) return;
+    enc_comma(b, f);
+    if (m->malformed & MOQ_MSF_LOCMAF_F_VERSION) {
+        enc_key(b, "locmafVersion");
+        enc_lit(b, "null");
+    } else {
+        enc_key_string(b, "locmafVersion", m->version);
+    }
+}
+
+static void lm_free_owned(const moq_alloc_t *alloc, void *rec)
+{
+    (void)alloc;
+    (void)rec;
+}
+
+static bool lm_equal(const void *pa, const void *pb)
+{
+    const moq_msf_locmaf_t *a = (const moq_msf_locmaf_t *)pa;
+    const moq_msf_locmaf_t *b = (const moq_msf_locmaf_t *)pb;
+    if (!a || !b) return a == b;
+    return a->has_version == b->has_version && a->malformed == b->malformed &&
+           (!a->has_version || bytes_eq(a->version, b->version));
+}
+
+static bool lm_is_empty(const void *rec)
+{
+    const moq_msf_locmaf_t *m = (const moq_msf_locmaf_t *)rec;
+    return !m->has_version && m->malformed == 0;
+}
+
 /* In ascending kind order; the parse block holds the records at the same
  * rows (MSF_ROW_*). */
 const msf_ext_kind_ops_t moq_msf_ext_kinds[] = {
@@ -3383,6 +3574,21 @@ const msf_ext_kind_ops_t moq_msf_ext_kinds[] = {
         .free_owned = supp_free_owned,
         .equal = supp_equal,
         .is_empty = supp_is_empty,
+    },
+    {
+        .kind = MOQ_MSF_EXT_LOCMAF,
+        .record_size = sizeof(moq_msf_locmaf_t),
+        .v0_size = MOQ_MSF_LOCMAF_V0_SIZE,
+        .init = lm_init,
+        .key_known = lm_key_known,
+        .parse_key = lm_parse_key,
+        .merge = lm_merge,
+        .storage_ok = lm_storage_ok,
+        .validate = lm_validate,
+        .encode = lm_encode,
+        .free_owned = lm_free_owned,
+        .equal = lm_equal,
+        .is_empty = lm_is_empty,
     },
 };
 const size_t moq_msf_ext_kind_count =

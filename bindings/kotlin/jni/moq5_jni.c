@@ -2554,11 +2554,12 @@ static jint JNICALL moq5_impl_nativeReceiverPollMediaTimeline(JNIEnv *env, jobje
 /* -- the receiver STATS row ---------------------------------------------------
  *
  * ONE moq_media_receiver_get_stats read under the receiver pin, every field
- * of moq_media_receiver_stats_t published exactly once into the block, in
- * the struct's order; the two booleans as 0/1. The block appended after
- * tracks_malformed is published only when the library's stamp covered all of
- * it, through loc_order_forced: slot 16 says so (1), and its slots are zero
- * otherwise. The reserved field after catalog_revision has no slot. */
+ * of moq_media_receiver_stats_t through loc_order_forced published exactly
+ * once into the block, in the struct's order; the two booleans as 0/1. The
+ * block appended after tracks_malformed is published only when the library's
+ * stamp covered all of it, through loc_order_forced: slot 16 says so (1), and
+ * its slots are zero otherwise. The reserved field after catalog_revision and
+ * the LOCMAF counters after loc_order_forced have no slot. */
 #define MOQ5_RX_STATS_SCALARS 27
 #define MOQ5_RX_STATS_COVERS(st, field) \
     ((size_t)(st).struct_size >= offsetof(moq_media_receiver_stats_t, field) + sizeof((st).field))
@@ -2909,7 +2910,8 @@ static jint JNICALL moq5_impl_nativeSenderAddTrack(JNIEnv *env, jobject self, jl
     }
     if (lens[0] < 1) return (jint)MOQ_ERR_INVAL;   /* the name is required */
     if (sc[0] != (jlong)MOQ_MEDIA_TYPE_VIDEO && sc[0] != (jlong)MOQ_MEDIA_TYPE_AUDIO) return (jint)MOQ_ERR_INVAL;
-    if (sc[1] != (jlong)MOQ_MEDIA_PACKAGING_RAW && sc[1] != (jlong)MOQ_MEDIA_PACKAGING_CMAF) return (jint)MOQ_ERR_INVAL;
+    if (sc[1] != (jlong)MOQ_MEDIA_PACKAGING_RAW && sc[1] != (jlong)MOQ_MEDIA_PACKAGING_CMAF &&
+        sc[1] != (jlong)MOQ_MEDIA_PACKAGING_LOCMAF) return (jint)MOQ_ERR_INVAL;
     if (!moq5_is_flag(sc[3]) || !moq5_is_flag(sc[9]) || !moq5_is_flag(sc[11]) || !moq5_is_flag(sc[13]) ||
         !moq5_is_flag(sc[15]) || !moq5_is_flag(sc[17]) || !moq5_is_flag(sc[19])) {
         return (jint)MOQ_ERR_INVAL;

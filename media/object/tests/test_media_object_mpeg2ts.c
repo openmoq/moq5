@@ -386,11 +386,15 @@ static void test_unknown_packaging(void)
     moq_media_track_info_t t;
     moq_media_object_parse_cfg_t cfg;
     moq_media_parsed_object_t o;
-    for (int pk = 4; pk <= 5; pk++) {
+    for (int pk = 5; pk <= 6; pk++) {
         track(&t, &cfg, 188, MOQ_MEDIA_TYPE_VIDEO);
         t.packaging = (moq_media_packaging_t)pk;
         CHECK(run(&t, &cfg, obj, n, &o, NULL) == MOQ_ERR_INVAL);
     }
+    /* LOCMAF is known, and needs a stateful decoder. */
+    track(&t, &cfg, 188, MOQ_MEDIA_TYPE_VIDEO);
+    t.packaging = MOQ_MEDIA_PACKAGING_LOCMAF;
+    CHECK(run(&t, &cfg, obj, n, &o, NULL) == MOQ_ERR_UNSUPPORTED);
 }
 
 int main(void)

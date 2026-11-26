@@ -29,6 +29,11 @@ if(TARGET moq::mpeg2ts)
     target_compile_definitions(moq_cpp INTERFACE MOQ_HAS_MPEG2TS)
 endif()
 
+if(TARGET moq::locmaf)
+    target_link_libraries(moq_cpp INTERFACE moq::locmaf)
+    target_compile_definitions(moq_cpp INTERFACE MOQ_HAS_LOCMAF)
+endif()
+
 set_target_properties(moq_cpp PROPERTIES EXPORT_NAME cpp)
 
 install(TARGETS moq_cpp
@@ -41,6 +46,7 @@ install(DIRECTORY include/moq
     PATTERN "msf.hpp" EXCLUDE
     PATTERN "cmaf.hpp" EXCLUDE
     PATTERN "mpeg2ts.hpp" EXCLUDE
+    PATTERN "locmaf.hpp" EXCLUDE
     PATTERN "media_player.hpp" EXCLUDE)
 
 if(TARGET moq::loc)
@@ -60,6 +66,11 @@ endif()
 
 if(TARGET moq::mpeg2ts)
     install(FILES include/moq/mpeg2ts.hpp
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moq)
+endif()
+
+if(TARGET moq::locmaf)
+    install(FILES include/moq/locmaf.hpp
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/moq)
 endif()
 
@@ -197,9 +208,30 @@ if(MOQ_BUILD_TESTS)
     endif()
 
     if(TARGET moq::cmaf)
-        add_executable(test_cpp_cmaf tests/test_cmaf.cpp)
+        add_executable(test_cpp_cmaf tests/test_cmaf.cpp
+            ${PROJECT_SOURCE_DIR}/tests/support/media_builders.c)
+        target_include_directories(test_cpp_cmaf PRIVATE
+            ${PROJECT_SOURCE_DIR}/tests/support)
         target_link_libraries(test_cpp_cmaf PRIVATE moq::cpp)
         add_test(NAME cpp_cmaf COMMAND test_cpp_cmaf)
+    endif()
+
+    if(TARGET moq::locmaf)
+        # The test replaces the global allocation functions to count the
+        # wrappers' storage and state, so it is its own program.
+        add_executable(test_cpp_locmaf tests/test_locmaf.cpp
+            ${PROJECT_SOURCE_DIR}/tests/support/media_builders.c)
+        target_include_directories(test_cpp_locmaf PRIVATE
+            ${PROJECT_SOURCE_DIR}/tests/support)
+        target_link_libraries(test_cpp_locmaf PRIVATE moq::cpp)
+        add_test(NAME cpp_locmaf COMMAND test_cpp_locmaf)
+
+        # <moq/locmaf.h> compiles alone as C++17, without the C++ binding.
+        add_executable(test_cpp_locmaf_header tests/test_locmaf_header.cpp)
+        target_link_libraries(test_cpp_locmaf_header PRIVATE moq::locmaf)
+        set_target_properties(test_cpp_locmaf_header PROPERTIES
+            CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+        add_test(NAME cpp_locmaf_header COMMAND test_cpp_locmaf_header)
     endif()
 
     if(TARGET moq::mpeg2ts)

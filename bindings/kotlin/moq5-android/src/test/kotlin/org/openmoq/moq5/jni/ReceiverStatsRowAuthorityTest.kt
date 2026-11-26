@@ -8,8 +8,8 @@ import kotlin.test.assertTrue
 
 /**
  * The receiver STATS row: one `moq_media_receiver_get_stats` read on the
- * receiver child, every field published exactly once into a fixed scalar
- * block in the struct's order.
+ * receiver child, every field through `loc_order_forced` published exactly
+ * once into a fixed scalar block in the struct's order.
  */
 internal class ReceiverStatsRowAuthorityTest {
     private companion object {

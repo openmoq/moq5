@@ -146,6 +146,51 @@ mod media {
     }
 }
 
+/// The LOCMAF tier's contracts, in its own generation and snapshot: what a
+/// decoded chunk borrows and for how long, how long a decoder keeps its
+/// storage, and what a commit adopts.
+#[cfg(feature = "locmaf")]
+mod locmaf {
+    const GENERATED: &str = include_str!(concat!(env!("OUT_DIR"), "/bindings_locmaf.rs"));
+    const SNAPSHOT: &str = include_str!("../docs/bindings_locmaf.rs");
+    const GENERATED_PREAMBLES: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/preambles_locmaf.md"));
+    const SNAPSHOT_PREAMBLES: &str = include_str!("../docs/preambles_locmaf.md");
+
+    #[test]
+    fn locmaf_contracts_reach_the_generated_documentation() {
+        for (name, phrase) in [
+            (
+                "moq_locmaf_decoder_push",
+                "decoder's storage until the next push, reset or copy into this decoder",
+            ),
+            (
+                "moq_locmaf_decoder_init",
+                "storage until it is re-initialized or no longer used",
+            ),
+            (
+                "moq_locmaf_encoder_commit",
+                "Adopt what the last successful encode staged",
+            ),
+        ] {
+            for (bindings, which) in [(GENERATED, "generated"), (SNAPSHOT, "snapshot")] {
+                assert!(
+                    super::function_doc(bindings, name).contains(phrase),
+                    "the {which} `{name}` carries its header comment ({phrase:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn locmaf_preambles_reach_the_crate_documentation() {
+        for preambles in [GENERATED_PREAMBLES, SNAPSHOT_PREAMBLES] {
+            assert!(preambles.contains("## moq/locmaf.h"));
+            assert!(preambles.contains("Sans-I/O and allocation-free."));
+        }
+    }
+}
+
 /// The service tier's contracts, in its own generation and snapshot:
 /// endpoint lifecycle (teardown precondition and the refusal with live
 /// attachments) and a receiver record's field.

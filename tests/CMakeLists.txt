@@ -2294,6 +2294,9 @@ if(UNIX)
            AND TARGET moq-media-object AND TARGET moq-msf)
             string(APPEND _tier_packages ",libmoq-media")
         endif()
+        if(TARGET moq-locmaf)
+            string(APPEND _tier_packages ",libmoq-locmaf")
+        endif()
         # The consumers are built for the producer's own target, with its
         # compilers and its C, C++ and link flags kept apart.
         set(_tier_context "${CMAKE_CURRENT_BINARY_DIR}/tier-pkgconfig-context.cmake")

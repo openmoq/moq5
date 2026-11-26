@@ -6,6 +6,7 @@
 | Endpoint URI validation | `endpoint_uri.c` |
 | Owned resource authorization | `media_auth.c` |
 | Receiver discovery, selection and object delivery | `media_receiver.c` |
+| LOCMAF decoding of live Objects, per Group | `media_receiver_locmaf.c` |
 | Player orchestration | `media_player.c` |
 | Sender configuration, construction and state queries | `media_sender.c` |
 | Sender track configuration, registration and removal | `media_sender_tracks.c` |
@@ -15,9 +16,12 @@
 | Publisher callbacks, demand and endpoint pumping | `media_sender_pump.c` |
 | Generated SAP and media timeline delivery | `media_sender_timeline.c` |
 | MPEG-2 TS configuration and byte-stream delivery | `media_sender_mpeg2ts.c` |
+| LOCMAF encoding and the wire buffers it writes | `media_sender_locmaf.c` |
 | Private sender test seams | `media_sender_testing.c` |
 
 `media_sender_internal.h` owns the sender's private layout. Family-specific
 internal headers declare only helpers used by another sender file. The testing
 source is compiled only into the existing private test variants. MPEG-2 TS
-entry points retain their unsupported behavior when that component is absent.
+entry points retain their unsupported behavior when that component is absent,
+and so do LOCMAF tracks without moq::locmaf: `media_sender_locmaf.c` is built
+either way, and `media_receiver_locmaf.c` only with it.

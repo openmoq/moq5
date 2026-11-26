@@ -14,6 +14,8 @@ import org.openmoq.moq5.engine.BackendSenderTrackResult
 import org.openmoq.moq5.engine.BackendWriteResult
 import org.openmoq.moq5.engine.EngineFixture
 import org.openmoq.moq5.engine.ScriptedEndpointBackend
+import org.openmoq.moq5.engine.SendTrackConfigCodec
+import org.openmoq.moq5.jni.SendTrackScalars
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -173,6 +175,27 @@ internal class PublicSenderSurfaceTest : EngineFixture() {
             assertFailsWith<ForeignSendTrackException> { foreignSender.convertToVod(listOf(VodConversion(track, MediaMillis(1uL)))) }
             assertEquals(before, otherBackend.observed().callOrder, "a foreign handle never reaches the bridge")
             other.closeAndJoin()
+            endpoint.closeAndJoin()
+        }
+
+    @Test
+    fun `a LOCMAF track crosses with its packaging and CMAF header, its chunks are written like any object, and the refusals are the C's`() =
+        runTest {
+            val backend = newBackend()
+            val endpoint = MoqEndpoint.open(EndpointConfig(URL)) { backend }
+            val sender = endpoint.attachSender(CONFIG)
+            val locmaf = VIDEO.copy(name = TrackName("l".toByteArray()), packaging = PackagingKind.Locmaf, initData = MediaBytes("ftyp..moov".toByteArray()))
+            val track = withTimeout(BOUND) { sender.addTrack(locmaf) }
+            assertEquals(locmaf, backend.observed().senderAddTracks.single().config)
+            assertEquals(4L, SendTrackConfigCodec.scalars(locmaf)[SendTrackScalars.PACKAGING], "moq_media_packaging_t LOCMAF")
+            assertEquals(2L, SendTrackConfigCodec.scalars(locmaf.copy(packaging = PackagingKind.Cmaf))[SendTrackScalars.PACKAGING])
+            ready(backend, sender)
+            assertEquals(WriteOutcome.Accepted, withTimeout(BOUND) { sender.tryWrite(track, key("moof..mdat..")) })
+            assertEquals(listOf("moof..mdat.."), backend.observed().acceptedPayloads.map { String(it) })
+            backend.scriptSenderAddTrack(BackendSenderTrackResult.Refused(MoqResultCode(INVAL)))
+            val bare = locmaf.copy(name = TrackName("m".toByteArray()), initData = null)
+            assertEquals(MoqResultCode(INVAL), assertFailsWith<TrackConfigRejectedException> { withTimeout(BOUND) { sender.addTrack(bare) } }.code, "a missing CMAF header is the C's refusal, passed through")
+            assertEquals(bare, backend.observed().senderAddTracks.last().config, "the binding does not refuse it first")
             endpoint.closeAndJoin()
         }
 

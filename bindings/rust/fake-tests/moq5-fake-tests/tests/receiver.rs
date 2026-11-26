@@ -2318,6 +2318,148 @@ fn descriptions_carry_their_extension_records() {
     drop(receiver);
 }
 
+static LOCMAF: &[u8] = b"locmaf";
+static LOCMAF_VERSION: &[u8] = b"0.3";
+
+/// A LOCMAF track (draft-einarsson-moq-locmaf-01) is described as one, with
+/// the parsed record of its CMAF Header and its catalog record; its Objects
+/// reach the application as the CMAF chunks they stand for, through the
+/// ordinary CMAF object path.
+#[test]
+fn locmaf_tracks_describe_their_header_and_deliver_cmaf() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    let mut record = CMAF_RECORD.0;
+    record.trak_count = 1;
+    record.has_trex = true;
+    record.trex_default_sample_description_index = 1;
+    record.trex_default_sample_duration = 1024;
+    record.trex_default_sample_flags = 0x0200_0000;
+    let locmaf = sys::moq_msf_locmaf_t {
+        struct_size: std::mem::size_of::<sys::moq_msf_locmaf_t>() as u32,
+        has_version: true,
+        version: fake::span(LOCMAF_VERSION),
+        malformed: 0,
+    };
+    let entries = [sys::moq_msf_track_ext_t {
+        kind: sys::MOQ_MSF_EXT_LOCMAF,
+        u: sys::moq_msf_track_ext__bindgen_ty_1 { locmaf: &locmaf },
+    }];
+    let mut description = raw_description(true);
+    description.info.packaging = sys::MOQ_MEDIA_PACKAGING_LOCMAF;
+    description.packaging = fake::span(LOCMAF);
+    description.cmaf = &record;
+    description.extensions = entries.as_ptr();
+    description.extension_count = entries.len();
+    // The provider copies the description; its pointers reach locals that
+    // outlive the receiver.
+    set_description(&receiver, 0, &description);
+    let track = track(&receiver, 0);
+    let copy = receiver
+        .track_description(track)
+        .expect("the description of a discovered track copies");
+    assert_eq!(copy.packaging(), Some(Packaging::Locmaf));
+    assert_eq!(copy.packaging_name(), LOCMAF);
+    let header = copy.init_info().expect("the CMAF Header's record");
+    assert_eq!(header.timescale(), 90000);
+    assert_eq!(header.trak_count(), Some(1));
+    let trex = header.trex().expect("the header facts are reported");
+    assert_eq!(trex.default_sample_duration, 1024);
+    assert_eq!(trex.default_sample_flags, 0x0200_0000);
+    let extension = copy
+        .extensions()
+        .next()
+        .expect("the catalog record is listed");
+    let TrackExtension::Locmaf(view) = extension else {
+        panic!("{extension:?} is the LOCMAF record");
+    };
+    assert_eq!(view.version(), Some(LOCMAF_VERSION));
+    assert!(!view.version_malformed());
+    assert!(format!("{view:?}").contains("version"));
+    assert!(copy.mpeg2ts().is_none());
+
+    // A malformed version is present, empty and flagged; a record below its
+    // first published size is not read as one.
+    let malformed = sys::moq_msf_locmaf_t {
+        version: sys::moq_bytes_t::default(),
+        malformed: sys::MOQ_MSF_LOCMAF_F_VERSION,
+        ..locmaf
+    };
+    let short = sys::moq_msf_locmaf_t {
+        struct_size: 4,
+        ..locmaf
+    };
+    for (record, readable) in [(&malformed, true), (&short, false)] {
+        let entries = [sys::moq_msf_track_ext_t {
+            kind: sys::MOQ_MSF_EXT_LOCMAF,
+            u: sys::moq_msf_track_ext__bindgen_ty_1 { locmaf: record },
+        }];
+        description.extensions = entries.as_ptr();
+        set_description(&receiver, 0, &description);
+        let copy = receiver
+            .track_description(track)
+            .expect("the description of a discovered track copies");
+        match copy.extensions().next() {
+            Some(TrackExtension::Locmaf(view)) if readable => {
+                assert_eq!(view.version(), Some(&b""[..]));
+                assert!(view.version_malformed());
+            }
+            Some(TrackExtension::Other(kind)) if !readable => {
+                assert_eq!(kind, sys::MOQ_MSF_EXT_LOCMAF);
+            }
+            other => panic!("{other:?} for a record that is readable: {readable}"),
+        }
+        set_description(&receiver, 0, &raw_description(true));
+    }
+
+    // The track's Objects are canonical CMAF: a fragment and its sample
+    // table, no payload.
+    RELEASES.store(0, Ordering::SeqCst);
+    push_object(&receiver);
+    let object = receiver
+        .poll_object()
+        .expect("poll_object on a live receiver")
+        .expect("the pushed object is pollable");
+    assert_eq!(object.packaging(), Some(Packaging::Cmaf));
+    assert_eq!(object.fragment(), PAYLOAD);
+    assert_eq!(object.payload(), b"");
+    assert_eq!(object.samples().len(), 2);
+    drop(object);
+    assert_eq!(RELEASES.load(Ordering::SeqCst), 1);
+    drop(receiver);
+}
+
+/// The six LOCMAF counters are one block: reported whole when the stamp
+/// covers the last of them, else none of them.
+#[test]
+fn locmaf_counters_are_one_block() {
+    let s = fake::suite();
+    let endpoint = connect(&s);
+    let receiver = attach(&s, &endpoint);
+    let stats = receiver.stats().expect("stats on a live receiver");
+    assert_eq!(
+        (
+            stats.locmaf_objects_rebuilt,
+            stats.locmaf_objects_undecodable,
+            stats.locmaf_objects_expired,
+            stats.locmaf_objects_late,
+            stats.locmaf_groups_evicted,
+            stats.locmaf_resets
+        ),
+        (Some(30), Some(31), Some(32), Some(33), Some(34), Some(35))
+    );
+    let end = std::mem::offset_of!(sys::moq_media_receiver_stats_t, locmaf_resets) + 8;
+    s.set("receiver_stats_stamp", (end - 1) as i64);
+    let stats = receiver.stats().expect("stats on a live receiver");
+    assert_eq!(stats.loc_order_forced, Some(29), "the block before it");
+    assert_eq!(stats.locmaf_objects_rebuilt, None);
+    assert_eq!(stats.locmaf_resets, None);
+    s.set("receiver_stats_stamp", end as i64);
+    let stats = receiver.stats().expect("stats on a live receiver");
+    assert_eq!(stats.locmaf_resets, Some(35));
+}
+
 #[test]
 fn fill_terminals_are_typed() {
     let s = fake::suite();

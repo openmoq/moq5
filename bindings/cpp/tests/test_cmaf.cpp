@@ -1,6 +1,10 @@
 #include <moq/cmaf.hpp>
 #include "test_support.hpp"
 
+extern "C" {
+#include "media_builders.h"
+}
+
 #include <cstring>
 
 /* -- Synthetic box helpers (same logic as C tests) ------------------- */
@@ -430,6 +434,92 @@ int main()
         MOQ_CHECK(r.ok());
         MOQ_CHECK(r->codec_config.data() >= buf);
         MOQ_CHECK(r->codec_config.data() + r->codec_config.size() <= buf + len);
+    }
+
+    // The header facts: trak count, trex defaults, a version-1 tenc's pattern
+    // and the constant IV, the constant IV borrowed from the input.
+    {
+        static const uint8_t kid[16] = {1, 2, 3, 4, 5, 6, 7, 8,
+                                        9, 10, 11, 12, 13, 14, 15, 16};
+        static const uint8_t avcc[] = {0x01, 0x64, 0x00, 0x1E, 0xFF};
+        static const uint8_t civ[16] = {0xC0, 0xC1, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7,
+                                        0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF};
+        moq_test_cenc_init_opts_t o{};
+        o.pattern = 0x19;
+        o.constant_iv_size = 16;
+        o.constant_iv = civ;
+        o.constant_iv_len = sizeof(civ);
+        o.with_trex = true;
+        o.trex[0] = 1;
+        o.trex[1] = 3000;
+        o.trex[2] = 0;
+        o.trex[3] = 0x01010000u;
+        uint8_t buf[1024];
+        size_t len = moq_test_build_cmaf_init_cenc_ex(buf, 1, 90000, 64, 64, avcc,
+            sizeof(avcc), "cbcs", 1, 0, kid, 1, MOQ_TEST_CENC_OK, &o);
+        auto r = moq::cmaf::parse_init(moq::bytes_view(buf, len));
+        MOQ_CHECK(r.ok());
+        if (r.ok()) {
+            MOQ_CHECK(r->trak_count == std::optional<uint32_t>(1));
+            MOQ_CHECK(r->trex.has_value());
+            if (r->trex) {
+                MOQ_CHECK(r->trex->sample_description_index == 1);
+                MOQ_CHECK(r->trex->sample_duration == 3000);
+                MOQ_CHECK(r->trex->sample_size == 0);
+                MOQ_CHECK(r->trex->sample_flags == 0x01010000u);
+            }
+            MOQ_CHECK(r->pattern.has_value());
+            if (r->pattern)
+                MOQ_CHECK(r->pattern->crypt_byte_block == 1 && r->pattern->skip_byte_block == 9);
+            MOQ_CHECK(r->constant_iv.has_value());
+            if (r->constant_iv) {
+                MOQ_CHECK(r->constant_iv->size() == sizeof(civ));
+                MOQ_CHECK(r->constant_iv->data() >= buf &&
+                          r->constant_iv->data() + r->constant_iv->size() <= buf + len);
+                MOQ_CHECK(std::memcmp(r->constant_iv->data(), civ, sizeof(civ)) == 0);
+            }
+        }
+
+        // A version-0 tenc with a per-sample IV has no pattern and no constant IV.
+        o.with_trex = false;
+        len = moq_test_build_cmaf_init_cenc_ex(buf, 1, 90000, 64, 64, avcc,
+            sizeof(avcc), "cenc", 1, 8, kid, 0, MOQ_TEST_CENC_OK, &o);
+        auto v0 = moq::cmaf::parse_init(moq::bytes_view(buf, len));
+        MOQ_CHECK(v0.ok());
+        if (v0.ok()) {
+            MOQ_CHECK(v0->trak_count == std::optional<uint32_t>(1));
+            MOQ_CHECK(!v0->trex && !v0->pattern && !v0->constant_iv);
+        }
+
+        // A clear header without mvex: the block is reported, the values absent.
+        uint8_t clear[512];
+        size_t clen = build_avc_init(clear, 30000, 640, 480, avcc, sizeof(avcc));
+        auto c = moq::cmaf::parse_init(moq::bytes_view(clear, clen));
+        MOQ_CHECK(c.ok());
+        if (c.ok()) {
+            MOQ_CHECK(c->trak_count == std::optional<uint32_t>(1));
+            MOQ_CHECK(!c->trex && !c->pattern && !c->constant_iv);
+        }
+
+        // The block is read only when the stamp covers all of it: a record an
+        // older library stamped through _reserved_sample_entry reports
+        // sample_entry and nothing of the block.
+        len = moq_test_build_cmaf_init_cenc_ex(buf, 1, 90000, 64, 64, avcc,
+            sizeof(avcc), "cbcs", 1, 0, kid, 1, MOQ_TEST_CENC_OK, &o);
+        moq_cmaf_init_info_t ci;
+        moq_cmaf_init_info_init(&ci);
+        MOQ_CHECK(moq_cmaf_parse_init_sized(moq::bytes_view(buf, len).raw(), &ci,
+                                            sizeof(ci)) == MOQ_OK);
+        MOQ_CHECK(ci.has_trex == false && ci.tenc_version == 1 &&
+                  ci.default_constant_iv.len == 16);
+        ci.has_trex = true;
+        ci.struct_size = MOQ_CMAF_INIT_INFO_SIZE_THROUGH_RESERVED;
+        auto old = moq::cmaf::detail::init_info_from(ci);
+        MOQ_CHECK(old.sample_entry.has_value());
+        MOQ_CHECK(!old.trak_count && !old.trex && !old.pattern && !old.constant_iv);
+        ci.struct_size = MOQ_CMAF_INIT_INFO_SIZE_THROUGH_CONSTANT_IV;
+        auto covered = moq::cmaf::detail::init_info_from(ci);
+        MOQ_CHECK(covered.trak_count && covered.trex && covered.pattern && covered.constant_iv);
     }
 
     std::printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

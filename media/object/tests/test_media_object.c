@@ -395,6 +395,47 @@ int main(void)
         CHECK(moq_media_object_parse(&ti, &oi, NULL, 0, &po, NULL) == MOQ_ERR_INVAL);
     }
 
+    /* -- LOCMAF -> UNSUPPORTED: a stateless parser cannot read it ---- */
+    {
+        CHECK(MOQ_MEDIA_PACKAGING_LOCMAF == 4u);
+        moq_media_track_info_t ti;
+        moq_media_track_info_init(&ti);
+        ti.media_type = MOQ_MEDIA_TYPE_VIDEO;
+        ti.packaging = MOQ_MEDIA_PACKAGING_LOCMAF;
+        ti.timescale = 90000;
+
+        uint8_t data[] = { 0x02, 0x00 };
+        moq_rcbuf_t *p = NULL;
+        CHECK(moq_rcbuf_create(alloc, data, sizeof(data), &p) == MOQ_OK);
+        moq_media_object_input_t oi;
+        moq_media_object_input_init(&oi);
+        oi.payload = p;
+        moq_media_parsed_object_t po;
+        memset(&po, 0xAB, sizeof(po));
+        moq_media_drop_reason_t why = 77;
+        CHECK(moq_media_object_parse(&ti, &oi, NULL, 0, &po, &why) == MOQ_ERR_UNSUPPORTED);
+        CHECK(why == 0);
+        CHECK(((const unsigned char *)&po)[0] == 0xAB);   /* out untouched */
+
+        /* The sized parser, on every companion; a status Object too. */
+        moq_media_object_parse_cfg_t cfg = MOQ_MEDIA_OBJECT_PARSE_CFG_INIT;
+        CHECK(moq_media_object_parse_sized(&ti, &oi, &cfg, NULL, 0, &po,
+                                           sizeof(po), NULL) == MOQ_ERR_UNSUPPORTED);
+        moq_media_track_info_init_sized(&ti, sizeof(ti));
+        ti.media_type = MOQ_MEDIA_TYPE_VIDEO;
+        ti.packaging = MOQ_MEDIA_PACKAGING_LOCMAF;
+        ti.timescale = 90000;
+        ti.transport_version = MOQ_VERSION_DRAFT_22;
+        cfg.companion_profile = MOQ_MEDIA_COMPANION_D22_MSF01_LOC05_PUBLIC;
+        CHECK(moq_media_object_parse_sized(&ti, &oi, &cfg, NULL, 0, &po,
+                                           sizeof(po), NULL) == MOQ_ERR_UNSUPPORTED);
+        moq_rcbuf_decref(p);
+        moq_media_object_input_init(&oi);
+        oi.status = MOQ_OBJECT_END_OF_GROUP;
+        CHECK(moq_media_object_parse_sized(&ti, &oi, &cfg, NULL, 0, &po,
+                                           sizeof(po), NULL) == MOQ_ERR_UNSUPPORTED);
+    }
+
     /* ================================================================ */
     /*  CMAF tests                                                     */
     /* ================================================================ */

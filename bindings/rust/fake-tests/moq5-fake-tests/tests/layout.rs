@@ -1,7 +1,9 @@
 //! The generated types against the C compiler's view of the same headers:
 //! sizeof, alignof and offsetof for every record the safe crate reads or
 //! writes (with the `player` feature, the player's records and the fields of
-//! their unions' members), and the frozen v0 floors and restated constants.
+//! their unions' members; with the `locmaf` feature, the LOCMAF records
+//! moq5-media reads, writes or allocates), and the frozen v0 floors and
+//! restated constants.
 
 use std::collections::BTreeMap;
 use std::ffi::CStr;
@@ -162,7 +164,9 @@ fn rust_side() -> BTreeMap<String, Entry> {
             reorder_refused, tracks_malformed, catalog_revision, _reserved_catalog_revision,
             objects_decompressed, decompress_failures, decompress_limited, compression_refused,
             compression_conflicts, compression_ignored, event_timeline_headers_ignored,
-            loc_order_gaps, loc_order_forced,
+            loc_order_gaps, loc_order_forced, locmaf_objects_rebuilt,
+            locmaf_objects_undecodable, locmaf_objects_expired, locmaf_objects_late,
+            locmaf_groups_evicted, locmaf_resets,
         }
         moq_location_filter_cfg_t {
             struct_size, kind, relative_group_offset, start_group, start_object, end_group,
@@ -202,6 +206,7 @@ fn rust_side() -> BTreeMap<String, Entry> {
             has_key_id, key_id, has_track_base_key, track_base_key, has_depends,
             depends_render_groups, depends_render_group_count, malformed,
         }
+        moq_msf_locmaf_t { struct_size, has_version, version, malformed }
         moq_loc_metadata_t {
             struct_size, present, timestamp, timescale, marking_len, marking, audio_level,
             reserved, video_config, audio_config,
@@ -214,6 +219,8 @@ fn rust_side() -> BTreeMap<String, Entry> {
     };
     #[cfg(feature = "player")]
     player_side(&mut v);
+    #[cfg(feature = "locmaf")]
+    locmaf_side(&mut v);
     for (name, value) in [
         ("MOQ_ENDPOINT_CFG_V0_SIZE", sys::MOQ_ENDPOINT_CFG_V0_SIZE),
         (
@@ -318,6 +325,16 @@ fn rust_side() -> BTreeMap<String, Entry> {
             "MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE",
             sys::MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE,
         ),
+        ("MOQ_MSF_LOCMAF_V0_SIZE", sys::MOQ_MSF_LOCMAF_V0_SIZE),
+        ("MOQ_MSF_EXT_LOCMAF", sys::MOQ_MSF_EXT_LOCMAF as usize),
+        (
+            "MOQ_MSF_LOCMAF_F_VERSION",
+            sys::MOQ_MSF_LOCMAF_F_VERSION as usize,
+        ),
+        (
+            "MOQ_MEDIA_PACKAGING_LOCMAF",
+            sys::MOQ_MEDIA_PACKAGING_LOCMAF as usize,
+        ),
         ("MOQ_LOC_METADATA_V0_SIZE", sys::MOQ_LOC_METADATA_V0_SIZE),
         ("MOQ_LOC_EXT_V0_SIZE", sys::MOQ_LOC_EXT_V0_SIZE),
         ("MOQ_MSF_MPEG2TS_V0_SIZE", sys::MOQ_MSF_MPEG2TS_V0_SIZE),
@@ -366,6 +383,88 @@ fn rust_side() -> BTreeMap<String, Entry> {
         v.insert(name.into(), Entry::Value(value));
     }
     v
+}
+
+/// The LOCMAF records, the opaque decoder and encoder states by size and
+/// alignment alone, and their floors and constants.
+#[cfg(feature = "locmaf")]
+fn locmaf_side(v: &mut BTreeMap<String, Entry>) {
+    v.extend(layout! {
+        moq_locmaf_track_t {
+            struct_size, track_id, trex_default_sample_description_index,
+            trex_default_sample_duration, trex_default_sample_size, trex_default_sample_flags,
+            is_protected, default_per_sample_iv_size, _reserved,
+        }
+        moq_locmaf_gen_box_t { type_, _reserved, payload }
+        moq_locmaf_sample_t {
+            duration, size, flags, subsample_count, composition_offset, offset,
+            subsample_index, _reserved,
+        }
+        moq_locmaf_subsample_t { clear_bytes, protected_bytes }
+        moq_locmaf_chunk_t {
+            struct_size, kind, base_media_decode_time, sample_description_index, sample_count,
+            samples, per_sample_iv_size, has_aux_info, has_subsamples, _reserved, ivs,
+            subsamples, subsample_total, gen_boxes, gen_box_count, mdat_payload, raw_boxes,
+        }
+        moq_locmaf_decoder_cfg_t {
+            struct_size, max_samples, max_subsamples, max_gen_boxes, track, storage,
+            storage_size,
+        }
+        moq_locmaf_decoder_stats_t {
+            struct_size, last_reason, objects_decoded, full_headers_decoded,
+            delta_headers_decoded, raw_boxes_decoded, objects_unreferenced, objects_malformed,
+            objects_limited, references_discarded, unknown_fields_skipped, objects_unsupported,
+        }
+        moq_locmaf_encoder_cfg_t {
+            struct_size, max_samples, max_subsamples, max_gen_boxes, track, storage,
+            storage_size,
+        }
+        moq_locmaf_encoder_stats_t {
+            struct_size, last_reason, chunks_encoded, full_headers_written,
+            delta_headers_written, raw_boxes_written, chunks_refused, stages_committed,
+            stages_replaced,
+        }
+        moq_locmaf_decoder_t {}
+        moq_locmaf_encoder_t {}
+    });
+    for (name, value) in [
+        ("MOQ_LOCMAF_TRACK_V0_SIZE", sys::MOQ_LOCMAF_TRACK_V0_SIZE),
+        ("MOQ_LOCMAF_CHUNK_V0_SIZE", sys::MOQ_LOCMAF_CHUNK_V0_SIZE),
+        (
+            "MOQ_LOCMAF_DECODER_CFG_V0_SIZE",
+            sys::MOQ_LOCMAF_DECODER_CFG_V0_SIZE,
+        ),
+        (
+            "MOQ_LOCMAF_DECODER_STATS_V0_SIZE",
+            sys::MOQ_LOCMAF_DECODER_STATS_V0_SIZE,
+        ),
+        (
+            "MOQ_LOCMAF_ENCODER_CFG_V0_SIZE",
+            sys::MOQ_LOCMAF_ENCODER_CFG_V0_SIZE,
+        ),
+        (
+            "MOQ_LOCMAF_ENCODER_STATS_V0_SIZE",
+            sys::MOQ_LOCMAF_ENCODER_STATS_V0_SIZE,
+        ),
+        (
+            "MOQ_LOCMAF_STORAGE_ALIGN",
+            sys::MOQ_LOCMAF_STORAGE_ALIGN as usize,
+        ),
+        (
+            "MOQ_LOCMAF_OBJECT_FULL",
+            sys::MOQ_LOCMAF_OBJECT_FULL as usize,
+        ),
+        (
+            "MOQ_LOCMAF_OBJECT_DELTA",
+            sys::MOQ_LOCMAF_OBJECT_DELTA as usize,
+        ),
+        (
+            "MOQ_LOCMAF_OBJECT_RAW_BOXES",
+            sys::MOQ_LOCMAF_OBJECT_RAW_BOXES as usize,
+        ),
+    ] {
+        v.insert(name.into(), Entry::Value(value));
+    }
 }
 
 /// The player's records, its union members' fields named
@@ -610,6 +709,10 @@ fn the_floors_lie_within_the_records() {
     assert_eq!(
         sys::MOQ_MSF_TRACK_SUPPLEMENT_V0_SIZE,
         offset_of!(sys::moq_msf_track_supplement_t, malformed) + size_of::<u32>()
+    );
+    assert_eq!(
+        sys::MOQ_MSF_LOCMAF_V0_SIZE,
+        offset_of!(sys::moq_msf_locmaf_t, malformed) + size_of::<u32>()
     );
 }
 

@@ -2,13 +2,14 @@
 //! their bindings.
 //!
 //! The tiers are additive features: none (the core, with the publisher and
-//! subscriber facades), `sim`, `media`, `service` (which implies `media`)
-//! and `player` (which implies `service`). Cargo unifies features across the
-//! graph, so this script builds the union, from one source: the installed
-//! SDK, found through pkg-config. There is no other source and no fallback:
-//! each tier links through its own package (`libmoq-core`, `libmoq-sim`,
-//! `libmoq-media`, or `libmoq-service`, whose `Requires` closure carries the
-//! core, the media parsers and the managed providers the SDK expresses
+//! subscriber facades), `sim`, `media`, `locmaf` (which implies `media`),
+//! `service` (which implies `media`) and `player` (which implies `service`).
+//! Cargo unifies features across the graph, so this script builds the
+//! union, from one source: the installed SDK, found through pkg-config.
+//! There is no other source and no fallback: each tier links through its
+//! own package (`libmoq-core`, `libmoq-sim`, `libmoq-media`,
+//! `libmoq-locmaf`, or `libmoq-service`, whose `Requires` closure carries
+//! the core, the media parsers and the managed providers the SDK expresses
 //! through pkg-config), every package the graph needs must resolve, and all
 //! of them from one SDK. `libmoq.pc` is never probed for a lower tier: it
 //! names every component the SDK was built with, adapters included. The
@@ -22,7 +23,8 @@
 //!   search variable the probe reads (`PKG_CONFIG_PATH`, or the host-specific
 //!   spelling of it when one is set).
 //! - `LIBMOQ_CORE_STATIC`, `LIBMOQ_SIM_STATIC`, `LIBMOQ_MEDIA_STATIC`,
-//!   `LIBMOQ_SERVICE_STATIC` (each with its `_DYNAMIC` form) and the
+//!   `LIBMOQ_LOCMAF_STATIC`, `LIBMOQ_SERVICE_STATIC` (each with its
+//!   `_DYNAMIC` form) and the
 //!   `PKG_CONFIG_ALL_*` forms: the `pkg-config` crate's own static/shared
 //!   selection for each probe. Unset, the installed libraries decide.
 //! - `BINDGEN_EXTRA_CLANG_ARGS`: extra arguments for libclang, for instance

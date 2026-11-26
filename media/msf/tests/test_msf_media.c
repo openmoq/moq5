@@ -1207,6 +1207,124 @@ int main(void)
         if (b64.buf) moq_rcbuf_decref(b64.buf);
     }
 
+    /* -- LOCMAF (draft-einarsson-moq-locmaf-01): the version gates the
+     *    mapping; the header is a CMAF Header, parsed as for "cmaf". */
+    {
+        static const uint32_t trex4[4] = { 1, 1024, 0, 0x02000000u };
+        uint8_t init_raw[512];
+        size_t init_len = moq_test_build_cmaf_init_trex(init_raw, 1, 48000, trex4, 1, true);
+        b64_result_t b64 = encode_b64(alloc, init_raw, init_len);
+        CHECK(b64.buf != NULL);
+        moq_msf_locmaf_t rec;
+        moq_msf_locmaf_init(&rec);
+        rec.has_version = true;
+        rec.version = lit(MOQ_MSF_LOCMAF_VERSION);
+        moq_msf_track_ext_t ext = { .kind = MOQ_MSF_EXT_LOCMAF, .u = { .locmaf = &rec } };
+        moq_msf_track_t t;
+        memset(&t, 0, sizeof(t));
+        t.struct_size = sizeof(t);
+        t.name = lit("video");
+        t.packaging = lit("locmaf");
+        t.is_live = true;
+        t.has_role = true;
+        t.role = lit("video");
+        t.has_codec = true;
+        t.codec = lit("avc1.64001e");
+        t.has_init_data = true;
+        t.init_data = b64.bytes;
+        t.extensions = &ext;
+        t.extension_count = 1;
+
+        /* "0.3": LOCMAF, the CMAF timescale and the whole header record. */
+        moq_media_track_info_t info;
+        moq_cmaf_init_info_t cinit;
+        moq_rcbuf_t *init_buf = NULL;
+        CHECK(map(alloc, &t, &info, &cinit, &init_buf) == MOQ_OK);
+        CHECK_EQ_U32(info.packaging, MOQ_MEDIA_PACKAGING_LOCMAF);
+        CHECK_EQ_INT(info.media_type, MOQ_MEDIA_TYPE_VIDEO);
+        CHECK_EQ_U32(info.timescale, 48000);
+        CHECK(init_buf != NULL);
+        CHECK_EQ_U32(cinit.struct_size, (uint32_t)sizeof(cinit));
+        CHECK(cinit.trak_count == 1 && cinit.has_trex);
+        CHECK_EQ_U32(cinit.trex_default_sample_duration, 1024);
+        CHECK_EQ_U32(cinit.trex_default_sample_flags, 0x02000000u);
+        if (init_buf) moq_rcbuf_decref(init_buf);
+        /* Without out_init: the timescale still comes from the header. */
+        CHECK(map(alloc, &t, &info, NULL, NULL) == MOQ_OK);
+        CHECK_EQ_U32(info.packaging, MOQ_MEDIA_PACKAGING_LOCMAF);
+        CHECK_EQ_U32(info.timescale, 48000);
+
+        /* A version this build does not implement: UNSUPPORTED, and nothing
+         * derived beyond the session's draft. */
+        rec.version = lit("0.4");
+        memset(&info, 0xAB, sizeof(info));
+        init_buf = NULL;
+        CHECK(map(alloc, &t, &info, &cinit, &init_buf) == MOQ_ERR_UNSUPPORTED);
+        CHECK(init_buf == NULL);
+        CHECK_EQ_U32(info.struct_size, (uint32_t)sizeof(info));
+        CHECK_EQ_U32(info.packaging, 0);
+        CHECK_EQ_INT((int)info.media_type, 0);
+        CHECK_EQ_U32(info.timescale, 0);
+        CHECK_EQ_U32(info.transport_version, MOQ_VERSION_DRAFT_16);
+        CHECK_EQ_U32(cinit.struct_size, (uint32_t)sizeof(cinit));
+        CHECK(!cinit.has_trex && cinit.codec_config.len == 0);
+
+        /* Missing, malformed or empty: the track breaks the catalog rules. */
+        rec.version = lit("");
+        CHECK(map(alloc, &t, &info, NULL, NULL) == MOQ_ERR_INVAL);
+        rec.version = lit(MOQ_MSF_LOCMAF_VERSION);
+        rec.malformed = MOQ_MSF_LOCMAF_F_VERSION;
+        CHECK(map(alloc, &t, &info, NULL, NULL) == MOQ_ERR_INVAL);
+        rec.malformed = 0;
+        t.extensions = NULL;
+        t.extension_count = 0;
+        CHECK(map(alloc, &t, &info, NULL, NULL) == MOQ_ERR_INVAL);
+        t.extensions = &ext;
+        t.extension_count = 1;
+
+        /* A locmaf track without a header asking for its record: as CMAF. */
+        t.has_init_data = false;
+        CHECK(map(alloc, &t, &info, &cinit, &init_buf) == MOQ_ERR_INVAL);
+        t.has_timescale = true;
+        t.timescale = 90000;
+        CHECK(map(alloc, &t, &info, NULL, NULL) == MOQ_OK);
+        CHECK_EQ_U32(info.packaging, MOQ_MEDIA_PACKAGING_LOCMAF);
+        CHECK_EQ_U32(info.timescale, 90000);
+        t.has_timescale = false;
+        t.has_init_data = true;
+
+        /* msf_media_init_extent_matrix, for a locmaf track: the record by
+         * whole capability extent. */
+        const size_t full = sizeof(moq_cmaf_init_info_t);
+        const size_t ext_sizes[] = { MOQ_CMAF_INIT_INFO_V0_SIZE,
+                                     MOQ_CMAF_INIT_INFO_SIZE_THROUGH_SAMPLE_ENTRY,
+                                     MOQ_CMAF_INIT_INFO_SIZE_THROUGH_RESERVED,
+                                     MOQ_CMAF_INIT_INFO_SIZE_THROUGH_CONSTANT_IV, full };
+        for (size_t size = MOQ_CMAF_INIT_INFO_V0_SIZE; b64.buf && size <= full + 8; size++) {
+            union {
+                moq_cmaf_init_info_t rec;
+                unsigned char raw[sizeof(moq_cmaf_init_info_t) + 16];
+            } out;
+            memset(out.raw, 0xA5, sizeof(out.raw));
+            init_buf = NULL;
+            moq_result_t rc = moq_msf_track_to_media_info_sized(
+                alloc, &t, &info, sizeof(info), MOQ_VERSION_DRAFT_22,
+                &out.rec, size, &init_buf);
+            CHECK(rc == MOQ_OK);
+            size_t want = MOQ_CMAF_INIT_INFO_V0_SIZE;
+            for (size_t e = 0; e < sizeof(ext_sizes) / sizeof(ext_sizes[0]); e++)
+                if (ext_sizes[e] <= size) want = ext_sizes[e];
+            size_t cleared = size < full ? size : full;
+            CHECK_EQ_U32(out.rec.struct_size, (uint32_t)want);
+            bool clean = true;
+            for (size_t i = want; i < cleared; i++) clean &= out.raw[i] == 0;
+            for (size_t i = cleared; i < sizeof(out.raw); i++) clean &= out.raw[i] == 0xA5;
+            CHECK(clean);
+            if (init_buf) moq_rcbuf_decref(init_buf);
+        }
+        if (b64.buf) moq_rcbuf_decref(b64.buf);
+    }
+
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

@@ -349,6 +349,30 @@ internal class PublicReceiverObjectTest : EngineFixture() {
         }
 
     @Test
+    fun `a LOCMAF track keeps its packaging kind and its objects arrive as CMAF`() =
+        runTest {
+            val backend = newBackend()
+            val endpoint = MoqEndpoint.open(EndpointConfig(URL)) { backend }
+            val receiver = endpoint.attachReceiver(CONFIG)
+            val locmaf = VIDEO.copy(packaging = MediaBytes("locmaf".toByteArray()), packagingKind = PackagingKind.Locmaf)
+            backend.scriptTrackEvents(added(T1, locmaf), ready)
+            backend.markActivity()
+            val track = withTimeout(BOUND) { receiver.inventory.first { it.catalogReady } }.tracks[0]
+            assertEquals(PackagingKind.Locmaf, track.description.packagingKind)
+            assertEquals(MediaBytes("locmaf".toByteArray()), track.description.packaging)
+            // The service rebuilds each Object as a canonical CMAF chunk.
+            val fragment = MediaBytes("moof....mdatMEDIA".toByteArray())
+            val chunk = raw(T1, "").copy(payload = MediaPayload.Cmaf(fragment = fragment, mdat = ByteRange(offset = 12, length = 5), samples = listOf(CmafSample(durationTicks = 1024u, sizeBytes = 5u, flags = 0x02000000u, compositionOffsetTicks = 0))))
+            backend.scriptObjects(chunk)
+            val o = withTimeout(BOUND) { receiver.objects.next() }!!
+            assertTrue(o.track === track, "the object names the LOCMAF track")
+            val cp = o.payload as MediaPayload.Cmaf
+            assertEquals(fragment, cp.fragment)
+            assertEquals("MEDIA", String(o.mediaBytes().bytes()))
+            endpoint.closeAndJoin()
+        }
+
+    @Test
     fun `a bridge answer on the object poll quarantines the endpoint and is not a receiver terminal`() =
         runTest {
             val backend = newBackend()

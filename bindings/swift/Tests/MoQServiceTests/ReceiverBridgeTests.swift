@@ -137,6 +137,32 @@ struct TrackDescriptionCopyTests {
     }
 
     @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
+    @Test("A LOCMAF track is a CMAF track: the service delivers its Objects as CMAF")
+    func locmafIsCMAF() {
+        let arena = CBytesArena()
+        var desc = moq_media_track_desc_t()
+        desc.name = arena.bytes("video")
+        desc.packaging = arena.bytes("locmaf")
+        desc.info.media_type = MOQ_MEDIA_TYPE_VIDEO
+        desc.info.packaging = MOQ_MEDIA_PACKAGING_LOCMAF
+        desc.info.timescale = 90_000
+        let copy = withExtendedLifetime(arena) { copyTrackDescription(desc) }
+        #expect(copy?.packaging == .cmaf)
+
+        /* Its Objects are canonical CMAF chunks: the fragment and its mdat. */
+        var object = moq_media_object_t()
+        object.packaging = MOQ_MEDIA_PACKAGING_CMAF
+        object.fragment = arena.bytes("moofHEADmdatDATA")
+        object.mdat_offset = 12
+        object.mdat_len = 4
+        let (media, fragment) = withExtendedLifetime(arena) {
+            copyObjectPayload(object)
+        }
+        #expect(fragment == Data("moofHEADmdatDATA".utf8))
+        #expect(media == Data("DATA".utf8))
+    }
+
+    @available(macOS 13.0, iOS 16.0, tvOS 16.0, watchOS 9.0, *)
     @Test("Non-media tracks (timeline et al.) are outside the v1 model")
     func nonMediaSkipped() {
         /* A zeroed desc models a timeline/unknown track: the C enum has no

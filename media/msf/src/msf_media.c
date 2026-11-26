@@ -166,6 +166,16 @@ moq_result_t moq_msf_track_to_media_info_sized(
     if (bytes_eq(track->packaging, "mpeg2ts"))
         return msf_mpeg2ts_to_media_info(alloc, track, out_info, out_init_buf);
 
+    /* draft-einarsson-moq-locmaf-01 section 5: a receiver MUST NOT subscribe
+     * to a version it does not support, so nothing is derived for one. A
+     * missing or malformed version is a track the catalog rules reject. */
+    bool locmaf = bytes_eq(track->packaging, "locmaf");
+    if (locmaf) {
+        moq_result_t vrc = moq_msf_track_locmaf_check(track, NULL);
+        if (vrc == MOQ_ERR_UNSUPPORTED) return MOQ_ERR_UNSUPPORTED;
+        if (vrc != MOQ_OK) return MOQ_ERR_INVAL;
+    }
+
     /* Map media type. role is OPTIONAL (MSF-01 §5.2.6) and custom roles are
      * allowed, so role alone cannot gate media classification:
      *   - "video"/"audio"            -> that media type;
@@ -189,13 +199,18 @@ moq_result_t moq_msf_track_to_media_info_sized(
     /* Map packaging. */
     if (bytes_eq(track->packaging, "cmaf"))
         out_info->packaging = MOQ_MEDIA_PACKAGING_CMAF;
+    else if (locmaf)
+        out_info->packaging = MOQ_MEDIA_PACKAGING_LOCMAF;
     else if (bytes_eq(track->packaging, "loc"))
         out_info->packaging = MOQ_MEDIA_PACKAGING_RAW;
     else
         return MOQ_ERR_INVAL;
 
-    /* Derive timescale. */
-    if (out_info->packaging == MOQ_MEDIA_PACKAGING_CMAF) {
+    /* Derive timescale. A LOCMAF track's header is a CMAF Header, carried
+     * and parsed exactly as for "cmaf" (draft-einarsson-moq-locmaf-01
+     * section 6). */
+    if (out_info->packaging == MOQ_MEDIA_PACKAGING_CMAF ||
+        out_info->packaging == MOQ_MEDIA_PACKAGING_LOCMAF) {
         bool has_init = (track->has_init_data && track->init_data.len > 0);
 
         if (has_init) {

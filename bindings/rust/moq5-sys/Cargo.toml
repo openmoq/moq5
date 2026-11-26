@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-description = "Raw FFI bindings to libmoq (MOQ5), by tier: core, simulator, media, service, player"
+description = "Raw FFI bindings to libmoq (MOQ5), by tier: core, simulator, media, LOCMAF, service, player"
 repository = "https://github.com/openmoq/moq5"
 readme = "README.md"
 keywords = ["moq", "media-over-quic", "ffi", "bindings"]
@@ -22,6 +22,9 @@ publish = false
 sim = []
 # The media parsers: LOC, CMAF, media object and MSF (libmoq-media.pc).
 media = []
+# The LOCMAF encoder and decoder (locmaf.h, libmoq-locmaf.pc; an SDK built
+# with MOQ_BUILD_LOCMAF=ON), over the media tier's CMAF records.
+locmaf = ["media"]
 # The managed endpoint, media sender and media receiver (libmoq-service.pc,
 # whose closure brings the core and the media libraries).
 service = ["media"]
@@ -56,6 +59,6 @@ shlex = "2"
 # to those; docs.rs's default set includes 32-bit targets the snapshot's
 # layout assertions would not compile on. Every tier's snapshot is
 # documented.
-features = ["sim", "player"]
+features = ["sim", "locmaf", "player"]
 default-target = "x86_64-unknown-linux-gnu"
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]

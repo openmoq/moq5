@@ -8,6 +8,8 @@
 //! - `sim`: the deterministic simulator (`sim.h`; an SDK built with
 //!   `MOQ_BUILD_SIM=ON`);
 //! - `media`: the LOC, CMAF, media-object and MSF parsers;
+//! - `locmaf` (implies `media`): the LOCMAF encoder and decoder (`locmaf.h`;
+//!   an SDK built with `MOQ_BUILD_LOCMAF=ON`);
 //! - `service` (implies `media`): the managed endpoint, media sender and
 //!   media receiver;
 //! - `player` (implies `service`): the media player and the playback engine
@@ -33,6 +35,14 @@
     doc = include_str!(concat!(env!("OUT_DIR"), "/preambles_media.md"))
 )]
 #![cfg_attr(all(docsrs, feature = "media"), doc = include_str!("../docs/preambles_media.md"))]
+#![cfg_attr(
+    all(not(docsrs), feature = "locmaf"),
+    doc = include_str!(concat!(env!("OUT_DIR"), "/preambles_locmaf.md"))
+)]
+#![cfg_attr(
+    all(docsrs, feature = "locmaf"),
+    doc = include_str!("../docs/preambles_locmaf.md")
+)]
 #![cfg_attr(
     all(not(docsrs), feature = "service"),
     doc = include_str!(concat!(env!("OUT_DIR"), "/preambles_service.md"))
@@ -70,6 +80,12 @@ include!(concat!(env!("OUT_DIR"), "/bindings_media.rs"));
 
 #[cfg(all(docsrs, feature = "media"))]
 include!("../docs/bindings_media.rs");
+
+#[cfg(all(not(docsrs), feature = "locmaf"))]
+include!(concat!(env!("OUT_DIR"), "/bindings_locmaf.rs"));
+
+#[cfg(all(docsrs, feature = "locmaf"))]
+include!("../docs/bindings_locmaf.rs");
 
 #[cfg(all(not(docsrs), feature = "service"))]
 include!(concat!(env!("OUT_DIR"), "/bindings_service.rs"));

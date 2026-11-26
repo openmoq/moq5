@@ -150,6 +150,9 @@ moq_result_t sender_check_extensions(const moq_media_track_cfg_t *cfg,
             *supp = e->u.supplement;
             continue;
         }
+        /* Every other kind is refused, MOQ_MSF_EXT_LOCMAF included: a
+         * LOCMAF track's record is the service's, written with the version
+         * this build encodes. */
         if (e->kind != MOQ_MSF_EXT_MPEG2TS) return MOQ_ERR_INVAL;
         if (*rec) return MOQ_ERR_INVAL;                   /* duplicate kind */
         const moq_msf_mpeg2ts_t *m = e->u.mpeg2ts;
@@ -172,14 +175,16 @@ moq_result_t sender_check_extensions(const moq_media_track_cfg_t *cfg,
 /* Deep-copy the checked records into one block -- the entries in kind
  * order, then each record with what it owns (the MPEG2TS record's SI PIDs
  * and names, the supplement's packagingMetadata) -- so the caller's buffers
- * need not outlive add_track. Every size is checked before the one
- * allocation, and nothing is changed on failure. */
+ * need not outlive add_track; a LOCMAF track's own record is added last.
+ * Every size is checked before the one allocation, and nothing is changed
+ * on failure. */
 moq_result_t sender_copy_extensions(moq_media_sender_t *s,
                                     moq_media_track_t *t,
                                     const moq_msf_mpeg2ts_t *src,
                                     const moq_msf_track_supplement_t *supp_src)
 {
-    size_t entries = (src ? 1u : 0u) + (supp_src ? 1u : 0u);
+    bool lm = t->packaging == MOQ_MEDIA_PACKAGING_LOCMAF;
+    size_t entries = (src ? 1u : 0u) + (supp_src ? 1u : 0u) + (lm ? 1u : 0u);
     if (entries == 0) return MOQ_OK;
     moq_msf_track_supplement_t supp;
     moq_bytes_t pm = { NULL, 0 };
@@ -203,6 +208,8 @@ moq_result_t sender_copy_extensions(moq_media_sender_t *s,
                           sender_align8(sizeof(moq_msf_track_supplement_t))) ||
          pm.len > SIZE_MAX - 8u ||
          !sender_sum_fits(&need, sender_align8(pm.len))))
+        return MOQ_ERR_INVAL;
+    if (lm && !sender_sum_fits(&need, sender_align8(sizeof(moq_msf_locmaf_t))))
         return MOQ_ERR_INVAL;
     uint8_t *blk = (uint8_t *)s->alloc.alloc(need, s->alloc.ctx);
     if (!blk) return MOQ_ERR_NOMEM;
@@ -261,6 +268,18 @@ moq_result_t sender_copy_extensions(moq_media_sender_t *s,
             supp.has_accessible_window_ms ? supp.accessible_window_ms : 0;
         list[k].kind = MOQ_MSF_EXT_SUPPLEMENT;
         list[k++].u.supplement = rec;
+    }
+    if (lm) {
+        /* draft-einarsson-moq-locmaf-01 section 5: the version this build
+         * encodes (static bytes). */
+        moq_msf_locmaf_t *rec = (moq_msf_locmaf_t *)(void *)(blk + off);
+        off += sender_align8(sizeof(*rec));
+        moq_msf_locmaf_init(rec);
+        rec->has_version = true;
+        rec->version = (moq_bytes_t){ (const uint8_t *)MOQ_MSF_LOCMAF_VERSION,
+                                      sizeof(MOQ_MSF_LOCMAF_VERSION) - 1u };
+        list[k].kind = MOQ_MSF_EXT_LOCMAF;
+        list[k++].u.locmaf = rec;
     }
     t->ext = list;
     t->ext_count = k;

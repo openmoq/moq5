@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use crate::locmaf_record::LocmafRecordRef;
 use crate::{ffi, sys};
 
 /// mpeg2tsMode (`moq_msf_mpeg2ts_mode_t`). A sender authors the four named
@@ -409,20 +410,24 @@ impl fmt::Debug for Mpeg2tsRecordRef<'_> {
 pub enum TrackExtension<'receiver> {
     /// The MPEG-TS record.
     Mpeg2ts(Mpeg2tsRecordRef<'receiver>),
-    /// A kind this crate does not read, or an MPEG-TS entry whose record is
+    /// The LOCMAF record (draft-einarsson-moq-locmaf-01 section 5).
+    Locmaf(LocmafRecordRef<'receiver>),
+    /// A kind this crate does not read, or a known entry whose record is
     /// missing or below its first published size.
     Other(u32),
 }
 
 impl<'receiver> TrackExtension<'receiver> {
-    /// Read one extension record: an MPEG-TS entry whose record is present
-    /// and covers the first published size is
-    /// [`TrackExtension::Mpeg2ts`], anything else its kind.
+    /// Read one extension record: an MPEG-TS or LOCMAF entry whose record
+    /// is present and covers its first published size is
+    /// [`TrackExtension::Mpeg2ts`] or [`TrackExtension::Locmaf`], anything
+    /// else its kind.
     ///
     /// # Safety
     /// For an MPEG-TS entry, `raw.u.mpeg2ts` must be null or point to a
     /// record valid for `'receiver` that meets
-    /// [`Mpeg2tsRecordRef::from_raw`]'s contract.
+    /// [`Mpeg2tsRecordRef::from_raw`]'s contract; for a LOCMAF entry,
+    /// `raw.u.locmaf` likewise, with [`LocmafRecordRef::from_raw`]'s.
     #[must_use]
     pub unsafe fn from_raw(raw: &'receiver sys::moq_msf_track_ext_t) -> TrackExtension<'receiver> {
         if raw.kind == sys::MOQ_MSF_EXT_MPEG2TS {
@@ -433,6 +438,15 @@ impl<'receiver> TrackExtension<'receiver> {
                 // contract by this function's.
                 if let Some(record) = unsafe { Mpeg2tsRecordRef::from_raw(record) } {
                     return TrackExtension::Mpeg2ts(record);
+                }
+            }
+        } else if raw.kind == sys::MOQ_MSF_EXT_LOCMAF {
+            // SAFETY: as for MPEG-TS, with the LOCMAF member.
+            if let Some(record) = unsafe { raw.u.locmaf.as_ref() } {
+                // SAFETY: the record meets LocmafRecordRef::from_raw's
+                // contract by this function's.
+                if let Some(record) = unsafe { LocmafRecordRef::from_raw(record) } {
+                    return TrackExtension::Locmaf(record);
                 }
             }
         }
@@ -506,5 +520,43 @@ mod tests {
         short.struct_size = 8;
         // SAFETY: as above.
         assert!(unsafe { Mpeg2tsRecordRef::from_raw(&short) }.is_none());
+    }
+
+    #[test]
+    fn a_locmaf_record_is_read_as_one() {
+        let version = b"0.3";
+        let record = sys::moq_msf_locmaf_t {
+            struct_size: std::mem::size_of::<sys::moq_msf_locmaf_t>() as u32,
+            has_version: true,
+            version: ffi::span(version),
+            malformed: 0,
+        };
+        let entry = sys::moq_msf_track_ext_t {
+            kind: sys::MOQ_MSF_EXT_LOCMAF,
+            u: sys::moq_msf_track_ext__bindgen_ty_1 { locmaf: &record },
+        };
+        // SAFETY: the entry's record and its span are locals alive here.
+        let extension = unsafe { TrackExtension::from_raw(&entry) };
+        assert!(
+            !matches!(extension, TrackExtension::Other(_)),
+            "{extension:?} is read as a LOCMAF record"
+        );
+        let TrackExtension::Locmaf(view) = extension else {
+            panic!("{extension:?} is the LOCMAF record");
+        };
+        assert_eq!(view.version(), Some(&version[..]));
+        // A null record is not read as one.
+        let null = sys::moq_msf_track_ext_t {
+            kind: sys::MOQ_MSF_EXT_LOCMAF,
+            u: sys::moq_msf_track_ext__bindgen_ty_1 {
+                locmaf: std::ptr::null(),
+            },
+        };
+        // SAFETY: a null record.
+        let extension = unsafe { TrackExtension::from_raw(&null) };
+        assert!(matches!(
+            extension,
+            TrackExtension::Other(kind) if kind == sys::MOQ_MSF_EXT_LOCMAF
+        ));
     }
 }

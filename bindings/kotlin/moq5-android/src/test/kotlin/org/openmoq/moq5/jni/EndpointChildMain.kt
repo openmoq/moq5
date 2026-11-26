@@ -3119,6 +3119,10 @@ internal object EndpointChildMain {
         untouched("add: short scalars", EndpointAbi.INVAL, tOut) { NativeBridge.nativeSenderAddTrack(root, tx, videoBytes("v"), LongArray(SendTrackScalars.COUNT - 1), tOut) }
         untouched("add: null out", EndpointAbi.INVAL, null) { NativeBridge.nativeSenderAddTrack(root, tx, videoBytes("v"), videoScalars(), null) }
         untouched("add: wrong root", EndpointAbi.REG_OWNER, tOut) { NativeBridge.nativeSenderAddTrack(other, tx, videoBytes("v"), videoScalars(), tOut) }
+        // A LOCMAF track passes the row's own checks: on a wrong root the
+        // refusal is the registry's, not a malformed carrier's INVAL.
+        val locmaf = videoScalars().also { it[SendTrackScalars.PACKAGING] = 4L }
+        untouched("add: a LOCMAF track reaches the registry", EndpointAbi.REG_OWNER, tOut) { NativeBridge.nativeSenderAddTrack(other, tx, videoBytes("l"), locmaf, tOut) }
         val v = addTrack(root, tx, "v")
         val probe = LongArray(SenderProbeScalars.COUNT - 1) { EndpointAbi.SENTINEL }
         untouched("probe: short block", EndpointAbi.INVAL, probe) { NativeBridge.nativeSenderProbe(root, tx, probe) }

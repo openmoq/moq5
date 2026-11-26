@@ -2,6 +2,9 @@
 #if __has_include(<moq/mpeg2ts.h>)
 #include <moq/mpeg2ts.h>
 #endif
+#ifdef MOQ_HAS_LOCMAF
+#include <moq/locmaf.hpp>
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -372,6 +375,31 @@ int main()
         CHECK(moq_mpeg2ts_receiver_push(&rx, 0, 0, 0, moq_bytes_t{pkt, 188},
                                         &res, sizeof(res)) == MOQ_OK, 95);
         CHECK(res.struct_size == sizeof(res) && res.accepted, 96);
+    }
+#endif
+
+#ifdef MOQ_HAS_LOCMAF
+    // -- LOCMAF wrappers: one full-header Object decoded, written as its
+    //    canonical CMAF chunk, and that chunk encoded back. ---------------
+    {
+        moq::locmaf::track t;
+        t.track_id = 1;
+        t.trex_default_sample_description_index = 1;
+        t.trex_default_sample_duration = 1024;
+        t.trex_default_sample_flags = 0x02000000u;
+        static const uint8_t object[] = {0x02, 0x04, 0x0A, 0x00, 0x0E, 0x01,
+                                         0xDE, 0xAD, 0xBE, 0xEF};
+        auto d = moq::locmaf::decoder::make(t);
+        CHECK(d.ok(), 100);
+        auto c = d->push(0, 0, moq::bytes_view(object, sizeof(object)));
+        CHECK(c.ok() && c->samples().size() == 1, 101);
+        auto chunk = moq::locmaf::write_cmaf(t, *c);
+        CHECK(chunk.ok() && chunk->size() == 104, 102);
+        auto e = moq::locmaf::encoder::make(t);
+        CHECK(e.ok(), 103);
+        auto o = e->encode_chunk(0, 0, moq::bytes_view(chunk->data(), chunk->size()));
+        CHECK(o.ok() && o->size() == sizeof(object) &&
+              std::memcmp(o->data(), object, sizeof(object)) == 0, 104);
     }
 #endif
 

@@ -330,6 +330,25 @@ class SendTrackConfigTests(SendTrackGatedBase):
         self.assertEqual(video["packaging"], int(moq5.Packaging.CMAF))
         self.assertEqual(video["media_type"], int(moq5.MediaType.VIDEO))
 
+    def test_b_locmaf_packaging_passes_through(self):
+        # The service does every LOCMAF refusal; the binding hands it the
+        # packaging value as it is, given as the member or its integer.
+        self.require_surface()
+        with self.connect() as endpoint:
+            sender = self.attach(endpoint)
+            try:
+                sender.add_track(self.video(packaging=moq5.Packaging.LOCMAF,
+                                            init_data=b"\x00moov"))
+                named = _native._test_send_track_config()
+                sender.add_track(self.video(name=b"v2", packaging=4,
+                                            init_data=b"\x00moov"))
+                numbered = _native._test_send_track_config()
+            finally:
+                sender.close()
+        self.assertEqual(named["packaging"], _native.constants["MEDIA_PACKAGING_LOCMAF"])
+        self.assertEqual(numbered["packaging"], 4)
+        self.assertIs(self.video(packaging=4).packaging, moq5.Packaging.LOCMAF)
+
     def test_c_values_above_thirty_two_bits_survive_intact(self):
         self.require_surface()
         # independently declared, not derived from any observation

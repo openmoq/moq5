@@ -104,4 +104,16 @@ if(MOQ_BUILD_TESTS)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_symbols_oracle.cmake)
         set_tests_properties(locmaf_export_oracle PROPERTIES TIMEOUT 90 LABELS "media;locmaf")
     endif()
+    # The installed package, found and linked by a cold CMake consumer.
+    if(MOQ_BUILD_PACKAGE_EXPORTS)
+        include("${PROJECT_SOURCE_DIR}/tests/cmake/ConsumerBuildContext.cmake")
+        set(locmaf_context "${CMAKE_CURRENT_BINARY_DIR}/consumer-context.cmake")
+        moq_write_consumer_context("${locmaf_context}")
+        add_test(NAME locmaf_consumer COMMAND ${CMAKE_COMMAND}
+            -DBUILD_DIR=${PROJECT_BINARY_DIR} -DCONTEXT=${locmaf_context}
+            -DCHECK_DIR=${CMAKE_CURRENT_BINARY_DIR}/cold-consumer
+            -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_consumer.cmake)
+        set_tests_properties(locmaf_consumer PROPERTIES TIMEOUT 90 LABELS "media;locmaf")
+    endif()
 endif()

@@ -337,6 +337,22 @@ class MediaObjectTests(unittest.TestCase):
         self.assertFalse(cmaf.is_status_only)
         self.assertIs(self.receiver.poll_object(), moq5.PollOutcome.EMPTY)
 
+    def test_a_locmaf_track_reads_locmaf_and_its_objects_read_cmaf(self):
+        # The service rebuilds a LOCMAF track's Objects as canonical CMAF:
+        # the description names the catalog packaging, the Objects CMAF.
+        a = self.track({**DESC, "packaging_text": b"locmaf", "packaging": 4})
+        _native._test_push_event(int(K.ADDED), a, None, None, None, None, None, None, None,
+                                 None, None, 0)
+        description = self.receiver.poll_track().description
+        self.assertIsInstance(description.packaging, moq5.Packaging)
+        self.assertIs(description.packaging, moq5.Packaging.LOCMAF)
+        self.assertEqual(int(moq5.Packaging.LOCMAF), _native.constants["MEDIA_PACKAGING_LOCMAF"])
+        self.assertEqual(description.packaging_text, b"locmaf")
+        self.push(a, CMAF)
+        cmaf = self.receiver.poll_object()
+        self.assertIs(cmaf.packaging, moq5.Packaging.CMAF)
+        self.assertEqual(cmaf, self.expected_cmaf(cmaf.track))
+
     def test_status_and_empty_payload_semantics_never_by_byte_length(self):
         a = self.track()
         self.push(a, {**RAW, "payload": b""})                                  # NORMAL with zero bytes: media

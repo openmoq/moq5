@@ -171,6 +171,21 @@ void moq_media_sender_test_refuse_reset(moq_media_sender_t *s, uint32_t n)
     pthread_mutex_unlock(&s->mu);
 }
 
+/* Call fn with every media Object's write before the facade: MOQ_OK lets
+ * the facade write it, any other result stands for the facade's without
+ * calling it. fn may take its own reference to ocfg->payload. NULL
+ * removes it. */
+void moq_media_sender_test_set_emit_hook(moq_media_sender_t *s,
+    moq_result_t (*fn)(void *ctx, const moq_pub_object_cfg_t *ocfg), void *ctx);
+void moq_media_sender_test_set_emit_hook(moq_media_sender_t *s,
+    moq_result_t (*fn)(void *ctx, const moq_pub_object_cfg_t *ocfg), void *ctx)
+{
+    pthread_mutex_lock(&s->mu);
+    s->test_emit_hook = fn;
+    s->test_emit_ctx = ctx;
+    pthread_mutex_unlock(&s->mu);
+}
+
 
 /* The owed-output answer the endpoint's drain reads after each pump. */
 bool moq_media_sender_test_has_pending_output(moq_media_sender_t *s);

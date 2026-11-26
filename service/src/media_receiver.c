@@ -30,6 +30,10 @@
 #ifdef MOQ_SERVICE_HAVE_MPEG2TS
 #include <moq/mpeg2ts.h>
 #endif
+#ifdef MOQ_SERVICE_HAVE_LOCMAF
+#include <moq/locmaf.h>
+#include "media_receiver_locmaf.h"
+#endif
 
 #include <assert.h>
 #include <errno.h>
@@ -263,6 +267,15 @@ _Static_assert(offsetof(moq_media_object_t, metadata) ==
     (offsetof(moq_media_receiver_stats_t, catalog_drops) + sizeof(uint64_t))
 #define MEDIA_RECEIVER_STATS_CATALOG_COMPLETE_SIZE \
     (offsetof(moq_media_receiver_stats_t, catalog_complete) + sizeof(bool))
+/* Where the LOCMAF block starts: the stats through loc_order_forced. */
+#define MEDIA_RECEIVER_STATS_LOCMAF_AT \
+    (offsetof(moq_media_receiver_stats_t, loc_order_forced) + sizeof(uint64_t))
+_Static_assert(offsetof(moq_media_receiver_stats_t, locmaf_objects_rebuilt) ==
+               MEDIA_RECEIVER_STATS_LOCMAF_AT,
+               "the LOCMAF counters follow loc_order_forced");
+_Static_assert(MOQ_MEDIA_RECEIVER_STATS_SIZE_THROUGH_LOCMAF ==
+               sizeof(moq_media_receiver_stats_t),
+               "the LOCMAF counters end the stats");
 #define MEDIA_SAP_RECORD_V0_SIZE \
     (offsetof(moq_media_sap_record_t, ept_ms) + sizeof(uint64_t))
 #define MEDIA_TIMELINE_RECORD_V0_SIZE \
@@ -354,6 +367,10 @@ struct moq_media_track {
     /* The join PSI (mpeg2ts_join_psi) went out with an Object of generation
      * ts_gen the application polled: no later Object of it carries it. */
     bool             ts_join_delivered;
+    /* LOCMAF (network thread): the live subscription's decoding stage
+     * (receiver_locmaf_t), allocated when the subscription is issued, which
+     * also starts a new ts_gen; NULL otherwise. */
+    void            *lm;
     receiver_track_options_t desired_options;
 
     /* Data path (network-thread state). */
@@ -663,6 +680,13 @@ typedef struct receiver_fill_dom {
      * and keys its loss records. */
     bool ts;
     uint32_t st_owed;              /* its RECEIVER_DROP records not yet polled */
+    /* A LOCMAF fill: Location-tracked as an MPEG2TS one is, and decoded by
+     * a decoder of its own (receiver_lm_dec_t, executor-owned), created at
+     * its first Object; lm_failed when that allocation failed, so its
+     * Objects are dropped. */
+    bool locmaf;
+    void *lm;
+    bool lm_failed;
 } receiver_fill_dom_t;
 
 struct moq_media_receiver {
@@ -891,6 +915,8 @@ typedef struct receiver_obj_entry {
 } receiver_obj_entry_t;
 
 static bool track_is_ts(const moq_media_track_t *t);
+static bool track_is_locmaf(const moq_media_track_t *t);
+static bool lm_holds_any(const moq_media_track_t *t);
 static void dom_ready_locked(moq_media_receiver_t *r, receiver_fill_dom_t *d);
 
 /* Release one queue entry's owned buffers (any thread that has exclusive
@@ -1046,7 +1072,8 @@ static void st_push_locked(moq_media_receiver_t *r,
     e->rec.struct_size = (uint32_t)sizeof(e->rec);
     e->barrier = r->st_collect ? r->intake_seq : r->ingress_seq;
     e->dom = dom;
-    e->ready = !track_is_ts(rec->track) && !rec->track->order;
+    e->ready = !track_is_ts(rec->track) && !rec->track->order &&
+               !lm_holds_any(rec->track);
     if (dom) r->fill_doms[dom - 1].st_owed++;
     r->st_tail++;
 }
@@ -1433,8 +1460,9 @@ static void dom_apply_carry(receiver_obj_entry_t *e)
 static void dom_note_loss_locked(moq_media_receiver_t *r, size_t idx,
                                  const receiver_loss_carry_t *c, uint32_t from)
 {
-    /* Only an MPEG2TS fill reports loss as Location-tracked gaps. */
-    if (!r->fill_doms[idx].ts) return;
+    /* Only an MPEG2TS or LOCMAF fill reports loss as Location-tracked
+     * gaps. */
+    if (!r->fill_doms[idx].ts && !r->fill_doms[idx].locmaf) return;
     for (uint32_t i = from; i != r->obj_tail; i++) {
         receiver_obj_entry_t *n = &r->objs[i % r->ring_cap];
         if (n->dom == idx + 1) {
@@ -1799,6 +1827,7 @@ static void receiver_gen_free(moq_media_receiver_t *r, receiver_desc_gen_t *g)
 }
 
 static void receiver_order_free(moq_media_receiver_t *r, moq_media_track_t *t);
+static void receiver_lm_free(moq_media_receiver_t *r, moq_media_track_t *t);
 
 static void receiver_track_free(moq_media_receiver_t *r, moq_media_track_t *t)
 {
@@ -1807,6 +1836,7 @@ static void receiver_track_free(moq_media_receiver_t *r, moq_media_track_t *t)
     receiver_cmd_auth_release(r, t);
     receiver_ts_free(r, t);
     receiver_order_free(r, t);
+    receiver_lm_free(r, t);
     while (t->gens) {
         receiver_desc_gen_t *g = t->gens;
         t->gens = g->next;
@@ -1855,7 +1885,8 @@ static size_t supplement_copy_size(const moq_msf_track_supplement_t *s)
 static bool ext_copied(const moq_msf_track_ext_t *e)
 {
     return (e->kind == MOQ_MSF_EXT_MPEG2TS && e->u.mpeg2ts) ||
-           (e->kind == MOQ_MSF_EXT_SUPPLEMENT && e->u.supplement);
+           (e->kind == MOQ_MSF_EXT_SUPPLEMENT && e->u.supplement) ||
+           (e->kind == MOQ_MSF_EXT_LOCMAF && e->u.locmaf);
 }
 
 /* The handle-owned size of a track's extension list (see
@@ -1872,6 +1903,10 @@ static size_t ext_copy_size(const moq_msf_track_t *mt)
         if (e->kind == MOQ_MSF_EXT_SUPPLEMENT) {
             add = supplement_copy_size(e->u.supplement);
             if (add == SIZE_MAX) return SIZE_MAX;
+        } else if (e->kind == MOQ_MSF_EXT_LOCMAF) {
+            const moq_msf_locmaf_t *lm = e->u.locmaf;
+            if (lm->version.len > SIZE_MAX / 4) return SIZE_MAX;
+            add = ext_align8(sizeof(moq_msf_locmaf_t)) + ext_align8(lm->version.len);
         } else {
             const moq_msf_mpeg2ts_t *ts = e->u.mpeg2ts;
             add = ext_align8(sizeof(moq_msf_mpeg2ts_t));
@@ -1897,8 +1932,9 @@ static moq_bytes_t ext_copy_span(uint8_t *blk, size_t *off, moq_bytes_t src)
     return out;
 }
 
-/* Deep-copy the records this receiver knows (MOQ_MSF_EXT_MPEG2TS and
- * MOQ_MSF_EXT_SUPPLEMENT) into one handle-owned block: the parsed record
+/* Deep-copy the records this receiver knows (MOQ_MSF_EXT_MPEG2TS,
+ * MOQ_MSF_EXT_SUPPLEMENT and MOQ_MSF_EXT_LOCMAF) into one handle-owned
+ * block: the parsed record
  * borrows the catalog DOM, which a later catalog replaces. The block is
  * ext_copy_size(mt) bytes, zeroed. */
 static void receiver_copy_extensions_to(uint8_t *blk, const moq_msf_track_t *mt,
@@ -1943,6 +1979,21 @@ static void receiver_copy_extensions_to(uint8_t *blk, const moq_msf_track_t *mt,
             }
             list[k].kind = MOQ_MSF_EXT_SUPPLEMENT;
             list[k].u.supplement = rec;
+            k++;
+            continue;
+        }
+        if (e->kind == MOQ_MSF_EXT_LOCMAF) {
+            const moq_msf_locmaf_t *src = e->u.locmaf;
+            moq_msf_locmaf_t *rec = (moq_msf_locmaf_t *)(void *)(blk + off);
+            off += ext_align8(sizeof(*rec));
+            moq_msf_locmaf_init(rec);
+            if (src->struct_size >= MOQ_MSF_LOCMAF_V0_SIZE) {
+                rec->has_version = src->has_version;
+                rec->malformed = src->malformed;
+                rec->version = ext_copy_span(blk, &off, src->version);
+            }
+            list[k].kind = MOQ_MSF_EXT_LOCMAF;
+            list[k].u.locmaf = rec;
             k++;
             continue;
         }
@@ -2062,13 +2113,15 @@ static moq_bytes_t receiver_resolved_init(const moq_media_receiver_t *r,
 }
 
 /* Whether a handle built from `mt` holds a parsed CMAF header record: a
- * "cmaf" track with init data to parse. Every other packaging keeps a NULL
- * desc.cmaf and pays nothing for it. */
+ * "cmaf" or "locmaf" track (whose header is a CMAF Header) with init data to
+ * parse. Every other packaging keeps a NULL desc.cmaf and pays nothing for
+ * it. */
 static bool receiver_track_holds_cmaf(const moq_media_receiver_t *r,
                                       const moq_msf_track_t *mt,
                                       const moq_msf_catalog_t *src)
 {
-    return span_eq_lit(mt->packaging, "cmaf", 4) &&
+    return (span_eq_lit(mt->packaging, "cmaf", 4) ||
+            span_eq_lit(mt->packaging, "locmaf", 6)) &&
            receiver_resolved_init(r, mt, src).len > 0;
 }
 
@@ -2083,7 +2136,22 @@ static bool receiver_parse_probe(const moq_media_receiver_t *r,
     moq_media_object_parse_cfg_t cfg = MOQ_MEDIA_OBJECT_PARSE_CFG_INIT;
     cfg.companion_profile = r->companion_profile;
     cfg.mpeg2ts_packet_size = receiver_ts_packet_size(desc);
-    return moq_media_object_parse_sized(&desc->info, &in, &cfg, NULL, 0,
+    moq_media_track_info_t info = desc->info;
+    if (info.packaging == MOQ_MEDIA_PACKAGING_LOCMAF) {
+        /* A LOCMAF track's Objects reach the parser as the canonical CMAF
+         * chunks they encode, decoded with the facts of its CMAF Header. */
+#ifdef MOQ_SERVICE_HAVE_LOCMAF
+        moq_locmaf_track_t facts;
+        moq_locmaf_track_init(&facts);
+        if (!desc->cmaf ||
+            moq_locmaf_track_from_cmaf(desc->cmaf, &facts, sizeof(facts)) != MOQ_OK)
+            return false;
+        info.packaging = MOQ_MEDIA_PACKAGING_CMAF;
+#else
+        return false;
+#endif
+    }
+    return moq_media_object_parse_sized(&info, &in, &cfg, NULL, 0,
                                         &out, sizeof(out), NULL) == MOQ_OK;
 }
 
@@ -2307,7 +2375,8 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
             /* The mapping reports decoder extradata in codec_config for every
              * packaging; only a CMAF header is a parsed record. */
             d->codec_config = parsed.codec_config;
-            if (holds_cmaf && d->info.packaging == MOQ_MEDIA_PACKAGING_CMAF) {
+            if (holds_cmaf && (d->info.packaging == MOQ_MEDIA_PACKAGING_CMAF ||
+                               d->info.packaging == MOQ_MEDIA_PACKAGING_LOCMAF)) {
                 moq_cmaf_init_info_t *rec =
                     (moq_cmaf_init_info_t *)(void *)t->desc_strings;
                 memcpy(rec, &parsed, sizeof(*rec));
@@ -2339,7 +2408,8 @@ static moq_media_track_t *receiver_track_build(moq_media_receiver_t *r,
             policy && irc == MOQ_OK && receiver_parse_probe(r, d);
     if (!t->has_ns_fields)
         t->has_media_path = t->has_path = false;
-    t->cmaf_track_id_check = r02 && d->cmaf && d->cmaf->track_id != 0;
+    t->cmaf_track_id_check = r02 && d->cmaf && d->cmaf->track_id != 0 &&
+                             d->info.packaging == MOQ_MEDIA_PACKAGING_CMAF;
     /* MSF-02 4.1.1: an "object" layout (or one not recognized) may deliver a
      * Group's Objects on separate streams, out of order; LOC playback takes
      * Object order as decode order, so such a track restores it. */
@@ -2424,6 +2494,15 @@ static bool ts_record_equal(const moq_msf_mpeg2ts_t *a,
     return a->malformed == b->malformed;
 }
 
+/* The LOCMAF records of two tracks (absent on both, or the same version
+ * and malformed bits). */
+static bool lm_record_equal(const moq_msf_locmaf_t *a, const moq_msf_locmaf_t *b)
+{
+    if (!a || !b) return a == b;
+    return a->has_version == b->has_version && a->malformed == b->malformed &&
+           span_eq(a->version, b->version);
+}
+
 static bool meta_equal_except_vod(const moq_msf_track_t *a,
                                   const moq_msf_track_t *b)
 {
@@ -2473,6 +2552,8 @@ static bool meta_equal_except_vod(const moq_msf_track_t *a,
         return false;
     /* The packaging-extension records belong to the tuple too. */
     if (!ts_record_equal(moq_msf_track_mpeg2ts(a), moq_msf_track_mpeg2ts(b)))
+        return false;
+    if (!lm_record_equal(moq_msf_track_locmaf(a), moq_msf_track_locmaf(b)))
         return false;
     return true;
 }
@@ -2597,6 +2678,7 @@ static track_change_t classify_r02(const moq_media_receiver_t *r,
         a->has_timescale != b->has_timescale || a->timescale != b->timescale ||
         a->has_samplerate != b->has_samplerate || a->samplerate != b->samplerate ||
         !ts_record_equal(moq_msf_track_mpeg2ts(a), moq_msf_track_mpeg2ts(b)) ||
+        !lm_record_equal(moq_msf_track_locmaf(a), moq_msf_track_locmaf(b)) ||
         moq_msf_track_stream_mapping(a) != moq_msf_track_stream_mapping(b) ||
         SUP_SPAN_DIFFERS(sa, sb, encryption_scheme))
         return TC_CRITICAL;
@@ -3018,6 +3100,7 @@ static void receiver_retire_removed(moq_media_receiver_t *r, moq_media_track_t *
                                      receiver_facade_drained(r));
     receiver_ts_free(r, t);
     receiver_order_free(r, t);
+    receiver_lm_free(r, t);
 }
 
 /* Adopt a candidate catalog in two phases (network thread).
@@ -3287,11 +3370,15 @@ static moq_result_t receiver_parse_media_object(
     size_t sample_cap, moq_media_parsed_object_t *parsed,
     moq_media_drop_reason_t *why)
 {
+    /* A LOCMAF track's Objects arrive here rebuilt as canonical CMAF. */
+    moq_media_track_info_t info = track->desc.info;
+    if (info.packaging == MOQ_MEDIA_PACKAGING_LOCMAF)
+        info.packaging = MOQ_MEDIA_PACKAGING_CMAF;
     /* The sized parser carries the draft-22 companion and an MPEG2TS track's
      * packet size; every other legacy track keeps the frozen-prefix parser. */
     bool d22 = receiver_companion_d22(r->companion_profile);
-    if (!d22 && track->desc.info.packaging != MOQ_MEDIA_PACKAGING_MPEG2TS)
-        return moq_media_object_parse(&track->desc.info, in, samples, sample_cap,
+    if (!d22 && info.packaging != MOQ_MEDIA_PACKAGING_MPEG2TS)
+        return moq_media_object_parse(&info, in, samples, sample_cap,
                                        parsed, why);
     moq_media_object_parse_cfg_t cfg = MOQ_MEDIA_OBJECT_PARSE_CFG_INIT;
     cfg.mpeg2ts_packet_size = receiver_ts_packet_size(&track->desc);
@@ -3312,7 +3399,7 @@ static moq_result_t receiver_parse_media_object(
         }
         cfg.catalog_codec = track->desc.codec;
     }
-    return moq_media_object_parse_sized(&track->desc.info, in, &cfg,
+    return moq_media_object_parse_sized(&info, in, &cfg,
                 samples, sample_cap, parsed, sizeof(*parsed), why);
 }
 
@@ -3328,6 +3415,14 @@ static void receiver_on_fill_ts_object(moq_media_receiver_t *r,
 static void receiver_on_fill_media_object(moq_media_receiver_t *r,
     moq_media_track_t *track, moq_sub_object_t *so, size_t dom,
     uint64_t initiating_request_id);
+static void receiver_on_fill_locmaf_object(moq_media_receiver_t *r,
+    moq_media_track_t *t, moq_sub_object_t *so, size_t dom,
+    uint64_t initiating_request_id, uint64_t now_us);
+static void receiver_on_fill_locmaf_undomained(moq_media_receiver_t *r,
+                                               moq_media_track_t *t,
+                                               moq_sub_object_t *so);
+static void lm_note_fill_created_locked(moq_media_track_t *track, uint32_t gen);
+static void lm_dom_free_locked(moq_media_receiver_t *r, receiver_fill_dom_t *d);
 static moq_result_t receiver_fill_ts_payload(moq_media_receiver_t *r,
     moq_media_track_t *t, bool join, const moq_rcbuf_t *payload,
     moq_rcbuf_t **out, uint32_t *psi_len);
@@ -4200,7 +4295,7 @@ static void receiver_fill_observe(moq_media_receiver_t *r,
          * fills take no record. Otherwise the gate held one free; were none
          * free, the fill would keep the immediate terminal of other tracks. */
         if (!r->catalog_ack_failed && track &&
-            (track_is_ts(track) || r->st_enabled) &&
+            (track_is_ts(track) || track_is_locmaf(track) || r->st_enabled) &&
             dom_find_locked(r, item->request) < 0) {
             receiver_fill_dom_t *d = NULL;
             for (size_t i = 0; i < RECEIVER_FILL_DOMS && !d; i++)
@@ -4213,6 +4308,8 @@ static void receiver_fill_observe(moq_media_receiver_t *r,
                 d->gen = track->ts_gen;
                 d->initiating_request_id = item->initiating_request_id;
                 d->ts = track_is_ts(track);
+                d->locmaf = track_is_locmaf(track);
+                if (d->locmaf) lm_note_fill_created_locked(track, d->gen);
             }
         }
         /* The receipt goes ahead of anything later of this child: its
@@ -4238,6 +4335,7 @@ static void receiver_fill_observe(moq_media_receiver_t *r,
             receiver_fill_dom_t *d = &r->fill_doms[dom];
             d->state = DOM_RETIRED;
             d->token = (moq_sub_fill_t){0};
+            lm_dom_free_locked(r, d);
             d->emit = !duplicate;
             d->reason = item->u.terminal.reason;
             d->error_domain = item->u.terminal.error_domain;
@@ -4336,6 +4434,11 @@ static void receiver_take_fill_item(moq_media_receiver_t *r,
             else if (dom >= 0 && track_is_ts(t))
                 receiver_on_fill_ts_object(r, t, &so, (size_t)dom,
                                            fi->initiating_request_id);
+            else if (dom >= 0 && track_is_locmaf(t))
+                receiver_on_fill_locmaf_object(r, t, &so, (size_t)dom,
+                                               fi->initiating_request_id, now_us);
+            else if (track_is_locmaf(t))
+                receiver_on_fill_locmaf_undomained(r, t, &so);
             else if (dom >= 0)
                 receiver_on_fill_media_object(r, t, &so, (size_t)dom,
                                               fi->initiating_request_id);
@@ -4436,6 +4539,7 @@ static void receiver_auth_fail(moq_media_receiver_t *r,
     if (t) {
         receiver_ts_free(r, t);
         receiver_order_free(r, t);
+        receiver_lm_free(r, t);
     }
     moq_media_auth_operation_notify(op, &r->auth_source, request, scope, t);
     moq_media_auth_operation_clear(op, &r->alloc);
@@ -4870,8 +4974,11 @@ static void receiver_loss_dropped_locked(moq_media_receiver_t *r,
  * drop -- the caller must NOT also call moq_sub_object_cleanup.
  *
  * `loss` is the Object's loss report when its track tracks Locations
- * (MPEG2TS), else NULL. `deliver` (owned, may be NULL) replaces the payload
- * the app receives -- the Object is still parsed from its own payload.
+ * (MPEG2TS, ordered LOC, LOCMAF), else NULL. `deliver` (owned, may be NULL)
+ * replaces the payload the app receives -- the Object is still parsed from
+ * its own payload -- unless `rebuilt`: then `deliver` is the Object itself
+ * (a LOCMAF Object's canonical CMAF chunk), parsed and queued in place of
+ * the received payload, which is released.
  * `delivery_origin` and `initiating_request_id` name the source of the whole
  * object: LIVE, or a FILL child and its initiating request. `dom` is the
  * fill record of a fill Object of an MPEG2TS track, else NULL. */
@@ -4890,19 +4997,22 @@ static void receiver_rebase_times(const moq_media_receiver_t *r,
         o->capture_time_us = o->capture_time_us > e ? o->capture_time_us - e : 0;
 }
 
-static void receiver_deliver_object(moq_media_receiver_t *r,
-                                    moq_media_track_t *track,
-                                    moq_sub_object_t *so,
-                                    const receiver_loss_t *loss,
-                                    moq_rcbuf_t *deliver,
-                                    uint32_t delivery_origin,
-                                    uint64_t initiating_request_id,
-                                    const receiver_dom_ref_t *dom,
-                                    const receiver_join_t *join)
+static void receiver_deliver_object_ex(moq_media_receiver_t *r,
+                                       moq_media_track_t *track,
+                                       moq_sub_object_t *so,
+                                       const receiver_loss_t *loss,
+                                       moq_rcbuf_t *deliver,
+                                       uint32_t delivery_origin,
+                                       uint64_t initiating_request_id,
+                                       const receiver_dom_ref_t *dom,
+                                       const receiver_join_t *join,
+                                       bool rebuilt)
 {
     moq_media_object_input_t in;
     moq_media_object_input_init(&in);
-    if (moq_media_object_input_from_sub_object(so, &in) != MOQ_OK) {
+    moq_result_t irc = moq_media_object_input_from_sub_object(so, &in);
+    if (rebuilt) in.payload = deliver;
+    if (irc != MOQ_OK) {
         receiver_note_parse_drop(r, track, MOQ_MEDIA_PARSE_DROP_MEDIA);
         pthread_mutex_lock(&r->mu);
         receiver_loss_dropped_locked(r, track, so, loss, dom);
@@ -5122,8 +5232,10 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
         if (rc == MOQ_OK && track_properties.len)
             rc = moq_rcbuf_create(&r->alloc, track_properties.data,
                                   track_properties.len, &track_copy);
-        if (rc == MOQ_OK && (iso_payload || iso_props))
+        if (rc == MOQ_OK && (iso_payload || iso_props)) {
             rc = moq_media_object_input_from_sub_object(so, &in);
+            if (rebuilt) in.payload = deliver;
+        }
         if (rc == MOQ_OK) {
             moq_media_parsed_object_t copied;
             moq_bytes_t bytes = { NULL, 0 };
@@ -5198,6 +5310,9 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
         o->gap_duration_known = loss->gap_duration_known;
         o->gap_duration_27mhz = loss->gap_duration_27mhz;
         o->discontinuous = loss->discontinuous;
+        /* A rebuilt chunk that holds a random access point ends the
+         * discontinuity its gap began. */
+        if (rebuilt && o->keyframe) o->discontinuous = false;
         if (track->ts_loss_pending && track->ts_loss_gen == track->ts_gen)
             loss_merge(o, track->ts_loss_group, track->ts_loss_object);
         track->ts_loss_pending = false;
@@ -5213,7 +5328,7 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
         e->gen = d->gen;
         e->dom = (uint8_t)(dom->idx + 1);
         e->pos = dom->pos;
-        if (d->ts) {
+        if (d->ts || d->locmaf) {
             o->has_loss_report = true;
             if (d->pending.causes) {
                 e->carry = d->pending;
@@ -5236,8 +5351,12 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
     }
     /* Steal the facade object's refs (no moq_sub_object_cleanup). A
      * replacement payload is what the app receives; the facade's own payload
-     * reference is then released. */
-    if (deliver) {
+     * reference is then released. A rebuilt Object was parsed from that
+     * replacement, so the parse placed it (a CMAF chunk is the fragment,
+     * and payload stays empty). */
+    if (rebuilt) {
+        o->payload_ref = deliver;
+    } else if (deliver) {
         o->payload = (moq_bytes_t){ moq_rcbuf_data(deliver),
                                     moq_rcbuf_len(deliver) };
         o->payload_ref = deliver;
@@ -5253,6 +5372,20 @@ static void receiver_deliver_object(moq_media_receiver_t *r,
     r->obj_tail++;
     pthread_mutex_unlock(&r->mu);
     if (deliver && so->payload) moq_rcbuf_decref(so->payload);
+}
+
+static void receiver_deliver_object(moq_media_receiver_t *r,
+                                    moq_media_track_t *track,
+                                    moq_sub_object_t *so,
+                                    const receiver_loss_t *loss,
+                                    moq_rcbuf_t *deliver,
+                                    uint32_t delivery_origin,
+                                    uint64_t initiating_request_id,
+                                    const receiver_dom_ref_t *dom,
+                                    const receiver_join_t *join)
+{
+    receiver_deliver_object_ex(r, track, so, loss, deliver, delivery_origin,
+                               initiating_request_id, dom, join, false);
 }
 
 /* A non-Location-tracked media object: drop it unparsed while its track is
@@ -6102,6 +6235,11 @@ static bool track_is_ts(const moq_media_track_t *t)
     return t->desc.info.packaging == MOQ_MEDIA_PACKAGING_MPEG2TS;
 }
 
+static bool track_is_locmaf(const moq_media_track_t *t)
+{
+    return t->desc.info.packaging == MOQ_MEDIA_PACKAGING_LOCMAF;
+}
+
 /* -- In-group ordering stage (network thread) ------------------------------ *
  * An MSF-02 "loc" track whose streamMapping is "object", or a value this
  * receiver does not recognize, restores (Group, Object) order on its live
@@ -6467,6 +6605,548 @@ static bool order_holds_before(const moq_media_track_t *t, uint64_t barrier)
     receiver_order_for_each(o->stage, order_barrier_probe, &b);
     return b.found;
 }
+
+/* -- LOCMAF intake (network thread) ------------------------------------------ *
+ * A LOCMAF track's live subscription is decoded by its stage
+ * (media_receiver_locmaf.h), created when the subscription is issued; each
+ * fill of it by a decoder of its own, created at the fill's first Object.
+ * What either decodes reaches the common queue as the canonical CMAF chunk,
+ * through the CMAF path, with the loss reports of a Location-tracked track:
+ * a dropped Object is a gap on the next Object of its delivery source. An
+ * Object the stage holds keeps its intake's lane slot until it is released,
+ * and a release that waits for lane room stalls intake as a reorder window
+ * does. */
+
+#ifdef MOQ_SERVICE_HAVE_LOCMAF
+typedef struct receiver_locmaf {
+    receiver_lm_t       *stage;
+    uint64_t             app_gen_seen;
+    bool                 fill_requested;  /* the subscription asked for a fill */
+    bool                 fill_seen;       /* a fill of it was created */
+    bool                 stalled;
+    receiver_lm_counts_t counted;         /* the stage's counts in the stats */
+} receiver_locmaf_t;
+
+/* Fold the stage's new counts into the stats. */
+static void lm_fold_counts(moq_media_receiver_t *r, receiver_locmaf_t *lm)
+{
+    receiver_lm_counts_t c = receiver_lm_counts(lm->stage);
+    receiver_lm_counts_t *p = &lm->counted;
+    if (c.rebuilt == p->rebuilt && c.undecodable == p->undecodable &&
+        c.expired == p->expired && c.late == p->late &&
+        c.groups_evicted == p->groups_evicted && c.resets == p->resets)
+        return;
+    pthread_mutex_lock(&r->mu);
+    moq_media_receiver_stats_t *st = &r->stats;
+    st->locmaf_objects_rebuilt = sat_add(st->locmaf_objects_rebuilt, c.rebuilt - p->rebuilt);
+    st->locmaf_objects_undecodable =
+        sat_add(st->locmaf_objects_undecodable, c.undecodable - p->undecodable);
+    st->locmaf_objects_expired = sat_add(st->locmaf_objects_expired, c.expired - p->expired);
+    st->locmaf_objects_late = sat_add(st->locmaf_objects_late, c.late - p->late);
+    st->locmaf_groups_evicted =
+        sat_add(st->locmaf_groups_evicted, c.groups_evicted - p->groups_evicted);
+    st->locmaf_resets = sat_add(st->locmaf_resets, c.resets - p->resets);
+    pthread_mutex_unlock(&r->mu);
+    *p = c;
+}
+
+static void lm_set_stalled(moq_media_receiver_t *r, receiver_locmaf_t *lm,
+                           bool stalled)
+{
+    pthread_mutex_lock(&r->mu);
+    if (stalled != lm->stalled) {
+        lm->stalled = stalled;
+        if (stalled) r->ts_stalled++;
+        else r->ts_stalled--;
+    }
+    if (stalled) {
+        r->ts_wake = true;
+        r->st_blocked = true;
+    }
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* An item the stage gives up without delivering: its lane slot returns. */
+static void lm_item_release(void *ctx, receiver_lm_item_t *it)
+{
+    moq_media_receiver_t *r = (moq_media_receiver_t *)ctx;
+    moq_sub_object_cleanup(&it->so);
+    if (it->held) ts_drop_slot(r);
+}
+
+/* Free a track's stage and what it holds, with the lane slots they kept,
+ * without delivering anything. */
+static void receiver_lm_free(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    receiver_locmaf_t *lm = (receiver_locmaf_t *)t->lm;
+    if (!lm) return;
+    lm_set_stalled(r, lm, false);
+    lm_fold_counts(r, lm);
+    receiver_lm_destroy(lm->stage, lm_item_release, r);
+    r->alloc.free(lm, sizeof(*lm), r->alloc.ctx);
+    t->lm = NULL;
+}
+
+/* The track facts its CMAF Header gives (the build's parse probe found
+ * them). */
+static bool lm_track_facts(const moq_media_track_t *t, moq_locmaf_track_t *facts)
+{
+    moq_locmaf_track_init(facts);
+    return t->desc.cmaf &&
+           moq_locmaf_track_from_cmaf(t->desc.cmaf, facts, sizeof(*facts)) == MOQ_OK;
+}
+
+/* The track's subscription is being issued: a fresh stage, preallocating
+ * both Group slots' decoders, and a new loss generation. False on
+ * allocation failure (the subscribe is retried). */
+static bool receiver_lm_start(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    receiver_lm_free(r, t);
+    moq_locmaf_track_t facts;
+    if (!lm_track_facts(t, &facts)) return false;
+    receiver_locmaf_t *lm = (receiver_locmaf_t *)r->alloc.alloc(sizeof(*lm),
+                                                                r->alloc.ctx);
+    if (!lm) return false;
+    memset(lm, 0, sizeof(*lm));
+    if (receiver_lm_create(&r->alloc, &facts, &lm->stage) != MOQ_OK) {
+        r->alloc.free(lm, sizeof(*lm), r->alloc.ctx);
+        return false;
+    }
+    t->lm = lm;
+    pthread_mutex_lock(&r->mu);
+    t->ts_gen++;
+    lm->app_gen_seen = t->app_gen;
+    pthread_mutex_unlock(&r->mu);
+    return true;
+}
+
+static void receiver_lm_note_fill(moq_media_track_t *t, bool requested)
+{
+    if (t->lm) ((receiver_locmaf_t *)t->lm)->fill_requested = requested;
+}
+
+/* The decoders of the current subscription's fills, which may hand a chain
+ * on, and whether such a fill can still deliver: one is LIVE, or the
+ * subscription asked for one that has not been created yet. */
+static void lm_fills_of(moq_media_receiver_t *r, const moq_media_track_t *t,
+                        receiver_lm_fills_t *f)
+{
+    const receiver_locmaf_t *lm = (const receiver_locmaf_t *)t->lm;
+    memset(f, 0, sizeof(*f));
+    bool live = false;
+    pthread_mutex_lock(&r->mu);
+    for (size_t i = 0; i < RECEIVER_FILL_DOMS; i++) {
+        const receiver_fill_dom_t *d = &r->fill_doms[i];
+        if (d->state != DOM_LIVE || d->track != t || d->gen != t->ts_gen ||
+            d->lm_failed)
+            continue;
+        live = true;
+        if (d->lm && f->count < RECEIVER_LM_MAX_FILLS)
+            f->dec[f->count++] = (const receiver_lm_dec_t *)d->lm;
+    }
+    pthread_mutex_unlock(&r->mu);
+    f->possible = live || (lm && lm->fill_requested && !lm->fill_seen);
+}
+
+/* A LOCMAF Object dropped before or by decoding: counted as dropped (or as
+ * a parse drop, for a malformed one), and a loss of its delivery source
+ * when `loss`. */
+static void lm_drop(moq_media_receiver_t *r, moq_media_track_t *t,
+                    moq_sub_object_t *so, bool loss, bool parse_drop,
+                    const receiver_dom_ref_t *dom)
+{
+    if (parse_drop) receiver_note_parse_drop(r, t, MOQ_MEDIA_PARSE_DROP_MEDIA);
+    pthread_mutex_lock(&r->mu);
+    if (!parse_drop) {
+        r->stats.objects_received++;
+        r->stats.objects_dropped++;
+    }
+    if (loss) {
+        receiver_loss_t none;
+        memset(&none, 0, sizeof(none));
+        receiver_loss_dropped_locked(r, t, so, dom ? NULL : &none, dom);
+    }
+    pthread_mutex_unlock(&r->mu);
+    moq_sub_object_cleanup(so);
+}
+
+/* Hand one output to the queue, or drop it. A held item's delivery takes
+ * the lane slot it kept, under its own ingress sequence. */
+static void lm_deliver(moq_media_receiver_t *r, moq_media_track_t *t,
+                       receiver_lm_out_t *out)
+{
+    if (out->kind == RECEIVER_LM_OUT_LOSS || out->kind == RECEIVER_LM_OUT_SILENT) {
+        if (out->gap) {
+            pthread_mutex_lock(&r->mu);
+            ts_note_loss_locked(r, t, t->ts_gen, out->item.so.group_id,
+                                out->gap_object, r->obj_tail);
+            pthread_mutex_unlock(&r->mu);
+        }
+        lm_drop(r, t, &out->item.so, out->kind == RECEIVER_LM_OUT_LOSS,
+                out->parse_drop, NULL);
+        if (out->item.held) ts_drop_slot(r);
+        return;
+    }
+    receiver_ts_adm_t saved = { false, 0 };
+    if (out->item.held) saved = receiver_ts_adm_begin(r, out->item.seq);
+    if (out->kind == RECEIVER_LM_OUT_REBUILT) {
+        receiver_loss_t loss;
+        memset(&loss, 0, sizeof(loss));
+        loss.gap = out->gap;
+        loss.gap_group = out->item.so.group_id;
+        loss.gap_object = out->gap_object;
+        loss.discontinuous = out->gap;
+        receiver_deliver_object_ex(r, t, &out->item.so, &loss, out->rebuilt,
+                                   MOQ_MEDIA_DELIVERY_LIVE, 0, NULL, NULL, true);
+    } else {
+        receiver_deliver_object(r, t, &out->item.so, NULL, NULL,
+                                MOQ_MEDIA_DELIVERY_LIVE, 0, NULL, NULL);
+    }
+    if (out->item.held) receiver_ts_adm_end(r, saved);
+}
+
+/* Deliver what the stage gave back, in order. True when it stopped for lane
+ * room: what it stopped at stays with the stage, each item keeping a lane
+ * slot, and the application's next poll wakes the network thread to
+ * resume. */
+static bool receiver_lm_drain(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    receiver_locmaf_t *lm = (receiver_locmaf_t *)t->lm;
+    if (!lm) return false;
+    receiver_lm_out_t *o;
+    while ((o = receiver_lm_peek(lm->stage)) != NULL) {
+        if (o->item.held && o->kind != RECEIVER_LM_OUT_LOSS &&
+            o->kind != RECEIVER_LM_OUT_SILENT) {
+            const moq_rcbuf_t *q = o->kind == RECEIVER_LM_OUT_REBUILT
+                                   ? o->rebuilt : o->item.so.payload;
+            if (!receiver_release_room(r, receiver_charge(r, t,
+                                                         q ? moq_rcbuf_len(q) : 0))) {
+                /* The Object being taken in waits too, with its slot. */
+                for (size_t i = 0; i < receiver_lm_out_count(lm->stage); i++) {
+                    receiver_lm_out_t *p = receiver_lm_out_at(lm->stage, i);
+                    if (!p->item.held) {
+                        p->item.held = true;
+                        ts_keep_slot(r);
+                    }
+                }
+                lm_fold_counts(r, lm);
+                lm_set_stalled(r, lm, true);
+                return true;
+            }
+        }
+        receiver_lm_out_t out = *o;
+        receiver_lm_pop(lm->stage);
+        lm_deliver(r, t, &out);
+    }
+    lm_fold_counts(r, lm);
+    lm_set_stalled(r, lm, false);
+    return false;
+}
+
+/* The application's selection changed since the stage last saw it: a
+ * disable (or the resume after one) resets the stage and the decoders of
+ * the track's fills, since the Objects dropped meanwhile leave a gap. */
+static void receiver_lm_sync_intent(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    receiver_locmaf_t *lm = (receiver_locmaf_t *)t->lm;
+    if (!lm) return;
+    pthread_mutex_lock(&r->mu);
+    uint64_t gen = t->app_gen;
+    bool changed = gen != lm->app_gen_seen;
+    if (changed) {
+        for (size_t i = 0; i < RECEIVER_FILL_DOMS; i++) {
+            receiver_fill_dom_t *d = &r->fill_doms[i];
+            if (d->track == t && d->lm)
+                receiver_lm_dec_reset((receiver_lm_dec_t *)d->lm);
+        }
+    }
+    pthread_mutex_unlock(&r->mu);
+    if (!changed) return;
+    lm->app_gen_seen = gen;
+    receiver_lm_disable(lm->stage);
+}
+
+/* One arriving live Object of a LOCMAF track. */
+static void receiver_on_locmaf_object(moq_media_receiver_t *r,
+                                      moq_media_track_t *t,
+                                      moq_sub_object_t *so, uint64_t now_us)
+{
+    receiver_locmaf_t *lm = (receiver_locmaf_t *)t->lm;
+    if (!lm) { moq_sub_object_cleanup(so); return; }
+    receiver_lm_sync_intent(r, t);
+    pthread_mutex_lock(&r->mu);
+    bool wanted = t->desired_subscribed && !t->auth_failed &&
+                  (t->local_result == MOQ_OK || t->delivery_failed);
+    uint64_t seq = r->intake_seq;
+    pthread_mutex_unlock(&r->mu);
+    if (!wanted && so->status != MOQ_OBJECT_END_OF_TRACK) {
+        /* Disabled or failed: dropped unread, as for any track. */
+        pthread_mutex_lock(&r->mu);
+        r->stats.objects_received++;
+        r->stats.objects_dropped++;
+        pthread_mutex_unlock(&r->mu);
+        moq_sub_object_cleanup(so);
+        return;
+    }
+    if (so->track && so->track != t->sub_track) {
+        /* An Object of an earlier subscription of the track. */
+        pthread_mutex_lock(&r->mu);
+        r->stats.locmaf_objects_undecodable =
+            sat_add(r->stats.locmaf_objects_undecodable, 1);
+        pthread_mutex_unlock(&r->mu);
+        lm_drop(r, t, so, false, false, NULL);
+        return;
+    }
+    receiver_lm_item_t item;
+    memset(&item, 0, sizeof(item));
+    item.so = *so;
+    memset(so, 0, sizeof(*so));
+    item.seq = seq;
+    bool kept;
+    if (item.so.status == MOQ_OBJECT_NORMAL) {
+        receiver_lm_fills_t fills;
+        lm_fills_of(r, t, &fills);
+        kept = receiver_lm_object(lm->stage, now_us, &fills, &item);
+    } else {
+        kept = receiver_lm_status(lm->stage, &item);
+    }
+    if (kept) ts_keep_slot(r);
+    (void)receiver_lm_drain(r, t);
+}
+
+/* A fill progressed, or time passed: the stage may hand a chain on, or give
+ * a hold up. */
+static void receiver_lm_progress_now(moq_media_receiver_t *r, moq_media_track_t *t,
+                                     uint64_t now_us)
+{
+    receiver_locmaf_t *lm = (receiver_locmaf_t *)t->lm;
+    if (!lm || lm->stalled) return;
+    receiver_lm_sync_intent(r, t);
+    receiver_lm_fills_t fills;
+    lm_fills_of(r, t, &fills);
+    receiver_lm_progress(lm->stage, now_us, &fills);
+    (void)receiver_lm_drain(r, t);
+}
+
+/* One Object of a fill of a LOCMAF track, with its fill record: decoded by
+ * the fill's own decoder, never by the live one's (a fill takes no state
+ * from another origin). */
+static void receiver_on_fill_locmaf_object(moq_media_receiver_t *r,
+    moq_media_track_t *t, moq_sub_object_t *so, size_t dom,
+    uint64_t initiating_request_id, uint64_t now_us)
+{
+    receiver_lm_sync_intent(r, t);
+    pthread_mutex_lock(&r->mu);
+    receiver_fill_dom_t *d = &r->fill_doms[dom];
+    receiver_dom_ref_t ref = { dom, d->next_pos++ };
+    bool wanted = t->desired_subscribed &&
+                  (t->local_result == MOQ_OK || t->delivery_failed);
+    receiver_lm_dec_t *dec = (receiver_lm_dec_t *)d->lm;
+    bool failed = d->lm_failed;
+    pthread_mutex_unlock(&r->mu);
+    if (!wanted) {
+        pthread_mutex_lock(&r->mu);
+        r->stats.objects_received++;
+        r->stats.objects_dropped++;
+        pthread_mutex_unlock(&r->mu);
+        moq_sub_object_cleanup(so);
+        return;
+    }
+    if (!dec && !failed) {
+        moq_locmaf_track_t facts;
+        moq_result_t rc = lm_track_facts(t, &facts)
+            ? receiver_lm_dec_create(&r->alloc, &facts, &dec) : MOQ_ERR_INVAL;
+        pthread_mutex_lock(&r->mu);
+        if (rc == MOQ_OK) d->lm = dec;
+        else d->lm_failed = true;
+        pthread_mutex_unlock(&r->mu);
+    }
+    if (so->status != MOQ_OBJECT_NORMAL) {
+        receiver_deliver_object(r, t, so, NULL, NULL, MOQ_MEDIA_DELIVERY_FILL,
+                                initiating_request_id, &ref, NULL);
+        return;
+    }
+    moq_result_t rc = MOQ_ERR_NOMEM;
+    moq_locmaf_chunk_t chunk;
+    moq_rcbuf_t *rebuilt = NULL;
+    if (dec) {
+        moq_bytes_t payload = so->payload
+            ? (moq_bytes_t){ moq_rcbuf_data(so->payload), moq_rcbuf_len(so->payload) }
+            : (moq_bytes_t){ NULL, 0 };
+        moq_locmaf_reason_t why = 0;
+        rc = receiver_lm_dec_push(dec, so->group_id, so->object_id, payload,
+                                  &chunk, &why);
+        if (rc == MOQ_OK && receiver_lm_rebuild(&r->alloc, dec, &chunk, &rebuilt) != MOQ_OK)
+            rc = MOQ_ERR_NOMEM;
+    }
+    pthread_mutex_lock(&r->mu);
+    if (rc == MOQ_OK)
+        r->stats.locmaf_objects_rebuilt = sat_add(r->stats.locmaf_objects_rebuilt, 1);
+    else
+        r->stats.locmaf_objects_undecodable =
+            sat_add(r->stats.locmaf_objects_undecodable, 1);
+    pthread_mutex_unlock(&r->mu);
+    if (rc == MOQ_OK) {
+        receiver_deliver_object_ex(r, t, so, NULL, rebuilt, MOQ_MEDIA_DELIVERY_FILL,
+                                   initiating_request_id, &ref, NULL, true);
+    } else {
+        /* A duplicate is no loss; anything else is a loss of the fill. */
+        lm_drop(r, t, so, rc != MOQ_ERR_INVAL, receiver_lm_refused(rc), &ref);
+    }
+    receiver_lm_progress_now(r, t, now_us);
+}
+
+/* A fill Object of a LOCMAF track that found no free fill record: it has no
+ * decoder of its own, and is never decoded by the live one. */
+static void receiver_on_fill_locmaf_undomained(moq_media_receiver_t *r,
+                                               moq_media_track_t *t,
+                                               moq_sub_object_t *so)
+{
+    pthread_mutex_lock(&r->mu);
+    r->stats.locmaf_objects_undecodable =
+        sat_add(r->stats.locmaf_objects_undecodable, 1);
+    pthread_mutex_unlock(&r->mu);
+    lm_drop(r, t, so, false, false, NULL);
+}
+
+/* A stream terminal of the track's live subscription, for its stage. */
+static void receiver_lm_terminal_now(moq_media_receiver_t *r, moq_media_track_t *t,
+                                     const moq_sub_stream_terminal_t *st)
+{
+    receiver_locmaf_t *lm = (receiver_locmaf_t *)t->lm;
+    if (!lm || t->sub_track != st->track) return;
+    receiver_lm_terminal(lm->stage, st->kind, st->group_id, st->subgroup_id);
+    (void)receiver_lm_drain(r, t);
+}
+
+/* The subscription ended: held Objects no fill can continue are given up
+ * and every Group slot closes, a parked END_OF_TRACK last. True while
+ * something is still held or waits for lane room. */
+static bool receiver_lm_finish_now(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    receiver_locmaf_t *lm = (receiver_locmaf_t *)t->lm;
+    if (!lm) return false;
+    receiver_lm_fills_t fills;
+    lm_fills_of(r, t, &fills);
+    receiver_lm_finish(lm->stage, &fills);
+    return receiver_lm_drain(r, t) || receiver_lm_holds(lm->stage);
+}
+
+/* Time passed: hand-offs and hold expiry; the next hold deadline, or
+ * UINT64_MAX (also while stalled: the application's poll wakes it). */
+static uint64_t receiver_lm_timer(moq_media_receiver_t *r, moq_media_track_t *t,
+                                  uint64_t now_us)
+{
+    receiver_locmaf_t *lm = (receiver_locmaf_t *)t->lm;
+    if (!lm) return UINT64_MAX;
+    if (lm->stalled && receiver_lm_drain(r, t)) return UINT64_MAX;
+    receiver_lm_progress_now(r, t, now_us);
+    return lm->stalled ? UINT64_MAX : receiver_lm_deadline(lm->stage);
+}
+
+/* Whether the track's stage holds, or has parked or given back untaken, an
+ * Object taken in before `barrier` (network thread). */
+static bool lm_holds_before(const moq_media_track_t *t, uint64_t barrier)
+{
+    const receiver_locmaf_t *lm = (const receiver_locmaf_t *)t->lm;
+    return lm && receiver_lm_holds_before(lm->stage, barrier);
+}
+
+static bool lm_holds_any(const moq_media_track_t *t)
+{
+    const receiver_locmaf_t *lm = (const receiver_locmaf_t *)t->lm;
+    return lm && (receiver_lm_holds(lm->stage) ||
+                  receiver_lm_out_count(lm->stage) > 0);
+}
+
+/* A fill record of `track` is created (fill_observe, under r->mu). */
+static void lm_note_fill_created_locked(moq_media_track_t *track, uint32_t gen)
+{
+    receiver_locmaf_t *lm = (receiver_locmaf_t *)track->lm;
+    if (lm && gen == track->ts_gen) lm->fill_seen = true;
+}
+
+/* A fill record retires: its decoder goes with it (under r->mu). */
+static void lm_dom_free_locked(moq_media_receiver_t *r, receiver_fill_dom_t *d)
+{
+    if (d->lm) receiver_lm_dec_destroy(&r->alloc, (receiver_lm_dec_t *)d->lm);
+    d->lm = NULL;
+}
+#else
+static void receiver_lm_free(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    (void)r; (void)t;
+}
+static bool receiver_lm_start(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    (void)r; (void)t;
+    return false;
+}
+static void receiver_lm_note_fill(moq_media_track_t *t, bool requested)
+{
+    (void)t; (void)requested;
+}
+static bool receiver_lm_drain(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    (void)r; (void)t;
+    return false;
+}
+static void receiver_on_locmaf_object(moq_media_receiver_t *r,
+                                      moq_media_track_t *t,
+                                      moq_sub_object_t *so, uint64_t now_us)
+{
+    (void)r; (void)t; (void)now_us;
+    moq_sub_object_cleanup(so);
+}
+static void receiver_on_fill_locmaf_object(moq_media_receiver_t *r,
+    moq_media_track_t *t, moq_sub_object_t *so, size_t dom,
+    uint64_t initiating_request_id, uint64_t now_us)
+{
+    (void)r; (void)t; (void)dom; (void)initiating_request_id; (void)now_us;
+    moq_sub_object_cleanup(so);
+}
+static void receiver_on_fill_locmaf_undomained(moq_media_receiver_t *r,
+                                               moq_media_track_t *t,
+                                               moq_sub_object_t *so)
+{
+    (void)r; (void)t;
+    moq_sub_object_cleanup(so);
+}
+static void receiver_lm_terminal_now(moq_media_receiver_t *r, moq_media_track_t *t,
+                                     const moq_sub_stream_terminal_t *st)
+{
+    (void)r; (void)t; (void)st;
+}
+static bool receiver_lm_finish_now(moq_media_receiver_t *r, moq_media_track_t *t)
+{
+    (void)r; (void)t;
+    return false;
+}
+static uint64_t receiver_lm_timer(moq_media_receiver_t *r, moq_media_track_t *t,
+                                  uint64_t now_us)
+{
+    (void)r; (void)t; (void)now_us;
+    return UINT64_MAX;
+}
+static bool lm_holds_before(const moq_media_track_t *t, uint64_t barrier)
+{
+    (void)t; (void)barrier;
+    return false;
+}
+static bool lm_holds_any(const moq_media_track_t *t)
+{
+    (void)t;
+    return false;
+}
+static void lm_note_fill_created_locked(moq_media_track_t *track, uint32_t gen)
+{
+    (void)track; (void)gen;
+}
+static void lm_dom_free_locked(moq_media_receiver_t *r, receiver_fill_dom_t *d)
+{
+    (void)r; (void)d;
+}
+#endif
 
 /* -- SAP event-timeline intake (network thread) ------------------------- *
  * A self-contained, tolerant scanner for the fixed CMSF §3.6.1 payload: a JSON
@@ -6931,6 +7611,7 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
          * one is freed once the facade slot is released. */
         if (receiver_ts_finish(r, t, now_us)) continue;
         if (receiver_order_finish_now(r, t, now_us)) continue;
+        if (receiver_lm_finish_now(r, t)) continue;
 
         /* The subscription is already complete: free its facade slot (no
          * UNSUBSCRIBE is sent) and drop our handle so reconcile may re-subscribe. */
@@ -6943,6 +7624,7 @@ static void receiver_process_subscription_dones(moq_media_receiver_t *r,
         }
         receiver_ts_free(r, t);
         receiver_order_free(r, t);
+        receiver_lm_free(r, t);
         t->done_pending = false;
         moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
         /* the live subscription is gone; a pending app attribution
@@ -7029,6 +7711,9 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
         /* So does an ordered track's stage. */
         if (t->ordered && !receiver_order_start(r, t))
             continue;   /* allocation failed: retried next cycle */
+        /* And a LOCMAF track's decoders, both Group slots'. */
+        if (track_is_locmaf(t) && !receiver_lm_start(r, t))
+            continue;   /* allocation failed: retried next cycle */
 
         moq_sub_track_cfg_t tcfg;
         moq_sub_track_cfg_init(&tcfg);
@@ -7062,6 +7747,9 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
             tcfg.location = &loc;
             tcfg.fill = &fill;
         }
+        /* Whether a fill of this subscription may yet hand a LOCMAF chain
+         * on. */
+        receiver_lm_note_fill(t, tcfg.fill != NULL);
         if (t->auth_action != MOQ_MEDIA_AUTH_ACTION_SUBSCRIBE ||
             t->auth_generation != gen)
             moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
@@ -7080,6 +7768,7 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
             moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
             receiver_ts_free(r, t);
             receiver_order_free(r, t);
+            receiver_lm_free(r, t);
             continue;
         }
         if (rc != MOQ_OK) {
@@ -7107,6 +7796,7 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
             t->sub_track = NULL;        /* transient: retry next cycle */
             receiver_ts_free(r, t);
             receiver_order_free(r, t);
+            receiver_lm_free(r, t);
         } else if (receiver_auth_encoding_error(r, &t->auth_operation, rc)) {
             receiver_auth_fail(r, &t->auth_operation, &request,
                 MOQ_MEDIA_AUTH_SCOPE_TRACK, t);
@@ -7420,6 +8110,7 @@ static void receiver_poll_stream_terminals(moq_media_receiver_t *r, uint64_t now
             t->is_event_timeline)
             continue;
         receiver_order_terminal(r, t, &st, now_us);
+        receiver_lm_terminal_now(r, t, &st);
         if (!r->st_enabled) continue;
         moq_media_stream_terminal_t rec;
         memset(&rec, 0, sizeof(rec));
@@ -7514,6 +8205,7 @@ static void receiver_settle_completions(moq_media_receiver_t *r, uint64_t now_us
                                          receiver_facade_drained(r));
         receiver_ts_free(r, t);
         receiver_order_free(r, t);
+        receiver_lm_free(r, t);
         if (!rq_push(r, MOQ_MEDIA_TRACK_REMOVED, t)) return;   /* overflow terminalized */
     }
 }
@@ -7573,6 +8265,7 @@ static void receiver_retire_failed_catalog(moq_media_receiver_t *r, uint64_t now
     for (size_t i = 0; i < r->track_count; i++) {
         receiver_ts_free(r, r->tracks[i]);
         receiver_order_free(r, r->tracks[i]);
+        receiver_lm_free(r, r->tracks[i]);
     }
     receiver_st_mark_ready(r);
     bool drained = receiver_facade_drained(r);
@@ -7592,6 +8285,10 @@ static void receiver_ts_timers(moq_media_receiver_t *r, uint64_t now_us)
         moq_media_track_t *t = r->tracks[i];
         if (t->order && !receiver_order_drain(r, t, now_us)) {
             uint64_t d = receiver_order_next_deadline_us(t->order->stage);
+            if (d < deadline) deadline = d;
+        }
+        if (t->lm) {
+            uint64_t d = receiver_lm_timer(r, t, now_us);
             if (d < deadline) deadline = d;
         }
         if (!t->ts) continue;
@@ -7616,6 +8313,7 @@ static void receiver_ts_resume(moq_media_receiver_t *r, uint64_t now_us)
     for (size_t i = 0; i < r->track_count; i++) {
         if (r->tracks[i]->ts) (void)receiver_ts_drain(r, r->tracks[i], now_us);
         if (r->tracks[i]->order) (void)receiver_order_drain(r, r->tracks[i], now_us);
+        if (r->tracks[i]->lm) (void)receiver_lm_drain(r, r->tracks[i]);
     }
 }
 
@@ -7635,6 +8333,7 @@ static void receiver_st_mark_ready(moq_media_receiver_t *r)
         if (ts_holds_before(e->rec.track, e->barrier)) continue;
 #endif
         if (order_holds_before(e->rec.track, e->barrier)) continue;
+        if (lm_holds_before(e->rec.track, e->barrier)) continue;
         e->ready = true;
         woke = true;
     }
@@ -7878,6 +8577,8 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
             moq_sub_object_cleanup(&obj);
         else if (track_is_ts(t))
             receiver_on_ts_object(r, t, &obj, now_us);
+        else if (track_is_locmaf(t))
+            receiver_on_locmaf_object(r, t, &obj, now_us);
         else if (t->order)
             receiver_on_ordered_object(r, t, &obj, now_us);
         else
@@ -8359,6 +9060,8 @@ static void receiver_free(moq_media_receiver_t *r)
     if (r->st)
         r->alloc.free(r->st, r->st_cap * sizeof(receiver_st_entry_t), r->alloc.ctx);
     receiver_bootstrap_discard(r);
+    for (size_t i = 0; i < RECEIVER_FILL_DOMS; i++)
+        lm_dom_free_locked(r, &r->fill_doms[i]);
     for (size_t i = 0; i < r->track_count; i++)
         receiver_track_free(r, r->tracks[i]);
     if (r->tracks)
@@ -9810,6 +10513,11 @@ moq_result_t moq_media_receiver_get_stats(const moq_media_receiver_t *r,
     snap.paused = mr->paused;
     pthread_mutex_unlock(&mr->mu);
     size_t n = out_size < sizeof(*out) ? out_size : sizeof(*out);
+    /* The LOCMAF counters are one block: a size that ends inside it gets the
+     * fields before it. */
+    if (n > MEDIA_RECEIVER_STATS_LOCMAF_AT &&
+        n < MOQ_MEDIA_RECEIVER_STATS_SIZE_THROUGH_LOCMAF)
+        n = MEDIA_RECEIVER_STATS_LOCMAF_AT;
     snap.struct_size = (uint32_t)n;
     memcpy(out, &snap, n);
     return MOQ_OK;
@@ -10586,6 +11294,8 @@ void moq_media_receiver_test_push_object_ex(moq_media_receiver_t *r, moq_media_t
         moq_sub_object_cleanup(&so);
     else if (track_is_ts(track))
         receiver_on_ts_object(r, track, &so, 0);
+    else if (track_is_locmaf(track))
+        receiver_on_locmaf_object(r, track, &so, 0);
     else if (track->order)
         receiver_on_ordered_object(r, track, &so, 0);
     else

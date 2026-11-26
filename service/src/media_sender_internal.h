@@ -447,6 +447,8 @@ struct moq_media_track {
     bool                  ts_app_objects;
     bool                  ts_random_access;
     void                 *ts;
+    /* LOCMAF: the track's encoder (sender_lm_t), allocated at add_track. */
+    void                 *lm;
 };
 
 
@@ -470,6 +472,13 @@ typedef struct sender_preq_entry {
      * Recorded at emit time so the timeline record carries the real Location. */
     bool               has_sap_type;
     uint8_t            sap_type;            /* 0..3 when has_sap_type */
+    /* LOCMAF: the Object's wire buffer, reserved by write() (wire_block,
+     * owned until the drain wraps it, wire_bound bytes after its owner),
+     * then the wrapped payload kept for a retry (wire_rcbuf). At most one
+     * is set; payload stays the CMAF chunk it encodes. */
+    void              *wire_block;
+    size_t             wire_bound;
+    moq_rcbuf_t       *wire_rcbuf;
 } sender_preq_entry_t;
 
 
@@ -584,6 +593,10 @@ struct moq_media_sender {
     /* Test-only: refuse this many pending-reset attempts as
      * moq_pub_reset_group's WOULD_BLOCK would, keeping the obligation. */
     uint32_t          test_refuse_reset;
+    /* Test-only: called with every media Object's write before the facade
+     * sees it; a result other than MOQ_OK stands for the facade's. */
+    moq_result_t    (*test_emit_hook)(void *ctx, const moq_pub_object_cfg_t *ocfg);
+    void             *test_emit_ctx;
     /* Test-only injected catalog clock. MSF §5.1.2 generatedAt is a wallclock
      * millisecond, so a test that needs two builds to differ -- or to be
      * identical -- cannot get there by waiting without becoming timing
@@ -825,6 +838,11 @@ typedef struct sender_admit {
      * being finished): it neither evicts queued media nor waits for room,
      * and is refused MOQ_ERR_WOULD_BLOCK while none is free. */
     bool         completing;
+    /* LOCMAF: the Object's reserved wire buffer, charged to the queue with
+     * the payload and transferred on MOQ_OK (sender_lm_reserve). */
+    void        *wire_block;
+    size_t       wire_block_size;
+    size_t       wire_bound;
 } sender_admit_t;
 
 #if defined(__GNUC__) || defined(__clang__)

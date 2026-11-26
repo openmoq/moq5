@@ -227,6 +227,17 @@ if(TARGET moq-loc AND TARGET moq-cmaf AND TARGET moq-mpeg2ts
         "-lmoq-msf -lmoq-media-object -lmoq-cmaf -lmoq-mpeg2ts -lmoq-loc")
 endif()
 
+# -- LOCMAF package ---------------------------------------------------
+# A tier of its own while MOQ_BUILD_LOCMAF is off by default, so the media
+# tier keeps naming exactly its five parsers. <moq/locmaf.h> includes
+# <moq/cmaf.h>, so the CMAF library comes with it.
+if(TARGET moq-locmaf)
+    moq_install_tier_pc(libmoq-locmaf
+        "MoQ LOCMAF: Low Overhead CMAF encoder and decoder"
+        "libmoq-core"
+        "-lmoq-locmaf -lmoq-cmaf")
+endif()
+
 # -- moq_media_probe (black-box catalog-parse probe) ----------------
 if(MOQ_BUILD_MEDIA_PROBE)
     if(NOT MOQ_BUILD_MSF)

@@ -91,13 +91,15 @@ done
 grep -q '^build.rs$' "$WORK/moq5-sys.files"
 grep -q '^build_sysroot.rs$' "$WORK/moq5-sys.files"
 grep -q '^build_tiers.rs$' "$WORK/moq5-sys.files"
-for tier in core sim media service player; do
+for tier in core sim media locmaf service player; do
     grep -q "^wrapper_$tier.h\$" "$WORK/moq5-sys.files"
     grep -q "^docs/bindings_$tier.rs\$" "$WORK/moq5-sys.files"
     grep -q "^docs/preambles_$tier.md\$" "$WORK/moq5-sys.files"
 done
 grep -q '^src/namespace.rs$' "$WORK/moq5-core.files"
 grep -q '^src/cmaf.rs$' "$WORK/moq5-media.files"
+grep -q '^src/locmaf.rs$' "$WORK/moq5-media.files"
+grep -q '^tests/locmaf_compile_fail/locmaf_moves_between_threads.rs$' "$WORK/moq5-media.files"
 grep -q '^src/lib.rs$' "$WORK/moq5.files"
 grep -q '^src/player.rs$' "$WORK/moq5.files"
 grep -q '^tests/compile_fail/buffer_cloned.rs$' "$WORK/moq5.files"
