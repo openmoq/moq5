@@ -1636,6 +1636,18 @@ if(MOQ_BUILD_TESTS)
                 COMMAND test_media_sender_reject)
         endif()
 
+        # publish_paused: Forward 0 PUBLISH and demand on resume.
+        if(TARGET moq::sim)
+            add_executable(test_media_sender_publish_paused
+                tests/test_media_sender_publish_paused.c)
+            target_link_libraries(test_media_sender_publish_paused PRIVATE
+                moq-service-sender-test-internals moq::sim)
+            target_include_directories(test_media_sender_publish_paused PRIVATE
+                ${PROJECT_SOURCE_DIR}/tests/unit)
+            add_test(NAME media_sender_publish_paused
+                COMMAND test_media_sender_publish_paused)
+        endif()
+
         # TRACK_STATUS, unserved requests, Track Properties and new-group
         # requests through the production sender hook.
         if(TARGET moq::sim)

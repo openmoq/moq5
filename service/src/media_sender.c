@@ -542,6 +542,9 @@ void sender_copy_cfg_tail(moq_media_sender_t *s,
     if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t, publish_tracks) +
                                 sizeof(cfg->publish_tracks))
         s->publish_tracks = cfg->publish_tracks;
+    if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t, publish_paused) +
+                                sizeof(cfg->publish_paused))
+        s->publish_paused = cfg->publish_paused;
     if (cfg->struct_size >= offsetof(moq_media_sender_cfg_t,
                                      drop_without_demand) +
                                 sizeof(cfg->drop_without_demand))
@@ -1037,6 +1040,22 @@ bool moq_media_sender_has_media_subscriber(const moq_media_sender_t *s)
         moq_media_track_t *t = ms->tracks[i];
         if (t->removed || !track_is_app_media(t)) continue;
         if (t->active_subs > 0) { any = true; break; }
+    }
+    pthread_mutex_unlock(&ms->mu);
+    return any;
+}
+
+
+bool moq_media_sender_has_media_demand(const moq_media_sender_t *s)
+{
+    if (!s) return false;
+    moq_media_sender_t *ms = (moq_media_sender_t *)(uintptr_t)s;
+    bool any = false;
+    pthread_mutex_lock(&ms->mu);
+    for (size_t i = 0; i < ms->track_count; i++) {
+        moq_media_track_t *t = ms->tracks[i];
+        if (t->removed || !track_is_app_media(t)) continue;
+        if (t->active_subs > 0 || t->publication_forwards) { any = true; break; }
     }
     pthread_mutex_unlock(&ms->mu);
     return any;
