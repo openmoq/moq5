@@ -3,7 +3,7 @@
 // by scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: f64ecaf69750
+// libmoq commit: 33f2d1ec6e7b
 // SDK: libmoq-service.pc Requires: libmoq; libmoq-locmaf.pc Requires: libmoq-core; libmoq-sim.pc Requires: libmoq-core
 // generated on: x86_64-unknown-linux-gnu with bindgen 0.73.2, libclang from (clang-sys search) (clang version 18.1.1)
 

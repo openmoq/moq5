@@ -3,7 +3,7 @@
 // by scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: f64ecaf69750
+// libmoq commit: 33f2d1ec6e7b
 // SDK: libmoq-service.pc Requires: libmoq; libmoq-locmaf.pc Requires: libmoq-core; libmoq-sim.pc Requires: libmoq-core
 // generated on: x86_64-unknown-linux-gnu with bindgen 0.73.2, libclang from (clang-sys search) (clang version 18.1.1)
 
@@ -2057,7 +2057,7 @@ pub struct moq_media_receiver_track_subscribe_cfg {
     #[doc = " Appended after fill: the OBJECT_DELIVERY_TIMEOUT and\n SUBGROUP_DELIVERY_TIMEOUT that every SUBSCRIBE for the track carries,\n in milliseconds, as moq_sub_track_cfg_t takes them. NULL leaves one\n absent. The values are copied before returning. Draft 16 carries one\n shared value: a selected value must be nonzero, and two selected\n values must be equal; otherwise MOQ_ERR_INVAL."]
     pub object_delivery_timeout_ms: *const u64,
     pub subgroup_delivery_timeout_ms: *const u64,
-    #[doc = " Appended: the subscription's initial Forward State, borrowed for the\n call (read only when struct_size covers the whole pointer). NULL keeps\n Forward 1. Non-NULL false subscribes with Forward 0: the track is\n wanted and known but passive, the publisher sends it no Objects, and\n the receiver never raises its Forward State itself (flow control and\n subscribe_track resumes leave it at 0). It applies only when the\n subscription is first issued, as the other options do. A passive track\n takes no implicit current-group join fill on draft 22. A passive track\n that stays silent is not an error and raises no event. In this version\n passive is fixed for the subscription's life: the receiver has no call\n to raise Forward on it later."]
+    #[doc = " Appended: the subscription's initial Forward State, borrowed for the\n call (read only when struct_size covers the whole pointer). NULL keeps\n Forward 1. Non-NULL false subscribes with Forward 0: the track is\n wanted and known but passive, the publisher sends it no Objects, and\n the receiver never raises its Forward State itself (flow control and\n subscribe_track resumes leave it at 0). It applies only when the\n subscription is first issued, as the other options do. A passive track\n takes no implicit current-group join fill on draft 22. A passive track\n that stays silent is not an error and raises no event. The app can\n raise and lower its Forward State later with\n moq_media_receiver_set_track_forward()."]
     pub forward: *const bool,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
@@ -2136,6 +2136,15 @@ unsafe extern "C" {
     pub fn moq_media_receiver_unsubscribe_track(
         r: *mut moq_media_receiver_t,
         track: *mut moq_media_track_t,
+    ) -> moq_result_t;
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " Raise (forward = true) or lower (false) the Forward State of a track the\n app subscribed passively (track subscribe cfg forward = &false). Records the\n intent and wakes the executor, which sends one REQUEST_UPDATE with the\n Forward State once the subscription is established and no other update of\n the track is in flight, as for flow control: intents that cancel out before\n the update goes out send nothing. Flow control still applies to a raised\n track (a FLOW_CONTROL pause sends Forward 0 until resumed). Raising issues no\n join fill on any draft; Objects the publisher sends after the update reach\n the track as live deliveries. The intent survives a re-subscription of the\n same track within one receiver (unsubscribe_track then subscribe_track):\n the new SUBSCRIBE goes out with Forward 0, as the track's options ask, and\n an update to Forward 1 follows once it is established. A new receiver\n starts passive.\n\n Returns:\n   MOQ_OK            recorded (also when the Forward State already matches)\n   MOQ_ERR_INVAL     NULL r or track, or a foreign track\n   MOQ_ERR_WRONG_STATE  not subscribed passively, disabled by\n                     unsubscribe_track, ended, failed or removed\n   MOQ_ERR_CLOSED    the receiver or its endpoint is terminal"]
+    pub fn moq_media_receiver_set_track_forward(
+        r: *mut moq_media_receiver_t,
+        track: *mut moq_media_track_t,
+        forward: bool,
     ) -> moq_result_t;
 }
 unsafe extern "C" {
