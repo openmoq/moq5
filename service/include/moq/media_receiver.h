@@ -1344,7 +1344,9 @@ MOQ_API void moq_media_fetch_cfg_init_sized(moq_media_fetch_cfg_t *cfg,
  *                     beyond 62 bits
  *   MOQ_ERR_ABI_MISMATCH  cfg->struct_size below MOQ_MEDIA_FETCH_CFG_V0_SIZE
  *   MOQ_ERR_UNSUPPORTED   the receiver has no Object path for this track
- *                     (not a media track with a delivery path)
+ *                     (not a media track with a delivery path), or the track
+ *                     is LOCMAF-packaged: how a fetch interacts with its
+ *                     decoder state is not defined yet
  *   MOQ_ERR_WRONG_STATE   the track is not subscribed (never subscribed, or
  *                     disabled by unsubscribe_track), has ended, failed
  *                     locally or been removed

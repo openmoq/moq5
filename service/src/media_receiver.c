@@ -10896,6 +10896,9 @@ moq_result_t moq_media_receiver_fetch_track(
               copy.end_object > MOQ_QUIC_VARINT_MAX))
         rc = MOQ_ERR_INVAL;
     else if (!track->has_media_path) rc = MOQ_ERR_UNSUPPORTED;
+    /* A LOCMAF track's fetch semantics (its decoder state across a fetch,
+     * the FETCH origin and loss reporting) are not defined yet. */
+    else if (track_is_locmaf(track)) rc = MOQ_ERR_UNSUPPORTED;
     else if (track->ended || track->removed || track->local_result != MOQ_OK ||
              track->auth_failed || !track->desired_subscribed)
         rc = MOQ_ERR_WRONG_STATE;

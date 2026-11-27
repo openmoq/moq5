@@ -155,6 +155,24 @@ static size_t pos_of(const lmx_t *f, uint64_t g, uint64_t o, uint32_t origin)
 
 /* -- The hand-off -------------------------------------------------------------- */
 
+/* A fetch of a LOCMAF track is refused, with no command queued: its fetch
+ * semantics (decoder state, FETCH origin, loss reporting) are not defined. */
+static void test_fetch_refused(void)
+{
+    ROW("fetch_refused");
+    lmx_t f;
+    if (!fx_open(&f)) { failures++; return; }
+    f.t->desired_subscribed = true;
+    MOQ_TEST_CHECK(f.t->has_media_path && track_is_locmaf(f.t));
+    moq_media_fetch_cfg_t cfg;
+    moq_media_fetch_cfg_init(&cfg);
+    cfg.start_group = 1;
+    cfg.end_group = 2;
+    MOQ_TEST_CHECK(moq_media_receiver_fetch_track(f.r, f.t, &cfg) == MOQ_ERR_UNSUPPORTED);
+    MOQ_TEST_CHECK(f.t->fetch_cmd_state == FETCH_CMD_NONE);
+    fx_close(&f);
+}
+
 static void test_handoff(bool live_first)
 {
     ROW(live_first ? "handoff_bootstrap_ok live first" : "handoff_bootstrap_ok fill first");
@@ -669,6 +687,7 @@ int main(void)
         int before = failures;
         test_handoff(false);
         test_handoff(true);
+        test_fetch_refused();
         test_handoff_refused_after_reset();
         test_handoff_refused_after_gap();
         test_handoff_refused_other_generation();
