@@ -3,7 +3,7 @@
 // by scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: b02b3c8833ce
+// libmoq commit: f64ecaf69750
 // SDK: libmoq-service.pc Requires: libmoq; libmoq-locmaf.pc Requires: libmoq-core; libmoq-sim.pc Requires: libmoq-core
 // generated on: x86_64-unknown-linux-gnu with bindgen 0.73.2, libclang from (clang-sys search) (clang version 18.1.1)
 
@@ -35,8 +35,19 @@ pub const MOQ_MEDIA_SENDER_FATAL_NAMESPACE_TERMINATED: u32 = 6;
 pub const MOQ_MEDIA_FILL_LOSS_LOCAL_DROP: u32 = 1;
 pub const MOQ_MEDIA_FILL_LOSS_UNKNOWN: u32 = 2;
 pub const MOQ_MEDIA_FILL_LOSS_TIMED_OUT: u32 = 4;
+pub const MOQ_MEDIA_FETCH_COMPLETE: u32 = 1;
+pub const MOQ_MEDIA_FETCH_PEER_ERROR: u32 = 2;
+pub const MOQ_MEDIA_FETCH_RESET: u32 = 3;
+pub const MOQ_MEDIA_FETCH_CANCELLED: u32 = 4;
+pub const MOQ_MEDIA_FETCH_SESSION_CLOSED: u32 = 5;
+pub const MOQ_MEDIA_FETCH_LOCAL_FAILURE: u32 = 6;
+pub const MOQ_MEDIA_FETCH_NOT_SENT: u32 = 7;
+pub const MOQ_MEDIA_FETCH_ERROR_NONE: u32 = 0;
+pub const MOQ_MEDIA_FETCH_ERROR_STREAM: u32 = 1;
+pub const MOQ_MEDIA_FETCH_ERROR_REQUEST: u32 = 2;
 pub const MOQ_MEDIA_DELIVERY_LIVE: u32 = 1;
 pub const MOQ_MEDIA_DELIVERY_FILL: u32 = 2;
+pub const MOQ_MEDIA_DELIVERY_FETCH: u32 = 3;
 pub const MOQ_MEDIA_STREAM_FIN_END_OF_GROUP: u32 = 1;
 pub const MOQ_MEDIA_STREAM_FIN: u32 = 2;
 pub const MOQ_MEDIA_STREAM_RESET: u32 = 3;
@@ -1540,10 +1551,14 @@ pub struct moq_media_receiver_cfg {
     pub _reserved_stream_terminals: [u8; 3usize],
     #[doc = " Optional resource credentials, independent of endpoint SETUP tokens.\n Construction copies the source and static bytes. Selection/outcomes\n follow media_auth.h; absent/partial/NULL means anonymous. A configured\n source never falls back to anonymous access. A D22 SUBSCRIBE plus fill\n selects once for SUBSCRIBE, not a separate FETCH. Use a sized init."]
     pub resource_auth: *const moq_media_auth_cfg_t,
+    #[doc = " Permanently reserved, never read: covers the tail padding after\n resource_auth on targets where it has any (32-bit targets that align\n uint64_t to 8, where an older caller's sizeof includes four bytes of\n padding after the pointer), so the field below starts at or past the\n complete sizeof of the layout that ends with resource_auth."]
+    pub _reserved_auth: [u8; 4usize],
+    #[doc = " Appended: how many standalone fetches of one track\n (moq_media_receiver_fetch_track) may be open at once, counted from\n MOQ_MEDIA_TRACK_FETCH_CREATED until the fetch's\n MOQ_MEDIA_TRACK_FETCH_TERMINAL is polled; past it fetch_track returns\n MOQ_ERR_CAPACITY. 0 = 4. Read only when struct_size covers the whole\n field."]
+    pub max_fetches_per_track: u32,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_media_receiver_cfg"][::std::mem::size_of::<moq_media_receiver_cfg>() - 128usize];
+    ["Size of moq_media_receiver_cfg"][::std::mem::size_of::<moq_media_receiver_cfg>() - 136usize];
     ["Alignment of moq_media_receiver_cfg"]
         [::std::mem::align_of::<moq_media_receiver_cfg>() - 8usize];
     ["Offset of field: moq_media_receiver_cfg::struct_size"]
@@ -1584,6 +1599,10 @@ const _: () = {
         [::std::mem::offset_of!(moq_media_receiver_cfg, _reserved_stream_terminals) - 117usize];
     ["Offset of field: moq_media_receiver_cfg::resource_auth"]
         [::std::mem::offset_of!(moq_media_receiver_cfg, resource_auth) - 120usize];
+    ["Offset of field: moq_media_receiver_cfg::_reserved_auth"]
+        [::std::mem::offset_of!(moq_media_receiver_cfg, _reserved_auth) - 128usize];
+    ["Offset of field: moq_media_receiver_cfg::max_fetches_per_track"]
+        [::std::mem::offset_of!(moq_media_receiver_cfg, max_fetches_per_track) - 132usize];
 };
 impl Default for moq_media_receiver_cfg {
     fn default() -> Self {
@@ -1833,6 +1852,10 @@ pub const MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE: moq_media_track_event_kind = 1
 pub const MOQ_MEDIA_TRACK_UPDATE_LOCAL_FAILURE: moq_media_track_event_kind = 11;
 #[doc = " the fill recorded by\nmoq_media_receiver_fill_track() was admitted\nlocally: its UPDATE was sent and the child\nexists. Read its initiating_request_id below\n(zero is valid) and cancel the child with\nmoq_media_receiver_cancel_fill(). Local\nadmission only: not the peer's acceptance,\nan opened stream or a live child at poll\ntime. Queued before that child's\nFILL_TERMINAL. Fills requested by\nsubscribe_track options and the catalog's\nfills never produce it."]
 pub const MOQ_MEDIA_TRACK_FILL_CREATED: moq_media_track_event_kind = 12;
+#[doc = " the fetch recorded by\nmoq_media_receiver_fetch_track() was sent:\nits FETCH was admitted by the session.\ninitiating_request_id is the FETCH's\nrequest ID, which its Objects carry and\nmoq_media_receiver_cancel_fetch() takes.\nLocal admission only, not the peer's\nacceptance. Queued before that fetch's\nFETCH_TERMINAL. Polling it (by any output\nsize) releases the track's command slot."]
+pub const MOQ_MEDIA_TRACK_FETCH_CREATED: moq_media_track_event_kind = 13;
+#[doc = " one standalone fetch ended, or its\ncommand was refused before it was sent;\nthe track's state is unchanged. Read\ninitiating_request_id, fill_reason\n(MOQ_MEDIA_FETCH_* reason),\nfill_error_domain and fill_error_code,\nlocal_result, and, for an MPEG2TS track,\nthe fill_unreported_loss_* block (see the\nfields below). It follows every Object of\nthe fetch: it is queued once each of them\nhas been polled or dropped (and, with the\nstream-terminal lane, once the fetch's\nRECEIVER_DROP records are polled). Exactly\none per FETCH_CREATED."]
+pub const MOQ_MEDIA_TRACK_FETCH_TERMINAL: moq_media_track_event_kind = 14;
 #[doc = " -- Track discovery events (§6.2) ------------------------------------"]
 pub type moq_media_track_event_kind = ::std::os::raw::c_uint;
 #[doc = " -- Track discovery events (§6.2) ------------------------------------"]
@@ -1874,11 +1897,11 @@ pub struct moq_media_track_event {
     pub parse_drops_total: u64,
     #[doc = " drops since the previous drained\nparse-drop event for this track"]
     pub parse_drops_delta: u64,
-    #[doc = " Appended after the complete preceding allocation, never in its padding.\n LOCAL_FAILURE carries the exact signed MOQ_ERR_NOMEM or MOQ_ERR_BUFFER\n from initial ACK retention. DELIVERY_LOCAL_FAILURE carries MOQ_ERR_BUFFER\n from facade delivery admission. UPDATE_LOCAL_FAILURE carries the exact\n local UPDATE admission error, not a peer response. None is a wire error\n code. Read\n only when struct_size >= offsetof(local_result) + sizeof(local_result).\n Older/short callers still receive the event's supported prefix but must\n not infer an error value from an absent or partial field. Zero for every\n other event kind."]
+    #[doc = " Appended after the complete preceding allocation, never in its padding.\n LOCAL_FAILURE carries the exact signed MOQ_ERR_NOMEM or MOQ_ERR_BUFFER\n from initial ACK retention. DELIVERY_LOCAL_FAILURE carries MOQ_ERR_BUFFER\n from facade delivery admission. UPDATE_LOCAL_FAILURE carries the exact\n local UPDATE admission error, not a peer response. FETCH_TERMINAL\n carries it for the two local reasons (MOQ_MEDIA_FETCH_LOCAL_FAILURE:\n MOQ_ERR_BUFFER; MOQ_MEDIA_FETCH_NOT_SENT: the admission error, or\n MOQ_DONE when the resource credential policy denied the FETCH) and\n zero for the others. None is a wire error code. Read\n only when struct_size >= offsetof(local_result) + sizeof(local_result).\n Older/short callers still receive the event's supported prefix but must\n not infer an error value from an absent or partial field. Zero for every\n other event kind."]
     pub local_result: i32,
     #[doc = " zero; never read"]
     pub _reserved_local_failure: u32,
-    #[doc = " Appended after the complete LOCAL_FAILURE allocation. Valid only for\n FILL_TERMINAL, with the exact initiating SUBSCRIBE/UPDATE ID (zero is\n valid), MOQ_FILL_* reason and MOQ_FILL_ERROR_* domain from session.h.\n A STREAM code of zero is still a failure, not COMPLETE. FILL_CREATED\n uses initiating_request_id alone, for the UPDATE that requested the\n fill (zero is valid); its reason, domain and code are zero. Each field\n is observable only when wholly covered by struct_size. Short/old outputs\n consume the event's supported prefix; an absent tail is unobserved, and\n a FILL_CREATED polled that way still releases its command slot.\n These are plain values, with no cleanup and no borrowed child handle."]
+    #[doc = " Appended after the complete LOCAL_FAILURE allocation. Valid only for\n FILL_TERMINAL, with the exact initiating SUBSCRIBE/UPDATE ID (zero is\n valid), MOQ_FILL_* reason and MOQ_FILL_ERROR_* domain from session.h.\n A STREAM code of zero is still a failure, not COMPLETE. FILL_CREATED\n uses initiating_request_id alone, for the UPDATE that requested the\n fill (zero is valid); its reason, domain and code are zero. Each field\n is observable only when wholly covered by struct_size. Short/old outputs\n consume the event's supported prefix; an absent tail is unobserved, and\n a FILL_CREATED polled that way still releases its command slot.\n These are plain values, with no cleanup and no borrowed child handle.\n\n FETCH_CREATED and FETCH_TERMINAL use the same fields for a standalone\n fetch: initiating_request_id is the FETCH's request ID (zero is valid;\n zero with MOQ_MEDIA_FETCH_NOT_SENT, which no FETCH_CREATED precedes).\n On FETCH_TERMINAL, fill_reason is a MOQ_MEDIA_FETCH_* reason,\n fill_error_domain a MOQ_MEDIA_FETCH_ERROR_* domain and fill_error_code\n the code in that domain (an error code of zero is valid when the\n domain is not NONE). FETCH_CREATED leaves the three zero."]
     pub initiating_request_id: u64,
     pub fill_reason: u32,
     pub fill_error_domain: u32,
@@ -2133,6 +2156,72 @@ unsafe extern "C" {
         initiating_request_id: u64,
     ) -> moq_result_t;
 }
+#[doc = " The range of a standalone fetch of a media track:\n [start_group:start_object, end_group:end_object), an exclusive end;\n end_object 0 requests the whole end_group, as moq_fetch_cfg_t. The fetch\n carries the subscriber priority when has_subscriber_priority is set."]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct moq_media_fetch_cfg {
+    pub struct_size: u32,
+    pub start_group: u64,
+    pub start_object: u64,
+    pub end_group: u64,
+    pub end_object: u64,
+    pub has_subscriber_priority: bool,
+    pub subscriber_priority: u8,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of moq_media_fetch_cfg"][::std::mem::size_of::<moq_media_fetch_cfg>() - 48usize];
+    ["Alignment of moq_media_fetch_cfg"][::std::mem::align_of::<moq_media_fetch_cfg>() - 8usize];
+    ["Offset of field: moq_media_fetch_cfg::struct_size"]
+        [::std::mem::offset_of!(moq_media_fetch_cfg, struct_size) - 0usize];
+    ["Offset of field: moq_media_fetch_cfg::start_group"]
+        [::std::mem::offset_of!(moq_media_fetch_cfg, start_group) - 8usize];
+    ["Offset of field: moq_media_fetch_cfg::start_object"]
+        [::std::mem::offset_of!(moq_media_fetch_cfg, start_object) - 16usize];
+    ["Offset of field: moq_media_fetch_cfg::end_group"]
+        [::std::mem::offset_of!(moq_media_fetch_cfg, end_group) - 24usize];
+    ["Offset of field: moq_media_fetch_cfg::end_object"]
+        [::std::mem::offset_of!(moq_media_fetch_cfg, end_object) - 32usize];
+    ["Offset of field: moq_media_fetch_cfg::has_subscriber_priority"]
+        [::std::mem::offset_of!(moq_media_fetch_cfg, has_subscriber_priority) - 40usize];
+    ["Offset of field: moq_media_fetch_cfg::subscriber_priority"]
+        [::std::mem::offset_of!(moq_media_fetch_cfg, subscriber_priority) - 41usize];
+};
+#[doc = " The range of a standalone fetch of a media track:\n [start_group:start_object, end_group:end_object), an exclusive end;\n end_object 0 requests the whole end_group, as moq_fetch_cfg_t. The fetch\n carries the subscriber priority when has_subscriber_priority is set."]
+pub type moq_media_fetch_cfg_t = moq_media_fetch_cfg;
+unsafe extern "C" {
+    #[doc = " Pointer-only initializer: clears and stamps ONLY the frozen v0 prefix.\n The sized initializer clears and stamps min(cfg_size, this library's\n struct size); no-op if cfg is NULL or cfg_size cannot hold struct_size."]
+    pub fn moq_media_fetch_cfg_init(cfg: *mut moq_media_fetch_cfg_t);
+}
+unsafe extern "C" {
+    pub fn moq_media_fetch_cfg_init_sized(cfg: *mut moq_media_fetch_cfg_t, cfg_size: usize);
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " Request a standalone FETCH of `track`'s Objects in `cfg`'s range, on the\n session the receiver subscribes on, with the track's namespace and name.\n Every draft the receiver supports carries it (16, 18 and 22). `cfg` is\n required and borrowed only for this call; its values are copied before\n returning.\n\n The track must be subscribed (subscribe_track, not disabled since) and\n not ended, failed or removed; a passive track (subscribed with Forward 0)\n is the expected caller. The executor sends the FETCH once the track's\n subscription is established.\n\n Nonblocking and callable from any thread: it records one command and wakes\n the endpoint executor, which sends the FETCH. MOQ_OK means recorded, not\n sent or accepted by the peer. The interrupt latch of wait() neither refuses\n nor withdraws it. Once the FETCH is sent the track gets\n MOQ_MEDIA_TRACK_FETCH_CREATED with the fetch's request ID; a command\n refused before anything is sent gets MOQ_MEDIA_TRACK_FETCH_TERMINAL with\n MOQ_MEDIA_FETCH_NOT_SENT instead. A track holds one unobserved command:\n until that event is polled (by any output size), a second call returns\n MOQ_ERR_WOULD_BLOCK with no effect. Several sent fetches of a track may be\n open at once, up to moq_media_receiver_cfg_t.max_fetches_per_track; each\n stays open until its FETCH_TERMINAL is polled.\n\n The fetch's Objects come out of poll_object with delivery_origin\n MOQ_MEDIA_DELIVERY_FETCH and the fetch's request ID in\n initiating_request_id, in the fetch stream's order. They count against\n the receiver's queue limits like any Object, and the overflow policy\n drops them like any Object. An MPEG2TS track's fetched Objects bypass its\n reorder window and take no join PSI (mpeg2ts_join_psi); they are\n validated as whole packets, mpeg2ts_strip_prefix applies to them, and each\n reports the fetch's own loss (ranges the peer marked Unknown or\n Timed-Out, and local drops) as its gap. The application merges them with\n the live Objects by Location. Each fetch ends with exactly one\n FETCH_TERMINAL, queued after every Object of the fetch has been polled or\n dropped; a fetch open when the session closes ends with\n MOQ_MEDIA_FETCH_SESSION_CLOSED. A receiver that turns terminal (fatal)\n ends open fetches as it ends open fills: it synthesizes no FETCH_TERMINAL\n (one already pollable stays pollable), except after these catalog\n failures: the catalog failing while it is still being bootstrapped, a\n catalog ACK or delivery loss, or a credential failure at service scope.\n After one of those, each open fetch still ends: its Objects not yet taken\n from the session are discarded, and it ends with the peer's terminal, or\n with MOQ_MEDIA_FETCH_SESSION_CLOSED if the session closes first. A refusal\n of the catalog subscription after the catalog took effect is an ordinary\n fatal, with no terminal. When moq_media_receiver_is_fatal() reports true\n and no FETCH_TERMINAL is pollable for a fetch, the application treats that\n fetch as ended.\n\n unsubscribe_track withdraws a command not yet taken by the executor, with\n no event, as does the track's end, failure or removal and the receiver's\n close; it does not cancel a sent fetch, whose Objects are then dropped as\n the track's are. See moq_media_receiver_withdraw_fetch() and\n moq_media_receiver_cancel_fetch().\n\n Returns:\n   MOQ_OK            recorded and scheduled\n   MOQ_ERR_INVAL     NULL r/track/cfg, a foreign track, a range that ends\n                     at or before its start, or, on draft 16, a value\n                     beyond 62 bits\n   MOQ_ERR_ABI_MISMATCH  cfg->struct_size below MOQ_MEDIA_FETCH_CFG_V0_SIZE\n   MOQ_ERR_UNSUPPORTED   the receiver has no Object path for this track\n                     (not a media track with a delivery path)\n   MOQ_ERR_WRONG_STATE   the track is not subscribed (never subscribed, or\n                     disabled by unsubscribe_track), has ended, failed\n                     locally or been removed\n   MOQ_ERR_WOULD_BLOCK   the track's previous command is not yet observed\n   MOQ_ERR_CAPACITY  max_fetches_per_track fetches of the track are open;\n                     polling one's FETCH_TERMINAL frees room\n   MOQ_ERR_LIMIT     the receiver's command identities are exhausted\n   MOQ_ERR_CLOSED    the receiver or its endpoint is terminal"]
+    pub fn moq_media_receiver_fetch_track(
+        r: *mut moq_media_receiver_t,
+        track: *mut moq_media_track_t,
+        cfg: *const moq_media_fetch_cfg_t,
+    ) -> moq_result_t;
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " Cancel one open standalone fetch of `track`, selected by the request ID\n its FETCH_CREATED carried. Zero is a valid ID. Records bounded intent and\n wakes the endpoint executor, which cancels the fetch on the session.\n MOQ_OK means scheduled (repeating it while it is pending is idempotent),\n not that the cancellation has won a race with the peer's end of the\n fetch: the fetch's single FETCH_TERMINAL reports whichever won\n (MOQ_MEDIA_FETCH_CANCELLED when the cancellation did). Objects already\n queued stay pollable and FETCH_TERMINAL follows them. The receiver\n cancels a fetch only on this call; it never cancels one by itself.\n\n Returns INVAL for NULL r/track or a foreign track, STALE_HANDLE when no\n open fetch of the track has that ID (never created, or already ended),\n CLOSED for a terminal receiver or endpoint."]
+    pub fn moq_media_receiver_cancel_fetch(
+        r: *mut moq_media_receiver_t,
+        track: *mut moq_media_track_t,
+        fetch_request_id: u64,
+    ) -> moq_result_t;
+}
+unsafe extern "C" {
+    #[must_use]
+    #[doc = " Withdraw `track`'s fetch command that the executor has not taken yet.\n Nonblocking and callable from any thread.\n\n Returns:\n   MOQ_OK            the command was withdrawn: no FETCH went out, no\n                     FETCH_CREATED or FETCH_TERMINAL follows, and the\n                     command slot is free\n   MOQ_DONE          the track has no recorded command\n   MOQ_ERR_WRONG_STATE  the executor already took the command: its\n                     admission completes and its FETCH_CREATED (or a\n                     FETCH_TERMINAL with MOQ_MEDIA_FETCH_NOT_SENT) follows,\n                     or is queued; cancel a created fetch by its request ID\n   MOQ_ERR_INVAL     NULL r/track, or a foreign track\n   MOQ_ERR_CLOSED    the receiver or its endpoint is terminal"]
+    pub fn moq_media_receiver_withdraw_fetch(
+        r: *mut moq_media_receiver_t,
+        track: *mut moq_media_track_t,
+    ) -> moq_result_t;
+}
 #[doc = " in the catalog, never subscribed"]
 pub const MOQ_MEDIA_TRACK_STATE_DISCOVERED: moq_media_track_state = 0;
 #[doc = " subscribe issued, not yet active"]
@@ -2353,7 +2442,7 @@ unsafe extern "C" {
     #[doc = " The bytes a polled object holds until cleanup, as poll_object_within\n charges them; 0 for NULL. Reads only what its stamped struct_size\n covers."]
     pub fn moq_media_object_charge(obj: *const moq_media_object_t) -> u64;
 }
-#[doc = " -- Stream terminals -------------------------------------------------- *\n With moq_media_receiver_cfg_t.surface_stream_terminals, the receiver keeps\n an ordered lane of delivery facts for its media tracks, of every\n packaging, so a consumer can tell where delivery ended, what was lost and\n where the track ends, relative to the objects it polls:\n\n   - FIN_END_OF_GROUP / FIN / RESET: how the stream carrying a subgroup\n     ended, with the last Object it carried (completely, for RESET), or\n     for a RESET that cut an Object short, that Object;\n   - RECEIVER_DROP: the receiver's overflow policy dropped Objects of the\n     track in groups group_id..last_group_id (its safety loss, beyond the\n     drop counters), from one delivery domain: the LIVE subscription, or\n     one fill, named by its initiating request ID. The drops of one\n     admission are one record per track and domain;\n   - END_OF_TRACK: the track's END_OF_TRACK, at its Location.\n\n Ordering: every terminal is one record, never coalesced, in the order the\n receiver learned of it. A record is pollable once every Object of its\n track the receiver took in before it has left the receiver (polled,\n dropped, evicted or purged), including Objects an MPEG2TS reorder window\n still holds, and the lane is read in order. To apply each fact in order,\n poll terminals after each polled Object (or poll Objects until none is\n queued, then terminals); a record never comes back ahead of an Object it\n follows. A consumer that moves polled Objects into its own pending\n storage must settle those before applying a later terminal.\n\n Fill terminals: with the lane on, a fill's MOQ_MEDIA_TRACK_FILL_TERMINAL\n is pollable only once every Object of the fill has left the receiver and\n every RECEIVER_DROP of the fill has been polled, so a fill does not\n report completion while its Objects can still be lost or before its loss.\n\n Exact debt: the receiver takes in an Object only while the lane has room\n for every record that admission can produce: a RECEIVER_DROP per\n delivery domain with queued Objects, and one for the Object itself. It\n takes in a stream terminal only while it has room for that record.\n Otherwise intake stops, under every overflow policy: the next Object\n waits upstream, so the subscription backs up as it does under\n FLOW_CONTROL, and no record is ever lost or merged with another\n admission's.\n\n MPEG2TS: an Object, status Object or END_OF_TRACK that a reorder window\n holds keeps the lane slot its intake reserved for its own record, so a\n record waiting for it never takes the room its release needs. A release\n that fits the queue destroys nothing and needs no more; one that would\n evict also needs a RECEIVER_DROP per delivery domain with queued Objects.\n Until the lane has that, the window waits, reports no deadline, and the\n application's next poll wakes the network thread to resume it; a\n subscription that completes meanwhile is retired once its window has\n released everything.\n\n Retirement: a track removed from the catalog keeps reporting the stream\n terminals already received for it, under its removed handle, until its\n subscription is released; a track added back is a new handle. A receiver\n whose catalog failed discards its media, with the stream terminals it has\n not yet put on the lane and what its MPEG2TS reorder windows hold; the\n records already on the lane stay, and become pollable as the media they\n follow leaves.\n\n Capacity: a lane of one record works, taking in one Object at a time;\n every reserved slot counts against max_stream_terminals, so a deeper lane\n lets more Objects be queued or held at once. Polling Objects and records\n always lets intake resume. A consumer that enables the lane polls it.\n\n Records name the stable track handle and carry plain values only."]
+#[doc = " -- Stream terminals -------------------------------------------------- *\n With moq_media_receiver_cfg_t.surface_stream_terminals, the receiver keeps\n an ordered lane of delivery facts for its media tracks, of every\n packaging, so a consumer can tell where delivery ended, what was lost and\n where the track ends, relative to the objects it polls:\n\n   - FIN_END_OF_GROUP / FIN / RESET: how the stream carrying a subgroup\n     ended, with the last Object it carried (completely, for RESET), or\n     for a RESET that cut an Object short, that Object;\n   - RECEIVER_DROP: the receiver's overflow policy dropped Objects of the\n     track in groups group_id..last_group_id (its safety loss, beyond the\n     drop counters), from one delivery domain: the LIVE subscription, one\n     fill, named by its initiating request ID, or one standalone fetch,\n     named by its request ID. The drops of one\n     admission are one record per track and domain;\n   - END_OF_TRACK: the track's END_OF_TRACK, at its Location.\n\n Ordering: every terminal is one record, never coalesced, in the order the\n receiver learned of it. A record is pollable once every Object of its\n track the receiver took in before it has left the receiver (polled,\n dropped, evicted or purged), including Objects an MPEG2TS reorder window\n still holds, and the lane is read in order. To apply each fact in order,\n poll terminals after each polled Object (or poll Objects until none is\n queued, then terminals); a record never comes back ahead of an Object it\n follows. A consumer that moves polled Objects into its own pending\n storage must settle those before applying a later terminal.\n\n Fill terminals: with the lane on, a fill's MOQ_MEDIA_TRACK_FILL_TERMINAL\n is pollable only once every Object of the fill has left the receiver and\n every RECEIVER_DROP of the fill has been polled, so a fill does not\n report completion while its Objects can still be lost or before its loss.\n A standalone fetch's MOQ_MEDIA_TRACK_FETCH_TERMINAL follows the same rule.\n\n Exact debt: the receiver takes in an Object only while the lane has room\n for every record that admission can produce: a RECEIVER_DROP per\n delivery domain with queued Objects, and one for the Object itself. It\n takes in a stream terminal only while it has room for that record.\n Otherwise intake stops, under every overflow policy: the next Object\n waits upstream, so the subscription backs up as it does under\n FLOW_CONTROL, and no record is ever lost or merged with another\n admission's.\n\n MPEG2TS: an Object, status Object or END_OF_TRACK that a reorder window\n holds keeps the lane slot its intake reserved for its own record, so a\n record waiting for it never takes the room its release needs. A release\n that fits the queue destroys nothing and needs no more; one that would\n evict also needs a RECEIVER_DROP per delivery domain with queued Objects.\n Until the lane has that, the window waits, reports no deadline, and the\n application's next poll wakes the network thread to resume it; a\n subscription that completes meanwhile is retired once its window has\n released everything.\n\n Retirement: a track removed from the catalog keeps reporting the stream\n terminals already received for it, under its removed handle, until its\n subscription is released; a track added back is a new handle. A receiver\n whose catalog failed discards its media, with the stream terminals it has\n not yet put on the lane and what its MPEG2TS reorder windows hold; the\n records already on the lane stay, and become pollable as the media they\n follow leaves.\n\n Capacity: a lane of one record works, taking in one Object at a time;\n every reserved slot counts against max_stream_terminals, so a deeper lane\n lets more Objects be queued or held at once. Polling Objects and records\n always lets intake resume. A consumer that enables the lane polls it.\n\n Records name the stable track handle and carry plain values only."]
 pub type moq_media_stream_terminal_kind_t = u32;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -2373,7 +2462,7 @@ pub struct moq_media_stream_terminal {
     pub has_last_object: bool,
     pub has_cut_object: bool,
     pub _reserved: [u8; 2usize],
-    #[doc = " RECEIVER_DROP: whose Objects were dropped, a MOQ_MEDIA_DELIVERY_*\n value, and for FILL the fill's initiating request ID (zero is a\n valid ID). Drops of one admission are one record per track and\n delivery domain."]
+    #[doc = " RECEIVER_DROP: whose Objects were dropped, a MOQ_MEDIA_DELIVERY_*\n value, and for FILL the fill's initiating request ID, for FETCH the\n fetch's request ID (zero is a valid ID). Drops of one admission are\n one record per track and\n delivery domain."]
     pub delivery_origin: u32,
     pub last_object_id: u64,
     pub cut_object_id: u64,
