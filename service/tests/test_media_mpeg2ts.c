@@ -19,7 +19,9 @@
  * expectations of such a build.
  */
 #include <moq/media_receiver.h>
-#include <moq/mpeg2ts.h>
+#ifdef MOQ_TEST_HAVE_MPEG2TS
+#include <moq/mpeg2ts.h>      /* MOQ_MPEG2TS_JOIN_GRACE_US */
+#endif
 #include <moq/media_sender.h>
 #include <moq/publisher.h>
 #include <moq/msf.h>
