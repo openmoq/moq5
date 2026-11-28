@@ -19,6 +19,7 @@
  * expectations of such a build.
  */
 #include <moq/media_receiver.h>
+#include <moq/mpeg2ts.h>
 #include <moq/media_sender.h>
 #include <moq/publisher.h>
 #include <moq/msf.h>
@@ -349,6 +350,9 @@ static void fx_cycle(fx_t *f)
  * the receiver's allocator (NULL = the default). */
 static uint32_t g_fx_slots;
 static const moq_alloc_t *g_fx_alloc;
+/* The next fx_setup subscribes the TS track passively (Forward 0) itself
+ * instead of auto-subscribing. */
+static bool g_fx_passive;
 
 /* An allocator that refuses its next `g_refuse_next` requests. */
 static int g_refuse_next;
@@ -409,7 +413,7 @@ static bool fx_setup(fx_t *f, moq_version_t ver, uint32_t max_objects,
     moq_media_receiver_cfg_t rc;
     moq_media_receiver_cfg_init_live_sized(&rc, sizeof(rc));
     rc.namespace_ = (moq_namespace_t){ g_ns, 2 };
-    rc.auto_subscribe = true;
+    rc.auto_subscribe = !g_fx_passive;
     rc.overflow.policy = policy;
     rc.overflow.max_objects = max_objects;
     rc.mpeg2ts_reorder_window_us = 300000;
@@ -423,6 +427,14 @@ static bool fx_setup(fx_t *f, moq_version_t ver, uint32_t max_objects,
         fx_cycle(f);
         moq_media_track_t *t = drain_events(f->r, "ts", &f->ended,
                                             &f->parse_drops);
+        if (t && g_fx_passive) {
+            const bool off = false;
+            moq_media_receiver_track_subscribe_cfg_t sc;
+            /* the plain _init stamps the frozen v0 size, which predates forward */
+            moq_media_receiver_track_subscribe_cfg_init_sized(&sc, sizeof(sc));
+            sc.forward = &off;
+            if (moq_media_receiver_subscribe_track(f->r, t, &sc) != MOQ_OK) return false;
+        }
         if (t) f->track = t;
     }
     return f->track && moq_pub_has_subscriber(f->pub, f->ts);
@@ -571,6 +583,87 @@ static moq_result_t pub_write_open(fx_t *f, uint64_t g, uint64_t o,
     moq_result_t rc = moq_pub_write_object_ex(f->pub, f->ts, &oc, f->now);
     moq_rcbuf_decref(b);
     return rc;
+}
+
+/* A passive TS track raised mid-Group: its first live Object is released
+ * after the join grace (MOQ_MPEG2TS_JOIN_GRACE_US), not after the 300 ms
+ * window, with no gap; a lower and a second raise rejoin the same way, also
+ * without a gap. Rule: every raise of a passive track lets the next window
+ * start at its first Object after the grace; a window that already released
+ * Objects is started afresh on the raise. */
+static void test_raise_joins_mid_group(moq_version_t ver)
+{
+    int before = failures;
+    fx_t f;
+    g_fx_passive = true;
+    bool ok = fx_setup(&f, ver, 64, MOQ_MEDIA_OVERFLOW_DROP_GROUP);
+    g_fx_passive = false;
+    if (!ok) { failures++; fx_free(&f); return; }
+    moq_media_track_t *t = f.track;
+    /* Passive: what the publisher writes now is not forwarded. */
+    MOQ_TEST_CHECK(pub_write_open(&f, 5, 3, 0xC3) == MOQ_OK);
+    fx_cycle(&f);
+
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.r, t, true), MOQ_OK);
+    fx_cycle(&f);
+    fx_cycle(&f);
+    MOQ_TEST_CHECK(pub_write_open(&f, 5, 7, 0xC7) == MOQ_OK);   /* mid-Group */
+    fx_cycle(&f);
+    got_t got[8];
+    MOQ_TEST_CHECK_EQ_INT(poll_all(&f, got, 8), 0);              /* inside the grace */
+    f.now += MOQ_MPEG2TS_JOIN_GRACE_US;
+    fx_cycle(&f);
+    int n = poll_all(&f, got, 8);
+    MOQ_TEST_CHECK_EQ_INT(n, 1);
+    if (n == 1) MOQ_TEST_CHECK(got[0].group == 5 && got[0].object == 7 && !got[0].gap);
+    MOQ_TEST_CHECK(pub_write_open(&f, 5, 8, 0xC8) == MOQ_OK);   /* next: at once */
+    fx_cycle(&f);
+    n = poll_all(&f, got, 8);
+    MOQ_TEST_CHECK_EQ_INT(n, 1);
+
+    /* Lower, then raise again further on: a fresh start, no gap. */
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.r, t, false), MOQ_OK);
+    fx_cycle(&f);
+    f.now += 1000000;
+    fx_cycle(&f);
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.r, t, true), MOQ_OK);
+    fx_cycle(&f);
+    fx_cycle(&f);
+    MOQ_TEST_CHECK(pub_write_open(&f, 9, 4, 0xC9) == MOQ_OK);
+    fx_cycle(&f);
+    MOQ_TEST_CHECK_EQ_INT(poll_all(&f, got, 8), 0);
+    f.now += MOQ_MPEG2TS_JOIN_GRACE_US;
+    fx_cycle(&f);
+    n = poll_all(&f, got, 8);
+    MOQ_TEST_CHECK_EQ_INT(n, 1);
+    if (n == 1) MOQ_TEST_CHECK(got[0].group == 9 && got[0].object == 4 && !got[0].gap);
+    moq_media_receiver_stats_t st;
+    MOQ_TEST_CHECK(moq_media_receiver_get_stats(f.r, &st, sizeof(st)) == MOQ_OK);
+    MOQ_TEST_CHECK_EQ_U64(st.gaps_reported, 0);
+    fx_free(&f);
+    if (failures == before) printf("PASS: ts_raise_joins_mid_group_%s\n", vname(ver));
+}
+
+/* The control: an active (not raised) subscription joining mid-Group still
+ * waits the whole window, as before. */
+static void test_active_mid_group_waits_window(moq_version_t ver)
+{
+    int before = failures;
+    fx_t f;
+    if (!fx_setup(&f, ver, 64, MOQ_MEDIA_OVERFLOW_DROP_GROUP)) {
+        failures++; fx_free(&f); return;
+    }
+    MOQ_TEST_CHECK(pub_write_open(&f, 5, 7, 0xD7) == MOQ_OK);
+    fx_cycle(&f);
+    got_t got[8];
+    f.now += MOQ_MPEG2TS_JOIN_GRACE_US;
+    fx_cycle(&f);
+    MOQ_TEST_CHECK_EQ_INT(poll_all(&f, got, 8), 0);
+    f.now += 300000;
+    fx_cycle(&f);
+    MOQ_TEST_CHECK_EQ_INT(poll_all(&f, got, 8), 1);
+    fx_free(&f);
+    if (failures == before) printf("PASS: ts_active_mid_group_waits_window_%s\n", vname(ver));
 }
 
 static moq_result_t pub_status(fx_t *f, uint64_t g, uint64_t o)
@@ -2371,6 +2464,8 @@ int main(void)
         test_e2e_copy_loss_resets(v);
         test_e2e_lost_start_keeps_previous(v);
         test_e2e_strip_join(v);
+        test_raise_joins_mid_group(v);
+        test_active_mid_group_waits_window(v);
     }
 #endif
     if (failures) {

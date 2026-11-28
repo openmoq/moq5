@@ -597,6 +597,18 @@ MOQ_API moq_result_t moq_mpeg2ts_inspect_object(
  * (with END_OF_GROUP) ended with a FIN after it, or an END_OF_GROUP status
  * followed it. */
 #define MOQ_MPEG2TS_OBJ_LAST_IN_GROUP       (1u << 1)
+/* The receiver has not released anything yet, and the caller knows its
+ * first Objects come from a join in the middle of a Group (for example a
+ * passive subscription whose Forward State was just raised): such an Object
+ * may start the receiver once it has waited MOQ_MPEG2TS_JOIN_GRACE_US (at
+ * most the reorder window), without waiting for Object 0 or the whole
+ * window. The grace still lets a slightly reordered first pair go out in
+ * order. Ignored once the receiver has started. The grace is fixed: the
+ * receiver does not know the Object interval, and 50 ms is about two
+ * Objects at the rates MPEG-TS tracks use (one Object every 20-30 ms); a
+ * window shorter than the grace bounds it. */
+#define MOQ_MPEG2TS_OBJ_JOINABLE            (1u << 2)
+#define MOQ_MPEG2TS_JOIN_GRACE_US           50000u
 
 /* One held Object of the receiver's reorder window (frozen layout). The
  * caller provides an array of these and never touches its contents. */

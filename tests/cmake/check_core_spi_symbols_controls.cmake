@@ -73,7 +73,8 @@ set(virtual_names
 set(rcbuf_names
     moq_core_internal_rcbuf_transferable)
 set(facade_names
-    moq_core_internal_sub_tick_routed)
+    moq_core_internal_sub_tick_routed
+    moq_core_internal_sub_fetch_request_id)
 set(macho "0000000000001000 T _${want}\n0000000000001800 T _${want2}\n0000000000001c00 T _${want3}\n")
 set(elf "0000000000001000 T ${want}\n0000000000001800 T ${want2}\n0000000000001c00 T ${want3}\n")
 set(versioned "0000000000001000 T ${want}@@MOQ_1\n0000000000001800 T ${want2}@@MOQ_1\n0000000000001c00 T ${want3}@@MOQ_1\n")

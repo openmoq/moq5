@@ -145,6 +145,17 @@ MOQ_API moq_result_t moq_core_internal_sub_tick_routed(
     moq_subscriber_t *sub, uint64_t now_us,
     moq_core_internal_route_fn route, void *ctx);
 
+/* The Request ID the session assigned to a fetch this subscriber made
+ * (moq_sub_fetch or moq_sub_joining_fetch), while its session fetch entry
+ * exists: from the call that created it until its terminal item is polled,
+ * it is cancelled, or the session retires it. MOQ_OK with *out_request_id;
+ * MOQ_ERR_INVAL for a NULL argument or a request of another subscriber;
+ * MOQ_ERR_STALE_HANDLE when the request or its session entry is gone (out
+ * untouched). Observing: no session state changes. Executor only. */
+MOQ_API moq_result_t moq_core_internal_sub_fetch_request_id(
+    const moq_subscriber_t *sub, const moq_sub_fetch_req_t *req,
+    uint64_t *out_request_id);
+
 #ifdef __cplusplus
 }
 #endif

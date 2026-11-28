@@ -3022,6 +3022,18 @@ moq_result_t moq_core_internal_sub_tick_routed(moq_subscriber_t *sub, uint64_t n
     return rc;
 }
 
+moq_result_t moq_core_internal_sub_fetch_request_id(const moq_subscriber_t *sub,
+                                                    const moq_sub_fetch_req_t *req,
+                                                    uint64_t *out_request_id)
+{
+    if (!sub || !req || !out_request_id || req->sub != sub) return MOQ_ERR_INVAL;
+    if (req->state == SUB_FETCH_FREE) return MOQ_ERR_STALE_HANDLE;
+    int slot = fetch_resolve_handle(sub->session, req->handle);
+    if (slot < 0) return MOQ_ERR_STALE_HANDLE;
+    *out_request_id = sub->session->fetches[slot].request_id;
+    return MOQ_OK;
+}
+
 moq_result_t moq_sub_poll_object(moq_subscriber_t *sub,
                                    moq_sub_object_t *out)
 {

@@ -46,6 +46,10 @@
 #define RECEIVER_SUB_MAX_TRACKS  32u  /* catalog + auto-subscribed tracks */
 #define RECEIVER_SUB_MAX_OBJECTS 64u
 #define RECEIVER_SUB_MAX_FILLS   16u
+/* The subscriber facade's default fetch capacity (max_fetches 0), which the
+ * receiver keeps; its media fetch records are sized from it. */
+#define RECEIVER_SUB_MAX_FETCHES 16u
+#define RECEIVER_DEFAULT_FETCHES_PER_TRACK 4u
 #define RECEIVER_DEFAULT_MAX_OBJECTS 256u
 #define RECEIVER_DEFAULT_MAX_BYTES   (32u * 1024u * 1024u)
 #define RECEIVER_PARSE_STACK_SAMPLES 64u
@@ -249,6 +253,11 @@ _Static_assert(offsetof(moq_media_receiver_cfg_t, resource_auth) >=
                  sizeof(bool) + _Alignof(moq_media_receiver_cfg_t) - 1u) &
                 ~((size_t)_Alignof(moq_media_receiver_cfg_t) - 1u)),
                "resource_auth must follow the complete stream-terminal allocation");
+_Static_assert(offsetof(moq_media_receiver_cfg_t, max_fetches_per_track) >=
+               ((offsetof(moq_media_receiver_cfg_t, resource_auth) +
+                 sizeof(void *) + _Alignof(moq_media_receiver_cfg_t) - 1u) &
+                ~((size_t)_Alignof(moq_media_receiver_cfg_t) - 1u)),
+               "max_fetches_per_track must follow the complete resource_auth allocation");
 _Static_assert(offsetof(moq_media_receiver_track_subscribe_cfg_t, location) >=
                offsetof(moq_media_receiver_track_subscribe_cfg_t,
                         mpeg2ts_program_number) + sizeof(uint32_t),
@@ -373,6 +382,11 @@ struct moq_media_track {
      * (receiver_locmaf_t), allocated when the subscription is issued, which
      * also starts a new ts_gen; NULL otherwise. */
     void            *lm;
+    /* Executor only: a raise of this passive track's Forward State is under
+     * way, so the relay starts it mid-Group; its Objects may start the
+     * window without waiting for Object 0 (MOQ_MPEG2TS_OBJ_JOINABLE) until
+     * the window releases its first Object. */
+    bool             ts_rejoin;
     receiver_track_options_t desired_options;
 
     /* Data path (network-thread state). */
@@ -447,6 +461,9 @@ struct moq_media_track {
     bool             forward_sent;     /* last forward state sent (pause) */
     bool             forward_desired;
     bool             passive;          /* subscribed with Forward 0 (option) */
+    bool             raised;           /* r->mu: the app raised the passive track
+                                          (moq_media_receiver_set_track_forward);
+                                          reconciliation forwards it while set */
     /* -- update-acknowledgment attribution state machine --------------- *
      * app_gen bumps on every subscribe_track/unsubscribe_track call that
      * CHANGES desired_subscribed; reconciled_app_gen is the newest app
@@ -504,6 +521,28 @@ struct moq_media_track {
      * command holds a selection. */
     moq_media_auth_operation_t *cmd_auth;
     uint64_t         cmd_auth_seq;
+
+    /* The standalone fetch command of moq_media_receiver_fetch_track (under
+     * mu), apart from the fill command above:
+     *   NONE     the slot is free;
+     *   QUEUED   recorded, not yet taken by the executor;
+     *   CLAIMED  taken: the executor is admitting it without the mutex, so
+     *            an unsubscribe only marks it withdrawn and admission may win;
+     *   RECEIPT  its FETCH_CREATED (or NOT_SENT FETCH_TERMINAL) is queued;
+     *            polling it frees the slot.
+     * fetch_cmd_seq is the command's receiver-wide, never-reused identity. */
+    uint8_t          fetch_cmd_state;
+    bool             fetch_cmd_withdrawn;
+    uint64_t         fetch_cmd_seq;
+    moq_media_fetch_cfg_t fetch_cmd_cfg;
+    /* Executor-owned: the FETCH credential selected for command
+     * `fetch_auth_seq`, kept across its transient admission retries and
+     * freed once it is admitted, refused or gone (as cmd_auth). */
+    moq_media_auth_operation_t *fetch_auth;
+    uint64_t         fetch_auth_seq;
+    /* Objects of this track's standalone fetches taken from the facade
+     * (under mu). Never part of the LIVE counters. */
+    uint64_t         fetch_objects_received;
 
     /* Timeline classification (network thread). is_event_timeline is any
      * packaging=="eventtimeline" track; is_media_timeline is any
@@ -618,6 +657,8 @@ typedef struct receiver_event {
     uint32_t config_generation;
     moq_media_track_t *replaces;           /* TRACK_ADDED of a replacement */
     moq_media_track_t *replaced_by;        /* TRACK_REMOVED of a replacement */
+    uint64_t fetch_cmd_seq;                /* FETCH_CREATED, or a NOT_SENT
+                                              FETCH_TERMINAL: its command */
 } receiver_event_t;
 
 /* Identity/intent only, not a second item queue. The facade keeps each child
@@ -635,6 +676,9 @@ typedef struct receiver_fill {
 /* moq_media_track.cmd_state */
 enum { FILL_CMD_NONE = 0, FILL_CMD_QUEUED, FILL_CMD_CLAIMED, FILL_CMD_ADMITTED,
        FILL_CMD_RECEIPT };
+/* moq_media_track.fetch_cmd_state */
+enum { FETCH_CMD_NONE = 0, FETCH_CMD_QUEUED, FETCH_CMD_CLAIMED,
+       FETCH_CMD_RECEIPT };
 
 typedef struct receiver_catalog_bootstrap {
     bool active, ack_seen, has_largest, have_base, terminal_seen;
@@ -661,6 +705,16 @@ typedef struct receiver_loss_carry {
  * queued Object of the fill to report it; at READY it is the summary. The
  * catalog fill and fills of other tracks never take one. */
 #define RECEIVER_FILL_DOMS (2u * RECEIVER_SUB_MAX_FILLS)
+/* One standalone fetch of a media track (moq_media_receiver_fetch_track)
+ * takes a record of its own, of any packaging, from FETCH_CREATED until its
+ * FETCH_TERMINAL is polled: the same life as a fill's, keyed by the facade
+ * request while LIVE. Fetch records follow the fill records in one table, so
+ * an Object's `dom` names either; fills allocate and look up only in the
+ * first RECEIVER_FILL_DOMS, fetches only in the rest, and neither pool
+ * takes from the other. */
+#define RECEIVER_FETCH_DOMS (2u * RECEIVER_SUB_MAX_FETCHES)
+#define RECEIVER_DOMS (RECEIVER_FILL_DOMS + RECEIVER_FETCH_DOMS)
+_Static_assert(RECEIVER_DOMS <= UINT8_MAX, "an Object names its record + 1 in a uint8_t");
 enum { DOM_FREE = 0, DOM_LIVE, DOM_RETIRED, DOM_READY };
 typedef struct receiver_fill_dom {
     uint8_t state;
@@ -690,6 +744,14 @@ typedef struct receiver_fill_dom {
     bool locmaf;
     void *lm;
     bool lm_failed;
+    /* A standalone fetch's record: reason/error_domain/error_code hold a
+     * MOQ_MEDIA_FETCH_* reason and domain, local_result its local cause.
+     * fetch_req is the facade request while LIVE; cancel_pending is the
+     * application's cancel_fetch, which the executor carries out. */
+    bool fetch;
+    bool cancel_pending;
+    int32_t local_result;
+    moq_sub_fetch_req_t *fetch_req;
 } receiver_fill_dom_t;
 
 struct moq_media_receiver {
@@ -823,7 +885,10 @@ struct moq_media_receiver {
     receiver_fill_t fills[RECEIVER_SUB_MAX_FILLS]; /* mu-protected */
     uint64_t        fill_cmd_next;    /* last fill command identity issued */
     bool            fill_blocked; /* app event drain must wake the hook */
-    receiver_fill_dom_t fill_doms[RECEIVER_FILL_DOMS]; /* mu-protected */
+    receiver_fill_dom_t fill_doms[RECEIVER_DOMS]; /* fills, then fetches;
+                                                     mu-protected */
+    uint32_t        max_fetches_per_track; /* fixed at creation */
+    uint64_t        fetch_cmd_next;   /* last fetch command identity issued */
     uint32_t        fill_ready_count;  /* READY records */
     uint64_t        fill_ready_order;
     bool            fill_dom_wake;     /* a record became READY or freed:
@@ -1147,7 +1212,7 @@ static void st_note_drop_locked(moq_media_receiver_t *r, moq_media_track_t *t,
     rec.last_group_id = group;
     rec.delivery_origin = origin;
     rec.initiating_request_id =
-        origin == MOQ_MEDIA_DELIVERY_FILL ? initiating_request_id : 0;
+        origin != MOQ_MEDIA_DELIVERY_LIVE ? initiating_request_id : 0;
     st_push_locked(r, &rec, dom);
 }
 
@@ -1832,11 +1897,24 @@ static void receiver_gen_free(moq_media_receiver_t *r, receiver_desc_gen_t *g)
 static void receiver_order_free(moq_media_receiver_t *r, moq_media_track_t *t);
 static void receiver_lm_free(moq_media_receiver_t *r, moq_media_track_t *t);
 
+/* Release the selection a fetch command holds, if any. */
+static void receiver_fetch_auth_release(moq_media_receiver_t *r,
+                                        moq_media_track_t *t)
+{
+    if (t->fetch_auth) {
+        moq_media_auth_operation_clear(t->fetch_auth, &r->alloc);
+        r->alloc.free(t->fetch_auth, sizeof(*t->fetch_auth), r->alloc.ctx);
+        t->fetch_auth = NULL;
+    }
+    t->fetch_auth_seq = 0;
+}
+
 static void receiver_track_free(moq_media_receiver_t *r, moq_media_track_t *t)
 {
     if (!t) return;
     moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
     receiver_cmd_auth_release(r, t);
+    receiver_fetch_auth_release(r, t);
     receiver_ts_free(r, t);
     receiver_order_free(r, t);
     receiver_lm_free(r, t);
@@ -4488,6 +4566,7 @@ static void receiver_auth_clear_pending(moq_media_receiver_t *r)
     for (size_t i = 0; i < r->track_count; i++) {
         moq_media_auth_operation_clear(&r->tracks[i]->auth_operation, &r->alloc);
         receiver_cmd_auth_release(r, r->tracks[i]);
+        receiver_fetch_auth_release(r, r->tracks[i]);
     }
 }
 
@@ -4549,6 +4628,180 @@ static void receiver_auth_fail(moq_media_receiver_t *r,
     moq_endpoint_wake(r->ep);
 }
 
+/* -- Standalone fetches of media tracks (moq_media_receiver_fetch_track) -- *
+ * A sent fetch owns a record in the fetch half of fill_doms from its
+ * FETCH_CREATED until its FETCH_TERMINAL is polled. Its Objects take the
+ * fill intake with that record, so they queue, drop and report loss as a
+ * fill's do, and its terminal waits for them (dom_unqueue_locked). The
+ * executor creates, retires and cancels records; the application frees a
+ * READY one by polling it and marks a LIVE one for cancellation. */
+
+/* The LIVE fetch record of facade request `req`, or -1. */
+static int dom_fetch_find_locked(const moq_media_receiver_t *r,
+                                 const moq_sub_fetch_req_t *req)
+{
+    for (size_t i = RECEIVER_FILL_DOMS; i < RECEIVER_DOMS; i++)
+        if (r->fill_doms[i].state == DOM_LIVE && r->fill_doms[i].fetch_req == req)
+            return (int)i;
+    return -1;
+}
+
+static bool dom_fetch_any_live(moq_media_receiver_t *r)
+{
+    pthread_mutex_lock(&r->mu);
+    bool live = false;
+    for (size_t i = RECEIVER_FILL_DOMS; i < RECEIVER_DOMS && !live; i++)
+        live = r->fill_doms[i].state == DOM_LIVE;
+    pthread_mutex_unlock(&r->mu);
+    return live;
+}
+
+/* The fetch ended with `reason`: its FETCH_TERMINAL is pollable once its
+ * queued Objects have left and its loss records on the lane are polled. */
+static void dom_fetch_retire_locked(moq_media_receiver_t *r, receiver_fill_dom_t *d,
+                                    uint32_t reason, uint32_t domain,
+                                    uint64_t code, int32_t local_result)
+{
+    assert(d->fetch && d->state == DOM_LIVE);
+    d->state = DOM_RETIRED;
+    d->fetch_req = NULL;
+    d->cancel_pending = false;
+    d->emit = true;
+    d->reason = reason;
+    d->error_domain = domain;
+    d->error_code = code;
+    d->local_result = local_result;
+    if (d->queued == 0 && d->st_owed == 0) dom_ready_locked(r, d);
+}
+
+/* A facade terminal item of LIVE fetch record `d` ends it; any other item
+ * kind is left to the caller. Caller holds r->mu. */
+static void dom_fetch_item_terminal_locked(moq_media_receiver_t *r,
+                                           receiver_fill_dom_t *d,
+                                           const moq_sub_fetch_item_t *item)
+{
+    if (item->kind == MOQ_SUB_FETCH_ERROR)
+        dom_fetch_retire_locked(r, d, MOQ_MEDIA_FETCH_PEER_ERROR,
+                                MOQ_MEDIA_FETCH_ERROR_REQUEST,
+                                (uint64_t)item->u.error.error_code, 0);
+    else if (item->kind == MOQ_SUB_FETCH_RESET)
+        dom_fetch_retire_locked(r, d, MOQ_MEDIA_FETCH_RESET,
+                                MOQ_MEDIA_FETCH_ERROR_STREAM,
+                                item->u.reset.error_code, 0);
+    else if (item->kind == MOQ_SUB_FETCH_COMPLETE)
+        dom_fetch_retire_locked(r, d, MOQ_MEDIA_FETCH_COMPLETE,
+                                MOQ_MEDIA_FETCH_ERROR_NONE, 0, 0);
+}
+
+/* One facade item of a media fetch. Its refs pass to the intake or are
+ * released here. An item of a fetch whose record already ended (cancelled
+ * locally, failed locally or closed) is discarded. */
+static void receiver_take_fetch_item(moq_media_receiver_t *r,
+                                     moq_sub_fetch_item_t *item)
+{
+    pthread_mutex_lock(&r->mu);
+    int dom = dom_fetch_find_locked(r, item->request);
+    if (dom < 0) {
+        pthread_mutex_unlock(&r->mu);
+        moq_sub_fetch_item_cleanup(item);
+        return;
+    }
+    receiver_fill_dom_t *d = &r->fill_doms[dom];
+    moq_media_track_t *t = d->track;
+    uint64_t id = d->initiating_request_id;
+    bool object = false;
+    switch (item->kind) {
+    case MOQ_SUB_FETCH_OBJECT:
+        object = true;
+        break;
+    case MOQ_SUB_FETCH_GAP:
+        receiver_fill_ts_range_locked(r, (size_t)dom, (uint32_t)item->u.gap.range_kind,
+                                      item->u.gap.group_id, item->u.gap.object_id);
+        break;
+    default:
+        dom_fetch_item_terminal_locked(r, d, item);
+        break;
+    }
+    bool usable = object && !t->auth_failed &&
+                  (t->local_result == MOQ_OK || t->delivery_failed);
+    if (object) t->fetch_objects_received++;
+    if (object && !usable) {
+        /* Not taken by a failed track: a local drop of the fetch. */
+        receiver_loss_carry_t c = { MOQ_MEDIA_FILL_LOSS_LOCAL_DROP,
+            d->next_pos++, item->u.object.group_id, item->u.object.object_id };
+        d->has_prev = true;
+        d->prev_group = item->u.object.group_id;
+        d->prev_object = item->u.object.object_id;
+        dom_note_loss_locked(r, (size_t)dom, &c, r->obj_tail);
+    }
+    pthread_mutex_unlock(&r->mu);
+    if (usable) {
+        /* Ownership of the item's refs passes to the intake. A fetched
+         * Object has no subgroup in the facade item; the track's
+         * subscription (read here, on the executor) supplies its Track
+         * Properties. */
+        moq_sub_object_t so;
+        memset(&so, 0, sizeof(so));
+        so.track = t->sub_track;
+        so.group_id = item->u.object.group_id;
+        so.object_id = item->u.object.object_id;
+        so.publisher_priority = item->u.object.publisher_priority;
+        so.status = MOQ_OBJECT_NORMAL;
+        so.payload = item->u.object.payload;
+        so.properties = item->u.object.properties;
+        item->u.object.payload = NULL;
+        item->u.object.properties = NULL;
+        if (t->is_sap_timeline || t->is_media_timeline || t->is_event_timeline)
+            moq_sub_object_cleanup(&so);
+        else if (track_is_ts(t))
+            receiver_on_fill_ts_object(r, t, &so, (size_t)dom, id);
+        else
+            receiver_on_fill_media_object(r, t, &so, (size_t)dom, id);
+    }
+    moq_sub_fetch_item_cleanup(item);
+}
+
+/* Drain the facade's fetch items: the catalog's joining FETCH (D16/18) and
+ * the media fetches. While a media fetch is open each item is an intake
+ * (receiver_intake_begin), as a fill item is; otherwise the loop is the
+ * catalog's alone, unchanged. */
+static void receiver_poll_fetch_items(moq_media_receiver_t *r, uint64_t now_us)
+{
+    moq_sub_fetch_item_t item;
+    for (;;) {
+        bool media = dom_fetch_any_live(r);
+        if (media && !receiver_intake_begin(r)) break;
+        if (moq_sub_poll_fetch(r->sub, &item) != MOQ_OK) {
+            if (media) receiver_intake_end(r);
+            break;
+        }
+        if (item.request == r->catalog_fetch) {
+            if (item.kind == MOQ_SUB_FETCH_OBJECT)
+                receiver_ingest_catalog(r, item.u.object.group_id,
+                                        item.u.object.object_id,
+                                        item.u.object.payload,
+                                        rcbuf_bytes(item.u.object.properties),
+                                        receiver_fetch_track_props(r, item.request),
+                                        now_us);
+            /* moq_sub_poll_fetch already released the request slot for terminal
+             * items; drop our handle (only on our own fetch) so a recycled slot
+             * can't later match. */
+            if (item.kind == MOQ_SUB_FETCH_ERROR ||
+                item.kind == MOQ_SUB_FETCH_COMPLETE ||
+                item.kind == MOQ_SUB_FETCH_RESET)
+                r->catalog_fetch = NULL;
+            moq_sub_fetch_item_cleanup(&item);
+        } else if (media) {
+            receiver_take_fetch_item(r, &item);
+        } else {
+            moq_sub_fetch_item_cleanup(&item);
+        }
+        if (media) receiver_intake_end(r);
+    }
+    /* A terminal read here may have made a fetch record ready. */
+    receiver_dom_wake(r);
+}
+
 static void receiver_pump_catalog_fetch(moq_media_receiver_t *r,
                                         uint64_t now_us)
 {
@@ -4601,26 +4854,7 @@ static void receiver_pump_catalog_fetch(moq_media_receiver_t *r,
         }
     }
 
-    moq_sub_fetch_item_t item;
-    while (moq_sub_poll_fetch(r->sub, &item) == MOQ_OK) {
-        if (item.request == r->catalog_fetch) {
-            if (item.kind == MOQ_SUB_FETCH_OBJECT)
-                receiver_ingest_catalog(r, item.u.object.group_id,
-                                        item.u.object.object_id,
-                                        item.u.object.payload,
-                                        rcbuf_bytes(item.u.object.properties),
-                                        receiver_fetch_track_props(r, item.request),
-                                        now_us);
-            /* moq_sub_poll_fetch already released the request slot for terminal
-             * items; drop our handle (only on our own fetch) so a recycled slot
-             * can't later match. */
-            if (item.kind == MOQ_SUB_FETCH_ERROR ||
-                item.kind == MOQ_SUB_FETCH_COMPLETE ||
-                item.kind == MOQ_SUB_FETCH_RESET)
-                r->catalog_fetch = NULL;
-        }
-        moq_sub_fetch_item_cleanup(&item);
-    }
+    receiver_poll_fetch_items(r, now_us);
 
     /* Catalog fills stay private until bootstrap commits. Media fills share
      * live-object conversion and preserve their distinct origin/terminal;
@@ -4709,6 +4943,28 @@ static void receiver_inspect_delivery_failures(moq_media_receiver_t *r)
                 receiver_set_fatal(r, MOQ_MEDIA_RECEIVER_FATAL_CATALOG_UNUSABLE);
                 moq_endpoint_wake(r->ep);
             }
+            continue;
+        }
+        if (failure.owner_kind == MOQ_SUB_LOCAL_FAILURE_FETCH) {
+            /* A media fetch's Objects exceeded the facade's budget: the
+             * facade cancels it; that fetch alone fails. */
+            pthread_mutex_lock(&r->mu);
+            int dom = dom_fetch_find_locked(r, failure.fetch);
+            if (dom >= 0) {
+                receiver_fill_dom_t *d = &r->fill_doms[dom];
+                receiver_event_t *event = &r->events[r->ev_tail++ % r->ev_cap];
+                *event = (receiver_event_t){
+                    .kind = MOQ_MEDIA_TRACK_DELIVERY_LOCAL_FAILURE,
+                    .track = d->track, .local_result = failure.local_result,
+                    .delivery_origin = MOQ_MEDIA_DELIVERY_FETCH,
+                    .delivery_initiating_request_id = d->initiating_request_id };
+                dom_fetch_retire_locked(r, d, MOQ_MEDIA_FETCH_LOCAL_FAILURE,
+                                        MOQ_MEDIA_FETCH_ERROR_NONE, 0,
+                                        failure.local_result);
+            }
+            pthread_mutex_unlock(&r->mu);
+            receiver_dom_wake(r);
+            if (dom >= 0) moq_endpoint_wake(r->ep);
             continue;
         }
         moq_media_track_t *track = track_for_sub(r, failure.track);
@@ -5343,7 +5599,7 @@ static void receiver_deliver_object_ex(moq_media_receiver_t *r,
         d->queued++;
     }
     o->delivery_origin = delivery_origin;
-    o->initiating_request_id = delivery_origin == MOQ_MEDIA_DELIVERY_FILL
+    o->initiating_request_id = delivery_origin != MOQ_MEDIA_DELIVERY_LIVE
         ? initiating_request_id : 0;
     if (receiver_companion_d22(r->companion_profile)) {
         o->metadata = parsed.metadata;
@@ -5440,7 +5696,8 @@ static void receiver_on_media_object(moq_media_receiver_t *r,
  * that fill. */
 /* A fill Object of a RAW or CMAF track with its fill record (the
  * stream-terminal lane): the record keys its loss and holds the fill's
- * terminal until its queued Objects have left. */
+ * terminal until its queued Objects have left. A standalone fetch's Object
+ * of such a track takes the same path with its fetch record. */
 static void receiver_on_fill_media_object(moq_media_receiver_t *r,
     moq_media_track_t *track, moq_sub_object_t *so, size_t dom,
     uint64_t initiating_request_id)
@@ -5448,6 +5705,7 @@ static void receiver_on_fill_media_object(moq_media_receiver_t *r,
     pthread_mutex_lock(&r->mu);
     receiver_fill_dom_t *d = &r->fill_doms[dom];
     receiver_dom_ref_t ref = { dom, d->next_pos++ };
+    uint32_t origin = d->fetch ? MOQ_MEDIA_DELIVERY_FETCH : MOQ_MEDIA_DELIVERY_FILL;
     if ((track->local_result != MOQ_OK && !track->delivery_failed) ||
         !track->desired_subscribed) {
         r->stats.objects_received++;
@@ -5457,7 +5715,7 @@ static void receiver_on_fill_media_object(moq_media_receiver_t *r,
         return;
     }
     pthread_mutex_unlock(&r->mu);
-    receiver_deliver_object(r, track, so, NULL, NULL, MOQ_MEDIA_DELIVERY_FILL,
+    receiver_deliver_object(r, track, so, NULL, NULL, origin,
                             initiating_request_id, &ref, NULL);
 }
 
@@ -5468,6 +5726,7 @@ static void receiver_on_fill_ts_object(moq_media_receiver_t *r,
     pthread_mutex_lock(&r->mu);
     receiver_fill_dom_t *d = &r->fill_doms[dom];
     receiver_dom_ref_t ref = { dom, d->next_pos++ };
+    uint32_t origin = d->fetch ? MOQ_MEDIA_DELIVERY_FETCH : MOQ_MEDIA_DELIVERY_FILL;
     d->has_prev = true;
     d->prev_group = so->group_id;
     d->prev_object = so->object_id;
@@ -5481,7 +5740,8 @@ static void receiver_on_fill_ts_object(moq_media_receiver_t *r,
         moq_sub_object_cleanup(so);
         return;
     }
-    bool join = ts_join_wanted_locked(r, track, d->gen);
+    /* A standalone fetch is a gap fill, not a join: it takes no join PSI. */
+    bool join = !d->fetch && ts_join_wanted_locked(r, track, d->gen);
     pthread_mutex_unlock(&r->mu);
     moq_rcbuf_t *deliver = NULL;
     receiver_join_t jr = { 0 };
@@ -5495,7 +5755,7 @@ static void receiver_on_fill_ts_object(moq_media_receiver_t *r,
         moq_sub_object_cleanup(so);
         return;
     }
-    receiver_deliver_object(r, track, so, NULL, deliver, MOQ_MEDIA_DELIVERY_FILL,
+    receiver_deliver_object(r, track, so, NULL, deliver, origin,
                             initiating_request_id, &ref, join ? &jr : NULL);
 }
 
@@ -5628,6 +5888,7 @@ typedef struct receiver_ts {
     uint64_t                    status_seq, status_us;
     bool                        end_pending;
     uint64_t                    end_group, end_object;
+    bool                        released_any;   /* the window released an Object */
 } receiver_ts_t;
 
 /* The window ctx of a track's END_OF_TRACK (an address no holder has). */
@@ -5865,6 +6126,8 @@ static bool receiver_ts_drain(moq_media_receiver_t *r, moq_media_track_t *t,
             return true;
         }
         ts->has_parked = false;
+        ts->released_any = true;
+        t->ts_rejoin = false;      /* the window has started */
     }
     ts_set_stalled(r, ts, false);
     if (ts->end_pending) {
@@ -6103,6 +6366,7 @@ static void receiver_on_ts_object(moq_media_receiver_t *r,
     moq_bytes_t pl = { so->payload ? moq_rcbuf_data(so->payload) : NULL,
                        so->payload ? moq_rcbuf_len(so->payload) : 0 };
     uint32_t flags = so->end_of_group ? MOQ_MPEG2TS_OBJ_SUBGROUP_ENDS_GROUP : 0u;
+    if (t->ts_rejoin && !ts->released_any) flags |= MOQ_MPEG2TS_OBJ_JOINABLE;
     moq_result_t rc = moq_mpeg2ts_receiver_offer(&ts->rx, now_us,
                                                  so->group_id, so->object_id,
                                                  flags, pl, h);
@@ -7944,6 +8208,269 @@ static void receiver_admit_fill_command(moq_media_receiver_t *r,
     }
 }
 
+/* Settle a taken fetch command that was not sent: back in the queue for a
+ * transient refusal, otherwise -- or once an unsubscribe withdrew it -- the
+ * slot is freed with no event. Only the command `seq` still holding the
+ * claim is touched. */
+static void receiver_fetch_unclaim_locked(moq_media_track_t *t, uint64_t seq,
+                                          bool retry)
+{
+    if (t->fetch_cmd_state != FETCH_CMD_CLAIMED || t->fetch_cmd_seq != seq) return;
+    t->fetch_cmd_state = retry && !t->fetch_cmd_withdrawn ? FETCH_CMD_QUEUED
+                                                          : FETCH_CMD_NONE;
+    t->fetch_cmd_withdrawn = false;
+}
+
+/* A taken fetch command was refused for good before any FETCH went out:
+ * its receipt is a FETCH_TERMINAL (MOQ_MEDIA_FETCH_NOT_SENT) carrying the
+ * cause. The admission checked event room before taking the command, and
+ * only the executor queues events. */
+static void receiver_fetch_refused_locked(moq_media_receiver_t *r,
+                                          moq_media_track_t *t, uint64_t seq,
+                                          moq_result_t cause)
+{
+    if (t->fetch_cmd_state != FETCH_CMD_CLAIMED || t->fetch_cmd_seq != seq) return;
+    t->fetch_cmd_withdrawn = false;
+    if (r->ev_tail - r->ev_head >= r->ev_cap) {
+        t->fetch_cmd_state = FETCH_CMD_NONE;
+        r->fatal = true;
+        r->fatal_code = MOQ_MEDIA_RECEIVER_FATAL_EVENT_OVERFLOW;
+        return;
+    }
+    receiver_event_t *event = &r->events[r->ev_tail++ % r->ev_cap];
+    *event = (receiver_event_t){ .kind = MOQ_MEDIA_TRACK_FETCH_TERMINAL,
+        .track = t, .fill_reason = MOQ_MEDIA_FETCH_NOT_SENT,
+        .fill_error_domain = MOQ_MEDIA_FETCH_ERROR_NONE,
+        .local_result = (int32_t)cause, .fetch_cmd_seq = seq };
+    t->fetch_cmd_state = FETCH_CMD_RECEIPT;
+}
+
+/* A sent fetch's record: LIVE, keyed by its facade request, with its
+ * FETCH_CREATED queued as the receipt of command `seq` (0: none). The
+ * caller checked a free fetch record and event room under r->mu, which it
+ * holds; only the executor takes records and queues events. */
+static bool receiver_fetch_open_locked(moq_media_receiver_t *r, moq_media_track_t *t,
+                                       moq_sub_fetch_req_t *req, uint64_t request_id,
+                                       uint64_t seq)
+{
+    receiver_fill_dom_t *d = NULL;
+    for (size_t i = RECEIVER_FILL_DOMS; i < RECEIVER_DOMS && !d; i++)
+        if (r->fill_doms[i].state == DOM_FREE) d = &r->fill_doms[i];
+    if (!d || r->ev_tail - r->ev_head >= r->ev_cap) {
+        /* Unreachable while only the executor takes records and queues
+         * events; a broken invariant ends the receiver (mu is held). */
+        assert(!"fetch record or event room vanished");
+        if (!r->fatal) {
+            r->fatal = true;
+            r->fatal_code = MOQ_MEDIA_RECEIVER_FATAL_EVENT_OVERFLOW;
+        }
+        return false;
+    }
+    memset(d, 0, sizeof(*d));
+    d->state = DOM_LIVE;
+    d->fetch = true;
+    d->fetch_req = req;
+    d->track = t;
+    d->gen = t->ts_gen;
+    d->initiating_request_id = request_id;
+    d->ts = track_is_ts(t);
+    receiver_event_t *event = &r->events[r->ev_tail++ % r->ev_cap];
+    *event = (receiver_event_t){ .kind = MOQ_MEDIA_TRACK_FETCH_CREATED,
+        .track = t, .initiating_request_id = request_id, .fetch_cmd_seq = seq };
+    return true;
+}
+
+/* Send the track's queued fetch command: moq_sub_fetch with the track's
+ * namespace and name on the receiver's subscriber. It is taken only with
+ * room for its receipt and a free fetch record; both are returned by the
+ * application's polls, which then wake the executor. The claim is held,
+ * without the mutex, across credential selection and the facade call; an
+ * unsubscribe meanwhile only marks it withdrawn, and admission may win. */
+static void receiver_admit_fetch_command(moq_media_receiver_t *r,
+                                         moq_media_track_t *t, uint64_t now_us)
+{
+    pthread_mutex_lock(&r->mu);
+    if (t->fetch_cmd_state != FETCH_CMD_QUEUED || !t->desired_subscribed) {
+        pthread_mutex_unlock(&r->mu);
+        return;
+    }
+    bool room = r->ev_tail - r->ev_head < r->ev_cap;
+    bool record = false;
+    for (size_t i = RECEIVER_FILL_DOMS; i < RECEIVER_DOMS && !record; i++)
+        record = r->fill_doms[i].state == DOM_FREE;
+    if (!room || !record) {
+        r->fill_blocked = true;
+        pthread_mutex_unlock(&r->mu);
+        return;
+    }
+    t->fetch_cmd_state = FETCH_CMD_CLAIMED;
+    t->fetch_cmd_withdrawn = false;
+    uint64_t seq = t->fetch_cmd_seq;
+    moq_media_fetch_cfg_t cfg = t->fetch_cmd_cfg;
+    pthread_mutex_unlock(&r->mu);
+
+    /* The command's selection is made once and reused by its retries; a
+     * different command never inherits it. */
+    if (t->fetch_auth_seq != seq) receiver_fetch_auth_release(r, t);
+    if (!t->fetch_auth) {
+        t->fetch_auth = (moq_media_auth_operation_t *)r->alloc.alloc(
+            sizeof(*t->fetch_auth), r->alloc.ctx);
+        if (!t->fetch_auth) {
+            /* No storage for a selection now: the command waits its turn. */
+            pthread_mutex_lock(&r->mu);
+            receiver_fetch_unclaim_locked(t, seq, true);
+            pthread_mutex_unlock(&r->mu);
+            return;
+        }
+        memset(t->fetch_auth, 0, sizeof(*t->fetch_auth));
+        t->fetch_auth_seq = seq;
+    }
+    moq_media_auth_request_t request =
+        receiver_auth_request(r, MOQ_MEDIA_AUTH_ACTION_FETCH, t);
+    moq_result_t rc = moq_media_auth_operation_prepare(t->fetch_auth,
+        &r->auth_source, &request, r->transport_version, &r->alloc);
+    AUTH_PRE_ADMIT(r, t);
+    pthread_mutex_lock(&r->mu);
+    bool current = !r->fatal && !t->removed && !t->ended && !t->auth_failed &&
+                   t->local_result == MOQ_OK && t->desired_subscribed &&
+                   !t->fetch_cmd_withdrawn && t->fetch_cmd_state == FETCH_CMD_CLAIMED &&
+                   t->fetch_cmd_seq == seq;
+    if (!current) receiver_fetch_unclaim_locked(t, seq, true);
+    else if (rc != MOQ_OK) receiver_fetch_refused_locked(r, t, seq, rc);
+    pthread_mutex_unlock(&r->mu);
+    /* A command put back in the queue keeps its selection; a withdrawn one
+     * is released by the next admission pass. */
+    if (!current) return;
+    if (rc != MOQ_OK) {
+        /* The request alone fails: the track and its subscription stay. */
+        moq_media_auth_operation_notify(t->fetch_auth, &r->auth_source, &request,
+                                        MOQ_MEDIA_AUTH_SCOPE_REQUEST, t);
+        receiver_fetch_auth_release(r, t);
+        moq_endpoint_wake(r->ep);
+        return;
+    }
+
+    moq_sub_fetch_cfg_t fcfg;
+    moq_sub_fetch_cfg_init_sized(&fcfg, sizeof(fcfg));
+    fcfg.track_namespace = r->namespace_;
+    fcfg.track_name = t->desc.name;
+    fcfg.start_group = cfg.start_group;
+    fcfg.start_object = cfg.start_object;
+    fcfg.end_group = cfg.end_group;
+    fcfg.end_object = cfg.end_object;
+    fcfg.has_subscriber_priority = cfg.has_subscriber_priority;
+    fcfg.subscriber_priority = cfg.subscriber_priority;
+    fcfg.auth_tokens = t->fetch_auth->list.tokens;
+    fcfg.auth_token_count = t->fetch_auth->list.count;
+    moq_sub_fetch_req_t *req = NULL;
+    rc = moq_sub_fetch(r->sub, &fcfg, now_us, &req);
+    if (rc == MOQ_OK) {
+        /* The session entry exists from this call on: its Request ID is
+         * the fetch's identity for the application. */
+        uint64_t request_id = 0;
+        moq_result_t idrc = moq_core_internal_sub_fetch_request_id(r->sub, req,
+                                                                   &request_id);
+        assert(idrc == MOQ_OK);
+        (void)idrc;
+        receiver_fetch_auth_release(r, t);
+        pthread_mutex_lock(&r->mu);
+        /* Only this executor takes fetch records and queues events, so the
+         * record and the room checked above are still there. */
+        if (!receiver_fetch_open_locked(r, t, req, request_id, seq)) {
+            t->fetch_cmd_state = FETCH_CMD_NONE;
+            pthread_mutex_unlock(&r->mu);
+            return;
+        }
+        /* Admission won, even over an unsubscribe that came during the call. */
+        t->fetch_cmd_state = FETCH_CMD_RECEIPT;
+        t->fetch_cmd_withdrawn = false;
+        pthread_mutex_unlock(&r->mu);
+        moq_endpoint_wake(r->ep);
+        return;
+    }
+    bool auth_error = receiver_auth_encoding_error(r, t->fetch_auth, rc);
+    bool retry = !auth_error && receiver_admission_retry(rc);
+    pthread_mutex_lock(&r->mu);
+    if (retry) receiver_fetch_unclaim_locked(t, seq, true);
+    else receiver_fetch_refused_locked(r, t, seq, rc);
+    pthread_mutex_unlock(&r->mu);
+    if (auth_error)
+        moq_media_auth_operation_notify(t->fetch_auth, &r->auth_source, &request,
+                                        MOQ_MEDIA_AUTH_SCOPE_REQUEST, t);
+    if (!retry) {
+        receiver_fetch_auth_release(r, t);
+        moq_endpoint_wake(r->ep);
+    }
+}
+
+/* Each track's queued fetch command goes out once its subscription is
+ * established. A command of a track that ended, failed or was removed is
+ * withdrawn with no event, as a fill command is. */
+static void receiver_admit_fetch_commands(moq_media_receiver_t *r, uint64_t now_us)
+{
+    for (size_t i = 0; i < r->track_count; i++) {
+        moq_media_track_t *t = r->tracks[i];
+        pthread_mutex_lock(&r->mu);
+        if (t->fetch_cmd_state == FETCH_CMD_QUEUED &&
+            (t->ended || t->removed || t->local_result != MOQ_OK || t->auth_failed))
+            t->fetch_cmd_state = FETCH_CMD_NONE;
+        bool queued = t->fetch_cmd_state == FETCH_CMD_QUEUED;
+        bool selection_live = queued && t->fetch_cmd_seq == t->fetch_auth_seq;
+        pthread_mutex_unlock(&r->mu);
+        if (t->fetch_auth && !selection_live) receiver_fetch_auth_release(r, t);
+        if (!queued || !t->sub_track || !moq_sub_track_is_active(t->sub_track))
+            continue;
+        receiver_admit_fetch_command(r, t, now_us);
+    }
+}
+
+/* Carry out the application's cancel_fetch calls. A successful facade
+ * cancel discards the fetch's items still in the facade and ends the fetch
+ * as CANCELLED; any other final answer means the fetch already ended there,
+ * and its own terminal (or local failure notice) is still to be read. */
+static void receiver_cancel_fetches(moq_media_receiver_t *r, uint64_t now_us)
+{
+    for (size_t i = RECEIVER_FILL_DOMS; i < RECEIVER_DOMS; i++) {
+        receiver_fill_dom_t *d = &r->fill_doms[i];
+        pthread_mutex_lock(&r->mu);
+        bool pending = d->state == DOM_LIVE && d->cancel_pending;
+        moq_sub_fetch_req_t *req = d->fetch_req;
+        pthread_mutex_unlock(&r->mu);
+        if (!pending) continue;
+        moq_result_t rc = moq_sub_cancel_fetch(r->sub, req, now_us);
+        if (rc == MOQ_ERR_WOULD_BLOCK || rc == MOQ_ERR_BUFFER) continue;
+        pthread_mutex_lock(&r->mu);
+        if (d->state == DOM_LIVE && d->fetch_req == req) {
+            if (rc == MOQ_OK)
+                dom_fetch_retire_locked(r, d, MOQ_MEDIA_FETCH_CANCELLED,
+                                        MOQ_MEDIA_FETCH_ERROR_NONE, 0, 0);
+            else
+                d->cancel_pending = false;
+        }
+        pthread_mutex_unlock(&r->mu);
+    }
+    receiver_dom_wake(r);
+}
+
+/* The session closed: the facade ends its fetches with no terminal item, so
+ * every fetch still open ends here, after the items already read (the
+ * fetch items were drained earlier in this pass). A command not yet sent is
+ * withdrawn with no event. */
+static void receiver_close_fetches(moq_media_receiver_t *r, moq_session_t *session)
+{
+    if (moq_session_state(session) != MOQ_SESS_CLOSED) return;
+    pthread_mutex_lock(&r->mu);
+    for (size_t i = RECEIVER_FILL_DOMS; i < RECEIVER_DOMS; i++)
+        if (r->fill_doms[i].state == DOM_LIVE)
+            dom_fetch_retire_locked(r, &r->fill_doms[i], MOQ_MEDIA_FETCH_SESSION_CLOSED,
+                                    MOQ_MEDIA_FETCH_ERROR_NONE, 0, 0);
+    for (size_t i = 0; i < r->track_count; i++)
+        if (r->tracks[i]->fetch_cmd_state == FETCH_CMD_QUEUED)
+            r->tracks[i]->fetch_cmd_state = FETCH_CMD_NONE;
+    pthread_mutex_unlock(&r->mu);
+    receiver_dom_wake(r);
+}
+
 /* Reconcile per-track delivery (the subscription's Forward State) with the two
  * things that can suppress it: an app unsubscribe (desired_subscribed=false) and
  * FLOW_CONTROL backpressure. A disabled track keeps its handle but pauses with
@@ -7990,6 +8517,7 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
          * toggle or silently swallow the toggle's own future update. */
         pthread_mutex_lock(&r->mu);
         bool want = t->desired_subscribed;
+        bool raised = t->raised;
         uint64_t gen_snap = t->app_gen;
         pthread_mutex_unlock(&r->mu);
         /* Queued objects for a disabled track are purged in unsubscribe_track
@@ -8000,7 +8528,41 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
          * its attribution, and must stay unreconciled for the next pass. */
         RECONCILE_RACE_HOOK();
 
-        bool target = want && flow_allows && !t->passive;
+        /* A passive track forwards only while the app raised it; raising
+         * sends this update alone (never a join fill, on any draft). */
+        bool target = want && flow_allows && (!t->passive || raised);
+#ifdef MOQ_SERVICE_HAVE_MPEG2TS
+        /* A raise of a passive MPEG-TS track: the relay starts forwarding it
+         * mid-Group, so its first Objects may start the window at once
+         * instead of waiting for Object 0 or the whole window. A window that
+         * already released Objects before a lower is started afresh, since
+         * the raised stream resumes past its last Location. */
+        if (target && t->passive && !t->forward_sent && !t->ts_rejoin && t->ts) {
+            receiver_ts_t *ts = (receiver_ts_t *)t->ts;
+            if (!ts->released_any) {
+                t->ts_rejoin = true;
+            } else {
+                /* Objects still held from before the lower are not wanted;
+                 * they count as received and dropped, so none vanishes. */
+                uint64_t held = 0;
+                for (size_t i = 0; i < ts->slot_count; i++)
+                    if (ts->slots[i].used && ts->slots[i].ctx &&
+                        ts->slots[i].ctx != RECEIVER_TS_END_MARK) held++;
+                if (ts->has_parked && ts->parked.ctx &&
+                    ts->parked.ctx != RECEIVER_TS_END_MARK) held++;
+                if (receiver_ts_start(r, t, t->desired_ts_program)) {
+                    t->ts_rejoin = true;
+                    if (held) {
+                        pthread_mutex_lock(&r->mu);
+                        r->stats.objects_received += held;
+                        r->stats.objects_dropped += held;
+                        pthread_mutex_unlock(&r->mu);
+                    }
+                }
+                /* else: allocation failed; the next pass tries again */
+            }
+        }
+#endif
         t->forward_desired = target;
         if (t->forward_desired == t->forward_sent) {
             moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
@@ -8242,10 +8804,18 @@ static void receiver_retire_failed_catalog(moq_media_receiver_t *r, uint64_t now
         moq_sub_object_cleanup(&object);
     moq_sub_fetch_item_t fetch;
     while (moq_sub_poll_fetch(r->sub, &fetch) == MOQ_OK) {
-        if (fetch.request == r->catalog_fetch &&
-            (fetch.kind == MOQ_SUB_FETCH_ERROR || fetch.kind == MOQ_SUB_FETCH_COMPLETE ||
-             fetch.kind == MOQ_SUB_FETCH_RESET))
-            r->catalog_fetch = NULL;
+        if (fetch.request == r->catalog_fetch) {
+            if (fetch.kind == MOQ_SUB_FETCH_ERROR || fetch.kind == MOQ_SUB_FETCH_COMPLETE ||
+                fetch.kind == MOQ_SUB_FETCH_RESET)
+                r->catalog_fetch = NULL;
+        } else {
+            /* As the fill drain below: Objects are discarded, a media
+             * fetch's terminal still ends it. */
+            pthread_mutex_lock(&r->mu);
+            int dom = dom_fetch_find_locked(r, fetch.request);
+            if (dom >= 0) dom_fetch_item_terminal_locked(r, &r->fill_doms[dom], &fetch);
+            pthread_mutex_unlock(&r->mu);
+        }
         moq_sub_fetch_item_cleanup(&fetch);
     }
     if (r->catalog_fetch &&
@@ -8396,6 +8966,8 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         (void)receiver_tick(r, now_us);
         receiver_inspect_delivery_failures(r);
         receiver_retire_failed_catalog(r, now_us);
+        /* Fetches still open end here too when the session closes. */
+        receiver_close_fetches(r, session);
         return;
     }
     if (fatal) {
@@ -8541,6 +9113,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
     receiver_inspect_delivery_failures(r);
     if (r->catalog_ack_failed) {
         receiver_retire_failed_catalog(r, now_us);
+        receiver_close_fetches(r, session);
         return;
     }
 
@@ -8613,6 +9186,10 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         receiver_bootstrap_fail(r);
     r->catalog_done_pending = false;
     receiver_cancel_fills(r, now_us);
+    /* Standalone fetches: the application's cancellations, then, on a closed
+     * session, the end of every fetch still open. */
+    receiver_cancel_fetches(r, now_us);
+    receiver_close_fetches(r, session);
     if (r->joins_by_fill) receiver_process_subscription_dones(r, now_us);
     receiver_settle_completions(r, now_us);
     receiver_retire_tracks(r, now_us);
@@ -8644,6 +9221,7 @@ static void receiver_hook(moq_endpoint_t *ep, moq_session_t *session,
         return;
     }
     receiver_reconcile_delivery(r, now_us);
+    receiver_admit_fetch_commands(r, now_us);
 
     receiver_ts_timers(r, now_us);
     receiver_st_mark_ready(r);
@@ -8927,6 +9505,7 @@ static void receiver_cfg_read(const moq_media_receiver_cfg_t *in,
     RCFG_COPY(mpeg2ts_strip_prefix);
     RCFG_COPY(mpeg2ts_join_psi);
     RCFG_COPY(resource_auth);
+    RCFG_COPY(max_fetches_per_track);
 #undef RCFG_COPY
     {
         const size_t end = offsetof(moq_media_receiver_cfg_t,
@@ -9257,6 +9836,8 @@ static moq_result_t receiver_new(moq_endpoint_t *ep, bool owns,
                           : RECEIVER_DEFAULT_TS_WINDOW_US;
     r->ts_strip_prefix = cfg->mpeg2ts_strip_prefix;
     r->ts_join_psi = cfg->mpeg2ts_join_psi;
+    r->max_fetches_per_track = cfg->max_fetches_per_track
+        ? cfg->max_fetches_per_track : RECEIVER_DEFAULT_FETCHES_PER_TRACK;
     r->ts_deadline_us = UINT64_MAX;
     pthread_mutex_init(&r->mu, NULL);
 
@@ -9577,12 +10158,12 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
     memset(ev, 0, n);
 
     pthread_mutex_lock(&r->mu);
-    /* A READY fill record whose place has come -- every event queued before
-     * it became ready is read -- goes ahead of the next queued event; among
-     * those, the one ready first. */
+    /* A READY fill or fetch record whose place has come -- every event
+     * queued before it became ready is read -- goes ahead of the next queued
+     * event; among those, the one ready first. */
     receiver_fill_dom_t *ready = NULL;
     if (r->fill_ready_count > 0) {
-        for (size_t i = 0; i < RECEIVER_FILL_DOMS; i++) {
+        for (size_t i = 0; i < RECEIVER_DOMS; i++) {
             receiver_fill_dom_t *d = &r->fill_doms[i];
             if (d->state != DOM_READY ||
                 (int32_t)(r->ev_head - d->ready_seq) < 0) continue;
@@ -9593,7 +10174,8 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
         moq_media_track_event_t full;
         memset(&full, 0, sizeof(full));
         full.struct_size = (uint32_t)n;
-        full.kind = MOQ_MEDIA_TRACK_FILL_TERMINAL;
+        full.kind = ready->fetch ? MOQ_MEDIA_TRACK_FETCH_TERMINAL
+                                 : MOQ_MEDIA_TRACK_FILL_TERMINAL;
         full.track = ready->track;
         full.desc = ready->track->desc_cur;
         full.config_generation = ready->track->config_gen;
@@ -9601,6 +10183,7 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
         full.fill_reason = ready->reason;
         full.fill_error_domain = ready->error_domain;
         full.fill_error_code = ready->error_code;
+        full.local_result = ready->local_result;   /* zero for a fill */
         if (n >= MEDIA_TRACK_EVENT_FILL_LOSS_END && ready->pending.causes) {
             full.fill_unreported_loss_causes = ready->pending.causes;
             full.fill_unreported_loss_group = ready->pending.group;
@@ -9628,6 +10211,14 @@ static moq_result_t receiver_poll_track(moq_media_receiver_t *r,
             e.track->cmd_state == FILL_CMD_RECEIPT &&
             e.track->cmd_seq == e.fill_cmd_seq)
             e.track->cmd_state = FILL_CMD_NONE;
+        /* Likewise a fetch command's receipt: its FETCH_CREATED, or the
+         * NOT_SENT FETCH_TERMINAL of a refused one. */
+        if ((e.kind == MOQ_MEDIA_TRACK_FETCH_CREATED ||
+             e.kind == MOQ_MEDIA_TRACK_FETCH_TERMINAL) && e.track &&
+            e.fetch_cmd_seq != 0 &&
+            e.track->fetch_cmd_state == FETCH_CMD_RECEIPT &&
+            e.track->fetch_cmd_seq == e.fetch_cmd_seq)
+            e.track->fetch_cmd_state = FETCH_CMD_NONE;
         bool wake_fill = r->fill_blocked;
         pthread_mutex_unlock(&r->mu);
         if (wake_fill) moq_endpoint_wake(r->ep);
@@ -10126,6 +10717,11 @@ moq_result_t moq_media_receiver_unsubscribe_track(
      * Admitted fills are not cancelled. */
     if (track->cmd_state == FILL_CMD_QUEUED) track->cmd_state = FILL_CMD_NONE;
     else if (track->cmd_state == FILL_CMD_CLAIMED) track->cmd_withdrawn = true;
+    /* The same for a fetch command; sent fetches are not cancelled. */
+    if (track->fetch_cmd_state == FETCH_CMD_QUEUED)
+        track->fetch_cmd_state = FETCH_CMD_NONE;
+    else if (track->fetch_cmd_state == FETCH_CMD_CLAIMED)
+        track->fetch_cmd_withdrawn = true;
     /* Purge the track's queued objects now, under the same lock that guards the
      * queue (a pure data operation -- no session calls -- so it is safe off the
      * network thread). Doing it here rather than in the delivery reconcile makes
@@ -10134,6 +10730,35 @@ moq_result_t moq_media_receiver_unsubscribe_track(
      * that arrive before the forward=false update lands are dropped at intake. */
     obj_compact_locked(r, keep_not_track, track);
     track->has_drop_filter = false;
+    pthread_mutex_unlock(&r->mu);
+
+    moq_endpoint_wake(r->ep);
+    return MOQ_OK;
+}
+
+moq_result_t moq_media_receiver_set_track_forward(
+    moq_media_receiver_t *r, moq_media_track_t *track, bool forward)
+{
+    if (!r || !track) return MOQ_ERR_INVAL;
+    if (r->ep && moq_endpoint_is_closed(r->ep)) return MOQ_ERR_CLOSED;
+
+    pthread_mutex_lock(&r->mu);
+    if (r->fatal) { pthread_mutex_unlock(&r->mu); return MOQ_ERR_CLOSED; }
+    if (!receiver_owns_track(r, track)) {
+        pthread_mutex_unlock(&r->mu);
+        return MOQ_ERR_INVAL;
+    }
+    /* Only a track the app subscribed passively, still wanted and alive. */
+    bool passive = track->desired_options.has_forward && !track->desired_options.forward;
+    if (!passive || !track->desired_subscribed || track->removed || track->ended ||
+        track->auth_failed || track->local_result != MOQ_OK) {
+        pthread_mutex_unlock(&r->mu);
+        return MOQ_ERR_WRONG_STATE;
+    }
+    if (track->raised != forward) {
+        track->raised = forward;
+        track->app_gen++;          /* state-changing app intent */
+    }
     pthread_mutex_unlock(&r->mu);
 
     moq_endpoint_wake(r->ep);
@@ -10205,6 +10830,132 @@ moq_result_t moq_media_receiver_cancel_fill(
     }
     pthread_mutex_unlock(&r->mu);
     if (rc == MOQ_OK) moq_endpoint_wake(r->ep);
+    return rc;
+}
+
+void moq_media_fetch_cfg_init(moq_media_fetch_cfg_t *cfg)
+{
+    moq_media_fetch_cfg_init_sized(cfg, MOQ_MEDIA_FETCH_CFG_V0_SIZE);
+}
+
+void moq_media_fetch_cfg_init_sized(moq_media_fetch_cfg_t *cfg, size_t cfg_size)
+{
+    if (!cfg || cfg_size < sizeof(cfg->struct_size)) return;
+    size_t n = cfg_size < sizeof(*cfg) ? cfg_size : sizeof(*cfg);
+    unsigned char *storage = (unsigned char *)cfg;
+    memset(storage, 0, n);
+    uint32_t stamp = (uint32_t)n;
+    memcpy(storage, &stamp, sizeof(stamp));
+}
+
+/* Open standalone fetches of `track`: created, with a FETCH_TERMINAL not yet
+ * polled. Caller holds r->mu. */
+static uint32_t receiver_open_fetches_locked(const moq_media_receiver_t *r,
+                                             const moq_media_track_t *track)
+{
+    uint32_t n = 0;
+    for (size_t i = RECEIVER_FILL_DOMS; i < RECEIVER_DOMS; i++)
+        if (r->fill_doms[i].state != DOM_FREE && r->fill_doms[i].track == track)
+            n++;
+    return n;
+}
+
+moq_result_t moq_media_receiver_fetch_track(
+    moq_media_receiver_t *r, moq_media_track_t *track,
+    const moq_media_fetch_cfg_t *cfg)
+{
+    if (!r || !track || !cfg) return MOQ_ERR_INVAL;
+    if (r->ep && moq_endpoint_is_closed(r->ep)) return MOQ_ERR_CLOSED;
+    if (cfg->struct_size < MOQ_MEDIA_FETCH_CFG_V0_SIZE) return MOQ_ERR_ABI_MISMATCH;
+    /* Every field is within the v0 floor: copy the values, never the
+     * caller's storage beyond it. */
+    moq_media_fetch_cfg_t copy;
+    memset(&copy, 0, sizeof(copy));
+    copy.struct_size = (uint32_t)sizeof(copy);
+    copy.start_group = cfg->start_group;
+    copy.start_object = cfg->start_object;
+    copy.end_group = cfg->end_group;
+    copy.end_object = cfg->end_object;
+    copy.has_subscriber_priority = cfg->has_subscriber_priority;
+    copy.subscriber_priority = cfg->subscriber_priority;
+    /* The range ends after its start: end_object 0 is the whole end group,
+     * otherwise the end is exclusive. */
+    bool empty = copy.end_group < copy.start_group ||
+        (copy.end_group == copy.start_group && copy.end_object != 0 &&
+         copy.end_object <= copy.start_object);
+    if (empty) return MOQ_ERR_INVAL;
+
+    pthread_mutex_lock(&r->mu);
+    moq_result_t rc = MOQ_OK;
+    if (r->fatal) rc = MOQ_ERR_CLOSED;
+    else if (!receiver_owns_track(r, track)) rc = MOQ_ERR_INVAL;
+    else if (r->transport_version == MOQ_VERSION_DRAFT_16 &&
+             (copy.start_group > MOQ_QUIC_VARINT_MAX ||
+              copy.start_object > MOQ_QUIC_VARINT_MAX ||
+              copy.end_group > MOQ_QUIC_VARINT_MAX ||
+              copy.end_object > MOQ_QUIC_VARINT_MAX))
+        rc = MOQ_ERR_INVAL;
+    else if (!track->has_media_path) rc = MOQ_ERR_UNSUPPORTED;
+    else if (track->ended || track->removed || track->local_result != MOQ_OK ||
+             track->auth_failed || !track->desired_subscribed)
+        rc = MOQ_ERR_WRONG_STATE;
+    else if (track->fetch_cmd_state != FETCH_CMD_NONE) rc = MOQ_ERR_WOULD_BLOCK;
+    else if (r->fetch_cmd_next == UINT64_MAX) rc = MOQ_ERR_LIMIT;
+    /* The bound replenishes as terminals are polled: a capacity refusal. */
+    else if (receiver_open_fetches_locked(r, track) >= r->max_fetches_per_track)
+        rc = MOQ_ERR_CAPACITY;
+    else {
+        track->fetch_cmd_state = FETCH_CMD_QUEUED;
+        track->fetch_cmd_withdrawn = false;
+        track->fetch_cmd_seq = ++r->fetch_cmd_next;
+        track->fetch_cmd_cfg = copy;
+    }
+    pthread_mutex_unlock(&r->mu);
+    if (rc == MOQ_OK) moq_endpoint_wake(r->ep);
+    return rc;
+}
+
+moq_result_t moq_media_receiver_cancel_fetch(
+    moq_media_receiver_t *r, moq_media_track_t *track,
+    uint64_t fetch_request_id)
+{
+    if (!r || !track) return MOQ_ERR_INVAL;
+    if (r->ep && moq_endpoint_is_closed(r->ep)) return MOQ_ERR_CLOSED;
+    pthread_mutex_lock(&r->mu);
+    moq_result_t rc = MOQ_ERR_STALE_HANDLE;
+    if (r->fatal) rc = MOQ_ERR_CLOSED;
+    else if (!receiver_owns_track(r, track)) rc = MOQ_ERR_INVAL;
+    else {
+        for (size_t i = RECEIVER_FILL_DOMS; i < RECEIVER_DOMS; i++) {
+            receiver_fill_dom_t *d = &r->fill_doms[i];
+            if (d->state == DOM_LIVE && d->track == track &&
+                d->initiating_request_id == fetch_request_id) {
+                d->cancel_pending = true;
+                rc = MOQ_OK;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&r->mu);
+    if (rc == MOQ_OK) moq_endpoint_wake(r->ep);
+    return rc;
+}
+
+moq_result_t moq_media_receiver_withdraw_fetch(
+    moq_media_receiver_t *r, moq_media_track_t *track)
+{
+    if (!r || !track) return MOQ_ERR_INVAL;
+    if (r->ep && moq_endpoint_is_closed(r->ep)) return MOQ_ERR_CLOSED;
+    pthread_mutex_lock(&r->mu);
+    moq_result_t rc;
+    if (r->fatal) rc = MOQ_ERR_CLOSED;
+    else if (!receiver_owns_track(r, track)) rc = MOQ_ERR_INVAL;
+    else if (track->fetch_cmd_state == FETCH_CMD_QUEUED) {
+        track->fetch_cmd_state = FETCH_CMD_NONE;
+        rc = MOQ_OK;
+    } else if (track->fetch_cmd_state == FETCH_CMD_NONE) rc = MOQ_DONE;
+    else rc = MOQ_ERR_WRONG_STATE;
+    pthread_mutex_unlock(&r->mu);
     return rc;
 }
 

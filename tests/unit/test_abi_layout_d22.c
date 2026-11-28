@@ -1193,7 +1193,28 @@ PIN_THROUGH(moq_media_receiver_cfg_t, surface_stream_terminals,
 PIN_AFTER(moq_media_receiver_cfg_t, surface_stream_terminals, resource_auth);
 PIN_AT(moq_media_receiver_cfg_t, resource_auth,
        120, 88 - ABI_RECEIVER_ENUM_SHIFT, 96);
-PIN_SIZE(moq_media_receiver_cfg_t, 128, 92 - ABI_RECEIVER_ENUM_SHIFT, 104);
+/* The per-track fetch bound starts at the complete sizeof through
+ * resource_auth (128 LP64, 92 i386, 104 ARM), past its tail padding, which
+ * the reserved spacer covers (none on LP64 and i386, four bytes on ARM). */
+PIN_THROUGH(moq_media_receiver_cfg_t, resource_auth,
+            128, 92 - ABI_RECEIVER_ENUM_SHIFT, 104, 8, 4, 8);
+PIN_AFTER(moq_media_receiver_cfg_t, resource_auth, max_fetches_per_track);
+PIN_AT(moq_media_receiver_cfg_t, _reserved_auth,
+       128, 92 - ABI_RECEIVER_ENUM_SHIFT, 100);
+PIN_AT(moq_media_receiver_cfg_t, max_fetches_per_track,
+       132, 96 - ABI_RECEIVER_ENUM_SHIFT, 104);
+PIN_SIZE(moq_media_receiver_cfg_t, 136, 100 - ABI_RECEIVER_ENUM_SHIFT, 112);
+/* A standalone fetch's range: four uint64_t after struct_size (4-aligned on
+ * i386), then the priority pair; the v0 floor ends at subscriber_priority. */
+PIN_AT(moq_media_fetch_cfg_t, start_group, 8, 4, 8);
+PIN_AT(moq_media_fetch_cfg_t, start_object, 16, 12, 16);
+PIN_AT(moq_media_fetch_cfg_t, end_group, 24, 20, 24);
+PIN_AT(moq_media_fetch_cfg_t, end_object, 32, 28, 32);
+PIN_AT(moq_media_fetch_cfg_t, has_subscriber_priority, 40, 36, 40);
+PIN_AT(moq_media_fetch_cfg_t, subscriber_priority, 41, 37, 41);
+PIN_THROUGH(moq_media_fetch_cfg_t, subscriber_priority, 48, 40, 48, 8, 4, 8);
+PIN_SIZE(moq_media_fetch_cfg_t, 48, 40, 48);
+PIN_V0(MOQ_MEDIA_FETCH_CFG_V0_SIZE, 42, 38, 42);
 /* The descriptor's prefix: the common decoder spans, then the borrowed
  * pointer to the parsed CMAF record, through the is_live floor. */
 PIN_AT(moq_media_track_desc_t, codec_config, 112, 64, 64);
