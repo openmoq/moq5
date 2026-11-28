@@ -174,10 +174,12 @@ current Group comes with a fill: the live deltas of that first Group are
 held (at most 64, each for at most 300 ms) until the fill has decoded the
 Group's Objects before them, from a full header, and then decode in
 Location order after the fill's. A fill's Objects are decoded by a
-decoder of the fill's own and delivered as FILL; nothing is shared across
-origins otherwise, and a Location both deliver is delivered by both. The
-track's END_OF_TRACK, and an END_OF_GROUP status Object, follow the
-Objects held before them. The counters are in the stats.
+decoder of the fill's own and delivered as FILL, and a standalone
+fetch's by a decoder of the fetch's own, delivered as FETCH; nothing is
+shared across origins otherwise, and a Location both deliver is
+delivered by both. The track's END_OF_TRACK, and an END_OF_GROUP status
+Object, follow the Objects held before them. The counters are in the
+stats.
 
 A LOCMAF Object carries no configuration identity: after a replacement a
 Group encoded under the previous CMAF Header is rebuilt with the new

@@ -26,6 +26,9 @@
  * - a rawBoxes Object then a delta on a fill: the delta is refused there;
  * - the join Group bootstraps while the next Group runs; a history fill of
  *   earlier Groups decodes in its own decoder;
+ * - a standalone fetch's Objects decode in a decoder of the fetch's own and
+ *   are delivered as FETCH, canonical CMAF; the decoder goes when the fetch
+ *   ends, or with the receiver while the fetch is open;
  * - every Object taken in is counted once.
  */
 #include <moq/media_receiver.h>
@@ -152,6 +155,48 @@ static size_t pos_of(const lmx_t *f, uint64_t g, uint64_t o, uint32_t origin)
 
 #define LIVE MOQ_MEDIA_DELIVERY_LIVE
 #define FILL MOQ_MEDIA_DELIVERY_FILL
+#define FETCH MOQ_MEDIA_DELIVERY_FETCH
+
+/* A standalone fetch of the track, its facade request FETCH_REQ. */
+static char g_fetch_req;
+#define FETCH_REQ ((moq_sub_fetch_req_t *)(void *)&g_fetch_req)
+
+/* The track's fetch record, as the executor opens it once its FETCH is sent. */
+static bool fetch_open(lmx_t *f)
+{
+    pthread_mutex_lock(&f->r->mu);
+    bool ok = receiver_fetch_open_locked(f->r, f->t, FETCH_REQ, 200, 0);
+    pthread_mutex_unlock(&f->r->mu);
+    return ok;
+}
+
+/* One facade item of the fetch: (g, o) when `obj`, else `kind` alone. */
+static void fetch_item(lmx_t *f, moq_sub_fetch_item_kind_t kind, uint64_t g,
+                       uint64_t o, const lmx_obj_t *obj)
+{
+    moq_sub_fetch_item_t it;
+    memset(&it, 0, sizeof(it));
+    it.kind = kind;
+    it.request = FETCH_REQ;
+    if (obj) {
+        it.u.object.group_id = g;
+        it.u.object.object_id = o;
+        MOQ_TEST_CHECK(moq_rcbuf_create(&f->r->alloc, obj->wire, obj->wire_len,
+                                        &it.u.object.payload) == MOQ_OK);
+    }
+    receiver_take_fetch_item(f->r, &it);
+}
+
+/* The decoders the track's fetch records hold. */
+static unsigned fetch_decoders(lmx_t *f)
+{
+    unsigned n = 0;
+    pthread_mutex_lock(&f->r->mu);
+    for (size_t i = RECEIVER_FILL_DOMS; i < RECEIVER_DOMS; i++)
+        if (f->r->fill_doms[i].lm) n++;
+    pthread_mutex_unlock(&f->r->mu);
+    return n;
+}
 
 /* -- The hand-off -------------------------------------------------------------- */
 
@@ -662,6 +707,55 @@ static void test_fill_decoder_oom(void)
     fx_close(&f);
 }
 
+/* -- A standalone fetch ------------------------------------------------------- */
+
+/* A fetch of a whole Group: each Object decodes in the fetch's own decoder
+ * (a delta against the full header before it) and is delivered as FETCH,
+ * its canonical chunk; the decoder goes with the fetch's end, and the
+ * terminal follows the Objects. */
+static void test_fetch_decodes(void)
+{
+    ROW("fetch_decodes");
+    lmx_t f;
+    if (!fx_open(&f)) { fx_close(&f); return; }
+    lmx_obj_t a[4];
+    lmx_group(&f, 2, 4, a);
+    MOQ_TEST_CHECK(fetch_open(&f));
+    for (uint64_t o = 0; o < 4; o++) fetch_item(&f, MOQ_SUB_FETCH_OBJECT, 2, o, &a[o]);
+    MOQ_TEST_CHECK(fetch_decoders(&f) == 1);
+    fetch_item(&f, MOQ_SUB_FETCH_COMPLETE, 0, 0, NULL);
+    MOQ_TEST_CHECK(fetch_decoders(&f) == 0);
+    lmx_poll(&f);
+    MOQ_TEST_CHECK(f.got_count == 4);
+    for (uint64_t o = 0; o < 4; o++) MOQ_TEST_CHECK(rebuilt_from(&f, 2, o, FETCH, &a[o]));
+    MOQ_TEST_CHECK(lmx_in_order(&f, 2));
+    MOQ_TEST_CHECK(lmx_stats(&f).locmaf_objects_rebuilt == 4);
+    MOQ_TEST_CHECK(lmx_balanced(&f, 4));
+    bool terminal = false;
+    moq_media_track_event_t ev;
+    while (moq_media_receiver_poll_track(f.r, &ev, sizeof(ev)) == MOQ_OK)
+        if (ev.kind == MOQ_MEDIA_TRACK_FETCH_TERMINAL)
+            terminal = ev.fill_reason == MOQ_MEDIA_FETCH_COMPLETE &&
+                       ev.initiating_request_id == 200;
+    MOQ_TEST_CHECK(terminal);
+    fx_close(&f);
+}
+
+/* A receiver freed while a fetch is open frees the fetch's decoder (the
+ * ledger balances at close). */
+static void test_fetch_open_at_free(void)
+{
+    ROW("fetch_open_at_free");
+    lmx_t f;
+    if (!fx_open(&f)) { fx_close(&f); return; }
+    lmx_obj_t a[1];
+    lmx_group(&f, 0, 1, a);
+    MOQ_TEST_CHECK(fetch_open(&f));
+    fetch_item(&f, MOQ_SUB_FETCH_OBJECT, 0, 0, &a[0]);
+    MOQ_TEST_CHECK(fetch_decoders(&f) == 1);
+    fx_close(&f);
+}
+
 int main(void)
 {
     for (int lane = 0; lane < 2; lane++) {
@@ -687,6 +781,8 @@ int main(void)
         test_history_fill();
         test_no_free_domain();
         test_fill_decoder_oom();
+        test_fetch_decodes();
+        test_fetch_open_at_free();
         printf("lane %s: %s\n", g_lane ? "on" : "off", failures == before ? "PASS" : "FAIL");
     }
     printf("%s: %d failures\n", failures ? "FAIL" : "PASS", failures);

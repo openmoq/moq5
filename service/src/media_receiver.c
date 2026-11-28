@@ -4666,6 +4666,7 @@ static void dom_fetch_retire_locked(moq_media_receiver_t *r, receiver_fill_dom_t
     d->state = DOM_RETIRED;
     d->fetch_req = NULL;
     d->cancel_pending = false;
+    lm_dom_free_locked(r, d);
     d->emit = true;
     d->reason = reason;
     d->error_domain = domain;
@@ -4755,6 +4756,9 @@ static void receiver_take_fetch_item(moq_media_receiver_t *r,
             moq_sub_object_cleanup(&so);
         else if (track_is_ts(t))
             receiver_on_fill_ts_object(r, t, &so, (size_t)dom, id);
+        else if (track_is_locmaf(t))
+            /* No clock: a fetch hands nothing on to the live stage. */
+            receiver_on_fill_locmaf_object(r, t, &so, (size_t)dom, id, 0);
         else
             receiver_on_fill_media_object(r, t, &so, (size_t)dom, id);
     }
@@ -7195,9 +7199,11 @@ static void receiver_lm_progress_now(moq_media_receiver_t *r, moq_media_track_t 
     (void)receiver_lm_drain(r, t);
 }
 
-/* One Object of a fill of a LOCMAF track, with its fill record: decoded by
- * the fill's own decoder, never by the live one's (a fill takes no state
- * from another origin). */
+/* One Object of a fill or a standalone fetch of a LOCMAF track, with its
+ * record: decoded by the record's own decoder, never by the live one's (a
+ * fill or fetch takes no state from another origin). Only a fill can hand a
+ * chain on to the live stage (lm_fills_of), so only a fill's Object moves
+ * the stage on. */
 static void receiver_on_fill_locmaf_object(moq_media_receiver_t *r,
     moq_media_track_t *t, moq_sub_object_t *so, size_t dom,
     uint64_t initiating_request_id, uint64_t now_us)
@@ -7210,6 +7216,8 @@ static void receiver_on_fill_locmaf_object(moq_media_receiver_t *r,
                   (t->local_result == MOQ_OK || t->delivery_failed);
     receiver_lm_dec_t *dec = (receiver_lm_dec_t *)d->lm;
     bool failed = d->lm_failed;
+    bool fetch = d->fetch;
+    uint32_t origin = fetch ? MOQ_MEDIA_DELIVERY_FETCH : MOQ_MEDIA_DELIVERY_FILL;
     pthread_mutex_unlock(&r->mu);
     if (!wanted) {
         pthread_mutex_lock(&r->mu);
@@ -7229,7 +7237,7 @@ static void receiver_on_fill_locmaf_object(moq_media_receiver_t *r,
         pthread_mutex_unlock(&r->mu);
     }
     if (so->status != MOQ_OBJECT_NORMAL) {
-        receiver_deliver_object(r, t, so, NULL, NULL, MOQ_MEDIA_DELIVERY_FILL,
+        receiver_deliver_object(r, t, so, NULL, NULL, origin,
                                 initiating_request_id, &ref, NULL);
         return;
     }
@@ -7254,13 +7262,13 @@ static void receiver_on_fill_locmaf_object(moq_media_receiver_t *r,
             sat_add(r->stats.locmaf_objects_undecodable, 1);
     pthread_mutex_unlock(&r->mu);
     if (rc == MOQ_OK) {
-        receiver_deliver_object_ex(r, t, so, NULL, rebuilt, MOQ_MEDIA_DELIVERY_FILL,
+        receiver_deliver_object_ex(r, t, so, NULL, rebuilt, origin,
                                    initiating_request_id, &ref, NULL, true);
     } else {
-        /* A duplicate is no loss; anything else is a loss of the fill. */
+        /* A duplicate is no loss; anything else is a loss of the record. */
         lm_drop(r, t, so, rc != MOQ_ERR_INVAL, receiver_lm_refused(rc), &ref);
     }
-    receiver_lm_progress_now(r, t, now_us);
+    if (!fetch) receiver_lm_progress_now(r, t, now_us);
 }
 
 /* A fill Object of a LOCMAF track that found no free fill record: it has no
@@ -8274,6 +8282,7 @@ static bool receiver_fetch_open_locked(moq_media_receiver_t *r, moq_media_track_
     d->gen = t->ts_gen;
     d->initiating_request_id = request_id;
     d->ts = track_is_ts(t);
+    d->locmaf = track_is_locmaf(t);
     receiver_event_t *event = &r->events[r->ev_tail++ % r->ev_cap];
     *event = (receiver_event_t){ .kind = MOQ_MEDIA_TRACK_FETCH_CREATED,
         .track = t, .initiating_request_id = request_id, .fetch_cmd_seq = seq };
@@ -9649,7 +9658,7 @@ static void receiver_free(moq_media_receiver_t *r)
     if (r->st)
         r->alloc.free(r->st, r->st_cap * sizeof(receiver_st_entry_t), r->alloc.ctx);
     receiver_bootstrap_discard(r);
-    for (size_t i = 0; i < RECEIVER_FILL_DOMS; i++)
+    for (size_t i = 0; i < RECEIVER_DOMS; i++)
         lm_dom_free_locked(r, &r->fill_doms[i]);
     for (size_t i = 0; i < r->track_count; i++)
         receiver_track_free(r, r->tracks[i]);

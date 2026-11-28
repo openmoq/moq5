@@ -115,10 +115,12 @@
  * held (at most 64, each for at most 300 ms) until the fill has decoded the
  * Group's Objects before them, from a full header, and then decode in
  * Location order after the fill's. A fill's Objects are decoded by a
- * decoder of the fill's own and delivered as FILL; nothing is shared across
- * origins otherwise, and a Location both deliver is delivered by both. The
- * track's END_OF_TRACK, and an END_OF_GROUP status Object, follow the
- * Objects held before them. The counters are in the stats.
+ * decoder of the fill's own and delivered as FILL, and a standalone
+ * fetch's by a decoder of the fetch's own, delivered as FETCH; nothing is
+ * shared across origins otherwise, and a Location both deliver is
+ * delivered by both. The track's END_OF_TRACK, and an END_OF_GROUP status
+ * Object, follow the Objects held before them. The counters are in the
+ * stats.
  *
  * A LOCMAF Object carries no configuration identity: after a replacement a
  * Group encoded under the previous CMAF Header is rebuilt with the new
@@ -1314,7 +1316,11 @@ MOQ_API void moq_media_fetch_cfg_init_sized(moq_media_fetch_cfg_t *cfg,
  * reorder window and take no join PSI (mpeg2ts_join_psi); they are
  * validated as whole packets, mpeg2ts_strip_prefix applies to them, and each
  * reports the fetch's own loss (ranges the peer marked Unknown or
- * Timed-Out, and local drops) as its gap. The application merges them with
+ * Timed-Out, and local drops) as its gap. A LOCMAF track's fetched Objects
+ * are decoded by a decoder of the fetch's own, as a fill's are (see
+ * LOCMAF above), and come out as the CMAF chunks they encode; a range that
+ * starts after a Group's full header gets none of that Group's deltas
+ * before its next full header. The application merges them with
  * the live Objects by Location. Each fetch ends with exactly one
  * FETCH_TERMINAL, queued after every Object of the fetch has been polled or
  * dropped; a fetch open when the session closes ends with
@@ -1955,11 +1961,11 @@ typedef struct moq_media_receiver_stats {
      * per-group rules below), expired (held for a fill hand-off that did not
      * come in time, or past the hold's capacity) or late (its group already
      * closed). So, on the subscription, received = rebuilt + undecodable +
-     * expired + late. Objects of a fill are counted as rebuilt or
-     * undecodable. locmaf_groups_evicted: groups closed because a third
-     * group opened while two were in flight; locmaf_resets: decoder resets
-     * for a reset stream, a datagram, a second subgroup or a disabled
-     * track. */
+     * expired + late. Objects of a fill or a standalone fetch are counted
+     * as rebuilt or undecodable. locmaf_groups_evicted: groups closed
+     * because a third group opened while two were in flight; locmaf_resets:
+     * decoder resets for a reset stream, a datagram, a second subgroup or a
+     * disabled track. */
     uint64_t locmaf_objects_rebuilt;
     uint64_t locmaf_objects_undecodable;
     uint64_t locmaf_objects_expired;
