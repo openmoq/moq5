@@ -60,6 +60,7 @@ typedef struct moq_endpoint_resolved {
      * Consumed only by the raw-QUIC picoquic adapter -- resolve rejects a
      * non-zero value anywhere else. */
     uint64_t      done_wait_timeout_us;
+    bool          done_wait_exact;   /* struct_size-gated; only with a non-zero wait */
     /* SETUP authorization tokens, struct_size-gated and validated at resolve;
      * BORROWED from the cfg. Only the picoquic backend carries them. */
     const moq_auth_token_t *setup_auth_tokens;

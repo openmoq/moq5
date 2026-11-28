@@ -527,8 +527,8 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
 
     /* Session terminal-wait bound: the same complete-presence gate and byte
      * copy as the idle timeout. Any duration is valid (the session's deadline
-     * arithmetic saturates); only the raw-QUIC picoquic adapter forwards it,
-     * so a non-zero value anywhere else is an UNSUPPORTED reject. */
+     * arithmetic saturates); both picoquic adapters forward it, so a non-zero
+     * value on any other backend is an UNSUPPORTED reject. */
     {
         const size_t at = offsetof(moq_endpoint_cfg_t, done_wait_timeout_us);
         uint32_t size;
@@ -537,11 +537,17 @@ moq_result_t moq_endpoint_resolve_cfg(const moq_endpoint_cfg_t *cfg,
         if ((size_t)size >= at + sizeof(done_wait_us))
             memcpy(&done_wait_us, (const uint8_t *)cfg + at,
                    sizeof(done_wait_us));
-        if (done_wait_us != 0 &&
-            (out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC ||
-             out->protocol != MOQ_TRANSPORT_PROTOCOL_RAW_QUIC))
+        if (done_wait_us != 0 && out->backend != MOQ_TRANSPORT_BACKEND_PICOQUIC)
             return MOQ_ERR_UNSUPPORTED;
         out->done_wait_timeout_us = done_wait_us;
+
+        /* done_wait_exact: the same gate, copied by bytes; it only has
+         * meaning with a non-zero wait, so it is cleared otherwise. */
+        const size_t xat = offsetof(moq_endpoint_cfg_t, done_wait_exact);
+        uint8_t exact = 0;   /* a byte, never read through the bool type */
+        if ((size_t)size >= xat + sizeof(((moq_endpoint_cfg_t *)0)->done_wait_exact))
+            memcpy(&exact, (const uint8_t *)cfg + xat, 1);
+        out->done_wait_exact = exact != 0 && done_wait_us != 0;
     }
 
     /* SETUP authorization tokens: the session's own limits, and that the
@@ -1635,6 +1641,7 @@ static moq_result_t ep_create_pq(moq_endpoint_t *ep,
      * half of it. Distinct from a MoQ/session deadline; see picoquic_threaded.h. */
     fc.idle_timeout_ms = r->idle_timeout_ms;
     fc.done_wait_timeout_us = r->done_wait_timeout_us;
+    fc.done_wait_exact = r->done_wait_exact;
     fc.keep_alive_interval_ms = 15000;
     if (r->idle_timeout_ms != 0 && r->idle_timeout_ms / 2 < fc.keep_alive_interval_ms)
         fc.keep_alive_interval_ms = r->idle_timeout_ms / 2;
@@ -1689,6 +1696,8 @@ static moq_result_t ep_create_wt(moq_endpoint_t *ep,
     fc.keep_alive_interval_ms = 15000;
     fc.setup_auth_tokens = ep->setup_tokens.tokens;
     fc.setup_auth_token_count = ep->setup_tokens.count;
+    fc.done_wait_timeout_us = r->done_wait_timeout_us;
+    fc.done_wait_exact = r->done_wait_exact;
     moq_pico_wt_managed_t *fac = NULL;
     moq_result_t crc = moq_pico_wt_managed_create(&fc, &fac);
     if (crc < 0) return crc;
@@ -2098,6 +2107,10 @@ _Static_assert(offsetof(moq_endpoint_cfg_t, done_wait_timeout_us) >=
                    offsetof(moq_endpoint_cfg_t, idle_timeout_ms) +
                        sizeof(((moq_endpoint_cfg_t *)0)->idle_timeout_ms),
                "done_wait_timeout_us must be appended after idle_timeout_ms");
+_Static_assert(offsetof(moq_endpoint_cfg_t, done_wait_exact) >=
+                   offsetof(moq_endpoint_cfg_t, done_wait_timeout_us) +
+                       sizeof(((moq_endpoint_cfg_t *)0)->done_wait_timeout_us),
+               "done_wait_exact must be appended after done_wait_timeout_us");
 _Static_assert(offsetof(moq_endpoint_cfg_t, verify_certificate_ctx) >=
                    offsetof(moq_endpoint_cfg_t, verify_certificate) +
                        sizeof(((moq_endpoint_cfg_t *)0)->verify_certificate),

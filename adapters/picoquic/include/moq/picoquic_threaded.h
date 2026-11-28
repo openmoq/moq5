@@ -401,9 +401,18 @@ typedef struct moq_pq_threaded_cfg {
     /* Appended: forwarded to every session this facade creates as
      * moq_session_cfg_t.done_wait_timeout_us, the bound on how long a
      * terminal PUBLISH_DONE waits for its data streams (floored by the
-     * negotiated delivery timeouts). 0 = the library default (30 s). Set via
+     * negotiated delivery timeouts unless done_wait_exact). 0 = the library
+     * default (30 s). Set via
      * moq_pq_threaded_cfg_init_sized. */
     uint64_t           done_wait_timeout_us;
+    /* Appended: forwarded as moq_session_cfg_t.done_wait_exact together with
+     * a non-zero done_wait_timeout_us, so the wait is used as given, without
+     * the delivery-timeout floor; it may then be shorter than the negotiated
+     * delivery timeouts (draft 22 Section 9.9, MAY discard earlier), at the
+     * cost of the tail of data streams still in flight. Ignored when
+     * done_wait_timeout_us is 0.
+     * Set via moq_pq_threaded_cfg_init_sized. */
+    bool               done_wait_exact;
 } moq_pq_threaded_cfg_t;
 
 /* Pointer-only initializer. Clears and stamps ONLY the frozen prefix that

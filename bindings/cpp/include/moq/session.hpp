@@ -109,6 +109,10 @@ struct session_options {
      * Largest Object unresolved (extended_event::fetch_request::options) and answer it
      * with the End the application resolved. */
     bool               defer_fetch_ranges       = false;
+    /* Use session_config::done_wait_timeout_us as given, without the floor
+     * the delivery timeouts set on it (draft 22 Section 9.9 lets a subscriber
+     * discard subscription state earlier); ignored when that wait is 0. */
+    bool               done_wait_exact          = false;
 };
 
 namespace detail {
@@ -254,6 +258,7 @@ public:
         c.max_fills                = options.max_fills;
         c.defer_subscription_updates = options.defer_subscription_updates;
         c.defer_fetch_ranges       = options.defer_fetch_ranges;
+        c.done_wait_exact          = options.done_wait_exact;
 
         moq_session_t *s = nullptr;
         auto rc = moq_session_create(&c, now, &s);

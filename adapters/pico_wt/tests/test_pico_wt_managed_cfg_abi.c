@@ -26,6 +26,26 @@ static uint64_t deadline_cb(void *ctx) { (void)ctx; return UINT64_MAX; }
 static int      pump_cb(moq_pico_wt_managed_t *m, uint64_t now, void *ctx)
 { (void)m; (void)now; (void)ctx; return 0; }
 
+/* The terminal-wait fields are appended after `target`: the first starts at
+ * or past the sizeof of the layout that ended with `target` (that layout's
+ * last field is a pointer, so its sizeof is the end of `target` rounded to
+ * the struct alignment), and the flag follows it. An older caller's
+ * struct_size therefore never covers either. */
+#define WT_CFG_ALIGN _Alignof(moq_pico_wt_managed_cfg_t)
+#define WT_CFG_THROUGH_TARGET                                                     \
+    ((offsetof(moq_pico_wt_managed_cfg_t, target) + sizeof(void *) + WT_CFG_ALIGN - 1) \
+     / WT_CFG_ALIGN * WT_CFG_ALIGN)
+_Static_assert(offsetof(moq_pico_wt_managed_cfg_t, done_wait_timeout_us) == WT_CFG_THROUGH_TARGET,
+               "done_wait_timeout_us starts at the sizeof through target");
+_Static_assert(offsetof(moq_pico_wt_managed_cfg_t, done_wait_exact) ==
+                   offsetof(moq_pico_wt_managed_cfg_t, done_wait_timeout_us) + sizeof(uint64_t),
+               "done_wait_exact follows done_wait_timeout_us");
+#if UINTPTR_MAX == UINT64_MAX
+_Static_assert(sizeof(moq_pico_wt_managed_cfg_t) ==
+                   offsetof(moq_pico_wt_managed_cfg_t, done_wait_exact) + 8,
+               "LP64: the flag's byte padded to 8");
+#endif
+
 int main(void)
 {
     /* An old caller has storage only through wt_protocols. The canary

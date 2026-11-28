@@ -3534,6 +3534,17 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     if (cfg->struct_size >= offsetof(moq_session_cfg_t, done_wait_timeout_us)
                             + sizeof(cfg->done_wait_timeout_us))
         done_wait_us = cfg->done_wait_timeout_us;
+    /* done_wait_exact (appended; read only when covered, as a byte rather
+     * than through the bool type). It applies only to a configured wait: with
+     * done_wait_timeout_us at 0 it is ignored, so the default keeps its floor. */
+    bool done_wait_exact = false;
+    if (done_wait_us != 0 &&
+        cfg->struct_size >= offsetof(moq_session_cfg_t, done_wait_exact)
+                            + sizeof(cfg->done_wait_exact)) {
+        uint8_t b;
+        memcpy(&b, (const uint8_t *)cfg + offsetof(moq_session_cfg_t, done_wait_exact), 1);
+        done_wait_exact = b != 0;
+    }
     if (done_wait_us == 0) done_wait_us = MOQ_DONE_WAIT_DEFAULT_US;
     if (!th_cap)      th_cap = sub_cap + pub_cap + ts_cap;
     if (th_cap > SIZE_MAX / sizeof(moq_track_hist_t)) return MOQ_ERR_INVAL;
@@ -4022,6 +4033,7 @@ moq_result_t moq_session_create(const moq_session_cfg_t *cfg,
     s->subgroup_retry_deadline_us = UINT64_MAX;
     s->idle_deadline_us = UINT64_MAX;
     s->done_wait_timeout_us = done_wait_us;
+    s->done_wait_exact = done_wait_exact;
     s->expiry_retry_deadline_us = UINT64_MAX;
     if (cfg->struct_size >= offsetof(moq_session_cfg_t, goaway_timeout_us) +
         sizeof(cfg->goaway_timeout_us))

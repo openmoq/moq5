@@ -85,6 +85,7 @@ pub struct SessionConfig {
     auth_token_cache_size: Option<u64>,
     setup_auth_tokens: Vec<AuthToken>,
     done_wait_timeout: Option<Duration>,
+    done_wait_exact: bool,
 }
 
 /// The session's resource limits, each a `moq_session_cfg_t` field where
@@ -145,6 +146,7 @@ impl SessionConfig {
             auth_token_cache_size: None,
             setup_auth_tokens: Vec::new(),
             done_wait_timeout: None,
+            done_wait_exact: false,
         }
     }
 
@@ -192,6 +194,17 @@ impl SessionConfig {
     #[must_use]
     pub fn done_wait_timeout(mut self, timeout: Duration) -> SessionConfig {
         self.done_wait_timeout = Some(timeout);
+        self
+    }
+
+    /// Use the [`done_wait_timeout`](Self::done_wait_timeout) as given,
+    /// without the floor the subscription's delivery timeouts set on it, so
+    /// late objects past it are not delivered (draft 22 Section 9.9 lets a
+    /// subscriber discard subscription state earlier). Ignored when no
+    /// done wait is set. Off by default.
+    #[must_use]
+    pub fn done_wait_exact(mut self, exact: bool) -> SessionConfig {
+        self.done_wait_exact = exact;
         self
     }
 
@@ -397,6 +410,7 @@ impl SessionConfig {
         }
         if let Some(timeout) = self.done_wait_timeout {
             cfg.done_wait_timeout_us = raw::micros(timeout)?;
+            cfg.done_wait_exact = self.done_wait_exact;
         }
         cfg.setup_auth_tokens = tokens_ptr(&tokens);
         cfg.setup_auth_token_count = tokens.len();

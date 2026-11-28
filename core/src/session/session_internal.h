@@ -2560,6 +2560,7 @@ struct moq_session {
      * on action/event capacity -- recomputed after the COMPLETE two-pool
      * reap sweep, UINT64_MAX when no expired entry has blocked work. */
     uint64_t            done_wait_timeout_us;
+    bool                done_wait_exact;    /* no delivery-timeout floor */
     uint64_t            expiry_retry_deadline_us;
 
     /*

@@ -464,15 +464,76 @@ int main(void)
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&old, &r), (int)MOQ_OK);
         MOQ_TEST_CHECK_EQ_U64(r.done_wait_timeout_us, 0);
 
-        /* WebTransport does not forward it: refused, 0 still fine. */
+        /* WebTransport over picoquic forwards it too. */
         moq_endpoint_cfg_t w;
         moq_endpoint_cfg_init_sized(&w, sizeof(w));
         w.url = B("https://relay.example:4433/moq");
         w.done_wait_timeout_us = 2000000ull;
-        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r),
-                              (int)MOQ_ERR_UNSUPPORTED);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK_EQ_U64(r.done_wait_timeout_us, 2000000ull);
         w.done_wait_timeout_us = 0;
         MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&w, &r), (int)MOQ_OK);
+
+#ifdef MOQ_SERVICE_HAVE_MSQUIC_MANAGED
+        /* Another backend cannot forward it: refused, 0 still fine. */
+        moq_endpoint_cfg_t q;
+        moq_endpoint_cfg_init_sized(&q, sizeof(q));
+        q.url = B("moqt://relay.example:4433");
+        q.backend = MOQ_TRANSPORT_BACKEND_MSQUIC;
+        q.done_wait_timeout_us = 2000000ull;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&q, &r),
+                              (int)MOQ_ERR_UNSUPPORTED);
+        q.done_wait_timeout_us = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&q, &r), (int)MOQ_OK);
+#endif
+    }
+
+    /* == done_wait_exact resolve: gated, and only with a wait ============ */
+    {
+        moq_endpoint_resolved_t r;
+        moq_endpoint_cfg_t c;
+        moq_endpoint_cfg_init_sized(&c, sizeof(c));
+        c.url = B("moqt://relay.example:4433");
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!r.done_wait_exact);                 /* default off */
+        c.done_wait_timeout_us = 2000000ull;
+        c.done_wait_exact = true;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(r.done_wait_exact);
+        c.url = B("https://relay.example:4433/moq");         /* WebTransport too */
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(r.done_wait_exact);
+        c.url = B("moqt://relay.example:4433");
+
+        /* No wait: the flag is cleared, so the default keeps its floor. */
+        c.done_wait_timeout_us = 0;
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(!r.done_wait_exact);
+
+        /* A byte other than 0 or 1 reads as set, never through the bool type. */
+        c.done_wait_timeout_us = 2000000ull;
+        memset((uint8_t *)&c + offsetof(moq_endpoint_cfg_t, done_wait_exact), 0x5A, 1);
+        MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(&c, &r), (int)MOQ_OK);
+        MOQ_TEST_CHECK(r.done_wait_exact);
+
+        /* The layout that ends with done_wait_timeout_us (#74's), in an
+         * allocation of exactly that size with the flag's byte past it: never
+         * read. */
+        const size_t pre = offsetof(moq_endpoint_cfg_t, done_wait_timeout_us) + sizeof(uint64_t);
+        MOQ_TEST_CHECK(pre <= offsetof(moq_endpoint_cfg_t, done_wait_exact));
+        void *raw = malloc(pre);
+        MOQ_TEST_CHECK(raw != NULL);
+        if (raw != NULL) {
+            moq_endpoint_cfg_init_sized(raw, pre);
+            moq_bytes_t url = B("moqt://relay.example:4433");
+            uint64_t wait = 2000000ull;
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, pre, url, url));
+            MOQ_TEST_CHECK(PUT_CFG_FIELD(raw, pre, done_wait_timeout_us, wait));
+            MOQ_TEST_CHECK_EQ_INT((int)moq_endpoint_resolve_cfg(raw, &r), (int)MOQ_OK);
+            MOQ_TEST_CHECK_EQ_U64(r.done_wait_timeout_us, 2000000ull);
+            MOQ_TEST_CHECK(!r.done_wait_exact);
+            free(raw);
+        }
     }
 
     /* == idle_timeout_ms on older, partial and short layouts ========== *

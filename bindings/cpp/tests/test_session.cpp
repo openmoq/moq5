@@ -533,6 +533,60 @@ int main()
         (void)sub;
     }
 
+    // -- 13c. done_wait_exact forwards (behavioral) ----------------------
+    // The subscriber asks for a 60 s object delivery timeout, which floors
+    // the 7 s configured wait: without done_wait_exact the deadline is the
+    // floor, with it the configured wait as given.
+    for (bool exact : {false, true}) {
+        moq::session_config ccfg{};
+        ccfg.perspective              = moq::perspective::client;
+        ccfg.send_request_capacity    = true;
+        ccfg.initial_request_capacity = 16;
+        ccfg.done_wait_timeout_us     = 7000000;
+        moq::session_options copts{};
+        copts.done_wait_exact         = exact;
+        moq::session_config scfg{};
+        scfg.perspective              = moq::perspective::server;
+        scfg.send_request_capacity    = true;
+        scfg.initial_request_capacity = 16;
+        auto cr = moq::session::create(ccfg, copts, 0);
+        auto sr = moq::session::create(scfg);
+        MOQ_CHECK(cr.ok() && sr.ok());
+        auto c3 = std::move(*cr);
+        auto s3 = std::move(*sr);
+        c3.start(0);
+        auto pump = [](moq::session &from, moq::session &to, uint64_t now) {
+            while (auto act = from.poll_action()) {
+                act->visit(
+                    [&](const moq::action::send_control &sc) {
+                        (void)to.on_control_bytes(sc.data, now);
+                    },
+                    [&](const auto &) {});
+            }
+        };
+        pump(c3, s3, 0); (void)s3.poll_event();
+        pump(s3, c3, 0); (void)c3.poll_event();
+        moq::subscribe_options opts{};
+        opts.object_delivery_timeout_ms = 60000;
+        auto sub = c3.subscribe({.ns = {"ns"}, .track = "t"}, opts, 0).value();
+        pump(c3, s3, 0);
+        auto req = s3.poll_event();
+        MOQ_CHECK(req.has_value());
+        moq::subscription srv_sub{};
+        req->visit(
+            [&](const moq::event::subscribe_request &sr3) { srv_sub = sr3.sub; },
+            [&](const auto &) { MOQ_CHECK(false); });
+        MOQ_CHECK(s3.accept_subscribe(srv_sub, {}, 0).ok());
+        pump(s3, c3, 0); (void)c3.poll_event();
+        MOQ_CHECK(s3.done_subscribe(srv_sub,
+            {.status_code = 2, .stream_count = 1}, 100).ok());
+        pump(s3, c3, 100);
+        MOQ_CHECK(!c3.poll_event().has_value());   // no terminal yet
+        MOQ_CHECK(c3.next_deadline_us() ==
+                  100 + (exact ? 7000000ull : 60000ull * 1000ull));
+        (void)sub;
+    }
+
     // -- 14. Enum conversion static asserts -----------------------------
     {
         static_assert(moq::to_c(moq::perspective::client) == MOQ_PERSPECTIVE_CLIENT);

@@ -15,6 +15,14 @@
  *   idle_wake       a server with no connection pumps when woken
  *   idle_deadline   a server with no connection pumps at its app deadline,
  *                   unwoken
+ *   done_wait       a client asking a 5 s delivery timeout, with
+ *                   done_wait_timeout_us 300 ms and done_wait_exact: a
+ *                   PUBLISH_DONE that announces more streams than arrive ends
+ *                   after about 300 ms, not at the 5 s floor
+ *   done_wait_floor the same without done_wait_exact: the 5 s delivery
+ *                   timeout floors the wait (the endpoint field's own rule)
+ *   done_wait_old_layout  done_wait_exact set, but the client's struct_size
+ *                   ends before it: the flag is not read, so the floor holds
  */
 
 #include <moq/picoquic_threaded.h>
@@ -24,6 +32,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <netinet/in.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,6 +108,12 @@ typedef struct {
     _Atomic int accept_rc;    /* first refused accept */
     _Atomic int write_rc;     /* first refused open/write */
     struct idle_dl *dl;       /* set before create: the app deadline */
+    /* done_wait row: after its object, end the subscription with
+     * TRACK_ENDED announcing 3 streams (1 sent). Network thread only. */
+    int done_mode;
+    moq_session_t *done_sess;
+    moq_subscription_t done_sub;
+    _Atomic int done_sent;
 } srv_ctx_t;
 
 /* The app deadline of the idle_deadline row, owned by the network thread:
@@ -132,6 +147,7 @@ static void idle_dl_on_pump(idle_dl_t *d, uint64_t now)
 }
 
 static int user_tag;
+static _Atomic uint32_t g_client_delivery_timeout_ms;   /* the next client's SUBSCRIBE (read on its network thread); 0 = none */
 
 static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                        uint64_t now, void *vctx)
@@ -176,10 +192,23 @@ static int server_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                             (s->served += 1);
                         moq_rcbuf_decref(b);
                         moq_session_close_subgroup(sess, h, now);
+                        if (s->done_mode) {
+                            s->done_sess = sess;
+                            s->done_sub = sub;
+                        }
                     }
                 }
             }
             moq_event_cleanup(&ev[i]);
+        }
+        /* Retried on later pumps while the subgroup's FIN is still owed. */
+        if (s->done_sess == sess && !s->done_sent) {
+            moq_done_subscribe_cfg_t dc;
+            moq_done_subscribe_cfg_init(&dc);
+            dc.status_code = 0x2;      /* TRACK_ENDED: the receiver waits */
+            dc.stream_count = 3;       /* only 1 is ever sent */
+            if (moq_session_done_subscribe(sess, s->done_sub, &dc, now) >= 0)
+                (s->done_sent = 1);
         }
     }
     return 0;
@@ -232,7 +261,17 @@ typedef struct {
     _Atomic int chunk_end;       /* a chunk with end = true */
     _Atomic int whole;           /* OBJECT_RECEIVED events */
     _Atomic int whole_bytes;
+    _Atomic int sub_done;        /* SUBSCRIBE_DONE events */
+    _Atomic uint64_t object_ns;  /* CLOCK_MONOTONIC of the first object */
+    _Atomic uint64_t done_ns;    /* CLOCK_MONOTONIC of SUBSCRIBE_DONE */
 } cli_ctx_t;
+
+static uint64_t mono_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
 
 static int client_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
                        uint64_t now, void *vctx)
@@ -254,6 +293,10 @@ static int client_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
         sc.track_namespace.count = 1;
         sc.track_name = MOQ_BYTES_LITERAL("t");
         sc.filter = MOQ_SUBSCRIBE_FILTER_NEXT_GROUP;
+        if (g_client_delivery_timeout_ms) {   /* floors the done wait */
+            sc.delivery_timeout_flags |= MOQ_SUBSCRIBE_OBJECT_DELIVERY_TIMEOUT;
+            sc.object_delivery_timeout_ms = g_client_delivery_timeout_ms;
+        }
         moq_subscription_t sub;
         moq_result_t src = moq_session_subscribe(sess, &sc, now, &sub);
         if (src >= 0)
@@ -273,7 +316,11 @@ static int client_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
         } else if (ev[i].kind == MOQ_EVENT_OBJECT_RECEIVED) {
             const moq_object_received_event_t *o = &ev[i].u.object_received;
             c->whole_bytes += o->payload ? (int)moq_rcbuf_len(o->payload) : 0;
+            if (!c->object_ns) (c->object_ns = mono_ns());
             (c->whole += 1);
+        } else if (ev[i].kind == MOQ_EVENT_SUBSCRIBE_DONE) {
+            if (!c->done_ns) (c->done_ns = mono_ns());
+            (c->sub_done += 1);
         }
         moq_event_cleanup(&ev[i]);
     }
@@ -281,6 +328,9 @@ static int client_pump(moq_pq_threaded_t *t, moq_pq_threaded_lane_t *lane,
 }
 
 static const char *g_client_host = "localhost";
+static uint64_t g_client_done_wait_us;   /* the next client's; 0 = default */
+static bool g_client_done_wait_exact;    /* the next client's done_wait_exact */
+static bool g_client_old_layout;         /* struct_size ends before done_wait_exact */
 
 static moq_pq_threaded_t *client_create(int port, bool streaming, cli_ctx_t *c)
 {
@@ -294,6 +344,11 @@ static moq_pq_threaded_t *client_create(int port, bool streaming, cli_ctx_t *c)
     cfg.on_lane_pump = client_pump;
     cfg.on_lane_pump_ctx = c;
     cfg.streaming_objects = streaming;
+    cfg.done_wait_timeout_us = g_client_done_wait_us;
+    cfg.done_wait_exact = g_client_done_wait_exact;
+    if (g_client_old_layout)   /* an older layout: the flag is past it */
+        cfg.struct_size = (uint32_t)offsetof(moq_pq_threaded_cfg_t,
+                                             done_wait_exact);
     moq_pq_threaded_t *cli = NULL;
     return moq_pq_threaded_create(&cfg, &cli) == MOQ_OK ? cli : NULL;
 }
@@ -555,6 +610,55 @@ static void row_idle_deadline(void)
     stop(&srv);
 }
 
+/* done_wait_timeout_us 300 ms against a 5 s delivery timeout the client asks
+ * for. mode 0: done_wait_exact, the done comes after about 300 ms. mode 1: no
+ * flag, the 5 s delivery timeout floors the wait. mode 2: the flag is set but
+ * past the client's struct_size, so it is not read and the floor holds. */
+static void row_done_wait(int mode)
+{
+    static const char *const names[] = { "done_wait", "done_wait_floor", "done_wait_old_layout" };
+    srv_ctx_t s;
+    memset(&s, 0, sizeof(s));
+    s.done_mode = 1;
+    moq_pq_threaded_t *srv = NULL;
+    int port = 0;
+    for (int attempt = 0; attempt < 16 && !srv; attempt++) {
+        port = pick_free_udp_port();
+        if (port && server_create(port, 0, &s, &srv) != MOQ_OK) srv = NULL;
+    }
+    CHECK(srv != NULL);
+    if (!srv) return;
+    cli_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    g_client_done_wait_us = 300000;
+    g_client_done_wait_exact = mode != 1;
+    g_client_old_layout = mode == 2;
+    g_client_delivery_timeout_ms = 5000;
+    moq_pq_threaded_t *cli = client_create(port, false, &c);
+    g_client_done_wait_us = 0;
+    g_client_done_wait_exact = false;
+    g_client_old_layout = false;
+    CHECK(cli != NULL);
+    if (cli) DRIVE_UNTIL(cli, (c.sub_done));
+    /* Cleared only now: the client subscribes later, on its network thread. */
+    g_client_delivery_timeout_ms = 0;
+    uint64_t ms = (c.done_ns && c.object_ns && c.done_ns > c.object_ns)
+                      ? (c.done_ns - c.object_ns) / 1000000ull : 0;
+    printf("%s: whole=%d done_sent=%d sub_done=%d object->done %llu ms\n",
+           names[mode], c.whole, s.done_sent, c.sub_done, (unsigned long long)ms);
+    CHECK(c.whole == 1);
+    CHECK(s.done_sent == 1);
+    CHECK(c.sub_done == 1);
+    if (mode == 0) {
+        CHECK(ms >= 250);       /* TRACK_ENDED still waits: not ended early */
+        CHECK(ms < 3000);       /* the 300 ms as given, well before the floor */
+    } else {
+        CHECK(ms >= 4500);      /* the 5 s delivery-timeout floor */
+    }
+    stop(&cli);
+    stop(&srv);
+}
+
 int main(int argc, char **argv)
 {
     const char *row = argc > 1 ? argv[1] : "streaming_on";
@@ -567,6 +671,9 @@ int main(int argc, char **argv)
     else if (strcmp(row, "socket_buffer_limit") == 0) row_socket_buffer_limit();
     else if (strcmp(row, "idle_wake") == 0) row_idle_wake();
     else if (strcmp(row, "idle_deadline") == 0) row_idle_deadline();
+    else if (strcmp(row, "done_wait") == 0) row_done_wait(0);
+    else if (strcmp(row, "done_wait_floor") == 0) row_done_wait(1);
+    else if (strcmp(row, "done_wait_old_layout") == 0) row_done_wait(2);
     else {
         fprintf(stderr, "unknown row %s\n", row);
         return 2;
