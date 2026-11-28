@@ -613,6 +613,52 @@ static void test_fetch_track_properties(void)
     printf("%s: fetch_track_properties_d22\n", ok ? "PASS" : "FAIL");
 }
 
+/* A command on a replaced handle acts on its successor (an MSF-02 critical
+ * change replaces the handle): fetch_track and withdraw_fetch on the old
+ * handle queue and withdraw the successor's command, its FETCH goes out once
+ * the successor is subscribed, and cancel_fetch on the old handle finds it. */
+static void test_replaced_handle(moq_version_t version)
+{
+    static const char c1[] =
+        "{\"version\":\"draft-02\",\"generatedAt\":1,\"tracks\":["
+        "{\"name\":\"v\",\"packaging\":\"loc\",\"isLive\":true,\"role\":\"video\","
+        "\"codec\":\"av01\",\"bitrate\":1,\"framerate\":30}]}";
+    static const char c2[] =
+        "{\"version\":\"draft-02\",\"generatedAt\":2,\"tracks\":["
+        "{\"name\":\"v\",\"packaging\":\"loc\",\"isLive\":true,\"role\":\"video\","
+        "\"codec\":\"vp09.00.10.08\",\"bitrate\":1,\"framerate\":30}]}";
+    fx_t f;
+    fx_catalog_json = c1;
+    bool ok = fx_start(&f, version, true, 0);
+    fx_catalog_json = NULL;
+    moq_media_track_t *old = ok ? f.track : NULL, *successor = NULL;
+    if (ok) {
+        moq_media_receiver_test_ingest(f.receiver, 1, 0, c2, sizeof(c2) - 1);
+        moq_media_track_event_t ev;
+        while (moq_media_receiver_poll_track(f.receiver, &ev, sizeof(ev)) == MOQ_OK)
+            if (ev.kind == MOQ_MEDIA_TRACK_ADDED) successor = ev.track;
+    }
+    ok = ok && successor != NULL && successor != old;
+    ok = ok && fx_fetch(&f) == MOQ_OK;
+    ok = ok && moq_media_receiver_withdraw_fetch(f.receiver, old) == MOQ_OK;
+    ok = ok && fx_fetch(&f) == MOQ_OK;
+    for (unsigned k = 0; ok && k < 6 && f.fetch_requests == 0; k++) ok = fx_pump(&f);
+    ok = ok && f.fetch_requests == 1 && f.peer[0].named_v;
+    uint64_t id = 0;
+    bool created = false;
+    moq_media_track_event_t ev;
+    while (ok && moq_media_receiver_poll_track(f.receiver, &ev, sizeof(ev)) == MOQ_OK)
+        if (ev.kind == MOQ_MEDIA_TRACK_FETCH_CREATED && ev.track == successor) {
+            created = true;
+            id = ev.initiating_request_id;
+        }
+    ok = ok && created;
+    ok = ok && moq_media_receiver_cancel_fetch(f.receiver, old, id) == MOQ_OK;
+    fx_finish(&f);
+    MOQ_TEST_CHECK(ok);
+    printf("%s: fetch_replaced_handle_%s\n", ok ? "PASS" : "FAIL", fx_vname(version));
+}
+
 /* One unobserved command per track: WOULD_BLOCK until its FETCH_CREATED is
  * polled, by any output size; then the next command is accepted. */
 static void test_would_block(moq_version_t version)
@@ -943,6 +989,8 @@ int main(void)
     test_subgroup_unknown(MOQ_VERSION_DRAFT_18);
     test_subgroup_unknown(MOQ_VERSION_DRAFT_22);
     test_fetch_track_properties();
+    test_replaced_handle(MOQ_VERSION_DRAFT_18);
+    test_replaced_handle(MOQ_VERSION_DRAFT_22);
     printf("receiver_fetch: %d failures\n", failures);
     return failures ? 1 : 0;
 }

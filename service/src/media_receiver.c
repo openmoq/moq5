@@ -3340,6 +3340,7 @@ static adopt_result_t receiver_adopt(moq_media_receiver_t *r,
             nt->desired_priority = live->desired_priority;
             nt->desired_ts_program = live->desired_ts_program;
             nt->desired_options = live->desired_options;
+            nt->raised = live->raised;
             /* A successor's first wire action is a SUBSCRIBE, not an
              * UPDATE: no acknowledgment attribution carries over. */
             nt->app_gen = nt->reconciled_app_gen = 0;
@@ -8077,15 +8078,17 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
         if (rc == MOQ_OK) {
             moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
             /* A fresh SUBSCRIBE forwards by default; a passive one does not. */
-            t->passive = options.has_forward && !options.forward;
-            t->forward_sent = !t->passive;
-            t->forward_desired = !t->passive;
+            bool passive = options.has_forward && !options.forward;
+            t->forward_sent = !passive;
+            t->forward_desired = !passive;
             t->has_drop_filter = false;
             r->subscribed_media = true;
             /* SUBSCRIBE issued, not yet accepted -> PENDING. Published under mu
              * for the app-thread track_state accessor; established is set later
-             * from the on_subscribed (SUBSCRIBE_OK) callback. */
+             * from the on_subscribed (SUBSCRIBE_OK) callback. The subscription's
+             * passivity is published with it, for set_track_forward. */
             pthread_mutex_lock(&r->mu);
+            t->passive = passive;
             t->requested = true;
             pthread_mutex_unlock(&r->mu);
         } else if (receiver_admission_retry(rc)) {
@@ -10771,8 +10774,12 @@ moq_result_t moq_media_receiver_set_track_forward(
         pthread_mutex_unlock(&r->mu);
         return MOQ_ERR_INVAL;
     }
-    /* Only a track the app subscribed passively, still wanted and alive. */
-    bool passive = track->desired_options.has_forward && !track->desired_options.forward;
+    track = receiver_chain_head_locked(r, track);
+    /* Only a track the app subscribed passively, still wanted and alive:
+     * passive by the options its next SUBSCRIBE takes, or by the subscription
+     * it has, which a resume (subscribe_track again) leaves unchanged. */
+    bool passive = (track->desired_options.has_forward && !track->desired_options.forward) ||
+                   track->passive;
     if (!passive || !track->desired_subscribed || track->removed || track->ended ||
         track->auth_failed || track->local_result != MOQ_OK) {
         pthread_mutex_unlock(&r->mu);
@@ -10910,6 +10917,8 @@ moq_result_t moq_media_receiver_fetch_track(
 
     pthread_mutex_lock(&r->mu);
     moq_result_t rc = MOQ_OK;
+    if (!r->fatal && receiver_owns_track(r, track))
+        track = receiver_chain_head_locked(r, track);
     if (r->fatal) rc = MOQ_ERR_CLOSED;
     else if (!receiver_owns_track(r, track)) rc = MOQ_ERR_INVAL;
     else if (r->transport_version == MOQ_VERSION_DRAFT_16 &&
@@ -10949,9 +10958,12 @@ moq_result_t moq_media_receiver_cancel_fetch(
     if (r->fatal) rc = MOQ_ERR_CLOSED;
     else if (!receiver_owns_track(r, track)) rc = MOQ_ERR_INVAL;
     else {
+        /* A fetch of the handle, or of its successor (a command issued on a
+         * replaced handle acts on the successor). */
+        moq_media_track_t *head = receiver_chain_head_locked(r, track);
         for (size_t i = RECEIVER_FILL_DOMS; i < RECEIVER_DOMS; i++) {
             receiver_fill_dom_t *d = &r->fill_doms[i];
-            if (d->state == DOM_LIVE && d->track == track &&
+            if (d->state == DOM_LIVE && (d->track == track || d->track == head) &&
                 d->initiating_request_id == fetch_request_id) {
                 d->cancel_pending = true;
                 rc = MOQ_OK;
@@ -10971,6 +10983,8 @@ moq_result_t moq_media_receiver_withdraw_fetch(
     if (r->ep && moq_endpoint_is_closed(r->ep)) return MOQ_ERR_CLOSED;
     pthread_mutex_lock(&r->mu);
     moq_result_t rc;
+    if (!r->fatal && receiver_owns_track(r, track))
+        track = receiver_chain_head_locked(r, track);
     if (r->fatal) rc = MOQ_ERR_CLOSED;
     else if (!receiver_owns_track(r, track)) rc = MOQ_ERR_INVAL;
     else if (track->fetch_cmd_state == FETCH_CMD_QUEUED) {

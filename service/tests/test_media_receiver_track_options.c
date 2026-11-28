@@ -130,6 +130,9 @@ static void finish(fixture_t *f)
     MOQ_TEST_CHECK(f->ledger.balance == 0);
 }
 
+/* The catalog start() ingests in place of its own, when set. */
+static const char *g_catalog;
+
 static bool start(fixture_t *f, moq_version_t version)
 {
     static moq_bytes_t ns[] = {
@@ -185,7 +188,8 @@ static bool start(fixture_t *f, moq_version_t version)
     sub_cfg.on_update_ok = receiver_on_update_ok;
     if (moq_sub_create(client, &alloc, &sub_cfg, &f->receiver->sub) != MOQ_OK)
         return false;
-    moq_media_receiver_test_ingest(f->receiver, 0, 0, catalog, sizeof(catalog) - 1);
+    const char *json = g_catalog ? g_catalog : catalog;
+    moq_media_receiver_test_ingest(f->receiver, 0, 0, json, strlen(json));
     moq_media_track_event_t event;
     for (unsigned i = 0; i < 16 &&
          moq_media_receiver_poll_track(f->receiver, &event, sizeof(event)) == MOQ_OK; i++)
@@ -859,6 +863,139 @@ static void test_raise_refusals(void)
     MOQ_TEST_PASS("track_options_raise_refusals");
 }
 
+/* A passive subscription resumed by subscribe_track without the forward
+ * option is still the passive one (options apply when the subscription is
+ * first issued): set_track_forward raises it with one update. */
+static void test_raise_after_resume(moq_version_t version)
+{
+    fixture_t f;
+    bool ready = start(&f, version);
+    MOQ_TEST_CHECK(ready);
+    if (!ready) { finish(&f); return; }
+    const bool off = false;
+    options_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.struct_size = sizeof(cfg);
+    cfg.forward = &off;
+    MOQ_TEST_CHECK_EQ_INT(subscribe(&f, &cfg), MOQ_OK);
+    reconcile(&f);
+    MOQ_TEST_CHECK(accept_subscribe(&f));
+    (void)pump(&f, 2);
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_unsubscribe_track(f.receiver, f.track), MOQ_OK);
+    (void)pump(&f, 2);
+    MOQ_TEST_CHECK_EQ_INT(subscribe(&f, NULL), MOQ_OK);
+    pumped_t p = pump(&f, 2);
+    MOQ_TEST_CHECK_EQ_INT((int)p.updates, 0);
+    MOQ_TEST_CHECK(f.track->passive && !f.track->forward_sent);
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.receiver, f.track, true), MOQ_OK);
+    p = pump(&f, 3);
+    MOQ_TEST_CHECK_EQ_INT((int)p.updates, 1);
+    MOQ_TEST_CHECK(p.last_forward && f.track->forward_sent);
+    finish(&f);
+    MOQ_TEST_PASS(version == MOQ_VERSION_DRAFT_22 ? "track_options_raise_after_resume_d22"
+                                                  : "track_options_raise_after_resume_d18");
+}
+
+/* An MSF-02 critical change replaces a raised passive track: the raise moves
+ * to the successor with the rest of the selection (its SUBSCRIBE goes out
+ * with Forward 0, then one update to Forward 1), and set_track_forward on
+ * the predecessor acts on the successor (a lower sends Forward 0). */
+typedef struct replaced_pump {
+    unsigned subscribes, subscribes_forward, raises, lowers;
+} replaced_pump_t;
+
+static replaced_pump_t pump_accepting(fixture_t *f, int seconds)
+{
+    replaced_pump_t p = {0};
+    moq_session_t *server = moq_simpair_server(f->pair);
+    for (int s = 0; s < seconds; ++s) {
+        moq_simpair_advance_to(f->pair, moq_simpair_now_us(f->pair) + 1000000);
+        moq_media_receiver_test_pump(f->receiver, moq_simpair_client(f->pair),
+                                     moq_simpair_now_us(f->pair));
+        moq_simpair_run_until_quiescent(f->pair, 32, NULL);
+        moq_media_track_event_t te;
+        while (moq_media_receiver_poll_track(f->receiver, &te, sizeof(te)) == MOQ_OK) {}
+        moq_event_t ev;
+        while (moq_session_poll_events(server, &ev, 1)) {
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST) {
+                p.subscribes++;
+                if (ev.u.subscribe_request.forward) p.subscribes_forward++;
+                moq_accept_subscribe_cfg_t acc;
+                moq_accept_subscribe_cfg_init(&acc);
+                MOQ_TEST_CHECK_EQ_INT(moq_session_accept_subscribe(server,
+                    ev.u.subscribe_request.sub, &acc, moq_simpair_now_us(f->pair)), MOQ_OK);
+            }
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED && ev.u.subscribe_updated.has_forward) {
+                if (ev.u.subscribe_updated.forward) p.raises++;
+                else p.lowers++;
+            }
+            if (ev.kind == MOQ_EVENT_SUBSCRIBE_UPDATED && ev.u.subscribe_updated.answer_owed) {
+                moq_accept_subscription_update_cfg_t acc;
+                moq_accept_subscription_update_cfg_init(&acc);
+                acc.update_request_id = ev.u.subscribe_updated.update_request_id;
+                MOQ_TEST_CHECK_EQ_INT(moq_session_accept_subscription_update(server,
+                    ev.u.subscribe_updated.sub, &acc, moq_simpair_now_us(f->pair)), MOQ_OK);
+            }
+            moq_event_cleanup(&ev);
+        }
+        moq_simpair_run_until_quiescent(f->pair, 32, NULL);
+    }
+    return p;
+}
+
+static void test_raise_survives_replacement(moq_version_t version)
+{
+    static const char c1[] = "{\"version\":\"draft-02\",\"generatedAt\":1,\"tracks\":["
+        "{\"name\":\"v\",\"packaging\":\"loc\",\"isLive\":true,\"role\":\"video\","
+        "\"codec\":\"av01\",\"bitrate\":1,\"framerate\":30}]}";
+    static const char c2[] = "{\"version\":\"draft-02\",\"generatedAt\":2,\"tracks\":["
+        "{\"name\":\"v\",\"packaging\":\"loc\",\"isLive\":true,\"role\":\"video\","
+        "\"codec\":\"vp09.00.10.08\",\"bitrate\":1,\"framerate\":30}]}";
+    fixture_t f;
+    g_catalog = c1;
+    bool ready = start(&f, version);
+    g_catalog = NULL;
+    MOQ_TEST_CHECK(ready);
+    if (!ready) { finish(&f); return; }
+    const bool off = false;
+    options_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.struct_size = sizeof(cfg);
+    cfg.forward = &off;
+    MOQ_TEST_CHECK_EQ_INT(subscribe(&f, &cfg), MOQ_OK);
+    reconcile(&f);
+    MOQ_TEST_CHECK(accept_subscribe(&f));
+    (void)pump(&f, 2);
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.receiver, f.track, true), MOQ_OK);
+    pumped_t p = pump(&f, 3);
+    MOQ_TEST_CHECK(p.updates == 1 && p.last_forward && f.track->forward_sent);
+
+    moq_media_track_t *old = f.track, *successor = NULL;
+    moq_media_receiver_test_ingest(f.receiver, 1, 0, c2, sizeof(c2) - 1);
+    moq_media_track_event_t te;
+    while (moq_media_receiver_poll_track(f.receiver, &te, sizeof(te)) == MOQ_OK)
+        if (te.kind == MOQ_MEDIA_TRACK_ADDED) successor = te.track;
+    MOQ_TEST_CHECK(successor != NULL && successor != old);
+
+    /* The successor subscribes passively and is raised with no new call. */
+    replaced_pump_t rp = pump_accepting(&f, 8);
+    MOQ_TEST_CHECK_EQ_INT((int)rp.subscribes, 1);
+    MOQ_TEST_CHECK_EQ_INT((int)rp.subscribes_forward, 0);
+    MOQ_TEST_CHECK_EQ_INT((int)rp.raises, 1);
+    MOQ_TEST_CHECK(successor && successor->passive && successor->forward_sent);
+
+    /* A lower on the old handle lowers the successor. */
+    MOQ_TEST_CHECK_EQ_INT(moq_media_receiver_set_track_forward(f.receiver, old, false), MOQ_OK);
+    rp = pump_accepting(&f, 3);
+    MOQ_TEST_CHECK_EQ_INT((int)rp.lowers, 1);
+    MOQ_TEST_CHECK(successor && !successor->forward_sent);
+    MOQ_TEST_CHECK(!moq_media_receiver_is_fatal(f.receiver));
+    finish(&f);
+    MOQ_TEST_PASS(version == MOQ_VERSION_DRAFT_22
+                  ? "track_options_raise_survives_replacement_d22"
+                  : "track_options_raise_survives_replacement_d18");
+}
+
 int main(void)
 {
     test_passive_forward(MOQ_VERSION_DRAFT_18);
@@ -876,6 +1013,10 @@ int main(void)
     test_raise_lower(MOQ_VERSION_DRAFT_18);
     test_raise_lower(MOQ_VERSION_DRAFT_22);
     test_raise_refusals();
+    test_raise_after_resume(MOQ_VERSION_DRAFT_18);
+    test_raise_after_resume(MOQ_VERSION_DRAFT_22);
+    test_raise_survives_replacement(MOQ_VERSION_DRAFT_18);
+    test_raise_survives_replacement(MOQ_VERSION_DRAFT_22);
     printf("receiver_track_options: %d failures\n", failures);
     return failures ? 1 : 0;
 }
