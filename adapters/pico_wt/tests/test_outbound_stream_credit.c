@@ -10,7 +10,14 @@
  * This tests connection QUIC credit, not WT_MAX_STREAMS session capsules.
  * The WT bootstrap is the small-limit variant of pico_wt_harness_setup;
  * pumping, MoQ handshake and teardown reuse that existing harness.
- * Selectors: raw-uni, raw-bidi, wt-uni, wt-bidi, raw-reset, wt-reset.
+ * Selectors: raw-uni, raw-bidi, wt-uni, wt-bidi, raw-reset, wt-reset,
+ * raw-bidi-cancel.
+ *
+ * raw-bidi-cancel parks a FETCH above the peer's bidi credit and cancels it
+ * before any credit arrives. Neither RESET_STREAM nor STOP_SENDING may name
+ * the parked stream: the peer never opened it, and a frame for it is a
+ * STREAM_LIMIT_ERROR (RFC 9000 section 4.6) that closes the connection. Once
+ * credit arrives, both deferred frames go out and the connection stays up.
  */
 #include "pico_wt_harness.h"
 #include <moq/moq.h>
@@ -36,11 +43,11 @@ static const char *row;
 typedef struct credit_pair {
     pico_wt_harness_t h;
     moq_pq_conn_t *raw_client, *raw_server;
-    bool wt, bidi, reset, armed;
+    bool wt, bidi, reset, cancel, armed;
     int setup_error, bad;
     picoquic_cnx_t *sender, *receiver;
     uint64_t initial_credit, observed_credit, target_sid;
-    unsigned grant_tx, grant_rx, packets, forbidden, frames, fins, resets;
+    unsigned grant_tx, grant_rx, packets, forbidden, frames, fins, resets, stops;
     unsigned same_time_max;
     uint8_t wire[WIRE_BYTES], present[WIRE_BYTES];
     size_t wire_end;
@@ -75,7 +82,8 @@ static void observe_frames(credit_pair_t *p, picoquic_cnx_t *cnx,
         if (!b) { p->bad = 1; return; }
         bool stream = type >= 8 && type <= 15;
         bool reset = type == 4 || type == 0x24;
-        if (stream || reset) {
+        bool stop = type == 5;
+        if (stream || reset || stop) {
             b = vi(b, end, &sid);
             if (!b) { p->bad = 1; return; }
             if (!incoming && cnx == p->sender &&
@@ -101,7 +109,8 @@ static void observe_frames(credit_pair_t *p, picoquic_cnx_t *cnx,
                     if (off + n > p->wire_end) p->wire_end = (size_t)(off + n);
                 }
             } else if (!incoming && cnx == p->sender && sid == p->target_sid) {
-                p->resets++;
+                if (stop) p->stops++;
+                else p->resets++;
             }
         } else if (type == (p->bidi ? 0x12u : 0x13u)) {
             uint64_t grant;
@@ -457,11 +466,24 @@ static int publish(credit_pair_t *p, unsigned i, bool data)
     return rc;
 }
 
-static void run(bool wt, bool bidi, bool reset, uint8_t discriminator)
+/* A standalone FETCH on its own request stream, issued and cancelled while
+ * the stream waits for credit. The server never sees it, so it never answers. */
+static int fetch_parked(credit_pair_t *p, moq_fetch_t *out)
+{
+    moq_bytes_t ns = MOQ_BYTES_LITERAL("issue45-credit");
+    moq_fetch_cfg_t cfg;
+    moq_fetch_cfg_init(&cfg);
+    cfg.track_namespace = (moq_namespace_t){&ns, 1};
+    cfg.track_name = MOQ_BYTES_LITERAL("cZ");
+    cfg.start_group = 0; cfg.start_object = 0; cfg.end_group = 0; cfg.end_object = 1;
+    return moq_session_fetch(p->h.client_session, &cfg, p->h.now, out);
+}
+
+static void run(bool wt, bool bidi, bool reset, bool cancel, uint8_t discriminator)
 {
     credit_pair_t p;
     memset(&p, 0, sizeof(p));
-    p.wt = wt; p.bidi = bidi; p.reset = reset;
+    p.wt = wt; p.bidi = bidi; p.reset = reset; p.cancel = cancel;
     unsigned permitted = 0;
     uint64_t reserved_next = 0;
     REQUIRE(setup(&p, discriminator) == 0);
@@ -490,6 +512,51 @@ static void run(bool wt, bool bidi, bool reset, uint8_t discriminator)
     REQUIRE((bidi ? p.sender->max_streams_bidir_remote : p.sender->max_streams_unidir_remote) == p.initial_credit);
     p.observed_credit = p.initial_credit;
     p.armed = true;
+    if (cancel) {
+        moq_fetch_t parked;
+        memset(&parked, 0, sizeof(parked));
+        CHECK(fetch_parked(&p, &parked) == MOQ_OK);
+        service(&p);
+        CHECK(pump(&p, 100000) == 0 && healthy(&p));
+        /* The parked FETCH holds target_sid, the first stream above credit,
+         * so the per-target counters below watch the right stream. */
+        const picoquic_stream_head_t *parked_stream = picoquic_find_stream(p.sender, p.target_sid);
+        printf("%s parked: target=%"PRIu64" sender-stream=%s next=%"PRIu64" credit=%"PRIu64"\n",
+               row, p.target_sid, parked_stream ? "present" : "absent",
+               picoquic_get_next_local_stream_id(p.sender, 0), p.sender->max_streams_bidir_remote);
+        CHECK(parked_stream != NULL);
+        CHECK(picoquic_get_next_local_stream_id(p.sender, 0) == p.target_sid + 4);
+        CHECK(picoquic_find_stream(p.receiver, p.target_sid) == NULL);
+        CHECK(moq_session_fetch_cancel(p.h.client_session, parked, p.h.now) == MOQ_OK);
+        service(&p);
+        int rc = pump(&p, 200000);
+        picoquic_cnx_t *c = p.h.test_ctx->cnx_client, *s = p.h.test_ctx->cnx_server;
+        printf("%s cancel: pump=%d healthy=%d forbidden=%u target frames/reset/stop=%u/%u/%u"
+               " client local/remote error=0x%"PRIx64"/0x%"PRIx64
+               " server local/remote error=0x%"PRIx64"/0x%"PRIx64"\n",
+               row, rc, healthy(&p), p.forbidden, p.frames, p.resets, p.stops,
+               c ? c->local_error : 0, c ? c->remote_error : 0,
+               s ? s->local_error : 0, s ? s->remote_error : 0);
+        CHECK(p.forbidden == 0 && p.resets == 0 && p.stops == 0);
+        CHECK(rc == 0 && healthy(&p));
+        CHECK(picoquic_find_stream(p.receiver, p.target_sid) == NULL);
+        /* Release credit as the held rows do: the deferred RESET_STREAM and
+         * STOP_SENDING for the parked stream now go out, the peer sees both,
+         * and the connection stays up. */
+        for (unsigned i = 0; i < permitted; i++) {
+            moq_done_subscribe_cfg_t done;
+            moq_done_subscribe_cfg_init(&done);
+            CHECK(moq_session_done_subscribe(p.h.server_session, p.server_sub[i], &done, p.h.now) == MOQ_OK);
+        }
+        rc = pump(&p, 500000);
+        printf("%s granted: pump=%d healthy=%d grant=%"PRIu64" forbidden=%u target frames/reset/stop=%u/%u/%u\n",
+               row, rc, healthy(&p), p.observed_credit, p.forbidden, p.frames, p.resets, p.stops);
+        CHECK(rc == 0 && healthy(&p));
+        CHECK(p.grant_rx > 0 && p.observed_credit > p.initial_credit);
+        CHECK(p.forbidden == 0 && p.frames == 0);
+        CHECK(p.resets > 0 && p.stops > 0);
+        goto done;
+    }
     CHECK((bidi ? subscribe(&p, permitted) : publish(&p, permitted, !reset)) == MOQ_OK);
     service(&p); /* offer the open before FIN/reset; do not send a packet yet */
     if (!bidi) CHECK((reset ? moq_session_reset_subgroup(p.h.server_session, p.group[permitted], 77, p.h.now) :
@@ -561,10 +628,11 @@ done:
 
 int main(int argc, char **argv)
 {
-    static const struct { const char *name; bool wt, bidi, reset; } rows[] = {
-        {"raw-uni", false, false, false}, {"raw-bidi", false, true, false},
-        {"wt-uni", true, false, false}, {"wt-bidi", true, true, false},
-        {"raw-reset", false, false, true}, {"wt-reset", true, false, true}
+    static const struct { const char *name; bool wt, bidi, reset, cancel; } rows[] = {
+        {"raw-uni", false, false, false, false}, {"raw-bidi", false, true, false, false},
+        {"wt-uni", true, false, false, false}, {"wt-bidi", true, true, false, false},
+        {"raw-reset", false, false, true, false}, {"wt-reset", true, false, true, false},
+        {"raw-bidi-cancel", false, true, false, true}
     };
     if (argc > 2) return 2;
     unsigned selected = 0;
@@ -573,7 +641,7 @@ int main(int argc, char **argv)
         if (argc == 2 && strcmp(argv[1], rows[i].name) != 0) continue;
         row = rows[i].name;
         selected++;
-        run(rows[i].wt, rows[i].bidi, rows[i].reset, (uint8_t)(0x90 + i));
+        run(rows[i].wt, rows[i].bidi, rows[i].reset, rows[i].cancel, (uint8_t)(0x90 + i));
     }
     printf("%u rows, %u prerequisites, %u failures\n", selected, prerequisites, failures);
     return !selected || prerequisites ? 2 : failures ? 1 : 0;

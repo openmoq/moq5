@@ -56,6 +56,7 @@ after rebasing; no new test result is asserted by this inventory.
 | 0009 | Stateless-reset ingress and sending policy preserve authentication, routing and opt-out behavior. |
 | 0010 | STOP refuses a direct-receive stream whose receive half has completed, without changing its context. |
 | 0011 | Loading, unloading and resetting the crypto providers are serialized, so contexts created concurrently on different threads each see the providers completely loaded. |
+| 0012 | STOP_SENDING for a local stream above the peer's stream limit waits for credit, as STREAM and RESET_STREAM do, instead of closing the connection with STREAM_LIMIT_ERROR. |
 
 No new provider API is introduced by this rebase. External provider headers and
 binaries must still implement the existing declared semantic contracts together.
