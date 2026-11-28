@@ -1,6 +1,7 @@
 #include "test_session_support.h"
 #include "../../core/src/session/session_internal.h"
 #include <moq/control_d18.h>
+#include <moq/subscriber.h>
 #ifdef MOQ_TEST_SIM
 #include <moq/sim.h>
 #endif
@@ -5448,6 +5449,42 @@ int main(void)
         moq_event_cleanup(&ev);
         MOQ_TEST_CHECK(moq_session_state(c) == MOQ_SESS_ESTABLISHED);
 
+        moq_session_destroy(c);
+        moq_session_destroy(sv);
+        MOQ_TEST_CHECK(as.balance == 0);
+    }
+
+    /* == The subscriber facade carries an initial Forward State ======= */
+    {
+        test_alloc_state_t as = {0};
+        moq_alloc_t alloc = test_allocator(&as);
+        moq_session_t *c = NULL, *sv = NULL;
+        establish_pair(&alloc, 10, 10, &c, &sv, NULL, NULL);
+        moq_sub_cfg_t subcfg;
+        moq_sub_cfg_init_sized(&subcfg, sizeof subcfg);
+        moq_subscriber_t *fsub = NULL;
+        MOQ_TEST_CHECK_EQ_INT(moq_sub_create(c, &alloc, &subcfg, &fsub), MOQ_OK);
+
+        moq_bytes_t ns_parts[] = { MOQ_BYTES_LITERAL("ns") };
+        const bool off = false;
+        for (int round = 0; round < 2; ++round) {
+            /* round 0: forward = &off selects Forward 0; round 1: NULL keeps 1 */
+            moq_sub_track_cfg_t tc;
+            moq_sub_track_cfg_init(&tc);
+            tc.track_namespace = (moq_namespace_t){ ns_parts, 1 };
+            tc.track_name = round == 0 ? MOQ_BYTES_LITERAL("passive")
+                                       : MOQ_BYTES_LITERAL("live");
+            tc.forward = round == 0 ? &off : NULL;
+            moq_sub_track_t *trk = NULL;
+            MOQ_TEST_CHECK_EQ_INT(moq_sub_subscribe(fsub, &tc, 0, &trk), MOQ_OK);
+            pump_actions_to_peer(c, sv, 0);
+            moq_event_t ev;
+            MOQ_TEST_CHECK_EQ_SIZE(moq_session_poll_events(sv, &ev, 1), 1);
+            MOQ_TEST_CHECK(ev.kind == MOQ_EVENT_SUBSCRIBE_REQUEST);
+            MOQ_TEST_CHECK(ev.u.subscribe_request.forward == (round == 1));
+            moq_event_cleanup(&ev);
+        }
+        moq_sub_destroy(fsub);
         moq_session_destroy(c);
         moq_session_destroy(sv);
         MOQ_TEST_CHECK(as.balance == 0);

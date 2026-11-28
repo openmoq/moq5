@@ -1359,6 +1359,7 @@ fn subscriptions_and_state() {
             Some(SubscribeOptions {
                 start: StartMode::NextGroup,
                 priority: Some(5),
+                forward: Some(false),
                 ..SubscribeOptions::default()
             })
         ),
@@ -1379,12 +1380,14 @@ fn subscriptions_and_state() {
     assert_eq!(fake::field(line_text, "priority"), "5");
     assert_eq!(fake::field(line_text, "location"), "0");
     assert_eq!(fake::field(line_text, "fill"), "0");
+    assert_eq!(fake::field(line_text, "forward"), "0");
     assert_eq!(
         fake::field(line_text, "struct_size"),
         std::mem::size_of::<sys::moq_media_receiver_track_subscribe_cfg_t>().to_string()
     );
     assert_eq!(fake::field(&log[2], "start"), "0");
     assert_eq!(fake::field(&log[2], "priority"), "none");
+    assert_eq!(fake::field(&log[2], "forward"), "none");
     assert_eq!(log[3], "unsubscribe track=0");
     s.set("subscribe_result", i64::from(sys::MOQ_ERR_UNSUPPORTED));
     assert_eq!(

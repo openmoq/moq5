@@ -3,7 +3,7 @@
 // by scripts/update_snapshot.sh; tests/snapshot.rs holds it equal to a fresh
 // generation on every qualified target.
 //
-// libmoq commit: 00d65174f2d1 (native headers modified in the worktree)
+// libmoq commit: 0340f9633f67 (native headers modified in the worktree)
 // SDK: libmoq-service.pc Requires: libmoq
 // generated on: aarch64-apple-darwin with bindgen 0.73.2, libclang from /opt/homebrew/opt/llvm/lib (Homebrew clang version 22.1.4)
 
@@ -10554,10 +10554,12 @@ pub struct moq_sub_track_cfg {
     #[doc = " Appended: OBJECT_DELIVERY_TIMEOUT and SUBGROUP_DELIVERY_TIMEOUT the\n subscriber asks for, each exact milliseconds borrowed for the call.\n Non-NULL selects one with its value, zero included; NULL leaves it\n absent. Pointers keep the struct's alignment. Each is read only when\n struct_size covers that whole pointer. Drafts 18 and 22 send each\n as its own parameter (draft 18 §10.2.3, §10.2.4). Draft 16 carries\n one shared value: a selected value must be nonzero, and two selected\n values must be equal; otherwise the subscribe is MOQ_ERR_INVAL\n before anything is sent."]
     pub object_delivery_timeout_ms: *const u64,
     pub subgroup_delivery_timeout_ms: *const u64,
+    #[doc = " Appended: the SUBSCRIBE's Forward State, borrowed for the call.\n Non-NULL selects it with its value; NULL leaves the session default\n (Forward 1). With Forward 0 the publisher sends no Objects until a\n subscription update sets Forward 1. Whether a FETCH can still be\n served depends on what the relay holds. Every draft carries Forward\n on SUBSCRIBE. A pointer keeps the struct's alignment; read only when\n struct_size covers the whole pointer."]
+    pub forward: *const bool,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of moq_sub_track_cfg"][::std::mem::size_of::<moq_sub_track_cfg>() - 104usize];
+    ["Size of moq_sub_track_cfg"][::std::mem::size_of::<moq_sub_track_cfg>() - 112usize];
     ["Alignment of moq_sub_track_cfg"][::std::mem::align_of::<moq_sub_track_cfg>() - 8usize];
     ["Offset of field: moq_sub_track_cfg::struct_size"]
         [::std::mem::offset_of!(moq_sub_track_cfg, struct_size) - 0usize];
@@ -10585,6 +10587,8 @@ const _: () = {
         [::std::mem::offset_of!(moq_sub_track_cfg, object_delivery_timeout_ms) - 88usize];
     ["Offset of field: moq_sub_track_cfg::subgroup_delivery_timeout_ms"]
         [::std::mem::offset_of!(moq_sub_track_cfg, subgroup_delivery_timeout_ms) - 96usize];
+    ["Offset of field: moq_sub_track_cfg::forward"]
+        [::std::mem::offset_of!(moq_sub_track_cfg, forward) - 104usize];
 };
 impl Default for moq_sub_track_cfg {
     fn default() -> Self {

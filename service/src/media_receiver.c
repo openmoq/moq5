@@ -296,6 +296,8 @@ typedef struct receiver_track_options {
     bool has_subgroup_delivery_timeout;
     uint64_t object_delivery_timeout_ms;
     uint64_t subgroup_delivery_timeout_ms;
+    bool has_forward;
+    bool forward;
 } receiver_track_options_t;
 
 struct moq_media_track {
@@ -444,6 +446,7 @@ struct moq_media_track {
     uint64_t         walk_key_group;
     bool             forward_sent;     /* last forward state sent (pause) */
     bool             forward_desired;
+    bool             passive;          /* subscribed with Forward 0 (option) */
     /* -- update-acknowledgment attribution state machine --------------- *
      * app_gen bumps on every subscribe_track/unsubscribe_track call that
      * CHANGES desired_subscribed; reconciled_app_gen is the newest app
@@ -7726,6 +7729,8 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
             tcfg.object_delivery_timeout_ms = &options.object_delivery_timeout_ms;
         if (options.has_subgroup_delivery_timeout)
             tcfg.subgroup_delivery_timeout_ms = &options.subgroup_delivery_timeout_ms;
+        if (options.has_forward)
+            tcfg.forward = &options.forward;
         /* The live join (LargestObject) on a draft with fills is the section
          * 3.5 join at the current group, so playback can start at that
          * group's start instead of waiting for the next one. A publisher
@@ -7742,7 +7747,10 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
                 tcfg.fill = &options.fill;
             }
         } else if (r->joins_by_fill &&
-            tcfg.filter == MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT) {
+            tcfg.filter == MOQ_SUBSCRIBE_FILTER_LARGEST_OBJECT &&
+            !(options.has_forward && !options.forward)) {
+            /* A passive track (Forward 0) takes no join fill: it would pull
+             * the current group, which the passive subscription avoids. */
             receiver_join_current_group(&loc, &fill_loc, &fill);
             tcfg.location = &loc;
             tcfg.fill = &fill;
@@ -7782,8 +7790,10 @@ static void receiver_reconcile_subscriptions(moq_media_receiver_t *r,
                                             &t->sub_track);
         if (rc == MOQ_OK) {
             moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
-            t->forward_sent = true;     /* a fresh SUBSCRIBE forwards by default */
-            t->forward_desired = true;
+            /* A fresh SUBSCRIBE forwards by default; a passive one does not. */
+            t->passive = options.has_forward && !options.forward;
+            t->forward_sent = !t->passive;
+            t->forward_desired = !t->passive;
             t->has_drop_filter = false;
             r->subscribed_media = true;
             /* SUBSCRIBE issued, not yet accepted -> PENDING. Published under mu
@@ -7990,7 +8000,7 @@ static void receiver_reconcile_delivery(moq_media_receiver_t *r,
          * its attribution, and must stay unreconciled for the next pass. */
         RECONCILE_RACE_HOOK();
 
-        bool target = want && flow_allows;
+        bool target = want && flow_allows && !t->passive;
         t->forward_desired = target;
         if (t->forward_desired == t->forward_sent) {
             moq_media_auth_operation_clear(&t->auth_operation, &r->alloc);
@@ -10010,6 +10020,12 @@ moq_result_t moq_media_receiver_subscribe_track(
             cfg->subgroup_delivery_timeout_ms) {
             options.has_subgroup_delivery_timeout = true;
             options.subgroup_delivery_timeout_ms = *cfg->subgroup_delivery_timeout_ms;
+        }
+        if (cfg->struct_size >= offsetof(moq_media_receiver_track_subscribe_cfg_t, forward) +
+                                sizeof(cfg->forward) &&
+            cfg->forward) {
+            options.has_forward = true;
+            options.forward = *cfg->forward;
         }
         has_prio = cfg->has_priority;
         if (has_prio) prio = cfg->priority;

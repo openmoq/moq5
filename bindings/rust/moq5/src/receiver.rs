@@ -1705,6 +1705,11 @@ pub struct SubscribeOptions {
     /// it needs the draft-22 companion). It suppresses the implicit
     /// current-group fill.
     pub fill: Option<FillOptions>,
+    /// The subscription's Forward state, fixed for its life. `Some(false)`
+    /// makes the track passive: the SUBSCRIBE carries Forward 0, the
+    /// receiver never sends Forward 1 for it, and it takes no implicit
+    /// current-group fill. `None` and `Some(true)` keep Forward 1.
+    pub forward: Option<bool>,
 }
 
 /// A fill requested with a subscription (`moq_fill_cfg_t`): a range of
@@ -2421,6 +2426,7 @@ impl Receiver {
             Some(fill) => Some(raw_fill(&fill, fill_location.as_ref())?),
             None => None,
         };
+        let forward = options.and_then(|o| o.forward);
         let raw_options = options.map(|options| {
             let mut raw_options = sys::moq_media_receiver_track_subscribe_cfg_t::default();
             // SAFETY: a writable struct of exactly the size passed.
@@ -2441,6 +2447,9 @@ impl Receiver {
                 .as_ref()
                 .map_or(ptr::null(), |location| location as *const _);
             raw_options.fill = fill.as_ref().map_or(ptr::null(), |fill| fill as *const _);
+            raw_options.forward = forward
+                .as_ref()
+                .map_or(ptr::null(), |forward| forward as *const _);
             raw_options
         });
         let options_ptr = raw_options
