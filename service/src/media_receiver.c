@@ -5294,7 +5294,18 @@ static void receiver_deliver_object_ex(moq_media_receiver_t *r,
      * first parse determines admission/keyframe policy; none of its inherited
      * spans may cross the queue boundary until reparsed from a private copy. */
     moq_bytes_t track_properties = {0};
-    if (receiver_companion_d22(r->companion_profile)) {
+    /* A standalone fetch's Object: its record names the facade request. */
+    moq_sub_fetch_req_t *fetch_req = NULL;
+    if (dom) {
+        pthread_mutex_lock(&r->mu);
+        if (r->fill_doms[dom->idx].fetch) fetch_req = r->fill_doms[dom->idx].fetch_req;
+        pthread_mutex_unlock(&r->mu);
+    }
+    if (receiver_companion_d22(r->companion_profile) && fetch_req) {
+        /* Its own response's Track Properties (FETCH_OK), never the
+         * subscription's. */
+        track_properties = receiver_fetch_track_props(r, fetch_req);
+    } else if (receiver_companion_d22(r->companion_profile)) {
         const moq_sub_track_t *generation = so->track ? so->track : track->sub_track;
         if (generation) {
             moq_sub_track_result_t result;
@@ -5557,10 +5568,13 @@ static void receiver_deliver_object_ex(moq_media_receiver_t *r,
     /* The wire identity, as the facade delivered it: a datagram has no
      * subgroup on the wire, so its subgroup_id is zero and has_subgroup false. */
     o->group_id = so->group_id;
-    o->subgroup_id = so->datagram ? 0 : so->subgroup_id;
+    /* Nor does a standalone fetch's Object: the facade does not report the
+     * subgroup it carried. */
+    bool has_subgroup = !so->datagram && !fetch_req;
+    o->subgroup_id = has_subgroup ? so->subgroup_id : 0;
     o->object_id = so->object_id;
     o->publisher_priority = so->publisher_priority;
-    o->has_subgroup = !so->datagram;
+    o->has_subgroup = has_subgroup;
     /* The loss report of a Location-tracked Object, with any local loss
      * recorded since the track's previous queued Object merged in. */
     e->gen = track->ts_gen;

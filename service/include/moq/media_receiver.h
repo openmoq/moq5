@@ -1524,9 +1524,12 @@ typedef struct moq_media_object {
      *                          from a subgroup stream (subgroup_id is the
      *                          SUBGROUP_HEADER's value, resolved to the first
      *                          object's id or zero per its mode), false for a
-     *                          datagram, which has no subgroup on the wire.
-     *                          subgroup_id is then zero, and only this flag
-     *                          says so: zero is also a real subgroup id;
+     *                          datagram, which has no subgroup on the wire,
+     *                          and for an Object of a standalone fetch
+     *                          (MOQ_MEDIA_DELIVERY_FETCH), whose subgroup the
+     *                          receiver is not told. subgroup_id is then
+     *                          zero, and only this flag says so: zero is also
+     *                          a real subgroup id;
      *   publisher_priority     the effective priority the session delivered:
      *                          the header or datagram byte when present, else
      *                          the session's default for an inherited priority.

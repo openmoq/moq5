@@ -533,6 +533,86 @@ static void test_track_namespace(moq_version_t version)
     printf("%s: fetch_track_namespace_%s\n", ok ? "PASS" : "FAIL", fx_vname(version));
 }
 
+/* A fetched Object's subgroup is not reported by the facade: its record says
+ * so (has_subgroup false, subgroup_id 0) rather than naming a subgroup the
+ * wire did not carry. The Object here was served on subgroup 3. */
+static void test_subgroup_unknown(moq_version_t version)
+{
+    fx_t f;
+    bool ok = fx_start(&f, version, true, 0);
+    uint64_t id = 0;
+    ok = ok && fx_fetch(&f) == MOQ_OK && fx_created(&f, &id) && fx_accept(&f, 0);
+    moq_fetch_object_cfg_t oc;
+    moq_fetch_object_cfg_init(&oc);
+    oc.group_id = FX_GROUP;
+    oc.subgroup_id = 3;
+    oc.object_id = 0;
+    oc.publisher_priority = 7;
+    oc.payload = oc.properties = NULL;
+    ok = ok && fx_buffers(&f, 9000, &oc.payload, &oc.properties);
+    if (ok) {
+        ok = moq_session_write_fetch_object(fx_server(&f), f.peer[0].fetch, &oc,
+                                            fx_now(&f)) == MOQ_OK;
+        moq_rcbuf_decref(oc.payload);
+        moq_rcbuf_decref(oc.properties);
+    }
+    ok = ok && fx_network(&f) && fx_pump(&f);
+    moq_media_object_t obj;
+    memset(&obj, 0, sizeof(obj));
+    bool got = ok && moq_media_receiver_poll_object(f.receiver, &obj, sizeof(obj)) == MOQ_OK;
+    ok = got && obj.delivery_origin == MOQ_MEDIA_DELIVERY_FETCH &&
+         obj.initiating_request_id == id && !obj.has_subgroup && obj.subgroup_id == 0;
+    if (got) moq_media_object_cleanup(&obj);
+    fx_finish(&f);
+    MOQ_TEST_CHECK(ok);
+    printf("%s: fetch_subgroup_unknown_%s\n", ok ? "PASS" : "FAIL", fx_vname(version));
+}
+
+/* On draft 22 a fetched Object is parsed against its own response's Track
+ * Properties (FETCH_OK), never its subscription's: here FETCH_OK carries
+ * VIDEO_CONFIG 11 22 33 and SUBSCRIBE_OK a4 00 b5. */
+static void test_fetch_track_properties(void)
+{
+    static const uint8_t fetch_video[] = { 0x11, 0x22, 0x33 };
+    fx_t f;
+    bool ok = fx_start(&f, MOQ_VERSION_DRAFT_22, true, 0);
+    uint64_t id = 0;
+    ok = ok && fx_fetch(&f) == MOQ_OK && fx_created(&f, &id);
+    moq_rcbuf_t *props = NULL;
+    if (ok) {
+        moq_loc_metadata_t loc;
+        moq_loc_metadata_init_sized(&loc, sizeof(loc));
+        loc.present = MOQ_LOC_METADATA_HAS_VIDEO_CONFIG | MOQ_LOC_METADATA_HAS_TIMESCALE;
+        loc.video_config = (moq_bytes_t){ fetch_video, sizeof(fetch_video) };
+        loc.timescale = 1000;
+        ok = moq_loc_encode_metadata(&f.alloc, MOQ_VERSION_DRAFT_22, MOQ_LOC_PROFILE_04,
+                                     &loc, &props) == MOQ_OK;
+    }
+    if (ok) {
+        moq_accept_fetch_cfg_t ac;
+        moq_accept_fetch_cfg_init_sized(&ac, sizeof(ac));
+        ac.end_group = f.peer[0].end_group;
+        ac.end_object = f.peer[0].end_object;
+        ac.track_properties = (moq_bytes_t){ moq_rcbuf_data(props), moq_rcbuf_len(props) };
+        ok = moq_session_accept_fetch(fx_server(&f), f.peer[0].fetch, &ac,
+                                      fx_now(&f)) == MOQ_OK;
+    }
+    if (props) moq_rcbuf_decref(props);
+    ok = ok && fx_network(&f) && fx_serve(&f, 0, 1, true) && fx_pump(&f);
+    moq_media_object_t obj;
+    memset(&obj, 0, sizeof(obj));
+    bool got = ok && moq_media_receiver_poll_object(f.receiver, &obj, sizeof(obj)) == MOQ_OK;
+    const moq_loc_metadata_t *loc = got ? &obj.metadata.loc : NULL;
+    ok = got && obj.delivery_origin == MOQ_MEDIA_DELIVERY_FETCH &&
+         (loc->present & MOQ_LOC_METADATA_HAS_VIDEO_CONFIG) &&
+         loc->video_config.len == sizeof(fetch_video) &&
+         memcmp(loc->video_config.data, fetch_video, sizeof(fetch_video)) == 0;
+    if (got) moq_media_object_cleanup(&obj);
+    fx_finish(&f);
+    MOQ_TEST_CHECK(ok);
+    printf("%s: fetch_track_properties_d22\n", ok ? "PASS" : "FAIL");
+}
+
 /* One unobserved command per track: WOULD_BLOCK until its FETCH_CREATED is
  * polled, by any output size; then the next command is accepted. */
 static void test_would_block(moq_version_t version)
@@ -860,6 +940,9 @@ int main(void)
     test_two_in_flight(MOQ_VERSION_DRAFT_22);
     test_track_namespace(MOQ_VERSION_DRAFT_18);
     test_track_namespace(MOQ_VERSION_DRAFT_22);
+    test_subgroup_unknown(MOQ_VERSION_DRAFT_18);
+    test_subgroup_unknown(MOQ_VERSION_DRAFT_22);
+    test_fetch_track_properties();
     printf("receiver_fetch: %d failures\n", failures);
     return failures ? 1 : 0;
 }
