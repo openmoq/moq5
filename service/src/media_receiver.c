@@ -8352,7 +8352,7 @@ static void receiver_admit_fetch_command(moq_media_receiver_t *r,
 
     moq_sub_fetch_cfg_t fcfg;
     moq_sub_fetch_cfg_init_sized(&fcfg, sizeof(fcfg));
-    fcfg.track_namespace = r->namespace_;
+    fcfg.track_namespace = t->ns_fields;     /* the track's, as its SUBSCRIBE's */
     fcfg.track_name = t->desc.name;
     fcfg.start_group = cfg.start_group;
     fcfg.start_object = cfg.start_object;

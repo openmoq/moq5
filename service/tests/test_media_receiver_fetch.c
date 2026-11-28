@@ -25,6 +25,9 @@ static const uint8_t fx_video[] = { 0xa4, 0, 0xb5 };
 typedef struct fx_peer_fetch {
     moq_fetch_t fetch;
     bool named_v;
+    size_t ns_count;              /* the FETCH's namespace, its first two fields */
+    char ns[2][16];
+    size_t ns_len[2];
     uint64_t start_group, start_object, end_group, end_object;
 } fx_peer_fetch_t;
 
@@ -112,6 +115,12 @@ static bool fx_network(fx_t *f)
                     fx_peer_fetch_t *p = &f->peer[f->fetch_requests];
                     p->fetch = fr->fetch;
                     p->named_v = fr->track_name.len == 1 && fr->track_name.data[0] == 'v';
+                    p->ns_count = fr->track_namespace.count;
+                    for (size_t k = 0; k < 2 && k < fr->track_namespace.count; k++) {
+                        moq_bytes_t part = fr->track_namespace.parts[k];
+                        p->ns_len[k] = part.len < sizeof(p->ns[k]) ? part.len : sizeof(p->ns[k]);
+                        if (p->ns_len[k]) memcpy(p->ns[k], part.data, p->ns_len[k]);
+                    }
                     p->start_group = fr->start_group;
                     p->start_object = fr->start_object;
                     p->end_group = fr->end_group;
@@ -160,6 +169,9 @@ static void fx_outcome(void *ctx, const moq_media_auth_outcome_info_t *info)
     f->outcome = info->outcome;
     f->outcome_track = info->track;
 }
+
+/* The catalog fx_start_auth ingests in place of its own, when set. */
+static const char *fx_catalog_json;
 
 /* A pair at `version`, a receiver on it with one LOC track "v" subscribed
  * (passive: Forward 0) and established; with deny_fetch, a credential source
@@ -220,7 +232,8 @@ static bool fx_start_auth(fx_t *f, moq_version_t version, bool passive,
     sub_cfg.on_subscribe_done = receiver_on_subscribe_done;
     sub_cfg.on_update_ok = receiver_on_update_ok;
     FX_CHECK(moq_sub_create(fx_client(f), &f->alloc, &sub_cfg, &f->receiver->sub) == MOQ_OK);
-    moq_media_receiver_test_ingest(f->receiver, 0, 0, catalog, sizeof(catalog) - 1);
+    const char *json = fx_catalog_json ? fx_catalog_json : catalog;
+    moq_media_receiver_test_ingest(f->receiver, 0, 0, json, strlen(json));
     moq_media_track_event_t event;
     for (unsigned i = 0; i < 16 &&
          moq_media_receiver_poll_track(f->receiver, &event, sizeof(event)) == MOQ_OK; i++)
@@ -491,6 +504,33 @@ static void test_cancel(moq_version_t version)
     fx_finish(&f);
     MOQ_TEST_CHECK(ok);
     printf("%s: fetch_local_cancel_%s\n", ok ? "PASS" : "FAIL", fx_vname(version));
+}
+
+/* A track whose MSF-02 entry names a namespace of its own is fetched under
+ * that namespace, as it is subscribed, not under the receiver's. */
+static void test_track_namespace(moq_version_t version)
+{
+    static const char catalog[] =
+        "{\"version\":\"draft-02\",\"generatedAt\":1,\"tracks\":["
+        "{\"name\":\"v\",\"namespace\":\"other/ns\",\"packaging\":\"loc\","
+        "\"isLive\":true,\"role\":\"video\",\"codec\":\"av01\",\"bitrate\":1,"
+        "\"framerate\":30}]}";
+    fx_t f;
+    fx_catalog_json = catalog;
+    bool ok = fx_start(&f, version, true, 0);
+    fx_catalog_json = NULL;
+    ok = ok && f.track->ns_override;
+    ok = ok && fx_fetch(&f) == MOQ_OK && fx_pump(&f) && f.fetch_requests == 1;
+    const fx_peer_fetch_t *p = &f.peer[0];
+    ok = ok && p->named_v && p->ns_count == 2 &&
+         p->ns_len[0] == 5 && memcmp(p->ns[0], "other", 5) == 0 &&
+         p->ns_len[1] == 2 && memcmp(p->ns[1], "ns", 2) == 0;
+    if (!ok)
+        fprintf(stderr, "  fetch namespace: %zu fields, first \"%.*s\"\n", p->ns_count,
+                (int)p->ns_len[0], p->ns[0]);
+    fx_finish(&f);
+    MOQ_TEST_CHECK(ok);
+    printf("%s: fetch_track_namespace_%s\n", ok ? "PASS" : "FAIL", fx_vname(version));
 }
 
 /* One unobserved command per track: WOULD_BLOCK until its FETCH_CREATED is
@@ -818,6 +858,8 @@ int main(void)
     test_not_sent(MOQ_VERSION_DRAFT_22);
     test_two_in_flight(MOQ_VERSION_DRAFT_18);
     test_two_in_flight(MOQ_VERSION_DRAFT_22);
+    test_track_namespace(MOQ_VERSION_DRAFT_18);
+    test_track_namespace(MOQ_VERSION_DRAFT_22);
     printf("receiver_fetch: %d failures\n", failures);
     return failures ? 1 : 0;
 }
